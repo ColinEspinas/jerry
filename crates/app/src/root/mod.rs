@@ -1308,6 +1308,20 @@ pub struct AdeApp {
     /// staleness check still independently guards against a stale result ever being applied, the
     /// same defense-in-depth this module already establishes elsewhere.
     pub(crate) _completions_request_task: Option<Task<()>>,
+    /// The single, real in-flight `completionItem/resolve` request task, if any - mirrors
+    /// [`Self::_completions_request_task`]'s own single-slot reasoning: only the item the user is
+    /// *currently* looking at in the detail pane is ever worth resolving, so a fresh selection
+    /// always supersedes an in-flight resolve for a previous one.
+    pub(crate) _completions_resolve_task: Option<Task<()>>,
+    /// Which `(path, completions_generation, item index into `CompletionsStatus::Ready::items`)`
+    /// triples this app has already dispatched a real `completionItem/resolve` request for -
+    /// keyed by [`Self::completions_generation`] (not cleared explicitly) so a stale entry from a
+    /// since-replaced server response is simply never looked up again rather than needing its own
+    /// cleanup pass. Exists purely to avoid re-requesting the same already-resolved (or
+    /// already-failed) item on every render/selection revisit; the growth this leaves behind is
+    /// bounded by how many distinct items a user has actually looked at, not by anything
+    /// unbounded.
+    pub(crate) completions_resolved: std::collections::HashSet<(PathBuf, u64, usize)>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
     /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
     /// [`CompletionsEntry::path`] names; a stale entry for a file that's no
@@ -1331,6 +1345,18 @@ pub struct AdeApp {
     /// once its slow response finally arrives. A request's completion handler only ever applies
     /// its result if the generation it captured at dispatch time still matches this field.
     pub(crate) completions_generation: u64,
+    /// A real, one-shot flag: `true` right after [`crate::lsp::completion_popup::AdeApp::
+    /// accept_active_completion`] splices an accepted item's text into the buffer, consumed
+    /// (reset to `false`) by the very next [`Self::prepare_lsp_sync`] call for that edit. The
+    /// text an accept splices in routinely still ends in a real identifier character (accepting
+    /// a bare `println` leaves the caret right after a real `n`), which - left unchecked - made
+    /// `prepare_lsp_sync`'s own completion-trigger check treat the *accept's own edit* as a fresh,
+    /// completion-worthy keystroke and immediately reopen the popup, now filtered down to
+    /// essentially just the item the user had just picked. Real editors don't do this: accepting
+    /// is itself a real signal the user is done with that particular completion, not an invitation
+    /// to show it right back. Does not touch the same edit's real `textDocument/didChange` sync at
+    /// all - only the completion-request half of that one debounce tick is skipped.
+    pub(crate) completions_suppress_next_trigger: bool,
     /// Per-line diagnostic index (`crate::lsp::diagnostics::index_diagnostics_by_line`) for
     /// whichever Rust file [`Self::render_file_view`] last rendered - recomputed at the start of
     /// every render for a Rust file, cleared for a non-Rust file so diagnostics can't bleed

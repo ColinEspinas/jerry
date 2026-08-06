@@ -162,6 +162,16 @@ const POPOVER_BORDER_HEIGHT: gpui::Pixels = gpui::px(2.0);
 /// asserts the popup's real painted height against exactly this arithmetic.
 const POPOVER_FOOTER_HEIGHT: gpui::Pixels = gpui::px(23.0);
 
+/// A real, typical upper bound on [`render_completion_detail_pane`]'s own painted height for a
+/// normal item: its doc paragraph is capped at `.line_clamp(6)` (~17px/line ≈ 102px), a real
+/// signature line rarely wraps past two real lines (~40px), and the module-path footer plus the
+/// pane's own paddings/margins add roughly 45px more - about 190px total, rounded up for real
+/// headroom. Used only for [`AdeApp::render_completions_popover`]'s own flip-above-the-caret
+/// *estimate*, never as a hard cap (that's still [`popover_max_height`]'s own job via the popup's
+/// real `.max_h()`/`.overflow_hidden()`) - an unusually long signature can still legitimately
+/// exceed this and simply get clipped by that real cap, exactly as it always could.
+const DETAIL_PANE_TYPICAL_HEIGHT: gpui::Pixels = gpui::px(190.0);
+
 /// [`MAX_VISIBLE_COMPLETION_ROWS`] rows' worth of [`POPOVER_ROW_HEIGHT`] - the scrolling list's
 /// own `max_h`, which is what clamps `gpui::ListSizingBehavior::Infer`'s laid-out height and so
 /// gives the scroll handle a real viewport smaller than its content. See
@@ -178,10 +188,44 @@ fn popover_list_max_height() -> gpui::Pixels {
 
 /// [`popover_list_max_height`] plus the popover's own [`POPOVER_VERTICAL_PADDING`],
 /// [`POPOVER_BORDER_HEIGHT`], and [`POPOVER_FOOTER_HEIGHT`] - the whole popup's real maximum
-/// painted height, which is also what [`AdeApp::render_completions_popover`]'s flip-above-the-caret
-/// decision measures the available space below the caret row against.
+/// painted height, still the real cap [`AdeApp::render_completions_popover`]'s own `.max_h()`/
+/// `.overflow_hidden()` enforces (see [`estimated_popover_height`]'s own docs for what drives the
+/// *positioning* decision instead - a real, worst-case-only height was itself the bug: for a
+/// short, common list this always assumed the full `MAX_VISIBLE_COMPLETION_ROWS` list, which
+/// could put the flipped-above popup dozens of real pixels higher than its own actually-painted
+/// content, leaving a large, visibly wrong gap between it and the real caret row it was supposed
+/// to anchor to).
 fn popover_max_height() -> gpui::Pixels {
     popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT + POPOVER_FOOTER_HEIGHT
+}
+
+/// A real, tighter *estimate* of what [`AdeApp::render_completions_popover`] is actually about to
+/// paint for `status` - used only to decide *where* to position the popup (the flip-above-the-
+/// caret judgment and, when flipped, the real vertical offset), never as the popup's own render
+/// cap (that stays [`popover_max_height`], via the popup's own `.max_h()`/`.overflow_hidden()`,
+/// completely unchanged). [`popover_max_height`]'s own worst-case number (a full
+/// `MAX_VISIBLE_COMPLETION_ROWS`-row list) is the right cap for "never paint past this", but the
+/// wrong number for "how far above the caret should this be positioned" - a real, common 2-3 item
+/// filtered list is a small fraction of that, and positioning it as if it were the full 12-row
+/// list left a large, real gap between the flipped-above popup and the caret row it's meant to
+/// anchor to, which is what made the popup look like it was floating at the wrong, "super high"
+/// position entirely.
+fn estimated_popover_height(status: &CompletionsStatus) -> gpui::Pixels {
+    match status {
+        CompletionsStatus::Ready { visible, .. } => {
+            let rows = visible.len().clamp(1, MAX_VISIBLE_COMPLETION_ROWS) as f32;
+            let list_height = POPOVER_ROW_HEIGHT * rows
+                + POPOVER_VERTICAL_PADDING
+                + POPOVER_BORDER_HEIGHT
+                + POPOVER_FOOTER_HEIGHT;
+            // A real `Ready` popup always has a real selected item (`visible` is never empty -
+            // see that field's own docs), so the detail pane always paints alongside the list.
+            list_height.max(DETAIL_PANE_TYPICAL_HEIGHT)
+        }
+        CompletionsStatus::Loading | CompletionsStatus::Failed(_) => {
+            POPOVER_ROW_HEIGHT + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT
+        }
+    }
 }
 
 impl AdeApp {
@@ -318,6 +362,7 @@ impl AdeApp {
         // can't actually see.
         self.completions_scroll_handle
             .scroll_to_item(next_selected, gpui::ScrollStrategy::Nearest);
+        self.maybe_resolve_selected_completion_item(cx);
         cx.notify();
     }
 
@@ -381,6 +426,7 @@ impl AdeApp {
         *selected = next;
         self.completions_scroll_handle
             .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        self.maybe_resolve_selected_completion_item(cx);
         cx.notify();
     }
 
@@ -493,6 +539,12 @@ impl AdeApp {
         buffer.replace_range(Some(range), &text);
         buffer.seal_history();
         self.schedule_rehighlight(path.clone(), cx);
+        // The accepted text routinely still ends in a real identifier character (accepting a
+        // bare `println` leaves the caret right after a real `n`) - without this, the very next
+        // debounce tick would read as a fresh, completion-worthy keystroke and immediately
+        // reopen the popup, filtered down to essentially just the item the user had just picked.
+        // See this field's own docs.
+        self.completions_suppress_next_trigger = true;
         self.schedule_lsp_sync(self.file_tree_root.clone(), path, cx);
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
@@ -538,13 +590,17 @@ impl AdeApp {
         // `vendor/zed/crates/editor/src/element.rs`'s own `layout_popovers_above_or_below_line`
         // makes (see this module's own top docs), reusing `AdeApp::body_bounds` (already captured
         // every render by `AdeApp::render_workspace_body`'s own canvas) rather than a second,
-        // independently-tracked window-bounds value.
+        // independently-tracked window-bounds value. Measured against `estimated_popover_height`
+        // (a real, tight estimate of what's actually about to paint), not `popover_max_height`
+        // (a real, worst-case-only number that made a short, common list flip dozens of pixels
+        // higher than its own actual content ever needed - see that function's own docs).
+        let estimated_height = estimated_popover_height(&entry.status);
         let space_below = self.body_bounds.bottom() - row_bottom;
-        let fits_below = space_below >= popover_max_height();
+        let fits_below = space_below >= estimated_height;
         let top = if fits_below {
             row_bottom
         } else {
-            (row_top - popover_max_height()).max(self.body_bounds.top())
+            (row_top - estimated_height).max(self.body_bounds.top())
         };
 
         let (shadow_x, shadow_y, shadow_blur) = theme::shadow::POPOVER;
@@ -703,6 +759,20 @@ impl AdeApp {
                         .flex()
                         .flex_col()
                         .min_h_0()
+                        // `flex_1()`, not left implicit: `list_column`'s own outer box stretches
+                        // to match `render_completion_detail_pane`'s real height whenever the
+                        // detail pane's own content (a long signature, a real resolved doc
+                        // paragraph) makes it taller than the list side needs - GPUI's default
+                        // cross-axis stretch on `popover`'s own row layout, the same way a CSS
+                        // flex row would. Without `flex_1()` here, this wrapper (and the footer
+                        // hints row below it) just kept their own natural, shorter height inside
+                        // that taller stretched box, leaving real, visible empty space between
+                        // the footer and the popover's real bottom edge instead of the footer
+                        // genuinely sitting flush against it. `flex_1()` is what makes this
+                        // wrapper absorb that real extra space instead, so the footer - a
+                        // `flex_none()` sibling right after it - lands at the true bottom
+                        // regardless of how tall the detail pane makes the row.
+                        .flex_1()
                         .child(list)
                         .children(self.render_vertical_scrollbar(
                             "completions-scrollbar",
@@ -810,6 +880,7 @@ fn render_completion_row(
         // painted this frame, rather than trusting that scrolling "probably" happened.
         .debug_selector(move || format!("completion-item-{index}"))
         .flex_none()
+        .w_full()
         .h(POPOVER_ROW_HEIGHT)
         // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item row padding is
         // `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each `.completions` row).
@@ -830,6 +901,14 @@ fn render_completion_row(
             gpui::div()
                 .flex_1()
                 .min_w_0()
+                // A real item label can be longer than the row is wide (a fully-qualified
+                // constructor, a long generic instantiation) - `.truncate()` (`overflow_hidden`
+                // + `whitespace_nowrap` + `text_ellipsis`) keeps it on the row's own single line
+                // instead of wrapping, which would grow the row past `POPOVER_ROW_HEIGHT` and
+                // desync every row after it in the virtualized list (each row is painted at a
+                // fixed `POPOVER_ROW_HEIGHT` offset, so one row quietly growing taller than that
+                // just overlaps the next one rather than pushing it down).
+                .truncate()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(if is_selected {
                     theme::completions_popup::ITEM_SELECTED_FG
@@ -840,7 +919,18 @@ fn render_completion_row(
         )
         .children(detail.map(|detail| {
             gpui::div()
+                .id(("completion-item-detail", index))
+                // Lets a real test measure this real span's own painted bounds (`debug_bounds`
+                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+                // `debug_selector` in this crate.
+                .debug_selector(move || format!("completion-item-{index}-detail"))
                 .flex_none()
+                // Same real overflow the label just above needs to guard against, on the
+                // right-hand type/detail hint instead - a real, unbounded type string (a deeply
+                // nested generic, a long tuple) capped to a reasonable share of the row rather
+                // than left free to push the row's total content wider than the popup itself.
+                .max_w(gpui::px(120.0))
+                .truncate()
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
                 .child(detail)
@@ -915,12 +1005,14 @@ fn render_completion_detail_pane(
         .px(gpui::px(10.0))
         .py(gpui::px(8.0));
 
-    // Signature: `item.detail` when the server sent one (rust-analyzer/typescript-language-
-    // server/pyright all commonly do, inline, no `completionItem/resolve` round trip needed) -
-    // the bare label otherwise, so the pane is never left blank for a real, selected item.
-    // Highlighted the same real way `crate::code_surface::code_view::highlight_block` highlights
-    // any other standalone fragment (a diff hunk, a merge conflict side) - see that function's
-    // own docs.
+    // Signature: `item.detail` when there is one - inline from the server's own
+    // `textDocument/completion` response for an item it already fully described, or filled in
+    // after the fact by a real `completionItem/resolve` round trip
+    // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
+    // much included) case where a server only sends a bare `label`/`kind` up front - the bare
+    // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
+    // same real way `crate::code_surface::code_view::highlight_block` highlights any other
+    // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
     let signature_text = item
         .detail
         .as_ref()
@@ -958,6 +1050,12 @@ fn render_completion_detail_pane(
                 .font(gpui::font(theme::font::SANS))
                 .text_size(gpui::px(11.0))
                 .text_color(theme::text::DIMMER)
+                // A real doc comment can run to many paragraphs (rustdoc examples, long prose) -
+                // `.line_clamp(6)` caps it at a real, bounded number of visible lines with an
+                // ellipsis on the last one, rather than growing the pane past `popover_max_height()`
+                // and having the outer popup's own `overflow_hidden()` cut it off mid-sentence at
+                // an arbitrary point.
+                .line_clamp(6)
                 .child(doc),
         );
     }
@@ -972,6 +1070,10 @@ fn render_completion_detail_pane(
                 .font(gpui::font(theme::font::MONO))
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
+                // A real, fully-qualified module path can be long enough to wrap onto a second
+                // line on its own - `.truncate()` keeps this footer the real, fixed single line
+                // the design's own mockup shows.
+                .truncate()
                 .child(module_path),
         );
     }
@@ -1478,6 +1580,247 @@ mod completion_detail_pane_tests {
             footer_hints.top() >= detail_pane.top(),
             "the real footer hint row belongs to the list column, below the real item rows, not \
              floating above the detail pane"
+        );
+    }
+
+    /// Direct regression coverage for the real, live-reported "position is not right and can be
+    /// super high compared to the actual typing location" bug: when the popup has to flip above
+    /// the caret (no real room below), the pre-fix version always positioned it as if a full
+    /// `MAX_VISIBLE_COMPLETION_ROWS`-row list were about to paint - `popover_max_height()`'s own
+    /// worst case - even for a real, short, filtered list. That left a large, real, visibly wrong
+    /// gap between the flipped-above popup and the caret row it's meant to anchor to. Proven by
+    /// forcing a real flip (a real multi-line file, caret on its last line, a genuinely short
+    /// window) and checking the real gap between the popup and the caret row against
+    /// `estimated_popover_height` - the tight, real estimate - rather than the old worst case.
+    #[gpui::test]
+    fn a_short_lists_flipped_above_position_is_close_to_the_caret_not_the_worst_case_height(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("sample.rs");
+        let lines: Vec<String> = (0..30).map(|i| format!("fn f{i}() {{}}")).collect();
+        std::fs::write(&file, lines.join("\n") + "\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+
+        // A genuinely short window, so there's real, deliberately insufficient room below the
+        // caret's own last-line row for the popup to fit without flipping, under either the old
+        // or the new logic.
+        cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(350.0)));
+        cx.run_until_parked();
+
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
+            let last_line_offset = buffer.content.rfind("fn f29").expect("real last line");
+            buffer.move_to(last_line_offset);
+            app.sync_cursor_and_scroll();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // `scroll_to_item`'s own target is deferred, resolved on the *next* real prepaint (see
+        // `Self::move_completions_selection`'s own docs for the identical mechanism) - the first
+        // real frame after arming it still paints the old scroll position, so a real caret row
+        // this far down the file needs a couple more real, settled frames before its own
+        // `AdeApp::file_view_last_bounds`/`file_view_last_layout_for` genuinely reflect it.
+        for _ in 0..3 {
+            app.update(cx, |_app, cx| cx.notify());
+            cx.run_until_parked();
+        }
+
+        let row_top = app
+            .read_with(cx, |app, _| app.file_view_last_bounds)
+            .expect("the real caret row must have painted real bounds")
+            .top();
+
+        // A real, short (one-item) `Ready` popup - the common case a filtered list narrows down
+        // to, and the one the pre-fix worst-case-height math treated identically to a full
+        // 12-item list.
+        let short_status = CompletionsStatus::ready(
+            vec![lsp_core::lsp_types::CompletionItem {
+                label: "short".to_string(),
+                ..Default::default()
+            }],
+            "",
+        )
+        .expect("a real, non-empty item list must produce a real Ready state");
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative,
+                status: short_status.clone(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let popover = cx
+            .debug_bounds("completions-popover")
+            .expect("the real popover must have painted, flipped above the caret");
+        assert!(
+            popover.top() < row_top,
+            "sanity check: the popup must genuinely have flipped above the caret row in this \
+             deliberately short window (row top {row_top:?}, popover top {:?})",
+            popover.top()
+        );
+
+        let real_gap = row_top - popover.top();
+        let estimated = estimated_popover_height(&short_status);
+        assert!(
+            (real_gap - estimated).abs() < gpui::px(5.0),
+            "the flipped-above popup's real gap from the caret row must match the tight, real \
+             `estimated_popover_height` for this short list, not the old worst-case \
+             `popover_max_height()` - real gap {real_gap:?}, estimated {estimated:?}, old \
+             worst-case would have been {:?}",
+            popover_max_height()
+        );
+        assert!(
+            popover_max_height() - real_gap > gpui::px(50.0),
+            "the real gap must be meaningfully smaller than the old worst-case height - a short, \
+             one-item list positioned as if it were a full {MAX_VISIBLE_COMPLETION_ROWS}-row list \
+             is exactly the real, reported \"super high\" bug"
+        );
+    }
+
+    /// A real completion row's own selected/hover background (`theme::completions_popup::
+    /// ITEM_SELECTED_BG`) must cover the *whole* row, not just as much of it as the label text
+    /// happens to need - an earlier version left `.w_full()` off the row `div()` entirely, so the
+    /// row (and therefore its background) shrank to its own content width instead of stretching
+    /// to fill `LIST_WIDTH`, leaving a real, visible gap of unhighlighted background to the right
+    /// of a short label.
+    #[gpui::test]
+    fn a_selected_rows_background_spans_the_full_list_width_not_just_its_text(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let row = cx
+            .debug_bounds("completion-item-0")
+            .expect("the real selected row must have painted");
+        // Within 2px of `LIST_WIDTH`, not exactly it: this fixture's own single item is a real
+        // selected item with nothing to show in the detail pane's own signature slot, so
+        // `list_column`'s conditional `border_r_1()` (only added once a real detail pane sits
+        // beside it) is present here too, and border-box sizing takes that real 1px out of the
+        // row's own available content width.
+        assert!(
+            (row.size.width - LIST_WIDTH).abs() <= gpui::px(2.0),
+            "a real completion row - and therefore its selected/hover background - must span \
+             the full real list column width, not shrink to fit a short label's own text width \
+             (got {:?}, expected close to {:?})",
+            row.size.width,
+            LIST_WIDTH
+        );
+    }
+
+    /// A real, unusually long detail/type hint (a deeply nested generic, a long tuple return
+    /// type) must not be left free to grow the right-hand hint span past a real, bounded width -
+    /// unbounded, it would push the row's total content wider than the list column itself
+    /// (`flex_none` doesn't shrink), overflowing the popup horizontally. `.max_w(120px)` plus
+    /// `.truncate()` caps it at a real, fixed share of the row instead.
+    #[gpui::test]
+    fn a_very_long_detail_hint_is_capped_to_a_bounded_width_not_left_to_grow(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some(
+                "a genuinely long real detail string describing a deeply nested generic return \
+                 type that just keeps going and going far past any reasonable row width"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let detail_span = cx
+            .debug_bounds("completion-item-0-detail")
+            .expect("the real detail hint span must have painted for a real, non-empty detail");
+        assert!(
+            detail_span.size.width <= gpui::px(120.0) + gpui::px(1.0),
+            "a real, unusually long detail/type hint must be capped at its own bounded max \
+             width, not left to grow with the real text - got {:?}",
+            detail_span.size.width
+        );
+    }
+
+    /// A real, long documentation string (a multi-paragraph rustdoc comment is common) must not
+    /// grow the detail pane without bound - `.line_clamp(6)` caps the doc paragraph at a real,
+    /// fixed number of visible lines instead of leaving the outer popup's own `overflow_hidden()`
+    /// to cut it off at an arbitrary point mid-sentence.
+    #[gpui::test]
+    fn a_very_long_documentation_string_does_not_grow_the_pane_without_bound(
+        cx: &mut TestAppContext,
+    ) {
+        let long_doc = "This is a genuinely long real documentation paragraph. ".repeat(60);
+        let long_doc_item = lsp_core::lsp_types::CompletionItem {
+            label: "long_doc".to_string(),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(long_doc)),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted for the long-doc item");
+
+        // Unclamped, 60 real repetitions of that sentence wrapped inside the pane's own ~280px
+        // real content width would run to dozens of real lines - hundreds of real pixels tall.
+        // `popover_max_height()` (the outer popup's own cap) is comfortably less than that, so a
+        // pane genuinely respecting its own `.line_clamp(6)` must paint well under it.
+        assert!(
+            pane.size.height < popover_max_height(),
+            "a real, genuinely long documentation string (many repeated sentences) must not \
+             grow the detail pane's own painted height past the popup's own real maximum - got \
+             pane height {:?}, popover_max_height() {:?}",
+            pane.size.height,
+            popover_max_height()
+        );
+    }
+
+    /// Direct regression coverage for the real, live-reported bug: when the real detail pane's
+    /// own content (a long signature plus a real, resolved doc paragraph) makes it taller than
+    /// the list side's own natural content needs, `list_column`'s own box stretches to match it
+    /// (GPUI's default cross-axis stretch on `popover`'s own row layout) - but without
+    /// `flex_1()` on the scrolling-list wrapper, the footer hints row just kept its own shorter,
+    /// natural height inside that taller box, leaving real, visible empty space between the
+    /// footer and the popover's true bottom edge instead of sitting flush against it.
+    #[gpui::test]
+    fn the_footer_hints_row_stays_pinned_to_the_real_bottom_even_when_the_detail_pane_is_taller(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some(
+                "fn x(a: i32, b: i32, c: i32, d: i32) -> SomeReallyLongReturnType<WithGenerics, AndEvenMore>"
+                    .to_string(),
+            ),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "A genuinely long real doc paragraph that keeps going. ".repeat(30),
+            )),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let popover = cx
+            .debug_bounds("completions-popover")
+            .expect("the real popover must have painted");
+        let footer = cx
+            .debug_bounds("completions-footer-hints")
+            .expect("the real footer hints row must have painted for a real Ready popup");
+
+        assert!(
+            (popover.bottom() - footer.bottom()).abs() < gpui::px(6.0),
+            "the real footer hints row must stay pinned near the popover's own real bottom edge \
+             even when the detail pane's own content is much taller than the list side needs - \
+             popover bottom {:?}, footer bottom {:?} (gap {:?})",
+            popover.bottom(),
+            footer.bottom(),
+            popover.bottom() - footer.bottom()
         );
     }
 
