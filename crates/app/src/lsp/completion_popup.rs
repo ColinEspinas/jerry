@@ -152,6 +152,15 @@ const POPOVER_VERTICAL_PADDING: gpui::Pixels = gpui::px(6.0);
 /// Measured, not assumed: `completions_scroll_tests` asserts the popup's real painted height
 /// against exactly this arithmetic.
 const POPOVER_BORDER_HEIGHT: gpui::Pixels = gpui::px(2.0);
+/// The footer hint row's own real painted height (`h(20.0)` plus its `mt(3.0)` top margin, plus
+/// its own `border_t_1()` collapsing half a pixel into the row above it under GPUI's layout) -
+/// only present for a real [`CompletionsStatus::Ready`] popup (see [`AdeApp::
+/// render_completions_popover`]'s own match arm), but folded into [`popover_max_height`]
+/// unconditionally since that height also drives the popover's flip-above-the-caret decision and
+/// its own `overflow_hidden()` clamp, both of which must have real room for the footer whenever a
+/// `Ready` popup is the tallest thing being measured. Measured, not assumed: `completions_scroll_tests`
+/// asserts the popup's real painted height against exactly this arithmetic.
+const POPOVER_FOOTER_HEIGHT: gpui::Pixels = gpui::px(23.0);
 
 /// [`MAX_VISIBLE_COMPLETION_ROWS`] rows' worth of [`POPOVER_ROW_HEIGHT`] - the scrolling list's
 /// own `max_h`, which is what clamps `gpui::ListSizingBehavior::Infer`'s laid-out height and so
@@ -167,12 +176,12 @@ fn popover_list_max_height() -> gpui::Pixels {
     POPOVER_ROW_HEIGHT * MAX_VISIBLE_COMPLETION_ROWS as f32
 }
 
-/// [`popover_list_max_height`] plus the popover's own [`POPOVER_VERTICAL_PADDING`] and
-/// [`POPOVER_BORDER_HEIGHT`] - the whole popup's real maximum painted height, which is also what
-/// [`AdeApp::render_completions_popover`]'s flip-above-the-caret decision measures the available
-/// space below the caret row against.
+/// [`popover_list_max_height`] plus the popover's own [`POPOVER_VERTICAL_PADDING`],
+/// [`POPOVER_BORDER_HEIGHT`], and [`POPOVER_FOOTER_HEIGHT`] - the whole popup's real maximum
+/// painted height, which is also what [`AdeApp::render_completions_popover`]'s flip-above-the-caret
+/// decision measures the available space below the caret row against.
 fn popover_max_height() -> gpui::Pixels {
-    popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT
+    popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT + POPOVER_FOOTER_HEIGHT
 }
 
 impl AdeApp {
@@ -1321,10 +1330,13 @@ mod completions_scroll_tests {
                 .expect("the popup itself must have painted")
                 .size
                 .height,
-            POPOVER_ROW_HEIGHT * SHORT as f32 + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT,
-            "a short list must shrink the popup to exactly its own {SHORT} rows plus padding - \
-             not leave {MAX_VISIBLE_COMPLETION_ROWS} rows' worth of empty popover background \
-             below them"
+            POPOVER_ROW_HEIGHT * SHORT as f32
+                + POPOVER_VERTICAL_PADDING
+                + POPOVER_BORDER_HEIGHT
+                + POPOVER_FOOTER_HEIGHT,
+            "a short list must shrink the popup to exactly its own {SHORT} rows plus padding plus \
+             the real footer hint row - not leave {MAX_VISIBLE_COMPLETION_ROWS} rows' worth of \
+             empty popover background below them"
         );
         assert!(
             max_scroll_offset(&app, cx) <= gpui::px(0.5),
