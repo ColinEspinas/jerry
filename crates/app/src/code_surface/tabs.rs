@@ -204,7 +204,7 @@ impl AdeApp {
         // data-corruption bug: without this, a popup left open from switching away from a file
         // could resurrect and splice stale text into whatever's active when the same path
         // becomes active again - see `Self::dismiss_completions`'s own docs).
-        self.hover = None;
+        self.dismiss_hover();
         self.dismiss_completions();
         self.close_tab_confirm_armed = None;
         cx.notify();
@@ -337,7 +337,7 @@ impl AdeApp {
         };
         self.markdown_view = markdown_preview::MarkdownView::Source;
         self.refresh_open_diff_file_cache();
-        self.hover = None;
+        self.dismiss_hover();
         // See `Self::open_and_focus_file`'s identical `dismiss_completions()` call for why
         // (Revision R8.5b audit finding 3).
         self.dismiss_completions();
@@ -433,13 +433,13 @@ impl AdeApp {
                 Some(next_path) => {
                     self.open_change = Some(next_path.clone());
                     self.refresh_open_diff_file_cache();
-                    self.hover = None;
+                    self.dismiss_hover();
                     self.dismiss_completions();
                 }
                 None => {
                     self.open_change = None;
                     self.refresh_open_diff_file_cache();
-                    self.hover = None;
+                    self.dismiss_hover();
                     self.dismiss_completions();
                     restore_focus(&self.agents, &mut self.code_focus, window, cx);
                 }

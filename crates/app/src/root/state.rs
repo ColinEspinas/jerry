@@ -394,6 +394,9 @@ impl AdeApp {
             _lsp_tasks: TaskPool::new(),
             _lsp_poll_task: None,
             hover: None,
+            hover_pending: None,
+            _hover_debounce_task: None,
+            hover_card_bounds: None,
             _hover_request_task: None,
             _goto_definition_tasks: TaskPool::new(),
             pending_cursor_line: None,
@@ -1103,7 +1106,7 @@ impl AdeApp {
         // `self.hover = None` site in this codebase now pairs the two (Revision R8.5b audit
         // finding 3), rather than relying solely on it having already run earlier in this
         // function.
-        self.hover = None;
+        self.dismiss_hover();
         self.dismiss_completions();
         self.pending_cursor_line = None;
         // Real blame state (GitHub issue #29) is absolute-path-keyed - cleared alongside the

@@ -1854,7 +1854,7 @@ impl AdeApp {
         self.file_view_last_layout = None;
         self.file_view_last_bounds = None;
         self.file_view_last_layout_for = None;
-        self.hover = None;
+        self.dismiss_hover();
         self.completions = None;
         self.pending_cursor_line = None;
     }
