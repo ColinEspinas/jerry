@@ -724,7 +724,7 @@ impl AdeApp {
         // Anything still on screen was computed from the connection just torn down - the same
         // set `AdeApp::select_worktree` clears for the same reason.
         self.dismiss_completions();
-        self.hover = None;
+        self.dismiss_hover();
         self.file_view_diagnostics = std::collections::HashMap::new();
         // The next render's own `ensure_lsp_client`/`dispatch_did_open` calls do the real
         // respawn and re-open, through exactly the same code path a cold start uses.
@@ -1249,6 +1249,14 @@ impl AdeApp {
         relative_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #189, and deliberately *before* the debounce below, not inside it: every
+        // real edit path in `crate::code_surface::editing` already funnels through this method
+        // synchronously, so this one call is what makes an already-open popup narrow on the very
+        // keystroke that was typed, with no round trip and no timer in between. The debounced
+        // request below still refreshes the underlying candidate set behind it - see
+        // `AdeApp::refilter_completions`' own docs for how the two compose.
+        self.refilter_completions(cx);
+
         let task = cx.spawn({
             let relative_path = relative_path.clone();
             async move |this, cx| {
@@ -1766,14 +1774,20 @@ impl AdeApp {
                     lsp_core::lsp_types::CompletionResponse::Array(items) => items,
                     lsp_core::lsp_types::CompletionResponse::List(list) => list.items,
                 };
-                if items.is_empty() {
-                    None
-                } else {
-                    Some(CompletionsEntry {
-                        path: relative_path.to_path_buf(),
-                        status: CompletionsStatus::Ready { items, selected: 0 },
-                    })
-                }
+                // Narrowed against the prefix typed at the caret *right now* (GitHub issue #189),
+                // not against the one that was there when this request went out - a response that
+                // took a real round trip to arrive must land already filtered to what the user has
+                // since typed, or the popup would visibly widen back out for one frame on every
+                // server reply. `CompletionsStatus::ready` returns `None` when nothing in the
+                // response matches, which is treated exactly like the genuinely-empty response
+                // below: no popup.
+                let query = self
+                    .completion_filter_query(relative_path)
+                    .unwrap_or_default();
+                CompletionsStatus::ready(items, &query).map(|status| CompletionsEntry {
+                    path: relative_path.to_path_buf(),
+                    status,
+                })
             }
             Ok(None) => None,
             Err(err) => Some(CompletionsEntry {
@@ -1781,7 +1795,21 @@ impl AdeApp {
                 status: CompletionsStatus::Failed(err.to_string()),
             }),
         };
+        let is_ready = matches!(
+            new_state.as_ref().map(|entry| &entry.status),
+            Some(CompletionsStatus::Ready { .. })
+        );
         self.completions = new_state;
+        if is_ready {
+            // A genuinely new response starts at `selected: 0`, so its list has to start scrolled
+            // to the top too - `AdeApp::completions_scroll_handle` is a long-lived field, and
+            // without this the *previous* response's scroll offset would survive into this one,
+            // showing a viewport that has nothing to do with the freshly selected first item
+            // (GitHub issue #185). `Top`, not `Nearest`: this is a reset, not a follow-the-
+            // selection nudge.
+            self.completions_scroll_handle
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 }
@@ -2193,7 +2221,7 @@ mod lsp_client_eviction_tests {
 /// actually work against the real
 /// thing" is proven.
 #[cfg(test)]
-mod lsp_connection_facade_tests {
+pub(crate) mod lsp_connection_facade_tests {
     use super::*;
     use gpui::TestAppContext;
     use std::time::Instant;
@@ -2308,7 +2336,7 @@ process.stdin.on('data', (d) => {
     /// Genuinely spawns [`FAKE_SERVER_SOURCE`] as a real child process and drives a real
     /// `initialize`/`initialized` handshake through `lsp_core::LspClient::spawn` - the exact same
     /// spawn path every real server in this app goes through, with no test-only shortcut.
-    fn spawn_fake_server(
+    pub(crate) fn spawn_fake_server(
         root: &Path,
         name: &'static str,
         mode: &str,
@@ -2346,7 +2374,7 @@ process.stdin.on('data', (d) => {
 
     /// Pushes a real `publishDiagnostics` from `client`'s own process and waits for it to land in
     /// that client's real diagnostics sink.
-    fn publish_and_wait(client: &lsp_core::LspClient, target: &str, message: &str) {
+    pub(crate) fn publish_and_wait(client: &lsp_core::LspClient, target: &str, message: &str) {
         client
             .notify_raw(
                 "test/publish",

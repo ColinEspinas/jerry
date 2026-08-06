@@ -282,6 +282,57 @@ pub enum HighlightKind {
     /// GitHub issue #104: Markdown's `text.emphasis` capture (`*italic*`) - see
     /// `theme::syntax::EMPHASIS`'s own docs.
     Emphasis,
+    /// GitHub issue #183: the grammar's own `@punctuation.special` capture - Markdown's ATX `#`
+    /// heading marker and list bullets, JS/TS's `${`/`}` template-interpolation delimiters,
+    /// YAML's `---`/`&`/`*`/`...` sigils. Used to fall through to [`Operator`](Self::Operator),
+    /// which reads a heading marker or a document separator as an arithmetic/comparison operator,
+    /// a real, distinct grammar-level concept, now its own bucket. `theme::syntax::
+    /// PUNCTUATION_SPECIAL` keeps `Operator`'s own colour (the restraint palette has no reason to
+    /// tell them apart *visually* yet), but the classification itself is real and independently
+    /// themeable now.
+    PunctuationSpecial,
+    /// GitHub issue #183: the grammar's own `@label` capture - Rust lifetimes (`'a`), C `goto`
+    /// targets, YAML anchor/alias names. Used to fall through to [`Variable`](Self::Variable),
+    /// which is a different real concept again. Note this one real bucket still covers all three:
+    /// `tree-sitter-highlight` resolves purely on the capture-name string, which is identical
+    /// (`"label"`) across all three grammars, so nothing downstream of the parse can tell a Rust
+    /// lifetime from a YAML anchor by capture name alone; splitting those three apart from *each
+    /// other* would need a real, new per-language supplement query (the same pattern
+    /// [`RUST_DEFINITION_SUPPLEMENT`]/[`GO_HIGHLIGHTS_SUPPLEMENT`] already use) re-capturing each
+    /// language's own node under a more specific dotted name, deliberately out of scope here.
+    /// `theme::syntax::LABEL` keeps `Variable`'s own colour for the same restraint-palette reason
+    /// [`PunctuationSpecial`](Self::PunctuationSpecial) does.
+    Label,
+    /// GitHub issue #183: the grammar's own `@string.special` capture - a JS/TS regex literal, a
+    /// TOML datetime, a CSS colour value (`#fff`, `rgb(...)`). Not registered in
+    /// [`HIGHLIGHT_NAMES`] before this issue, so it fell through `tree-sitter-highlight`'s own
+    /// subset match to the coarser, already-registered plain `"string"` - a regex literal reading
+    /// as an ordinary string. `theme::syntax::STRING_SPECIAL` keeps `String`'s own colour.
+    StringSpecial,
+    /// GitHub issue #183: the grammar's own `@function.builtin` capture - Python's `len`/`print`,
+    /// Go's `append`/`make`/`panic`, JavaScript's `require`. Not registered before this issue, so
+    /// it fell through to the coarser plain `"function"`. `theme::syntax::FUNCTION_BUILTIN` keeps
+    /// `Function`'s own colour.
+    FunctionBuiltin,
+    /// GitHub issue #183: the grammar's own `@function.macro` capture - Rust's `println!`-style
+    /// macro invocations (both the macro name and its own `!`). Not registered before this issue
+    /// (this app's own docs used to name it as a deliberate, known gap - see this issue's own
+    /// discussion), so it fell through to the coarser plain `"function"`, reading as an ordinary
+    /// call. `theme::syntax::FUNCTION_MACRO` keeps `Function`'s own colour.
+    FunctionMacro,
+    /// GitHub issue #183: the grammar's own `@tag.error` capture - HTML's mismatched/erroneous
+    /// closing tag. Not registered before this issue, so it fell through to the coarser plain
+    /// `"tag"`, reading as an ordinary (correct) tag. `theme::syntax::TAG_ERROR` keeps `Tag`'s own
+    /// colour.
+    TagError,
+    /// GitHub issue #183: the grammar's own `@constructor` capture - Rust/Python/JavaScript's
+    /// shared `^[A-Z]`-starts-with-a-capital heuristic for "this identifier names a type or one
+    /// of its variants" (`tree-sitter-rust`'s own comment: "enum constructors ... either that, or
+    /// struct names"). Was folded into [`Type`](Self::Type) - the same real capture rule, but a
+    /// distinct grammar-level concept (an enum variant construction site vs. a type name used
+    /// elsewhere) that a theme wanting to tell them apart now has a real, independent bucket for.
+    /// `theme::syntax::CONSTRUCTOR` keeps `Type`'s own colour, its exact pre-issue behavior.
+    Constructor,
 }
 
 impl HighlightKind {
@@ -328,6 +379,13 @@ impl HighlightKind {
             HighlightKind::Link => "link",
             HighlightKind::Strong => "strong",
             HighlightKind::Emphasis => "emphasis",
+            HighlightKind::PunctuationSpecial => "punctuation_special",
+            HighlightKind::Label => "label",
+            HighlightKind::StringSpecial => "string_special",
+            HighlightKind::FunctionBuiltin => "function_builtin",
+            HighlightKind::FunctionMacro => "function_macro",
+            HighlightKind::TagError => "tag_error",
+            HighlightKind::Constructor => "constructor",
         }
     }
 
@@ -342,7 +400,7 @@ impl HighlightKind {
     /// source [`Self::from_name`] searches and
     /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
     /// checks exhaustively against.
-    pub const ALL: [HighlightKind; 34] = [
+    pub const ALL: [HighlightKind; 41] = [
         HighlightKind::Keyword,
         HighlightKind::Function,
         HighlightKind::FunctionMethod,
@@ -377,6 +435,13 @@ impl HighlightKind {
         HighlightKind::Link,
         HighlightKind::Strong,
         HighlightKind::Emphasis,
+        HighlightKind::PunctuationSpecial,
+        HighlightKind::Label,
+        HighlightKind::StringSpecial,
+        HighlightKind::FunctionBuiltin,
+        HighlightKind::FunctionMacro,
+        HighlightKind::TagError,
+        HighlightKind::Constructor,
     ];
 
     /// GitHub issue #168's rotating bracket-pair depth ring, in ring order: a real matched pair at
@@ -449,6 +514,13 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Link => theme::syntax::LINK.into(),
         HighlightKind::Strong => theme::syntax::STRONG.into(),
         HighlightKind::Emphasis => theme::syntax::EMPHASIS.into(),
+        HighlightKind::PunctuationSpecial => theme::syntax::PUNCTUATION_SPECIAL.into(),
+        HighlightKind::Label => theme::syntax::LABEL.into(),
+        HighlightKind::StringSpecial => theme::syntax::STRING_SPECIAL.into(),
+        HighlightKind::FunctionBuiltin => theme::syntax::FUNCTION_BUILTIN.into(),
+        HighlightKind::FunctionMacro => theme::syntax::FUNCTION_MACRO.into(),
+        HighlightKind::TagError => theme::syntax::TAG_ERROR.into(),
+        HighlightKind::Constructor => theme::syntax::CONSTRUCTOR.into(),
     }
 }
 
@@ -760,35 +832,47 @@ impl Grammar {
 ///   already-registered `punctuation.delimiter`, one dot-part short of it) ->
 ///   [`HighlightKind::PunctuationDelimiter`], the bucket its dotted cousin already reaches.
 /// - **`label`** (`-c`'s `(statement_identifier) @label`, a goto target; `-yaml`'s
-///   `[(anchor_name)(alias_name)] @label`, an anchor/alias reference) ->
-///   [`HighlightKind::Variable`]. This also newly classifies a real capture one of the original
-///   four already emitted: `-rust`'s own `@label` is a lifetime annotation (`'a`). Harmless -
-///   `theme::syntax::VARIABLE` is a direct alias of `theme::syntax::TEXT` (see that module's
-///   docs), the same colour an unclassified lifetime already rendered as.
+///   `[(anchor_name)(alias_name)] @label`, an anchor/alias reference; `-rust`'s own `@label`, a
+///   lifetime annotation `'a`) -> [`HighlightKind::Label`] - its own real, dedicated bucket as of
+///   GitHub issue #183 (previously folded into [`HighlightKind::Variable`], a different real
+///   concept again). See [`HighlightKind::Label`]'s own docs for why a Rust lifetime, a C goto
+///   target and a YAML anchor still share this one bucket rather than three.
 /// - **`punctuation.special`** (`-yaml`'s `["*" "&" "---" "..."] @punctuation.special`, anchor/
-///   alias sigils and document markers) -> [`HighlightKind::Operator`]. Also newly classifies a
-///   real, previously-unregistered capture from the original four: `-javascript`'s own
-///   template-literal `${`/`}` interpolation delimiters carry this same name - again harmless,
-///   since `theme::syntax::OPERATOR` is also a direct `TEXT` alias.
+///   alias sigils and document markers; `-javascript`'s own template-literal `${`/`}`
+///   interpolation delimiters; Markdown's ATX `#` heading marker and list bullets) ->
+///   [`HighlightKind::PunctuationSpecial`] - its own real bucket as of GitHub issue #183
+///   (previously folded into [`HighlightKind::Operator`], which read a heading marker as an
+///   arithmetic operator).
 /// - **`string.special.key`** (`-json`'s `key: (_) @string.special.key`, an object key) ->
 ///   [`HighlightKind::Property`], not [`HighlightKind::String`]: a JSON key is semantically a
 ///   property name, matching how the other grammars already classify a struct/object field name.
 ///   Registered as its own, more-specific 3-part name specifically to *win* over the
 ///   already-registered plain `"string"` (which would otherwise also match, by the "most parts
-///   wins" rule described above, and misclassify it as a plain string value).
+///   wins" rule described above, and misclassify it as a plain string value) - and, since GitHub
+///   issue #183, over the new, less-specific 2-part `"string.special"` below too, for the same
+///   reason.
 ///
-/// Two more real captures the new grammars emit needed **no** new registration, already resolving
-/// correctly through an existing, less-specific entry via that same "fewer parts still matches"
-/// rule: `-go`'s `@function.builtin` and `-c`'s `@function.special` (a `#define` macro name) both
-/// already read as [`HighlightKind::Function`] through the plain `"function"` entry, and `-toml`'s
-/// own `@string.special` (its date/time literals) already reads as [`HighlightKind::String`]
-/// through the plain `"string"` entry - the identical reasoning [`HighlightKind::String`]'s own
-/// pre-existing JavaScript-`/regex/`-literal case below already relied on.
+/// GitHub issue #183 registered four more real captures, each previously falling through to a
+/// coarser, already-registered entry via the "fewer parts still matches" rule - genuinely losing
+/// grammar-level meaning, not just an internal implementation detail, since e.g. a JS/TS regex
+/// literal and an ordinary string both used to read as [`HighlightKind::String`]:
 ///
-/// Still deliberately absent, each a real capture found while verifying the above but out of
-/// scope for this list, and each still falls through to [`HighlightKind::Text`] rather than being
-/// forced into an unrelated bucket: `function.macro` (Rust's `println!`-style invocations; reads
-/// as `Function` anyway via the same subset match).
+/// - **`string.special`** (`-javascript`'s `(regex) @string.special`; `-toml`'s date/time
+///   literals; `-css`'s `(color_value) @string.special`) -> [`HighlightKind::StringSpecial`],
+///   previously falling through to the plain `"string"` entry above.
+/// - **`function.builtin`** (`-python`'s `len`/`print`/...; `-go`'s `append`/`make`/`panic`/...;
+///   `-javascript`'s `require`) -> [`HighlightKind::FunctionBuiltin`], previously falling through
+///   to the plain `"function"` entry.
+/// - **`function.macro`** (`-rust`'s `println!`-style macro invocations, both the macro name and
+///   its own `!`) -> [`HighlightKind::FunctionMacro`], previously falling through to the plain
+///   `"function"` entry.
+/// - **`tag.error`** (`-html`'s `(erroneous_end_tag_name) @tag.error`, a mismatched closing tag)
+///   -> [`HighlightKind::TagError`], previously falling through to the plain `"tag"` entry.
+///
+/// `-c`'s own `@function.special` (a `#define` macro name) is deliberately **not** given its own
+/// entry here - it stays folded into [`HighlightKind::Function`] via the plain `"function"` entry,
+/// out of scope for GitHub issue #183's own table (which named `function.macro` and
+/// `function.builtin`, not C's own `function.special`).
 const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
@@ -828,6 +912,13 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "text.reference",
     "text.strong",
     "text.emphasis",
+    // GitHub issue #183 - see this constant's own docs above for what each was falling through
+    // to before, and why each is a real, distinct grammar-level concept rather than an internal
+    // implementation detail.
+    "string.special",
+    "function.builtin",
+    "function.macro",
+    "tag.error",
     // `"none"` is deliberately **not** registered, and that absence is load-bearing - see
     // [`MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT`], which is what makes real per-fence language
     // injection produce correct spans. GitHub issue #104 originally registered it (mapped to
@@ -841,10 +932,13 @@ const HIGHLIGHT_NAMES: &[&str] = &[
 ///
 /// The non-obvious mappings, each a real judgement call rather than a mechanical rename:
 ///
-/// - **`constructor` -> `Type`.** All four grammars use `@constructor` for their own
-///   "identifier that starts with a capital letter" heuristic (`tree-sitter-rust`'s own comment
-///   calls these "enum constructors ... either that, or struct names"). Those name a *type* or one
-///   of its variants, so `Type` is where they belong. Note this is *not* what makes Python's
+/// - **`constructor` -> `Constructor`, its own real bucket as of GitHub issue #183** (was folded
+///   into `Type` before). All four grammars use `@constructor` for their own "identifier that
+///   starts with a capital letter" heuristic (`tree-sitter-rust`'s own comment calls these "enum
+///   constructors ... either that, or struct names") - a real capture rule, but a distinct
+///   grammar-level concept from a type name used elsewhere. `theme::syntax::CONSTRUCTOR` keeps
+///   `Type`'s own colour, so this is a classification-precision improvement, not a visual change,
+///   see [`HighlightKind::Constructor`]'s own docs. Note this is *not* what makes Python's
 ///   `class Foo:` come out right - `@constructor`'s `^[A-Z]` guard makes it unreliable for exactly
 ///   that, which is [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s fourth rule's whole reason for existing.
 /// - **`tag` -> `Tag`, a real, dedicated bucket now (was folded into `Type` before this issue).**
@@ -878,7 +972,7 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::FunctionDefinition,
     HighlightKind::Type,
     HighlightKind::TypeBuiltin,
-    HighlightKind::Type,
+    HighlightKind::Constructor,
     HighlightKind::Tag,
     HighlightKind::Constant,
     HighlightKind::ConstantBuiltin,
@@ -899,8 +993,8 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Embedded,
     HighlightKind::ConstantBuiltin,
     HighlightKind::PunctuationDelimiter,
-    HighlightKind::Variable,
-    HighlightKind::Operator,
+    HighlightKind::Label,
+    HighlightKind::PunctuationSpecial,
     HighlightKind::Property,
     HighlightKind::Heading,
     HighlightKind::String,
@@ -908,6 +1002,10 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Link,
     HighlightKind::Strong,
     HighlightKind::Emphasis,
+    HighlightKind::StringSpecial,
+    HighlightKind::FunctionBuiltin,
+    HighlightKind::FunctionMacro,
+    HighlightKind::TagError,
 ];
 
 /// Real supplement appended after `tree-sitter-python`'s own bundled `queries/highlights.scm`,
@@ -2348,17 +2446,22 @@ fn is_tracked_closer(ch: char) -> bool {
 /// background re-highlight. Cost is one linear pass over a span list that was just built by a
 /// parse costing orders of magnitude more.
 pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
-    // Pass 1: find every tracked bracket character, in source order, and work out which ones are
-    // halves of a real pair. `depths[i]` stays `None` for a bracket that never found its partner.
-    // `bracket_bytes` records where each of those was, so pass 2 can `debug_assert` it is walking
-    // the exact same sequence - the two passes iterate the same spans by the same rule, and this
-    // is what would catch them ever drifting apart and silently colouring the wrong characters.
+    // Pass 1a: find every tracked bracket character, in source order, and work out which ones
+    // are halves of a real pair - a single-stack matcher, exactly as before, except its only real
+    // job now is the boolean "did this occurrence ever find a real partner", not depth. `depths`
+    // is computed fresh in pass 1b below (see that pass's own docs for why a first-pass depth is
+    // wrong for GitHub issue #182). `bracket_bytes`/`bracket_chars`/`bracket_scopes` record every
+    // occurrence in source order, so pass 1b can walk the identical sequence a second time and
+    // pass 2 can `debug_assert` it too - all three passes iterating the same spans by the same
+    // rule is what would catch them ever drifting apart and silently colouring the wrong
+    // characters.
     let mut bracket_bytes: Vec<usize> = Vec::new();
-    let mut depths: Vec<Option<usize>> = Vec::new();
+    let mut bracket_chars: Vec<char> = Vec::new();
+    let mut bracket_scopes: Vec<u32> = Vec::new();
+    let mut matched: Vec<bool> = Vec::new();
     // One independent stack per `HighlightSpan::scope` - see this function's own "Injected regions
-    // pair independently" docs. Each entry is (expected closer, index into `depths` of the opener,
-    // that opener's nesting depth *within its own scope*).
-    let mut stacks: HashMap<u32, Vec<(char, usize, usize)>> = HashMap::new();
+    // pair independently" docs. Each entry is (expected closer, index into `matched` of the opener).
+    let mut stacks: HashMap<u32, Vec<(char, usize)>> = HashMap::new();
 
     for span in &spans {
         if span.kind != HighlightKind::PunctuationBracket {
@@ -2369,20 +2472,27 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
         };
         let stack = stacks.entry(span.scope).or_default();
         for (offset, ch) in text.char_indices() {
+            // Only a *tracked* opener/closer (`(`/`)`/`[`/`]`/`{`/`}` - see
+            // `TRACKED_BRACKET_PAIRS`) gets a real occurrence slot at all; an untracked
+            // punctuation character sharing this span's `PunctuationBracket` kind (an angle
+            // bracket, most commonly - deliberately never tracked, see this function's own docs)
+            // must stay invisible to `bracket_bytes` the same way it always has, or pass 2's own
+            // `next_bracket` walk (which only ever advances on a tracked char) desyncs from it.
+            if closer_for(ch).is_none() && !is_tracked_closer(ch) {
+                continue;
+            }
+            let index = bracket_bytes.len();
+            bracket_bytes.push(span.start + offset);
+            bracket_chars.push(ch);
+            bracket_scopes.push(span.scope);
+            matched.push(false);
             if let Some(closer) = closer_for(ch) {
-                stack.push((closer, depths.len(), stack.len()));
-                bracket_bytes.push(span.start + offset);
-                depths.push(None);
-            } else if is_tracked_closer(ch) {
-                bracket_bytes.push(span.start + offset);
-                depths.push(None);
-                let closer_index = depths.len() - 1;
-                if let Some(&(expected, opener_index, depth)) = stack.last() {
-                    if expected == ch {
-                        stack.pop();
-                        depths[opener_index] = Some(depth);
-                        depths[closer_index] = Some(depth);
-                    }
+                stack.push((closer, index));
+            } else if let Some(&(expected, opener_index)) = stack.last() {
+                if expected == ch {
+                    stack.pop();
+                    matched[opener_index] = true;
+                    matched[index] = true;
                 }
             }
         }
@@ -2390,6 +2500,37 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
 
     if bracket_bytes.is_empty() {
         return spans;
+    }
+
+    // Pass 1b (GitHub issue #182): recomputes `depths` over only the occurrences pass 1a found a
+    // real partner for, in effect dropping every unmatched opener from the stack retroactively -
+    // the fix the issue itself proposes. Pass 1a's own single stack counts an opener's depth as
+    // the stack's size *at push time*, which is wrong whenever an *earlier* opener in the same
+    // scope never gets a real closer: that earlier opener never leaves the stack, so it inflates
+    // the depth of every real, well-formed pair that follows it for the rest of the scope - one
+    // unterminated `(` mid-edit used to shift the whole rest of the file's ring by one. Walking
+    // the identical occurrence sequence a second time, skipping anything `matched` says never
+    // found a real partner, means the depth stack here only ever holds genuinely open, genuinely
+    // real pairs - exactly what the ring is supposed to reflect.
+    let mut depths: Vec<Option<usize>> = vec![None; bracket_bytes.len()];
+    let mut real_pair_stacks: HashMap<u32, Vec<usize>> = HashMap::new();
+    for index in 0..bracket_bytes.len() {
+        if !matched[index] {
+            continue;
+        }
+        let stack = real_pair_stacks.entry(bracket_scopes[index]).or_default();
+        if closer_for(bracket_chars[index]).is_some() {
+            depths[index] = Some(stack.len());
+            stack.push(index);
+        } else {
+            // `matched[index]` already guarantees this closer has a real partner somewhere
+            // earlier in this same scope, and skipping every unmatched occurrence keeps this
+            // stack's push/pop order identical to the real pairs alone - so the top of the stack
+            // here is always that exact partner.
+            if let Some(opener_index) = stack.pop() {
+                depths[index] = depths[opener_index];
+            }
+        }
     }
 
     // Pass 2: rebuild the span list, splitting each `PunctuationBracket` span into its individual
@@ -3058,6 +3199,19 @@ mod tests {
         assert_eq!(span.kind, HighlightKind::String);
     }
 
+    /// `(regex) @string.special` - its own dedicated bucket since GitHub issue #183 (previously
+    /// fell through to the plain `"string"` entry, reading a regex literal as an ordinary
+    /// string).
+    #[test]
+    fn typescript_regex_literal_is_classified_as_string_special() {
+        let source = "const pattern = /^[a-z]+$/;\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "^[a-z]+$"),
+            HighlightKind::StringSpecial
+        );
+    }
+
     #[test]
     fn typescript_function_declaration_name_is_classified_as_function() {
         let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
@@ -3715,7 +3869,7 @@ mod tests {
         assert_eq!(bucket("string.escape"), HighlightKind::StringEscape);
         assert_eq!(bucket("comment.documentation"), HighlightKind::CommentDoc);
         // The non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
-        assert_eq!(bucket("constructor"), HighlightKind::Type);
+        assert_eq!(bucket("constructor"), HighlightKind::Constructor);
         assert_eq!(bucket("tag"), HighlightKind::Tag);
         assert_eq!(bucket("variable.builtin"), HighlightKind::VariableBuiltin);
     }
@@ -3725,17 +3879,20 @@ mod tests {
     /// grammar queries do. `clone` is a real `@function.method` capture (its own dedicated bucket
     /// since GitHub issue #31 registered `"function.method"` as more specific than the plain
     /// `"function"` it used to fall back to); `println!` is a macro invocation, `@function.macro`,
-    /// which this module deliberately leaves unregistered (see [`HIGHLIGHT_NAMES`]'s own docs) so
-    /// it still falls back to the plain `Function` bucket.
+    /// its own dedicated bucket since GitHub issue #183 (previously unregistered, falling back to
+    /// the plain `Function` bucket - see [`HIGHLIGHT_NAMES`]'s own docs).
     #[test]
-    fn rust_method_calls_and_macros_are_now_classified_as_functions() {
+    fn rust_method_calls_and_macros_are_classified_into_their_own_real_buckets() {
         let source = "fn main() {\n    let x = value.clone();\n    println!(\"{x}\");\n}\n";
         let spans = highlight_rust(source);
         assert_eq!(
             kind_at(&spans, source, "clone"),
             HighlightKind::FunctionMethod
         );
-        assert_eq!(kind_at(&spans, source, "println"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "println"),
+            HighlightKind::FunctionMacro
+        );
     }
 
     /// `mut` was listed in the replaced implementation's own Rust keyword table and never actually
@@ -3747,6 +3904,20 @@ mod tests {
         let source = "fn main() { let mut count = 0; }\n";
         let spans = highlight_rust(source);
         assert_eq!(kind_at(&spans, source, "mut "), HighlightKind::Keyword);
+    }
+
+    /// `(lifetime (identifier) @label)` - the `"label"` registration's Rust half, its own
+    /// dedicated bucket since GitHub issue #183 (see [`HighlightKind::Label`]'s own docs on the
+    /// cross-language unification with `c_goto_label_is_classified_as_label`/
+    /// `yaml_anchor_name_is_classified_as_label`).
+    #[test]
+    fn rust_lifetime_is_classified_as_label() {
+        let source = "fn longest<'a>(x: &'a str, y: &'a str) -> &'a str { x }\n";
+        let spans = highlight_rust(source);
+        // Starting the search at `a`, not the leading `'` - the grammar's own `(lifetime
+        // (identifier) @label)` rule only captures the identifier, not the apostrophe sigil
+        // (which is its own, separately-classified token).
+        assert_eq!(kind_at(&spans, source, "a>"), HighlightKind::Label);
     }
 
     /// Rust's `self` stays `VariableBuiltin` (its own dedicated bucket since GitHub issue #31,
@@ -3902,15 +4073,14 @@ mod tests {
         );
     }
 
-    /// `(local_date) @string.special` - real, and deliberately left to fall through to the plain
-    /// `"string"` entry rather than getting its own registration - see this module's own docs on
-    /// why.
+    /// `(local_date) @string.special` - its own dedicated bucket since GitHub issue #183
+    /// (previously fell through to the plain `"string"` entry).
     #[test]
-    fn toml_date_literal_is_classified_as_string() {
+    fn toml_date_literal_is_classified_as_string_special() {
         let spans = highlight_toml(SAMPLE_TOML);
         assert_eq!(
             kind_at(&spans, SAMPLE_TOML, "1979-05-27"),
-            HighlightKind::String
+            HighlightKind::StringSpecial
         );
     }
 
@@ -3932,12 +4102,15 @@ mod tests {
         );
     }
 
-    /// `@function.builtin` (`len`) needs no new registration of its own - it already reads as
-    /// `Function` through the plain `"function"` entry's subset match, same as a call to `add`.
+    /// `@function.builtin` (`len`) - its own dedicated bucket since GitHub issue #183 (previously
+    /// fell through to the plain `"function"` entry's subset match, same as a call to `add`).
     #[test]
-    fn go_builtin_function_call_is_classified_as_function() {
+    fn go_builtin_function_call_is_classified_as_function_builtin() {
         let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(kind_at(&spans, SAMPLE_GO, "len("), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_GO, "len("),
+            HighlightKind::FunctionBuiltin
+        );
     }
 
     const SAMPLE_JSON: &str = "{\n  \"name\": \"jerry\",\n  \"count\": 3\n}\n";
@@ -3988,28 +4161,28 @@ mod tests {
         );
     }
 
-    /// `(anchor_name) @label` - the new, cross-language `"label"` registration's YAML half (its
-    /// C half is a goto target - see `c_goto_label_is_classified_as_variable` below).
+    /// `(anchor_name) @label` - the cross-language `"label"` registration's YAML half, its own
+    /// dedicated bucket since GitHub issue #183 (its C half is a goto target - see
+    /// `c_goto_label_is_classified_as_label` below; previously both fell through to
+    /// `Variable`).
     #[test]
-    fn yaml_anchor_name_is_classified_as_variable() {
+    fn yaml_anchor_name_is_classified_as_label() {
         let spans = highlight_yaml(SAMPLE_YAML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_YAML, "base\n"),
-            HighlightKind::Variable
-        );
+        assert_eq!(kind_at(&spans, SAMPLE_YAML, "base\n"), HighlightKind::Label);
     }
 
-    /// `"&"/"*" @punctuation.special` - the new `"punctuation.special"` registration.
+    /// `"&"/"*" @punctuation.special` - its own dedicated bucket since GitHub issue #183
+    /// (previously fell through to `Operator`).
     #[test]
-    fn yaml_anchor_and_alias_sigils_are_classified_as_operator() {
+    fn yaml_anchor_and_alias_sigils_are_classified_as_punctuation_special() {
         let spans = highlight_yaml(SAMPLE_YAML);
         assert_eq!(
             kind_at(&spans, SAMPLE_YAML, "&base"),
-            HighlightKind::Operator
+            HighlightKind::PunctuationSpecial
         );
         assert_eq!(
             kind_at(&spans, SAMPLE_YAML, "*base"),
-            HighlightKind::Operator
+            HighlightKind::PunctuationSpecial
         );
     }
 
@@ -4031,12 +4204,12 @@ mod tests {
         );
     }
 
-    /// `(statement_identifier) @label` - the new `"label"` registration's C half (a goto target,
-    /// not a lifetime - see this module's own docs on the cross-language unification).
+    /// `(statement_identifier) @label` - the `"label"` registration's C half (a goto target, not
+    /// a lifetime - see [`HighlightKind::Label`]'s own docs on the cross-language unification).
     #[test]
-    fn c_goto_label_is_classified_as_variable() {
+    fn c_goto_label_is_classified_as_label() {
         let spans = highlight_c(SAMPLE_C);
-        assert_eq!(kind_at(&spans, SAMPLE_C, "done:"), HighlightKind::Variable);
+        assert_eq!(kind_at(&spans, SAMPLE_C, "done:"), HighlightKind::Label);
     }
 
     /// `";" @delimiter` - the new, plain `"delimiter"` registration, distinct from the
@@ -4174,6 +4347,18 @@ mod tests {
         );
     }
 
+    /// `(erroneous_end_tag_name) @tag.error` - its own dedicated bucket since GitHub issue #183
+    /// (previously fell through to the plain `"tag"` entry, reading a mismatched closing tag as
+    /// an ordinary, correct one). `</spam>` never had a matching `<spam>` opener - only `<div>`
+    /// did - so `tree-sitter-html` itself flags it as erroneous, not this app's own logic.
+    #[test]
+    fn html_mismatched_closing_tag_is_classified_as_tag_error() {
+        let source = "<div></spam>\n";
+        let spans = highlight_html(source);
+        assert_eq!(kind_at(&spans, source, "div"), HighlightKind::Tag);
+        assert_eq!(kind_at(&spans, source, "spam"), HighlightKind::TagError);
+    }
+
     /// The real reason `tree-sitter-html`'s own `INJECTIONS_QUERY` is wired rather than dropped:
     /// a `<style>` element's body is genuinely CSS and a `<script>` element's body is genuinely
     /// JavaScript, and both now reach those grammars for real. `#ff0000` inside `<style>` is a
@@ -4195,7 +4380,7 @@ mod tests {
         );
         assert_eq!(
             kind_at(&spans, SAMPLE_HTML, "ff0000"),
-            HighlightKind::String,
+            HighlightKind::StringSpecial,
             "the colour literal's own digits"
         );
         assert_eq!(
@@ -4247,14 +4432,18 @@ mod tests {
         );
     }
 
-    /// `(color_value) @string.special` must resolve through the plain `"string"` entry, **not**
+    /// `(color_value) @string.special` gets its own real bucket since GitHub issue #183
+    /// (previously fell through to the plain `"string"` entry), and must **not** resolve through
     /// the more specific `"string.special.key"` one that JSON registers: the recognized-name rule
     /// requires every one of a recognized name's own dot-parts to be present in the capture, and
     /// `key` is not present in `string.special`.
     #[test]
-    fn css_color_literal_is_a_string_not_a_json_style_key() {
+    fn css_color_literal_is_a_string_special_not_a_json_style_key() {
         let spans = highlight_css(SAMPLE_CSS);
-        assert_eq!(kind_at(&spans, SAMPLE_CSS, "ff0000"), HighlightKind::String);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_CSS, "ff0000"),
+            HighlightKind::StringSpecial
+        );
     }
 
     const SAMPLE_MARKDOWN_FENCES: &str = "# Fences\n\n```html\n<div class=\"card\">hi</div>\n```\n\n```css\n.card { color: red; }\n```\n\n```rust\nfn main() {}\n```\n\n```zig\nconst x = 1;\n```\n\n```\nplain fence\n```\n";
@@ -4417,8 +4606,9 @@ mod tests {
         );
         assert_eq!(
             kind_at(&quote_spans, quote, "> fn"),
-            HighlightKind::Operator,
-            "the block quote marker on the fence's own content line keeps its markdown colour"
+            HighlightKind::PunctuationSpecial,
+            "the block quote marker on the fence's own content line keeps its markdown colour \
+             (its own dedicated bucket since GitHub issue #183 - previously `Operator`)"
         );
     }
 
@@ -5175,9 +5365,68 @@ mod tests {
     /// Shapes have to agree, not just counts - a naive depth counter would happily colour `([)]`
     /// as two nested pairs. The real stack matcher pairs `[` with `]` and leaves both the `(` and
     /// the `)` plain, because neither ever met a partner of its own shape.
+    ///
+    /// `[`/`]` land at ring depth 0 (`"-1-1"`), not depth 1 - GitHub issue #182's own fix:
+    /// the never-matched `(` is dropped from the depth stack retroactively, so it can't hold a
+    /// level for the real pair that comes after it, the same way it wouldn't if it simply weren't
+    /// there. Before that fix this asserted `"-2-2"` - `[`/`]` read as nested one level inside an
+    /// opener that was never going to close.
     #[test]
     fn mismatched_shapes_do_not_pair_up() {
-        assert_eq!(depth_map("([)]", "([)]"), "-2-2");
+        assert_eq!(depth_map("([)]", "([)]"), "-1-1");
+    }
+
+    /// GitHub issue #182's own minimal case: one permanently-unmatched opener, followed by two
+    /// completely real, well-formed pairs. Before the fix, `(x)` read as nested one level inside
+    /// the leading `(` (ring 1, `"2"`) and `(y(z))` one level deeper again (rings "2"/"3") - both
+    /// wrong, since that leading `(` was never actually their ancestor; it just never closed.
+    /// With it dropped from the stack retroactively, `(x)` and the outer `(y(z))` both correctly
+    /// read as their own real, independent depth-0 pairs, `(z)` one real level inside `(y...)`.
+    #[test]
+    fn an_unmatched_opener_no_longer_shifts_the_depth_of_real_pairs_that_follow_it() {
+        assert_eq!(depth_map("( (x) (y(z))", "()"), "-.1.1.1.2.21");
+    }
+
+    /// Real regression coverage for GitHub issue #182, reproduced with the exact source the
+    /// issue itself used: three "functions" in one file, the middle one deliberately never
+    /// closing its own body - the ordinary state of a file being actively typed into. Before the
+    /// fix, `fn c`'s own perfectly well-formed body brace and its nested `ok()` call rendered at
+    /// ring depths 4/5 instead of 0/1 (verified by hand-tracing the pre-fix algorithm against
+    /// this exact source - it matches the issue's own reported "fn c... renders at depths 4/5"
+    /// exactly), because two earlier, permanently-unmatched openers (`fn a`'s own `{`, orphaned
+    /// when its own `}` got consumed matching the wrong bracket inside `([)]`; and the stray `(`
+    /// inside `([)]` itself) never left the depth stack.
+    ///
+    /// Rather than hand-transcribe the combined source's full ~90-character depth map (fragile,
+    /// and no more informative than the property that actually matters), this asserts the
+    /// property GitHub issue #182 is really about: `fn c`'s own brackets must colour *identically*
+    /// whether or not those two earlier unmatched openers precede it in the same file. Comparing
+    /// against a completely independent, isolated parse of the same `fn c` snippet is what proves
+    /// that - if the earlier unmatched brackets were still leaking into depth, the two parses
+    /// would disagree.
+    #[test]
+    fn an_earlier_unmatched_opener_does_not_shift_a_later_well_formed_functions_own_depth() {
+        let with_earlier_unmatched_openers =
+            "fn a() { let x = ([)]; }\nfn b() { let y = ( ;\n}\nfn c() { ok(); }\n";
+        let isolated = "fn c() { ok(); }\n";
+        let bracket_chars = "(){}[]";
+
+        let combined_map = depth_map(with_earlier_unmatched_openers, bracket_chars);
+        let isolated_map = depth_map(isolated, bracket_chars);
+        let combined_fn_c_tail = &combined_map[combined_map.len() - isolated_map.len()..];
+
+        assert_eq!(
+            combined_fn_c_tail, isolated_map,
+            "fn c's own well-formed brackets must colour identically whether or not two \
+             earlier, permanently-unmatched openers precede it in the same file - a real \
+             difference here means the earlier unmatched brackets are still leaking into depth, \
+             GitHub issue #182's own bug (combined tail: {combined_fn_c_tail:?}, isolated: \
+             {isolated_map:?})"
+        );
+        // Pinned to the exact real values, not just "they match": `fn c`'s own body brace and
+        // its nested `ok()` call must differ by one real ring step from each other, at the
+        // file's own natural depth 0/1 - not the pre-fix bug's 4/5.
+        assert_eq!(isolated_map, "....11.1...22..1.");
     }
 
     /// Nothing panics or produces nonsense on input that is nothing but noise - the honest

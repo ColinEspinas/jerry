@@ -3,8 +3,7 @@
 //! only draws what `super::edit_buffer` currently holds.
 
 use super::lsp_ui::{
-    diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
-    render_diagnostics_card,
+    diagnostic_row_bg, diagnostic_underline_color, render_inline_diagnostic_message,
 };
 use super::zoom::zoom_scoped;
 use super::*;
@@ -349,7 +348,6 @@ impl AdeApp {
         // entry exists yet for this file (see `Self::current_line_blame`'s own docs). Computed
         // once here, not per row: only the current line ever shows it.
         let inline_blame = self.inline_blame_render_model(&absolute_path, cursor, buffer_dirty, cx);
-        let diagnostics_card = render_diagnostics_card(&self.file_view_diagnostics);
         // Hover only applies to a file whose extension has a real LSP identity; cloned once here
         // and reused per row for the same reason as `file_uri` above.
         let hover_target = has_lsp.then(|| absolute_path.clone());
@@ -501,7 +499,6 @@ impl AdeApp {
                             secondary_cursors_local,
                             diagnostics: &line_diagnostics,
                             hovered_byte_range,
-                            hover_target: hover_target.as_deref(),
                             inline_blame: is_current.then_some(inline_blame.as_ref()).flatten(),
                             caret_style: this.settings.appearance.caret_style,
                             caret_blink_visible: this.caret_blink_visible,
@@ -592,7 +589,10 @@ impl AdeApp {
                     // A real click moves the caret somewhere the completions popup's own anchor
                     // almost certainly no longer describes - same real dismiss-on-caret-move
                     // reasoning as the per-row click handler in `crate::code_surface::editing`.
+                    // GitHub issue #186: a click below the last line dismisses the Hover card for
+                    // the same reason a click on a row does - see that handler's own comment.
                     this.dismiss_completions();
+                    this.dismiss_hover();
                     let Some(buffer) = this.edit_buffer_mut(&click_path) else {
                         return;
                     };
@@ -698,13 +698,11 @@ impl AdeApp {
         } else if let Some(message) = save_error {
             body = body.child(render_sidebar_message(message, theme::status::FAIL.into()));
         }
-        if let Some(card) = diagnostics_card {
-            body = body.child(card);
-        }
-        // Real Hover popover (this revision): no longer embedded here as an in-flow child - see
-        // `Self::render_hover_card`'s own docs for why it now paints as a real, absolutely-
-        // positioned top-level sibling instead (`crate::root::AdeApp::render`), the same real
-        // mechanism `Self::render_completions_popover` already established.
+        // Neither LSP popup is embedded here as an in-flow child any more. The Hover popover
+        // never was; the Diagnostic card was, and GitHub issue #186 moved it out for the same
+        // reason - as a plain flex child it took real, permanent vertical space away from the code
+        // view. Both now paint as real, absolutely-positioned top-level siblings in
+        // `crate::root::AdeApp::render`; see `Self::render_diagnostic_card`'s own docs.
 
         body.child(status_bar).into_any_element()
     }
@@ -1171,9 +1169,10 @@ pub(in crate::code_surface) fn render_file_view_line(
     let hovered_byte_range = hover_entry
         .and_then(|entry| (entry.line_number == line_number).then(|| entry.byte_range.clone()));
 
-    // The code runs (and the inline diagnostic message) keep their natural width in their own
-    // `flex_none` box, so they never shrink; only the blame span placed beside them below yields
-    // and truncates at the pane's right edge.
+    // The code runs keep their natural width in their own `flex_none` box, so they never shrink.
+    // The inline diagnostic message is deliberately **not** in here (GitHub issue #186): inside a
+    // `flex_none` box it could never shrink either, so on a narrow pane it overflowed and painted
+    // straight over the code text. It is a shrinkable sibling below instead.
     let mut runs = div().flex().flex_none();
     let mut byte_cursor = 0usize;
     for (run_text, kind, is_diagnostic) in
@@ -1202,55 +1201,63 @@ pub(in crate::code_surface) fn render_file_view_line(
                 .border_dashed();
         } else if hovered_byte_range.as_ref() == Some(&(run_start..run_end)) {
             // A diagnostic underline always wins over the hover underline on the same run - an
-            // active error is more urgent than a symbol the user merely clicked to inspect.
+            // active error is more urgent than a symbol the pointer is merely resting on.
             run = run
                 .border_b_1()
                 .border_color(theme::syntax::HOVER_UNDERLINE);
         }
-        // Only a non-whitespace token is a hover/go-to-definition target; clicking whitespace
+        // GitHub issue #186: a real mouse-hover trigger, not the click this used to be. This
+        // read-only fallback view has one real element per syntax run, so GPUI's own
+        // `on_hover` (`vendor/zed/crates/gpui/src/elements/div.rs`, closure argument `&bool`)
+        // resolves "which token is the pointer on" precisely with no hit-testing of its own -
+        // unlike the live-buffer view, whose row is a single shaped line and which therefore needs
+        // `AdeApp::track_hover_pointer`'s real per-pixel resolution instead.
+        //
+        // Only a non-whitespace token is a hover/go-to-definition target; hovering whitespace
         // would just ask rust-analyzer about nothing.
         if let Some(path) = hover_target {
             if !run_text.trim().is_empty() {
-                let path = path.to_path_buf();
-                let position = hover_view::position_for_line_byte_offset(
-                    line_number as u32 - 1,
-                    &line.text,
-                    run_start,
-                );
-                let byte_range = run_start..run_end;
-                run = run.cursor_pointer().on_click(cx.listener(
-                    move |this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        this.code_cursor = Some(line_number);
-                        this.request_hover(
-                            path.clone(),
-                            line_number,
-                            byte_range.clone(),
-                            position,
-                            cx,
-                        );
-                    },
-                ));
+                let anchor = HoverAnchor {
+                    path: path.to_path_buf(),
+                    line_number,
+                    byte_range: run_start..run_end,
+                    position: hover_view::position_for_line_byte_offset(
+                        line_number as u32 - 1,
+                        &line.text,
+                        run_start,
+                    ),
+                };
+                run = run.on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    if *hovered {
+                        this.hover_over_token(anchor.clone(), cx);
+                    } else if this.hover_anchor_matches(&anchor) {
+                        // Guarded on the anchor still being *this* token: moving from one run
+                        // straight onto the next delivers the new run's `true` and the old run's
+                        // `false` in an order GPUI doesn't promise, and an unguarded dismissal
+                        // would then close the card the new run had just opened.
+                        this.dismiss_hover_and_notify(cx);
+                    }
+                }));
             }
         }
         runs = runs.child(run);
     }
+    // `flex_1` + `min_w_0` so the text row fills the pane's remaining width and the shrinkable
+    // children below (the inline diagnostic message, the blame span) truncate exactly at its
+    // right edge.
+    let mut text_row = div().flex().flex_1().min_w_0().child(runs);
     if let Some(first) = diagnostics.first() {
         // Only the message's first line is shown inline: `uniform_list` measures one row's
         // height and applies it uniformly to every row, so a multi-line rustc message (embedded
         // `\n`s are routine) would otherwise clip or overlap the row below. The full message is
-        // still shown in `render_diagnostics_card` below, which isn't height-constrained.
+        // in `AdeApp::render_diagnostic_card`'s real popover, which isn't height-constrained.
         let first_line = first.message.lines().next().unwrap_or_default();
-        runs = runs.child(
-            div()
-                .pl(px(10.0))
-                .text_color(diagnostic_inline_message_color(first.severity))
-                .child(first_line.to_string()),
-        );
+        text_row = text_row.child(render_inline_diagnostic_message(
+            first_line,
+            first.severity,
+            line_number,
+        ));
     }
-    // `flex_1` + `min_w_0` so the text row fills the pane's remaining width and the blame span
-    // below (the only shrinkable child) truncates exactly at its right edge.
-    let mut text_row = div().flex().flex_1().min_w_0().child(runs);
     // GitHub issue #29: the current line's dimmed inline git blame, placed in-flow immediately
     // after the code text so it begins right at the end of the line and is truncated at the
     // pane's right edge. `inline_blame` is only ever `Some` on the current line (see

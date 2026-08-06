@@ -2,7 +2,7 @@
 //! "Language server UI" subsection) - turns an `lsp_types::Hover` response (returned by
 //! `rust-analyzer` via `lsp_core::LspClient::request`, see `crate::root::AdeApp::request_hover`)
 //! into a render model `crate::root` draws a signature/doc/module-path card from, plus the
-//! position-encoding helper the click-to-hover trigger needs to build that request. Deliberately
+//! position-encoding helper the hover trigger needs to build that request. Deliberately
 //! `gpui`-window-free (no `gpui` type is used at all - output is plain `String`s, wrapped in a
 //! `SharedString` by `crate::root` at render time).
 //!

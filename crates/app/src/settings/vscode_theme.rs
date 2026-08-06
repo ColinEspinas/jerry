@@ -1058,6 +1058,47 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
         ),
         Strong => (&["markup.bold"], None),
         Emphasis => (&["markup.italic"], None),
+        // GitHub issue #183's seven classification-precision splits. None of these has one single
+        // agreed-upon TextMate scope the way `entity.name.function`/`keyword.control` do (they're
+        // tree-sitter-highlight-era distinctions, not TextMate-era ones), so each searches the
+        // handful of real scopes different popular grammars actually use for the concept, and
+        // falls back to its own pre-issue parent bucket when an imported theme styles neither -
+        // the same "inherit rather than default to Jerry's own accent" discipline every other
+        // fallback above already follows.
+        PunctuationSpecial => (
+            &[
+                "punctuation.definition.heading",
+                "punctuation.definition.list.begin",
+                "punctuation.definition.template-expression",
+            ],
+            Some(Operator),
+        ),
+        Label => (
+            &["entity.name.label", "constant.other.label"],
+            Some(Variable),
+        ),
+        StringSpecial => (&["string.regexp"], Some(String)),
+        // `support.function` is already in `Function`'s own list above (many real themes don't
+        // distinguish "builtin" from "user-defined" either) - searched here too so a theme that
+        // *does* distinguish still resolves this bucket to its own real colour, not `Function`'s.
+        FunctionBuiltin => (
+            &["support.function.builtin", "support.function"],
+            Some(Function),
+        ),
+        FunctionMacro => (
+            &["entity.name.function.macro", "keyword.other.macro"],
+            Some(Function),
+        ),
+        // No real, widely-used TextMate scope exists for "an erroneous/mismatched closing tag" -
+        // this is an LSP/tree-sitter-era diagnostic-adjacent concept, not a TextMate-era styling
+        // one - so this always inherits `Tag`'s own colour on import, the same honest "no scope"
+        // shape `Embedded`'s own rule above uses.
+        TagError => (&[], Some(Tag)),
+        // Same reasoning as `TagError`: `entity.name.class`/`entity.name.function.constructor` are
+        // already `Type`'s own scopes above, and neither one specifically means "a capitalized
+        // enum-variant/struct construction site" in real-world usage - inheriting `Type` directly
+        // is more honest than manufacturing a scope search that would rarely actually match.
+        Constructor => (&[], Some(Type)),
     }
 }
 

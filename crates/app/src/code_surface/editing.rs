@@ -40,7 +40,9 @@
 //! - flagged here rather than silently left undocumented.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
@@ -55,11 +57,10 @@ use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
 use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
-    diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
+    diagnostic_row_bg, diagnostic_underline_color, render_inline_diagnostic_message,
 };
 use crate::code_surface::symbols;
 use crate::lsp::diagnostics as diagnostics_view;
-use crate::lsp::hover as hover_view;
 use crate::root::{
     AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDedent,
     EditorDelete, EditorDown, EditorEnd, EditorEnter, EditorEscape, EditorHome, EditorIndent,
@@ -585,6 +586,16 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #186: an open LSP popup is the first thing `Escape` should close, ahead of
+        // both behaviours below - the same precedence `CompletionsDismiss` already has for the
+        // Completions popup (which owns `Escape` outright while it is open, via the
+        // `"file-editor && completions"` binding). `dismiss_hover` reports whether there was
+        // genuinely anything to close, so a plain `Escape` with no popup up still falls straight
+        // through to the multi-cursor collapse and the accessibility escape hatch.
+        if self.dismiss_hover() {
+            cx.notify();
+            return;
+        }
         if self.apply_multi_cursor_action(cx, EditBuffer::collapse_to_single_cursor) {
             return;
         }
@@ -773,8 +784,11 @@ impl AdeApp {
         // A real caret move away from wherever the popup was anchored invalidates it - real
         // editors close completions the moment the caret leaves the word being completed, rather
         // than leaving a popup up that no longer describes the real insertion point Tab/Enter
-        // would act on.
+        // would act on. GitHub issue #186: the same reasoning applies to the Hover card, which
+        // until now had no dismissal path of any kind - a keyboard caret move is the user working
+        // somewhere other than wherever the pointer happens to be resting.
         self.dismiss_completions();
+        self.dismiss_hover();
         cx.notify();
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
@@ -1455,7 +1469,6 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     pub secondary_cursors_local: Vec<usize>,
     pub diagnostics: &'a [diagnostics_view::LineDiagnostic],
     pub hovered_byte_range: Option<Range<usize>>,
-    pub hover_target: Option<&'a Path>,
     /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
     /// only when `is_current` (only the current line ever shows it); see
     /// `crate::code_surface::blame_view::AdeApp::inline_blame_render_model`'s own docs for how
@@ -1582,7 +1595,6 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         secondary_cursors_local,
         diagnostics,
         hovered_byte_range,
-        hover_target,
         inline_blame,
         caret_style,
         caret_blink_visible,
@@ -1619,9 +1631,6 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     let drag_row_path = row_path.clone();
     let click_line_index = line_index;
     let click_line_number = line_number;
-    let click_hover_target = hover_target.map(|target| target.to_path_buf());
-    let click_line_runs = line.runs.clone();
-    let click_line_text = line.text.clone();
 
     let paint_entity = entity;
     let paint_path = path;
@@ -1845,6 +1854,21 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .flex_none()
                 .child(visible_text),
         );
+    // GitHub issue #186: the dim end-of-line diagnostic message, placed *inside* `text_row` (a
+    // real `flex_1`/`min_w_0` box) immediately after the `flex_none` code text, rather than as a
+    // sibling of that whole wrapper further down the row where it used to be. As a sibling it
+    // competed with the code text for the row's width and, having no `min_w_0`/`truncate` of its
+    // own, overflowed and painted over the glyphs on a narrow pane. Here the code text is the
+    // `flex_none` child and this is the shrinkable one, so it takes exactly whatever width is
+    // left after the code and ellipsizes - see `render_inline_diagnostic_message`'s own docs.
+    if let Some(first) = diagnostics.first() {
+        let first_line = first.message.lines().next().unwrap_or_default();
+        text_row = text_row.child(render_inline_diagnostic_message(
+            first_line,
+            first.severity,
+            line_number,
+        ));
+    }
     // GitHub issue #29: the current line's dimmed inline git blame, placed *in-flow* immediately
     // after the code text so it begins right at the end of the line and is truncated at the
     // pane's right edge - rather than pinned to the far right of the row (a flex sibling of the
@@ -1916,7 +1940,19 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                     // double/triple-click timing - it just reads the count GPUI already
                     // computed. `>= 3` (not `== 3`) so a fourth/fifth rapid click keeps
                     // re-selecting the line rather than falling back to a plain caret placement.
-                    if event.modifiers.alt {
+                    // Ctrl+click (Cmd+click on macOS - `Modifiers::secondary()`, the same
+                    // cross-platform check `crate::terminal::pane`'s own detected-link
+                    // `on_click` uses for its own Ctrl/Cmd+click-to-open) is checked first, ahead
+                    // of Alt: real IDE convention (VS Code, JetBrains, Zed) treats it as an
+                    // unconditional "go to definition" gesture that overrides click-count/Shift
+                    // semantics entirely, not something a double-click or a Shift-held click
+                    // should be allowed to shadow. It still moves the caret to the clicked token
+                    // first (the plain-click branch's own `buffer.move_to`), so `goto_definition_
+                    // target`'s own caret fallback below resolves to exactly the clicked token,
+                    // not wherever the caret happened to be before this click.
+                    if event.modifiers.secondary() {
+                        buffer.move_to(absolute_offset);
+                    } else if event.modifiers.alt {
                         buffer.add_cursor_at(absolute_offset);
                     } else if event.click_count >= 3 {
                         buffer.select_line_at(click_line_index);
@@ -1931,25 +1967,23 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 this.code_cursor = Some(click_line_number);
                 this.reset_caret_blink(cx);
 
-                if let Some(hover_target) = &click_hover_target {
-                    if let Some(token_range) = token_at_offset(&click_line_runs, local_offset) {
-                        let token_text =
-                            click_line_text.get(token_range.clone()).unwrap_or_default();
-                        if !token_text.trim().is_empty() {
-                            let position = hover_view::position_for_line_byte_offset(
-                                click_line_number as u32 - 1,
-                                &click_line_text,
-                                token_range.start,
-                            );
-                            this.request_hover(
-                                hover_target.clone(),
-                                click_line_number,
-                                token_range,
-                                position,
-                                cx,
-                            );
-                        }
-                    }
+                // GitHub issue #186: a real click no longer *opens* the Hover popup - it closes
+                // it. Hover is a pointer-rest gesture now (`AdeApp::track_hover_pointer`), and a
+                // click is the user doing something else entirely, so leaving a card open over
+                // the text they just clicked into would be the "click and it stays open, can't
+                // close it" bug the issue reports. `F12` no longer depends on this having run
+                // either: `Self::trigger_goto_definition` falls back to the caret's own position.
+                this.dismiss_hover();
+                if event.modifiers.secondary() {
+                    // `dismiss_hover()` above already ran by this point - load-bearing for this
+                    // branch specifically, not just incidental cleanup: `Self::
+                    // goto_definition_target` prefers a real, still-open `Self::hover` entry over
+                    // the caret when one exists, and that entry can genuinely describe a
+                    // *different* token than the one just Ctrl+clicked (the pointer rested
+                    // somewhere, then moved to click elsewhere). Triggering before the dismissal
+                    // above would let that stale hover target win over the click the user just
+                    // made - a real, confusing wrong-definition bug.
+                    this.trigger_goto_definition(cx);
                 }
                 cx.stop_propagation();
                 cx.notify();
@@ -1960,8 +1994,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         // Some(MouseButton::Left)`, verified via the finder subagent, real usage confirmed at
         // `data_table.rs:350`'s own `if !ev.dragging() { return; }`), the same real idiom this
         // whole file's own per-row hit-testing already uses for clicks - registered per-row
-        // (matching `crate::code_surface::lsp_ui`'s own per-row `.on_mouse_move` hover-debounce
-        // precedent in this same crate) rather than a window-level capture, so this naturally
+        // rather than as a window-level capture, so this naturally
         // only extends the selection while the pointer is actually over *some* row - dragging
         // past the very top/bottom of the visible rows (auto-scroll) is a real, documented gap,
         // not built this phase - see `BUILD-LOG.md`.
@@ -2060,18 +2093,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .child(text_row),
         );
 
-    if let Some(first) = diagnostics.first() {
-        let first_line = first.message.lines().next().unwrap_or_default();
-        row = row.child(
-            gpui::div()
-                .pl(gpui::px(10.0))
-                .text_color(diagnostic_inline_message_color(first.severity))
-                .child(first_line.to_string()),
-        );
-    }
-
-    // NB: the current line's inline git blame is rendered *inside* `text_row` above (right after
-    // the code runs), not appended here at the end of the row - see that construction's own docs.
+    // NB: the current line's inline git blame *and* its inline diagnostic message are both
+    // rendered inside `text_row` above (right after the code runs), not appended here at the end
+    // of the row - see those constructions' own docs.
 
     row.into_any_element()
 }
@@ -2292,10 +2316,15 @@ pub(crate) fn split_runs_for_marked_range(
 }
 
 /// Finds the real syntax-highlight run in `runs` (a `RenderedLine::runs` slice) containing byte
-/// `offset`, for click-to-hover token detection - mirrors the read-only File view's own per-run
-/// click boundaries (`crate::code_surface::file_view::render_file_view_line`), computed here from a
+/// `offset`, for hover token detection - mirrors the read-only File view's own per-run
+/// boundaries (`crate::code_surface::file_view::render_file_view_line`), computed here from a
 /// hit-tested offset instead of from per-run `div` boundaries.
-fn token_at_offset(
+///
+/// `pub(in crate::code_surface)` since GitHub issue #186: `crate::code_surface::lsp_ui::
+/// AdeApp::hover_anchor_at` resolves the pointer to a token through this exact same function
+/// rather than a second, independently-drifting notion of where one token ends and the next
+/// begins.
+pub(in crate::code_surface) fn token_at_offset(
     runs: &[(gpui::SharedString, code_view::HighlightKind)],
     offset: usize,
 ) -> Option<Range<usize>> {
@@ -3983,10 +4012,15 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("alpha"), fake_item("beta")],
-                    selected: 0,
-                },
+                // Built through the real `CompletionsStatus::ready` constructor with an empty
+                // typed prefix, so the popup's own real client-side filter (GitHub issue #189)
+                // is what decides what's visible here too - never a hand-written `visible` list
+                // that could disagree with it.
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("alpha"), fake_item("beta")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });
@@ -4051,10 +4085,11 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("gamma")],
-                    selected: 0,
-                },
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("gamma")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });
@@ -4074,6 +4109,241 @@ mod editing_tests {
                 .clone()),
             content_before_escape,
             "dismissing via Escape must not touch the real buffer content"
+        );
+    }
+
+    /// The real labels the Completions popup is currently *showing* - resolved through
+    /// [`crate::lsp::completion_popup::CompletionsStatus::Ready`]'s own `visible` index list, so
+    /// these assertions read exactly what the popup's own render reads, never the raw, unfiltered
+    /// server list underneath it.
+    fn visible_completion_labels(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        app.read_with(cx, |app, _| {
+            let Some(entry) = app.completions.as_ref() else {
+                return Vec::new();
+            };
+            match &entry.status {
+                crate::lsp::completion_popup::CompletionsStatus::Ready {
+                    items, visible, ..
+                } => visible
+                    .iter()
+                    .filter_map(|index| items.get(*index))
+                    .map(|item| item.label.clone())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    /// The popup's real selected row, as an index into what it's actually showing.
+    fn selected_completion_row(app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext) -> usize {
+        app.read_with(cx, |app, _| {
+            match &app.completions.as_ref().expect("an open popup").status {
+                crate::lsp::completion_popup::CompletionsStatus::Ready { selected, .. } => {
+                    *selected
+                }
+                _ => panic!("expected a real Ready popup"),
+            }
+        })
+    }
+
+    /// Seeds a real, open `Ready` popup for `relative` carrying `labels`, through the same real
+    /// `CompletionsStatus::ready` constructor `crate::lsp::client::AdeApp::apply_completion_result`
+    /// itself uses for a genuine server response - with an empty typed prefix, i.e. the honest
+    /// state right after a trigger character, before anything has been typed to narrow by.
+    fn seed_completions(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        relative: &std::path::Path,
+        labels: &[&str],
+    ) {
+        let items = labels
+            .iter()
+            .map(|label| lsp_core::lsp_types::CompletionItem {
+                label: label.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        app.update(cx, |app, cx| {
+            app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
+                path: relative.to_path_buf(),
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(items, "")
+                    .expect("a real, non-empty ready state"),
+            });
+            cx.notify();
+        });
+    }
+
+    /// GitHub issue #189, test (a): the real bug. With a popup already open, typing more real
+    /// characters must narrow what it shows *immediately* - on the keystroke itself, with no
+    /// `textDocument/completion` round trip in between - and an item the typed text doesn't match
+    /// at all must genuinely disappear.
+    ///
+    /// Driven through real, bound keystrokes (`cx.simulate_input`), so this exercises the whole
+    /// real path a user's typing takes: `EntityInputHandler::replace_text_in_range` ->
+    /// `AdeApp::schedule_lsp_sync` -> `AdeApp::refilter_completions`. No clock is advanced
+    /// afterwards on purpose: the 50ms debounced server re-request must not be what makes this
+    /// pass (there is no real LSP client in this test at all), because instant narrowing between
+    /// round trips is precisely what the issue asks for.
+    #[gpui::test]
+    fn typing_past_the_trigger_point_narrows_the_real_completions_list(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        seed_completions(
+            &app,
+            cx,
+            &relative,
+            &["version", "verify", "vector_of_readers", "unwrap", "clone"],
+        );
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers", "unwrap", "clone"],
+            "sanity check: with nothing typed past the trigger point, the popup must show the \
+             server's own full set, in the server's own order"
+        );
+
+        cx.simulate_input("ver");
+
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "let x = ver\n",
+            "sanity check: the three characters must genuinely have been typed into the real \
+             buffer, or this proves nothing about typing"
+        );
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers"],
+            "typing `ver` must narrow the popup to the real matches and drop `unwrap`/`clone`, \
+             which contain no `ver` match at all - GitHub issue #189's exact reported symptom"
+        );
+
+        // Backspace must genuinely widen it back out - only possible because the full server
+        // response is kept intact underneath the filtered view, never narrowed in place.
+        cx.simulate_keystrokes("backspace backspace");
+        assert_eq!(buffer_content(&app, cx, &relative), "let x = v\n");
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers"],
+            "`v` still matches exactly these three and still excludes `unwrap`/`clone`"
+        );
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers", "unwrap", "clone"],
+            "deleting the last typed character must restore the server's own full set"
+        );
+    }
+
+    /// GitHub issue #189, test (b): the matching semantics actually chosen - a real fuzzy
+    /// *subsequence* match (VSCode-equivalent), not a prefix/substring one. `vrs` is genuinely
+    /// non-contiguous inside `version` (`v`, then `r`, then `s`, with characters skipped between
+    /// them), so a substring matcher would drop it; `verify` and `unwrap` must still be dropped,
+    /// so this isn't passing by simply matching everything.
+    #[gpui::test]
+    fn a_real_non_contiguous_typed_prefix_still_matches_the_right_item(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        seed_completions(&app, cx, &relative, &["version", "verify", "unwrap"]);
+
+        cx.simulate_input("vrs");
+
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version"],
+            "a real fuzzy client keeps `version` for the non-contiguous query `vrs`, and still \
+             drops `verify` (no `s` at all) and `unwrap` (no `v` at all)"
+        );
+    }
+
+    /// GitHub issue #189, test (c): keyboard selection must stay pinned to the *item* the user
+    /// picked as the list narrows underneath it, never to a stale row number - and whatever row is
+    /// selected must be the item a real `Enter` actually inserts. This is the real desync risk
+    /// filtering introduces: "the Nth visible row" and "the Nth item in the server's list" stop
+    /// being the same thing the moment anything is filtered out.
+    #[gpui::test]
+    fn keyboard_selection_stays_aligned_with_the_filtered_completions_view(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        // `version` is deliberately the *third* server item, so the narrowing below genuinely
+        // moves it to a different row - a test where it stayed put would prove nothing.
+        seed_completions(
+            &app,
+            cx,
+            &relative,
+            &["clone", "unwrap", "version", "verify"],
+        );
+
+        cx.simulate_keystrokes("down down");
+        assert_eq!(selected_completion_row(&app, cx), 2);
+        assert_eq!(
+            visible_completion_labels(&app, cx)[2],
+            "version",
+            "sanity check: row 2 really is `version` before any narrowing"
+        );
+
+        cx.simulate_input("ver");
+
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify"],
+            "sanity check: the list really did narrow, so the row numbers really did shift"
+        );
+        let selected = selected_completion_row(&app, cx);
+        assert_eq!(
+            visible_completion_labels(&app, cx)[selected],
+            "version",
+            "the selection must follow the real item the user had picked to its new row (0), not \
+             stay on the stale row number (2), which no longer exists at all"
+        );
+
+        // And one real `down` from there must land on the next *visible* row, which a real
+        // `Enter` must then actually insert.
+        cx.simulate_keystrokes("down");
+        let selected = selected_completion_row(&app, cx);
+        assert_eq!(visible_completion_labels(&app, cx)[selected], "verify");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "let x = verify\n",
+            "accepting must insert the item on the selected *visible* row, resolved back through \
+             the filter into the real server list"
         );
     }
 
@@ -4486,10 +4756,11 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("alpha")],
-                    selected: 0,
-                },
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("alpha")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });

@@ -11,6 +11,36 @@ toplevel. See `BUILD-LOG.md`'s screenshot correction for the recipe and for what
 | `jerry-dark-rust-doc-comments.png` | Jerry Dark | **Predates the final palette** — kept only as the "before" side of the §2b evidence below. A screenful of `///` doc comments at the brighter `comment_doc` tone. Its screaming-case constants render in `syntax.type`'s cyan, which is the misclassification `RUST_CONSTANT_SUPPLEMENT` fixes; this README used to describe them as "amber", which was simply wrong. |
 | `jerry-dark-markdown.png` | Jerry Dark | Markdown prose under the **final** palette — this file's own `THEME.md`, so it doubles as a check that the spec and the render agree. Headings in **gold**, inline code in green, bold at the brighter neutral. The fenced block visible is **untagged**, so it shows no language injection — per-fence injection is covered by `fixture_corpus_tests`. |
 | `paper-chrome.png` | Paper | The light theme's chrome. **No editor tab is open in this one** — it does not show syntax colours. |
+| `completions-popup-top.png` | Jerry Dark | The Completions popup (GitHub issue #185) against a **real, live rust-analyzer** response — `Ctrl+Space` at `s.` where `s: String`, so the list is every real method on `String`, well over a hundred items. Twelve rows visible (`MAX_VISIBLE_COMPLETION_ROWS`), the overlay scrollbar's thumb parked at the top, real signatures in the right-hand detail column of each row. |
+| `completions-popup-scrolled.png` | Jerry Dark | The same popup after 30 real `Down` keystrokes. A completely different set of rows, `replace_range` selected on the bottom row, and the thumb moved down the track — item 30 was **permanently unreachable** before this fix, which hard-capped rendering at 12 items with no scroll mechanism at all. |
+| `completions-unfiltered.png` | Jerry Dark | The Completions popup (GitHub issue #189) against a **real, live rust-analyzer**, right after `Ctrl+Space` at `v.` where `v: Vec<u8>` — nothing typed past the trigger point yet, so it shows the server's own broad candidate set in the server's own order: `reverse`, `clone(as Clone)`, `sort_unstable`, `insert`, `trim_ascii_start`, `utf8_chunks`, … |
+| `completions-filtered.png` | Jerry Dark | The **same popup after typing three real characters**, `res`. Every row now genuinely matches: `resize_with`, `reserve_exact`, `reserve`, `resize`, the two `try_reserve*` rows, and the fuzzy (non-contiguous) `reverse`/`iter().rev()` matches. `clone`, `sort_unstable`, `insert`, `utf8_chunks` are gone. The status bar reads `1 servers`, i.e. a real server answered — these are not mock items. |
+
+## The completions captures
+
+Driven the same way as everything else here (`python-xlib` XTEST clicks into the file tree, then
+per-window `XGetImage`), against a throwaway cargo project rather than this repo — a small crate is
+what makes rust-analyzer reach a real, answering state in seconds instead of minutes. The
+`Ctrl+Space` force-invoke (`CompletionsInvoke`) is what makes this scriptable at all: it needs three
+key events, where reproducing the same popup by *typing* a prefix would run into the `xdotool
+type`/XTEST character-mangling limitation described below.
+
+The `completions-popup-top`/`-scrolled` pair was captured against a two-file project; the status
+bar in those uncropped frames reads `1 servers · 3 errors`, the real server answering with real
+diagnostics for the deliberately incomplete `s.` — not mock items.
+
+The `completions-unfiltered`/`-filtered` pair was captured separately, against a one-file project,
+using single XTEST key events for the three characters typed after the trigger (which do work,
+unlike the `xdotool type` mangling described below). **What this pair does and does not prove.** It
+is real, direct evidence that the popup visibly narrows as the user types, which is exactly the
+symptom issue #189 reported. It is *not* on its own proof that the narrowing is **client-side**: the
+50ms debounced `textDocument/completion` re-request also fires in that window, and a capture cannot
+be timed between the keystroke and the round trip. That half is carried by the real tests
+(`typing_past_the_trigger_point_narrows_the_real_completions_list` and its two siblings in
+`crate::code_surface::editing::editing_tests`), which run with **no LSP client at all** and never
+advance the debounce clock — so only `AdeApp::refilter_completions` can explain the narrowing they
+observe. Both frames also carry a mild double-drawn-text artifact from `XGetImage` grabbing a
+partially-updated GL surface; it is a capture artifact, not how the app renders on screen.
 
 ## Verified by pixel diff, not by eye
 

@@ -18,6 +18,20 @@
 //! `AdeApp::plus_button_bounds`), not nested inside the File view's own `uniform_list` - a popup
 //! anchored to one row must not be clipped by that row's own virtualized scroll container.
 //!
+//! ## Scrolling (GitHub issue #185)
+//!
+//! The item list is a real virtualized [`gpui::uniform_list`] tracked by
+//! [`AdeApp::completions_scroll_handle`], capped at [`popover_list_max_height`]
+//! ([`MAX_VISIBLE_COMPLETION_ROWS`] rows) with this app's own overlay scrollbar
+//! ([`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`]) as a sibling. There is no
+//! render cap: an earlier version of this module truncated the real, live-returned response at
+//! `MAX_RENDERED_COMPLETION_ITEMS` (12) and painted a static `"+ N more"` row instead, which made
+//! every item past the twelfth permanently unreachable by keyboard *and* by mouse - and, since
+//! that version's popup was only `182px` tall inside an `overflow_hidden()` container, seven
+//! whole rows was all it could actually show of the twelve it built, so it silently clipped the
+//! rest *and* the `"+ N more"` row itself. [`AdeApp::move_completions_selection`] now wraps over
+//! the whole list and scrolls the viewport to follow the selection.
+//!
 //! ## Deliberately not on the shared menu chrome (GitHub issue #129)
 //!
 //! An audit for that issue flagged this popover's `theme::surface::POPOVER` background,
@@ -62,20 +76,46 @@ pub(crate) enum CompletionsStatus {
     /// point [`AdeApp::completions`] is written - see `crate::lsp::client::AdeApp::
     /// apply_completion_result`'s own docs - so this variant is never empty).
     Ready {
+        /// **Every** item the server actually returned, in the order it returned them - never
+        /// narrowed in place. Keeping the full response intact is what lets Backspace genuinely
+        /// widen the popup back out (see [`AdeApp::refilter_completions`]) without re-asking the
+        /// server for a set it already sent.
         items: Vec<lsp_core::lsp_types::CompletionItem>,
+        /// Indices into `items`, best match first, for the prefix currently typed at the caret -
+        /// the real, client-side filtered/re-ranked view (GitHub issue #189), computed by
+        /// [`completion_view::rank_completion_items`]. This, not `items`, is what the popup
+        /// renders and what keyboard navigation walks; never empty for a live `Ready` entry (an
+        /// empty filter result dismisses the popup outright, exactly as an empty server response
+        /// already does).
+        visible: Vec<usize>,
+        /// An index into `visible`, **not** into `items` - so "the Nth visible row" and "the Nth
+        /// selected item" can never drift apart as the filter narrows.
         selected: usize,
     },
     Failed(String),
 }
 
-/// A soft cap on how many real completion items this popup renders at once - this app has no
-/// virtualized/scrollable popover widget (unlike the File view's own `uniform_list`), and a real
-/// completion response can legitimately carry hundreds of items (e.g. an empty-prefix "complete
-/// everything in scope" request) - rendering all of them would paint an enormous, unusable
-/// column. The real, live-returned list is truncated for *display* only; `Self::move_completions_selection`/
-/// `Self::accept_active_completion` still only ever act on what's actually shown, so a truncated
-/// tail is never silently selectable via keyboard nav either.
-const MAX_RENDERED_COMPLETION_ITEMS: usize = 12;
+impl CompletionsStatus {
+    /// A real `Ready` state for a server response, already narrowed/re-ranked against `query` (the
+    /// identifier prefix currently typed at the caret - see [`AdeApp::completion_filter_query`]).
+    /// `None` when nothing in `items` matches `query` at all, which the caller treats exactly the
+    /// way it already treats a genuinely empty server response: no popup.
+    pub(crate) fn ready(
+        items: Vec<lsp_core::lsp_types::CompletionItem>,
+        query: &str,
+    ) -> Option<Self> {
+        let visible = completion_view::rank_completion_items(&items, query);
+        if visible.is_empty() {
+            return None;
+        }
+        Some(Self::Ready {
+            items,
+            visible,
+            selected: 0,
+        })
+    }
+}
+
 
 /// 290px - the design mockup's own real completions-list column width
 /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:290px` on the list column), plus
@@ -93,12 +133,56 @@ const LIST_WIDTH: gpui::Pixels = gpui::px(290.0);
 /// cut, not a deliberate permanent simplification.
 const DETAIL_WIDTH: gpui::Pixels = gpui::px(300.0);
 /// The design mockup's own real completion-item row height (`Jerry.dc.html`: `height:22px`).
+/// `uniform_list`'s one real requirement is that every row is exactly this tall - see
+/// [`AdeApp::render_completions_popover`]'s own docs.
 const POPOVER_ROW_HEIGHT: gpui::Pixels = gpui::px(22.0);
-/// 8 real rows' worth of [`POPOVER_ROW_HEIGHT`] plus the popover's own real `py(3.0)` top/bottom
-/// padding (see [`AdeApp::render_completions_popover`]'s own padding) - not derived arithmetically
-/// from [`POPOVER_ROW_HEIGHT`] itself, since `gpui::Pixels`' inner `f32` is only `pub(crate)`
-/// inside `gpui`, not reachable for a real `const`-context multiply from this crate.
-const POPOVER_MAX_HEIGHT: gpui::Pixels = gpui::px(182.0);
+/// How many real completion rows the popup shows at once before the rest have to be *scrolled*
+/// to (GitHub issue #185). This is a viewport height, no longer a render cap: every item a real
+/// server returned is reachable by keyboard and by mouse wheel/scrollbar. `12` matches the same
+/// judgment every other real editor makes here - `vendor/zed/crates/editor`'s own completions
+/// menu defaults to 12 lines too (`max_height_in_lines`), as does VS Code's.
+const MAX_VISIBLE_COMPLETION_ROWS: usize = 12;
+/// The popover's own real `py(3.0)` top/bottom padding, as a single vertical total - the design
+/// mockup's own completions-list column padding is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on
+/// the `290px` list column), so the popup is exactly this much taller than its list.
+const POPOVER_VERTICAL_PADDING: gpui::Pixels = gpui::px(6.0);
+/// The popover's own real `border_1()`, top plus bottom. GPUI lays out border-box, so this counts
+/// toward the popup's painted height and therefore toward its own `max_h` - leaving it out of
+/// [`popover_max_height`] would silently cost the twelfth row two of its twenty-two pixels.
+/// Measured, not assumed: `completions_scroll_tests` asserts the popup's real painted height
+/// against exactly this arithmetic.
+const POPOVER_BORDER_HEIGHT: gpui::Pixels = gpui::px(2.0);
+/// The footer hint row's own real painted height (`h(20.0)` plus its `mt(3.0)` top margin, plus
+/// its own `border_t_1()` collapsing half a pixel into the row above it under GPUI's layout) -
+/// only present for a real [`CompletionsStatus::Ready`] popup (see [`AdeApp::
+/// render_completions_popover`]'s own match arm), but folded into [`popover_max_height`]
+/// unconditionally since that height also drives the popover's flip-above-the-caret decision and
+/// its own `overflow_hidden()` clamp, both of which must have real room for the footer whenever a
+/// `Ready` popup is the tallest thing being measured. Measured, not assumed: `completions_scroll_tests`
+/// asserts the popup's real painted height against exactly this arithmetic.
+const POPOVER_FOOTER_HEIGHT: gpui::Pixels = gpui::px(23.0);
+
+/// [`MAX_VISIBLE_COMPLETION_ROWS`] rows' worth of [`POPOVER_ROW_HEIGHT`] - the scrolling list's
+/// own `max_h`, which is what clamps `gpui::ListSizingBehavior::Infer`'s laid-out height and so
+/// gives the scroll handle a real viewport smaller than its content. See
+/// [`AdeApp::render_completions_popover`]'s own comment at the `max_h` call site for the measured,
+/// honest account of how this and [`popover_max_height`] divide the work (they overlap).
+///
+/// A `fn` rather than a `const`, since `gpui::Pixels`' inner `f32` is only `pub(crate)` inside
+/// `gpui`, so `Pixels * f32` (`vendor/zed/crates/gpui/src/geometry.rs:2707`) isn't
+/// `const`-callable here - deriving it for real still beats restating the product as a magic
+/// number.
+fn popover_list_max_height() -> gpui::Pixels {
+    POPOVER_ROW_HEIGHT * MAX_VISIBLE_COMPLETION_ROWS as f32
+}
+
+/// [`popover_list_max_height`] plus the popover's own [`POPOVER_VERTICAL_PADDING`],
+/// [`POPOVER_BORDER_HEIGHT`], and [`POPOVER_FOOTER_HEIGHT`] - the whole popup's real maximum
+/// painted height, which is also what [`AdeApp::render_completions_popover`]'s flip-above-the-caret
+/// decision measures the available space below the caret row against.
+fn popover_max_height() -> gpui::Pixels {
+    popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT + POPOVER_FOOTER_HEIGHT
+}
 
 impl AdeApp {
     /// Whether [`Self::completions`] is genuinely, *actionably* open *for the currently active
@@ -141,6 +225,102 @@ impl AdeApp {
         self.completions_generation = self.completions_generation.wrapping_add(1);
     }
 
+    /// The real text the user has typed since the completion was triggered, as a live-completions
+    /// client must match it: the identifier prefix immediately before the caret in `path`'s own
+    /// buffer (`crate::lsp::completion::identifier_prefix_start` - the exact same real word-start
+    /// scan [`resolve_completion_edit`] already uses to decide what an accepted item replaces, so
+    /// "what gets filtered on" and "what gets overwritten on accept" can never disagree).
+    ///
+    /// Deliberately derived from the buffer every time rather than accumulated in a separate
+    /// "typed since trigger" field: that scan is already the real definition of the word being
+    /// completed, it stays correct through Backspace/Delete and caret moves with no extra
+    /// bookkeeping to get out of sync, and it is empty exactly when it should be - right after a
+    /// real trigger character (`foo.`, `std::`), where nothing has been typed to narrow by yet.
+    /// This is the same "word range at the position" query model VSCode's own suggest widget uses.
+    ///
+    /// `None` when there is no buffer for `path` at all; the empty string (match everything) is a
+    /// real, distinct answer from that.
+    pub(crate) fn completion_filter_query(&self, path: &Path) -> Option<String> {
+        let buffer = self.edit_buffer(path)?;
+        let cursor = buffer.cursor_offset();
+        let (line, _) = buffer.line_col_for_offset(cursor);
+        let line_range = buffer.line_ranges.get(line).cloned()?;
+        let line_text = buffer.content.get(line_range.clone())?;
+        let local_cursor = cursor.saturating_sub(line_range.start).min(line_text.len());
+        let prefix_start = completion_view::identifier_prefix_start(line_text, local_cursor);
+        Some(line_text[prefix_start..local_cursor].to_string())
+    }
+
+    /// Re-applies the real, client-side filter (GitHub issue #189) to whatever completion list is
+    /// currently held, against the prefix now typed at the caret - the fix's whole point: this runs
+    /// synchronously on every real keystroke (from `crate::lsp::client::AdeApp::schedule_lsp_sync`,
+    /// the one call site every real edit path already funnels through), so the popup narrows
+    /// instantly rather than waiting on the debounced `textDocument/completion` round trip that
+    /// refreshes the underlying candidate set behind it.
+    ///
+    /// The two compose without fighting: the server's own response still *replaces* `items`
+    /// wholesale when it lands (a moved position genuinely changes what's semantically valid), and
+    /// `crate::lsp::client::AdeApp::apply_completion_result` re-derives `visible` from this same
+    /// query as it does so - so a response always arrives already narrowed to what's typed, and
+    /// every keystroke in between narrows further without a round trip.
+    ///
+    /// Narrowing to nothing dismisses the popup outright, matching both what a real suggest widget
+    /// does when the typed text stops matching anything and this module's own existing discipline
+    /// (`crate::lsp::client::AdeApp::prepare_lsp_sync` already dismisses when the context that
+    /// justified the popup is gone). It matters mechanically too: [`Self::
+    /// completions_open_for_active_path`] claims `Enter`/`Up`/`Down` for *any* `Ready` entry, so an
+    /// entry left open with nothing visible would silently swallow those keystrokes.
+    pub(crate) fn refilter_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .completions
+            .as_ref()
+            .filter(|entry| matches!(entry.status, CompletionsStatus::Ready { .. }))
+            .map(|entry| entry.path.clone())
+        else {
+            return;
+        };
+        let query = self.completion_filter_query(&path).unwrap_or_default();
+        let Some(entry) = self.completions.as_mut() else {
+            return;
+        };
+        let CompletionsStatus::Ready {
+            items,
+            visible,
+            selected,
+        } = &mut entry.status
+        else {
+            return;
+        };
+
+        let previously_selected_item = visible.get(*selected).copied();
+        let next_visible = completion_view::rank_completion_items(items, &query);
+        if next_visible.is_empty() {
+            self.dismiss_completions();
+            cx.notify();
+            return;
+        }
+        // Follow the *item* the user had selected to its new row, rather than keeping the raw row
+        // number (which would silently point at a different completion once the list narrows).
+        // Falls back to the new best match when that item didn't survive the narrowing. No
+        // keyboard-reachable-row cap here (unlike an earlier version of this fix): GitHub issue
+        // #185's real virtualized scrolling means every real row is reachable regardless of how
+        // far down the now-narrowed list it lands, so the followed row is scrolled into view
+        // below instead of being discarded.
+        let next_selected = previously_selected_item
+            .and_then(|item| next_visible.iter().position(|index| *index == item))
+            .unwrap_or(0);
+        *selected = next_selected;
+        *visible = next_visible;
+        // Same real "scroll the minimum amount needed to bring this row into view" strategy
+        // `Self::move_completions_selection` uses for the identical job - the followed row can
+        // land well outside the current viewport (a filter narrowing the list changes every row's
+        // own position), and without this the selection highlight would move somewhere the user
+        // can't actually see.
+        self.completions_scroll_handle
+            .scroll_to_item(next_selected, gpui::ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
     pub(crate) fn handle_completions_up_action(
         &mut self,
         _: &CompletionsUp,
@@ -159,19 +339,48 @@ impl AdeApp {
         self.move_completions_selection(1, cx);
     }
 
+    /// Moves the popup's keyboard selection by `delta` rows, wrapping at both ends, and scrolls
+    /// the list's viewport just enough to keep the newly selected row visible.
+    ///
+    /// The wrap is over the **whole** real, live-returned item list (GitHub issue #185). It used
+    /// to be over `items.len().min(MAX_RENDERED_COMPLETION_ITEMS)` - a 12-item render cap with no
+    /// scroll mechanism behind it - which made every item past the twelfth permanently unreachable
+    /// by keyboard *and* by mouse. There is no cap of any kind now: [`Self::completions_scroll_handle`]
+    /// plus the `uniform_list` in [`Self::render_completions_popover`] is the real scrolling the
+    /// cap was standing in for.
+    ///
+    /// `gpui::ScrollStrategy::Nearest` (not `Top`/`Center`) is the "scroll the minimum amount
+    /// needed to bring this row fully into view, and don't move at all if it already is"
+    /// strategy: the same one `crate::code_surface::editing::AdeApp::sync_cursor_and_scroll` uses
+    /// to keep the real caret's own row in view, and the same one `vendor/zed/crates/editor/src/
+    /// code_context_menus.rs:611` uses for this exact job in Zed's own completions menu. The
+    /// scroll is a *deferred* target resolved in the list's next prepaint (see
+    /// `vendor/zed/crates/gpui/src/elements/uniform_list.rs:150`), so the `cx.notify()` below is
+    /// what actually makes it happen - it is not an immediate offset write.
     fn move_completions_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.as_mut() else {
             return;
         };
-        let CompletionsStatus::Ready { items, selected } = &mut entry.status else {
+        // Navigation walks the *filtered* view (`visible`), never the raw server list - `selected`
+        // is an index into `visible` (see that field's own docs), so "the Nth visible row" and
+        // "the Nth item keyboard nav lands on" stay the same thing however far the filter narrows.
+        let CompletionsStatus::Ready {
+            visible, selected, ..
+        } = &mut entry.status
+        else {
             return;
         };
-        let shown = items.len().min(MAX_RENDERED_COMPLETION_ITEMS);
-        if shown == 0 {
+        // Navigation walks the whole real, filtered `visible` list, not a truncated slice of it -
+        // GitHub issue #185 replaced the old hard render cap with real virtualized scrolling, so
+        // there is no shorter "shown" subset to clamp against anymore.
+        let total = visible.len();
+        if total == 0 {
             return;
         }
-        let next = (*selected as i32 + delta).rem_euclid(shown as i32) as usize;
+        let next = (*selected as i32 + delta).rem_euclid(total as i32) as usize;
         *selected = next;
+        self.completions_scroll_handle
+            .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -244,14 +453,22 @@ impl AdeApp {
             return;
         };
         self.completions_generation = self.completions_generation.wrapping_add(1);
-        let CompletionsStatus::Ready { items, selected } = entry.status else {
+        let CompletionsStatus::Ready {
+            items,
+            visible,
+            selected,
+        } = entry.status
+        else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
             self.reset_caret_blink(cx);
             return;
         };
-        let Some(item) = items.get(selected) else {
+        // `selected` indexes the filtered view, so it must be resolved *through* `visible` back
+        // into the real server list - accepting "the row I can see" and "the item that gets
+        // inserted" are the same item by construction.
+        let Some(item) = visible.get(selected).and_then(|index| items.get(*index)) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
@@ -323,11 +540,11 @@ impl AdeApp {
         // every render by `AdeApp::render_workspace_body`'s own canvas) rather than a second,
         // independently-tracked window-bounds value.
         let space_below = self.body_bounds.bottom() - row_bottom;
-        let fits_below = space_below >= POPOVER_MAX_HEIGHT;
+        let fits_below = space_below >= popover_max_height();
         let top = if fits_below {
             row_bottom
         } else {
-            (row_top - POPOVER_MAX_HEIGHT).max(self.body_bounds.top())
+            (row_top - popover_max_height()).max(self.body_bounds.top())
         };
 
         let (shadow_x, shadow_y, shadow_blur) = theme::shadow::POPOVER;
@@ -335,21 +552,26 @@ impl AdeApp {
         let macos = self.window_controls_style().is_macos();
 
         // The list column - always present, whatever the status. `Loading`/`Failed` show a
-        // single message row here and nothing else; `Ready` shows the real item rows plus the
-        // mockup's own footer hint row (`README.md`: "footer `⇅ move · ⏎ accept · ⇥ snippet`").
+        // single message row here and nothing else; `Ready` shows the real, virtualized item
+        // rows (GitHub issue #185's real scrolling over the GitHub issue #189 client-side
+        // filtered/re-ranked `visible` view) plus the mockup's own footer hint row (`README.md`:
+        // "footer `⇅ move · ⏎ accept · ⇥ snippet`").
         let mut list_column = gpui::div()
             .flex_none()
             .w(LIST_WIDTH)
             .flex()
             .flex_col()
             // `py(3.0)`, not `py(4.0)`: the design mockup's own completions-list column padding
-            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `.290px` list column) - see
-            // `POPOVER_MAX_HEIGHT`'s own docs for why this exact value matters there too.
+            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `290px` list column) - see
+            // `POPOVER_VERTICAL_PADDING`'s own docs, which restate the same `3px 0` as one
+            // vertical total.
             .py(gpui::px(3.0));
 
         // The selected item, if any - drives the detail pane below. Read once, outside the
         // `Ready` match arm's own item loop, so both the list rows and the detail pane read the
-        // exact same real selection rather than two independently-indexed lookups.
+        // exact same real selection rather than two independently-indexed lookups. Resolved
+        // *through* `visible` back into the real server list, matching every other real
+        // selection read in this module (see [`CompletionsStatus::Ready::selected`]'s own docs).
         let mut selected_item: Option<&lsp_core::lsp_types::CompletionItem> = None;
 
         match &entry.status {
@@ -361,8 +583,12 @@ impl AdeApp {
                     "completion request failed: {message}"
                 )));
             }
-            CompletionsStatus::Ready { items, selected } => {
-                selected_item = items.get(*selected);
+            CompletionsStatus::Ready {
+                items,
+                visible,
+                selected,
+            } => {
+                selected_item = visible.get(*selected).and_then(|index| items.get(*index));
                 // `border-right:1px solid #23282c` in the mockup, on the list column's own right
                 // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
                 // while there's a real detail pane beside it to divide from.
@@ -371,85 +597,121 @@ impl AdeApp {
                         .border_r_1()
                         .border_color(theme::border::CARD);
                 }
-                for (index, item) in items.iter().take(MAX_RENDERED_COMPLETION_ITEMS).enumerate() {
-                    let (label, detail) = completion_view::completion_item_display(item);
-                    let is_selected = index == *selected;
-                    let kind_badge = completion_view::completion_kind_badge(item.kind);
-                    list_column = list_column.child(
-                        gpui::div()
-                            .id(("completion-item", index))
-                            // Lets a real test measure/find this real row (`debug_bounds` reads
-                            // this, not `.id(..)`) - a no-op outside test builds, matching every
-                            // other `debug_selector` in this crate.
-                            .debug_selector(move || format!("completion-item-{index}"))
-                            .flex_none()
-                            .h(POPOVER_ROW_HEIGHT)
-                            // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item
-                            // row padding is `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each
-                            // `.completions` row).
-                            .px(gpui::px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(gpui::px(8.0))
-                            .cursor_pointer()
-                            // `theme::completions_popup::ITEM_SELECTED_BG` (`#243c50`), not
-                            // `theme::surface::CURRENT_LINE` (`#181c20`) - `CURRENT_LINE` is the
-                            // exact same hex as this popover's own background
-                            // (`theme::surface::POPOVER`), so the "selected" row highlight used
-                            // to be genuinely invisible; see that token's own docs.
-                            .when(is_selected, |el| {
-                                el.bg(theme::completions_popup::ITEM_SELECTED_BG)
-                            })
-                            .children(kind_badge.map(render_completion_kind_badge))
-                            .child(
-                                gpui::div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(if is_selected {
-                                        theme::completions_popup::ITEM_SELECTED_FG
-                                    } else {
-                                        theme::completions_popup::ITEM_FG
-                                    })
-                                    .child(label),
-                            )
-                            .children(detail.map(|detail| {
-                                gpui::div()
-                                    .flex_none()
-                                    .text_size(gpui::px(10.0))
-                                    .text_color(theme::text::GHOST)
-                                    .child(detail)
-                            }))
-                            // A real click both selects *and* accepts this row in one step -
-                            // `on_mouse_down`, not `on_click`, matching this app's own established
-                            // idiom for a popover row that both selects and immediately commits
-                            // (`crate::work_surface::render::render_dropdown_menu_row`'s sibling
-                            // rows use `on_click` since picking one never needs an intermediate
-                            // "select" state the way this popup's keyboard nav does).
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(
-                                    move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                                        if let Some(entry) = this.completions.as_mut() {
-                                            if let CompletionsStatus::Ready { selected, .. } =
-                                                &mut entry.status
-                                            {
-                                                *selected = index;
-                                            }
-                                        }
-                                        this.accept_active_completion(window, cx);
-                                        cx.stop_propagation();
-                                    },
-                                ),
-                            ),
-                    );
-                }
-                if items.len() > MAX_RENDERED_COMPLETION_ITEMS {
-                    list_column = list_column.child(popover_message_row(&format!(
-                        "+ {} more",
-                        items.len() - MAX_RENDERED_COMPLETION_ITEMS
-                    )));
-                }
+
+                // Real virtualization, not a render cap (GitHub issue #185): `uniform_list` only
+                // ever builds the rows genuinely inside its own viewport, so `visible.len()` here
+                // is the *whole* real, filtered/re-ranked view (GitHub issue #189) - hundreds of
+                // items included when the filter is empty - and every one of them is reachable by
+                // keyboard (`Self::move_completions_selection` scrolls the viewport to follow the
+                // selection), by mouse wheel, and by the overlay scrollbar below. `index` below is
+                // always a position *in `visible`*, matching `selected`'s own indexing convention
+                // (see [`CompletionsStatus::Ready::selected`]'s own docs) - never a raw index into
+                // the untouched server list. The same `uniform_list` idiom
+                // `crate::sidebar::render::AdeApp::render_file_tree` and
+                // `crate::code_surface::file_view::AdeApp::render_file_view` already use, and the
+                // same one Zed's own completions menu uses for this exact surface
+                // (`vendor/zed/crates/editor/src/code_context_menus.rs:929-1155`:
+                // `uniform_list(...).max_h(...).track_scroll(...).with_sizing_behavior(Infer)`).
+                // Every row is exactly `POPOVER_ROW_HEIGHT` tall, which is `uniform_list`'s one
+                // real requirement.
+                let list = gpui::uniform_list(
+                    "completions-list",
+                    visible.len(),
+                    cx.processor(
+                        move |this: &mut Self,
+                              range: std::ops::Range<usize>,
+                              _window,
+                              cx: &mut Context<Self>| {
+                            // Re-read the live state rather than capturing a clone of `items`/
+                            // `visible`: this closure runs once per frame, and a real "complete
+                            // everything in scope" response is large enough that cloning it every
+                            // frame would be a genuine cost. Every index is clamped rather than
+                            // trusted, so a future divergence degrades to "renders fewer rows"
+                            // instead of panicking.
+                            let Some(entry) = this.completions.as_ref() else {
+                                return Vec::new();
+                            };
+                            let CompletionsStatus::Ready {
+                                items,
+                                visible,
+                                selected,
+                            } = &entry.status
+                            else {
+                                return Vec::new();
+                            };
+                            let selected = *selected;
+                            let end = range.end.min(visible.len());
+                            let start = range.start.min(end);
+                            visible[start..end]
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(offset, item_index)| {
+                                    let index = start + offset;
+                                    let item = items.get(*item_index)?;
+                                    Some(render_completion_row(
+                                        index,
+                                        item,
+                                        index == selected,
+                                        cx,
+                                    ))
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    ),
+                )
+                // The list's own real height cap. *Some* real maximum has to reach this element,
+                // or `ListSizingBehavior::Infer`'s measure function
+                // (`vendor/zed/crates/gpui/src/elements/uniform_list.rs:290-313`) lays the list
+                // out at its full `row_height * item_count` content height, its viewport equals
+                // its content, `max_offset` is zero, and nothing can ever scroll - it would just
+                // be clipped by the popover's `overflow_hidden()`, which is exactly the pre-fix
+                // bug. Verified by deleting it: with *both* this and the popover's own
+                // `max_h(popover_max_height())` gone, `completions_scroll_tests::
+                // the_viewport_really_scrolls_to_follow_keyboard_selection` fails on a zero
+                // `max_offset`.
+                //
+                // Honest note on redundancy: in this layout the two are interchangeable - the
+                // popover's `max_h` cascades a definite available height into `Infer`'s measure
+                // call, so deleting *either one alone* still passes those tests. Both are kept
+                // deliberately. The popover's is what the flip-above-the-caret math above already
+                // measures against (`popover_max_height()` has to be the popup's real height for
+                // that decision to be correct), and this one is what pins the *list's* cap
+                // directly to its own node, independent of whatever the parent chain does - the
+                // same placement Zed's own completions menu uses
+                // (`vendor/zed/crates/editor/src/code_context_menus.rs:1153`).
+                .max_h(popover_list_max_height())
+                // `Infer` (not the default `Auto`): `Auto` has no measure function at all, so the
+                // list's intrinsic height is zero and it must inherit a definite height from a
+                // `flex_1` parent - which is wrong here, because this popup has to *shrink to fit*
+                // a short list (three real items must paint a 66px-tall popup, not a 264px one
+                // with 198px of empty background). `Infer` gives it a real content-derived height,
+                // clamped by the `max_h` above.
+                .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+                .track_scroll(&self.completions_scroll_handle);
+
+                // The scrollbar is a *sibling* of the list inside its own non-scrolling
+                // `.relative()` wrapper, never a child of the list itself - see
+                // `crate::sidebar::render::AdeApp::render_file_tree`'s own docs for the real
+                // reason (GPUI applies a scrolling element's own scroll translation to *every*
+                // child, absolutely-positioned ones included, so a scrollbar painted inside would
+                // scroll away with the rows). `render_vertical_scrollbar` returns `None` outright
+                // when the handle's own `max_offset` shows the content genuinely doesn't overflow,
+                // so a short list paints no scrollbar at all.
+                list_column = list_column.child(
+                    gpui::div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .child(list)
+                        .children(self.render_vertical_scrollbar(
+                            "completions-scrollbar",
+                            &self.completions_scroll_handle,
+                            &[],
+                            cx,
+                        )),
+                );
+
                 list_column = list_column.child(
                     gpui::div()
                         .id("completions-footer-hints")
@@ -490,7 +752,7 @@ impl AdeApp {
             .absolute()
             .left(anchor_x)
             .top(top)
-            .max_h(POPOVER_MAX_HEIGHT)
+            .max_h(popover_max_height())
             .overflow_hidden()
             .flex()
             .bg(theme::surface::POPOVER)
@@ -525,6 +787,82 @@ impl AdeApp {
 
         Some(popover.into_any_element())
     }
+}
+
+/// One real completion row, built for whichever indices [`AdeApp::render_completions_popover`]'s
+/// `uniform_list` asked for this frame. Extracted out of that method's own body when the popup
+/// gained real scrolling (GitHub issue #185) purely because a `uniform_list` builds its rows
+/// inside a `cx.processor` closure rather than inline - the row's own markup, padding, colors and
+/// click-to-accept behavior are unchanged.
+fn render_completion_row(
+    index: usize,
+    item: &lsp_core::lsp_types::CompletionItem,
+    is_selected: bool,
+    cx: &mut Context<AdeApp>,
+) -> gpui::AnyElement {
+    let (label, detail) = completion_view::completion_item_display(item);
+    let kind_badge = completion_view::completion_kind_badge(item.kind);
+    gpui::div()
+        .id(("completion-item", index))
+        // Test-only (a no-op outside test builds, like every other `debug_selector` in this
+        // codebase) - lets a real render test read a row's own painted bounds back with
+        // `VisualTestContext::debug_bounds` and prove which rows `uniform_list` genuinely
+        // painted this frame, rather than trusting that scrolling "probably" happened.
+        .debug_selector(move || format!("completion-item-{index}"))
+        .flex_none()
+        .h(POPOVER_ROW_HEIGHT)
+        // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item row padding is
+        // `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each `.completions` row).
+        .px(gpui::px(8.0))
+        .flex()
+        .items_center()
+        .gap(gpui::px(8.0))
+        .cursor_pointer()
+        // `theme::completions_popup::ITEM_SELECTED_BG` (`#243c50`), not
+        // `theme::surface::CURRENT_LINE` (`#181c20`) - `CURRENT_LINE` is the exact same hex as
+        // this popover's own background (`theme::surface::POPOVER`), so the "selected" row
+        // highlight used to be genuinely invisible; see that token's own docs.
+        .when(is_selected, |el| {
+            el.bg(theme::completions_popup::ITEM_SELECTED_BG)
+        })
+        .children(kind_badge.map(render_completion_kind_badge))
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(if is_selected {
+                    theme::completions_popup::ITEM_SELECTED_FG
+                } else {
+                    theme::completions_popup::ITEM_FG
+                })
+                .child(label),
+        )
+        .children(detail.map(|detail| {
+            gpui::div()
+                .flex_none()
+                .text_size(gpui::px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(detail)
+        }))
+        // A real click both selects *and* accepts this row in one step - `on_mouse_down`, not
+        // `on_click`, matching this app's own established idiom for a popover row that both
+        // selects and immediately commits (`crate::work_surface::render::render_dropdown_menu_row`'s
+        // sibling rows use `on_click` since picking one never needs an intermediate "select"
+        // state the way this popup's keyboard nav does).
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                if let Some(entry) = this.completions.as_mut() {
+                    if let CompletionsStatus::Ready { selected, .. } = &mut entry.status {
+                        *selected = index;
+                    }
+                }
+                this.accept_active_completion(window, cx);
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
 }
 
 /// A real completion item's kind badge - a 13x13 box with a one-letter glyph, colored per
@@ -687,6 +1025,354 @@ fn resolve_completion_edit(
     (line_range.start + prefix_start_local..cursor, text)
 }
 
+/// GitHub issue #185's direct regression coverage: the popup used to hard-cap rendering at
+/// `MAX_RENDERED_COMPLETION_ITEMS` (12) with no scroll mechanism at all, so every item past the
+/// twelfth was unreachable by keyboard *and* by mouse. These tests drive the real, painted popup
+/// in a real GPUI test window - real keystrokes through the real key bindings, real
+/// `uniform_list` virtualization, real `gpui::UniformListScrollHandle` geometry - rather than
+/// asserting on the selection index alone, which would prove nothing about whether the selected
+/// row is actually on screen.
+///
+/// The `Ready` popup state is seeded directly rather than driven through a real language server,
+/// matching `crate::code_surface::tabs::stale_completions_popup_tests`' own established precedent
+/// (`crate::lsp::client::lsp_diagnostics_wiring_tests` owns the real, live end-to-end
+/// rust-analyzer completion proof this module doesn't duplicate). What's under test here is the
+/// popup's own scrolling, which is entirely independent of where the items came from.
+#[cfg(test)]
+mod completions_scroll_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::root::scrollbar::ScrollableHandle;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    /// Comfortably more than both the old 12-item render cap and the
+    /// [`MAX_VISIBLE_COMPLETION_ROWS`] viewport, so "reachable" and "scrolled into view" are two
+    /// genuinely different claims.
+    const LONG: usize = 40;
+    /// Fewer than one viewport's worth - the "doesn't break, doesn't grow a scrollbar" case.
+    const SHORT: usize = 3;
+
+    fn fake_items(count: usize) -> Vec<lsp_core::lsp_types::CompletionItem> {
+        (0..count)
+            .map(|index| lsp_core::lsp_types::CompletionItem {
+                label: format!("item_{index:03}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Opens a real editable file in a real test window, paints it (which is what populates the
+    /// `AdeApp::file_view_last_bounds`/`file_view_last_layout` caret layout
+    /// [`AdeApp::render_completions_popover`] anchors to - without a real paint first the popover
+    /// honestly renders nothing at all), then seeds a real `Ready` popup of `count` items for it
+    /// and paints again.
+    ///
+    /// The returned `TempDir` is the file's own real backing directory and must be held for the
+    /// lifetime of the test - dropping it deletes the file out from under the open buffer.
+    fn open_with_seeded_popup(
+        cx: &mut TestAppContext,
+        count: usize,
+    ) -> (
+        Entity<AdeApp>,
+        &mut VisualTestContext,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("sample.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                // Empty query - every item stays visible, in the real server's own order (see
+                // `completion_view::completion_match`'s own docs), matching what this helper's
+                // real callers (real scroll-position/virtualization tests) need: an unshifted,
+                // predictable `visible` for their own index-based assertions.
+                status: CompletionsStatus::ready(fake_items(count), "")
+                    .expect("a real, non-empty item list must produce a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // A second real frame: `AdeApp::render_vertical_scrollbar` reads its geometry off the
+        // scroll handle's *last painted* bounds/`max_offset`, so the very first frame after a
+        // list appears never has a scrollbar yet, by design (see that method's own docs).
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+        (app, cx, repo, relative)
+    }
+
+    fn selected(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> usize {
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            match &entry.status {
+                CompletionsStatus::Ready { selected, .. } => *selected,
+                other => panic!("expected a Ready popup, got {other:?}"),
+            }
+        })
+    }
+
+    fn scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> gpui::Pixels {
+        app.read_with(cx, |app, _| {
+            app.completions_scroll_handle.base_handle().offset().y
+        })
+    }
+
+    fn max_scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> gpui::Pixels {
+        app.read_with(cx, |app, _| {
+            app.completions_scroll_handle.base_handle().max_offset().y
+        })
+    }
+
+    /// The load-bearing assertion for issue #185: with a real 40-item response, `down` must reach
+    /// every one of the 40 - the old `rem_euclid(items.len().min(12))` wrap made items 13..40
+    /// permanently unreachable, silently, with no error and no feedback.
+    #[gpui::test]
+    fn keyboard_navigation_reaches_every_item_past_the_old_twelve_item_cap(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _repo, _relative) = open_with_seeded_popup(cx, LONG);
+
+        for expected in 1..LONG {
+            cx.simulate_keystrokes("down");
+            assert_eq!(
+                selected(&app, cx),
+                expected,
+                "a real `down` keystroke must advance the popup's selection one row at a time \
+                 all the way through the real, live-returned item list - under the old 12-item \
+                 render cap this wrapped back to 0 at row 12 and rows 12..{LONG} were \
+                 unreachable"
+            );
+        }
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            selected(&app, cx),
+            0,
+            "one more `down` past the genuinely last item must wrap to the first"
+        );
+        cx.simulate_keystrokes("up");
+        assert_eq!(
+            selected(&app, cx),
+            LONG - 1,
+            "`up` from the first item must wrap to the genuinely last one, not to the twelfth"
+        );
+    }
+
+    /// Reaching an item is only half the fix - the viewport has to follow, or item 39 is
+    /// "selected" while the popup still paints rows 0..12. This asserts on the real
+    /// `uniform_list` geometry and on which rows genuinely painted, not on the index.
+    #[gpui::test]
+    fn the_viewport_really_scrolls_to_follow_keyboard_selection(cx: &mut TestAppContext) {
+        let (app, cx, _repo, _relative) = open_with_seeded_popup(cx, LONG);
+
+        assert!(
+            cx.debug_bounds("completion-item-0").is_some(),
+            "sanity check: the first real row must have painted - if it didn't, this test isn't \
+             exercising a real popup at all"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-39").is_none(),
+            "sanity check: the last of {LONG} rows must be genuinely virtualized away while the \
+             list is scrolled to the top - {MAX_VISIBLE_COMPLETION_ROWS} rows fit in the viewport"
+        );
+        // Exactly `MAX_VISIBLE_COMPLETION_ROWS` rows visible, proved against the real painted
+        // frame rather than against the arithmetic that produced the height. The `11`/`12` here
+        // are that constant minus one and that constant - `VisualTestContext::debug_bounds` takes
+        // a `&'static str`, so they cannot be interpolated.
+        assert_eq!(
+            MAX_VISIBLE_COMPLETION_ROWS, 12,
+            "the two selectors below are hard-coded to it"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-11").is_some(),
+            "the twelfth row must fit entirely inside the popup's real viewport"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-12").is_none(),
+            "and the thirteenth must not - that is what makes \
+             MAX_VISIBLE_COMPLETION_ROWS a real, painted viewport size rather than a number in a \
+             doc comment"
+        );
+        assert_eq!(
+            cx.debug_bounds("completions-popover")
+                .expect("the popup itself must have painted")
+                .size
+                .height,
+            popover_max_height(),
+            "a long list must cap the popup at exactly {MAX_VISIBLE_COMPLETION_ROWS} rows plus \
+             its own padding - a completions popup that grows to fill the screen is as unusable \
+             as one that truncates"
+        );
+        assert!(
+            max_scroll_offset(&app, cx) > gpui::px(0.0),
+            "{LONG} real rows of {POPOVER_ROW_HEIGHT:?} must genuinely overflow the \
+             {:?} viewport - a zero `max_offset` would mean the list laid out at full content \
+             height and nothing can ever scroll",
+            popover_list_max_height()
+        );
+        assert_eq!(
+            scroll_offset(&app, cx),
+            gpui::px(0.0),
+            "a freshly opened popup must start at the top"
+        );
+        assert!(
+            cx.debug_bounds("completions-scrollbar").is_some(),
+            "a genuinely overflowing list must paint this app's own real overlay scrollbar, the \
+             same one every other scrollable region here uses"
+        );
+
+        for _ in 0..(LONG - 1) {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+
+        assert_eq!(selected(&app, cx), LONG - 1, "sanity check");
+        assert!(
+            scroll_offset(&app, cx) < gpui::px(0.0),
+            "keyboard nav down to the last item must have really scrolled the viewport (GPUI's \
+             own scroll offset goes negative as you scroll down), not merely moved an index"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-39").is_some(),
+            "the selected row must genuinely be painted after scrolling to it - this is the \
+             whole point of `ScrollStrategy::Nearest` in `move_completions_selection`"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-0").is_none(),
+            "and the first row must have scrolled genuinely out of the viewport, proving the \
+             `uniform_list` is really virtualizing rather than painting all {LONG} at once"
+        );
+
+        // Wrapping back around to the first item must scroll back to it, too.
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(
+            selected(&app, cx),
+            0,
+            "sanity check: wrapped to the first item"
+        );
+        assert_eq!(
+            scroll_offset(&app, cx),
+            gpui::px(0.0),
+            "wrapping to the first item must scroll the viewport back to the top with it"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-0").is_some(),
+            "the first row must be painted again after wrapping back to it"
+        );
+    }
+
+    /// A row that only exists past the old cap must be clickable, too - `uniform_list` builds a
+    /// real, hit-testable element for it once it's scrolled into view, which the old truncated
+    /// render never did. Clicks the row's own real painted bounds.
+    #[gpui::test]
+    fn a_row_past_the_old_cap_can_be_accepted_with_a_real_mouse_click(cx: &mut TestAppContext) {
+        let (app, cx, _repo, relative) = open_with_seeded_popup(cx, LONG);
+
+        for _ in 0..(LONG - 1) {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("completion-item-39")
+            .expect("the last row must be painted after scrolling to it");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.completions.is_none()),
+            "a real click on a real completion row must accept it and close the popup"
+        );
+        let content = app.read_with(cx, |app, _| {
+            app.edit_buffer(&relative)
+                .expect("a real buffer")
+                .content
+                .clone()
+        });
+        assert!(
+            content.contains("item_039"),
+            "clicking the 40th row must splice *that* item's real text into the real buffer - \
+             under the old 12-item cap this row was never painted, so it could never be clicked \
+             at all. Got: {content:?}"
+        );
+    }
+
+    /// The other half of the ask: a list that comfortably fits must not grow a scrollbar, must
+    /// not scroll, and must paint every one of its rows.
+    #[gpui::test]
+    fn a_short_completions_list_neither_scrolls_nor_paints_a_scrollbar(cx: &mut TestAppContext) {
+        let (app, cx, _repo, _relative) = open_with_seeded_popup(cx, SHORT);
+
+        for selector in [
+            "completion-item-0",
+            "completion-item-1",
+            "completion-item-2",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "every row of a short list must paint - {selector} did not"
+            );
+        }
+        assert_eq!(
+            cx.debug_bounds("completions-popover")
+                .expect("the popup itself must have painted")
+                .size
+                .height,
+            POPOVER_ROW_HEIGHT * SHORT as f32
+                + POPOVER_VERTICAL_PADDING
+                + POPOVER_BORDER_HEIGHT
+                + POPOVER_FOOTER_HEIGHT,
+            "a short list must shrink the popup to exactly its own {SHORT} rows plus padding plus \
+             the real footer hint row - not leave {MAX_VISIBLE_COMPLETION_ROWS} rows' worth of \
+             empty popover background below them"
+        );
+        assert!(
+            max_scroll_offset(&app, cx) <= gpui::px(0.5),
+            "{SHORT} real rows must not overflow the {:?} viewport at all - a non-zero \
+             `max_offset` here would mean the list laid itself out taller than its own content, \
+             i.e. `ListSizingBehavior::Infer` isn't shrinking the popup to fit",
+            popover_list_max_height()
+        );
+        assert!(
+            cx.debug_bounds("completions-scrollbar").is_none(),
+            "a list that genuinely doesn't overflow must paint no scrollbar - \
+             `render_vertical_scrollbar` returns `None` off the same real `max_offset` asserted \
+             above"
+        );
+
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            selected(&app, cx),
+            2,
+            "keyboard nav must still work normally in a short list"
+        );
+        assert_eq!(
+            scroll_offset(&app, cx),
+            gpui::px(0.0),
+            "navigating within a list that fits must never scroll it"
+        );
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            selected(&app, cx),
+            0,
+            "and it must still wrap at the genuine end of a short list"
+        );
+    }
+}
+
 /// Regression coverage for the design-review follow-up: the Completions popup used to be a
 /// list-only single column - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own mockup
 /// (and `README.md`'s "Right 300: signature in mono, doc in 11px Plex Sans #7d848b, module path
@@ -719,7 +1405,11 @@ mod completion_detail_pane_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(CompletionsEntry {
                 path: relative.clone(),
-                status: CompletionsStatus::Ready { items, selected: 0 },
+                // Empty query - every item stays visible, matching this helper's real callers'
+                // need for an unshifted, predictable `visible` for their own assertions (mirrors
+                // `completions_scroll_tests::open_with_seeded_popup`'s own reasoning).
+                status: CompletionsStatus::ready(items, "")
+                    .expect("a real, non-empty item list must produce a real Ready state"),
             });
             cx.notify();
         });
