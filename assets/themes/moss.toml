@@ -53,24 +53,27 @@ current_line          = "#1a1d20"
 title_bar_close_hover = "#be392f"
 menu_row_hover        = "#1e2225"
 tab_close_hover       = "#24272a"  # A file tab's close-affordance hover fill
+lsp_popover_footer    = "#16191a"
 
 # The 1px rules that separate things - zone edges, card and popover outlines, and the
 # selected-row edge.
 [border]
-zone            = "#1f2224"  # between the three zones
-inner           = "#1d2023"  # between bands inside a zone
-rail_inner      = "#1b1d1f"
-row             = "#191b1d"  # change-list row separators
-divider         = "#232528"  # 1px vertical rules
-card            = "#24272a"
-card_field      = "#232629"
-composer        = "#24282c"
-popover         = "#2b2f34"
-button          = "#2a2d31"  # outline button
-button_disabled = "#202326"
-keycap          = "#272a2e"
-keycap_hint     = "#232629"  # The hint-size keycap's own border
-selected_edge   = "#3f5264"  # 2px left edge on a selected row
+zone                   = "#1f2224"  # between the three zones
+inner                  = "#1d2023"  # between bands inside a zone
+rail_inner             = "#1b1d1f"
+row                    = "#191b1d"  # change-list row separators
+divider                = "#232528"  # 1px vertical rules
+card                   = "#24272a"
+card_field             = "#232629"
+composer               = "#24282c"
+popover                = "#2b2f34"
+button                 = "#2a2d31"  # outline button
+button_disabled        = "#202326"
+keycap                 = "#272a2e"
+keycap_hint            = "#232629"  # The hint-size keycap's own border
+selected_edge          = "#3f5264"  # 2px left edge on a selected row
+diagnostic_card        = "#352324"
+diagnostic_card_footer = "#292224"  # The Diagnostic popover's own footer band's top border
 
 # The Files tree's own structural marks (GitHub issue #18 §3).
 [tree]
@@ -240,7 +243,7 @@ error_underline           = "#bd685f"  # 2px dotted
 hover_underline           = "#6683a3"  # 1px solid
 diagnostic_row_bg         = "#1a1618"
 diagnostic_inline_message = "#a6736d"
-diagnostic_card_message   = "#c6766d"
+diagnostic_card_message   = "#bd827c"
 
 # The File view's structural chrome (GitHub issue #31's "editor chrome" checklist item) -
 # selection, the current-line highlight, the caret, and a handful of tokens for editor features

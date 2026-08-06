@@ -27,7 +27,25 @@ pub(crate) enum FileLoadState {
     Error(PathBuf, String),
 }
 
-/// The state of one in-flight or completed click-triggered `textDocument/hover` request; see
+/// Which real token the pointer is currently resting on, before
+/// `crate::code_surface::lsp_ui::HOVER_TRIGGER_DELAY` has elapsed and a real
+/// `textDocument/hover` request has gone out for it - see
+/// [`AdeApp::hover_over_token`]'s own docs for the debounce this backs.
+///
+/// Deliberately the exact same four fields [`HoverEntry`] carries minus its `status`: a resolved
+/// [`HoverEntry`] *is* this anchor plus a real response, so [`AdeApp::hover_anchor_matches`] can
+/// compare the two directly rather than through a second, independently-derived notion of "the
+/// same token".
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HoverAnchor {
+    pub(in crate::code_surface) path: PathBuf,
+    /// 1-based, matching [`HoverEntry::line_number`]/[`AdeApp::code_cursor`].
+    pub(in crate::code_surface) line_number: usize,
+    pub(in crate::code_surface) byte_range: Range<usize>,
+    pub(in crate::code_surface) position: lsp_core::lsp_types::Position,
+}
+
+/// The state of one in-flight or completed hover-triggered `textDocument/hover` request; see
 /// [`AdeApp::hover`]'s docs for the caching discipline this backs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HoverEntry {
@@ -37,7 +55,7 @@ pub(crate) struct HoverEntry {
     /// 1-based line number (matching [`AdeApp::code_cursor`]'s convention); half of this entry's
     /// cache key along with [`Self::byte_range`].
     pub(in crate::code_surface) line_number: usize,
-    /// Byte range, within the line's text, of the clicked token - the span
+    /// Byte range, within the line's text, of the hovered token - the span
     /// [`crate::code_surface::file_view::render_file_view_line`] underlines with `theme::syntax::HOVER_UNDERLINE`,
     /// and the other half of the cache key.
     pub(in crate::code_surface) byte_range: Range<usize>,

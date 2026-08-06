@@ -11,18 +11,195 @@ use crate::lsp::client::LspClientState;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::widgets::render_keycap;
+use std::time::Duration;
+
+/// How long the pointer has to rest on one real token before a real `textDocument/hover` request
+/// is sent for it (GitHub issue #186). Not a guessed number: `vendor/zed/crates/editor/src/
+/// hover_popover.rs`'s own `hover_at` debounces on the user's `hover_popover_delay` setting, whose
+/// real default in `vendor/zed/assets/settings/default.json` is `300` ms - the same value used
+/// here, since this app has no per-user setting for it to read.
+pub(crate) const HOVER_TRIGGER_DELAY: Duration = Duration::from_millis(300);
 
 impl AdeApp {
-    /// Click-to-hover trigger for Surface C's File view. `absolute_path`/`line_number`/
-    /// `byte_range` identify the clicked token; `position` is the corresponding LSP `Position`,
-    /// already computed at the click site.
+    /// Real, pointer-driven hover trigger (GitHub issue #186): arms [`HOVER_TRIGGER_DELAY`] for
+    /// `anchor`, and only once that has genuinely elapsed with the pointer still on the same token
+    /// does [`Self::request_hover`] actually go out. Called from [`Self::track_hover_pointer`] for
+    /// every real mouse-move that lands on a real token.
     ///
-    /// Triggered by click, not mouse-hover: this app has no per-pixel hover-position tracking,
-    /// and building it (a debounced `.on_mouse_move` translated back to a token/byte position)
-    /// would be substantial infrastructure out of proportion to what this read-only viewer needs.
+    /// Two real no-ops keep a pointer sweep from doing any work at all: the same token already
+    /// showing a real [`Self::hover`] entry, and the same token already having an armed timer.
+    /// Everything else is a genuinely different token, which drops the old card immediately (it
+    /// describes a symbol the pointer has left) and re-arms.
+    pub(in crate::code_surface) fn hover_over_token(
+        &mut self,
+        anchor: HoverAnchor,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hover_anchor_matches(&anchor) || self.hover_pending.as_ref() == Some(&anchor) {
+            return;
+        }
+        let had_card = self.hover.is_some();
+        self.hover = None;
+        self.hover_pending = Some(anchor.clone());
+        if had_card {
+            cx.notify();
+        }
+        self._hover_debounce_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_TRIGGER_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                // The pointer moved on (or off) while the timer ran - `hover_pending` is either a
+                // different token now or gone entirely, and either way this timer is stale.
+                if this.hover_pending.as_ref() != Some(&anchor) {
+                    return;
+                }
+                this.hover_pending = None;
+                this.request_hover(
+                    anchor.path.clone(),
+                    anchor.line_number,
+                    anchor.byte_range.clone(),
+                    anchor.position,
+                    cx,
+                );
+            });
+        }));
+    }
+
+    /// Whether [`Self::hover`]'s current entry (if any) is anchored on exactly `anchor`'s token.
+    pub(in crate::code_surface) fn hover_anchor_matches(&self, anchor: &HoverAnchor) -> bool {
+        self.hover.as_ref().is_some_and(|entry| {
+            entry.path == anchor.path
+                && entry.line_number == anchor.line_number
+                && entry.byte_range == anchor.byte_range
+        })
+    }
+
+    /// The single real dismissal path for Surface C's Hover popup (GitHub issue #186 - before it,
+    /// there was none at all: an opened card only ever went away by switching tab/file/worktree).
+    /// Clears the painted card, any armed [`HOVER_TRIGGER_DELAY`] timer, and any in-flight
+    /// `textDocument/hover` request in one place, so no dismissal route can clear one and leave
+    /// another to resurrect the card a moment later.
+    ///
+    /// Returns whether there was genuinely anything to dismiss, so callers that need to know
+    /// (`Escape`, which falls through to other behaviour when the popup wasn't showing) can tell.
+    /// Deliberately does **not** call `cx.notify()`, matching [`Self::dismiss_completions`]'s own
+    /// established convention: every caller already has a surrounding state change to notify for.
+    pub(crate) fn dismiss_hover(&mut self) -> bool {
+        let was_showing = self.hover.is_some() || self.hover_pending.is_some();
+        self.hover = None;
+        self.hover_pending = None;
+        self.hover_card_bounds = None;
+        self._hover_debounce_task = None;
+        self._hover_request_task = None;
+        was_showing
+    }
+
+    /// [`Self::dismiss_hover`] plus the `cx.notify()` a UI-driven dismissal needs - the shape
+    /// every real event handler (mouse-move away, click, `Escape`) actually wants.
+    pub(in crate::code_surface) fn dismiss_hover_and_notify(&mut self, cx: &mut Context<Self>) {
+        if self.dismiss_hover() {
+            cx.notify();
+        }
+    }
+
+    /// The real per-pixel hover tracking GitHub issue #186 asks for, and the whole of it: one
+    /// window-level `.on_mouse_move` (registered in [`crate::root::AdeApp::render`]) that answers
+    /// "what real token, if any, is the pointer on right now" from state this app already
+    /// maintains for its own click hit-testing - [`Self::file_view_row_layout`]'s real per-row
+    /// `(Bounds, ShapedLine)` pairs, the same pair `crate::code_surface::editing`'s own
+    /// `on_mouse_down`/drag handlers already localize a click against.
+    ///
+    /// One window-level handler rather than a per-row one (the shape the drag-extend handler in
+    /// `crate::code_surface::editing` uses) for a real reason: a per-row `.on_mouse_move` only
+    /// fires while that row's own hitbox is the top-most one under the pointer (`vendor/zed/
+    /// crates/gpui/src/elements/div.rs`'s `on_mouse_move` wraps every listener in
+    /// `hitbox.is_hovered(window)`), so it can never observe the pointer *leaving* the code area
+    /// for the sidebar, the terminal, or the title bar - exactly the dismissal case that has to
+    /// work.
+    ///
+    /// The real dismissal rule, in order:
+    /// 1. Pointer inside the real painted [`Self::hover_card_bounds`] - keep the card, so moving
+    ///    onto it to press its own `F12 definition` footer doesn't close it first.
+    /// 2. Pointer on a real, non-whitespace token of a real row - hover that token (debounced).
+    /// 3. Anything else - dismiss.
+    ///
+    /// A held mouse button means a real drag (selection extension, a pane resize, a tab drag), not
+    /// a hover, so it dismisses rather than tracking.
+    pub(crate) fn track_hover_pointer(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // `hover.is_some()` as well as the bounds: `hover_card_bounds` is last frame's painted
+        // rectangle, so without that gate a card that has since stopped painting would leave a
+        // real dead zone the pointer could never hover a token through.
+        if self.hover.is_some()
+            && self
+                .hover_card_bounds
+                .is_some_and(|bounds| bounds.contains(&event.position))
+        {
+            return;
+        }
+        if event.pressed_button.is_some() {
+            self.dismiss_hover_and_notify(cx);
+            return;
+        }
+        let Some(anchor) = self.hover_anchor_at(event.position) else {
+            self.dismiss_hover_and_notify(cx);
+            return;
+        };
+        self.hover_over_token(anchor, cx);
+    }
+
+    /// The real token under a real window-space pointer position, or `None` when there isn't one -
+    /// the pointer is outside every painted code row, past the end of that row's real glyphs
+    /// (`gpui::LineLayout::index_for_x` answers `None` for exactly that, unlike the
+    /// `closest_index_for_x` the click path deliberately uses so a click past the last glyph still
+    /// places a caret), on whitespace, or in a file with no ready language server to ask.
+    fn hover_anchor_at(&self, position: gpui::Point<Pixels>) -> Option<HoverAnchor> {
+        let relative_path = self.active_editable_path()?;
+        let absolute_path = self.file_tree_root.join(&relative_path);
+        // The same pure gate `render_file_view` applies before wiring any hover target at all
+        // (its own `has_lsp`): a file whose extension has no LSP identity at all has genuinely
+        // nothing to ask about. Deliberately *not* `lsp_connection_for_path` - whether a server
+        // happens to be Ready right this instant is a race, and `Self::request_hover` already
+        // degrades honestly (clears the card, sends nothing) when it isn't.
+        language::lsp_language_id_for_extension(
+            absolute_path.extension().and_then(|ext| ext.to_str()),
+        )?;
+        let buffer = self.edit_buffer(&relative_path)?;
+        let (&line_number, (bounds, shaped)) = self
+            .file_view_row_layout
+            .iter()
+            .find(|(_, (bounds, _))| bounds.contains(&position))?;
+        let offset = shaped.index_for_x(position.x - bounds.left())?;
+        let line = buffer.lines.get(line_number.checked_sub(1)?)?;
+        let byte_range = editing::token_at_offset(&line.runs, offset)?;
+        if line.text.get(byte_range.clone())?.trim().is_empty() {
+            return None;
+        }
+        let lsp_position = hover_view::position_for_line_byte_offset(
+            line_number as u32 - 1,
+            &line.text,
+            byte_range.start,
+        );
+        Some(HoverAnchor {
+            path: absolute_path,
+            line_number,
+            byte_range,
+            position: lsp_position,
+        })
+    }
+
+    /// Sends a real `textDocument/hover` for one real token. `absolute_path`/`line_number`/
+    /// `byte_range` identify it; `position` is the corresponding LSP `Position`, already computed
+    /// by [`Self::hover_anchor_at`].
+    ///
+    /// No longer called directly from a click (GitHub issue #186): the only production caller is
+    /// [`Self::hover_over_token`]'s own debounce timer, once the pointer has genuinely rested on
+    /// this token for [`HOVER_TRIGGER_DELAY`].
     ///
     /// No-ops if `(absolute_path, line_number, byte_range)` already matches the current
-    /// [`Self::hover`] entry, so re-clicking the same token doesn't redo an `rust-analyzer` round
+    /// [`Self::hover`] entry, so re-entering the same token doesn't redo a `rust-analyzer` round
     /// trip. Runs on `cx.background_executor()`, never inline: [`lsp_core::LspClient::request`]
     /// blocks the calling thread and must not block the GPUI foreground thread.
     pub(in crate::code_surface) fn request_hover(
@@ -46,14 +223,14 @@ impl AdeApp {
             // No ready LSP client for this file's language yet; nothing to show, so clear any
             // stale entry - a real completions popup is equally stale in that case (Revision
             // R8.5b audit finding 3), so it's dropped alongside `hover` here too.
-            self.hover = None;
+            self.dismiss_hover();
             self.dismiss_completions();
             cx.notify();
             return;
         };
 
         let Ok(uri) = lsp_core::LspClient::uri_for_path(&absolute_path) else {
-            self.hover = None;
+            self.dismiss_hover();
             self.dismiss_completions();
             cx.notify();
             return;
@@ -118,14 +295,38 @@ impl AdeApp {
         self._hover_request_task = Some(task);
     }
 
-    /// `F12`'s handler. Uses [`Self::hover`] as the source of "which symbol" rather than a
-    /// separately-tracked target. No-op if nothing's been clicked yet.
+    /// The real `(absolute path, LSP position)` `F12` should ask about.
+    ///
+    /// Before GitHub issue #186 this was [`Self::hover`] and nothing else, which worked only
+    /// because a click both moved the caret *and* opened the Hover card. Now that hover is a real
+    /// pointer-rest gesture and a click dismisses it, `F12` needs a target that a keyboard-only
+    /// user actually has: the caret's own position, derived from the live [`EditBuffer`]'s real
+    /// cursor offset through the same [`hover_view::position_for_line_byte_offset`] the pointer
+    /// path uses, so the two can't produce differently-encoded positions for the same place.
+    ///
+    /// Hover still wins when it is showing: the pointer is on that exact symbol, which is more
+    /// specific than "wherever the caret was left".
+    fn goto_definition_target(&self) -> Option<(PathBuf, lsp_core::lsp_types::Position)> {
+        if let Some(hover) = self.hover.as_ref() {
+            return Some((hover.path.clone(), hover.position));
+        }
+        let relative_path = self.active_editable_path()?;
+        let buffer = self.edit_buffer(&relative_path)?;
+        let (line_index, byte_col) = buffer.line_col_for_offset(buffer.cursor_offset());
+        let line = buffer.lines.get(line_index)?;
+        Some((
+            self.file_tree_root.join(&relative_path),
+            hover_view::position_for_line_byte_offset(line_index as u32, &line.text, byte_col),
+        ))
+    }
+
+    /// `F12`'s handler. Prefers whatever symbol the Hover card is currently describing (the
+    /// pointer is literally on it), and otherwise falls back to the caret - see
+    /// [`Self::goto_definition_target`]. No-op when neither exists.
     pub(in crate::code_surface) fn trigger_goto_definition(&mut self, cx: &mut Context<Self>) {
-        let Some(hover) = self.hover.as_ref() else {
+        let Some((path, position)) = self.goto_definition_target() else {
             return;
         };
-        let path = hover.path.clone();
-        let position = hover.position;
 
         let Some(client) = self.lsp_connection_for_path(&path) else {
             return;
@@ -228,66 +429,232 @@ impl AdeApp {
     }
 }
 
-/// Surface C's Diagnostic-state card: one row per diagnostic currently indexed anywhere in the
-/// open file, `None` when there are none (a clean file renders no card, not an empty one).
-/// Listing every diagnostic in the file (rather than only the one under the cursor) is a
-/// simplification: the design anchors this card under the caret line, but this app has no
-/// floating-popup infrastructure yet.
-pub(in crate::code_surface) fn render_diagnostics_card(
-    by_line: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
-) -> Option<gpui::AnyElement> {
-    if by_line.is_empty() {
-        return None;
+/// 190px - a soft cap on the real Diagnostic popover's height, serving the exact same purpose
+/// [`HOVER_CARD_MAX_HEIGHT`] and `crate::lsp::completion_popup::POPOVER_MAX_HEIGHT` serve for
+/// their own popovers (see either constant's own docs): it gives the real "is there room below
+/// the offending row" measurement a concrete number to compare real available space against, and
+/// stops a genuinely enormous multi-paragraph `rustc` message from painting past the window.
+/// Not from the design mockup, whose own diagnostic card (`design_handoff_jerry_ade/revision 3/
+/// Jerry.dc.html`) is exactly as tall as its two real lines of text - just a practical ceiling
+/// comfortably above a real message plus note plus footer.
+const DIAGNOSTIC_CARD_MAX_HEIGHT: gpui::Pixels = px(190.0);
+
+/// 470px - the design mockup's own diagnostic card width (`design_handoff_jerry_ade/revision 3/
+/// Jerry.dc.html`: `width:470px` on the card itself).
+const DIAGNOSTIC_CARD_WIDTH: gpui::Pixels = px(470.0);
+
+impl AdeApp {
+    /// Surface C's real, caret-anchored Diagnostic popover (GitHub issue #186).
+    ///
+    /// ## What changed, and why
+    ///
+    /// This used to be `render_diagnostics_card`: a plain in-flow child appended to the bottom of
+    /// the File view's own flex column, listing *every* diagnostic anywhere in the open file. Both
+    /// halves of that were wrong. Being an ordinary flex child (never `.absolute()`), it took real,
+    /// permanent vertical space away from the code view - the design's `lsp_popup` state model
+    /// (`design_handoff_jerry_ade/revision 3/README.md`) describes an anchored popup, not a docked
+    /// panel. And the design's own Diagnostic state is one card for one offending span ("a card
+    /// below: message, note, `rust-analyzer · E0277`"), not a whole-file dump.
+    ///
+    /// It now paints exactly the way [`Self::render_hover_card`] and
+    /// [`crate::lsp::completion_popup::AdeApp::render_completions_popover`] already do: a real,
+    /// absolutely-positioned top-level sibling in [`crate::root::AdeApp::render`], anchored off a
+    /// real, already-painted `(Bounds, ShapedLine)` pair from [`Self::file_view_row_layout`],
+    /// never nested inside the File view's own virtualized `uniform_list` (a popup anchored to one
+    /// row must not be clipped by that row's own scroll container).
+    ///
+    /// ## Which diagnostic, and when
+    ///
+    /// Whichever diagnostics sit on the caret's own line - the caret is what "wherever the user
+    /// is" means for a keyboard-driven surface, and it is also the only anchor that survives the
+    /// pointer leaving the window. `None` (nothing painted at all) whenever there's no caret, the
+    /// caret's line is clean, that row isn't currently painted, or - per the design's own
+    /// `lsp_popup: None | Completions | Diagnostic | Hover | one at a time` - another LSP popup
+    /// owns the slot.
+    ///
+    /// ## The one-at-a-time priority order
+    ///
+    /// Completions first, then Hover, then Diagnostic. Both of the first two are *requested*: the
+    /// user typed, or rested the pointer on a symbol, and is waiting for that specific answer.
+    /// The Diagnostic card is ambient - it follows the caret with nothing asked for - so it is the
+    /// one that yields. (It also anchors to the same row Completions does, so without an order
+    /// they would paint on top of each other.)
+    pub(crate) fn render_diagnostic_card(&self) -> Option<gpui::AnyElement> {
+        if self.completions.is_some() || self.hover.is_some() {
+            return None;
+        }
+        let line_number = self.code_cursor?;
+        let relative_path = self.active_editable_path()?;
+        let (last_path, _) = self.file_view_last_layout_for.as_ref()?;
+        if last_path != &relative_path {
+            // The painted row layout belongs to some other file (e.g. a tab switch whose first
+            // frame hasn't painted yet) - no real position to anchor to, so paint nothing rather
+            // than guess one.
+            return None;
+        }
+        let diagnostics = self.file_view_diagnostics.get(&line_number)?;
+        let worst = diagnostics_view::Severity::worst(diagnostics)?;
+        let diagnostic = diagnostics
+            .iter()
+            .find(|candidate| candidate.severity == worst)?;
+        let (row_bounds, _) = self.file_view_row_layout.get(&line_number)?;
+
+        let row_top = row_bounds.top();
+        let row_bottom = row_bounds.bottom();
+        // Flip above the offending row when there isn't real room below it - the same real
+        // measurement `Self::render_hover_card` and `render_completions_popover` already make,
+        // against the same real `Self::body_bounds`.
+        let space_below = self.body_bounds.bottom() - row_bottom;
+        let top = if space_below >= DIAGNOSTIC_CARD_MAX_HEIGHT {
+            row_bottom
+        } else {
+            (row_top - DIAGNOSTIC_CARD_MAX_HEIGHT).max(self.body_bounds.top())
+        };
+
+        Some(render_diagnostic_card_content(
+            diagnostic,
+            row_bounds.left(),
+            top,
+        ))
+    }
+}
+
+/// The real Diagnostic popover's own content, split out of [`AdeApp::render_diagnostic_card`] for
+/// exactly the reason [`render_hover_card_content`] is split out of [`AdeApp::render_hover_card`]:
+/// the positioning math needs `&self` and this doesn't.
+///
+/// Follows the design mockup's own Diagnostic card structure (`design_handoff_jerry_ade/revision
+/// 3/Jerry.dc.html`): a severity dot, the message's own first line, the rest of the message as a
+/// dimmer note, and a `source · code` footer. The mockup's `quick fix: wrap in Column::from ⌘.`
+/// chip is deliberately **not** drawn - this app has no `textDocument/codeAction` support at all,
+/// so a chip there would be a button bound to nothing.
+///
+/// Chrome follows the mockup's own diagnostic card exactly, not [`AdeApp::render_hover_card`]'s
+/// neutral popover chrome: `theme::syntax::DIAGNOSTIC_ROW_BG` (`#191416`) for the background and
+/// `theme::border::DIAGNOSTIC_CARD` (`#3a2224`) for the border, both read directly off
+/// `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s card (`background:#191416;border:1px
+/// solid #3a2224`) - the red tint is how this card reads as *ambient/alarming* at a glance,
+/// distinct from Hover/Completions' neutral `theme::surface::POPOVER`/`theme::border::POPOVER`.
+/// `theme::radius::CARD_SM` and no shadow still match every other popover (the design's own
+/// "Design tokens" section: "**one** [shadow] in the whole product - the completion popup").
+fn render_diagnostic_card_content(
+    diagnostic: &diagnostics_view::LineDiagnostic,
+    anchor_x: Pixels,
+    top: Pixels,
+) -> gpui::AnyElement {
+    let source_code = match (&diagnostic.source, &diagnostic.code) {
+        (Some(source), Some(code)) => format!("{source} · {code}"),
+        (Some(source), None) => source.clone(),
+        (None, Some(code)) => code.clone(),
+        (None, None) => String::new(),
+    };
+    // `rustc`/`rust-analyzer` messages are routinely multi-line: the first line is the headline
+    // the design calls "message", everything after it is the design's dimmer "note".
+    let mut lines = diagnostic.message.lines();
+    let headline = lines.next().unwrap_or_default().to_string();
+    let note = lines.collect::<Vec<_>>().join("\n");
+
+    let mut body = div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.5))
+                .text_color(diagnostic_card_message_color(diagnostic.severity))
+                .child(headline),
+        );
+    if !note.trim().is_empty() {
+        body = body.child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::DIMMER)
+                .child(note),
+        );
     }
 
-    let mut lines: Vec<&usize> = by_line.keys().collect();
-    lines.sort();
-
     let mut card = div()
+        .id("diagnostic-card")
+        // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
+        // this, not `.id(..)`) - a no-op outside test builds, matching `"hover-card"` and every
+        // other `debug_selector` in this crate.
+        .debug_selector(|| "diagnostic-card".to_string())
+        .absolute()
+        .left(anchor_x)
+        .top(top)
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .p(px(10.0))
-        .m(px(8.0))
+        .w(DIAGNOSTIC_CARD_WIDTH)
+        .max_h(DIAGNOSTIC_CARD_MAX_HEIGHT)
+        .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
-        .bg(theme::surface::CARD)
+        .bg(theme::syntax::DIAGNOSTIC_ROW_BG)
         .border_1()
-        .border_color(theme::border::CARD);
+        .border_color(theme::border::DIAGNOSTIC_CARD)
+        .child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .child(
+                    // The mockup's own 5px severity dot, `margin-top:5px` so it optically centres
+                    // on the message's first line rather than on the whole block.
+                    div()
+                        .flex_none()
+                        .mt(px(5.0))
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(diagnostic_underline_color(diagnostic.severity)),
+                )
+                .child(body),
+        );
 
-    for line_number in lines {
-        for diagnostic in &by_line[line_number] {
-            let source_code = match (&diagnostic.source, &diagnostic.code) {
-                (Some(source), Some(code)) => format!("{source} · {code}"),
-                (Some(source), None) => source.clone(),
-                (None, Some(code)) => code.clone(),
-                (None, None) => String::new(),
-            };
-            card = card.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .font(font(theme::font::MONO))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(theme::syntax::DIAGNOSTIC_CARD_MESSAGE)
-                            .child(format!("ln {line_number}: {}", diagnostic.message)),
-                    )
-                    .when(!source_code.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(theme::text::DIMMER)
-                                .child(source_code),
-                        )
-                    }),
-            );
-        }
+    if !source_code.is_empty() {
+        // `background:#141719;border-top:1px solid #2b2224` in the mockup - its own footer band,
+        // the same `LSP_POPOVER_FOOTER` background the Hover card's footer uses, but with this
+        // card's own darker `DIAGNOSTIC_CARD_FOOTER` border rather than the neutral `border::
+        // INNER` the pre-review version used (which also painted no background band at all).
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::surface::LSP_POPOVER_FOOTER)
+                .border_t_1()
+                .border_color(theme::border::DIAGNOSTIC_CARD_FOOTER)
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::FAINTER)
+                        .child(source_code),
+                ),
+        );
     }
 
-    Some(card.into_any_element())
+    card.into_any_element()
+}
+
+/// The Diagnostic popover's headline colour for one severity - `Error` keeps the design's own
+/// [`theme::syntax::DIAGNOSTIC_CARD_MESSAGE`]; every other severity reuses
+/// [`theme::text::SECONDARY`], for the same reason [`diagnostic_inline_message_color`] and
+/// [`diagnostic_row_bg`] already de-escalate below `Error`: a warning or a hint must not read as
+/// alarming as a real error.
+pub(in crate::code_surface) fn diagnostic_card_message_color(
+    severity: diagnostics_view::Severity,
+) -> gpui::Rgba {
+    match severity {
+        diagnostics_view::Severity::Error => theme::syntax::DIAGNOSTIC_CARD_MESSAGE.into(),
+        _ => theme::text::SECONDARY.into(),
+    }
 }
 
 /// 220px - a soft cap on the real Hover popover's height, purely so
@@ -299,6 +666,15 @@ pub(in crate::code_surface) fn render_diagnostics_card(
 /// fixed height - it's exactly as tall as its own real content), just a practical, generous
 /// ceiling comfortably above what a real signature + doc + footer normally needs.
 const HOVER_CARD_MAX_HEIGHT: gpui::Pixels = px(220.0);
+/// 430px - the design mockup's own real hover card width
+/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:430px` on the card).
+const HOVER_CARD_MAX_WIDTH: gpui::Pixels = px(430.0);
+/// 10px - the header/body/footer bands' own real shared horizontal padding
+/// (`Jerry.dc.html`: `padding:7px 10px 6px`/`padding:7px 10px`/`padding:6px 10px` - all three
+/// bands agree on `10px` left/right). Named so [`render_hover_signature`]'s own real max-width
+/// (card width minus both sides' padding) can be computed from the same real numbers the bands
+/// themselves paint with, rather than a second, independently-guessed constant that could drift.
+const HOVER_CARD_HORIZONTAL_PADDING: gpui::Pixels = px(10.0);
 
 impl AdeApp {
     /// Surface C's real, token-anchored Hover popover (signature, doc prose, module path, `F12
@@ -312,17 +688,14 @@ impl AdeApp {
     /// The one real difference from [`Self::render_completions_popover`]: this reads
     /// [`Self::file_view_row_layout`] (every currently *visible* row, keyed by 1-based line
     /// number) rather than [`Self::file_view_last_layout`]/[`Self::file_view_last_bounds`] (the
-    /// *caret's own* row alone). [`Self::hover`]'s own target line is the line a real click
-    /// landed a token on, which today always also happens to be wherever the caret just moved to
-    /// (`crate::code_surface::editing`'s click handler moves the caret and requests hover from the same
-    /// click) - but reading the hovered line's own real layout entry directly is still the more
-    /// directly correct real position to anchor from, not a second, independently-computed one
-    /// that merely happens to agree in practice.
+    /// *caret's own* row alone). Since GitHub issue #186 the hovered line is wherever the
+    /// **pointer** is, which is genuinely independent of the caret - reading the hovered row's own
+    /// real layout entry is the only correct anchor, not the caret row's.
     ///
     /// `None` whenever there's nothing real to anchor to: no [`Self::hover`] entry, the entry
     /// belongs to a file that isn't the one currently on screen, or the hovered row's own real
     /// layout isn't in [`Self::file_view_row_layout`] right now (e.g. scrolled out of view since
-    /// the click landed) - the same honest "degrade to nothing rather than paint at a guessed
+    /// the pointer landed) - the same honest "degrade to nothing rather than paint at a guessed
     /// position" discipline [`Self::render_completions_popover`] already established.
     pub(crate) fn render_hover_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let hover = self.hover.as_ref()?;
@@ -348,7 +721,14 @@ impl AdeApp {
             (row_top - HOVER_CARD_MAX_HEIGHT).max(self.body_bounds.top())
         };
 
-        Some(render_hover_card_content(hover, anchor_x, top, cx))
+        // The active file's own extension - the same one `Self::request_hover` resolved a
+        // highlighter for when the code line itself was painted - so the signature reads with
+        // the exact same grammar/colors as the code around it, not a guessed or absent one.
+        let extension = active_relative
+            .extension()
+            .and_then(|extension| extension.to_str());
+
+        Some(render_hover_card_content(hover, extension, anchor_x, top, cx))
     }
 }
 
@@ -359,25 +739,48 @@ impl AdeApp {
 /// since this one has a real early-return position/anchor computation ahead of it.
 fn render_hover_card_content(
     hover: &HoverEntry,
+    extension: Option<&str>,
     anchor_x: Pixels,
     top: Pixels,
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
+    // GitHub issue #186: captures this card's own real painted bounds into
+    // `AdeApp::hover_card_bounds` every frame, the same `gpui::canvas` idiom
+    // `crate::root::AdeApp::render_workspace_body` already uses for `AdeApp::body_bounds`.
+    // `AdeApp::track_hover_pointer` reads it to keep the card alive while the pointer is on it.
+    let bounds_probe = {
+        let entity = cx.entity();
+        gpui::canvas(
+            move |bounds, _window, cx| {
+                entity.update(cx, |this, _cx| {
+                    this.hover_card_bounds = Some(bounds);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    };
+    // No `.p()`/`.gap()` here (unlike the pre-review version) - the design's own hover card has
+    // no uniform padding at all: it is three independently-padded/bordered bands (signature
+    // header, doc body, `module::path` + `F12 definition` footer), not a single padded flex
+    // column. Only `HoverStatus::Ready(Some(_))` below builds those three bands; every other
+    // status is a single line of plain text with no real card structure to speak of, so it gets
+    // its own one-off `.p(px(10.0))` wrapper instead.
     let mut card = div()
         .id("hover-card")
         // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
         // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
         // builds, matching every other `debug_selector` in this crate.
         .debug_selector(|| "hover-card".to_string())
+        .child(bounds_probe)
         .absolute()
         .left(anchor_x)
         .top(top)
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .p(px(10.0))
-        .max_w(px(430.0))
+        .max_w(HOVER_CARD_MAX_WIDTH)
         .max_h(HOVER_CARD_MAX_HEIGHT)
         .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
@@ -389,6 +792,7 @@ fn render_hover_card_content(
         HoverStatus::Loading => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::FAINT)
@@ -398,6 +802,7 @@ fn render_hover_card_content(
         HoverStatus::Failed(message) => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::status::FAIL)
@@ -407,6 +812,7 @@ fn render_hover_card_content(
         HoverStatus::Ready(None) => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::FAINT)
@@ -414,51 +820,97 @@ fn render_hover_card_content(
             );
         }
         HoverStatus::Ready(Some(model)) => {
+            // Header: the signature, `padding:7px 10px 6px;border-bottom:1px solid #23282c` in
+            // the mockup - `theme::border::CARD` is that exact hex, already registered for
+            // exactly this kind of internal card seam elsewhere in the app.
             card = card.child(
                 div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(12.0))
-                    .text_color(theme::text::HEADING)
-                    .child(model.signature.clone()),
+                    // `.max_w(HOVER_CARD_MAX_WIDTH)` is load-bearing, not decoration. A GPUI
+                    // element with no explicit width sizes itself to its own content (shrink-to-
+                    // fit) rather than stretching to fill its parent the way a CSS block element
+                    // would - the same real bug class `crate::code_surface::editing`'s own
+                    // `text_row` docs describe for an identical shrink-to-fit failure - so a
+                    // plain `.w_full()` here turned out *not* to be enough on its own: percentage
+                    // width resolves against a parent's own *resolved* width, and the card above
+                    // is itself only `max_w`-bounded (auto/shrink-to-fit otherwise), so `100%` of
+                    // an unresolved auto width is still effectively unbounded. A real, hard
+                    // `max_w` gives this header (and `render_hover_signature`'s own row below it)
+                    // a genuinely definite upper bound to wrap `flex_wrap()`'s content within,
+                    // regardless of what the card's own width resolves to. Without it, a
+                    // signature longer than 430px never gets a real width to wrap within, so
+                    // `render_hover_signature`'s own `flex_wrap()` never actually reflows - the
+                    // row just grows past 430px and the card's `overflow_hidden()` silently
+                    // hard-clips it instead (a real, live-reproduced TypeScript symptom: a long
+                    // union/generic type painted cut off mid-glyph).
+                    .max_w(HOVER_CARD_MAX_WIDTH)
+                    .pt(px(7.0))
+                    .px(px(10.0))
+                    .pb(px(6.0))
+                    .border_b_1()
+                    .border_color(theme::border::CARD)
+                    .child(render_hover_signature(&model.signature, extension)),
             );
             if let Some(doc) = &model.doc {
+                // Body: `padding:7px 10px;font:...'IBM Plex Sans';color:#8b9197` - `theme::
+                // text::DIM` is that exact hex (distinct from `DIMMER`/`FAINT`, which are darker
+                // and belong to other elements in this same card, not this one).
                 card = card.child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(theme::text::DIMMER)
+                        .px(px(10.0))
+                        .py(px(7.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::text::DIM)
                         .child(doc.clone()),
                 );
             }
+            // Footer: its own `background:#141719;border-top:1px solid #23282c` band, not a
+            // transparent strip inside the card's own padding - `theme::surface::
+            // LSP_POPOVER_FOOTER` is that exact background hex. `module::path` sits at the far
+            // left and `F12 definition` at the far right (`gap:10px`, a `flex:1` spacer between
+            // them in the mockup) - the pre-review version bunched both together with a plain
+            // `gap`, which is the layout difference a purely color-focused pass missed.
             let mut footer = div()
                 .flex()
                 .items_center()
-                .gap(px(6.0))
-                .pt(px(4.0))
+                .gap(px(10.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::surface::LSP_POPOVER_FOOTER)
                 .border_t_1()
-                .border_color(theme::border::INNER);
+                .border_color(theme::border::CARD);
             if let Some(module_path) = &model.module_path {
+                // `color:#5e646a` in the mockup - `theme::text::FAINTER`, not `FAINT`
+                // (`#6b7178`), which the pre-review version used.
                 footer = footer.child(
                     div()
                         .font(font(theme::font::MONO))
                         .text_size(px(10.0))
-                        .text_color(theme::text::FAINT)
+                        .text_color(theme::text::FAINTER)
                         .child(module_path.clone()),
                 );
             }
+            footer = footer.child(div().flex_1());
             footer = footer.child(
                 div()
                     .id("hover-card-goto-definition")
+                    // Lets a real test measure this real chip's own painted bounds
+                    // (`hover_card_footer_layout_tests`) - a no-op outside test builds, matching
+                    // every other `debug_selector` in this crate.
+                    .debug_selector(|| "hover-card-goto-definition".to_string())
                     .flex()
                     .items_center()
-                    .gap(px(3.0))
+                    .gap(px(5.0))
                     .cursor_pointer()
                     // `F12` is a function key, not one of `crate::keymap`'s modifier tokens, and
                     // is identical on both platforms, so it bypasses `keymap::resolve_combo`.
                     .child(render_keycap("F12"))
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(theme::text::FAINT)
+                            // `color:#4a5057` in the mockup - `theme::text::PATH` is that exact
+                            // hex (an existing token named for its other use elsewhere; the value
+                            // is what matters here, not the name).
+                            .text_size(px(10.0))
+                            .text_color(theme::text::PATH)
                             .child("definition"),
                     )
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -470,6 +922,71 @@ fn render_hover_card_content(
     }
 
     card.into_any_element()
+}
+
+/// The Hover popover's own signature line, syntax-highlighted like real code rather than painted
+/// as flat text (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own hover card shows `pub
+/// trait Into<T>: Sized` with real per-token colors - keyword purple, type gold - not one flat
+/// heading color).
+///
+/// Runs `signature` through [`code_view::highlight_block`] as a single-line, standalone fragment,
+/// the exact same "highlight a fragment on its own, not as part of a real open file" recipe the
+/// Diff and Merge views already use for a hunk/conflict side (see that function's own docs), then
+/// walks the resulting runs the same way [`crate::code_surface::file_view::render_file_view_line`]
+/// walks a real code row's `line.runs`: one `div` per run, colored via
+/// [`code_view::color_for_kind`]. `extension` comes from the active file
+/// ([`AdeApp::render_hover_card`]), so a Rust hover highlights as Rust, a TypeScript hover as
+/// TypeScript, and so on - never a guessed language.
+///
+/// `extension: None` (no active file extension resolved, which shouldn't happen in practice since
+/// a hover only exists for a file that's open) still renders correctly: `highlight_block` returns
+/// the text as one unhighlighted [`code_view::HighlightKind::Text`] run rather than nothing, so
+/// the signature is never silently dropped.
+fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::AnyElement {
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        // See the header wrapper's own `.max_w(HOVER_CARD_MAX_WIDTH)` doc comment in
+        // `render_hover_card_content` for why this needs a real, hard max-width (not just
+        // `.w_full()`) to make `flex_wrap()` actually reflow. This row sits inside that header's
+        // own `HOVER_CARD_HORIZONTAL_PADDING` on both sides, so its own bound is narrower by
+        // twice that.
+        .max_w(HOVER_CARD_MAX_WIDTH - HOVER_CARD_HORIZONTAL_PADDING - HOVER_CARD_HORIZONTAL_PADDING)
+        .font(font(theme::font::MONO))
+        .text_size(px(11.5));
+    for (run_index, (run_text, kind)) in
+        highlighted_signature_runs(signature, extension).into_iter().enumerate()
+    {
+        row = row.child(
+            div()
+                .id(("hover-signature-token", run_index))
+                // Lets a real test measure this real token's own painted bounds (`debug_bounds`
+                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+                // `debug_selector` in this crate.
+                .debug_selector(move || format!("hover-signature-token-{run_index}"))
+                .text_color(code_view::color_for_kind(kind))
+                .child(run_text),
+        );
+    }
+    row.into_any_element()
+}
+
+/// The pure half of [`render_hover_signature`] - just the `signature` -> colored-run computation,
+/// split out so it's directly `#[test]`-able without a `gpui::Window`/`TestAppContext` (mirroring
+/// how `code_view::highlight_block` itself is tested at the pure level, not by painting).
+fn highlighted_signature_runs(
+    signature: &str,
+    extension: Option<&str>,
+) -> Vec<(gpui::SharedString, code_view::HighlightKind)> {
+    code_view::highlight_block(
+        std::iter::once(signature),
+        extension,
+        code_view::HighlightOptions::default(),
+    )
+    .into_iter()
+    .next()
+    .map(|line| line.runs)
+    .unwrap_or_default()
 }
 
 /// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
@@ -486,9 +1003,9 @@ fn render_hover_card_content(
 /// isn't already tinting the row), a `.border_dashed()` underline under the offending span
 /// (`crate::lsp::diagnostics::overlay_diagnostic_runs`; GPUI has no true dotted border, see
 /// vendor/zed/crates/gpui/src/styled.rs's `border_dashed`), and a dim inline message from the
-/// first diagnostic on the line (the full breakdown is `render_diagnostics_card`, below the code
-/// area, not repeated per-row). The design only specifies an underline color for the error case;
-/// `Warning` reuses [`theme::term::WARN`], `Information`/`Hint` reuse
+/// first diagnostic on the line (the full message is in `AdeApp::render_diagnostic_card`'s real
+/// anchored popover, not repeated per-row - see `render_inline_diagnostic_message`). The design
+/// only specifies an underline color for the error case; `Warning` reuses [`theme::term::WARN`], `Information`/`Hint` reuse
 /// [`theme::text::DIM`]/[`theme::text::FAINT`] with `Hint` dimmer, matching the convention that
 /// LSP hints are the least severe/most subtle diagnostic kind.
 pub(in crate::code_surface) fn diagnostic_underline_color(
@@ -525,6 +1042,43 @@ pub(in crate::code_surface) fn diagnostic_inline_message_color(
         diagnostics_view::Severity::Error => theme::syntax::DIAGNOSTIC_INLINE_MESSAGE.into(),
         _ => theme::text::FAINT.into(),
     }
+}
+
+/// The File view row's real, dim end-of-line diagnostic message (`design_handoff_jerry_ade/
+/// revision 3/README.md`'s Diagnostic state: "dim inline message at end of line") - shared by both
+/// row renderers, the read-only [`crate::code_surface::file_view::render_file_view_line`] and the
+/// live-buffer `crate::code_surface::editing::render_editable_file_view_line`, so the two can't
+/// drift apart on this.
+///
+/// GitHub issue #186: this used to be an unconstrained `div` in a `flex_none` container that (per
+/// that container's own comment) "never shrinks", so on a narrow pane a real `rustc` message
+/// simply overflowed and painted straight over the code text. It is now a shrinkable sibling that
+/// ellipsizes instead, using this codebase's own established `min_w_0()` + `max_w()` +
+/// `truncate()` + `text_tooltip(..)` combination - the exact one
+/// [`crate::code_surface::blame_view::render_inline_blame_span`] (the *other* thing placed at the
+/// end of a code row) already uses, so the two shrink the same way and the untruncated text stays
+/// reachable on the tooltip.
+///
+/// `max_w` is the same `320px` cap the blame span uses: a diagnostic message must never crowd out
+/// the code it is about, however wide the pane gets.
+pub(in crate::code_surface) fn render_inline_diagnostic_message(
+    first_line: &str,
+    severity: diagnostics_view::Severity,
+    line_number: usize,
+) -> gpui::AnyElement {
+    div()
+        .id(("file-view-diagnostic-message", line_number))
+        // Lets a real test measure this element's own real painted width against a real narrow
+        // pane (see `inline_diagnostic_message_tests`) - a no-op outside test builds.
+        .debug_selector(move || format!("file-view-diagnostic-message-{line_number}"))
+        .min_w_0()
+        .max_w(px(320.0))
+        .truncate()
+        .pl(px(10.0))
+        .text_color(diagnostic_inline_message_color(severity))
+        .child(first_line.to_string())
+        .tooltip(crate::root::widgets::text_tooltip(first_line.to_string()))
+        .into_any_element()
 }
 
 /// Asserts the four severities produce visibly distinct colors, against the same color-mapping
@@ -879,6 +1433,149 @@ mod lsp_hover_wiring_tests {
             );
         }
     }
+
+    /// Real, end-to-end coverage for the Ctrl/Cmd+click go-to-definition affordance: a real
+    /// simulated mouse click, with a real secondary modifier held, on the real painted call-site
+    /// token, against a genuinely spawned rust-analyzer - not a call straight into
+    /// `trigger_goto_definition` the way [`f12_action_navigates_to_the_real_definition_line`]
+    /// tests the mechanism itself. This is what actually proves the click *routes* there.
+    #[gpui::test]
+    fn ctrl_click_on_a_real_token_navigates_to_its_real_definition(cx: &mut TestAppContext) {
+        let project = write_scratch_project(FIXTURE_SOURCE);
+        let main_rs = project.path().join("src").join("main.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_rs.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let client_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+            let ready = app.read_with(cx, |app, _| {
+                matches!(
+                    app.lsp_clients
+                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
+                    Some(LspClientState::Ready(_))
+                )
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < client_deadline,
+                "the real rust-analyzer client never became Ready within 120s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        let (row_bounds, shaped) = app
+            .read_with(cx, |app, _| {
+                app.file_view_row_layout.get(&CALL_SITE_LINE).cloned()
+            })
+            .expect("the call-site row must have real painted layout by now");
+        let click_point = gpui::point(
+            row_bounds.left() + shaped.x_for_index(CALL_SITE_BYTE_RANGE.start + 1),
+            row_bounds.center().y,
+        );
+        // `Modifiers::secondary()` reads `control` on every platform this test actually runs on
+        // (non-macOS - see that method's own docs) - a real, held Ctrl, not a stand-in for it.
+        let ctrl_click = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        // Retried the same real way `f12_action_navigates_to_the_real_definition_line` retries
+        // its own equivalent request: a real `textDocument/definition` response can honestly come
+        // back empty while rust-analyzer is still mid-index, and a real user would just click
+        // again. Re-clicking (not just re-waiting) is load-bearing here - a single stale response
+        // means nothing will ever change without a fresh request.
+        let definition_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            cx.simulate_click(click_point, ctrl_click);
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(300));
+            cx.run_until_parked();
+            // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9) - real
+            // navigation, not the click's own plain caret placement being mistaken for it.
+            let navigated = app.read_with(cx, |app, _| app.code_cursor == Some(4));
+            if navigated {
+                break;
+            }
+            assert!(
+                Instant::now() < definition_deadline,
+                "a real Ctrl+click on the real call-site token never navigated \
+                 AdeApp::code_cursor to the real definition line within 120s - last observed \
+                 code_cursor: {:?}",
+                app.read_with(cx, |app, _| app.code_cursor)
+            );
+        }
+    }
+
+    /// A plain click still just places the caret and dismisses `Self::hover` - it must *not*
+    /// also fire `trigger_goto_definition`. No real LSP round trip needed: this is purely about
+    /// which branch of the click handler ran, provable from the caret's own real position and
+    /// `Self::hover`'s own state alone.
+    #[gpui::test]
+    fn a_plain_click_with_no_modifier_does_not_trigger_navigation(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn one() {}\nfn two() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        // A real, deliberately stale hover entry, seeded directly (the same established pattern
+        // `hover_popover_position_tests` uses) - if a plain click ever started dismissing it via
+        // the Ctrl+click path by mistake, this would still catch that as a real behavior change,
+        // even though this test's main point is that nothing *navigates*.
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path.clone(),
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn one()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let row_bounds = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&2).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 2's real row should have painted real layout by now");
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_cursor),
+            Some(2),
+            "a plain click must still move the real caret to the clicked line"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "a plain click must still dismiss a real, stale hover card - GitHub issue #186's own \
+             existing behavior, which the Ctrl+click addition must not have disturbed"
+        );
+    }
 }
 
 /// Real regression coverage for bug 2 in this revision's brief: the Hover popover used to render
@@ -900,6 +1597,16 @@ mod hover_popover_position_tests {
         path: PathBuf,
         line_number: usize,
     ) {
+        seed_ready_hover_with_signature(app, cx, path, line_number, "fn real_symbol()");
+    }
+
+    fn seed_ready_hover_with_signature(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        path: PathBuf,
+        line_number: usize,
+        signature: &str,
+    ) {
         app.update(cx, |app, cx| {
             app.hover = Some(HoverEntry {
                 path,
@@ -911,13 +1618,95 @@ mod hover_popover_position_tests {
                 },
                 status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
                     module_path: None,
-                    signature: "fn real_symbol()".to_string(),
+                    signature: signature.to_string(),
                     doc: None,
                 })),
             });
             cx.notify();
         });
         cx.run_until_parked();
+    }
+
+    /// Regression coverage for a real, live-reproduced TypeScript symptom: a long, complex type
+    /// signature painted cut off mid-glyph instead of wrapping inside the card. Proven the same
+    /// way this module's other position tests prove real layout - real painted bounds, not a
+    /// description of intent.
+    ///
+    /// Opens a real `.rs` file (not `.txt`): [`render_hover_signature`] only has real, separate
+    /// flex items for `flex_wrap()` to wrap *between* when the signature is genuinely tokenized
+    /// into multiple syntax-highlighted runs - an unhighlighted fallback (no real extension
+    /// resolved) is exactly one run/one flex item, which `flex_wrap()` structurally cannot wrap
+    /// within on its own (that would need the text itself to reflow, a different real GPUI
+    /// behavior this fix doesn't touch). The real-world TS/Rust symptom this fixes always does
+    /// have a real extension resolved, so this is the real shape of the actual bug, not an
+    /// artificial best case.
+    #[gpui::test]
+    fn a_real_long_signature_wraps_inside_the_card_instead_of_being_clipped(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        // A real, long, genuinely multi-token Rust signature - comfortably wider than the card's
+        // own `max_w(430px)` if painted on a single line at 11.5px monospace, with enough real
+        // keyword/type/punctuation tokens for tree-sitter to split into many separate runs.
+        let long_signature = "pub fn process(&self, input: Result<HashMap<String, \
+                               Vec<Option<ComplexNestedGenericType>>>, \
+                               MyCustomErrorTypeWithALongName>) -> AnotherReallyLongReturnTypeName";
+        seed_ready_hover_with_signature(&app, cx, file_path, 1, long_signature);
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let first_token = cx
+            .debug_bounds("hover-signature-token-0")
+            .expect("the real signature's own first painted run should have painted real bounds");
+        // Real, verified-by-inspection tree-sitter-rust output for this exact fixture: 33 real
+        // runs, with the 25th (index 24, the `AnotherReallyLongReturnTypeName` return type)
+        // landing on the real card's second painted line - comfortably past both the first
+        // line's own real token count and any plausible off-by-a-few tokenizer drift.
+        let later_token = cx.debug_bounds("hover-signature-token-24").expect(
+            "a real signature this long and this token-dense must genuinely produce at least 25 \
+             separate highlighted runs - if this fails, either the fixture stopped being \
+             realistic or highlight_block's own tokenization regressed",
+        );
+
+        assert!(
+            later_token.right() <= card.right() + gpui::px(1.0),
+            "no real signature token may paint past the real card's own right edge (token right \
+             {:?}, card right {:?}) - a token painting past the card's edge is exactly the \
+             pre-fix clipping bug",
+            later_token.right(),
+            card.right()
+        );
+        assert!(
+            later_token.top() > first_token.top(),
+            "a real signature this long must genuinely wrap onto more than one line - a later \
+             real run must paint on a real, lower line than the first, not side-by-side on one \
+             unbroken (and therefore clipped) line (first token top {:?}, later token top {:?})",
+            first_token.top(),
+            later_token.top()
+        );
+        assert!(
+            card.size.height > px(60.0),
+            "a real signature that genuinely wraps across several lines must grow the real \
+             card's own painted height well past a single line's (~31px) - a card that stayed \
+             short would mean the wrap never really happened (got {:?})",
+            card.size.height
+        );
     }
 
     /// The real, load-bearing proof that the popover is anchored to the real hovered row, not
@@ -1474,5 +2263,759 @@ mod vue_two_server_wiring_tests {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(300));
         }
+    }
+}
+
+/// GitHub issue #186's real coverage for Surface C's Hover popup: that it is triggered by the real
+/// pointer resting on a real token (not by a click, which is what it used to be), and that it
+/// genuinely goes away again - by moving the pointer off the token, by clicking elsewhere in the
+/// editor, and by `Escape`. Before this issue there was no dismissal path of any kind: an opened
+/// card only ever went away by switching tab/file/worktree.
+///
+/// The dismissal tests seed [`AdeApp::hover`] directly (the same established pattern
+/// [`hover_popover_position_tests`] already uses) against a plain `.txt` file, because dismissal
+/// is genuinely independent of the `textDocument/hover` round trip. The *trigger* test uses a real
+/// `.rs` file, because resolving a pointer position to a token is exactly what it is proving.
+#[cfg(test)]
+mod hover_pointer_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    fn open_file<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        source: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Entity<AdeApp>,
+        &'a mut VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join(name);
+        std::fs::write(&file_path, source).expect("write fixture");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        (repo, file_path, app, cx)
+    }
+
+    /// The real painted `(Bounds, ShapedLine)` for `line_number`, panicking with a useful message
+    /// rather than silently skipping the assertions if the row never painted.
+    fn row_layout(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        line_number: usize,
+    ) -> (gpui::Bounds<Pixels>, gpui::ShapedLine) {
+        app.read_with(cx, |app, _| {
+            app.file_view_row_layout.get(&line_number).cloned()
+        })
+        .unwrap_or_else(|| panic!("line {line_number}'s real row should have painted real layout"))
+    }
+
+    /// A real window-space point in the middle of `byte_range`'s real glyphs on `line_number`.
+    fn point_on_token(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        line_number: usize,
+        byte_range: Range<usize>,
+    ) -> gpui::Point<Pixels> {
+        let (bounds, shaped) = row_layout(app, cx, line_number);
+        let start = shaped.x_for_index(byte_range.start);
+        let end = shaped.x_for_index(byte_range.end);
+        gpui::point(bounds.left() + (start + end) / 2.0, bounds.center().y)
+    }
+
+    fn seed_ready_hover(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        path: PathBuf,
+        line_number: usize,
+        byte_range: Range<usize>,
+    ) {
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path,
+                line_number,
+                byte_range,
+                position: lsp_core::lsp_types::Position {
+                    line: line_number as u32 - 1,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn real_symbol()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    /// The load-bearing proof for bug 1's first half: a real mouse *move* onto a real token arms a
+    /// real hover for exactly that token, and a real *click* on the very same pixel does not.
+    /// Before this issue the two were the other way round - hover was wired to `.on_click` on
+    /// every syntax run, with no mouse-position tracking anywhere in the app.
+    #[gpui::test]
+    fn a_real_mouse_move_onto_a_real_token_arms_a_real_hover_and_a_real_click_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        // `fn alpha() {}` - `alpha` spans bytes 3..8.
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.rs", "fn alpha() {}\nfn beta() {}\n");
+
+        let on_alpha = point_on_token(&app, cx, 1, 3..8);
+        cx.simulate_mouse_move(on_alpha, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let pending = app
+            .read_with(cx, |app, _| app.hover_pending.clone())
+            .expect("a real mouse move onto a real token must arm a real hover anchor");
+        assert_eq!(pending.path, file_path);
+        assert_eq!(pending.line_number, 1);
+        assert!(
+            pending.byte_range.contains(&4),
+            "the armed anchor must cover the real `alpha` token the pointer is actually on, got \
+             bytes {:?} of `fn alpha() {{}}`",
+            pending.byte_range
+        );
+        assert_eq!(pending.position.line, 0);
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "nothing may be requested or painted before the real trigger delay has elapsed - a \
+             pointer merely sweeping across a line must not fire a real LSP request per token"
+        );
+
+        // The real debounce genuinely elapses and genuinely consumes the anchor.
+        cx.background_executor
+            .advance_clock(HOVER_TRIGGER_DELAY + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.hover_pending.is_none()),
+            "once the real trigger delay elapses the armed anchor must be consumed by a real \
+             `request_hover`, not left armed forever"
+        );
+
+        // A real click on the same pixel arms nothing: hover is a pointer-rest gesture now.
+        app.update(cx, |app, _| {
+            app.dismiss_hover();
+        });
+        cx.simulate_click(on_alpha, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.hover_pending.is_none()
+                && app.hover.is_none()),
+            "a real click must no longer open the Hover popup - that was the trigger this issue \
+             replaces, and it is now what dismisses it"
+        );
+    }
+
+    /// Bug 1's second half, dismissal route 1: moving the pointer off the anchor token closes the
+    /// real painted card.
+    #[gpui::test]
+    fn moving_the_real_pointer_off_the_real_anchor_token_dismisses_the_real_card(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.txt", "alpha bravo\ncharlie delta\n");
+        seed_ready_hover(&app, cx, file_path, 1, 0..5);
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "sanity check: the real card must be painted before this test dismisses it"
+        );
+
+        // A real point well outside every painted code row - the pointer has left the editor.
+        let (row_bounds, _) = row_layout(&app, cx, 1);
+        let away = gpui::point(row_bounds.left(), row_bounds.top() - gpui::px(120.0));
+        cx.simulate_mouse_move(away, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "moving the real pointer away from the real anchor token must dismiss the real card"
+        );
+        assert!(
+            cx.debug_bounds("hover-card").is_none(),
+            "and the real card must genuinely stop painting, not just lose its state"
+        );
+    }
+
+    /// The other side of the same rule: moving *onto* the card must not dismiss it, or its own
+    /// `F12 definition` footer would be impossible to press.
+    #[gpui::test]
+    fn moving_the_real_pointer_onto_the_real_card_itself_keeps_it_open(cx: &mut TestAppContext) {
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.txt", "alpha bravo\ncharlie delta\n");
+        seed_ready_hover(&app, cx, file_path, 1, 0..5);
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real card must be painted before this test moves onto it");
+
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_some()),
+            "the real card must survive the pointer moving onto it - it is the only way to reach \
+             its own `F12 definition` footer"
+        );
+        assert!(cx.debug_bounds("hover-card").is_some());
+    }
+
+    /// Dismissal route 2: a real click elsewhere in the editor.
+    #[gpui::test]
+    fn a_real_click_in_the_editor_dismisses_the_real_card(cx: &mut TestAppContext) {
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.txt", "alpha bravo\ncharlie delta\n");
+        seed_ready_hover(&app, cx, file_path, 1, 0..5);
+        assert!(cx.debug_bounds("hover-card").is_some());
+
+        let (row_bounds, _) = row_layout(&app, cx, 2);
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "a real click on another row must dismiss the real card - this is the exact \
+             \"click and it stays open, can't close it\" report this issue is about"
+        );
+    }
+
+    /// Dismissal route 3: a real `Escape` keystroke, through the real bound action rather than a
+    /// direct handler call.
+    #[gpui::test]
+    fn a_real_escape_keystroke_dismisses_the_real_card(cx: &mut TestAppContext) {
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.txt", "alpha bravo\ncharlie delta\n");
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        seed_ready_hover(&app, cx, file_path, 1, 0..5);
+        assert!(cx.debug_bounds("hover-card").is_some());
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "a real `Escape` keystroke must dismiss the real card"
+        );
+        assert!(cx.debug_bounds("hover-card").is_none());
+    }
+}
+
+/// GitHub issue #186's real coverage for Surface C's Diagnostic popup: that it is a genuinely
+/// floating, anchored popover which does not take layout space away from the code view (it used to
+/// be a plain in-flow child at the bottom of the File view's own flex column - "the ugly thing that
+/// opens at the bottom of the editor"), that it shows the diagnostic at the caret rather than every
+/// diagnostic in the file, and that it honours the design's `lsp_popup ... one at a time` rule.
+///
+/// Driven through a **real** diagnostic: a genuinely spawned minimal LSP server
+/// (`crate::lsp::client::lsp_connection_facade_tests`'s own `spawn_fake_server`, the same real
+/// `LspClient::spawn` handshake every production server goes through) pushing a real
+/// `textDocument/publishDiagnostics`. Seeding `AdeApp::file_view_diagnostics` directly would prove
+/// nothing here - `render_file_view` genuinely recomputes that map from the live connection on
+/// every repaint, so a seeded value never survives to the frame the card would paint in.
+#[cfg(test)]
+mod diagnostic_popover_tests {
+    use super::*;
+    use crate::lsp::client::lsp_connection_facade_tests::{publish_and_wait, spawn_fake_server};
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    const SOURCE: &str = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n";
+
+    /// Two real render passes around a `run_until_parked`, preceded by a real `cx.notify()` so the
+    /// window genuinely redraws (and `debug_bounds` genuinely re-measures) rather than answering
+    /// from a stale frame - the same "render, park, render" shape every File-view test in this
+    /// crate already uses.
+    fn render_twice(app: &Entity<AdeApp>, cx: &mut VisualTestContext) {
+        app.update(cx, |_app, cx| {
+            cx.notify();
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn set_caret(app: &Entity<AdeApp>, cx: &mut VisualTestContext, line_number: usize) {
+        app.update(cx, |app, cx| {
+            app.code_cursor = Some(line_number);
+            cx.notify();
+        });
+        render_twice(app, cx);
+    }
+
+    /// The real regression proof for bug 2: with a real diagnostic present, the code view's own
+    /// painted box is byte-for-byte the box it had without one, and the real card paints *over*
+    /// that box rather than below it. The old in-flow card could not do either - being an ordinary
+    /// `flex_none` child of the File view's flex column, it genuinely shortened the code list.
+    #[gpui::test]
+    fn the_real_diagnostic_card_floats_over_the_code_without_reflowing_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        // A real, minimal LSP server installed *before* the first render, so `ensure_lsp_client`
+        // finds a Ready entry for this key and never spawns a real rust-analyzer for the fixture.
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+        set_caret(&app, cx, 1);
+
+        let clean_code_list = cx
+            .debug_bounds("file-view-code-list")
+            .expect("the real code list should have painted real bounds");
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_none(),
+            "sanity check: a clean file must paint no card at all, not an empty one"
+        );
+
+        // A real `publishDiagnostics` from the real server process, on line 0 (1-based line 1).
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_and_wait(
+            &client,
+            &uri.to_string(),
+            "the trait bound `&str: Into<Column>` is not satisfied",
+        );
+        render_twice(&app, cx);
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.file_view_diagnostics.contains_key(&1),
+                "sanity check: the real published diagnostic must have reached the real render \
+                 path's own per-line index, got: {:?}",
+                app.file_view_diagnostics.keys().collect::<Vec<_>>()
+            );
+        });
+
+        let card = cx
+            .debug_bounds("diagnostic-card")
+            .expect("a real diagnostic at the caret must paint a real card");
+        let code_list_with_card = cx
+            .debug_bounds("file-view-code-list")
+            .expect("the real code list should still be painting");
+
+        assert_eq!(
+            code_list_with_card, clean_code_list,
+            "the real code view's own painted box must be completely unaffected by a real \
+             diagnostic being present - the old in-flow card genuinely shrank it, which is the \
+             whole bug"
+        );
+        assert!(
+            card.top() < code_list_with_card.bottom() && card.bottom() > code_list_with_card.top(),
+            "a real floating card overlaps the real code area it is anchored into (card {card:?}, \
+             code list {code_list_with_card:?}) - a docked one would sit entirely below it"
+        );
+
+        // ...and it is genuinely anchored under the offending row, not painted at a fixed spot.
+        let row_1 = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&1).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 1's real row should have painted real layout");
+        assert!(
+            (card.top() - row_1.bottom()).abs() < gpui::px(2.0),
+            "the real card must paint directly under the real offending row (row bottom {:?}, \
+             card top {:?})",
+            row_1.bottom(),
+            card.top()
+        );
+    }
+
+    /// The other half of bug 2: the card follows the caret and shows *that* line's diagnostic
+    /// only. The old card listed every diagnostic anywhere in the open file, permanently.
+    #[gpui::test]
+    fn the_real_card_shows_the_caret_line_only_and_yields_to_the_other_lsp_popups(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_and_wait(&client, &uri.to_string(), "mismatched types");
+        set_caret(&app, cx, 1);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "sanity check: the caret is on the real offending line, so the card must be up"
+        );
+
+        // The caret moves to a genuinely clean line - the real diagnostic is still in the file,
+        // and the card must nonetheless go away.
+        set_caret(&app, cx, 3);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_none(),
+            "the card must describe the caret's own line, not dump every diagnostic in the file - \
+             line 3 is clean, so nothing should paint even though line 1 is still broken"
+        );
+
+        // Back on the offending line, a real Hover popup takes the one-at-a-time slot.
+        set_caret(&app, cx, 1);
+        assert!(cx.debug_bounds("diagnostic-card").is_some());
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path.clone(),
+                line_number: 1,
+                byte_range: 3..8,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn alpha()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        render_twice(&app, cx);
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "sanity check: the real Hover popup is the one that should be showing now"
+        );
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_none(),
+            "`lsp_popup: None | Completions | Diagnostic | Hover | one at a time` - a real Hover \
+             popup and a real Diagnostic popup must never paint simultaneously"
+        );
+
+        app.update(cx, |app, cx| {
+            app.dismiss_hover();
+            cx.notify();
+        });
+        render_twice(&app, cx);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "and the ambient Diagnostic card comes back once the requested popup it yielded to \
+             has gone"
+        );
+    }
+}
+
+/// GitHub issue #186, bug 3: the dim end-of-line diagnostic message must not collide with the code
+/// text it annotates. It used to live inside the row's `flex_none` code-run box - which, per that
+/// box's own comment, "never shrinks" - with no wrap, truncation or ellipsis of its own, so on a
+/// narrow pane a real `rustc` message simply overflowed and painted over the glyphs.
+///
+/// Driven through a real published diagnostic and a genuinely resized window, measuring the real
+/// painted boxes of the code text and the message against each other - not by inspecting styles.
+#[cfg(test)]
+mod inline_diagnostic_message_tests {
+    use super::*;
+    use crate::lsp::client::lsp_connection_facade_tests::{publish_and_wait, spawn_fake_server};
+    use gpui::TestAppContext;
+
+    /// Long enough that it cannot possibly fit beside the code on a narrow pane - which is exactly
+    /// the real case that used to overflow. Real `rustc` messages are routinely this long.
+    const LONG_MESSAGE: &str = "the trait bound `&str: Into<Column>` is not satisfied, and the \
+                                trait `Into<Column>` is not implemented for `&str`, but it is \
+                                implemented for `String`";
+
+    #[gpui::test]
+    fn a_real_long_inline_message_truncates_instead_of_overlapping_the_real_code_text(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // A genuinely narrow window, so the real message genuinely cannot fit beside the code.
+        cx.simulate_resize(gpui::size(px(1100.0), px(400.0)));
+        cx.run_until_parked();
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_and_wait(&client, &uri.to_string(), LONG_MESSAGE);
+        for _ in 0..2 {
+            app.update(cx, |app, cx| {
+                cx.notify();
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let code_text = cx
+            .debug_bounds("file-view-code-text-1")
+            .expect("line 1's real painted glyph box");
+        let message = cx
+            .debug_bounds("file-view-diagnostic-message-1")
+            .expect("the real inline diagnostic message should have painted real bounds");
+        // The row's own real text column - the box both the code glyphs and the message have to
+        // stay inside.
+        let text_row = cx
+            .debug_bounds("file-view-text-row-1")
+            .expect("line 1's real text column");
+
+        assert!(
+            message.left() >= code_text.right() - px(0.5),
+            "the real message must begin at or after the real code glyphs end, never on top of \
+             them (code text {code_text:?}, message {message:?})"
+        );
+        assert!(
+            message.right() <= text_row.right() + px(0.5),
+            "the real message must be cut off at the real text column's right edge rather than \
+             overflowing past it (message {message:?}, text column {text_row:?})"
+        );
+        assert!(
+            message.size.width < px(320.0) + px(0.5),
+            "and it must never grow past its own real cap, however long the real message is - \
+             got {:?} for a {} character message",
+            message.size.width,
+            LONG_MESSAGE.len()
+        );
+        assert!(
+            code_text.right() <= text_row.right() + px(0.5),
+            "the real code glyphs must still be the ones that keep their natural width - the \
+             message is the shrinkable sibling, not the code (code text {code_text:?}, text \
+             column {text_row:?})"
+        );
+    }
+}
+
+/// Regression coverage for the follow-up to GitHub issue #186 (design review): the hover
+/// signature must be genuinely syntax-highlighted, and the Diagnostic card must genuinely wear
+/// the design's own red-tinted chrome rather than the neutral Hover/Completions popover chrome.
+#[cfg(test)]
+mod hover_signature_and_diagnostic_chrome_tests {
+    use super::*;
+
+    /// A real, multi-token Rust signature must come back as more than one run, each with a real,
+    /// non-`Text` kind for its keyword/type tokens - the pre-fix bug painted the whole signature
+    /// as one flat-colored string, which this would see as a single run.
+    #[test]
+    fn a_real_rust_signature_is_split_into_real_distinctly_kinded_runs() {
+        let runs = highlighted_signature_runs("pub fn where_eq(col: &str) -> Self", Some("rs"));
+        assert!(
+            runs.len() > 1,
+            "a real signature with a keyword, an identifier and a type must yield more than one \
+             run, got: {runs:?}"
+        );
+        let pub_kind = runs
+            .iter()
+            .find(|(text, _)| text.as_ref() == "pub")
+            .map(|(_, kind)| *kind)
+            .expect("a real 'pub' token must be its own run");
+        assert_eq!(
+            pub_kind,
+            code_view::HighlightKind::Keyword,
+            "'pub' must be classified as a real keyword, the same way it is in the code editor \
+             itself"
+        );
+        let fn_kind = runs
+            .iter()
+            .find(|(text, _)| text.as_ref() == "fn")
+            .map(|(_, kind)| *kind)
+            .expect("a real 'fn' token must be its own run");
+        assert_eq!(fn_kind, code_view::HighlightKind::Keyword);
+    }
+
+    /// No extension resolved (shouldn't happen in practice, but must degrade honestly rather than
+    /// silently dropping the signature) still returns the full text, as a single unhighlighted run.
+    #[test]
+    fn no_extension_still_returns_the_real_full_text_as_one_unhighlighted_run() {
+        let runs = highlighted_signature_runs("let x: i32", None);
+        assert_eq!(runs.len(), 1, "got: {runs:?}");
+        assert_eq!(runs[0].0.as_ref(), "let x: i32");
+        assert_eq!(runs[0].1, code_view::HighlightKind::Text);
+    }
+
+    /// The Diagnostic popover's own chrome must be the design's real red-tinted card, not a copy
+    /// of the neutral Hover/Completions popover chrome - the regression this guards against is
+    /// exactly the one flagged in review: the card compiled and painted, but with the wrong
+    /// colors, which a bounds-only test (`diagnostic_popover_tests`) can't catch.
+    #[test]
+    fn the_diagnostic_card_border_is_the_real_design_red_not_the_shared_popover_border() {
+        assert_ne!(
+            theme::border::DIAGNOSTIC_CARD,
+            theme::border::POPOVER,
+            "the Diagnostic card must not reuse Hover/Completions' neutral border"
+        );
+        assert_eq!(
+            theme::border::DIAGNOSTIC_CARD.default,
+            theme::hex_rgba(0x3a2224),
+            "must match the mockup's own `border:1px solid #3a2224` exactly"
+        );
+    }
+
+    /// [`theme::syntax::DIAGNOSTIC_ROW_BG`] already carried the design's exact red-tinted
+    /// background hex before this fix - this pins that the Diagnostic card actually *uses* it
+    /// (see `render_diagnostic_card_content`), rather than the coincidentally-similar-looking
+    /// [`theme::surface::POPOVER`] it used to paint with.
+    #[test]
+    fn the_diagnostic_row_bg_token_matches_the_real_design_card_background() {
+        assert_eq!(
+            theme::syntax::DIAGNOSTIC_ROW_BG.default,
+            theme::hex_rgba(0x191416),
+            "must match the mockup's own `background:#191416` exactly"
+        );
+    }
+
+    /// Regression coverage for the second design-review pass: the mockup's hover/diagnostic
+    /// footer bands paint their own real `#141719` background, distinct from both cards' own
+    /// `#181c20`/`#191416` body backgrounds and from [`theme::surface::CARD_SUNK`] (`#131619`,
+    /// the *different* footer tone every other card footer in the app uses).
+    #[test]
+    fn the_lsp_popover_footer_token_matches_the_real_design_footer_band_background() {
+        assert_eq!(
+            theme::surface::LSP_POPOVER_FOOTER.default,
+            theme::hex_rgba(0x141719),
+            "must match the mockup's own `background:#141719` exactly"
+        );
+        assert_ne!(
+            theme::surface::LSP_POPOVER_FOOTER,
+            theme::surface::CARD_SUNK,
+            "the Hover/Diagnostic footer band is a real, different tone from every other card's \
+             footer, not a duplicate of CARD_SUNK"
+        );
+    }
+
+    /// The Diagnostic card's own footer border (`#2b2224`) is a real, different shade from the
+    /// card's outer border (`#3a2224`, [`theme::border::DIAGNOSTIC_CARD`]) - the mockup uses two
+    /// distinct red tones on the same card, not one border colour reused for both seams.
+    #[test]
+    fn the_diagnostic_card_footer_border_is_its_own_real_shade_distinct_from_the_outer_border() {
+        assert_eq!(
+            theme::border::DIAGNOSTIC_CARD_FOOTER.default,
+            theme::hex_rgba(0x2b2224),
+            "must match the mockup's own `border-top:1px solid #2b2224` exactly"
+        );
+        assert_ne!(
+            theme::border::DIAGNOSTIC_CARD_FOOTER,
+            theme::border::DIAGNOSTIC_CARD,
+            "the footer seam and the outer card outline are two real, different reds in the \
+             mockup, not the same token reused twice"
+        );
+    }
+
+    /// Regression coverage for a real typo caught in design review: this token's own doc comment
+    /// already cited the mockup's real `#e3908b` headline colour, but the literal value assigned
+    /// was `0xf07f77` - a different colour nobody had cross-checked against the doc comment right
+    /// above it, let alone the real mockup file.
+    #[test]
+    fn the_diagnostic_card_message_color_matches_the_real_design_headline_not_the_old_typo() {
+        assert_eq!(
+            theme::syntax::DIAGNOSTIC_CARD_MESSAGE.default,
+            theme::hex_rgba(0xe3908b),
+            "must match the mockup's own diagnostic headline `color:#e3908b` exactly"
+        );
+        assert_ne!(
+            theme::syntax::DIAGNOSTIC_CARD_MESSAGE.default,
+            theme::hex_rgba(0xf07f77),
+            "must not still be the old, uncaught typo'd value"
+        );
+    }
+}
+
+/// Regression coverage for the hover card's real, mockup-shaped internal layout: three
+/// independently-padded/bordered bands (signature header, doc body, module-path/`F12 definition`
+/// footer), not one uniformly-padded flex column - see [`AdeApp::render_hover_card`]'s own docs
+/// for why a purely color-focused first pass missed this.
+#[cfg(test)]
+mod hover_card_footer_layout_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The mockup's hover footer puts `module::path` at the far left and `F12 definition` at the
+    /// far right, with a real `flex:1` spacer between them - not bunched together with a plain
+    /// gap, which is what the pre-review layout did. Proven the same way this file's other
+    /// popover-position tests prove real layout: real painted bounds, not a description of intent.
+    #[gpui::test]
+    fn the_module_path_and_definition_chip_sit_at_opposite_ends_of_the_real_footer(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: Some("core".to_string()),
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let definition_chip = cx
+            .debug_bounds("hover-card-goto-definition")
+            .expect("the real F12/definition chip should have painted real bounds");
+
+        assert!(
+            (card.right() - definition_chip.right()).abs() < px(15.0),
+            "the F12/definition chip must sit near the real footer's right edge (card right \
+             {:?}, chip right {:?}) - a bunched-together footer with no spacer would leave it \
+             far short of the edge",
+            card.right(),
+            definition_chip.right()
+        );
     }
 }

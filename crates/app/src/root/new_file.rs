@@ -419,7 +419,7 @@ impl AdeApp {
             ),
         );
         self.refresh_open_diff_file_cache();
-        self.hover = None;
+        self.dismiss_hover();
         self.dismiss_completions();
         self.save_active_file(cx);
         self.load_file_tree(self.file_tree_root.clone(), cx);
