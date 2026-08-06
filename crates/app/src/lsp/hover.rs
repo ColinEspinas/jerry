@@ -277,7 +277,7 @@ fn markup_text(contents: &lsp_types::HoverContents) -> String {
 /// output this app actually parses (`typescript-language-server`, captured in this module's own
 /// tests) uses `**` for emphasis, never `__` - so `__` is left alone entirely rather than risk
 /// silently corrupting a real identifier for a real server that doesn't even need it stripped.
-fn degrade_markdown_to_plain_text(markdown: &str) -> String {
+pub(crate) fn degrade_markdown_to_plain_text(markdown: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
     let mut in_fence = false;
     for raw_line in markdown.lines() {
