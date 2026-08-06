@@ -240,7 +240,7 @@ impl AdeApp {
         if had_open_file_tab {
             self.open_change = None;
             self.refresh_open_diff_file_cache();
-            self.hover = None;
+            self.dismiss_hover();
             // See `crate::code_surface::tabs::AdeApp::open_and_focus_file`'s identical
             // `dismiss_completions()` call for why (Revision R8.5b audit finding 3).
             self.dismiss_completions();

@@ -40,7 +40,9 @@
 //! - flagged here rather than silently left undocumented.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
@@ -55,11 +57,10 @@ use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
 use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
-    diagnostic_inline_message_color, diagnostic_row_bg, diagnostic_underline_color,
+    diagnostic_row_bg, diagnostic_underline_color, render_inline_diagnostic_message,
 };
 use crate::code_surface::symbols;
 use crate::lsp::diagnostics as diagnostics_view;
-use crate::lsp::hover as hover_view;
 use crate::root::{
     AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDedent,
     EditorDelete, EditorDown, EditorEnd, EditorEnter, EditorEscape, EditorHome, EditorIndent,
@@ -585,6 +586,16 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #186: an open LSP popup is the first thing `Escape` should close, ahead of
+        // both behaviours below - the same precedence `CompletionsDismiss` already has for the
+        // Completions popup (which owns `Escape` outright while it is open, via the
+        // `"file-editor && completions"` binding). `dismiss_hover` reports whether there was
+        // genuinely anything to close, so a plain `Escape` with no popup up still falls straight
+        // through to the multi-cursor collapse and the accessibility escape hatch.
+        if self.dismiss_hover() {
+            cx.notify();
+            return;
+        }
         if self.apply_multi_cursor_action(cx, EditBuffer::collapse_to_single_cursor) {
             return;
         }
@@ -773,8 +784,11 @@ impl AdeApp {
         // A real caret move away from wherever the popup was anchored invalidates it - real
         // editors close completions the moment the caret leaves the word being completed, rather
         // than leaving a popup up that no longer describes the real insertion point Tab/Enter
-        // would act on.
+        // would act on. GitHub issue #186: the same reasoning applies to the Hover card, which
+        // until now had no dismissal path of any kind - a keyboard caret move is the user working
+        // somewhere other than wherever the pointer happens to be resting.
         self.dismiss_completions();
+        self.dismiss_hover();
         cx.notify();
         self.sync_cursor_and_scroll();
         self.reset_caret_blink(cx);
@@ -1455,7 +1469,6 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     pub secondary_cursors_local: Vec<usize>,
     pub diagnostics: &'a [diagnostics_view::LineDiagnostic],
     pub hovered_byte_range: Option<Range<usize>>,
-    pub hover_target: Option<&'a Path>,
     /// GitHub issue #29's real, already-computed inline blame label for *this* line - `Some`
     /// only when `is_current` (only the current line ever shows it); see
     /// `crate::code_surface::blame_view::AdeApp::inline_blame_render_model`'s own docs for how
@@ -1582,7 +1595,6 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         secondary_cursors_local,
         diagnostics,
         hovered_byte_range,
-        hover_target,
         inline_blame,
         caret_style,
         caret_blink_visible,
@@ -1619,9 +1631,6 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     let drag_row_path = row_path.clone();
     let click_line_index = line_index;
     let click_line_number = line_number;
-    let click_hover_target = hover_target.map(|target| target.to_path_buf());
-    let click_line_runs = line.runs.clone();
-    let click_line_text = line.text.clone();
 
     let paint_entity = entity;
     let paint_path = path;
@@ -1845,6 +1854,21 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .flex_none()
                 .child(visible_text),
         );
+    // GitHub issue #186: the dim end-of-line diagnostic message, placed *inside* `text_row` (a
+    // real `flex_1`/`min_w_0` box) immediately after the `flex_none` code text, rather than as a
+    // sibling of that whole wrapper further down the row where it used to be. As a sibling it
+    // competed with the code text for the row's width and, having no `min_w_0`/`truncate` of its
+    // own, overflowed and painted over the glyphs on a narrow pane. Here the code text is the
+    // `flex_none` child and this is the shrinkable one, so it takes exactly whatever width is
+    // left after the code and ellipsizes - see `render_inline_diagnostic_message`'s own docs.
+    if let Some(first) = diagnostics.first() {
+        let first_line = first.message.lines().next().unwrap_or_default();
+        text_row = text_row.child(render_inline_diagnostic_message(
+            first_line,
+            first.severity,
+            line_number,
+        ));
+    }
     // GitHub issue #29: the current line's dimmed inline git blame, placed *in-flow* immediately
     // after the code text so it begins right at the end of the line and is truncated at the
     // pane's right edge - rather than pinned to the far right of the row (a flex sibling of the
@@ -1931,26 +1955,13 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 this.code_cursor = Some(click_line_number);
                 this.reset_caret_blink(cx);
 
-                if let Some(hover_target) = &click_hover_target {
-                    if let Some(token_range) = token_at_offset(&click_line_runs, local_offset) {
-                        let token_text =
-                            click_line_text.get(token_range.clone()).unwrap_or_default();
-                        if !token_text.trim().is_empty() {
-                            let position = hover_view::position_for_line_byte_offset(
-                                click_line_number as u32 - 1,
-                                &click_line_text,
-                                token_range.start,
-                            );
-                            this.request_hover(
-                                hover_target.clone(),
-                                click_line_number,
-                                token_range,
-                                position,
-                                cx,
-                            );
-                        }
-                    }
-                }
+                // GitHub issue #186: a real click no longer *opens* the Hover popup - it closes
+                // it. Hover is a pointer-rest gesture now (`AdeApp::track_hover_pointer`), and a
+                // click is the user doing something else entirely, so leaving a card open over
+                // the text they just clicked into would be the "click and it stays open, can't
+                // close it" bug the issue reports. `F12` no longer depends on this having run
+                // either: `Self::trigger_goto_definition` falls back to the caret's own position.
+                this.dismiss_hover();
                 cx.stop_propagation();
                 cx.notify();
             }),
@@ -1960,8 +1971,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         // Some(MouseButton::Left)`, verified via the finder subagent, real usage confirmed at
         // `data_table.rs:350`'s own `if !ev.dragging() { return; }`), the same real idiom this
         // whole file's own per-row hit-testing already uses for clicks - registered per-row
-        // (matching `crate::code_surface::lsp_ui`'s own per-row `.on_mouse_move` hover-debounce
-        // precedent in this same crate) rather than a window-level capture, so this naturally
+        // rather than as a window-level capture, so this naturally
         // only extends the selection while the pointer is actually over *some* row - dragging
         // past the very top/bottom of the visible rows (auto-scroll) is a real, documented gap,
         // not built this phase - see `BUILD-LOG.md`.
@@ -2060,18 +2070,9 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .child(text_row),
         );
 
-    if let Some(first) = diagnostics.first() {
-        let first_line = first.message.lines().next().unwrap_or_default();
-        row = row.child(
-            gpui::div()
-                .pl(gpui::px(10.0))
-                .text_color(diagnostic_inline_message_color(first.severity))
-                .child(first_line.to_string()),
-        );
-    }
-
-    // NB: the current line's inline git blame is rendered *inside* `text_row` above (right after
-    // the code runs), not appended here at the end of the row - see that construction's own docs.
+    // NB: the current line's inline git blame *and* its inline diagnostic message are both
+    // rendered inside `text_row` above (right after the code runs), not appended here at the end
+    // of the row - see those constructions' own docs.
 
     row.into_any_element()
 }
@@ -2292,10 +2293,15 @@ pub(crate) fn split_runs_for_marked_range(
 }
 
 /// Finds the real syntax-highlight run in `runs` (a `RenderedLine::runs` slice) containing byte
-/// `offset`, for click-to-hover token detection - mirrors the read-only File view's own per-run
-/// click boundaries (`crate::code_surface::file_view::render_file_view_line`), computed here from a
+/// `offset`, for hover token detection - mirrors the read-only File view's own per-run
+/// boundaries (`crate::code_surface::file_view::render_file_view_line`), computed here from a
 /// hit-tested offset instead of from per-run `div` boundaries.
-fn token_at_offset(
+///
+/// `pub(in crate::code_surface)` since GitHub issue #186: `crate::code_surface::lsp_ui::
+/// AdeApp::hover_anchor_at` resolves the pointer to a token through this exact same function
+/// rather than a second, independently-drifting notion of where one token ends and the next
+/// begins.
+pub(in crate::code_surface) fn token_at_offset(
     runs: &[(gpui::SharedString, code_view::HighlightKind)],
     offset: usize,
 ) -> Option<Range<usize>> {

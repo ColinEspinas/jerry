@@ -40,8 +40,8 @@
 //! `use gpui::{...};` block instead.
 
 use crate::code_surface::state::{
-    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
-    HoverStatus,
+    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverAnchor,
+    HoverEntry, HoverStatus,
 };
 use crate::keymap::{self};
 use crate::language;
