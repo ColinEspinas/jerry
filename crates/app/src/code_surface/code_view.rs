@@ -2446,17 +2446,22 @@ fn is_tracked_closer(ch: char) -> bool {
 /// background re-highlight. Cost is one linear pass over a span list that was just built by a
 /// parse costing orders of magnitude more.
 pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
-    // Pass 1: find every tracked bracket character, in source order, and work out which ones are
-    // halves of a real pair. `depths[i]` stays `None` for a bracket that never found its partner.
-    // `bracket_bytes` records where each of those was, so pass 2 can `debug_assert` it is walking
-    // the exact same sequence - the two passes iterate the same spans by the same rule, and this
-    // is what would catch them ever drifting apart and silently colouring the wrong characters.
+    // Pass 1a: find every tracked bracket character, in source order, and work out which ones
+    // are halves of a real pair - a single-stack matcher, exactly as before, except its only real
+    // job now is the boolean "did this occurrence ever find a real partner", not depth. `depths`
+    // is computed fresh in pass 1b below (see that pass's own docs for why a first-pass depth is
+    // wrong for GitHub issue #182). `bracket_bytes`/`bracket_chars`/`bracket_scopes` record every
+    // occurrence in source order, so pass 1b can walk the identical sequence a second time and
+    // pass 2 can `debug_assert` it too - all three passes iterating the same spans by the same
+    // rule is what would catch them ever drifting apart and silently colouring the wrong
+    // characters.
     let mut bracket_bytes: Vec<usize> = Vec::new();
-    let mut depths: Vec<Option<usize>> = Vec::new();
+    let mut bracket_chars: Vec<char> = Vec::new();
+    let mut bracket_scopes: Vec<u32> = Vec::new();
+    let mut matched: Vec<bool> = Vec::new();
     // One independent stack per `HighlightSpan::scope` - see this function's own "Injected regions
-    // pair independently" docs. Each entry is (expected closer, index into `depths` of the opener,
-    // that opener's nesting depth *within its own scope*).
-    let mut stacks: HashMap<u32, Vec<(char, usize, usize)>> = HashMap::new();
+    // pair independently" docs. Each entry is (expected closer, index into `matched` of the opener).
+    let mut stacks: HashMap<u32, Vec<(char, usize)>> = HashMap::new();
 
     for span in &spans {
         if span.kind != HighlightKind::PunctuationBracket {
@@ -2467,20 +2472,27 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
         };
         let stack = stacks.entry(span.scope).or_default();
         for (offset, ch) in text.char_indices() {
+            // Only a *tracked* opener/closer (`(`/`)`/`[`/`]`/`{`/`}` - see
+            // `TRACKED_BRACKET_PAIRS`) gets a real occurrence slot at all; an untracked
+            // punctuation character sharing this span's `PunctuationBracket` kind (an angle
+            // bracket, most commonly - deliberately never tracked, see this function's own docs)
+            // must stay invisible to `bracket_bytes` the same way it always has, or pass 2's own
+            // `next_bracket` walk (which only ever advances on a tracked char) desyncs from it.
+            if closer_for(ch).is_none() && !is_tracked_closer(ch) {
+                continue;
+            }
+            let index = bracket_bytes.len();
+            bracket_bytes.push(span.start + offset);
+            bracket_chars.push(ch);
+            bracket_scopes.push(span.scope);
+            matched.push(false);
             if let Some(closer) = closer_for(ch) {
-                stack.push((closer, depths.len(), stack.len()));
-                bracket_bytes.push(span.start + offset);
-                depths.push(None);
-            } else if is_tracked_closer(ch) {
-                bracket_bytes.push(span.start + offset);
-                depths.push(None);
-                let closer_index = depths.len() - 1;
-                if let Some(&(expected, opener_index, depth)) = stack.last() {
-                    if expected == ch {
-                        stack.pop();
-                        depths[opener_index] = Some(depth);
-                        depths[closer_index] = Some(depth);
-                    }
+                stack.push((closer, index));
+            } else if let Some(&(expected, opener_index)) = stack.last() {
+                if expected == ch {
+                    stack.pop();
+                    matched[opener_index] = true;
+                    matched[index] = true;
                 }
             }
         }
@@ -2488,6 +2500,37 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
 
     if bracket_bytes.is_empty() {
         return spans;
+    }
+
+    // Pass 1b (GitHub issue #182): recomputes `depths` over only the occurrences pass 1a found a
+    // real partner for, in effect dropping every unmatched opener from the stack retroactively -
+    // the fix the issue itself proposes. Pass 1a's own single stack counts an opener's depth as
+    // the stack's size *at push time*, which is wrong whenever an *earlier* opener in the same
+    // scope never gets a real closer: that earlier opener never leaves the stack, so it inflates
+    // the depth of every real, well-formed pair that follows it for the rest of the scope - one
+    // unterminated `(` mid-edit used to shift the whole rest of the file's ring by one. Walking
+    // the identical occurrence sequence a second time, skipping anything `matched` says never
+    // found a real partner, means the depth stack here only ever holds genuinely open, genuinely
+    // real pairs - exactly what the ring is supposed to reflect.
+    let mut depths: Vec<Option<usize>> = vec![None; bracket_bytes.len()];
+    let mut real_pair_stacks: HashMap<u32, Vec<usize>> = HashMap::new();
+    for index in 0..bracket_bytes.len() {
+        if !matched[index] {
+            continue;
+        }
+        let stack = real_pair_stacks.entry(bracket_scopes[index]).or_default();
+        if closer_for(bracket_chars[index]).is_some() {
+            depths[index] = Some(stack.len());
+            stack.push(index);
+        } else {
+            // `matched[index]` already guarantees this closer has a real partner somewhere
+            // earlier in this same scope, and skipping every unmatched occurrence keeps this
+            // stack's push/pop order identical to the real pairs alone - so the top of the stack
+            // here is always that exact partner.
+            if let Some(opener_index) = stack.pop() {
+                depths[index] = depths[opener_index];
+            }
+        }
     }
 
     // Pass 2: rebuild the span list, splitting each `PunctuationBracket` span into its individual
@@ -5322,9 +5365,68 @@ mod tests {
     /// Shapes have to agree, not just counts - a naive depth counter would happily colour `([)]`
     /// as two nested pairs. The real stack matcher pairs `[` with `]` and leaves both the `(` and
     /// the `)` plain, because neither ever met a partner of its own shape.
+    ///
+    /// `[`/`]` land at ring depth 0 (`"-1-1"`), not depth 1 - GitHub issue #182's own fix:
+    /// the never-matched `(` is dropped from the depth stack retroactively, so it can't hold a
+    /// level for the real pair that comes after it, the same way it wouldn't if it simply weren't
+    /// there. Before that fix this asserted `"-2-2"` - `[`/`]` read as nested one level inside an
+    /// opener that was never going to close.
     #[test]
     fn mismatched_shapes_do_not_pair_up() {
-        assert_eq!(depth_map("([)]", "([)]"), "-2-2");
+        assert_eq!(depth_map("([)]", "([)]"), "-1-1");
+    }
+
+    /// GitHub issue #182's own minimal case: one permanently-unmatched opener, followed by two
+    /// completely real, well-formed pairs. Before the fix, `(x)` read as nested one level inside
+    /// the leading `(` (ring 1, `"2"`) and `(y(z))` one level deeper again (rings "2"/"3") - both
+    /// wrong, since that leading `(` was never actually their ancestor; it just never closed.
+    /// With it dropped from the stack retroactively, `(x)` and the outer `(y(z))` both correctly
+    /// read as their own real, independent depth-0 pairs, `(z)` one real level inside `(y...)`.
+    #[test]
+    fn an_unmatched_opener_no_longer_shifts_the_depth_of_real_pairs_that_follow_it() {
+        assert_eq!(depth_map("( (x) (y(z))", "()"), "-.1.1.1.2.21");
+    }
+
+    /// Real regression coverage for GitHub issue #182, reproduced with the exact source the
+    /// issue itself used: three "functions" in one file, the middle one deliberately never
+    /// closing its own body - the ordinary state of a file being actively typed into. Before the
+    /// fix, `fn c`'s own perfectly well-formed body brace and its nested `ok()` call rendered at
+    /// ring depths 4/5 instead of 0/1 (verified by hand-tracing the pre-fix algorithm against
+    /// this exact source - it matches the issue's own reported "fn c... renders at depths 4/5"
+    /// exactly), because two earlier, permanently-unmatched openers (`fn a`'s own `{`, orphaned
+    /// when its own `}` got consumed matching the wrong bracket inside `([)]`; and the stray `(`
+    /// inside `([)]` itself) never left the depth stack.
+    ///
+    /// Rather than hand-transcribe the combined source's full ~90-character depth map (fragile,
+    /// and no more informative than the property that actually matters), this asserts the
+    /// property GitHub issue #182 is really about: `fn c`'s own brackets must colour *identically*
+    /// whether or not those two earlier unmatched openers precede it in the same file. Comparing
+    /// against a completely independent, isolated parse of the same `fn c` snippet is what proves
+    /// that - if the earlier unmatched brackets were still leaking into depth, the two parses
+    /// would disagree.
+    #[test]
+    fn an_earlier_unmatched_opener_does_not_shift_a_later_well_formed_functions_own_depth() {
+        let with_earlier_unmatched_openers =
+            "fn a() { let x = ([)]; }\nfn b() { let y = ( ;\n}\nfn c() { ok(); }\n";
+        let isolated = "fn c() { ok(); }\n";
+        let bracket_chars = "(){}[]";
+
+        let combined_map = depth_map(with_earlier_unmatched_openers, bracket_chars);
+        let isolated_map = depth_map(isolated, bracket_chars);
+        let combined_fn_c_tail = &combined_map[combined_map.len() - isolated_map.len()..];
+
+        assert_eq!(
+            combined_fn_c_tail, isolated_map,
+            "fn c's own well-formed brackets must colour identically whether or not two \
+             earlier, permanently-unmatched openers precede it in the same file - a real \
+             difference here means the earlier unmatched brackets are still leaking into depth, \
+             GitHub issue #182's own bug (combined tail: {combined_fn_c_tail:?}, isolated: \
+             {isolated_map:?})"
+        );
+        // Pinned to the exact real values, not just "they match": `fn c`'s own body brace and
+        // its nested `ok()` call must differ by one real ring step from each other, at the
+        // file's own natural depth 0/1 - not the pre-fix bug's 4/5.
+        assert_eq!(isolated_map, "....11.1...22..1.");
     }
 
     /// Nothing panics or produces nonsense on input that is nothing but noise - the honest
