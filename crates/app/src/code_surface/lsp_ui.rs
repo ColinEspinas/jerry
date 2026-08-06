@@ -497,7 +497,7 @@ impl AdeApp {
         let diagnostic = diagnostics
             .iter()
             .find(|candidate| candidate.severity == worst)?;
-        let (row_bounds, _) = self.file_view_row_layout.get(&line_number)?;
+        let (row_bounds, shaped) = self.file_view_row_layout.get(&line_number)?;
 
         let row_top = row_bounds.top();
         let row_bottom = row_bounds.bottom();
@@ -510,12 +510,17 @@ impl AdeApp {
         } else {
             (row_top - DIAGNOSTIC_CARD_MAX_HEIGHT).max(self.body_bounds.top())
         };
+        // Anchored under the real, offending span's own start column - the same real
+        // `shaped.x_for_index(byte_range.start)` measurement `Self::render_hover_card` already
+        // makes off the identical `(Bounds, ShapedLine)` pair, not the row's bare left edge. An
+        // earlier version anchored at `row_bounds.left()` alone, which discarded `shaped` entirely
+        // and put the card flush under the line-number gutter regardless of where in the line the
+        // real error actually was - visibly wrong for anything past a short line, and the reason
+        // this was still wrong after two design-fidelity passes that only ever touched the card's
+        // own internal chrome, never its position.
+        let anchor_x = row_bounds.left() + shaped.x_for_index(diagnostic.byte_range.start);
 
-        Some(render_diagnostic_card_content(
-            diagnostic,
-            row_bounds.left(),
-            top,
-        ))
+        Some(render_diagnostic_card_content(diagnostic, anchor_x, top))
     }
 }
 
@@ -2528,7 +2533,9 @@ mod hover_pointer_tests {
 #[cfg(test)]
 mod diagnostic_popover_tests {
     use super::*;
-    use crate::lsp::client::lsp_connection_facade_tests::{publish_and_wait, spawn_fake_server};
+    use crate::lsp::client::lsp_connection_facade_tests::{
+        publish_and_wait, publish_at_and_wait, spawn_fake_server,
+    };
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     const SOURCE: &str = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n";
@@ -2641,6 +2648,66 @@ mod diagnostic_popover_tests {
              card top {:?})",
             row_1.bottom(),
             card.top()
+        );
+    }
+
+    /// Direct regression coverage for the card's real horizontal position: it must be anchored
+    /// under the real, offending span's own start column, not flush under the row's bare left
+    /// edge (i.e. under the line-number gutter). An earlier version of `AdeApp::
+    /// render_diagnostic_card` discarded the row's own `ShapedLine` entirely and anchored at
+    /// `row_bounds.left()` alone - a bug the sibling test above could never catch, since every
+    /// diagnostic it publishes starts at column 0, where the two anchors are numerically identical
+    /// by coincidence. This one publishes a diagnostic on `"alpha"` (columns 3..8 of `"fn alpha()
+    /// {}"`), where they are not.
+    #[gpui::test]
+    fn the_real_diagnostic_card_is_anchored_under_the_offending_span_not_the_row_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+        set_caret(&app, cx, 1);
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        // `"fn alpha() {}"` - `alpha` starts at byte/column 3, not 0.
+        publish_at_and_wait(&client, &uri.to_string(), "cannot find value `alpha`", 3, 8);
+        render_twice(&app, cx);
+
+        let card = cx
+            .debug_bounds("diagnostic-card")
+            .expect("a real diagnostic at the caret must paint a real card");
+        let (row_1_bounds, row_1_shaped) = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&1).cloned())
+            .expect("line 1's real row should have painted real layout");
+        let expected_left = row_1_bounds.left() + row_1_shaped.x_for_index(3);
+
+        assert!(
+            (card.left() - expected_left).abs() < gpui::px(2.0),
+            "the real card must be anchored under the real offending span's own start column \
+             (expected left {expected_left:?}, got {:?})",
+            card.left()
+        );
+        assert!(
+            (card.left() - row_1_bounds.left()).abs() > gpui::px(5.0),
+            "sanity check: this diagnostic starts well past column 0, so a card genuinely \
+             anchored to it must land well past the row's own bare left edge too (row left {:?}, \
+             card left {:?}) - equal here would mean the fix regressed back to ignoring the real \
+             column entirely",
+            row_1_bounds.left(),
+            card.left()
         );
     }
 
