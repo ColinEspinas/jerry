@@ -490,7 +490,6 @@ impl AdeApp {
         if self.completions.is_some() {
             return None;
         }
-        let line_number = self.code_cursor?;
         let relative_path = self.active_editable_path()?;
         let (last_path, _) = self.file_view_last_layout_for.as_ref()?;
         if last_path != &relative_path {
@@ -499,14 +498,25 @@ impl AdeApp {
             // than guess one.
             return None;
         }
-        let diagnostics = self.file_view_diagnostics.get(&line_number)?;
-        let worst = diagnostics_view::Severity::worst(diagnostics)?;
-        let diagnostic = diagnostics
-            .iter()
-            .find(|candidate| candidate.severity == worst)?;
-        if self.hover.is_some() && !self.hover_targets_a_real_diagnostic() {
-            return None;
-        }
+        // Two real triggers, not one: the caret's own line (keyboard nav, or a click that moved
+        // it there) still shows the card exactly as before, and - since the follow-up to GitHub
+        // issue #186 - the pointer resting directly on a diagnostic's own span shows it too, even
+        // when the caret is sitting somewhere else entirely. A real hover showing something else
+        // (an unrelated symbol) still wins the screen rather than stacking a caret-driven
+        // diagnostic underneath it.
+        let (line_number, diagnostic) = match (self.hover.as_ref(), self.hovered_diagnostic()) {
+            (Some(hover), Some(diagnostic)) => (hover.line_number, diagnostic),
+            (Some(_), None) => return None,
+            (None, _) => {
+                let line_number = self.code_cursor?;
+                let diagnostics = self.file_view_diagnostics.get(&line_number)?;
+                let worst = diagnostics_view::Severity::worst(diagnostics)?;
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|candidate| candidate.severity == worst)?;
+                (line_number, diagnostic)
+            }
+        };
         let (row_bounds, shaped) = self.file_view_row_layout.get(&line_number)?;
 
         let row_top = row_bounds.top();
@@ -533,19 +543,17 @@ impl AdeApp {
         Some(render_diagnostic_card_content(diagnostic, anchor_x, top))
     }
 
-    /// Whether [`Self::hover`]'s own hovered span genuinely overlaps a real diagnostic on the
-    /// same line - the one real condition that flips the usual Hover-over-Diagnostic priority
-    /// (see [`Self::render_diagnostic_card`]'s own docs for why). Shared between that method and
-    /// [`Self::render_hover_card`] so both sides of the swap agree on the exact same real
-    /// overlap, rather than two independently-computed checks that could disagree at the edges.
-    fn hover_targets_a_real_diagnostic(&self) -> bool {
-        let Some(hover) = self.hover.as_ref() else {
-            return false;
-        };
-        let Some(diagnostics) = self.file_view_diagnostics.get(&hover.line_number) else {
-            return false;
-        };
-        diagnostics.iter().any(|diagnostic| {
+    /// The real diagnostic [`Self::hover`]'s own hovered span genuinely overlaps on the same
+    /// line, if any - the one real condition that flips the usual Hover-over-Diagnostic priority
+    /// (see [`Self::render_diagnostic_card`]'s own docs for why), and that method's second real
+    /// trigger for the Diagnostic card itself, independent of wherever the caret happens to be.
+    /// Shared between that method and [`Self::render_hover_card`] so both sides of the swap agree
+    /// on the exact same real overlap, rather than two independently-computed checks that could
+    /// disagree at the edges.
+    fn hovered_diagnostic(&self) -> Option<&diagnostics_view::LineDiagnostic> {
+        let hover = self.hover.as_ref()?;
+        let diagnostics = self.file_view_diagnostics.get(&hover.line_number)?;
+        diagnostics.iter().find(|diagnostic| {
             hover.byte_range.start < diagnostic.byte_range.end
                 && diagnostic.byte_range.start < hover.byte_range.end
         })
@@ -741,7 +749,15 @@ impl AdeApp {
         if hover.path != self.file_tree_root.join(&active_relative) {
             return None;
         }
-        if self.hover_targets_a_real_diagnostic() {
+        if self.hovered_diagnostic().is_some() {
+            return None;
+        }
+        // A real, answered hover with genuinely nothing to say paints nothing at all rather than
+        // an empty "no symbol information here" card - that card told the user their pointer
+        // landed somewhere real (a token) but useless, which in practice is indistinguishable
+        // from having landed on plain whitespace between tokens; either way there's nothing to
+        // show, so neither should show a popup.
+        if matches!(hover.status, HoverStatus::Ready(None)) {
             return None;
         }
         let (row_bounds, shaped) = self.file_view_row_layout.get(&hover.line_number)?;
@@ -850,16 +866,10 @@ fn render_hover_card_content(
                     .child(format!("hover failed: {message}")),
             );
         }
-        HoverStatus::Ready(None) => {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::text::FAINT)
-                    .child("no symbol information here"),
-            );
-        }
+        // Unreachable in practice - `Self::render_hover_card` returns `None` itself for
+        // `Ready(None)` rather than calling this function, so a genuinely empty hover shows no
+        // popup at all.
+        HoverStatus::Ready(None) => {}
         HoverStatus::Ready(Some(model)) => {
             // Header: the signature, `padding:7px 10px 6px;border-bottom:1px solid #23282c` in
             // the mockup - `theme::border::CARD` is that exact hex, already registered for
@@ -1666,6 +1676,75 @@ mod hover_popover_position_tests {
             cx.notify();
         });
         cx.run_until_parked();
+    }
+
+    /// A real, answered hover with genuinely nothing to say (`HoverStatus::Ready(None)`) must
+    /// paint no popup at all - not an empty "no symbol information here" card. The `Loading` ->
+    /// `Ready(None)` transition genuinely happens (the loading card was up, then the real answer
+    /// arrived empty), and the card must disappear rather than swap to a different, still-empty
+    /// message.
+    #[gpui::test]
+    fn a_genuinely_empty_hover_result_paints_no_popup_at_all(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path.clone(),
+                line_number: 1,
+                byte_range: 0..3,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Loading,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "sanity check: the loading state itself still paints a real card"
+        );
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..3,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(None),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("hover-card").is_none(),
+            "a genuinely empty real hover answer must paint nothing at all, not an empty \"no \
+             symbol information here\" card"
+        );
     }
 
     /// Regression coverage for a real, live-reproduced TypeScript symptom: a long, complex type
@@ -2955,6 +3034,65 @@ mod diagnostic_popover_tests {
             cx.debug_bounds("hover-card").is_none(),
             "and the real hover card must not paint alongside it, or the two would read as the \
              same information duplicated"
+        );
+    }
+
+    /// Follow-up to GitHub issue #186: the Diagnostic card is no longer caret-only - resting the
+    /// real pointer directly on a diagnostic's own span shows it too, even while the caret is
+    /// sitting on a completely different, clean line. "Keep the click thing but just add the
+    /// hover" - the caret/click trigger from the tests above stays exactly as it was; this is
+    /// strictly a second, independent trigger.
+    #[gpui::test]
+    fn hovering_a_diagnostic_span_shows_the_card_even_while_the_caret_is_elsewhere(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        // The real diagnostic lands on line 1 ("alpha", columns 3..8); the caret sits on the
+        // genuinely clean line 3 the whole time.
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_at_and_wait(&client, &uri.to_string(), "cannot find value `alpha`", 3, 8);
+        set_caret(&app, cx, 3);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_none(),
+            "sanity check: the caret's own line is clean and nothing is hovered, so no card \
+             should be up yet"
+        );
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 3..8,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+                status: HoverStatus::Ready(None),
+            });
+            cx.notify();
+        });
+        render_twice(&app, cx);
+
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "the real pointer is resting directly on the diagnostic's own span - the card must \
+             show even though the caret never moved off the clean line"
         );
     }
 }
