@@ -1345,6 +1345,18 @@ pub struct AdeApp {
     /// once its slow response finally arrives. A request's completion handler only ever applies
     /// its result if the generation it captured at dispatch time still matches this field.
     pub(crate) completions_generation: u64,
+    /// A real, one-shot flag: `true` right after [`crate::lsp::completion_popup::AdeApp::
+    /// accept_active_completion`] splices an accepted item's text into the buffer, consumed
+    /// (reset to `false`) by the very next [`Self::prepare_lsp_sync`] call for that edit. The
+    /// text an accept splices in routinely still ends in a real identifier character (accepting
+    /// a bare `println` leaves the caret right after a real `n`), which - left unchecked - made
+    /// `prepare_lsp_sync`'s own completion-trigger check treat the *accept's own edit* as a fresh,
+    /// completion-worthy keystroke and immediately reopen the popup, now filtered down to
+    /// essentially just the item the user had just picked. Real editors don't do this: accepting
+    /// is itself a real signal the user is done with that particular completion, not an invitation
+    /// to show it right back. Does not touch the same edit's real `textDocument/didChange` sync at
+    /// all - only the completion-request half of that one debounce tick is skipped.
+    pub(crate) completions_suppress_next_trigger: bool,
     /// Per-line diagnostic index (`crate::lsp::diagnostics::index_diagnostics_by_line`) for
     /// whichever Rust file [`Self::render_file_view`] last rendered - recomputed at the start of
     /// every render for a Rust file, cleared for a non-Rust file so diagnostics can't bleed

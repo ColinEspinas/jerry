@@ -1651,11 +1651,18 @@ impl AdeApp {
         let content_unchanged = self.lsp_last_synced_content.get(relative_path) == Some(&content);
         let should_sync = !content_unchanged && client.supports_document_sync();
 
+        // Consumed here, exactly once, regardless of which branch below actually runs - see this
+        // field's own docs. Only suppresses the organic (non-`force_completion`) trigger check:
+        // an explicit Ctrl+Space right after accepting is a real, deliberate re-ask and must
+        // still work.
+        let suppress_organic_trigger = std::mem::take(&mut self.completions_suppress_next_trigger);
         let completion_context = if force_completion {
             Some(lsp_core::lsp_types::CompletionContext {
                 trigger_kind: lsp_core::lsp_types::CompletionTriggerKind::INVOKED,
                 trigger_character: None,
             })
+        } else if suppress_organic_trigger {
+            None
         } else {
             let char_before_cursor = crate::lsp::completion::char_before(&content, cursor);
             let trigger_characters = client.completion_trigger_characters();
@@ -2990,6 +2997,105 @@ process.stdin.on('data', (d) => {
                  was, never dropping it back to a bare Loading state before any new response has \
                  had a chance to arrive - got: {:?}",
                 app.completions.as_ref().map(|entry| &entry.status)
+            );
+        });
+    }
+
+    /// Direct regression coverage for the real, live-reported bug: accepting a completion
+    /// routinely leaves the caret right after a real identifier character (accepting a bare
+    /// `println` leaves it right after a real `n`), which the very next debounced re-sync tick
+    /// used to read as a fresh, completion-worthy keystroke - immediately reopening the popup,
+    /// filtered down to essentially just the item the user had just picked. Calls `prepare_lsp_sync`
+    /// directly (no `cx.run_until_parked` needed) for the same reason [`a_debounced_re_sync_never_drops_an_already_ready_popup_back_to_loading`]
+    /// does: the decision under test is synchronous, before any request is ever dispatched.
+    #[gpui::test]
+    fn accepting_a_completion_does_not_immediately_reopen_the_popup(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let absolute = root.join("src").join("main.rs");
+        std::fs::write(&absolute, "fn a() {\n    \n}\n").expect("write main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        // A real, seeded `Ready` popup with one item whose bare label ends in a real identifier
+        // character once accepted - the exact real shape that used to retrigger itself.
+        app.update(cx, |app, _cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "println".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.edit_buffer_mut(&relative)
+                .expect("a real buffer")
+                .move_to("fn a() {\n    ".len());
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_completions_accept_action(&crate::root::CompletionsAccept, window, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.completions.is_none(),
+                "accepting a completion must genuinely dismiss the popup, got: {:?}",
+                app.completions.as_ref().map(|entry| &entry.status)
+            );
+            let content = &app
+                .edit_buffer(&relative)
+                .expect("a real buffer")
+                .content;
+            assert!(
+                content.contains("println"),
+                "sanity check: the real accept must have spliced the real item's text into the \
+                 real buffer, got: {content:?}"
+            );
+        });
+
+        // The real decision under test: the very next debounced re-sync tick (driven directly,
+        // synchronously - see this test's own docs) must not reopen the popup just because the
+        // caret now sits right after a real identifier character.
+        app.update(cx, |app, cx| {
+            app.prepare_lsp_sync(&root, &relative, cx, false);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.completions.is_none(),
+                "the debounce tick immediately following an accept must not reopen the popup - \
+                 got: {:?}",
+                app.completions.as_ref().map(|entry| &entry.status)
+            );
+        });
+
+        // And the suppression is genuinely one-shot: a *subsequent* completion-worthy tick at the
+        // exact same real position must still trigger normally, proving this isn't a permanent,
+        // stuck-off switch - only the one debounce tick immediately after the accept is skipped.
+        app.update(cx, |app, cx| {
+            app.prepare_lsp_sync(&root, &relative, cx, false);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.completions.is_some(),
+                "a real, later debounce tick at the same completion-worthy position must still \
+                 trigger normally - the suppression must not outlive the one tick right after an \
+                 accept"
             );
         });
     }
