@@ -4012,10 +4012,15 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("alpha"), fake_item("beta")],
-                    selected: 0,
-                },
+                // Built through the real `CompletionsStatus::ready` constructor with an empty
+                // typed prefix, so the popup's own real client-side filter (GitHub issue #189)
+                // is what decides what's visible here too - never a hand-written `visible` list
+                // that could disagree with it.
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("alpha"), fake_item("beta")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });
@@ -4080,10 +4085,11 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("gamma")],
-                    selected: 0,
-                },
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("gamma")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });
@@ -4103,6 +4109,241 @@ mod editing_tests {
                 .clone()),
             content_before_escape,
             "dismissing via Escape must not touch the real buffer content"
+        );
+    }
+
+    /// The real labels the Completions popup is currently *showing* - resolved through
+    /// [`crate::lsp::completion_popup::CompletionsStatus::Ready`]'s own `visible` index list, so
+    /// these assertions read exactly what the popup's own render reads, never the raw, unfiltered
+    /// server list underneath it.
+    fn visible_completion_labels(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<String> {
+        app.read_with(cx, |app, _| {
+            let Some(entry) = app.completions.as_ref() else {
+                return Vec::new();
+            };
+            match &entry.status {
+                crate::lsp::completion_popup::CompletionsStatus::Ready {
+                    items, visible, ..
+                } => visible
+                    .iter()
+                    .filter_map(|index| items.get(*index))
+                    .map(|item| item.label.clone())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    /// The popup's real selected row, as an index into what it's actually showing.
+    fn selected_completion_row(app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext) -> usize {
+        app.read_with(cx, |app, _| {
+            match &app.completions.as_ref().expect("an open popup").status {
+                crate::lsp::completion_popup::CompletionsStatus::Ready { selected, .. } => {
+                    *selected
+                }
+                _ => panic!("expected a real Ready popup"),
+            }
+        })
+    }
+
+    /// Seeds a real, open `Ready` popup for `relative` carrying `labels`, through the same real
+    /// `CompletionsStatus::ready` constructor `crate::lsp::client::AdeApp::apply_completion_result`
+    /// itself uses for a genuine server response - with an empty typed prefix, i.e. the honest
+    /// state right after a trigger character, before anything has been typed to narrow by.
+    fn seed_completions(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        relative: &std::path::Path,
+        labels: &[&str],
+    ) {
+        let items = labels
+            .iter()
+            .map(|label| lsp_core::lsp_types::CompletionItem {
+                label: label.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        app.update(cx, |app, cx| {
+            app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
+                path: relative.to_path_buf(),
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(items, "")
+                    .expect("a real, non-empty ready state"),
+            });
+            cx.notify();
+        });
+    }
+
+    /// GitHub issue #189, test (a): the real bug. With a popup already open, typing more real
+    /// characters must narrow what it shows *immediately* - on the keystroke itself, with no
+    /// `textDocument/completion` round trip in between - and an item the typed text doesn't match
+    /// at all must genuinely disappear.
+    ///
+    /// Driven through real, bound keystrokes (`cx.simulate_input`), so this exercises the whole
+    /// real path a user's typing takes: `EntityInputHandler::replace_text_in_range` ->
+    /// `AdeApp::schedule_lsp_sync` -> `AdeApp::refilter_completions`. No clock is advanced
+    /// afterwards on purpose: the 50ms debounced server re-request must not be what makes this
+    /// pass (there is no real LSP client in this test at all), because instant narrowing between
+    /// round trips is precisely what the issue asks for.
+    #[gpui::test]
+    fn typing_past_the_trigger_point_narrows_the_real_completions_list(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        seed_completions(
+            &app,
+            cx,
+            &relative,
+            &["version", "verify", "vector_of_readers", "unwrap", "clone"],
+        );
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers", "unwrap", "clone"],
+            "sanity check: with nothing typed past the trigger point, the popup must show the \
+             server's own full set, in the server's own order"
+        );
+
+        cx.simulate_input("ver");
+
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "let x = ver\n",
+            "sanity check: the three characters must genuinely have been typed into the real \
+             buffer, or this proves nothing about typing"
+        );
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers"],
+            "typing `ver` must narrow the popup to the real matches and drop `unwrap`/`clone`, \
+             which contain no `ver` match at all - GitHub issue #189's exact reported symptom"
+        );
+
+        // Backspace must genuinely widen it back out - only possible because the full server
+        // response is kept intact underneath the filtered view, never narrowed in place.
+        cx.simulate_keystrokes("backspace backspace");
+        assert_eq!(buffer_content(&app, cx, &relative), "let x = v\n");
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers"],
+            "`v` still matches exactly these three and still excludes `unwrap`/`clone`"
+        );
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify", "vector_of_readers", "unwrap", "clone"],
+            "deleting the last typed character must restore the server's own full set"
+        );
+    }
+
+    /// GitHub issue #189, test (b): the matching semantics actually chosen - a real fuzzy
+    /// *subsequence* match (VSCode-equivalent), not a prefix/substring one. `vrs` is genuinely
+    /// non-contiguous inside `version` (`v`, then `r`, then `s`, with characters skipped between
+    /// them), so a substring matcher would drop it; `verify` and `unwrap` must still be dropped,
+    /// so this isn't passing by simply matching everything.
+    #[gpui::test]
+    fn a_real_non_contiguous_typed_prefix_still_matches_the_right_item(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        seed_completions(&app, cx, &relative, &["version", "verify", "unwrap"]);
+
+        cx.simulate_input("vrs");
+
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version"],
+            "a real fuzzy client keeps `version` for the non-contiguous query `vrs`, and still \
+             drops `verify` (no `s` at all) and `unwrap` (no `v` at all)"
+        );
+    }
+
+    /// GitHub issue #189, test (c): keyboard selection must stay pinned to the *item* the user
+    /// picked as the list narrows underneath it, never to a stale row number - and whatever row is
+    /// selected must be the item a real `Enter` actually inserts. This is the real desync risk
+    /// filtering introduces: "the Nth visible row" and "the Nth item in the server's list" stop
+    /// being the same thing the moment anything is filtered out.
+    #[gpui::test]
+    fn keyboard_selection_stays_aligned_with_the_filtered_completions_view(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        app.update(cx, |app, cx| {
+            app.edit_buffer_mut(&relative)
+                .unwrap()
+                .move_to("let x = ".len());
+            cx.notify();
+        });
+        // `version` is deliberately the *third* server item, so the narrowing below genuinely
+        // moves it to a different row - a test where it stayed put would prove nothing.
+        seed_completions(
+            &app,
+            cx,
+            &relative,
+            &["clone", "unwrap", "version", "verify"],
+        );
+
+        cx.simulate_keystrokes("down down");
+        assert_eq!(selected_completion_row(&app, cx), 2);
+        assert_eq!(
+            visible_completion_labels(&app, cx)[2],
+            "version",
+            "sanity check: row 2 really is `version` before any narrowing"
+        );
+
+        cx.simulate_input("ver");
+
+        assert_eq!(
+            visible_completion_labels(&app, cx),
+            ["version", "verify"],
+            "sanity check: the list really did narrow, so the row numbers really did shift"
+        );
+        let selected = selected_completion_row(&app, cx);
+        assert_eq!(
+            visible_completion_labels(&app, cx)[selected],
+            "version",
+            "the selection must follow the real item the user had picked to its new row (0), not \
+             stay on the stale row number (2), which no longer exists at all"
+        );
+
+        // And one real `down` from there must land on the next *visible* row, which a real
+        // `Enter` must then actually insert.
+        cx.simulate_keystrokes("down");
+        let selected = selected_completion_row(&app, cx);
+        assert_eq!(visible_completion_labels(&app, cx)[selected], "verify");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "let x = verify\n",
+            "accepting must insert the item on the selected *visible* row, resolved back through \
+             the filter into the real server list"
         );
     }
 
@@ -4515,10 +4756,11 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
-                status: crate::lsp::completion_popup::CompletionsStatus::Ready {
-                    items: vec![fake_item("alpha")],
-                    selected: 0,
-                },
+                status: crate::lsp::completion_popup::CompletionsStatus::ready(
+                    vec![fake_item("alpha")],
+                    "",
+                )
+                .expect("a real, non-empty ready state"),
             });
             cx.notify();
         });
