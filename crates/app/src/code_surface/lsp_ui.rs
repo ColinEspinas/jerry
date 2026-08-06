@@ -529,12 +529,14 @@ impl AdeApp {
 /// chip is deliberately **not** drawn - this app has no `textDocument/codeAction` support at all,
 /// so a chip there would be a button bound to nothing.
 ///
-/// Chrome is [`AdeApp::render_hover_card`]'s exactly - `theme::surface::POPOVER`,
-/// `theme::border::POPOVER`, `theme::radius::CARD_SM`, and no shadow (the design's own "Design
-/// tokens" section: "**one** [shadow] in the whole product - the completion popup"). The mockup
-/// gives this one card a red-tinted border and background of its own, but reusing the shared
-/// popover chrome is what keeps the three `lsp_popup` states reading as one family; the severity
-/// dot and message colour carry the diagnostic identity instead.
+/// Chrome follows the mockup's own diagnostic card exactly, not [`AdeApp::render_hover_card`]'s
+/// neutral popover chrome: `theme::syntax::DIAGNOSTIC_ROW_BG` (`#191416`) for the background and
+/// `theme::border::DIAGNOSTIC_CARD` (`#3a2224`) for the border, both read directly off
+/// `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s card (`background:#191416;border:1px
+/// solid #3a2224`) - the red tint is how this card reads as *ambient/alarming* at a glance,
+/// distinct from Hover/Completions' neutral `theme::surface::POPOVER`/`theme::border::POPOVER`.
+/// `theme::radius::CARD_SM` and no shadow still match every other popover (the design's own
+/// "Design tokens" section: "**one** [shadow] in the whole product - the completion popup").
 fn render_diagnostic_card_content(
     diagnostic: &diagnostics_view::LineDiagnostic,
     anchor_x: Pixels,
@@ -591,9 +593,9 @@ fn render_diagnostic_card_content(
         .max_h(DIAGNOSTIC_CARD_MAX_HEIGHT)
         .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
-        .bg(theme::surface::POPOVER)
+        .bg(theme::syntax::DIAGNOSTIC_ROW_BG)
         .border_1()
-        .border_color(theme::border::POPOVER)
+        .border_color(theme::border::DIAGNOSTIC_CARD)
         .child(
             div()
                 .flex()
@@ -704,7 +706,14 @@ impl AdeApp {
             (row_top - HOVER_CARD_MAX_HEIGHT).max(self.body_bounds.top())
         };
 
-        Some(render_hover_card_content(hover, anchor_x, top, cx))
+        // The active file's own extension - the same one `Self::request_hover` resolved a
+        // highlighter for when the code line itself was painted - so the signature reads with
+        // the exact same grammar/colors as the code around it, not a guessed or absent one.
+        let extension = active_relative
+            .extension()
+            .and_then(|extension| extension.to_str());
+
+        Some(render_hover_card_content(hover, extension, anchor_x, top, cx))
     }
 }
 
@@ -715,6 +724,7 @@ impl AdeApp {
 /// since this one has a real early-return position/anchor computation ahead of it.
 fn render_hover_card_content(
     hover: &HoverEntry,
+    extension: Option<&str>,
     anchor_x: Pixels,
     top: Pixels,
     cx: &mut Context<AdeApp>,
@@ -788,13 +798,7 @@ fn render_hover_card_content(
             );
         }
         HoverStatus::Ready(Some(model)) => {
-            card = card.child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(12.0))
-                    .text_color(theme::text::HEADING)
-                    .child(model.signature.clone()),
-            );
+            card = card.child(render_hover_signature(&model.signature, extension));
             if let Some(doc) = &model.doc {
                 card = card.child(
                     div()
@@ -844,6 +848,61 @@ fn render_hover_card_content(
     }
 
     card.into_any_element()
+}
+
+/// The Hover popover's own signature line, syntax-highlighted like real code rather than painted
+/// as flat text (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own hover card shows `pub
+/// trait Into<T>: Sized` with real per-token colors - keyword purple, type gold - not one flat
+/// heading color).
+///
+/// Runs `signature` through [`code_view::highlight_block`] as a single-line, standalone fragment,
+/// the exact same "highlight a fragment on its own, not as part of a real open file" recipe the
+/// Diff and Merge views already use for a hunk/conflict side (see that function's own docs), then
+/// walks the resulting runs the same way [`crate::code_surface::file_view::render_file_view_line`]
+/// walks a real code row's `line.runs`: one `div` per run, colored via
+/// [`code_view::color_for_kind`]. `extension` comes from the active file
+/// ([`AdeApp::render_hover_card`]), so a Rust hover highlights as Rust, a TypeScript hover as
+/// TypeScript, and so on - never a guessed language.
+///
+/// `extension: None` (no active file extension resolved, which shouldn't happen in practice since
+/// a hover only exists for a file that's open) still renders correctly: `highlight_block` returns
+/// the text as one unhighlighted [`code_view::HighlightKind::Text`] run rather than nothing, so
+/// the signature is never silently dropped.
+fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::AnyElement {
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .font(font(theme::font::MONO))
+        .text_size(px(12.0));
+    for (run_index, (run_text, kind)) in
+        highlighted_signature_runs(signature, extension).into_iter().enumerate()
+    {
+        row = row.child(
+            div()
+                .id(("hover-signature-token", run_index))
+                .text_color(code_view::color_for_kind(kind))
+                .child(run_text),
+        );
+    }
+    row.into_any_element()
+}
+
+/// The pure half of [`render_hover_signature`] - just the `signature` -> colored-run computation,
+/// split out so it's directly `#[test]`-able without a `gpui::Window`/`TestAppContext` (mirroring
+/// how `code_view::highlight_block` itself is tested at the pure level, not by painting).
+fn highlighted_signature_runs(
+    signature: &str,
+    extension: Option<&str>,
+) -> Vec<(gpui::SharedString, code_view::HighlightKind)> {
+    code_view::highlight_block(
+        std::iter::once(signature),
+        extension,
+        code_view::HighlightOptions::default(),
+    )
+    .into_iter()
+    .next()
+    .map(|line| line.runs)
+    .unwrap_or_default()
 }
 
 /// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
@@ -2437,6 +2496,85 @@ mod inline_diagnostic_message_tests {
             "the real code glyphs must still be the ones that keep their natural width - the \
              message is the shrinkable sibling, not the code (code text {code_text:?}, text \
              column {text_row:?})"
+        );
+    }
+}
+
+/// Regression coverage for the follow-up to GitHub issue #186 (design review): the hover
+/// signature must be genuinely syntax-highlighted, and the Diagnostic card must genuinely wear
+/// the design's own red-tinted chrome rather than the neutral Hover/Completions popover chrome.
+#[cfg(test)]
+mod hover_signature_and_diagnostic_chrome_tests {
+    use super::*;
+
+    /// A real, multi-token Rust signature must come back as more than one run, each with a real,
+    /// non-`Text` kind for its keyword/type tokens - the pre-fix bug painted the whole signature
+    /// as one flat-colored string, which this would see as a single run.
+    #[test]
+    fn a_real_rust_signature_is_split_into_real_distinctly_kinded_runs() {
+        let runs = highlighted_signature_runs("pub fn where_eq(col: &str) -> Self", Some("rs"));
+        assert!(
+            runs.len() > 1,
+            "a real signature with a keyword, an identifier and a type must yield more than one \
+             run, got: {runs:?}"
+        );
+        let pub_kind = runs
+            .iter()
+            .find(|(text, _)| text.as_ref() == "pub")
+            .map(|(_, kind)| *kind)
+            .expect("a real 'pub' token must be its own run");
+        assert_eq!(
+            pub_kind,
+            code_view::HighlightKind::Keyword,
+            "'pub' must be classified as a real keyword, the same way it is in the code editor \
+             itself"
+        );
+        let fn_kind = runs
+            .iter()
+            .find(|(text, _)| text.as_ref() == "fn")
+            .map(|(_, kind)| *kind)
+            .expect("a real 'fn' token must be its own run");
+        assert_eq!(fn_kind, code_view::HighlightKind::Keyword);
+    }
+
+    /// No extension resolved (shouldn't happen in practice, but must degrade honestly rather than
+    /// silently dropping the signature) still returns the full text, as a single unhighlighted run.
+    #[test]
+    fn no_extension_still_returns_the_real_full_text_as_one_unhighlighted_run() {
+        let runs = highlighted_signature_runs("let x: i32", None);
+        assert_eq!(runs.len(), 1, "got: {runs:?}");
+        assert_eq!(runs[0].0.as_ref(), "let x: i32");
+        assert_eq!(runs[0].1, code_view::HighlightKind::Text);
+    }
+
+    /// The Diagnostic popover's own chrome must be the design's real red-tinted card, not a copy
+    /// of the neutral Hover/Completions popover chrome - the regression this guards against is
+    /// exactly the one flagged in review: the card compiled and painted, but with the wrong
+    /// colors, which a bounds-only test (`diagnostic_popover_tests`) can't catch.
+    #[test]
+    fn the_diagnostic_card_border_is_the_real_design_red_not_the_shared_popover_border() {
+        assert_ne!(
+            theme::border::DIAGNOSTIC_CARD,
+            theme::border::POPOVER,
+            "the Diagnostic card must not reuse Hover/Completions' neutral border"
+        );
+        assert_eq!(
+            theme::border::DIAGNOSTIC_CARD.default,
+            theme::hex_rgba(0x3a2224),
+            "must match the mockup's own `border:1px solid #3a2224` exactly"
+        );
+    }
+
+    /// [`theme::syntax::DIAGNOSTIC_ROW_BG`] already carried the design's exact red-tinted
+    /// background hex before this fix - this pins that the Diagnostic card actually *uses* it
+    /// (see `render_diagnostic_card_content`), rather than the coincidentally-similar-looking
+    /// [`theme::surface::POPOVER`] it used to paint with.
+    #[test]
+    fn the_diagnostic_row_bg_token_matches_the_real_design_card_background() {
+        assert_eq!(
+            theme::syntax::DIAGNOSTIC_ROW_BG.default,
+            theme::hex_rgba(0x191416),
+            "must match the mockup's own `background:#191416` exactly"
         );
     }
 }

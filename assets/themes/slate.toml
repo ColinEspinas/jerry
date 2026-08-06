@@ -71,6 +71,7 @@ button_disabled = "#1b1e22"
 keycap          = "#202429"
 keycap_hint     = "#1e2125"  # The hint-size keycap's own border
 selected_edge   = "#2d435b"  # 2px left edge on a selected row
+diagnostic_card = "#321c1c"
 
 # The Files tree's own structural marks (GitHub issue #18 §3).
 [tree]

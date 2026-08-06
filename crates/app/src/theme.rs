@@ -882,6 +882,18 @@ pub mod border {
     /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`].
     pub const KEYCAP_HINT: ColorToken = token("border.keycap_hint", 0x23272b);
     pub const SELECTED_EDGE: ColorToken = token("border.selected_edge", 0x3f5b74); // 2px left edge on a selected row
+    /// The Diagnostic popover's own border (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`:
+    /// `border:1px solid #3a2224` on the diagnostic card). Paired with
+    /// [`super::syntax::DIAGNOSTIC_ROW_BG`] for that card's background - together they give the
+    /// Diagnostic popover the design's own red-tinted chrome, distinct from the Hover/Completions
+    /// popovers' neutral [`POPOVER`] - see `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
+    /// Lives here rather than in `syntax` (despite pairing with a `syntax.*` token) because it's a
+    /// border, not a syntax-highlighted foreground color: `syntax`'s own contrast-floor enforcement
+    /// (`enforce_syntax_contrast_floors`) requires every `syntax.*` token to clear a 4.5:1 ratio
+    /// against the code background, which is the *text-readability* bar - wrong for a deliberately
+    /// subtle card outline, and it would silently push this exact hex away from the design's own
+    /// value under a derived theme.
+    pub const DIAGNOSTIC_CARD: ColorToken = token("border.diagnostic_card", 0x3a2224);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -901,6 +913,7 @@ pub mod border {
         ("KEYCAP", KEYCAP),
         ("KEYCAP_HINT", KEYCAP_HINT),
         ("SELECTED_EDGE", SELECTED_EDGE),
+        ("DIAGNOSTIC_CARD", DIAGNOSTIC_CARD),
     ];
 }
 
