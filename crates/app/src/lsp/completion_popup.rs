@@ -812,6 +812,7 @@ fn render_completion_row(
         // painted this frame, rather than trusting that scrolling "probably" happened.
         .debug_selector(move || format!("completion-item-{index}"))
         .flex_none()
+        .w_full()
         .h(POPOVER_ROW_HEIGHT)
         // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item row padding is
         // `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each `.completions` row).
@@ -832,6 +833,14 @@ fn render_completion_row(
             gpui::div()
                 .flex_1()
                 .min_w_0()
+                // A real item label can be longer than the row is wide (a fully-qualified
+                // constructor, a long generic instantiation) - `.truncate()` (`overflow_hidden`
+                // + `whitespace_nowrap` + `text_ellipsis`) keeps it on the row's own single line
+                // instead of wrapping, which would grow the row past `POPOVER_ROW_HEIGHT` and
+                // desync every row after it in the virtualized list (each row is painted at a
+                // fixed `POPOVER_ROW_HEIGHT` offset, so one row quietly growing taller than that
+                // just overlaps the next one rather than pushing it down).
+                .truncate()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(if is_selected {
                     theme::completions_popup::ITEM_SELECTED_FG
@@ -842,7 +851,18 @@ fn render_completion_row(
         )
         .children(detail.map(|detail| {
             gpui::div()
+                .id(("completion-item-detail", index))
+                // Lets a real test measure this real span's own painted bounds (`debug_bounds`
+                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+                // `debug_selector` in this crate.
+                .debug_selector(move || format!("completion-item-{index}-detail"))
                 .flex_none()
+                // Same real overflow the label just above needs to guard against, on the
+                // right-hand type/detail hint instead - a real, unbounded type string (a deeply
+                // nested generic, a long tuple) capped to a reasonable share of the row rather
+                // than left free to push the row's total content wider than the popup itself.
+                .max_w(gpui::px(120.0))
+                .truncate()
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
                 .child(detail)
@@ -962,6 +982,12 @@ fn render_completion_detail_pane(
                 .font(gpui::font(theme::font::SANS))
                 .text_size(gpui::px(11.0))
                 .text_color(theme::text::DIMMER)
+                // A real doc comment can run to many paragraphs (rustdoc examples, long prose) -
+                // `.line_clamp(6)` caps it at a real, bounded number of visible lines with an
+                // ellipsis on the last one, rather than growing the pane past `popover_max_height()`
+                // and having the outer popup's own `overflow_hidden()` cut it off mid-sentence at
+                // an arbitrary point.
+                .line_clamp(6)
                 .child(doc),
         );
     }
@@ -976,6 +1002,10 @@ fn render_completion_detail_pane(
                 .font(gpui::font(theme::font::MONO))
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
+                // A real, fully-qualified module path can be long enough to wrap onto a second
+                // line on its own - `.truncate()` keeps this footer the real, fixed single line
+                // the design's own mockup shows.
+                .truncate()
                 .child(module_path),
         );
     }
@@ -1482,6 +1512,104 @@ mod completion_detail_pane_tests {
             footer_hints.top() >= detail_pane.top(),
             "the real footer hint row belongs to the list column, below the real item rows, not \
              floating above the detail pane"
+        );
+    }
+
+    /// A real completion row's own selected/hover background (`theme::completions_popup::
+    /// ITEM_SELECTED_BG`) must cover the *whole* row, not just as much of it as the label text
+    /// happens to need - an earlier version left `.w_full()` off the row `div()` entirely, so the
+    /// row (and therefore its background) shrank to its own content width instead of stretching
+    /// to fill `LIST_WIDTH`, leaving a real, visible gap of unhighlighted background to the right
+    /// of a short label.
+    #[gpui::test]
+    fn a_selected_rows_background_spans_the_full_list_width_not_just_its_text(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let row = cx
+            .debug_bounds("completion-item-0")
+            .expect("the real selected row must have painted");
+        // Within 2px of `LIST_WIDTH`, not exactly it: this fixture's own single item is a real
+        // selected item with nothing to show in the detail pane's own signature slot, so
+        // `list_column`'s conditional `border_r_1()` (only added once a real detail pane sits
+        // beside it) is present here too, and border-box sizing takes that real 1px out of the
+        // row's own available content width.
+        assert!(
+            (row.size.width - LIST_WIDTH).abs() <= gpui::px(2.0),
+            "a real completion row - and therefore its selected/hover background - must span \
+             the full real list column width, not shrink to fit a short label's own text width \
+             (got {:?}, expected close to {:?})",
+            row.size.width,
+            LIST_WIDTH
+        );
+    }
+
+    /// A real, unusually long detail/type hint (a deeply nested generic, a long tuple return
+    /// type) must not be left free to grow the right-hand hint span past a real, bounded width -
+    /// unbounded, it would push the row's total content wider than the list column itself
+    /// (`flex_none` doesn't shrink), overflowing the popup horizontally. `.max_w(120px)` plus
+    /// `.truncate()` caps it at a real, fixed share of the row instead.
+    #[gpui::test]
+    fn a_very_long_detail_hint_is_capped_to_a_bounded_width_not_left_to_grow(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some(
+                "a genuinely long real detail string describing a deeply nested generic return \
+                 type that just keeps going and going far past any reasonable row width"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let detail_span = cx
+            .debug_bounds("completion-item-0-detail")
+            .expect("the real detail hint span must have painted for a real, non-empty detail");
+        assert!(
+            detail_span.size.width <= gpui::px(120.0) + gpui::px(1.0),
+            "a real, unusually long detail/type hint must be capped at its own bounded max \
+             width, not left to grow with the real text - got {:?}",
+            detail_span.size.width
+        );
+    }
+
+    /// A real, long documentation string (a multi-paragraph rustdoc comment is common) must not
+    /// grow the detail pane without bound - `.line_clamp(6)` caps the doc paragraph at a real,
+    /// fixed number of visible lines instead of leaving the outer popup's own `overflow_hidden()`
+    /// to cut it off at an arbitrary point mid-sentence.
+    #[gpui::test]
+    fn a_very_long_documentation_string_does_not_grow_the_pane_without_bound(
+        cx: &mut TestAppContext,
+    ) {
+        let long_doc = "This is a genuinely long real documentation paragraph. ".repeat(60);
+        let long_doc_item = lsp_core::lsp_types::CompletionItem {
+            label: "long_doc".to_string(),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(long_doc)),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted for the long-doc item");
+
+        // Unclamped, 60 real repetitions of that sentence wrapped inside the pane's own ~280px
+        // real content width would run to dozens of real lines - hundreds of real pixels tall.
+        // `popover_max_height()` (the outer popup's own cap) is comfortably less than that, so a
+        // pane genuinely respecting its own `.line_clamp(6)` must paint well under it.
+        assert!(
+            pane.size.height < popover_max_height(),
+            "a real, genuinely long documentation string (many repeated sentences) must not \
+             grow the detail pane's own painted height past the popup's own real maximum - got \
+             pane height {:?}, popover_max_height() {:?}",
+            pane.size.height,
+            popover_max_height()
         );
     }
 
