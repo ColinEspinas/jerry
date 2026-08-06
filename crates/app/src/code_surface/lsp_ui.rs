@@ -616,14 +616,20 @@ fn render_diagnostic_card_content(
         );
 
     if !source_code.is_empty() {
+        // `background:#141719;border-top:1px solid #2b2224` in the mockup - its own footer band,
+        // the same `LSP_POPOVER_FOOTER` background the Hover card's footer uses, but with this
+        // card's own darker `DIAGNOSTIC_CARD_FOOTER` border rather than the neutral `border::
+        // INNER` the pre-review version used (which also painted no background band at all).
         card = card.child(
             div()
                 .flex()
                 .items_center()
+                .gap(px(8.0))
                 .px(px(10.0))
                 .py(px(6.0))
+                .bg(theme::surface::LSP_POPOVER_FOOTER)
                 .border_t_1()
-                .border_color(theme::border::INNER)
+                .border_color(theme::border::DIAGNOSTIC_CARD_FOOTER)
                 .child(
                     div()
                         .font(font(theme::font::MONO))
@@ -746,6 +752,12 @@ fn render_hover_card_content(
         .absolute()
         .size_full()
     };
+    // No `.p()`/`.gap()` here (unlike the pre-review version) - the design's own hover card has
+    // no uniform padding at all: it is three independently-padded/bordered bands (signature
+    // header, doc body, `module::path` + `F12 definition` footer), not a single padded flex
+    // column. Only `HoverStatus::Ready(Some(_))` below builds those three bands; every other
+    // status is a single line of plain text with no real card structure to speak of, so it gets
+    // its own one-off `.p(px(10.0))` wrapper instead.
     let mut card = div()
         .id("hover-card")
         // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
@@ -759,8 +771,6 @@ fn render_hover_card_content(
         .flex_none()
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .p(px(10.0))
         .max_w(px(430.0))
         .max_h(HOVER_CARD_MAX_HEIGHT)
         .overflow_hidden()
@@ -773,6 +783,7 @@ fn render_hover_card_content(
         HoverStatus::Loading => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::FAINT)
@@ -782,6 +793,7 @@ fn render_hover_card_content(
         HoverStatus::Failed(message) => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::status::FAIL)
@@ -791,6 +803,7 @@ fn render_hover_card_content(
         HoverStatus::Ready(None) => {
             card = card.child(
                 div()
+                    .p(px(10.0))
                     .font(font(theme::font::MONO))
                     .text_size(px(10.5))
                     .text_color(theme::text::FAINT)
@@ -798,45 +811,79 @@ fn render_hover_card_content(
             );
         }
         HoverStatus::Ready(Some(model)) => {
-            card = card.child(render_hover_signature(&model.signature, extension));
+            // Header: the signature, `padding:7px 10px 6px;border-bottom:1px solid #23282c` in
+            // the mockup - `theme::border::CARD` is that exact hex, already registered for
+            // exactly this kind of internal card seam elsewhere in the app.
+            card = card.child(
+                div()
+                    .pt(px(7.0))
+                    .px(px(10.0))
+                    .pb(px(6.0))
+                    .border_b_1()
+                    .border_color(theme::border::CARD)
+                    .child(render_hover_signature(&model.signature, extension)),
+            );
             if let Some(doc) = &model.doc {
+                // Body: `padding:7px 10px;font:...'IBM Plex Sans';color:#8b9197` - `theme::
+                // text::DIM` is that exact hex (distinct from `DIMMER`/`FAINT`, which are darker
+                // and belong to other elements in this same card, not this one).
                 card = card.child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(theme::text::DIMMER)
+                        .px(px(10.0))
+                        .py(px(7.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::text::DIM)
                         .child(doc.clone()),
                 );
             }
+            // Footer: its own `background:#141719;border-top:1px solid #23282c` band, not a
+            // transparent strip inside the card's own padding - `theme::surface::
+            // LSP_POPOVER_FOOTER` is that exact background hex. `module::path` sits at the far
+            // left and `F12 definition` at the far right (`gap:10px`, a `flex:1` spacer between
+            // them in the mockup) - the pre-review version bunched both together with a plain
+            // `gap`, which is the layout difference a purely color-focused pass missed.
             let mut footer = div()
                 .flex()
                 .items_center()
-                .gap(px(6.0))
-                .pt(px(4.0))
+                .gap(px(10.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::surface::LSP_POPOVER_FOOTER)
                 .border_t_1()
-                .border_color(theme::border::INNER);
+                .border_color(theme::border::CARD);
             if let Some(module_path) = &model.module_path {
+                // `color:#5e646a` in the mockup - `theme::text::FAINTER`, not `FAINT`
+                // (`#6b7178`), which the pre-review version used.
                 footer = footer.child(
                     div()
                         .font(font(theme::font::MONO))
                         .text_size(px(10.0))
-                        .text_color(theme::text::FAINT)
+                        .text_color(theme::text::FAINTER)
                         .child(module_path.clone()),
                 );
             }
+            footer = footer.child(div().flex_1());
             footer = footer.child(
                 div()
                     .id("hover-card-goto-definition")
+                    // Lets a real test measure this real chip's own painted bounds
+                    // (`hover_card_footer_layout_tests`) - a no-op outside test builds, matching
+                    // every other `debug_selector` in this crate.
+                    .debug_selector(|| "hover-card-goto-definition".to_string())
                     .flex()
                     .items_center()
-                    .gap(px(3.0))
+                    .gap(px(5.0))
                     .cursor_pointer()
                     // `F12` is a function key, not one of `crate::keymap`'s modifier tokens, and
                     // is identical on both platforms, so it bypasses `keymap::resolve_combo`.
                     .child(render_keycap("F12"))
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(theme::text::FAINT)
+                            // `color:#4a5057` in the mockup - `theme::text::PATH` is that exact
+                            // hex (an existing token named for its other use elsewhere; the value
+                            // is what matters here, not the name).
+                            .text_size(px(10.0))
+                            .text_color(theme::text::PATH)
                             .child("definition"),
                     )
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -873,7 +920,7 @@ fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::Any
         .flex()
         .flex_wrap()
         .font(font(theme::font::MONO))
-        .text_size(px(12.0));
+        .text_size(px(11.5));
     for (run_index, (run_text, kind)) in
         highlighted_signature_runs(signature, extension).into_iter().enumerate()
     {
@@ -2575,6 +2622,128 @@ mod hover_signature_and_diagnostic_chrome_tests {
             theme::syntax::DIAGNOSTIC_ROW_BG.default,
             theme::hex_rgba(0x191416),
             "must match the mockup's own `background:#191416` exactly"
+        );
+    }
+
+    /// Regression coverage for the second design-review pass: the mockup's hover/diagnostic
+    /// footer bands paint their own real `#141719` background, distinct from both cards' own
+    /// `#181c20`/`#191416` body backgrounds and from [`theme::surface::CARD_SUNK`] (`#131619`,
+    /// the *different* footer tone every other card footer in the app uses).
+    #[test]
+    fn the_lsp_popover_footer_token_matches_the_real_design_footer_band_background() {
+        assert_eq!(
+            theme::surface::LSP_POPOVER_FOOTER.default,
+            theme::hex_rgba(0x141719),
+            "must match the mockup's own `background:#141719` exactly"
+        );
+        assert_ne!(
+            theme::surface::LSP_POPOVER_FOOTER,
+            theme::surface::CARD_SUNK,
+            "the Hover/Diagnostic footer band is a real, different tone from every other card's \
+             footer, not a duplicate of CARD_SUNK"
+        );
+    }
+
+    /// The Diagnostic card's own footer border (`#2b2224`) is a real, different shade from the
+    /// card's outer border (`#3a2224`, [`theme::border::DIAGNOSTIC_CARD`]) - the mockup uses two
+    /// distinct red tones on the same card, not one border colour reused for both seams.
+    #[test]
+    fn the_diagnostic_card_footer_border_is_its_own_real_shade_distinct_from_the_outer_border() {
+        assert_eq!(
+            theme::border::DIAGNOSTIC_CARD_FOOTER.default,
+            theme::hex_rgba(0x2b2224),
+            "must match the mockup's own `border-top:1px solid #2b2224` exactly"
+        );
+        assert_ne!(
+            theme::border::DIAGNOSTIC_CARD_FOOTER,
+            theme::border::DIAGNOSTIC_CARD,
+            "the footer seam and the outer card outline are two real, different reds in the \
+             mockup, not the same token reused twice"
+        );
+    }
+
+    /// Regression coverage for a real typo caught in design review: this token's own doc comment
+    /// already cited the mockup's real `#e3908b` headline colour, but the literal value assigned
+    /// was `0xf07f77` - a different colour nobody had cross-checked against the doc comment right
+    /// above it, let alone the real mockup file.
+    #[test]
+    fn the_diagnostic_card_message_color_matches_the_real_design_headline_not_the_old_typo() {
+        assert_eq!(
+            theme::syntax::DIAGNOSTIC_CARD_MESSAGE.default,
+            theme::hex_rgba(0xe3908b),
+            "must match the mockup's own diagnostic headline `color:#e3908b` exactly"
+        );
+        assert_ne!(
+            theme::syntax::DIAGNOSTIC_CARD_MESSAGE.default,
+            theme::hex_rgba(0xf07f77),
+            "must not still be the old, uncaught typo'd value"
+        );
+    }
+}
+
+/// Regression coverage for the hover card's real, mockup-shaped internal layout: three
+/// independently-padded/bordered bands (signature header, doc body, module-path/`F12 definition`
+/// footer), not one uniformly-padded flex column - see [`AdeApp::render_hover_card`]'s own docs
+/// for why a purely color-focused first pass missed this.
+#[cfg(test)]
+mod hover_card_footer_layout_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// The mockup's hover footer puts `module::path` at the far left and `F12 definition` at the
+    /// far right, with a real `flex:1` spacer between them - not bunched together with a plain
+    /// gap, which is what the pre-review layout did. Proven the same way this file's other
+    /// popover-position tests prove real layout: real painted bounds, not a description of intent.
+    #[gpui::test]
+    fn the_module_path_and_definition_chip_sit_at_opposite_ends_of_the_real_footer(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: Some("core".to_string()),
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let definition_chip = cx
+            .debug_bounds("hover-card-goto-definition")
+            .expect("the real F12/definition chip should have painted real bounds");
+
+        assert!(
+            (card.right() - definition_chip.right()).abs() < px(15.0),
+            "the F12/definition chip must sit near the real footer's right edge (card right \
+             {:?}, chip right {:?}) - a bunched-together footer with no spacer would leave it \
+             far short of the edge",
+            card.right(),
+            definition_chip.right()
         );
     }
 }

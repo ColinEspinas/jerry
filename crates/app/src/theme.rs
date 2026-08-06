@@ -829,6 +829,14 @@ pub mod surface {
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
     /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: ColorToken = token("surface.tab_close_hover", 0x23282c);
+    /// The Hover/Diagnostic popover footer's own band background
+    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `background:#141719` on both cards'
+    /// `source · code`/`F12 definition` footer rows) - one hex step darker than [`CARD_SUNK`]
+    /// (`#131619`, used for every *other* card footer in the app), not a duplicate of it: the
+    /// mockup genuinely uses two adjacent-but-different footer tones, and this app's own contrast
+    /// tests already pin `CARD_SUNK`'s exact value elsewhere, so reusing it here would have
+    /// silently painted the wrong one of the two.
+    pub const LSP_POPOVER_FOOTER: ColorToken = token("surface.lsp_popover_footer", 0x141719);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -859,6 +867,7 @@ pub mod surface {
         ("TITLE_BAR_CLOSE_HOVER", TITLE_BAR_CLOSE_HOVER),
         ("MENU_ROW_HOVER", MENU_ROW_HOVER),
         ("TAB_CLOSE_HOVER", TAB_CLOSE_HOVER),
+        ("LSP_POPOVER_FOOTER", LSP_POPOVER_FOOTER),
     ];
 }
 
@@ -894,6 +903,12 @@ pub mod border {
     /// subtle card outline, and it would silently push this exact hex away from the design's own
     /// value under a derived theme.
     pub const DIAGNOSTIC_CARD: ColorToken = token("border.diagnostic_card", 0x3a2224);
+    /// The Diagnostic popover's own footer band's top border - `#2b2224` in the mockup, a real,
+    /// deliberately different shade from [`DIAGNOSTIC_CARD`]'s outer `#3a2224` (the mockup uses
+    /// two distinct border tones on the same card: a stronger one for the whole card's outline, a
+    /// subtler one for the internal seam above the footer) - see
+    /// `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
+    pub const DIAGNOSTIC_CARD_FOOTER: ColorToken = token("border.diagnostic_card_footer", 0x2b2224);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -914,6 +929,7 @@ pub mod border {
         ("KEYCAP_HINT", KEYCAP_HINT),
         ("SELECTED_EDGE", SELECTED_EDGE),
         ("DIAGNOSTIC_CARD", DIAGNOSTIC_CARD),
+        ("DIAGNOSTIC_CARD_FOOTER", DIAGNOSTIC_CARD_FOOTER),
     ];
 }
 
@@ -1453,11 +1469,14 @@ pub mod syntax {
     /// The Diagnostic state's dim, end-of-line inline message text (`README.md`: `#6b4a48`).
     pub const DIAGNOSTIC_INLINE_MESSAGE: ColorToken =
         token("syntax.diagnostic_inline_message", 0xb6706b);
-    /// The Diagnostic state's card message text (`README.md`: `#e3908b`). Same hex as
+    /// The Diagnostic state's card message text (`design_handoff_jerry_ade/revision 3/
+    /// Jerry.dc.html`'s diagnostic card headline: `color:#e3908b`). Same hex as
     /// [`super::button::DANGER_FG_HOVER`], kept as its own token - unrelated elements that
-    /// happen to share a designed red.
+    /// happen to share a designed red. Was previously `0xf07f77` - a real, uncaught typo against
+    /// this same doc comment's own cited value, fixed as part of GitHub issue #186's design
+    /// review follow-up.
     pub const DIAGNOSTIC_CARD_MESSAGE: ColorToken =
-        token("syntax.diagnostic_card_message", 0xf07f77);
+        token("syntax.diagnostic_card_message", 0xe3908b);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
