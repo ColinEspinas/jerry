@@ -710,6 +710,20 @@ impl LspClient {
             .unwrap_or_default()
     }
 
+    /// Whether this server's real, advertised `completionProvider.resolveProvider` permits a
+    /// `completionItem/resolve` request - real, installed servers commonly send only a bare
+    /// `label`/`kind` inline in the `textDocument/completion` response itself (documentation,
+    /// full detail, and `labelDetails` are comparatively expensive to compute for every candidate)
+    /// and expect the client to resolve the one item a user is actually looking at on demand.
+    /// `false` for a server with no `completionProvider` at all, or one that advertises it without
+    /// this flag.
+    pub fn supports_completion_resolve(&self) -> bool {
+        lock(&self.capabilities)
+            .completion_provider
+            .as_ref()
+            .is_some_and(|options| options.resolve_provider == Some(true))
+    }
+
     /// Whether this server's real, advertised `textDocumentSync` capability permits sending it
     /// real `textDocument/didChange` notifications at all - `false` only for the one explicit,
     /// real opt-out shape the spec defines (`TextDocumentSyncKind::NONE`, either as a bare kind or

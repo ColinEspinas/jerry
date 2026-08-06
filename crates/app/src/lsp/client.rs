@@ -686,6 +686,7 @@ impl AdeApp {
         // same ordering, as `AdeApp::select_worktree`'s own worktree-switch reset.
         self._lsp_sync_tasks = std::collections::HashMap::new();
         self._completions_request_task = None;
+        self._completions_resolve_task = None;
 
         let keys: Vec<LspClientKey> = self
             .lsp_clients
@@ -1709,11 +1710,30 @@ impl AdeApp {
         let completion = match (completion_context, cached_uri) {
             (Some(context), Some(uri)) => {
                 self.completions_generation = self.completions_generation.wrapping_add(1);
-                self.completions = Some(CompletionsEntry {
-                    path: relative_path.to_path_buf(),
-                    status: CompletionsStatus::Loading,
+                // Only actually drop to `Loading` when there's nothing real to show yet for this
+                // path - not unconditionally, as an earlier version did. `Self::schedule_lsp_sync`
+                // already called `Self::refilter_completions` synchronously just before this
+                // debounced tick, so a `Ready` popup here is already honestly narrowed to
+                // everything typed so far (GitHub issue #189); overwriting it with a bare
+                // "loading completions..." row on *every* debounce tick (every real
+                // `LSP_SYNC_DEBOUNCE` while typing continues) made the popup visibly flicker
+                // between that placeholder and real content on nearly every keystroke, and
+                // silently dropped the `"completions"` key context for that same window each time
+                // (`Self::completions_open_for_active_path` requires `Ready`) - so `Up`/`Down`/
+                // `Enter` briefly stopped reaching the popup too. The stale-response race this
+                // used to also guard against is still closed by the generation bump above and by
+                // `Self::apply_completion_result`'s own `completions_generation` check.
+                let already_ready_for_this_path = self.completions.as_ref().is_some_and(|entry| {
+                    entry.path == relative_path
+                        && matches!(entry.status, CompletionsStatus::Ready { .. })
                 });
-                cx.notify();
+                if !already_ready_for_this_path {
+                    self.completions = Some(CompletionsEntry {
+                        path: relative_path.to_path_buf(),
+                        status: CompletionsStatus::Loading,
+                    });
+                    cx.notify();
+                }
                 let params = lsp_core::lsp_types::CompletionParams {
                     text_document_position: lsp_core::lsp_types::TextDocumentPositionParams {
                         text_document: lsp_core::lsp_types::TextDocumentIdentifier { uri },
@@ -1809,6 +1829,127 @@ impl AdeApp {
             // selection nudge.
             self.completions_scroll_handle
                 .scroll_to_item(0, gpui::ScrollStrategy::Top);
+            self.maybe_resolve_selected_completion_item(cx);
+        }
+        cx.notify();
+    }
+
+    /// Dispatches a real `completionItem/resolve` request for whichever item [`Self::completions`]
+    /// currently has selected, if the server genuinely needs one - most real servers (rust-
+    /// analyzer very much included) send only a bare `label`/`kind` inline in the
+    /// `textDocument/completion` response itself and expect a follow-up `completionItem/resolve`
+    /// for the one item a user is actually looking at, which is exactly what
+    /// `crate::lsp::completion_popup::AdeApp::render_completions_popover`'s detail pane reads
+    /// (`crate::lsp::completion::completion_documentation_text`/`completion_module_path`, plus
+    /// `item.detail` for the signature line) - without this, that pane stays empty for nearly
+    /// every real item, not just the rare one a server genuinely has nothing more to say about.
+    ///
+    /// A real no-op whenever: there's no `Ready` popup, the currently selected item already has
+    /// both a `detail` and real `documentation` (nothing more a resolve could usefully add), this
+    /// exact `(path, generation, item index)` was already asked about once (successfully or not -
+    /// see [`Self::completions_resolved`]'s own docs), or the connection's own primary server
+    /// doesn't advertise `completionProvider.resolveProvider` at all.
+    pub(crate) fn maybe_resolve_selected_completion_item(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.completions.as_ref() else {
+            return;
+        };
+        let CompletionsStatus::Ready {
+            items,
+            visible,
+            selected,
+        } = &entry.status
+        else {
+            return;
+        };
+        let Some(&item_index) = visible.get(*selected) else {
+            return;
+        };
+        let Some(item) = items.get(item_index) else {
+            return;
+        };
+        if item.detail.is_some() && item.documentation.is_some() {
+            return;
+        }
+        let path = entry.path.clone();
+        let key = (path.clone(), self.completions_generation, item_index);
+        if self.completions_resolved.contains(&key) {
+            return;
+        }
+        let Some(absolute_path) = self
+            .edit_buffer(&path)
+            .map(|buffer| buffer.path.clone())
+        else {
+            return;
+        };
+        let Some(connection) = self.lsp_connection_for_path(&absolute_path) else {
+            return;
+        };
+        if !connection.primary().supports_completion_resolve() {
+            return;
+        }
+        self.completions_resolved.insert(key);
+        let item_to_resolve = item.clone();
+        let generation = self.completions_generation;
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    connection.request::<lsp_core::lsp_types::request::ResolveCompletionItem>(
+                        item_to_resolve,
+                        LSP_QUERY_TIMEOUT,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_resolved_completion_item(&path, generation, item_index, result, cx);
+            });
+        });
+        self._completions_resolve_task = Some(task);
+    }
+
+    /// Merges a real `completionItem/resolve` response into the exact item
+    /// [`Self::maybe_resolve_selected_completion_item`] asked about, in place - never replacing
+    /// fields the original `textDocument/completion` response already populated (a server that
+    /// sent a real inline `detail` already made its own choice there; the resolve response is
+    /// additive, not authoritative). Refuses stale results the same way [`Self::
+    /// apply_completion_result`] does: a `completions_generation` mismatch means a fresh server
+    /// response (or a dismiss) has already replaced whatever `items` this index used to point
+    /// into, so writing into it now would either silently corrupt an unrelated item or panic on an
+    /// out-of-bounds index.
+    fn apply_resolved_completion_item(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        item_index: usize,
+        result: Result<lsp_core::lsp_types::CompletionItem, lsp_core::LspError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completions_generation != generation {
+            return;
+        }
+        let Ok(resolved) = result else {
+            return;
+        };
+        let Some(entry) = self.completions.as_mut() else {
+            return;
+        };
+        if entry.path != path {
+            return;
+        }
+        let CompletionsStatus::Ready { items, .. } = &mut entry.status else {
+            return;
+        };
+        let Some(item) = items.get_mut(item_index) else {
+            return;
+        };
+        if item.detail.is_none() {
+            item.detail = resolved.detail;
+        }
+        if item.documentation.is_none() {
+            item.documentation = resolved.documentation;
+        }
+        if item.label_details.is_none() {
+            item.label_details = resolved.label_details;
         }
         cx.notify();
     }
@@ -2223,8 +2364,8 @@ mod lsp_client_eviction_tests {
 #[cfg(test)]
 pub(crate) mod lsp_connection_facade_tests {
     use super::*;
-    use gpui::TestAppContext;
-    use std::time::Instant;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use std::time::{Duration, Instant};
 
     /// A real, minimal LSP server over the real wire protocol, with real, requestable failure
     /// modes. Modes:
@@ -2244,6 +2385,10 @@ pub(crate) mod lsp_connection_facade_tests {
     ///   what `lsp_core::LspClient::supports_diagnostic_pull` genuinely reads. No real companion
     ///   advertises one today, so this is the only way to exercise that branch honestly rather
     ///   than by pinning a version.
+    /// - `no_resolve`: like `normal`, but its `completionProvider.resolveProvider` is `false` -
+    ///   every other mode advertises `true`, matching every real, installed server this app
+    ///   supports. Answers `completionItem/resolve` with a real `detail`/`documentation` pair
+    ///   derived from the request's own `label`, for the modes that do advertise it.
     ///
     /// Two test-only methods make its behavior observable and controllable from Rust without
     /// weakening anything real: `test/die` makes the process genuinely exit (standing in for a
@@ -2266,7 +2411,11 @@ function publish(uri, message) {
 }
 function handle(msg) {
   if (msg.method === 'initialize') {
-    const capabilities = { textDocumentSync: 1, hoverProvider: true };
+    const capabilities = {
+      textDocumentSync: 1,
+      hoverProvider: true,
+      completionProvider: { resolveProvider: MODE !== 'no_resolve' },
+    };
     if (MODE === 'pull') {
       capabilities.diagnosticProvider = { interFileDependencies: false, workspaceDiagnostics: false };
     }
@@ -2276,6 +2425,19 @@ function handle(msg) {
   if (msg.method === 'shutdown') { send({ jsonrpc: '2.0', id: msg.id, result: null }); return; }
   if (msg.method === 'exit' || msg.method === 'test/die') { process.exit(0); }
   if (msg.method === 'test/publish') { publish(msg.params.uri, msg.params.message); return; }
+  if (msg.method === 'completionItem/resolve') {
+    const item = msg.params;
+    send({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: {
+        ...item,
+        detail: 'resolved detail for ' + item.label,
+        documentation: { kind: 'plaintext', value: 'resolved doc for ' + item.label },
+      },
+    });
+    return;
+  }
   if (msg.method === 'textDocument/hover') {
     const result = (MODE === 'hover' || MODE === 'semantic')
       ? { contents: { kind: 'plaintext', value: 'real hover from ' + MODE } }
@@ -2726,6 +2888,232 @@ process.stdin.on('data', (d) => {
         };
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels, vec!["alpha", "beta"]);
+    }
+
+    /// Direct regression coverage for the completions-popup flicker: an earlier version of
+    /// `AdeApp::prepare_lsp_sync` unconditionally reset `AdeApp::completions` to `Loading` on
+    /// *every* debounced re-sync tick, even while a `Ready` popup for the same path (already
+    /// honestly narrowed in place by `Self::refilter_completions`, GitHub issue #189) was already
+    /// showing real, useful content - so the popup visibly flashed to a bare "loading
+    /// completions..." row and back on nearly every keystroke, and silently dropped the
+    /// `"completions"` key context for that same window (`Self::completions_open_for_active_path`
+    /// requires `Ready`).
+    ///
+    /// Calls `AdeApp::prepare_lsp_sync` directly rather than driving it through the real debounced
+    /// `Self::schedule_lsp_sync` task and `cx.run_until_parked`: that method is a plain, synchronous
+    /// state mutation (it only *builds* the completion request plan; dispatching and awaiting the
+    /// real response is a separate, independently-spawned task further up the call chain), so its
+    /// own decision about whether to touch `AdeApp::completions` can be observed with zero real
+    /// I/O and zero timing race. A first version of this test drove it through a real fake-server
+    /// round trip instead, and turned out unable to observe the bug at all: `cx.run_until_parked`
+    /// blocks for the real duration of an awaited `client.request(..)` call (proven by adding an
+    /// artificial multi-second server-side delay and watching the test's own wall-clock time grow
+    /// to match), so by the time control returns to the test the real response - not just the
+    /// `Loading` seed - has already landed, whatever the delay.
+    #[gpui::test]
+    fn a_debounced_re_sync_never_drops_an_already_ready_popup_back_to_loading(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let absolute = root.join("src").join("main.rs");
+        std::fs::write(&absolute, "fn a() {\n    x\n}\n").expect("write main.rs");
+        let relative = PathBuf::from("src/main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // `AdeApp::prepare_lsp_sync` only ever builds a completion plan once `AdeApp::
+        // lsp_uri_cache` has a real entry for this path - populated by `Self::dispatch_did_open`'s
+        // own background task, which `Self::render_center_pane` is what actually drives here
+        // (mirroring `wait_for_real_diagnostics`'s own reasoning).
+        let uri_cache_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.update(cx, |app, cx| app.render_center_pane(cx));
+            cx.run_until_parked();
+            if app.read_with(cx, |app, _| app.lsp_uri_cache.contains_key(&absolute)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < uri_cache_deadline,
+                "the fake client's uri never reached AdeApp::lsp_uri_cache"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // A pre-existing `Ready` popup for this exact path, seeded directly - standing in for
+        // whatever real server response is already showing by the time a later keystroke's
+        // debounce tick fires, without needing a real round trip to get there.
+        app.update(cx, |app, _cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "existing_item".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.edit_buffer_mut(&relative)
+                .expect("a real buffer")
+                .move_to("fn a() {\n    x".len());
+        });
+
+        // The real decision under test: a debounced re-sync tick for a completion-worthy position
+        // (the buffer's real content ends in the identifier char `x`) must not overwrite the
+        // already-`Ready` entry above with `Loading`, even though this "tick" would otherwise be
+        // completion-worthy on its own. No `cx.run_until_parked` needed - `prepare_lsp_sync` itself
+        // is where the old bug lived, synchronously, before any request is ever dispatched.
+        app.update(cx, |app, cx| {
+            app.prepare_lsp_sync(&root, &relative, cx, false);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.completions.as_ref().is_some_and(|entry| matches!(
+                    &entry.status,
+                    CompletionsStatus::Ready { items, .. } if items[0].label == "existing_item"
+                )),
+                "a debounced re-sync tick for an already-Ready popup must leave it exactly as it \
+                 was, never dropping it back to a bare Loading state before any new response has \
+                 had a chance to arrive - got: {:?}",
+                app.completions.as_ref().map(|entry| &entry.status)
+            );
+        });
+    }
+
+    /// Direct coverage for the Completions popup's detail pane (`crate::lsp::completion_popup::
+    /// AdeApp::render_completion_detail_pane`) being nearly empty for real items in practice: most
+    /// real servers (rust-analyzer very much included) send only a bare `label`/`kind` inline in
+    /// `textDocument/completion` and expect a follow-up `completionItem/resolve` for whichever one
+    /// the user is actually looking at. This proves the real, live round trip - `spawn_fake_server`
+    /// now advertises `completionProvider.resolveProvider: true` and answers `completionItem/
+    /// resolve` with a real `detail`/`documentation` pair - lands in the exact item `AdeApp::
+    /// completions` holds, not a parallel/shadow copy the render path wouldn't ever read.
+    #[gpui::test]
+    fn selecting_a_completion_item_resolves_its_real_detail_and_documentation(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        // A real `Ready` popup, seeded directly - only `label` set, matching what a real server
+        // commonly sends inline before resolution.
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "unresolved_item".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            assert_eq!(
+                items[0].detail.as_deref(),
+                Some("resolved detail for unresolved_item"),
+                "a real completionItem/resolve response must fill in the item's real detail, \
+                 which is what the detail pane's signature line reads"
+            );
+            let doc = crate::lsp::completion::completion_documentation_text(&items[0]);
+            assert_eq!(
+                doc.as_deref(),
+                Some("resolved doc for unresolved_item"),
+                "and its real documentation, which is what the detail pane's doc-prose body reads"
+            );
+        });
+    }
+
+    /// A server with no real `completionProvider.resolveProvider` at all must never get a
+    /// `completionItem/resolve` request - there's nothing on the other end that could ever answer
+    /// one usefully, and firing it anyway would just be a request every such server has to somehow
+    /// handle (most just answer `null`/an error, which resolves to a harmless no-op here, but the
+    /// request should never leave in the first place).
+    #[gpui::test]
+    fn a_server_without_resolve_support_is_never_asked_to_resolve(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.vue");
+        std::fs::write(&absolute, "<template></template>\n").expect("write main.vue");
+        let relative = PathBuf::from("main.vue");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        // `vue-language-server` is the fake client key `crate::language::lsp_binary_for_extension`
+        // resolves for `.vue` - reused here purely to get a `Ready` client under the right key,
+        // not because this test cares about the real Vue companion mechanism at all.
+        let binary = crate::language::lsp_binary_for_extension(Some("vue"))
+            .expect(".vue must resolve to a real binary key");
+        let server = spawn_fake_server(repo.path(), "primary", "no_resolve");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients
+                .insert((root.clone(), binary), LspClientState::Ready(server));
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "item".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.completions_resolved.is_empty(),
+                "a server with no real resolveProvider capability must never be asked to resolve \
+                 anything - a genuine dispatch would have recorded this (path, generation, index) \
+                 triple"
+            );
+        });
     }
 
     /// The other side of the registry-driven rule: a method that is genuinely **not** on the

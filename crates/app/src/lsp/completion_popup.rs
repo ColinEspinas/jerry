@@ -318,6 +318,7 @@ impl AdeApp {
         // can't actually see.
         self.completions_scroll_handle
             .scroll_to_item(next_selected, gpui::ScrollStrategy::Nearest);
+        self.maybe_resolve_selected_completion_item(cx);
         cx.notify();
     }
 
@@ -381,6 +382,7 @@ impl AdeApp {
         *selected = next;
         self.completions_scroll_handle
             .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        self.maybe_resolve_selected_completion_item(cx);
         cx.notify();
     }
 
@@ -915,12 +917,14 @@ fn render_completion_detail_pane(
         .px(gpui::px(10.0))
         .py(gpui::px(8.0));
 
-    // Signature: `item.detail` when the server sent one (rust-analyzer/typescript-language-
-    // server/pyright all commonly do, inline, no `completionItem/resolve` round trip needed) -
-    // the bare label otherwise, so the pane is never left blank for a real, selected item.
-    // Highlighted the same real way `crate::code_surface::code_view::highlight_block` highlights
-    // any other standalone fragment (a diff hunk, a merge conflict side) - see that function's
-    // own docs.
+    // Signature: `item.detail` when there is one - inline from the server's own
+    // `textDocument/completion` response for an item it already fully described, or filled in
+    // after the fact by a real `completionItem/resolve` round trip
+    // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
+    // much included) case where a server only sends a bare `label`/`kind` up front - the bare
+    // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
+    // same real way `crate::code_surface::code_view::highlight_block` highlights any other
+    // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
     let signature_text = item
         .detail
         .as_ref()

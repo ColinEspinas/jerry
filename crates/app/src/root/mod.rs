@@ -1308,6 +1308,20 @@ pub struct AdeApp {
     /// staleness check still independently guards against a stale result ever being applied, the
     /// same defense-in-depth this module already establishes elsewhere.
     pub(crate) _completions_request_task: Option<Task<()>>,
+    /// The single, real in-flight `completionItem/resolve` request task, if any - mirrors
+    /// [`Self::_completions_request_task`]'s own single-slot reasoning: only the item the user is
+    /// *currently* looking at in the detail pane is ever worth resolving, so a fresh selection
+    /// always supersedes an in-flight resolve for a previous one.
+    pub(crate) _completions_resolve_task: Option<Task<()>>,
+    /// Which `(path, completions_generation, item index into `CompletionsStatus::Ready::items`)`
+    /// triples this app has already dispatched a real `completionItem/resolve` request for -
+    /// keyed by [`Self::completions_generation`] (not cleared explicitly) so a stale entry from a
+    /// since-replaced server response is simply never looked up again rather than needing its own
+    /// cleanup pass. Exists purely to avoid re-requesting the same already-resolved (or
+    /// already-failed) item on every render/selection revisit; the growth this leaves behind is
+    /// bounded by how many distinct items a user has actually looked at, not by anything
+    /// unbounded.
+    pub(crate) completions_resolved: std::collections::HashSet<(PathBuf, u64, usize)>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
     /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
     /// [`CompletionsEntry::path`] names; a stale entry for a file that's no
