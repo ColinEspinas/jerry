@@ -2455,9 +2455,11 @@ function send(o) {
   const s = JSON.stringify(o);
   process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\r\n\r\n' + s);
 }
-function publish(uri, message) {
+function publish(uri, message, character, characterEnd) {
+  const start = character === undefined ? 0 : character;
+  const end = characterEnd === undefined ? start + 1 : characterEnd;
   send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [
-    { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, severity: 1, message }
+    { range: { start: { line: 0, character: start }, end: { line: 0, character: end } }, severity: 1, message }
   ] } });
 }
 function handle(msg) {
@@ -2475,7 +2477,10 @@ function handle(msg) {
   }
   if (msg.method === 'shutdown') { send({ jsonrpc: '2.0', id: msg.id, result: null }); return; }
   if (msg.method === 'exit' || msg.method === 'test/die') { process.exit(0); }
-  if (msg.method === 'test/publish') { publish(msg.params.uri, msg.params.message); return; }
+  if (msg.method === 'test/publish') {
+    publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd);
+    return;
+  }
   if (msg.method === 'completionItem/resolve') {
     const item = msg.params;
     send({
@@ -2611,6 +2616,40 @@ process.stdin.on('data', (d) => {
             .notify_raw(
                 "test/publish",
                 serde_json::json!({ "uri": target, "message": message }),
+            )
+            .expect("the fake server should accept a real notification");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let target = uri(target);
+        while !client.has_diagnostics_result_uri(&target) {
+            assert!(
+                Instant::now() < deadline,
+                "the real publishDiagnostics push never landed in the client's own sink"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Same real push as [`publish_and_wait`], at an explicit `character..character_end` UTF-16
+    /// column range on line 0, rather than the fixed `0..1` every other real caller uses - lets a
+    /// test prove real, position-dependent behavior (e.g. a diagnostic card genuinely anchored
+    /// under its own offending span, not just under column 0, where a bug that drops the real
+    /// column back to the row's bare left edge happens to look identical to the fix).
+    pub(crate) fn publish_at_and_wait(
+        client: &lsp_core::LspClient,
+        target: &str,
+        message: &str,
+        character: u32,
+        character_end: u32,
+    ) {
+        client
+            .notify_raw(
+                "test/publish",
+                serde_json::json!({
+                    "uri": target,
+                    "message": message,
+                    "character": character,
+                    "characterEnd": character_end,
+                }),
             )
             .expect("the fake server should accept a real notification");
         let deadline = Instant::now() + Duration::from_secs(10);
