@@ -1940,7 +1940,19 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                     // double/triple-click timing - it just reads the count GPUI already
                     // computed. `>= 3` (not `== 3`) so a fourth/fifth rapid click keeps
                     // re-selecting the line rather than falling back to a plain caret placement.
-                    if event.modifiers.alt {
+                    // Ctrl+click (Cmd+click on macOS - `Modifiers::secondary()`, the same
+                    // cross-platform check `crate::terminal::pane`'s own detected-link
+                    // `on_click` uses for its own Ctrl/Cmd+click-to-open) is checked first, ahead
+                    // of Alt: real IDE convention (VS Code, JetBrains, Zed) treats it as an
+                    // unconditional "go to definition" gesture that overrides click-count/Shift
+                    // semantics entirely, not something a double-click or a Shift-held click
+                    // should be allowed to shadow. It still moves the caret to the clicked token
+                    // first (the plain-click branch's own `buffer.move_to`), so `goto_definition_
+                    // target`'s own caret fallback below resolves to exactly the clicked token,
+                    // not wherever the caret happened to be before this click.
+                    if event.modifiers.secondary() {
+                        buffer.move_to(absolute_offset);
+                    } else if event.modifiers.alt {
                         buffer.add_cursor_at(absolute_offset);
                     } else if event.click_count >= 3 {
                         buffer.select_line_at(click_line_index);
@@ -1962,6 +1974,17 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // close it" bug the issue reports. `F12` no longer depends on this having run
                 // either: `Self::trigger_goto_definition` falls back to the caret's own position.
                 this.dismiss_hover();
+                if event.modifiers.secondary() {
+                    // `dismiss_hover()` above already ran by this point - load-bearing for this
+                    // branch specifically, not just incidental cleanup: `Self::
+                    // goto_definition_target` prefers a real, still-open `Self::hover` entry over
+                    // the caret when one exists, and that entry can genuinely describe a
+                    // *different* token than the one just Ctrl+clicked (the pointer rested
+                    // somewhere, then moved to click elsewhere). Triggering before the dismissal
+                    // above would let that stale hover target win over the click the user just
+                    // made - a real, confusing wrong-definition bug.
+                    this.trigger_goto_definition(cx);
+                }
                 cx.stop_propagation();
                 cx.notify();
             }),

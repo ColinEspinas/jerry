@@ -666,6 +666,15 @@ pub(in crate::code_surface) fn diagnostic_card_message_color(
 /// fixed height - it's exactly as tall as its own real content), just a practical, generous
 /// ceiling comfortably above what a real signature + doc + footer normally needs.
 const HOVER_CARD_MAX_HEIGHT: gpui::Pixels = px(220.0);
+/// 430px - the design mockup's own real hover card width
+/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:430px` on the card).
+const HOVER_CARD_MAX_WIDTH: gpui::Pixels = px(430.0);
+/// 10px - the header/body/footer bands' own real shared horizontal padding
+/// (`Jerry.dc.html`: `padding:7px 10px 6px`/`padding:7px 10px`/`padding:6px 10px` - all three
+/// bands agree on `10px` left/right). Named so [`render_hover_signature`]'s own real max-width
+/// (card width minus both sides' padding) can be computed from the same real numbers the bands
+/// themselves paint with, rather than a second, independently-guessed constant that could drift.
+const HOVER_CARD_HORIZONTAL_PADDING: gpui::Pixels = px(10.0);
 
 impl AdeApp {
     /// Surface C's real, token-anchored Hover popover (signature, doc prose, module path, `F12
@@ -771,7 +780,7 @@ fn render_hover_card_content(
         .flex_none()
         .flex()
         .flex_col()
-        .max_w(px(430.0))
+        .max_w(HOVER_CARD_MAX_WIDTH)
         .max_h(HOVER_CARD_MAX_HEIGHT)
         .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
@@ -816,6 +825,24 @@ fn render_hover_card_content(
             // exactly this kind of internal card seam elsewhere in the app.
             card = card.child(
                 div()
+                    // `.max_w(HOVER_CARD_MAX_WIDTH)` is load-bearing, not decoration. A GPUI
+                    // element with no explicit width sizes itself to its own content (shrink-to-
+                    // fit) rather than stretching to fill its parent the way a CSS block element
+                    // would - the same real bug class `crate::code_surface::editing`'s own
+                    // `text_row` docs describe for an identical shrink-to-fit failure - so a
+                    // plain `.w_full()` here turned out *not* to be enough on its own: percentage
+                    // width resolves against a parent's own *resolved* width, and the card above
+                    // is itself only `max_w`-bounded (auto/shrink-to-fit otherwise), so `100%` of
+                    // an unresolved auto width is still effectively unbounded. A real, hard
+                    // `max_w` gives this header (and `render_hover_signature`'s own row below it)
+                    // a genuinely definite upper bound to wrap `flex_wrap()`'s content within,
+                    // regardless of what the card's own width resolves to. Without it, a
+                    // signature longer than 430px never gets a real width to wrap within, so
+                    // `render_hover_signature`'s own `flex_wrap()` never actually reflows - the
+                    // row just grows past 430px and the card's `overflow_hidden()` silently
+                    // hard-clips it instead (a real, live-reproduced TypeScript symptom: a long
+                    // union/generic type painted cut off mid-glyph).
+                    .max_w(HOVER_CARD_MAX_WIDTH)
                     .pt(px(7.0))
                     .px(px(10.0))
                     .pb(px(6.0))
@@ -919,6 +946,12 @@ fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::Any
     let mut row = div()
         .flex()
         .flex_wrap()
+        // See the header wrapper's own `.max_w(HOVER_CARD_MAX_WIDTH)` doc comment in
+        // `render_hover_card_content` for why this needs a real, hard max-width (not just
+        // `.w_full()`) to make `flex_wrap()` actually reflow. This row sits inside that header's
+        // own `HOVER_CARD_HORIZONTAL_PADDING` on both sides, so its own bound is narrower by
+        // twice that.
+        .max_w(HOVER_CARD_MAX_WIDTH - HOVER_CARD_HORIZONTAL_PADDING - HOVER_CARD_HORIZONTAL_PADDING)
         .font(font(theme::font::MONO))
         .text_size(px(11.5));
     for (run_index, (run_text, kind)) in
@@ -927,6 +960,10 @@ fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::Any
         row = row.child(
             div()
                 .id(("hover-signature-token", run_index))
+                // Lets a real test measure this real token's own painted bounds (`debug_bounds`
+                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+                // `debug_selector` in this crate.
+                .debug_selector(move || format!("hover-signature-token-{run_index}"))
                 .text_color(code_view::color_for_kind(kind))
                 .child(run_text),
         );
@@ -1396,6 +1433,149 @@ mod lsp_hover_wiring_tests {
             );
         }
     }
+
+    /// Real, end-to-end coverage for the Ctrl/Cmd+click go-to-definition affordance: a real
+    /// simulated mouse click, with a real secondary modifier held, on the real painted call-site
+    /// token, against a genuinely spawned rust-analyzer - not a call straight into
+    /// `trigger_goto_definition` the way [`f12_action_navigates_to_the_real_definition_line`]
+    /// tests the mechanism itself. This is what actually proves the click *routes* there.
+    #[gpui::test]
+    fn ctrl_click_on_a_real_token_navigates_to_its_real_definition(cx: &mut TestAppContext) {
+        let project = write_scratch_project(FIXTURE_SOURCE);
+        let main_rs = project.path().join("src").join("main.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(main_rs.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let client_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+            let ready = app.read_with(cx, |app, _| {
+                matches!(
+                    app.lsp_clients
+                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
+                    Some(LspClientState::Ready(_))
+                )
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < client_deadline,
+                "the real rust-analyzer client never became Ready within 120s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        let (row_bounds, shaped) = app
+            .read_with(cx, |app, _| {
+                app.file_view_row_layout.get(&CALL_SITE_LINE).cloned()
+            })
+            .expect("the call-site row must have real painted layout by now");
+        let click_point = gpui::point(
+            row_bounds.left() + shaped.x_for_index(CALL_SITE_BYTE_RANGE.start + 1),
+            row_bounds.center().y,
+        );
+        // `Modifiers::secondary()` reads `control` on every platform this test actually runs on
+        // (non-macOS - see that method's own docs) - a real, held Ctrl, not a stand-in for it.
+        let ctrl_click = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        // Retried the same real way `f12_action_navigates_to_the_real_definition_line` retries
+        // its own equivalent request: a real `textDocument/definition` response can honestly come
+        // back empty while rust-analyzer is still mid-index, and a real user would just click
+        // again. Re-clicking (not just re-waiting) is load-bearing here - a single stale response
+        // means nothing will ever change without a fresh request.
+        let definition_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            cx.simulate_click(click_point, ctrl_click);
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(300));
+            cx.run_until_parked();
+            // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9) - real
+            // navigation, not the click's own plain caret placement being mistaken for it.
+            let navigated = app.read_with(cx, |app, _| app.code_cursor == Some(4));
+            if navigated {
+                break;
+            }
+            assert!(
+                Instant::now() < definition_deadline,
+                "a real Ctrl+click on the real call-site token never navigated \
+                 AdeApp::code_cursor to the real definition line within 120s - last observed \
+                 code_cursor: {:?}",
+                app.read_with(cx, |app, _| app.code_cursor)
+            );
+        }
+    }
+
+    /// A plain click still just places the caret and dismisses `Self::hover` - it must *not*
+    /// also fire `trigger_goto_definition`. No real LSP round trip needed: this is purely about
+    /// which branch of the click handler ran, provable from the caret's own real position and
+    /// `Self::hover`'s own state alone.
+    #[gpui::test]
+    fn a_plain_click_with_no_modifier_does_not_trigger_navigation(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn one() {}\nfn two() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        // A real, deliberately stale hover entry, seeded directly (the same established pattern
+        // `hover_popover_position_tests` uses) - if a plain click ever started dismissing it via
+        // the Ctrl+click path by mistake, this would still catch that as a real behavior change,
+        // even though this test's main point is that nothing *navigates*.
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path.clone(),
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn one()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let row_bounds = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&2).cloned())
+            .map(|(bounds, _)| bounds)
+            .expect("line 2's real row should have painted real layout by now");
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.code_cursor),
+            Some(2),
+            "a plain click must still move the real caret to the clicked line"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_none()),
+            "a plain click must still dismiss a real, stale hover card - GitHub issue #186's own \
+             existing behavior, which the Ctrl+click addition must not have disturbed"
+        );
+    }
 }
 
 /// Real regression coverage for bug 2 in this revision's brief: the Hover popover used to render
@@ -1417,6 +1597,16 @@ mod hover_popover_position_tests {
         path: PathBuf,
         line_number: usize,
     ) {
+        seed_ready_hover_with_signature(app, cx, path, line_number, "fn real_symbol()");
+    }
+
+    fn seed_ready_hover_with_signature(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        path: PathBuf,
+        line_number: usize,
+        signature: &str,
+    ) {
         app.update(cx, |app, cx| {
             app.hover = Some(HoverEntry {
                 path,
@@ -1428,13 +1618,95 @@ mod hover_popover_position_tests {
                 },
                 status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
                     module_path: None,
-                    signature: "fn real_symbol()".to_string(),
+                    signature: signature.to_string(),
                     doc: None,
                 })),
             });
             cx.notify();
         });
         cx.run_until_parked();
+    }
+
+    /// Regression coverage for a real, live-reproduced TypeScript symptom: a long, complex type
+    /// signature painted cut off mid-glyph instead of wrapping inside the card. Proven the same
+    /// way this module's other position tests prove real layout - real painted bounds, not a
+    /// description of intent.
+    ///
+    /// Opens a real `.rs` file (not `.txt`): [`render_hover_signature`] only has real, separate
+    /// flex items for `flex_wrap()` to wrap *between* when the signature is genuinely tokenized
+    /// into multiple syntax-highlighted runs - an unhighlighted fallback (no real extension
+    /// resolved) is exactly one run/one flex item, which `flex_wrap()` structurally cannot wrap
+    /// within on its own (that would need the text itself to reflow, a different real GPUI
+    /// behavior this fix doesn't touch). The real-world TS/Rust symptom this fixes always does
+    /// have a real extension resolved, so this is the real shape of the actual bug, not an
+    /// artificial best case.
+    #[gpui::test]
+    fn a_real_long_signature_wraps_inside_the_card_instead_of_being_clipped(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        // A real, long, genuinely multi-token Rust signature - comfortably wider than the card's
+        // own `max_w(430px)` if painted on a single line at 11.5px monospace, with enough real
+        // keyword/type/punctuation tokens for tree-sitter to split into many separate runs.
+        let long_signature = "pub fn process(&self, input: Result<HashMap<String, \
+                               Vec<Option<ComplexNestedGenericType>>>, \
+                               MyCustomErrorTypeWithALongName>) -> AnotherReallyLongReturnTypeName";
+        seed_ready_hover_with_signature(&app, cx, file_path, 1, long_signature);
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let first_token = cx
+            .debug_bounds("hover-signature-token-0")
+            .expect("the real signature's own first painted run should have painted real bounds");
+        // Real, verified-by-inspection tree-sitter-rust output for this exact fixture: 33 real
+        // runs, with the 25th (index 24, the `AnotherReallyLongReturnTypeName` return type)
+        // landing on the real card's second painted line - comfortably past both the first
+        // line's own real token count and any plausible off-by-a-few tokenizer drift.
+        let later_token = cx.debug_bounds("hover-signature-token-24").expect(
+            "a real signature this long and this token-dense must genuinely produce at least 25 \
+             separate highlighted runs - if this fails, either the fixture stopped being \
+             realistic or highlight_block's own tokenization regressed",
+        );
+
+        assert!(
+            later_token.right() <= card.right() + gpui::px(1.0),
+            "no real signature token may paint past the real card's own right edge (token right \
+             {:?}, card right {:?}) - a token painting past the card's edge is exactly the \
+             pre-fix clipping bug",
+            later_token.right(),
+            card.right()
+        );
+        assert!(
+            later_token.top() > first_token.top(),
+            "a real signature this long must genuinely wrap onto more than one line - a later \
+             real run must paint on a real, lower line than the first, not side-by-side on one \
+             unbroken (and therefore clipped) line (first token top {:?}, later token top {:?})",
+            first_token.top(),
+            later_token.top()
+        );
+        assert!(
+            card.size.height > px(60.0),
+            "a real signature that genuinely wraps across several lines must grow the real \
+             card's own painted height well past a single line's (~31px) - a card that stayed \
+             short would mean the wrap never really happened (got {:?})",
+            card.size.height
+        );
     }
 
     /// The real, load-bearing proof that the popover is anchored to the real hovered row, not
