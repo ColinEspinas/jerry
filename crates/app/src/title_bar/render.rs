@@ -888,6 +888,9 @@ mod agent_state_chip_live_tests {
             vec![(Status::Run, "1 agent running".to_string())],
             "one real running agent must read as the singular form"
         );
+        let first_agent_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup shell is the sole, active agent");
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_b.path().to_path_buf(), "wt-b")];
@@ -906,6 +909,61 @@ mod agent_state_chip_live_tests {
         // before reading a live `Status` off it, the same real seam
         // `rail_row_tests::worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` uses.
         cx.run_until_parked();
+
+        // Spawning this real second agent means a real, uncontrolled amount of wall-clock time
+        // elapses between it and the first agent's own last real activity (a real subprocess
+        // spawn - `TerminalPane::spawn_process` - under real full-suite parallel load, where
+        // dozens of other tests' own real subprocesses are contending for the same CPU cores,
+        // can genuinely take over `rail::status::RUN_RECENT_OUTPUT_WINDOW`'s real 2 real
+        // seconds; this was observed directly - `idle_duration` on the first agent measured at
+        // 2.91s in a loaded run, tipping it from `Status::Run` to `Status::Idle` and failing
+        // this test on a dimension it never meant to exercise). A real user with two
+        // simultaneously open agents naturally keeps glancing at/using each one, not leaving the
+        // first one motionless for that long the instant a second is spawned - so give the first
+        // agent's pty one more real, harmless Ctrl-L (the exact same real
+        // `TerminalPane::clear`/ECHOCTL round trip `terminal_clear_action_tests` and
+        // `clear_pty_signal_tests` already prove reaches a real pty) and wait for its real echo,
+        // which refreshes its real `activity_at` through the exact same product code path a real
+        // keystroke would. This is what the test is actually about - the chip correctly tracking
+        // two genuinely live agents - not an incidental race against how long the second agent's
+        // own real spawn happened to take.
+        let first_pane = app
+            .read_with(cx, |app, _| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == first_agent_id)
+                    .map(|agent| agent.pane.clone())
+            })
+            .expect("the first agent must still be open");
+        first_pane.update(cx, |pane, cx| pane.clear(cx));
+        // `clear()`'s real Ctrl-L reaches the real pty either way, but *what* comes back differs
+        // by how far along the real shell's own line editor is: a shell whose readline has
+        // already taken over the tty (as this long-alive first agent's has, unlike a
+        // freshly-spawned one) intercepts Ctrl-L as its own "redraw", never echoing a literal
+        // "^L" - so what's checked here is the actual thing this test cares about,
+        // `idle_duration` itself, not a literal byte sequence that this particular shell state
+        // was never going to produce.
+        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut first_agent_refreshed = false;
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            let idle = first_pane.read_with(cx, |pane, _| pane.idle_duration());
+            if idle.is_some_and(|idle| idle < std::time::Duration::from_secs(1)) {
+                first_agent_refreshed = true;
+                break;
+            }
+            if std::time::Instant::now() >= refresh_deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            first_agent_refreshed,
+            "expected the first agent's real pty activity to refresh after this real Ctrl-L \
+             round trip"
+        );
 
         let rows_after_second_spawn = app.update(cx, |app, cx| app.build_agent_rows(cx));
         let running_count = rows_after_second_spawn
