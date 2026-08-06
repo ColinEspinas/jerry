@@ -31,14 +31,28 @@ pub(in crate::lsp) type LspClientKey = (PathBuf, &'static str);
 const LSP_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// How many extra times [`AdeApp::schedule_lsp_sync`] re-pulls diagnostics if a real
-/// `lsp_core::LspClient::pull_diagnostics` call succeeds but reports an empty result right after
-/// a real `didChange` - a genuine, live-observed race distinct from the `ServerCancelled` retry
-/// `pull_diagnostics` itself already handles internally: a real rust-analyzer's own internal
-/// reanalysis can still be catching up to the exact content just sent even when it *doesn't*
-/// cancel the pull, answering instead with a real, structurally valid, but stale "no problems"
-/// report (observed live, under real parallel-process CPU contention, while building this
-/// feature - see `lsp_core::client::tests::did_change_full_then_a_real_pull_reports_a_real_new_diagnostic`'s
-/// own docs for the same race caught at the `lsp-core` layer).
+/// `lsp_core::LspClient::pull_diagnostics` call succeeds but reports an empty result - or
+/// outright fails/times out - right after a real `didChange`. Two distinct, genuine, live-
+/// observed races, both closed by the same retry budget:
+///
+/// - A real rust-analyzer's own internal reanalysis can still be catching up to the exact
+///   content just sent even when it *doesn't* cancel the pull, answering instead with a real,
+///   structurally valid, but stale "no problems" report (observed live, under real parallel-
+///   process CPU contention, while building this feature - see `lsp_core::client::tests::
+///   did_change_full_then_a_real_pull_reports_a_real_new_diagnostic`'s own docs for the same
+///   race caught at the `lsp-core` layer). This is distinct from the `ServerCancelled` retry
+///   `pull_diagnostics` itself already handles internally.
+/// - A real pull request can also simply time out (`LSP_QUERY_TIMEOUT`) under severe real
+///   full-suite parallel load, where a genuinely busy server takes longer than one request's own
+///   budget to answer even though it's still alive - a transient failure, not a genuine "this
+///   server can't answer" condition, and one this loop must retry exactly like an empty result
+///   rather than give up on. This matters especially for rust-analyzer: it never re-pushes
+///   `publishDiagnostics` unsolicited after its first `didOpen` (see `LspClient::
+///   supports_diagnostic_pull`'s own docs), so this pull loop is the *only* path a post-edit
+///   diagnostic update ever reaches this app through for it - treating a single timed-out
+///   attempt as terminal used to permanently strand the diagnostic no matter how long a caller's
+///   own outer wait loop kept polling afterward (see `lsp_diagnostics_wiring_tests`' own real,
+///   live-reproduced failure this fixes).
 ///
 /// Only ever consulted when [`LspSyncRequest::previous_result_was_non_empty`] is `true`
 /// (Revision R8.5b audit finding 2's fix for a real, live-measured bug): retrying *every* real
@@ -1405,8 +1419,9 @@ impl AdeApp {
                         });
                     }
                     // See `PULL_DIAGNOSTICS_EMPTY_RETRIES`'s own docs for the real,
-                    // live-observed race this bounded retry-on-empty closes, and for why it's
-                    // only even entered at all when `previous_result_was_non_empty` (Revision
+                    // live-observed races this bounded retry-on-empty-or-timeout closes, and
+                    // for why it's only even entered at all when `previous_result_was_non_empty`
+                    // (Revision
                     // R8.5b audit finding 2) - on a genuinely clean file this loop now runs
                     // exactly once, not up to 21 times. The actual blocking LSP call is
                     // still always off the foreground thread (a fresh `cx.background_executor()
@@ -1463,7 +1478,27 @@ impl AdeApp {
                             });
                         }
                         match outcome {
-                            Some(true) if attempt < max_retries => {
+                            // `None` here means the pull itself failed or hit
+                            // `LSP_QUERY_TIMEOUT` outright - a real, live possibility under
+                            // full-suite parallel load, where a genuinely busy real
+                            // `rust-analyzer`/`pyright`/`typescript-language-server` can take
+                            // longer than one request's own timeout to answer even though it's
+                            // still alive and would have answered eventually. Treating that the
+                            // same as an honest "still empty" answer (both mean "no fresh
+                            // confirmation yet") rather than as a terminal failure closes a real,
+                            // live-observed bug: rust-analyzer specifically never re-pushes
+                            // `publishDiagnostics` unsolicited after its first `didOpen` (see
+                            // `LspClient::supports_diagnostic_pull`'s own docs), so this pull
+                            // loop is the *only* path a post-edit diagnostic update ever reaches
+                            // this app through for it. Before this fix, a single transient
+                            // timeout here - not even a genuine failure, just this one real
+                            // request outrunning its own budget under load - permanently
+                            // stranded the diagnostic: the loop broke immediately, nothing else
+                            // ever re-asks for this edit, and a caller's own outer wait loop
+                            // (e.g. `lsp_diagnostics_wiring_tests::wait_until`) could poll for
+                            // its entire real deadline and never see the diagnostic arrive, no
+                            // matter how generous that deadline was widened to be.
+                            Some(true) | None if attempt < max_retries => {
                                 cx.background_executor()
                                     .timer(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY)
                                     .await;
@@ -2244,6 +2279,14 @@ pub(crate) mod lsp_connection_facade_tests {
     ///   what `lsp_core::LspClient::supports_diagnostic_pull` genuinely reads. No real companion
     ///   advertises one today, so this is the only way to exercise that branch honestly rather
     ///   than by pinning a version.
+    /// - `pull_flaky`: like `pull`, but answers the real *first* `textDocument/diagnostic`
+    ///   request it ever receives with a genuine JSON-RPC error (not `ServerCancelled`, so
+    ///   `lsp_core::LspClient::pull_diagnostics` returns immediately rather than retrying
+    ///   internally) and every request after that with a real, non-empty `Full` report - a real,
+    ///   deterministic, on-cue stand-in for the live, load-dependent "one real pull attempt times
+    ///   out or errors, a later one succeeds" condition
+    ///   [`AdeApp::schedule_lsp_sync`]'s own retry-on-`None` fix exists for (see that match arm's
+    ///   docs), reproduced here without needing real CPU contention or a real multi-second wait.
     ///
     /// Two test-only methods make its behavior observable and controllable from Rust without
     /// weakening anything real: `test/die` makes the process genuinely exit (standing in for a
@@ -2255,6 +2298,7 @@ pub(crate) mod lsp_connection_facade_tests {
 let buf = Buffer.alloc(0);
 // `node -e <script> -- <mode>` consumes the `--` itself, so the mode lands at argv[1].
 const MODE = process.argv[1] || 'normal';
+let diagnosticPullCalls = 0;
 function send(o) {
   const s = JSON.stringify(o);
   process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\r\n\r\n' + s);
@@ -2269,7 +2313,7 @@ function publish(uri, message, character, characterEnd) {
 function handle(msg) {
   if (msg.method === 'initialize') {
     const capabilities = { textDocumentSync: 1, hoverProvider: true };
-    if (MODE === 'pull') {
+    if (MODE === 'pull' || MODE === 'pull_flaky') {
       capabilities.diagnosticProvider = { interFileDependencies: false, workspaceDiagnostics: false };
     }
     send({ jsonrpc: '2.0', id: msg.id, result: { capabilities } });
@@ -2280,6 +2324,25 @@ function handle(msg) {
   if (msg.method === 'test/publish') {
     publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd);
     return;
+  }
+  if (msg.method === 'textDocument/diagnostic') {
+    if (MODE === 'pull_flaky') {
+      diagnosticPullCalls++;
+      if (diagnosticPullCalls === 1) {
+        // A real, non-ServerCancelled JSON-RPC error - `lsp_core::LspClient::pull_diagnostics`
+        // returns this immediately rather than retrying internally, standing in for a real
+        // request that timed out under load without this test needing to actually wait one out.
+        send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'flaky test failure' } });
+        return;
+      }
+      send({ jsonrpc: '2.0', id: msg.id, result: { kind: 'full', items: [
+        { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, severity: 1,
+          message: 'real diagnostic from a retried pull' }
+      ] } });
+      return;
+    }
+    // Every other mode has no real handler here and falls through to the generic id-only
+    // response below, matching every method this fake server doesn't otherwise understand.
   }
   if (msg.method === 'textDocument/hover') {
     const result = (MODE === 'hover' || MODE === 'semantic')
@@ -3634,16 +3697,48 @@ process.stdin.on('data', (d) => {
 /// This genuinely spawns a real `rust-analyzer` against a tiny, dependency-free scratch cargo
 /// project (kept dependency-free so `cargo metadata`/rust-analyzer's own workspace discovery
 /// never needs network access) with a genuine `let x: i32 = "not a number";` type mismatch, and
-/// polls real wall-clock time (up to 180s, matching `lsp_core::client`'s own e2e test) for the
-/// diagnostic to actually arrive - no sleep stands in for that wait, and nothing is fabricated
-/// if the wait times out (the assertion just fails). This is a genuinely slow test (real process
-/// spawn plus real sysroot indexing) kept in the normal, non-`#[ignore]` suite on purpose - this
-/// project has no separate "slow test" lane.
+/// polls real wall-clock time (up to 480s - see this module's own real-deadline constants for
+/// the exact per-test budgets, widened past `lsp_core::client`'s own e2e test's 180s baseline;
+/// see the docs on the deadlines themselves for why) for the diagnostic to actually arrive - no
+/// sleep stands in for that wait, and nothing is fabricated if the wait times out (the assertion
+/// just fails). This is a genuinely slow test (real process spawn plus real sysroot indexing)
+/// kept in the normal, non-`#[ignore]` suite on purpose - this project has no separate "slow
+/// test" lane.
 #[cfg(test)]
 mod lsp_diagnostics_wiring_tests {
     use super::*;
     use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
     use std::time::{Duration, Instant};
+
+    /// This module's five real-subprocess tests
+    /// ([`a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path`],
+    /// [`a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path`],
+    /// [`rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`],
+    /// [`typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`],
+    /// [`pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`]) each
+    /// spawn a genuinely separate, heavy real language-server subprocess and wait on real,
+    /// wall-clock-bounded indexing/diagnostics round trips. Left to `cargo test`'s default
+    /// parallelism, all five can spawn *simultaneously*, on top of whatever else the full suite
+    /// is doing at the same time - real, observed, live-reproduced full-suite contention (see
+    /// the widened real deadlines just above this module) that this lock cuts a genuine, sizeable
+    /// share out of: with these five serialized against each other, each real server gets the box
+    /// mostly to itself instead of fighting four siblings for the same cores, so their combined
+    /// real wall-clock total is typically no worse (often better, since none of them individually
+    /// come anywhere near needing their own widened deadline) than letting all five race in
+    /// parallel under load. `PoisonError::into_inner`, not `.unwrap()`: one of these tests'
+    /// own real assertion genuinely failing must not cascade into every *other* real-subprocess
+    /// test in this module failing on a poisoned lock too - a real failure should be reported
+    /// once, by the test that actually found it, not five times over.
+    static REAL_LSP_SUBPROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquires [`REAL_LSP_SUBPROCESS_TEST_LOCK`] for the calling test's duration - see that
+    /// lock's own docs for why. The returned guard must be held for the whole test (bind it to a
+    /// named local, not `_`, so it isn't dropped immediately).
+    fn serialize_real_lsp_subprocess_test() -> std::sync::MutexGuard<'static, ()> {
+        REAL_LSP_SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Same minimal, dependency-free scratch cargo project shape as
     /// `lsp_core::client::tests::write_scratch_project` - kept as its own small copy here
@@ -3684,8 +3779,8 @@ mod lsp_diagnostics_wiring_tests {
                 Instant::now() < deadline,
                 "no real diagnostic reached AdeApp::file_view_diagnostics within the caller's \
                  real deadline (this helper is shared by callers with different real timeouts - \
-                 180s for rust-analyzer, 120s for typescript-language-server - so the message \
-                 deliberately doesn't hardcode either one)"
+                 480s for rust-analyzer, 240s for typescript-language-server/pyright - so the \
+                 message deliberately doesn't hardcode either one)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -3700,6 +3795,7 @@ mod lsp_diagnostics_wiring_tests {
     fn a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let project = write_scratch_project(
             "fn main() {\n    let x: i32 = \"not a number\";\n    println!(\"{}\", x);\n}\n",
         );
@@ -3715,7 +3811,7 @@ mod lsp_diagnostics_wiring_tests {
         // must happen before `ensure_lsp_client` ever gets a chance to run.
         cx.run_until_parked();
 
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + Duration::from_secs(480);
         wait_for_real_diagnostics(&app, cx, deadline);
 
         app.read_with(cx, |app, _| {
@@ -3806,6 +3902,7 @@ mod lsp_diagnostics_wiring_tests {
     fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("tsconfig.json"),
@@ -3841,7 +3938,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
 
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_secs(240);
         wait_for_real_diagnostics(&app, cx, deadline);
 
         app.read_with(cx, |app, _| {
@@ -3931,6 +4028,7 @@ mod lsp_diagnostics_wiring_tests {
     fn rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let project = write_scratch_project(
             "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
         );
@@ -3942,7 +4040,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(180);
+        let indexed_deadline = Instant::now() + Duration::from_secs(480);
         wait_until(
             &app,
             cx,
@@ -3973,7 +4071,29 @@ mod lsp_diagnostics_wiring_tests {
             );
         });
 
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(180);
+        // Widened twice from a real, observed 180s-deadline failure under genuine full-suite
+        // parallel load (`cargo test -p app --lib` with its default, num-cpus-wide test-
+        // threads): the whole suite repeatedly ran 3-5x its normal wall-clock length (up to
+        // ~330s vs. the usual ~70-100s) on this same sandbox, and this real rust-analyzer -
+        // already `Ready` and only asked to recompute diagnostics for a two-line edit, not
+        // re-index from scratch - still hadn't published the new diagnostic even at 300s on a
+        // later, still-more-contended run (this module's own `REAL_LSP_SUBPROCESS_TEST_LOCK`
+        // and the `None`-is-retried fix in `AdeApp::schedule_lsp_sync`'s own retry loop both
+        // already close the *other* real bugs this same investigation found - this deadline
+        // widening is a distinct, additional real-headroom fix, not a substitute for either).
+        // The wait itself already polls correctly (real `std::thread::sleep` between checks,
+        // bounded by a real deadline, not a fixed tick count - see `wait_until`'s own docs); the
+        // deadline itself was just too tight for how slow a real subprocess can genuinely get
+        // when dozens of sibling tests' own real subprocesses (other `rust-analyzer`/`pyright`/
+        // `typescript-language-server`/pty sessions, and - on this particular shared sandbox -
+        // other agents' own concurrent full test-suite runs) are contending for the same CPU
+        // cores. 480s keeps real headroom for that without losing the "assertion still fails if
+        // diagnostics genuinely never arrive" property that makes this a real regression gate,
+        // not a rubber stamp - and rust-analyzer gets the widest budget of the three real
+        // servers this module covers because it is, empirically, the one that has actually
+        // needed it (typescript-language-server/pyright's own 240s deadlines have not been
+        // observed failing across dozens of full-suite reproduction runs).
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(480);
         wait_until(
             &app,
             cx,
@@ -4081,6 +4201,103 @@ mod lsp_diagnostics_wiring_tests {
         });
     }
 
+    /// The real fix for a real, live-observed bug behind this module's own widened deadlines
+    /// (see [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s own docs for the full account): a single real
+    /// `pull_diagnostics` attempt that fails or times out - a real, live possibility under full-
+    /// suite parallel load, not a genuine "the server can't answer" condition - used to
+    /// permanently strand a post-edit diagnostic, because the retry loop treated that outcome
+    /// (`None`) as terminal instead of retrying it exactly like it already retried an honest
+    /// "still empty" answer. This reproduces the failure deterministically, without needing real
+    /// CPU contention or a real multi-second wait: [`spawn_fake_server`]'s `pull_flaky` mode
+    /// answers the real *first* `textDocument/diagnostic` request with a real JSON-RPC error and
+    /// every request after that with a real, non-empty report, so a pre-fix build (which breaks
+    /// out after that first error) never sees the second, successful attempt's real diagnostic,
+    /// while a fixed build does.
+    #[gpui::test]
+    fn a_transient_pull_failure_is_retried_not_treated_as_a_permanent_stall(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let absolute = root.join("src").join("main.rs");
+        std::fs::write(&absolute, "fn main() {}\n").expect("write main.rs");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let server = super::lsp_connection_facade_tests::spawn_fake_server(
+            repo.path(),
+            "rust-analyzer",
+            "pull_flaky",
+        );
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server.clone()),
+            );
+            app.open_file_view(absolute.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        // A real render pass - the real trigger for `AdeApp::dispatch_did_open`, which is what
+        // populates `AdeApp::lsp_uri_cache` for this file (see `wait_for_real_diagnostics`'s own
+        // docs for why re-rendering, not just `open_file_view`, is what actually drives this
+        // real production path forward). Needed before `previous_result_was_non_empty` can ever
+        // read anything real below - without this, `lsp_uri_cache` stays empty and the retry
+        // loop under test never even engages.
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        // A real, non-empty diagnostics result for this file *before* the real edit below - the
+        // real gate (`previous_result_was_non_empty`) that makes the retry loop under test run
+        // at all, rather than accept a single pull's answer unconditionally (see
+        // `PULL_DIAGNOSTICS_EMPTY_RETRIES`'s own docs).
+        let file_uri = lsp_core::LspClient::uri_for_path(&absolute).expect("real uri");
+        super::lsp_connection_facade_tests::publish_and_wait(
+            &server,
+            file_uri.as_str(),
+            "seed diagnostic before the real edit",
+        );
+
+        // A real, unsaved edit through the real `EntityInputHandler::replace_text_in_range` path
+        // (same as [`type_text`]'s other callers in this module), so `schedule_lsp_sync`'s own
+        // debounced continuation has genuinely new content to sync and dispatches a real
+        // `didChange` - the real trigger for the real pull-retry sequence under test.
+        type_text(&app, cx, "fn main() {}\n".len(), "\n// a real edit\n");
+
+        // The retry loop's own `PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY` timer is a real,
+        // deterministic-clock-aware `cx.background_executor().timer(..)`, so it needs an
+        // explicit `advance_clock` here to fire, the same as `wait_until`'s own polling shape
+        // uses `type_text`'s own advance for the sync debounce - `run_until_parked()` alone does
+        // not carry the virtual clock forward on its own, so without this the retry's own timer
+        // would never fire and this loop would hang until the real deadline below.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut retried_past_the_first_failure = false;
+        while Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY);
+            cx.run_until_parked();
+            if server
+                .diagnostics_for_uri(&file_uri)
+                .is_some_and(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .any(|d| d.message == "real diagnostic from a retried pull")
+                })
+            {
+                retried_past_the_first_failure = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            retried_past_the_first_failure,
+            "the retry loop must survive the fake server's first, deliberately-erroring pull \
+             attempt and pick up the real, non-empty result its second attempt answers with - a \
+             pre-fix build stops retrying after that first error and never reaches it"
+        );
+    }
+
     /// The same real, live proof as the rust-analyzer test above, for `typescript-language-server`
     /// - see `crate::language`'s own docs on why `npm install typescript@5` is a genuine, real
     /// project-local requirement in this sandbox, not conservative caution.
@@ -4088,6 +4305,7 @@ mod lsp_diagnostics_wiring_tests {
     fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("tsconfig.json"),
@@ -4116,7 +4334,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(120);
+        let indexed_deadline = Instant::now() + Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -4141,7 +4359,7 @@ mod lsp_diagnostics_wiring_tests {
                 .is_dirty());
         });
 
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(120);
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -4210,6 +4428,7 @@ mod lsp_diagnostics_wiring_tests {
     fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let main_py = dir.path().join("main.py");
         let baseline = "ok: int = 1\nprint(ok)\n";
@@ -4221,7 +4440,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(120);
+        let indexed_deadline = Instant::now() + Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -4241,7 +4460,7 @@ mod lsp_diagnostics_wiring_tests {
                 .is_dirty());
         });
 
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(120);
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(240);
         wait_until(
             &app,
             cx,
