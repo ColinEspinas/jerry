@@ -73,11 +73,46 @@ pub(crate) enum CompletionsStatus {
     /// point [`AdeApp::completions`] is written - see `crate::lsp::client::AdeApp::
     /// apply_completion_result`'s own docs - so this variant is never empty).
     Ready {
+        /// **Every** item the server actually returned, in the order it returned them - never
+        /// narrowed in place. Keeping the full response intact is what lets Backspace genuinely
+        /// widen the popup back out (see [`AdeApp::refilter_completions`]) without re-asking the
+        /// server for a set it already sent.
         items: Vec<lsp_core::lsp_types::CompletionItem>,
+        /// Indices into `items`, best match first, for the prefix currently typed at the caret -
+        /// the real, client-side filtered/re-ranked view (GitHub issue #189), computed by
+        /// [`completion_view::rank_completion_items`]. This, not `items`, is what the popup
+        /// renders and what keyboard navigation walks; never empty for a live `Ready` entry (an
+        /// empty filter result dismisses the popup outright, exactly as an empty server response
+        /// already does).
+        visible: Vec<usize>,
+        /// An index into `visible`, **not** into `items` - so "the Nth visible row" and "the Nth
+        /// selected item" can never drift apart as the filter narrows.
         selected: usize,
     },
     Failed(String),
 }
+
+impl CompletionsStatus {
+    /// A real `Ready` state for a server response, already narrowed/re-ranked against `query` (the
+    /// identifier prefix currently typed at the caret - see [`AdeApp::completion_filter_query`]).
+    /// `None` when nothing in `items` matches `query` at all, which the caller treats exactly the
+    /// way it already treats a genuinely empty server response: no popup.
+    pub(crate) fn ready(
+        items: Vec<lsp_core::lsp_types::CompletionItem>,
+        query: &str,
+    ) -> Option<Self> {
+        let visible = completion_view::rank_completion_items(&items, query);
+        if visible.is_empty() {
+            return None;
+        }
+        Some(Self::Ready {
+            items,
+            visible,
+            selected: 0,
+        })
+    }
+}
+
 
 /// The popup's real total width - matches `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
 /// own real completions-list column width (`290px`) plus its `1px` right divider (this app has
@@ -170,6 +205,102 @@ impl AdeApp {
         self.completions_generation = self.completions_generation.wrapping_add(1);
     }
 
+    /// The real text the user has typed since the completion was triggered, as a live-completions
+    /// client must match it: the identifier prefix immediately before the caret in `path`'s own
+    /// buffer (`crate::lsp::completion::identifier_prefix_start` - the exact same real word-start
+    /// scan [`resolve_completion_edit`] already uses to decide what an accepted item replaces, so
+    /// "what gets filtered on" and "what gets overwritten on accept" can never disagree).
+    ///
+    /// Deliberately derived from the buffer every time rather than accumulated in a separate
+    /// "typed since trigger" field: that scan is already the real definition of the word being
+    /// completed, it stays correct through Backspace/Delete and caret moves with no extra
+    /// bookkeeping to get out of sync, and it is empty exactly when it should be - right after a
+    /// real trigger character (`foo.`, `std::`), where nothing has been typed to narrow by yet.
+    /// This is the same "word range at the position" query model VSCode's own suggest widget uses.
+    ///
+    /// `None` when there is no buffer for `path` at all; the empty string (match everything) is a
+    /// real, distinct answer from that.
+    pub(crate) fn completion_filter_query(&self, path: &Path) -> Option<String> {
+        let buffer = self.edit_buffer(path)?;
+        let cursor = buffer.cursor_offset();
+        let (line, _) = buffer.line_col_for_offset(cursor);
+        let line_range = buffer.line_ranges.get(line).cloned()?;
+        let line_text = buffer.content.get(line_range.clone())?;
+        let local_cursor = cursor.saturating_sub(line_range.start).min(line_text.len());
+        let prefix_start = completion_view::identifier_prefix_start(line_text, local_cursor);
+        Some(line_text[prefix_start..local_cursor].to_string())
+    }
+
+    /// Re-applies the real, client-side filter (GitHub issue #189) to whatever completion list is
+    /// currently held, against the prefix now typed at the caret - the fix's whole point: this runs
+    /// synchronously on every real keystroke (from `crate::lsp::client::AdeApp::schedule_lsp_sync`,
+    /// the one call site every real edit path already funnels through), so the popup narrows
+    /// instantly rather than waiting on the debounced `textDocument/completion` round trip that
+    /// refreshes the underlying candidate set behind it.
+    ///
+    /// The two compose without fighting: the server's own response still *replaces* `items`
+    /// wholesale when it lands (a moved position genuinely changes what's semantically valid), and
+    /// `crate::lsp::client::AdeApp::apply_completion_result` re-derives `visible` from this same
+    /// query as it does so - so a response always arrives already narrowed to what's typed, and
+    /// every keystroke in between narrows further without a round trip.
+    ///
+    /// Narrowing to nothing dismisses the popup outright, matching both what a real suggest widget
+    /// does when the typed text stops matching anything and this module's own existing discipline
+    /// (`crate::lsp::client::AdeApp::prepare_lsp_sync` already dismisses when the context that
+    /// justified the popup is gone). It matters mechanically too: [`Self::
+    /// completions_open_for_active_path`] claims `Enter`/`Up`/`Down` for *any* `Ready` entry, so an
+    /// entry left open with nothing visible would silently swallow those keystrokes.
+    pub(crate) fn refilter_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .completions
+            .as_ref()
+            .filter(|entry| matches!(entry.status, CompletionsStatus::Ready { .. }))
+            .map(|entry| entry.path.clone())
+        else {
+            return;
+        };
+        let query = self.completion_filter_query(&path).unwrap_or_default();
+        let Some(entry) = self.completions.as_mut() else {
+            return;
+        };
+        let CompletionsStatus::Ready {
+            items,
+            visible,
+            selected,
+        } = &mut entry.status
+        else {
+            return;
+        };
+
+        let previously_selected_item = visible.get(*selected).copied();
+        let next_visible = completion_view::rank_completion_items(items, &query);
+        if next_visible.is_empty() {
+            self.dismiss_completions();
+            cx.notify();
+            return;
+        }
+        // Follow the *item* the user had selected to its new row, rather than keeping the raw row
+        // number (which would silently point at a different completion once the list narrows).
+        // Falls back to the new best match when that item didn't survive the narrowing. No
+        // keyboard-reachable-row cap here (unlike an earlier version of this fix): GitHub issue
+        // #185's real virtualized scrolling means every real row is reachable regardless of how
+        // far down the now-narrowed list it lands, so the followed row is scrolled into view
+        // below instead of being discarded.
+        let next_selected = previously_selected_item
+            .and_then(|item| next_visible.iter().position(|index| *index == item))
+            .unwrap_or(0);
+        *selected = next_selected;
+        *visible = next_visible;
+        // Same real "scroll the minimum amount needed to bring this row into view" strategy
+        // `Self::move_completions_selection` uses for the identical job - the followed row can
+        // land well outside the current viewport (a filter narrowing the list changes every row's
+        // own position), and without this the selection highlight would move somewhere the user
+        // can't actually see.
+        self.completions_scroll_handle
+            .scroll_to_item(next_selected, gpui::ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
     pub(crate) fn handle_completions_up_action(
         &mut self,
         _: &CompletionsUp,
@@ -210,10 +341,19 @@ impl AdeApp {
         let Some(entry) = self.completions.as_mut() else {
             return;
         };
-        let CompletionsStatus::Ready { items, selected } = &mut entry.status else {
+        // Navigation walks the *filtered* view (`visible`), never the raw server list - `selected`
+        // is an index into `visible` (see that field's own docs), so "the Nth visible row" and
+        // "the Nth item keyboard nav lands on" stay the same thing however far the filter narrows.
+        let CompletionsStatus::Ready {
+            visible, selected, ..
+        } = &mut entry.status
+        else {
             return;
         };
-        let total = items.len();
+        // Navigation walks the whole real, filtered `visible` list, not a truncated slice of it -
+        // GitHub issue #185 replaced the old hard render cap with real virtualized scrolling, so
+        // there is no shorter "shown" subset to clamp against anymore.
+        let total = visible.len();
         if total == 0 {
             return;
         }
@@ -293,14 +433,22 @@ impl AdeApp {
             return;
         };
         self.completions_generation = self.completions_generation.wrapping_add(1);
-        let CompletionsStatus::Ready { items, selected } = entry.status else {
+        let CompletionsStatus::Ready {
+            items,
+            visible,
+            selected,
+        } = entry.status
+        else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
             self.reset_caret_blink(cx);
             return;
         };
-        let Some(item) = items.get(selected) else {
+        // `selected` indexes the filtered view, so it must be resolved *through* `visible` back
+        // into the real server list - accepting "the row I can see" and "the item that gets
+        // inserted" are the same item by construction.
+        let Some(item) = visible.get(selected).and_then(|index| items.get(*index)) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
@@ -431,13 +579,16 @@ impl AdeApp {
                     "completion request failed: {message}"
                 )));
             }
-            CompletionsStatus::Ready { items, .. } => {
+            CompletionsStatus::Ready { visible, .. } => {
                 // Real virtualization, not a render cap (GitHub issue #185): `uniform_list` only
-                // ever builds the rows genuinely inside its own viewport, so `items.len()` here is
-                // the *whole* real, live-returned response - hundreds of items included - and
-                // every one of them is reachable by keyboard (`Self::move_completions_selection`
-                // scrolls the viewport to follow the selection), by mouse wheel, and by the
-                // overlay scrollbar below. The same `uniform_list` idiom
+                // ever builds the rows genuinely inside its own viewport, so `visible.len()` here
+                // is the *whole* real, filtered/re-ranked view (GitHub issue #189) - hundreds of
+                // items included when the filter is empty - and every one of them is reachable by
+                // keyboard (`Self::move_completions_selection` scrolls the viewport to follow the
+                // selection), by mouse wheel, and by the overlay scrollbar below. `index` below is
+                // always a position *in `visible`*, matching `selected`'s own indexing convention
+                // (see [`CompletionsStatus::Ready::selected`]'s own docs) - never a raw index into
+                // the untouched server list. The same `uniform_list` idiom
                 // `crate::sidebar::render::AdeApp::render_file_tree` and
                 // `crate::code_surface::file_view::AdeApp::render_file_view` already use, and the
                 // same one Zed's own completions menu uses for this exact surface
@@ -447,33 +598,44 @@ impl AdeApp {
                 // real requirement.
                 let list = gpui::uniform_list(
                     "completions-list",
-                    items.len(),
+                    visible.len(),
                     cx.processor(
                         move |this: &mut Self,
                               range: std::ops::Range<usize>,
                               _window,
                               cx: &mut Context<Self>| {
-                            // Re-read the live state rather than capturing a clone of `items`:
-                            // this closure runs once per frame, and a real "complete everything in
-                            // scope" response is large enough that cloning it every frame would be
-                            // a genuine cost. Every index is clamped rather than trusted, so a
-                            // future divergence degrades to "renders fewer rows" instead of
-                            // panicking.
+                            // Re-read the live state rather than capturing a clone of `items`/
+                            // `visible`: this closure runs once per frame, and a real "complete
+                            // everything in scope" response is large enough that cloning it every
+                            // frame would be a genuine cost. Every index is clamped rather than
+                            // trusted, so a future divergence degrades to "renders fewer rows"
+                            // instead of panicking.
                             let Some(entry) = this.completions.as_ref() else {
                                 return Vec::new();
                             };
-                            let CompletionsStatus::Ready { items, selected } = &entry.status else {
+                            let CompletionsStatus::Ready {
+                                items,
+                                visible,
+                                selected,
+                            } = &entry.status
+                            else {
                                 return Vec::new();
                             };
                             let selected = *selected;
-                            let end = range.end.min(items.len());
+                            let end = range.end.min(visible.len());
                             let start = range.start.min(end);
-                            items[start..end]
+                            visible[start..end]
                                 .iter()
                                 .enumerate()
-                                .map(|(offset, item)| {
+                                .filter_map(|(offset, item_index)| {
                                     let index = start + offset;
-                                    render_completion_row(index, item, index == selected, cx)
+                                    let item = items.get(*item_index)?;
+                                    Some(render_completion_row(
+                                        index,
+                                        item,
+                                        index == selected,
+                                        cx,
+                                    ))
                                 })
                                 .collect::<Vec<_>>()
                         },
@@ -752,10 +914,12 @@ mod completions_scroll_tests {
         app.update(cx, |app, cx| {
             app.completions = Some(CompletionsEntry {
                 path: relative.clone(),
-                status: CompletionsStatus::Ready {
-                    items: fake_items(count),
-                    selected: 0,
-                },
+                // Empty query - every item stays visible, in the real server's own order (see
+                // `completion_view::completion_match`'s own docs), matching what this helper's
+                // real callers (real scroll-position/virtualization tests) need: an unshifted,
+                // predictable `visible` for their own index-based assertions.
+                status: CompletionsStatus::ready(fake_items(count), "")
+                    .expect("a real, non-empty item list must produce a real Ready state"),
             });
             cx.notify();
         });

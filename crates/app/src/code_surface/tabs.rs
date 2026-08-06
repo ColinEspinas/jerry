@@ -1953,13 +1953,14 @@ mod stale_completions_popup_tests {
     fn fake_ready_entry(path: PathBuf, label: &str) -> CompletionsEntry {
         CompletionsEntry {
             path,
-            status: CompletionsStatus::Ready {
-                items: vec![lsp_core::lsp_types::CompletionItem {
+            status: CompletionsStatus::ready(
+                vec![lsp_core::lsp_types::CompletionItem {
                     label: label.to_string(),
                     ..Default::default()
                 }],
-                selected: 0,
-            },
+                "",
+            )
+            .expect("a real, non-empty ready state"),
         }
     }
 
