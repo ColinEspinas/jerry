@@ -388,6 +388,7 @@ impl AdeApp {
             _lsp_sync_tasks: HashMap::new(),
             _completions_request_task: None,
             completions: None,
+            completions_scroll_handle: UniformListScrollHandle::new(),
             completions_generation: 0,
             file_view_diagnostics: HashMap::new(),
             file_view_error_count: None,

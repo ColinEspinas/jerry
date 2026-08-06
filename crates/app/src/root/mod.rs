@@ -1314,6 +1314,15 @@ pub struct AdeApp {
     /// longer open simply never matches [`Self::active_editable_path`] and is treated as absent
     /// by every render/keybinding site that reads it.
     pub(crate) completions: Option<CompletionsEntry>,
+    /// The Completions popup's own `uniform_list` scroll handle (GitHub issue #185) - the real
+    /// mechanism that replaced the popup's old `MAX_RENDERED_COMPLETION_ITEMS` (12) hard render
+    /// cap. `crate::lsp::completion_popup::AdeApp::render_completions_popover`'s `uniform_list` is
+    /// `track_scroll`'d with it, `Self::move_completions_selection` drives
+    /// `gpui::UniformListScrollHandle::scroll_to_item` off it so keyboard nav keeps the selected
+    /// row in view, and `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` reads its
+    /// overlay-scrollbar geometry straight off the same handle - not a second, parallel tracking
+    /// mechanism, exactly like [`Self::file_tree_scroll_handle`].
+    pub(crate) completions_scroll_handle: UniformListScrollHandle,
     /// A real generation counter bumped every time a completions request is dispatched or the
     /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
     /// docs for the real, live race this closes: an in-flight `textDocument/completion` request

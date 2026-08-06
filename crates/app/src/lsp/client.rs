@@ -1781,7 +1781,21 @@ impl AdeApp {
                 status: CompletionsStatus::Failed(err.to_string()),
             }),
         };
+        let is_ready = matches!(
+            new_state.as_ref().map(|entry| &entry.status),
+            Some(CompletionsStatus::Ready { .. })
+        );
         self.completions = new_state;
+        if is_ready {
+            // A genuinely new response starts at `selected: 0`, so its list has to start scrolled
+            // to the top too - `AdeApp::completions_scroll_handle` is a long-lived field, and
+            // without this the *previous* response's scroll offset would survive into this one,
+            // showing a viewport that has nothing to do with the freshly selected first item
+            // (GitHub issue #185). `Top`, not `Nearest`: this is a reset, not a follow-the-
+            // selection nudge.
+            self.completions_scroll_handle
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 }
