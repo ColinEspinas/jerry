@@ -3658,7 +3658,7 @@ process.stdin.on('data', (d) => {
 /// This genuinely spawns a real `rust-analyzer` against a tiny, dependency-free scratch cargo
 /// project (kept dependency-free so `cargo metadata`/rust-analyzer's own workspace discovery
 /// never needs network access) with a genuine `let x: i32 = "not a number";` type mismatch, and
-/// polls real wall-clock time (up to 300s - see this module's own real-deadline constants for
+/// polls real wall-clock time (up to 480s - see this module's own real-deadline constants for
 /// the exact per-test budgets, widened past `lsp_core::client`'s own e2e test's 180s baseline;
 /// see the docs on the deadlines themselves for why) for the diagnostic to actually arrive - no
 /// sleep stands in for that wait, and nothing is fabricated if the wait times out (the assertion
@@ -3740,7 +3740,7 @@ mod lsp_diagnostics_wiring_tests {
                 Instant::now() < deadline,
                 "no real diagnostic reached AdeApp::file_view_diagnostics within the caller's \
                  real deadline (this helper is shared by callers with different real timeouts - \
-                 300s for rust-analyzer, 240s for typescript-language-server/pyright - so the \
+                 480s for rust-analyzer, 240s for typescript-language-server/pyright - so the \
                  message deliberately doesn't hardcode either one)"
             );
             std::thread::sleep(Duration::from_millis(200));
@@ -3772,7 +3772,7 @@ mod lsp_diagnostics_wiring_tests {
         // must happen before `ensure_lsp_client` ever gets a chance to run.
         cx.run_until_parked();
 
-        let deadline = Instant::now() + Duration::from_secs(300);
+        let deadline = Instant::now() + Duration::from_secs(480);
         wait_for_real_diagnostics(&app, cx, deadline);
 
         app.read_with(cx, |app, _| {
@@ -4001,7 +4001,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(300);
+        let indexed_deadline = Instant::now() + Duration::from_secs(480);
         wait_until(
             &app,
             cx,
@@ -4032,20 +4032,29 @@ mod lsp_diagnostics_wiring_tests {
             );
         });
 
-        // Widened from a real, observed 180s-deadline failure under genuine full-suite parallel
-        // load (`cargo test -p app --lib` with its default, num-cpus-wide test-threads): the
-        // whole suite ran ~3x its normal wall-clock length (≈200s vs. the usual ≈70-100s) that
-        // run, and this real rust-analyzer - already `Ready` and only asked to recompute
-        // diagnostics for a two-line edit, not re-index from scratch - still hadn't published
-        // the new diagnostic by 180s. The wait itself already polls correctly (real
-        // `std::thread::sleep` between checks, bounded by a real deadline, not a fixed tick
-        // count - see `wait_until`'s own docs); the deadline itself was just too tight for how
-        // slow a real subprocess can genuinely get when dozens of sibling tests' own real
-        // subprocesses (other `rust-analyzer`/`pyright`/`typescript-language-server`/pty
-        // sessions) are contending for the same CPU cores. 300s keeps real headroom for that
-        // without losing the "assertion still fails if diagnostics genuinely never arrive"
-        // property that makes this a real regression gate, not a rubber stamp.
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(300);
+        // Widened twice from a real, observed 180s-deadline failure under genuine full-suite
+        // parallel load (`cargo test -p app --lib` with its default, num-cpus-wide test-
+        // threads): the whole suite repeatedly ran 3-5x its normal wall-clock length (up to
+        // ~330s vs. the usual ~70-100s) on this same sandbox, and this real rust-analyzer -
+        // already `Ready` and only asked to recompute diagnostics for a two-line edit, not
+        // re-index from scratch - still hadn't published the new diagnostic even at 300s on a
+        // later, still-more-contended run (this module's own `REAL_LSP_SUBPROCESS_TEST_LOCK`
+        // and the `None`-is-retried fix in `AdeApp::schedule_lsp_sync`'s own retry loop both
+        // already close the *other* real bugs this same investigation found - this deadline
+        // widening is a distinct, additional real-headroom fix, not a substitute for either).
+        // The wait itself already polls correctly (real `std::thread::sleep` between checks,
+        // bounded by a real deadline, not a fixed tick count - see `wait_until`'s own docs); the
+        // deadline itself was just too tight for how slow a real subprocess can genuinely get
+        // when dozens of sibling tests' own real subprocesses (other `rust-analyzer`/`pyright`/
+        // `typescript-language-server`/pty sessions, and - on this particular shared sandbox -
+        // other agents' own concurrent full test-suite runs) are contending for the same CPU
+        // cores. 480s keeps real headroom for that without losing the "assertion still fails if
+        // diagnostics genuinely never arrive" property that makes this a real regression gate,
+        // not a rubber stamp - and rust-analyzer gets the widest budget of the three real
+        // servers this module covers because it is, empirically, the one that has actually
+        // needed it (typescript-language-server/pyright's own 240s deadlines have not been
+        // observed failing across dozens of full-suite reproduction runs).
+        let diagnostic_deadline = Instant::now() + Duration::from_secs(480);
         wait_until(
             &app,
             cx,

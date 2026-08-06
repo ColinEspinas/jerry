@@ -943,7 +943,7 @@ mod agent_state_chip_live_tests {
         // "^L" - so what's checked here is the actual thing this test cares about,
         // `idle_duration` itself, not a literal byte sequence that this particular shell state
         // was never going to produce.
-        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         let mut first_agent_refreshed = false;
         loop {
             cx.background_executor

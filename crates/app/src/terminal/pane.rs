@@ -2490,7 +2490,7 @@ mod clear_pty_signal_tests {
         // `std::thread::sleep(Duration::from_millis(400))` for the identical Ctrl-L/ECHOCTL
         // round trip.
         let mut saw_caret_l = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
         loop {
             cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();

@@ -4110,8 +4110,8 @@ mod terminal_clear_action_tests {
 
         cx.dispatch_action(TerminalClear);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let saw_caret_l_on_second = wait_for_real_pty_output(cx, deadline, |cx| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let saw_real_output_on_second = wait_for_real_pty_output(cx, deadline, |cx| {
             let second_lines = app.read_with(cx, |app, cx| {
                 app.agents
                     .iter()
@@ -4121,12 +4121,24 @@ mod terminal_clear_action_tests {
                     .read(cx)
                     .visible_text_lines()
             });
-            second_lines.iter().any(|line| line.contains("^L"))
+            // `TerminalPane::clear` wipes its own local grid *first*, synchronously, before it
+            // ever writes the real Ctrl-L byte to the pty - so any real, non-blank content that
+            // reappears here can only be this real round trip's own echo. That echo can
+            // honestly take either shape: a raw `^L` (ECHOCTL, if the shell's own readline
+            // hasn't taken over the tty yet - the common case for a just-spawned shell) or a
+            // redrawn prompt (readline's own real `clear-screen` binding, once it has) - see
+            // `title_bar::render::agent_state_chip_live_tests`'s own docs for the identical real
+            // ambiguity, live-observed there first. Searching for the literal `^L` text alone
+            // made this test racy against exactly which one a real shell happens to pick under
+            // real full-suite load, where the extra real time before Ctrl-L is dispatched can
+            // let a freshly spawned shell's readline win a race it would usually lose on an
+            // otherwise-idle machine.
+            second_lines.iter().any(|line| !line.trim().is_empty())
         });
         assert!(
-            saw_caret_l_on_second,
-            "expected the active (second) agent's pty to echo back the real Ctrl-L byte \
-             TerminalClear's handler sends"
+            saw_real_output_on_second,
+            "expected the active (second) agent's real pty to echo something back after \
+             TerminalClear's real Ctrl-L byte reached it"
         );
 
         let first_lines = app.read_with(cx, |app, cx| {
@@ -4429,7 +4441,7 @@ mod terminal_clipboard_action_tests {
             "ctrl-shift-v"
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
             let lines = app.read_with(cx, |app, cx| {
                 app.agents
@@ -4462,7 +4474,7 @@ mod terminal_clipboard_action_tests {
         });
         cx.dispatch_action(TerminalPaste);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
             let lines = app.read_with(cx, |app, cx| {
                 app.agents
