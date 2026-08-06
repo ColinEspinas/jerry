@@ -1398,6 +1398,14 @@ pub struct AdeApp {
     /// (cancels) the previous one, so a pointer sweeping across ten tokens leaves exactly one
     /// armed timer, not ten.
     pub(crate) _hover_debounce_task: Option<Task<()>>,
+    /// The single in-flight [`HOVER_HIDE_DELAY`] timer that debounces *clearing* an already-
+    /// visible [`Self::hover`] - the hide-side mirror of [`Self::_hover_debounce_task`]'s show-
+    /// side delay. Without this, every real token boundary (or plain whitespace gap) the pointer
+    /// crosses while sweeping toward some other target synchronously cleared an already-resolved,
+    /// visible card, producing a real, reported flash on every sweep rather than only on a
+    /// deliberate re-hover. Assigning a fresh task drops the previous one, matching every other
+    /// single-slot task field here.
+    pub(crate) _hover_hide_task: Option<Task<()>>,
     /// The real painted bounds of the Hover card (GitHub issue #186), captured every frame by its
     /// own `gpui::canvas` - the same one-frame-lag idiom [`Self::body_bounds`] already uses.
     /// [`Self::track_hover_pointer`] reads it to answer "is the pointer on the card itself right

@@ -20,6 +20,16 @@ use std::time::Duration;
 /// here, since this app has no per-user setting for it to read.
 pub(crate) const HOVER_TRIGGER_DELAY: Duration = Duration::from_millis(300);
 
+/// How long an already-visible [`AdeApp::hover`] card stays up after the pointer leaves its token
+/// before it actually clears - the hide-side mirror of [`HOVER_TRIGGER_DELAY`], matching
+/// `vendor/zed/crates/editor/src/hover_popover.rs`'s own separate `hover_popover_hiding_delay`
+/// setting, whose real default (`vendor/zed/assets/settings/default.json`) is also `300`ms.
+/// Without this, every real token boundary - or the plain whitespace between two words on the
+/// same line - the pointer crosses while sweeping toward some other target synchronously cleared
+/// an already-resolved, visible card: a real, reported flash on every sweep, not just on a
+/// deliberate re-hover.
+pub(crate) const HOVER_HIDE_DELAY: Duration = Duration::from_millis(300);
+
 impl AdeApp {
     /// Real, pointer-driven hover trigger (GitHub issue #186): arms [`HOVER_TRIGGER_DELAY`] for
     /// `anchor`, and only once that has genuinely elapsed with the pointer still on the same token
@@ -27,23 +37,25 @@ impl AdeApp {
     /// every real mouse-move that lands on a real token.
     ///
     /// Two real no-ops keep a pointer sweep from doing any work at all: the same token already
-    /// showing a real [`Self::hover`] entry, and the same token already having an armed timer.
-    /// Everything else is a genuinely different token, which drops the old card immediately (it
-    /// describes a symbol the pointer has left) and re-arms.
+    /// showing a real [`Self::hover`] entry (which also cancels any [`HOVER_HIDE_DELAY`] a brief
+    /// earlier detour off it might have armed - the pointer is back), and the same token already
+    /// having an armed timer. Everything else is a genuinely different token: the *old* card, if
+    /// any, is not cleared here - [`Self::schedule_hover_hide`] debounces that - while the new
+    /// token's own show timer re-arms.
     pub(in crate::code_surface) fn hover_over_token(
         &mut self,
         anchor: HoverAnchor,
         cx: &mut Context<Self>,
     ) {
-        if self.hover_anchor_matches(&anchor) || self.hover_pending.as_ref() == Some(&anchor) {
+        if self.hover_anchor_matches(&anchor) {
+            self._hover_hide_task = None;
             return;
         }
-        let had_card = self.hover.is_some();
-        self.hover = None;
-        self.hover_pending = Some(anchor.clone());
-        if had_card {
-            cx.notify();
+        if self.hover_pending.as_ref() == Some(&anchor) {
+            return;
         }
+        self.schedule_hover_hide(cx);
+        self.hover_pending = Some(anchor.clone());
         self._hover_debounce_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(HOVER_TRIGGER_DELAY).await;
             let _ = this.update(cx, |this, cx| {
@@ -60,6 +72,48 @@ impl AdeApp {
                     anchor.position,
                     cx,
                 );
+            });
+        }));
+    }
+
+    /// Arms [`HOVER_HIDE_DELAY`] before genuinely clearing an already-visible [`Self::hover`] -
+    /// the hide-side debounce; see that constant's own docs for the flash it fixes. Always clears
+    /// [`Self::hover_pending`]/[`Self::_hover_debounce_task`] immediately regardless (there is no
+    /// reason to keep a stale pending *request* alive once the pointer has left the token that
+    /// would have triggered it - only the already-*visible* card gets the grace period).
+    ///
+    /// No-ops the actual hide-arming half when there is no visible card to hide, or one is
+    /// already armed (a pointer sweeping across several short-lived tokens in a row must not keep
+    /// resetting the same countdown - see [`Self::hover_over_token`]'s "different anchor" path,
+    /// the most common caller).
+    ///
+    /// The armed closure captures exactly which token it is hiding and only clears
+    /// [`Self::hover`] if that entry is *still* the one showing when the timer fires - if a newer
+    /// anchor's own request has since resolved and replaced it (a real race: this delay and
+    /// [`HOVER_TRIGGER_DELAY`] can land within milliseconds of each other on a direct A-to-B
+    /// sweep), this stale timer must not reach in and clear the *new*, unrelated card.
+    fn schedule_hover_hide(&mut self, cx: &mut Context<Self>) {
+        self.hover_pending = None;
+        self._hover_debounce_task = None;
+        let Some(showing) = self.hover.as_ref().map(|entry| {
+            (entry.path.clone(), entry.line_number, entry.byte_range.clone())
+        }) else {
+            return;
+        };
+        if self._hover_hide_task.is_some() {
+            return;
+        }
+        self._hover_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_HIDE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this._hover_hide_task = None;
+                let still_showing_old = this.hover.as_ref().is_some_and(|entry| {
+                    (entry.path.clone(), entry.line_number, entry.byte_range.clone()) == showing
+                });
+                if still_showing_old {
+                    this.hover = None;
+                    cx.notify();
+                }
             });
         }));
     }
@@ -89,6 +143,7 @@ impl AdeApp {
         self.hover_pending = None;
         self.hover_card_bounds = None;
         self._hover_debounce_task = None;
+        self._hover_hide_task = None;
         self._hover_request_task = None;
         was_showing
     }
@@ -120,10 +175,13 @@ impl AdeApp {
     /// 1. Pointer inside the real painted [`Self::hover_card_bounds`] - keep the card, so moving
     ///    onto it to press its own `F12 definition` footer doesn't close it first.
     /// 2. Pointer on a real, non-whitespace token of a real row - hover that token (debounced).
-    /// 3. Anything else - dismiss.
+    /// 3. Anything else - debounced dismiss (see [`Self::schedule_hover_hide`]/
+    ///    [`HOVER_HIDE_DELAY`]): the plain whitespace between two words on the same line is
+    ///    "anything else" too, so an un-debounced dismiss here flashed the card off and back on
+    ///    for every gap a sweep crossed, not just genuine token-to-token moves.
     ///
     /// A held mouse button means a real drag (selection extension, a pane resize, a tab drag), not
-    /// a hover, so it dismisses rather than tracking.
+    /// a hover, so it dismisses immediately rather than debouncing.
     pub(crate) fn track_hover_pointer(
         &mut self,
         event: &gpui::MouseMoveEvent,
@@ -137,6 +195,9 @@ impl AdeApp {
                 .hover_card_bounds
                 .is_some_and(|bounds| bounds.contains(&event.position))
         {
+            // Definitively on the card itself - cancel any hide a moment spent off its own token
+            // (crossing from the token onto the card's own chrome) might have armed.
+            self._hover_hide_task = None;
             return;
         }
         if event.pressed_button.is_some() {
@@ -144,7 +205,7 @@ impl AdeApp {
             return;
         }
         let Some(anchor) = self.hover_anchor_at(event.position) else {
-            self.dismiss_hover_and_notify(cx);
+            self.schedule_hover_hide(cx);
             return;
         };
         self.hover_over_token(anchor, cx);
@@ -2562,12 +2623,55 @@ mod hover_pointer_tests {
         cx.run_until_parked();
 
         assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "the real dismiss is debounced (HOVER_HIDE_DELAY) - the card must still be up the \
+             instant the pointer leaves, not vanish synchronously"
+        );
+
+        cx.background_executor
+            .advance_clock(HOVER_HIDE_DELAY + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+
+        assert!(
             app.read_with(cx, |app, _| app.hover.is_none()),
-            "moving the real pointer away from the real anchor token must dismiss the real card"
+            "once the real hide delay elapses, moving the pointer away from the real anchor \
+             token must dismiss the real card"
         );
         assert!(
             cx.debug_bounds("hover-card").is_none(),
             "and the real card must genuinely stop painting, not just lose its state"
+        );
+    }
+
+    /// Direct regression coverage for the debounce itself: a pointer sweep that merely passes
+    /// through a plain whitespace gap on its way to a different real token must not flash the
+    /// still-visible card off in between - the real, reported bug this fix addresses. Before this,
+    /// `Self::track_hover_pointer`'s "anything else" branch called `dismiss_hover_and_notify`
+    /// synchronously, so even a single frame spent over the space between "alpha" and "bravo"
+    /// cleared the card.
+    #[gpui::test]
+    fn a_brief_pass_through_whitespace_does_not_flash_the_card_off(cx: &mut TestAppContext) {
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.txt", "alpha bravo\ncharlie delta\n");
+        seed_ready_hover(&app, cx, file_path, 1, 0..5);
+        assert!(cx.debug_bounds("hover-card").is_some());
+
+        // The real space character between "alpha" and "bravo" - `hover_anchor_at` returns `None`
+        // here (real whitespace, no token), matching `track_hover_pointer`'s "anything else" arm.
+        let (row_bounds, shaped) = row_layout(&app, cx, 1);
+        let gap_x = (shaped.x_for_index(5) + shaped.x_for_index(6)) / 2.0;
+        let gap = gpui::point(row_bounds.left() + gap_x, row_bounds.center().y);
+        cx.simulate_mouse_move(gap, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "a brief pass through plain whitespace must not clear an already-visible card before \
+             HOVER_HIDE_DELAY genuinely elapses"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.hover.is_some()),
+            "the underlying state must likewise still describe the original token"
         );
     }
 

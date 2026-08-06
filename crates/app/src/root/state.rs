@@ -400,6 +400,7 @@ impl AdeApp {
             hover: None,
             hover_pending: None,
             _hover_debounce_task: None,
+            _hover_hide_task: None,
             hover_card_bounds: None,
             _hover_request_task: None,
             _goto_definition_tasks: TaskPool::new(),
