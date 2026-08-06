@@ -73,12 +73,15 @@
 //!   there is no scroll-*back* view to attach a scrollbar to at all yet. Building one is a real,
 //!   separate feature (surfacing `alacritty_terminal`'s own scrollback buffer for rendering), not
 //!   a styling change.
-//! - **Popups.** `crate::lsp::completion_popup`'s own docs already say why: "this app has no
-//!   virtualized/scrollable popover widget" - it hard-truncates at
-//!   `MAX_RENDERED_COMPLETION_ITEMS` (12) instead of scrolling. Turning that into a real scrollable
-//!   popup would also mean reworking `Self::move_completions_selection`'s keyboard-nav-into-view
-//!   behaviour, not just adding a thumb - left as a follow-up rather than done as a rushed half
-//!   measure alongside eight other regions in the same change.
+//! - **Popups.** Done as of GitHub issue #185, no longer a gap: the Completions popup's item list
+//!   is a real virtualized `uniform_list` tracked by `AdeApp::completions_scroll_handle`, and it
+//!   renders its own overlay scrollbar through [`AdeApp::render_vertical_scrollbar`] below
+//!   (`"completions-scrollbar"`) exactly like every other region here. Its keyboard nav
+//!   (`crate::lsp::completion_popup::AdeApp::move_completions_selection`) scrolls the viewport to
+//!   follow the selection, which is what the old `MAX_RENDERED_COMPLETION_ITEMS` (12) render cap
+//!   was standing in for. The remaining popovers (the hover card, the plus menu, dropdown menus)
+//!   still have no scroll region of their own - none of them has content that can overflow: each
+//!   sizes to a fixed, bounded body.
 //! - **Horizontal.** No region in this app has real horizontal content overflow today (`grep -rn
 //!   overflow_x crates/app/src` matches nothing anywhere). The code editor's own rows are
 //!   deliberately `.w_full()` (see `crate::code_surface::editing`'s own docs on why - a real,

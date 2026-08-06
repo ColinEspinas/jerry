@@ -11,6 +11,19 @@ toplevel. See `BUILD-LOG.md`'s screenshot correction for the recipe and for what
 | `jerry-dark-rust-doc-comments.png` | Jerry Dark | **Predates the final palette** — kept only as the "before" side of the §2b evidence below. A screenful of `///` doc comments at the brighter `comment_doc` tone. Its screaming-case constants render in `syntax.type`'s cyan, which is the misclassification `RUST_CONSTANT_SUPPLEMENT` fixes; this README used to describe them as "amber", which was simply wrong. |
 | `jerry-dark-markdown.png` | Jerry Dark | Markdown prose under the **final** palette — this file's own `THEME.md`, so it doubles as a check that the spec and the render agree. Headings in **gold**, inline code in green, bold at the brighter neutral. The fenced block visible is **untagged**, so it shows no language injection — per-fence injection is covered by `fixture_corpus_tests`. |
 | `paper-chrome.png` | Paper | The light theme's chrome. **No editor tab is open in this one** — it does not show syntax colours. |
+| `completions-popup-top.png` | Jerry Dark | The Completions popup (GitHub issue #185) against a **real, live rust-analyzer** response — `Ctrl+Space` at `s.` where `s: String`, so the list is every real method on `String`, well over a hundred items. Twelve rows visible (`MAX_VISIBLE_COMPLETION_ROWS`), the overlay scrollbar's thumb parked at the top, real signatures in the right-hand detail column of each row. |
+| `completions-popup-scrolled.png` | Jerry Dark | The same popup after 30 real `Down` keystrokes. A completely different set of rows, `replace_range` selected on the bottom row, and the thumb moved down the track — item 30 was **permanently unreachable** before this fix, which hard-capped rendering at 12 items with no scroll mechanism at all. |
+
+## The completions captures
+
+Driven the same way as everything else here (`python-xlib` XTEST clicks into the file tree, then
+per-window `XGetImage`), against a throwaway two-file cargo project rather than this repo — a small
+crate is what makes rust-analyzer reach a real, answering state in seconds instead of minutes. The
+`Ctrl+Space` force-invoke (`CompletionsInvoke`) is what makes this scriptable at all: it needs three
+key events, where reproducing the same popup by *typing* a prefix would run into the `xdotool
+type`/XTEST character-mangling limitation described below. The status bar in the uncropped frames
+reads `1 servers · 3 errors`, which is the real server answering with real diagnostics for the
+deliberately incomplete `s.` — these are not mock items.
 
 ## Verified by pixel diff, not by eye
 
