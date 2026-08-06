@@ -724,7 +724,7 @@ impl AdeApp {
         // Anything still on screen was computed from the connection just torn down - the same
         // set `AdeApp::select_worktree` clears for the same reason.
         self.dismiss_completions();
-        self.hover = None;
+        self.dismiss_hover();
         self.file_view_diagnostics = std::collections::HashMap::new();
         // The next render's own `ensure_lsp_client`/`dispatch_did_open` calls do the real
         // respawn and re-open, through exactly the same code path a cold start uses.
@@ -1795,7 +1795,21 @@ impl AdeApp {
                 status: CompletionsStatus::Failed(err.to_string()),
             }),
         };
+        let is_ready = matches!(
+            new_state.as_ref().map(|entry| &entry.status),
+            Some(CompletionsStatus::Ready { .. })
+        );
         self.completions = new_state;
+        if is_ready {
+            // A genuinely new response starts at `selected: 0`, so its list has to start scrolled
+            // to the top too - `AdeApp::completions_scroll_handle` is a long-lived field, and
+            // without this the *previous* response's scroll offset would survive into this one,
+            // showing a viewport that has nothing to do with the freshly selected first item
+            // (GitHub issue #185). `Top`, not `Nearest`: this is a reset, not a follow-the-
+            // selection nudge.
+            self.completions_scroll_handle
+                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 }
@@ -2207,7 +2221,7 @@ mod lsp_client_eviction_tests {
 /// actually work against the real
 /// thing" is proven.
 #[cfg(test)]
-mod lsp_connection_facade_tests {
+pub(crate) mod lsp_connection_facade_tests {
     use super::*;
     use gpui::TestAppContext;
     use std::time::Instant;
@@ -2322,7 +2336,7 @@ process.stdin.on('data', (d) => {
     /// Genuinely spawns [`FAKE_SERVER_SOURCE`] as a real child process and drives a real
     /// `initialize`/`initialized` handshake through `lsp_core::LspClient::spawn` - the exact same
     /// spawn path every real server in this app goes through, with no test-only shortcut.
-    fn spawn_fake_server(
+    pub(crate) fn spawn_fake_server(
         root: &Path,
         name: &'static str,
         mode: &str,
@@ -2360,7 +2374,7 @@ process.stdin.on('data', (d) => {
 
     /// Pushes a real `publishDiagnostics` from `client`'s own process and waits for it to land in
     /// that client's real diagnostics sink.
-    fn publish_and_wait(client: &lsp_core::LspClient, target: &str, message: &str) {
+    pub(crate) fn publish_and_wait(client: &lsp_core::LspClient, target: &str, message: &str) {
         client
             .notify_raw(
                 "test/publish",

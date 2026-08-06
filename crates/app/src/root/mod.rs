@@ -91,7 +91,8 @@ use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 
 use crate::code_surface::state::{
-    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverEntry,
+    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverAnchor,
+    HoverEntry,
 };
 use crate::lsp::client::LspClientState;
 use crate::lsp::completion_popup::CompletionsEntry;
@@ -1313,6 +1314,15 @@ pub struct AdeApp {
     /// longer open simply never matches [`Self::active_editable_path`] and is treated as absent
     /// by every render/keybinding site that reads it.
     pub(crate) completions: Option<CompletionsEntry>,
+    /// The Completions popup's own `uniform_list` scroll handle (GitHub issue #185) - the real
+    /// mechanism that replaced the popup's old `MAX_RENDERED_COMPLETION_ITEMS` (12) hard render
+    /// cap. `crate::lsp::completion_popup::AdeApp::render_completions_popover`'s `uniform_list` is
+    /// `track_scroll`'d with it, `Self::move_completions_selection` drives
+    /// `gpui::UniformListScrollHandle::scroll_to_item` off it so keyboard nav keeps the selected
+    /// row in view, and `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` reads its
+    /// overlay-scrollbar geometry straight off the same handle - not a second, parallel tracking
+    /// mechanism, exactly like [`Self::file_tree_scroll_handle`].
+    pub(crate) completions_scroll_handle: UniformListScrollHandle,
     /// A real generation counter bumped every time a completions request is dispatched or the
     /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
     /// docs for the real, live race this closes: an in-flight `textDocument/completion` request
@@ -1346,11 +1356,28 @@ pub struct AdeApp {
     /// lazily (see [`Self::ensure_lsp_poll_task`]), then deliberately never reset to `None` -
     /// one poll loop serves however many clients exist.
     pub(crate) _lsp_poll_task: Option<Task<()>>,
-    /// Surface C's hover-state cache - the outcome of the most recent click-triggered
-    /// `textDocument/hover` request (see [`Self::request_hover`]), `None` before the first click
-    /// or after switching files. Also doubles as [`Self::trigger_goto_definition`]'s target:
-    /// there's no separately-tracked "symbol under consideration" in this read-only viewer.
+    /// Surface C's hover-state cache - the outcome of the most recent pointer-triggered
+    /// `textDocument/hover` request (see [`Self::request_hover`]), `None` before the pointer has
+    /// rested on a real symbol, after it has moved away again (see [`Self::dismiss_hover`]), or
+    /// after switching files.
     pub(crate) hover: Option<HoverEntry>,
+    /// GitHub issue #186: the real token the pointer is resting on *right now*, waiting out
+    /// [`HOVER_TRIGGER_DELAY`] before a real `textDocument/hover` request is sent for it. Distinct
+    /// from [`Self::hover`] on purpose - the card only paints for a real request that has actually
+    /// been made, so merely sweeping the pointer across a line of code paints nothing and sends
+    /// nothing. Cleared by [`Self::dismiss_hover`] alongside [`Self::hover`].
+    pub(crate) hover_pending: Option<HoverAnchor>,
+    /// The single in-flight [`HOVER_TRIGGER_DELAY`] timer for [`Self::hover_pending`] - a single
+    /// slot for the same reason [`Self::_hover_request_task`] is one: assigning a fresh task drops
+    /// (cancels) the previous one, so a pointer sweeping across ten tokens leaves exactly one
+    /// armed timer, not ten.
+    pub(crate) _hover_debounce_task: Option<Task<()>>,
+    /// The real painted bounds of the Hover card (GitHub issue #186), captured every frame by its
+    /// own `gpui::canvas` - the same one-frame-lag idiom [`Self::body_bounds`] already uses.
+    /// [`Self::track_hover_pointer`] reads it to answer "is the pointer on the card itself right
+    /// now", which is what keeps the card alive while the user moves onto it to press its own
+    /// `F12 definition` footer instead of dismissing it out from under them.
+    pub(crate) hover_card_bounds: Option<gpui::Bounds<Pixels>>,
     /// The single in-flight [`Self::request_hover`] background task, if any - a single slot
     /// (not a [`TaskPool`]) because hover requests are never independent: [`Self::hover`] shows
     /// only one entry at a time, so a new click always supersedes an in-flight one. Assigning a
@@ -2298,6 +2325,16 @@ impl Render for AdeApp {
             // frame, so `!terminal` (and any future negated-context predicate) evaluates its
             // real, intended logic everywhere.
             .key_context("app")
+            // GitHub issue #186's real per-pixel hover tracking, registered once here at the
+            // window root rather than per code row. See `AdeApp::track_hover_pointer`'s own docs
+            // for why it has to be here: a per-row `.on_mouse_move` only fires while that row is
+            // the top-most hitbox under the pointer, so it can never observe the pointer leaving
+            // the code area - which is precisely the dismissal case that has to work.
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    this.track_hover_pointer(event, cx);
+                }),
+            )
             .on_action(cx.listener(Self::handle_new_agent_action))
             .on_action(cx.listener(Self::handle_toggle_palette_action))
             .on_action(cx.listener(Self::handle_toggle_settings_action))
@@ -2391,6 +2428,12 @@ impl Render for AdeApp {
             )
             .children(self.render_hover_card(cx))
             .children(self.render_completions_popover(cx))
+            // GitHub issue #186's real Diagnostic popover - a top-level sibling of the other two
+            // for exactly the same reason they are (see `render_hover_card`'s own docs), and
+            // painted after them so that if the one-at-a-time gate in `render_diagnostic_card`
+            // ever failed to hold, the ambient card would be the one on top to notice, not the
+            // requested one it would be hiding.
+            .children(self.render_diagnostic_card())
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })

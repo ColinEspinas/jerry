@@ -662,7 +662,9 @@ fn syntax_contrast_floor(key: &str) -> Option<f32> {
     match scope {
         // Real backgrounds and non-colour tokens - a floor against the background is meaningless.
         "diagnostic_row_bg" => None,
-        "operator" | "punctuation_bracket" | "punctuation_delimiter" => Some(3.0),
+        "operator" | "punctuation_bracket" | "punctuation_delimiter" | "punctuation_special" => {
+            Some(3.0)
+        }
         _ if scope.starts_with("bracket_") => Some(3.0),
         _ => Some(4.5),
     }
@@ -829,6 +831,14 @@ pub mod surface {
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
     /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: ColorToken = token("surface.tab_close_hover", 0x23282c);
+    /// The Hover/Diagnostic popover footer's own band background
+    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `background:#141719` on both cards'
+    /// `source · code`/`F12 definition` footer rows) - one hex step darker than [`CARD_SUNK`]
+    /// (`#131619`, used for every *other* card footer in the app), not a duplicate of it: the
+    /// mockup genuinely uses two adjacent-but-different footer tones, and this app's own contrast
+    /// tests already pin `CARD_SUNK`'s exact value elsewhere, so reusing it here would have
+    /// silently painted the wrong one of the two.
+    pub const LSP_POPOVER_FOOTER: ColorToken = token("surface.lsp_popover_footer", 0x141719);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -859,6 +869,7 @@ pub mod surface {
         ("TITLE_BAR_CLOSE_HOVER", TITLE_BAR_CLOSE_HOVER),
         ("MENU_ROW_HOVER", MENU_ROW_HOVER),
         ("TAB_CLOSE_HOVER", TAB_CLOSE_HOVER),
+        ("LSP_POPOVER_FOOTER", LSP_POPOVER_FOOTER),
     ];
 }
 
@@ -882,6 +893,24 @@ pub mod border {
     /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`].
     pub const KEYCAP_HINT: ColorToken = token("border.keycap_hint", 0x23272b);
     pub const SELECTED_EDGE: ColorToken = token("border.selected_edge", 0x3f5b74); // 2px left edge on a selected row
+    /// The Diagnostic popover's own border (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`:
+    /// `border:1px solid #3a2224` on the diagnostic card). Paired with
+    /// [`super::syntax::DIAGNOSTIC_ROW_BG`] for that card's background - together they give the
+    /// Diagnostic popover the design's own red-tinted chrome, distinct from the Hover/Completions
+    /// popovers' neutral [`POPOVER`] - see `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
+    /// Lives here rather than in `syntax` (despite pairing with a `syntax.*` token) because it's a
+    /// border, not a syntax-highlighted foreground color: `syntax`'s own contrast-floor enforcement
+    /// (`enforce_syntax_contrast_floors`) requires every `syntax.*` token to clear a 4.5:1 ratio
+    /// against the code background, which is the *text-readability* bar - wrong for a deliberately
+    /// subtle card outline, and it would silently push this exact hex away from the design's own
+    /// value under a derived theme.
+    pub const DIAGNOSTIC_CARD: ColorToken = token("border.diagnostic_card", 0x3a2224);
+    /// The Diagnostic popover's own footer band's top border - `#2b2224` in the mockup, a real,
+    /// deliberately different shade from [`DIAGNOSTIC_CARD`]'s outer `#3a2224` (the mockup uses
+    /// two distinct border tones on the same card: a stronger one for the whole card's outline, a
+    /// subtler one for the internal seam above the footer) - see
+    /// `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
+    pub const DIAGNOSTIC_CARD_FOOTER: ColorToken = token("border.diagnostic_card_footer", 0x2b2224);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -901,6 +930,8 @@ pub mod border {
         ("KEYCAP", KEYCAP),
         ("KEYCAP_HINT", KEYCAP_HINT),
         ("SELECTED_EDGE", SELECTED_EDGE),
+        ("DIAGNOSTIC_CARD", DIAGNOSTIC_CARD),
+        ("DIAGNOSTIC_CARD_FOOTER", DIAGNOSTIC_CARD_FOOTER),
     ];
 }
 
@@ -1421,6 +1452,39 @@ pub mod syntax {
     /// file has no keywords for it to collide with, exactly as [`HEADING`] shares [`TYPE`]'s gold.
     pub const EMPHASIS: ColorToken = token("syntax.emphasis", 0xc194d6);
 
+    /// GitHub issue #183's own seven classification-precision splits - each capture below was a
+    /// real, distinct grammar-level concept quietly folded into a coarser existing bucket. Every
+    /// one keeps its old parent's exact colour by default (the restraint palette has no reason to
+    /// tell them apart *visually* yet - see [`crate::code_surface::code_view::HighlightKind`]'s
+    /// own docs for each variant's real capture/grammar evidence), so this is purely a
+    /// classification fix: a future theme (or a future palette revision) now has a real,
+    /// independent token to differentiate any of them without this module changing again.
+    ///
+    /// `punctuation.special` (Markdown's ATX `#`/list bullets, JS/TS's `${`/`}` interpolation
+    /// delimiters, YAML's `---`/`&`/`*`) - defaults to [`OPERATOR`]'s own colour, its pre-issue
+    /// bucket.
+    pub const PUNCTUATION_SPECIAL: ColorToken = token("syntax.punctuation_special", 0x6f757e);
+    /// `label` (a Rust lifetime, a C goto target, a YAML anchor/alias) - defaults to
+    /// [`VARIABLE`]'s own colour, its pre-issue bucket. See `HighlightKind::Label`'s own docs for
+    /// why these three real, unrelated concepts still share this one token.
+    pub const LABEL: ColorToken = token("syntax.label", 0xda8db2);
+    /// `string.special` (a JS/TS regex literal, a TOML datetime, a CSS colour value) - defaults
+    /// to [`STRING`]'s own colour, its pre-issue bucket.
+    pub const STRING_SPECIAL: ColorToken = token("syntax.string_special", 0x98b46a);
+    /// `function.builtin` (Python's `len`/`print`, Go's `append`/`make`/`panic`, JavaScript's
+    /// `require`) - defaults to [`FUNCTION`]'s own colour, its pre-issue bucket.
+    pub const FUNCTION_BUILTIN: ColorToken = token("syntax.function_builtin", 0x74ade8);
+    /// `function.macro` (Rust's `println!`-style macro invocations) - defaults to [`FUNCTION`]'s
+    /// own colour, its pre-issue bucket.
+    pub const FUNCTION_MACRO: ColorToken = token("syntax.function_macro", 0x74ade8);
+    /// `tag.error` (HTML's mismatched/erroneous closing tag) - defaults to [`TAG`]'s own colour,
+    /// its pre-issue bucket.
+    pub const TAG_ERROR: ColorToken = token("syntax.tag_error", 0xc7a356);
+    /// `constructor` (Rust/Python/JavaScript's shared `^[A-Z]`-starts-with-a-capital heuristic for
+    /// an enum-variant/struct construction site) - defaults to [`TYPE`]'s own colour, its
+    /// pre-issue bucket.
+    pub const CONSTRUCTOR: ColorToken = token("syntax.constructor", 0xc7a356);
+
     pub const CARET: ColorToken = token("syntax.caret", 0x4d97de);
     /// The code editor's real selection fill opacity (GitHub issue #27) while genuinely
     /// focused - applied on top of [`CARET`], the same color the solid caret itself paints, so
@@ -1440,11 +1504,14 @@ pub mod syntax {
     /// The Diagnostic state's dim, end-of-line inline message text (`README.md`: `#6b4a48`).
     pub const DIAGNOSTIC_INLINE_MESSAGE: ColorToken =
         token("syntax.diagnostic_inline_message", 0xb6706b);
-    /// The Diagnostic state's card message text (`README.md`: `#e3908b`). Same hex as
+    /// The Diagnostic state's card message text (`design_handoff_jerry_ade/revision 3/
+    /// Jerry.dc.html`'s diagnostic card headline: `color:#e3908b`). Same hex as
     /// [`super::button::DANGER_FG_HOVER`], kept as its own token - unrelated elements that
-    /// happen to share a designed red.
+    /// happen to share a designed red. Was previously `0xf07f77` - a real, uncaught typo against
+    /// this same doc comment's own cited value, fixed as part of GitHub issue #186's design
+    /// review follow-up.
     pub const DIAGNOSTIC_CARD_MESSAGE: ColorToken =
-        token("syntax.diagnostic_card_message", 0xf07f77);
+        token("syntax.diagnostic_card_message", 0xe3908b);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -1484,6 +1551,13 @@ pub mod syntax {
         ("LINK", LINK),
         ("STRONG", STRONG),
         ("EMPHASIS", EMPHASIS),
+        ("PUNCTUATION_SPECIAL", PUNCTUATION_SPECIAL),
+        ("LABEL", LABEL),
+        ("STRING_SPECIAL", STRING_SPECIAL),
+        ("FUNCTION_BUILTIN", FUNCTION_BUILTIN),
+        ("FUNCTION_MACRO", FUNCTION_MACRO),
+        ("TAG_ERROR", TAG_ERROR),
+        ("CONSTRUCTOR", CONSTRUCTOR),
         ("CARET", CARET),
         ("ERROR_UNDERLINE", ERROR_UNDERLINE),
         ("HOVER_UNDERLINE", HOVER_UNDERLINE),
