@@ -3608,6 +3608,36 @@ mod lsp_diagnostics_wiring_tests {
     use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
     use std::time::{Duration, Instant};
 
+    /// This module's five real-subprocess tests
+    /// ([`a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path`],
+    /// [`a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path`],
+    /// [`rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`],
+    /// [`typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`],
+    /// [`pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions`]) each
+    /// spawn a genuinely separate, heavy real language-server subprocess and wait on real,
+    /// wall-clock-bounded indexing/diagnostics round trips. Left to `cargo test`'s default
+    /// parallelism, all five can spawn *simultaneously*, on top of whatever else the full suite
+    /// is doing at the same time - real, observed, live-reproduced full-suite contention (see
+    /// the widened real deadlines just above this module) that this lock cuts a genuine, sizeable
+    /// share out of: with these five serialized against each other, each real server gets the box
+    /// mostly to itself instead of fighting four siblings for the same cores, so their combined
+    /// real wall-clock total is typically no worse (often better, since none of them individually
+    /// come anywhere near needing their own widened deadline) than letting all five race in
+    /// parallel under load. `PoisonError::into_inner`, not `.unwrap()`: one of these tests'
+    /// own real assertion genuinely failing must not cascade into every *other* real-subprocess
+    /// test in this module failing on a poisoned lock too - a real failure should be reported
+    /// once, by the test that actually found it, not five times over.
+    static REAL_LSP_SUBPROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquires [`REAL_LSP_SUBPROCESS_TEST_LOCK`] for the calling test's duration - see that
+    /// lock's own docs for why. The returned guard must be held for the whole test (bind it to a
+    /// named local, not `_`, so it isn't dropped immediately).
+    fn serialize_real_lsp_subprocess_test() -> std::sync::MutexGuard<'static, ()> {
+        REAL_LSP_SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Same minimal, dependency-free scratch cargo project shape as
     /// `lsp_core::client::tests::write_scratch_project` - kept as its own small copy here
     /// rather than exporting that one across the crate boundary.
@@ -3663,6 +3693,7 @@ mod lsp_diagnostics_wiring_tests {
     fn a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let project = write_scratch_project(
             "fn main() {\n    let x: i32 = \"not a number\";\n    println!(\"{}\", x);\n}\n",
         );
@@ -3769,6 +3800,7 @@ mod lsp_diagnostics_wiring_tests {
     fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("tsconfig.json"),
@@ -3894,6 +3926,7 @@ mod lsp_diagnostics_wiring_tests {
     fn rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let project = write_scratch_project(
             "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
         );
@@ -4064,6 +4097,7 @@ mod lsp_diagnostics_wiring_tests {
     fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("tsconfig.json"),
@@ -4186,6 +4220,7 @@ mod lsp_diagnostics_wiring_tests {
     fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
+        let _serialize = serialize_real_lsp_subprocess_test();
         let dir = tempfile::tempdir().expect("tempdir");
         let main_py = dir.path().join("main.py");
         let baseline = "ok: int = 1\nprint(ok)\n";
