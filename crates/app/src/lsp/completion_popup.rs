@@ -47,8 +47,11 @@
 //! family, and have no per-row hover at all (keyboard/passive, not mouse-driven).
 
 use super::*;
+use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
+use crate::keymap;
 use crate::lsp::completion as completion_view;
+use crate::root::widgets::{render_hint_pair, render_hint_row};
 use crate::theme;
 use gpui::{BoxShadow, EntityInputHandler};
 
@@ -114,13 +117,21 @@ impl CompletionsStatus {
 }
 
 
-/// The popup's real total width - matches `design_handoff_jerry_ade/revision/Jerry.dc.html`'s
-/// own real completions-list column width (`290px`) plus its `1px` right divider (this app has
-/// no separate signature/doc detail pane the way the mockup's own two-column popup does - see
-/// [`AdeApp::render_completions_popover`]'s own docs for why a single, label+detail row is the
-/// deliberately narrower scope here), rounded up slightly (`gpui::px(300.0)`) so a real,
-/// moderately long label + detail pair doesn't visually crowd the popup's own right edge.
-const POPOVER_WIDTH: gpui::Pixels = gpui::px(300.0);
+/// 290px - the design mockup's own real completions-list column width
+/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:290px` on the list column), plus
+/// its own `1px` right divider. Design-review follow-up: this used to be the popup's *entire*
+/// width, with the detail pane below left out of scope entirely (see [`DETAIL_WIDTH`]'s own docs
+/// for why that was a real, addressable gap rather than a permanent one).
+const LIST_WIDTH: gpui::Pixels = gpui::px(290.0);
+/// 300px - the design mockup's own real signature/doc/module-path detail pane width
+/// (`Jerry.dc.html`: `width:300px` on the right column), shown alongside [`LIST_WIDTH`] only
+/// while [`CompletionsStatus::Ready`] has a real selected item to describe - `Loading`/`Failed`
+/// show the list column alone, since neither has anything real for a detail pane to describe.
+/// `README.md`'s own summary confirms this is core to "the differentiator" three-popup language
+/// server UI ("Right 300: signature in mono, doc in 11px Plex Sans #7d848b, module path
+/// footer"), not optional polish - this was a real, previously undocumented-to-the-user scope
+/// cut, not a deliberate permanent simplification.
+const DETAIL_WIDTH: gpui::Pixels = gpui::px(300.0);
 /// The design mockup's own real completion-item row height (`Jerry.dc.html`: `height:22px`).
 /// `uniform_list`'s one real requirement is that every row is exactly this tall - see
 /// [`AdeApp::render_completions_popover`]'s own docs.
@@ -528,58 +539,56 @@ impl AdeApp {
         };
 
         let (shadow_x, shadow_y, shadow_blur) = theme::shadow::POPOVER;
-        let mut popover = gpui::div()
-            .id("completions-popover")
-            // Test-only (a no-op outside test builds, like every other `debug_selector` in this
-            // codebase) - lets `completions_scroll_tests` read the popup's own real painted
-            // height back with `VisualTestContext::debug_bounds` and assert that it genuinely
-            // caps at `popover_max_height()` for a long list and genuinely shrinks to fit a short
-            // one, rather than trusting the style declarations alone.
-            .debug_selector(|| "completions-popover".to_string())
-            .absolute()
-            .left(anchor_x)
-            .top(top)
-            .w(POPOVER_WIDTH)
-            .max_h(popover_max_height())
-            .overflow_hidden()
+        let extension = entry.path.extension().and_then(|ext| ext.to_str());
+        let macos = self.window_controls_style().is_macos();
+
+        // The list column - always present, whatever the status. `Loading`/`Failed` show a
+        // single message row here and nothing else; `Ready` shows the real, virtualized item
+        // rows (GitHub issue #185's real scrolling over the GitHub issue #189 client-side
+        // filtered/re-ranked `visible` view) plus the mockup's own footer hint row (`README.md`:
+        // "footer `⇅ move · ⏎ accept · ⇥ snippet`").
+        let mut list_column = gpui::div()
+            .flex_none()
+            .w(LIST_WIDTH)
             .flex()
             .flex_col()
             // `py(3.0)`, not `py(4.0)`: the design mockup's own completions-list column padding
-            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `.290px` list column) - see
+            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `290px` list column) - see
             // `POPOVER_VERTICAL_PADDING`'s own docs, which restate the same `3px 0` as one
             // vertical total.
-            .py(gpui::px(3.0))
-            .bg(theme::surface::POPOVER)
-            .border_1()
-            .border_color(theme::border::POPOVER)
-            // `CARD_SM` (`5px`), not `CARD` (`6px`) - the design mockup's own completions popup
-            // border-radius is `5px` (`Jerry.dc.html`: `border-radius:5px` on the popup itself),
-            // matching `crate::code_surface::lsp_ui::AdeApp::render_hover_card`'s own popover,
-            // which already used the correct radius here.
-            .rounded(theme::radius::CARD_SM)
-            .shadow(vec![BoxShadow::new(
-                shadow_x,
-                shadow_y,
-                // `0.50`, not `0.55` - the design mockup's own completions popup shadow is
-                // `rgba(0,0,0,.5)` (`Jerry.dc.html`: `box-shadow:0 8px 20px rgba(0,0,0,.5)`),
-                // matching `theme::shadow::POPOVER`'s own doc comment, which already recorded
-                // the correct `0.50` even though this call site had drifted from it.
-                gpui::black().opacity(0.50),
-            )
-            .blur_radius(shadow_blur)])
-            .font(gpui::font(theme::font::MONO))
-            .text_size(gpui::px(11.5));
+            .py(gpui::px(3.0));
+
+        // The selected item, if any - drives the detail pane below. Read once, outside the
+        // `Ready` match arm's own item loop, so both the list rows and the detail pane read the
+        // exact same real selection rather than two independently-indexed lookups. Resolved
+        // *through* `visible` back into the real server list, matching every other real
+        // selection read in this module (see [`CompletionsStatus::Ready::selected`]'s own docs).
+        let mut selected_item: Option<&lsp_core::lsp_types::CompletionItem> = None;
 
         match &entry.status {
             CompletionsStatus::Loading => {
-                popover = popover.child(popover_message_row("loading completions\u{2026}"));
+                list_column = list_column.child(popover_message_row("loading completions\u{2026}"));
             }
             CompletionsStatus::Failed(message) => {
-                popover = popover.child(popover_message_row(&format!(
+                list_column = list_column.child(popover_message_row(&format!(
                     "completion request failed: {message}"
                 )));
             }
-            CompletionsStatus::Ready { visible, .. } => {
+            CompletionsStatus::Ready {
+                items,
+                visible,
+                selected,
+            } => {
+                selected_item = visible.get(*selected).and_then(|index| items.get(*index));
+                // `border-right:1px solid #23282c` in the mockup, on the list column's own right
+                // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
+                // while there's a real detail pane beside it to divide from.
+                if selected_item.is_some() {
+                    list_column = list_column
+                        .border_r_1()
+                        .border_color(theme::border::CARD);
+                }
+
                 // Real virtualization, not a render cap (GitHub issue #185): `uniform_list` only
                 // ever builds the rows genuinely inside its own viewport, so `visible.len()` here
                 // is the *whole* real, filtered/re-ranked view (GitHub issue #189) - hundreds of
@@ -679,7 +688,7 @@ impl AdeApp {
                 // scroll away with the rows). `render_vertical_scrollbar` returns `None` outright
                 // when the handle's own `max_offset` shows the content genuinely doesn't overflow,
                 // so a short list paints no scrollbar at all.
-                popover = popover.child(
+                list_column = list_column.child(
                     gpui::div()
                         .relative()
                         .flex()
@@ -693,7 +702,78 @@ impl AdeApp {
                             cx,
                         )),
                 );
+
+                list_column = list_column.child(
+                    gpui::div()
+                        .id("completions-footer-hints")
+                        // Lets a real test measure this real row's own painted bounds
+                        // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test
+                        // builds, matching every other `debug_selector` in this crate.
+                        .debug_selector(|| "completions-footer-hints".to_string())
+                        .flex_none()
+                        .h(gpui::px(20.0))
+                        .px(gpui::px(8.0))
+                        .mt(gpui::px(3.0))
+                        .border_t_1()
+                        .border_color(theme::border::CARD)
+                        .flex()
+                        .items_center()
+                        .child(render_hint_row(
+                            [
+                                (
+                                    keymap::resolve_combo("\u{2191}\u{2193}", macos),
+                                    "move",
+                                ),
+                                (keymap::resolve_combo("enter", macos), "accept"),
+                                (keymap::resolve_combo("tab", macos), "snippet"),
+                            ]
+                            .into_iter()
+                            .map(|(keys, label)| render_hint_pair(&keys, label).into_any_element()),
+                        )),
+                );
             }
+        }
+
+        let mut popover = gpui::div()
+            .id("completions-popover")
+            // Lets a real test measure this real popover's own painted bounds (`debug_bounds`
+            // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(|| "completions-popover".to_string())
+            .absolute()
+            .left(anchor_x)
+            .top(top)
+            .max_h(popover_max_height())
+            .overflow_hidden()
+            .flex()
+            .bg(theme::surface::POPOVER)
+            .border_1()
+            .border_color(theme::border::POPOVER)
+            // `CARD_SM` (`5px`), not `CARD` (`6px`) - the design mockup's own completions popup
+            // border-radius is `5px` (`Jerry.dc.html`: `border-radius:5px` on the popup itself),
+            // matching `crate::code_surface::lsp_ui::AdeApp::render_hover_card`'s own popover,
+            // which already used the correct radius here.
+            .rounded(theme::radius::CARD_SM)
+            .shadow(vec![BoxShadow::new(
+                shadow_x,
+                shadow_y,
+                // `0.50`, not `0.55` - the design mockup's own completions popup shadow is
+                // `rgba(0,0,0,.5)` (`Jerry.dc.html`: `box-shadow:0 8px 20px rgba(0,0,0,.5)`),
+                // matching `theme::shadow::POPOVER`'s own doc comment, which already recorded
+                // the correct `0.50` even though this call site had drifted from it.
+                gpui::black().opacity(0.50),
+            )
+            .blur_radius(shadow_blur)])
+            .font(gpui::font(theme::font::MONO))
+            .text_size(gpui::px(11.5))
+            .child(list_column);
+
+        // The detail pane - `border-right` lives on the list column's own right edge in the
+        // mockup (`Jerry.dc.html`: `border-right:1px solid #23282c` on the 290px list), so it's
+        // applied to `list_column` above only when there's a real detail pane beside it to
+        // divide from; a lone list column (Loading/Failed) has no seam to draw.
+        if let Some(item) = selected_item {
+            popover = popover.child(render_completion_detail_pane(item, extension));
         }
 
         Some(popover.into_any_element())
@@ -800,6 +880,94 @@ fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> g
         .text_size(gpui::px(8.0))
         .child(kind.letter())
         .into_any_element()
+}
+
+/// The Completions popup's own detail pane - the design mockup's real, 300px right column
+/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
+/// describing whichever item is currently selected: a syntax-highlighted signature line, doc
+/// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
+/// exactly (same three-piece shape, same reasoning for showing it), just for the selected
+/// completion item instead of a `textDocument/hover` response.
+///
+/// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
+/// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
+fn render_completion_detail_pane(
+    item: &lsp_core::lsp_types::CompletionItem,
+    extension: Option<&str>,
+) -> gpui::AnyElement {
+    let mut pane = gpui::div()
+        .id("completions-detail-pane")
+        // Lets a real test measure this real pane's own painted bounds (`debug_bounds` reads
+        // this, not `.id(..)`) - a no-op outside test builds, matching every other
+        // `debug_selector` in this crate.
+        .debug_selector(|| "completions-detail-pane".to_string())
+        .flex_none()
+        .w(DETAIL_WIDTH)
+        .px(gpui::px(10.0))
+        .py(gpui::px(8.0));
+
+    // Signature: `item.detail` when the server sent one (rust-analyzer/typescript-language-
+    // server/pyright all commonly do, inline, no `completionItem/resolve` round trip needed) -
+    // the bare label otherwise, so the pane is never left blank for a real, selected item.
+    // Highlighted the same real way `crate::code_surface::code_view::highlight_block` highlights
+    // any other standalone fragment (a diff hunk, a merge conflict side) - see that function's
+    // own docs.
+    let signature_text = item
+        .detail
+        .as_ref()
+        .map(|detail| detail.trim())
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or(item.label.as_str());
+    let signature_runs = code_view::highlight_block(
+        std::iter::once(signature_text),
+        extension,
+        code_view::HighlightOptions::default(),
+    )
+    .into_iter()
+    .next()
+    .map(|line| line.runs)
+    .unwrap_or_default();
+    let mut signature_row = gpui::div()
+        .flex()
+        .flex_wrap()
+        .font(gpui::font(theme::font::MONO))
+        .text_size(gpui::px(11.0));
+    for (index, (run_text, kind)) in signature_runs.into_iter().enumerate() {
+        signature_row = signature_row.child(
+            gpui::div()
+                .id(("completion-detail-signature-token", index))
+                .text_color(code_view::color_for_kind(kind))
+                .child(run_text),
+        );
+    }
+    pane = pane.child(signature_row);
+
+    if let Some(doc) = completion_view::completion_documentation_text(item) {
+        pane = pane.child(
+            gpui::div()
+                .mt(gpui::px(7.0))
+                .font(gpui::font(theme::font::SANS))
+                .text_size(gpui::px(11.0))
+                .text_color(theme::text::DIMMER)
+                .child(doc),
+        );
+    }
+
+    if let Some(module_path) = completion_view::completion_module_path(item) {
+        pane = pane.child(
+            gpui::div()
+                .mt(gpui::px(9.0))
+                .pt(gpui::px(7.0))
+                .border_t_1()
+                .border_color(theme::border::CARD)
+                .font(gpui::font(theme::font::MONO))
+                .text_size(gpui::px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(module_path),
+        );
+    }
+
+    pane.into_any_element()
 }
 
 fn popover_message_row(text: &str) -> gpui::AnyElement {
@@ -1189,6 +1357,162 @@ mod completions_scroll_tests {
             selected(&app, cx),
             0,
             "and it must still wrap at the genuine end of a short list"
+        );
+    }
+}
+
+/// Regression coverage for the design-review follow-up: the Completions popup used to be a
+/// list-only single column - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own mockup
+/// (and `README.md`'s "Right 300: signature in mono, doc in 11px Plex Sans #7d848b, module path
+/// footer") describes a real two-column popup with a detail pane and a footer hint row, neither
+/// of which existed before this fix. These tests prove the real painted layout, not just that
+/// the new code compiles and runs.
+#[cfg(test)]
+mod completion_detail_pane_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn seed_ready_popup(
+        cx: &mut TestAppContext,
+        items: Vec<lsp_core::lsp_types::CompletionItem>,
+    ) -> (
+        gpui::Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+        PathBuf,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("sample.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                // Empty query - every item stays visible, matching this helper's real callers'
+                // need for an unshifted, predictable `visible` for their own assertions (mirrors
+                // `completions_scroll_tests::open_with_seeded_popup`'s own reasoning).
+                status: CompletionsStatus::ready(items, "")
+                    .expect("a real, non-empty item list must produce a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (app, cx, relative)
+    }
+
+    /// A real, fully-populated item (a real `detail`, `documentation`, and `label_details`
+    /// description - the three real fields the detail pane reads) must paint a real list column,
+    /// a real detail pane beside it, and the real footer hint row - the whole shape the mockup's
+    /// own two-column popup describes, none of which existed at all before this fix.
+    #[gpui::test]
+    fn a_real_selected_item_paints_both_the_list_column_and_a_real_detail_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "Appends a given string slice.".to_string(),
+            )),
+            label_details: Some(lsp_core::lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completion-item-0").is_some(),
+            "sanity check: the real item row must have painted"
+        );
+        let popover = cx
+            .debug_bounds("completions-popover")
+            .expect("the real popover must have painted");
+        let detail_pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("a real selected item with real detail/documentation must paint a real \
+                     detail pane, not silently stay list-only");
+        let footer_hints = cx
+            .debug_bounds("completions-footer-hints")
+            .expect("the real footer hint row must have painted alongside the item rows");
+
+        // `+ px(2.0)`: the popover's own real `.border_1()` (1px on each side) is part of its
+        // painted border-box width, on top of the two columns' own content widths.
+        assert_eq!(
+            popover.size.width,
+            LIST_WIDTH + DETAIL_WIDTH + gpui::px(2.0),
+            "the real popover must be exactly as wide as its list column plus its detail pane \
+             combined (plus its own 1px border on each side) - matching the mockup's own real \
+             590px total (290 list + 300 detail)"
+        );
+        // `+ px(1.0)`: the popover's own real 1px left border sits between its own left edge and
+        // the list column's content.
+        assert!(
+            (detail_pane.left() - (popover.left() + gpui::px(1.0) + LIST_WIDTH)).abs()
+                < gpui::px(1.0),
+            "the real detail pane must begin exactly where the real list column ends (popover \
+             left {:?}, list width {:?}, detail pane left {:?})",
+            popover.left(),
+            LIST_WIDTH,
+            detail_pane.left()
+        );
+        assert!(
+            footer_hints.top() >= detail_pane.top(),
+            "the real footer hint row belongs to the list column, below the real item rows, not \
+             floating above the detail pane"
+        );
+    }
+
+    /// `Loading` has no real selected item to describe - the detail pane and footer hints must
+    /// both stay genuinely absent, and the popover must paint at the narrower list-only width,
+    /// not the wider two-column one.
+    #[gpui::test]
+    fn a_loading_popup_paints_only_the_list_column_with_no_detail_pane_or_footer_hints(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("sample.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("sample.rs");
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative,
+                status: CompletionsStatus::Loading,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let popover = cx
+            .debug_bounds("completions-popover")
+            .expect("the real popover must still paint a real loading message");
+        // `+ px(2.0)`: the popover's own real `.border_1()` (1px on each side).
+        assert_eq!(
+            popover.size.width,
+            LIST_WIDTH + gpui::px(2.0),
+            "a real Loading popup has no real item to describe, so it must stay at the narrow \
+             list-only width, not the wider two-column one"
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-pane").is_none(),
+            "a real Loading popup must never paint a real detail pane - there is no real \
+             selected item for it to describe"
+        );
+        assert!(
+            cx.debug_bounds("completions-footer-hints").is_none(),
+            "a real Loading popup must never paint the real footer hint row either - it belongs \
+             to the Ready list, not the loading message"
         );
     }
 }
