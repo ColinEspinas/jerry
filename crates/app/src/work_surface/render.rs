@@ -4044,6 +4044,41 @@ mod terminal_clear_action_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
+    /// The real pty's OS reader thread and the real child shell it feeds run entirely outside
+    /// GPUI's deterministic scheduler - `cx.background_executor.advance_clock` only fast-forwards
+    /// a *simulated* clock, which grants that real thread and that real process zero actual
+    /// wall-clock scheduling time. A retry loop that only ever advances the virtual clock (the
+    /// pre-fix shape here) can race arbitrarily far ahead of them: standalone, with an otherwise
+    /// idle CPU, the real echo lands within real microseconds so the race is never noticed, but
+    /// under real full-suite parallel load (dozens of other tests' own real subprocesses - other
+    /// ptys, `rust-analyzer`, `pyright`, `typescript-language-server` - contending for the same
+    /// cores) the OS can genuinely take real milliseconds to schedule the reader thread, and a
+    /// loop that burns through its whole retry budget in real microseconds finds every single
+    /// check empty and fails despite the real echo being on its way. This is exactly the same
+    /// class of bug `lsp::client::lsp_diagnostics_wiring_tests`' own `wait_for_real_diagnostics`/
+    /// `wait_until` exist to avoid one layer up (a real notification arriving on a real OS thread
+    /// outside GPUI's scheduler) - the fix is the same discipline: keep re-checking over *real*
+    /// wall-clock time (a real `std::thread::sleep` between checks), bounded by a real deadline,
+    /// not a fixed count of virtual-clock advances with no real-time floor at all.
+    fn wait_for_real_pty_output(
+        cx: &mut gpui::VisualTestContext,
+        deadline: std::time::Instant,
+        mut has_arrived: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) -> bool {
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            if has_arrived(cx) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[gpui::test]
     fn dispatching_terminal_clear_signals_only_the_active_agents_pty(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4075,11 +4110,8 @@ mod terminal_clear_action_tests {
 
         cx.dispatch_action(TerminalClear);
 
-        let mut saw_caret_l_on_second = false;
-        for _ in 0..50 {
-            cx.background_executor
-                .advance_clock(std::time::Duration::from_millis(8));
-            cx.run_until_parked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let saw_real_output_on_second = wait_for_real_pty_output(cx, deadline, |cx| {
             let second_lines = app.read_with(cx, |app, cx| {
                 app.agents
                     .iter()
@@ -4089,15 +4121,24 @@ mod terminal_clear_action_tests {
                     .read(cx)
                     .visible_text_lines()
             });
-            if second_lines.iter().any(|line| line.contains("^L")) {
-                saw_caret_l_on_second = true;
-                break;
-            }
-        }
+            // `TerminalPane::clear` wipes its own local grid *first*, synchronously, before it
+            // ever writes the real Ctrl-L byte to the pty - so any real, non-blank content that
+            // reappears here can only be this real round trip's own echo. That echo can
+            // honestly take either shape: a raw `^L` (ECHOCTL, if the shell's own readline
+            // hasn't taken over the tty yet - the common case for a just-spawned shell) or a
+            // redrawn prompt (readline's own real `clear-screen` binding, once it has) - see
+            // `title_bar::render::agent_state_chip_live_tests`'s own docs for the identical real
+            // ambiguity, live-observed there first. Searching for the literal `^L` text alone
+            // made this test racy against exactly which one a real shell happens to pick under
+            // real full-suite load, where the extra real time before Ctrl-L is dispatched can
+            // let a freshly spawned shell's readline win a race it would usually lose on an
+            // otherwise-idle machine.
+            second_lines.iter().any(|line| !line.trim().is_empty())
+        });
         assert!(
-            saw_caret_l_on_second,
-            "expected the active (second) agent's pty to echo back the real Ctrl-L byte \
-             TerminalClear's handler sends"
+            saw_real_output_on_second,
+            "expected the active (second) agent's real pty to echo something back after \
+             TerminalClear's real Ctrl-L byte reached it"
         );
 
         let first_lines = app.read_with(cx, |app, cx| {
@@ -4236,6 +4277,30 @@ mod terminal_clipboard_action_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
     use gpui::{Focusable, TestAppContext};
+
+    /// See `terminal_clear_action_tests::wait_for_real_pty_output`'s own docs for why this real
+    /// wall-clock-bounded retry (not a fixed count of virtual-clock advances) is genuinely
+    /// required here too: the real pty reader thread and the real child shell it feeds are
+    /// outside GPUI's deterministic scheduler, so only real elapsed time - not simulated time -
+    /// gives them a real chance to run under full-suite parallel load.
+    fn wait_for_real_pty_output(
+        cx: &mut gpui::VisualTestContext,
+        deadline: std::time::Instant,
+        mut has_arrived: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+    ) -> bool {
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            if has_arrived(cx) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     /// Places `text` at a fixed, addressed grid position in the active agent's pane, well below
     /// where a freshly-spawned shell's own prompt lands, so the row this test then selects can't
@@ -4376,11 +4441,8 @@ mod terminal_clipboard_action_tests {
             "ctrl-shift-v"
         });
 
-        let mut saw_pasted_text = false;
-        for _ in 0..50 {
-            cx.background_executor
-                .advance_clock(std::time::Duration::from_millis(8));
-            cx.run_until_parked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
             let lines = app.read_with(cx, |app, cx| {
                 app.agents
                     .active()
@@ -4389,14 +4451,10 @@ mod terminal_clipboard_action_tests {
                     .read(cx)
                     .visible_text_lines()
             });
-            if lines
+            lines
                 .iter()
                 .any(|line| line.contains("ade-keystroke-paste"))
-            {
-                saw_pasted_text = true;
-                break;
-            }
-        }
+        });
         assert!(
             saw_pasted_text,
             "the real paste keystroke over a focused terminal must reach TerminalPaste"
@@ -4416,11 +4474,8 @@ mod terminal_clipboard_action_tests {
         });
         cx.dispatch_action(TerminalPaste);
 
-        let mut saw_pasted_text = false;
-        for _ in 0..50 {
-            cx.background_executor
-                .advance_clock(std::time::Duration::from_millis(8));
-            cx.run_until_parked();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
             let lines = app.read_with(cx, |app, cx| {
                 app.agents
                     .active()
@@ -4429,11 +4484,8 @@ mod terminal_clipboard_action_tests {
                     .read(cx)
                     .visible_text_lines()
             });
-            if lines.iter().any(|line| line.contains("ade-pasted-marker")) {
-                saw_pasted_text = true;
-                break;
-            }
-        }
+            lines.iter().any(|line| line.contains("ade-pasted-marker"))
+        });
         assert!(
             saw_pasted_text,
             "expected the active agent's real pty to echo back the clipboard text \

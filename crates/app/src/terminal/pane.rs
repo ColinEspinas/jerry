@@ -2476,10 +2476,22 @@ mod clear_pty_signal_tests {
 
         pane.update(cx, |pane, cx| pane.clear(cx));
 
-        // Polls a bounded number of ticks rather than a fixed sleep, since which tick the
-        // background pty-read/echo round trip lands on isn't itself under test.
+        // The real pty reader thread and the real `cat` child it feeds run entirely outside
+        // GPUI's deterministic scheduler, so `advance_clock` alone (a purely *simulated* clock)
+        // grants them zero actual wall-clock scheduling time. Standalone, with an otherwise idle
+        // CPU, the real echo lands within real microseconds and a loop that only ever advances
+        // the virtual clock never notices it's racing ahead of real time - but under real
+        // full-suite parallel load (dozens of other tests' own real subprocesses contending for
+        // the same cores) the OS can genuinely take real milliseconds to schedule this thread,
+        // and a loop with no real-time floor at all can burn through every check before that
+        // happens. A real `std::thread::sleep` between checks (bounded by a real deadline, not a
+        // fixed tick count) gives it a genuine chance, mirroring this same file's own
+        // `a_background_pane_drains_on_the_background_interval_read_fresh_each_tick`'s upfront
+        // `std::thread::sleep(Duration::from_millis(400))` for the identical Ctrl-L/ECHOCTL
+        // round trip.
         let mut saw_caret_l = false;
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        loop {
             cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
             let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
@@ -2487,6 +2499,10 @@ mod clear_pty_signal_tests {
                 saw_caret_l = true;
                 break;
             }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
             saw_caret_l,
