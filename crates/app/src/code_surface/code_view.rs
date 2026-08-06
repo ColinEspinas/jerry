@@ -221,6 +221,8 @@ pub enum HighlightKind {
     Keyword,
     Function,
     FunctionMethod,
+    /// A function/method *definition site* - see `RUST_DEFINITION_SUPPLEMENT`.
+    FunctionDefinition,
     Type,
     TypeBuiltin,
     Constant,
@@ -295,6 +297,7 @@ impl HighlightKind {
             HighlightKind::Keyword => "keyword",
             HighlightKind::Function => "function",
             HighlightKind::FunctionMethod => "function_method",
+            HighlightKind::FunctionDefinition => "function_definition",
             HighlightKind::Type => "type",
             HighlightKind::TypeBuiltin => "type_builtin",
             HighlightKind::Constant => "constant",
@@ -339,10 +342,11 @@ impl HighlightKind {
     /// source [`Self::from_name`] searches and
     /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
     /// checks exhaustively against.
-    pub const ALL: [HighlightKind; 33] = [
+    pub const ALL: [HighlightKind; 34] = [
         HighlightKind::Keyword,
         HighlightKind::Function,
         HighlightKind::FunctionMethod,
+        HighlightKind::FunctionDefinition,
         HighlightKind::Type,
         HighlightKind::TypeBuiltin,
         HighlightKind::Constant,
@@ -414,6 +418,7 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Keyword => theme::syntax::KEYWORD.into(),
         HighlightKind::Function => theme::syntax::FUNCTION.into(),
         HighlightKind::FunctionMethod => theme::syntax::FUNCTION_METHOD.into(),
+        HighlightKind::FunctionDefinition => theme::syntax::FUNCTION_DEFINITION.into(),
         HighlightKind::Type => theme::syntax::TYPE.into(),
         HighlightKind::TypeBuiltin => theme::syntax::TYPE_BUILTIN.into(),
         HighlightKind::Constant => theme::syntax::CONSTANT.into(),
@@ -454,7 +459,21 @@ pub struct HighlightSpan {
     pub start: usize,
     pub end: usize,
     pub kind: HighlightKind,
+    /// Which real *injected region* of the file this span's bytes came from - see
+    /// [`injection_scopes`]. [`OUTER_SCOPE`] for the host language's own top-level text (which is
+    /// every span in a file whose grammar injects nothing at all, i.e. all but Markdown and HTML);
+    /// `1..` identifies one specific injected range, in source order.
+    ///
+    /// It exists for exactly one consumer, [`colorize_bracket_pairs`], which must not pair a `{`
+    /// in one fenced code block with a `}` in the *next* one. Carrying the region on the span is
+    /// what lets that pass stay a pure function of the span list while still being
+    /// injection-aware - the alternative (teaching every caller to also thread a range list
+    /// alongside the spans) would put the same invariant in nine places instead of one.
+    pub scope: u32,
 }
+
+/// [`HighlightSpan::scope`] for the host language's own text, outside every injected region.
+pub const OUTER_SCOPE: u32 = 0;
 /// Which real grammar a piece of source is parsed and queried with. `TypeScript` and `Tsx` are
 /// two genuinely different grammars in `tree-sitter-typescript` (not one grammar with a flag), and
 /// they need two different composed query strings - see [`highlight_query_for`].
@@ -688,17 +707,22 @@ impl Grammar {
 ///   the real capture name (`-rust`: `(escape_sequence) @escape`; `-python`: identical). Neither
 ///   JavaScript's nor TypeScript's own bundled query captures an escape sequence at all - verified
 ///   directly, not assumed - so this bucket is genuinely reachable for Rust/Python source only.
-///   `"string.escape"` (the issue's own checklist name) is registered too, purely so a future
-///   grammar or query supplement that does emit it starts working with no further change here;
-///   it never matches anything today, which is harmless.
+///   `"string.escape"` (the issue's own checklist name) is registered too, and - correcting what
+///   this comment claimed until the theme redesign audited it - it is **not** dead: both
+///   `tree-sitter-markdown` and `tree-sitter-markdown-inline` really do emit
+///   `(backslash_escape) @string.escape`, so a `\*` in a markdown document reaches this bucket
+///   through it. The claim that it "never matches anything today" was written before Markdown
+///   support existed (GitHub issue #104) and was never revisited.
 /// - **`number`** - real in Python/JS/TS (`[(integer)(float)] @number` / `(number) @number`).
 ///   Rust has no `number` capture at all; its numeric literals are `@constant.builtin` instead
 ///   (unchanged from before this issue).
-/// - **`comment.documentation`, registered here alongside `comment.doc`** - `comment.documentation`
-///   is the real capture name (`-rust`: `(line_comment (doc_comment)) @comment.documentation`);
-///   none of the other three grammars has a doc-comment concept in their bundled query.
-///   `"comment.doc"` (the issue's own checklist name) is registered for the same forward-
-///   compatibility reason `"string.escape"` is.
+/// - **`comment.documentation`** - the real capture name (`-rust`: `(line_comment (doc_comment))
+///   @comment.documentation`); no other grammar here has a doc-comment concept in its bundled
+///   query. `"comment.doc"` (GitHub issue #31's own checklist name) used to be registered
+///   alongside it as a forward-compatibility synonym; the theme redesign's coverage audit found it
+///   was the *only* genuinely dead entry in this list - no grammar emits it, and unlike
+///   `"string.escape"` none has started to - so it was removed rather than left to imply a
+///   coverage it never had.
 /// - **`variable`** - real, and a genuinely large behavioural change from before this issue:
 ///   `-python`'s query captures *every* identifier as `@variable` via one blanket top-of-file
 ///   rule (`(identifier) @variable`), and `-javascript`'s does the same. Previously unregistered,
@@ -769,6 +793,7 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
     "function",
     "function.method",
+    "function.definition",
     "type",
     "type.builtin",
     "constructor",
@@ -781,7 +806,6 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "number",
     "comment",
     "comment.documentation",
-    "comment.doc",
     "variable",
     "variable.parameter",
     "variable.builtin",
@@ -851,6 +875,7 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::Keyword,
     HighlightKind::Function,
     HighlightKind::FunctionMethod,
+    HighlightKind::FunctionDefinition,
     HighlightKind::Type,
     HighlightKind::TypeBuiltin,
     HighlightKind::Type,
@@ -862,7 +887,6 @@ const HIGHLIGHT_KINDS: [HighlightKind; HIGHLIGHT_NAMES.len()] = [
     HighlightKind::StringEscape,
     HighlightKind::Number,
     HighlightKind::Comment,
-    HighlightKind::CommentDoc,
     HighlightKind::CommentDoc,
     HighlightKind::Variable,
     HighlightKind::VariableParameter,
@@ -1069,6 +1093,335 @@ const C_BRACKET_SUPPLEMENT: &str = r#"
 ["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 "#;
 
+// ---------------------------------------------------------------------------------------------
+// Definition-site supplements
+// ---------------------------------------------------------------------------------------------
+//
+/// Real supplements that split a *function definition* out from a *function call*.
+///
+/// ## Why these have to exist at all
+///
+/// Not one of the bundled grammar queries distinguishes the two. `tree-sitter-rust`'s own
+/// `queries/highlights.scm` captures a call as `function: (identifier) @function` (line 43) and a
+/// definition as `(function_item (identifier) @function)` (line 67) - the *same* capture name.
+/// Python, JavaScript, TypeScript, Go and C all do the same. So "colour the definition, leave the
+/// call at plain foreground" is not a palette change: it needs new query rules, which is what these
+/// are.
+///
+/// The design principle behind wanting it is `theme::syntax`' own module docs' "what earns a
+/// colour" section: a definition site is rare and tells you where a name *comes from*. One revision
+/// of the palette used that to hold call sites at plain foreground entirely; that was rejected on
+/// the rendered result and walked back, so both are coloured now and the distinction is carried by
+/// hue instead - calls on the blue at H 250, definitions on the violet-blue at H 285. Either way
+/// these rules are what makes the distinction *expressible*, and without them the palette has
+/// nothing to attach it to.
+///
+/// ## How they win, and how they fail safe
+///
+/// Appended after the bundled query, so the "last matching pattern wins" rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] makes them override the bundled `@function`. Verified by
+/// execution against the real grammars, not assumed: with these appended, `fn alpha()` classifies
+/// as `function.definition` while the call `beta()` stays `function`.
+///
+/// Verified the other way too: if `"function.definition"` were ever dropped from
+/// [`HIGHLIGHT_NAMES`], `HighlightConfiguration::configure` leaves it unrecognized and the token
+/// falls back to the `@function` its dotted parent still matches - so a half-finished change
+/// degrades to the old colour rather than to unstyled text.
+///
+/// Every node kind and field name below was checked against that grammar's own real
+/// `src/node-types.json` under `~/.cargo/registry/src/`, and each pattern was compiled and run.
+/// Real supplement **prepended** to `tree-sitter-rust`'s own bundled query, giving Rust the blanket
+/// `(identifier) @variable` rule that every other language here already has.
+///
+/// ## The bug this fixes, which nothing else could have
+///
+/// `tree-sitter-rust`'s bundled `queries/highlights.scm` has **no** blanket identifier rule - its
+/// only `@variable`-family pattern is `(parameter (identifier) @variable.parameter)` at line 96.
+/// `tree-sitter-python` has `(identifier) @variable` at line 3, `-go` at line 26, `-c` at line 1.
+/// Rust was the sole outlier, so a plain local (`let child = ...`, and every later use of it)
+/// classified as [`HighlightKind::Text`] rather than [`HighlightKind::Variable`].
+///
+/// That made `theme::syntax::VARIABLE` **unreachable in Rust source**. Whatever colour that token
+/// held, a Rust local rendered as plain foreground - which is exactly the "most of the text is just
+/// white" the maintainer reported twice, in this app's own primary language, and which no amount of
+/// palette work could have fixed. It was found by taking a screenshot after a palette change and
+/// diffing it against the previous one: **zero pixels** in the code area moved.
+///
+/// ## Why prepended rather than appended
+///
+/// The opposite of the definition-site supplements below, and deliberately. The rule cited on
+/// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`] is that the **last** matching pattern wins, so a blanket rule
+/// appended last would override every specific classification in the file - functions, constants,
+/// types would all collapse to `variable`. Prepending makes it the *fallback* instead: every later,
+/// more specific pattern still wins, and only identifiers nothing else claims come out as
+/// variables. That is precisely the position Python's and Go's own queries put their blanket rule
+/// in, so this makes Rust consistent with them rather than special.
+const RUST_VARIABLE_PREFIX: &str = r#"
+(identifier) @variable
+"#;
+
+/// Real supplement **appended** after `tree-sitter-rust`'s own query, repairing the one genuine
+/// regression [`RUST_VARIABLE_PREFIX`] introduced.
+///
+/// The bundled query captures an attribute with `(attribute_item) @attribute` (line 156) - the
+/// whole *ancestor* node, not the identifiers inside it. Before the blanket variable rule those
+/// identifiers carried no capture of their own, so the ancestor's colour simply showed through.
+/// Afterwards they were claimed by `@variable`, and since `fold_highlight_events` resolves each
+/// byte to its **innermost** open highlight, the leaf beat the ancestor and `#[cfg(all(test,
+/// unix))]` started rendering `cfg`/`all`/`test`/`unix` as variables.
+///
+/// Caught by diffing a screenshot against the previous one and noticing 65 pixels going the wrong
+/// way (`ATTRIBUTE`'s amber to `VARIABLE`'s rose) alongside the 231 going the right way. Query
+/// order alone could not have fixed it: pattern order decides which pattern claims a given *node*,
+/// and these are two different nodes at different depths. Re-asserting `@attribute` on the leaves
+/// is what actually resolves it.
+///
+/// `token_tree` is the node an attribute's own argument list parses as, which is why
+/// `all(test, unix)` needs its own rule rather than being covered by the direct-child case - and
+/// why there is one rule per nesting depth: `#[cfg(all(test, unix))]` nests a `token_tree` inside
+/// a `token_tree`, so `test` and `unix` sit two levels down. Three levels are written, which
+/// covers every attribute shape in this workspace.
+///
+/// Anchoring every one of these on `attribute` is load-bearing rather than tidy: a bare
+/// `(token_tree (identifier) @attribute)` would also match a **macro invocation**'s argument list
+/// (`macro_invocation` carries a `token_tree` too), and would repaint every argument of every
+/// `println!`/`assert!` call as an attribute.
+const RUST_ATTRIBUTE_SUPPLEMENT: &str = r#"
+(attribute (identifier) @attribute)
+(attribute (scoped_identifier) @attribute)
+(attribute (token_tree (identifier) @attribute))
+(attribute (token_tree (token_tree (identifier) @attribute)))
+(attribute (token_tree (token_tree (token_tree (identifier) @attribute))))
+"#;
+
+/// Real supplement appended after `tree-sitter-rust`'s own bundled query, repairing a genuine
+/// **upstream typo** that makes `theme::syntax::CONSTANT` unreachable in Rust.
+///
+/// `tree-sitter-rust-0.24.2/queries/highlights.scm` lines 10-11 read:
+///
+/// ```scheme
+/// ((identifier) @constant
+///  (#match? @constant "^[A-Z][A-Z\d_]+$'"))
+/// ```
+///
+/// Note the stray apostrophe between the `$` and the closing quote - confirmed byte-for-byte with
+/// `od -c` against the real file on disk, not inferred. The regex therefore demands a literal `'`
+/// after end-of-input and can never match anything, so the rule is dead.
+///
+/// Two things go wrong as a result, and the second one survives even if upstream fixes the first:
+/// line 14's `((identifier) @constructor (#match? @constructor "^[A-Z]"))` is a *later* pattern and
+/// `MAX_SIZE` matches `^[A-Z]` too, so last-pattern-wins hands it to `@constructor` ->
+/// [`HighlightKind::Type`]. Measured before this supplement: `const MAX_SIZE: usize = 42;`
+/// classified `MAX_SIZE` as `Type` at its declaration *and* at every use.
+///
+/// That was invisible while the palette held constants and types at related colours. It stopped
+/// being invisible when the redesign gave `syntax.constant` its own orange and `syntax.type` its
+/// own gold - a Rust constant rendered in the *type* colour, colliding with the very tokens it is
+/// supposed to be told apart from.
+///
+/// This is the same *class* of bug as [`RUST_VARIABLE_PREFIX`]: Python (`highlights.scm:8-9`),
+/// JavaScript (`:54-59`) and C (`:3-4`) all reach `@constant` for the identical all-caps
+/// construct; Rust is the sole outlier. Placed before [`RUST_ATTRIBUTE_SUPPLEMENT`] so an
+/// all-caps identifier inside an attribute still reads as an attribute.
+const RUST_CONSTANT_SUPPLEMENT: &str = r#"
+((identifier) @constant (#match? @constant "^[A-Z][A-Z\d_]+$"))
+"#;
+
+const RUST_DEFINITION_SUPPLEMENT: &str = r#"
+(function_item name: (identifier) @function.definition)
+(function_signature_item name: (identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. `function_definition`'s `name` field is an `identifier`
+/// only (no metavariable case, unlike Rust). A `lambda` has no name node at all, so it is
+/// correctly untouched.
+/// Real supplement giving Python the `@variable.parameter` capture its bundled query has **no
+/// pattern for at all** - `tree-sitter-python-0.25.0/queries/highlights.scm` contains zero
+/// `@variable.parameter`, so every parameter fell through to its line-3 blanket
+/// `(identifier) @variable` and `theme::syntax::VARIABLE_PARAMETER` was unreachable in Python.
+///
+/// Same class of gap as [`RUST_VARIABLE_PREFIX`], found the same way: by asking, for each token
+/// the redesign gives a real distinct colour, which grammars can actually emit it. Rust and
+/// TypeScript could; Python and Go could not.
+///
+/// One rule per real parameter shape, every node kind and field checked against
+/// `tree-sitter-python-0.25.0/src/node-types.json` (`parameters`' children are the `parameter`
+/// supertype: bare `identifier`, `default_parameter{name}`, `typed_parameter{children}`,
+/// `typed_default_parameter{name}`, `list_splat_pattern`, `dictionary_splat_pattern`) and each one
+/// compiled and executed rather than assumed.
+///
+/// `self`/`cls` are deliberately restated **after** the parameter rules, and deliberately scoped
+/// to `(parameters ...)` rather than restated blanket. Appending the parameter rules alone would
+/// let them beat [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s earlier `variable.builtin` rule and repaint
+/// every `self` in a signature as an ordinary parameter. Restating the *blanket* rule instead
+/// would fix that but break something else: it would also run after that supplement's
+/// `(call function: (identifier) @function)` rule and turn a real `cls(...)` construction back
+/// into a self-reference - which `python_method_calls_match_rust_and_typescript` catches. Scoping
+/// it to the parameter list is what satisfies both.
+const PYTHON_PARAMETER_SUPPLEMENT: &str = r#"
+(parameters (identifier) @variable.parameter)
+(parameters (typed_parameter (identifier) @variable.parameter))
+(parameters (default_parameter name: (identifier) @variable.parameter))
+(parameters (typed_default_parameter name: (identifier) @variable.parameter))
+(parameters (list_splat_pattern (identifier) @variable.parameter))
+(parameters (dictionary_splat_pattern (identifier) @variable.parameter))
+(lambda_parameters (identifier) @variable.parameter)
+
+((parameters (identifier) @variable.builtin)
+ (#match? @variable.builtin "^(self|cls)$"))
+"#;
+
+const PYTHON_DEFINITION_SUPPLEMENT: &str = r#"
+(function_definition name: (identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. Composed onto the JavaScript query, so it covers TypeScript
+/// and TSX too (both inherit it - see [`highlight_query_for`]).
+///
+/// Three of these fix real gaps rather than just recolouring:
+/// - `generator_function_declaration` has **no** rule in `tree-sitter-javascript`'s own bundled
+///   query at all, so `function* gen()` was previously classified as a plain `@variable`.
+/// - `private_property_identifier` is why the `method_definition` rule is an alternation: matching
+///   only `(property_identifier)` silently misses a `#priv()` private method.
+/// - the `variable_declarator` rule catches `const f = () => {}` / `const f = function () {}`,
+///   which is how a large fraction of real JavaScript declares functions. It keeps working under a
+///   TypeScript type annotation, because `type` is a separate field from `value`.
+const JAVASCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function.definition)
+(generator_function_declaration name: (identifier) @function.definition)
+(method_definition
+  name: [(property_identifier) (private_property_identifier)] @function.definition)
+(variable_declarator
+  name: (identifier) @function.definition
+  value: [(arrow_function) (function_expression)])
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`] - the TypeScript-only declaration forms, which have no
+/// JavaScript counterpart: an ambient `declare function`, an interface member signature, and an
+/// `abstract` class method.
+/// Real supplement fixing the closest twin of the [`RUST_VARIABLE_PREFIX`] bug that exists in
+/// TypeScript/JavaScript, plus the parameter shapes TypeScript's own query misses.
+///
+/// ## Shorthand properties had no capture at all
+///
+/// `tree-sitter-javascript-0.23.1/queries/highlights.scm` mentions `shorthand_property_identifier`
+/// and `shorthand_property_identifier_pattern` exactly once, at lines 54-59, and there they are
+/// guarded by an **all-caps `#match?` predicate** for `@constant`. The line-4 blanket
+/// `(identifier) @variable` does not reach them - they are different node kinds. So every
+/// ordinary shorthand name emitted **no highlight event whatsoever** and fell to
+/// [`HighlightKind::Text`]:
+///
+/// ```text
+/// const { alpha, beta } = config;    alpha: <none>   beta: <none>
+/// const obj = { alpha, gamma: 1 };   alpha: <none>   gamma: property
+/// ```
+///
+/// That is every object destructure (`const { data, error } = useQuery()`) and every object-literal
+/// shorthand (`return { id, name, count }`) in idiomatic TypeScript - a very large fraction of a
+/// real file rendering as plain foreground for the same reason Rust locals used to.
+///
+/// The `#not-match?` guard is load-bearing: JavaScript's own all-caps `@constant` rule is an
+/// *earlier* pattern, so an unguarded blanket rule appended here would repaint `const { MAX_N } =
+/// limits` from a constant to a variable. Verified both ways - `alpha` becomes `variable`, `MAX_N`
+/// stays `constant`.
+///
+/// ## Three parameter shapes TypeScript's own rules miss
+///
+/// `tree-sitter-typescript-0.23.2/queries/highlights.scm:15-16` captures
+/// `(required_parameter (identifier))` and `(optional_parameter (identifier))` - a **direct**
+/// identifier child only. Three very common shapes therefore missed: an unparenthesized arrow
+/// parameter (`items.map(x => x + 1)`, how most callbacks are written), a rest parameter
+/// (`...rest: string[]`), and a destructured parameter (`function g({ lo, hi }: Range)`).
+///
+/// The rest-parameter rule uses the `pattern:` field rather than `name:`, which is what a real
+/// parse says even though `node-types.json` lists `name: [identifier, rest_pattern]` - dumped from
+/// an actual tree rather than trusted from the schema.
+///
+/// The object-pattern rule is placed after the shorthand rules on purpose: a destructured
+/// parameter is both a shorthand property *and* a parameter, and the parameter reading is the more
+/// specific one.
+const TYPESCRIPT_IDENTIFIER_SUPPLEMENT: &str = r#"
+((shorthand_property_identifier) @variable
+ (#not-match? @variable "^[A-Z_][A-Z\d_]+$"))
+((shorthand_property_identifier_pattern) @variable
+ (#not-match? @variable "^[A-Z_][A-Z\d_]+$"))
+
+(arrow_function parameter: (identifier) @variable.parameter)
+(required_parameter pattern: (rest_pattern (identifier) @variable.parameter))
+(required_parameter
+  pattern: (object_pattern (shorthand_property_identifier_pattern) @variable.parameter))
+"#;
+
+const TYPESCRIPT_DEFINITION_SUPPLEMENT: &str = r#"
+(function_signature name: (identifier) @function.definition)
+(method_signature name: (property_identifier) @function.definition)
+(abstract_method_signature name: (property_identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. A method's own name node is a `field_identifier`, not an
+/// `identifier` - a real difference from `function_declaration`, checked against
+/// `tree-sitter-go`'s `node-types.json` rather than assumed symmetrical. `method_elem` is the
+/// interface-method node kind in this grammar version (it was `method_spec` in older ones).
+/// Real supplement covering three roles `tree-sitter-go`'s own bundled query never emits, each of
+/// which a sibling grammar here does emit - the same gap class as [`RUST_VARIABLE_PREFIX`].
+///
+/// 1. **`@variable.parameter`.** `tree-sitter-go-0.25.0/queries/highlights.scm` has no
+///    `@variable.parameter` pattern anywhere, so parameters fell through to its line-26 blanket
+///    `(identifier) @variable`. Fields confirmed in that grammar's own `node-types.json`:
+///    `parameter_declaration{name: identifier, type: _type}` and
+///    `variadic_parameter_declaration{name: identifier}`.
+/// 2. **`@constant`.** Go's query has only `@constant.builtin` (`true`/`false`/`nil`/`iota`) and
+///    no `@constant`, because Go has no all-caps convention for upstream to key a heuristic off.
+///    It does have something better: a real `const_spec` node, so the rule here is *semantic*
+///    rather than a name-shape guess - `const MaxRetries = 3` is a constant because the grammar
+///    says it is a const declaration, not because of how it is capitalised.
+/// 3. **`@property` for composite-literal keys.** Go's `(field_identifier) @property` (line 25)
+///    covers `v.Name` but not `User{Name: "x"}`, where the key parses as a plain `identifier`
+///    inside a `literal_element`. Rust's `S { field: a }` and TypeScript's `{ gamma: 1 }` both
+///    reach `@property` for the identical construct; Go was the outlier, so a struct literal's
+///    field names rendered as ordinary locals.
+///
+/// Every pattern compiled and executed against the real grammar before being written down.
+const GO_CLASSIFICATION_SUPPLEMENT: &str = r#"
+(parameter_declaration name: (identifier) @variable.parameter)
+(variadic_parameter_declaration name: (identifier) @variable.parameter)
+
+(const_spec name: (identifier) @constant)
+
+(literal_value (keyed_element key: (literal_element (identifier) @property)))
+"#;
+
+const GO_DEFINITION_SUPPLEMENT: &str = r#"
+(function_declaration name: (identifier) @function.definition)
+(method_declaration name: (field_identifier) @function.definition)
+(method_elem name: (field_identifier) @function.definition)
+"#;
+
+/// See [`RUST_DEFINITION_SUPPLEMENT`]. C is the one language here that needs the *outer*
+/// `function_definition` node in the pattern rather than the declarator alone, and the reason is
+/// real rather than stylistic: `(function_declarator declarator: (identifier))` - the shape the
+/// bundled query itself uses for `@function` - fires identically on a **prototype**
+/// (`int f(int);`) and on a definition (`int f(int) {...}`), so appending it under this name would
+/// relabel every prototype in a header as a definition.
+///
+/// Anchoring on `function_definition` fixes that, at the cost of one pattern per pointer depth: a
+/// pointer return type nests the `function_declarator` under one `pointer_declarator` per `*`
+/// (`char **three(void) {}` parses as `pointer_declarator > pointer_declarator >
+/// function_declarator > identifier`, confirmed from a real parse). Two levels is what is written
+/// here - it covers `T *f()` and `T **f()`, i.e. essentially all real code. A three-star return
+/// type would need a fourth pattern and is deliberately not chased.
+const C_DEFINITION_SUPPLEMENT: &str = r#"
+(function_definition
+  declarator: (function_declarator declarator: (identifier) @function.definition))
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator declarator: (identifier) @function.definition)))
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @function.definition))))
+"#;
+
 /// Real supplement appended after the composed JavaScript + TypeScript query (see
 /// [`highlight_query_for`]), repairing two regressions that a live old-vs-new diff over real
 /// TypeScript caught. Both come from the same root cause: `tree-sitter-typescript`'s own
@@ -1164,27 +1517,36 @@ const MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT: &str = r#"
 /// outright rather than degrade quietly.
 fn highlight_query_for(grammar: Grammar) -> String {
     match grammar {
-        Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+        Grammar::Rust => format!(
+            "{RUST_VARIABLE_PREFIX}\n{}\n{RUST_CONSTANT_SUPPLEMENT}\n\
+             {RUST_ATTRIBUTE_SUPPLEMENT}\n{RUST_DEFINITION_SUPPLEMENT}",
+            tree_sitter_rust::HIGHLIGHTS_QUERY
+        ),
         Grammar::Python => {
             format!(
-                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}",
+                "{}\n{PYTHON_HIGHLIGHTS_SUPPLEMENT}\n{PYTHON_BRACKET_SUPPLEMENT}\n\
+                 {PYTHON_PARAMETER_SUPPLEMENT}\n{PYTHON_DEFINITION_SUPPLEMENT}",
                 tree_sitter_python::HIGHLIGHTS_QUERY
             )
         }
         Grammar::TypeScript => format!(
-            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n{TYPESCRIPT_IDENTIFIER_SUPPLEMENT}\n\
+             {JAVASCRIPT_DEFINITION_SUPPLEMENT}\n{TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Tsx => format!(
-            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}",
+            "{}\n{}\n{}\n{TYPESCRIPT_HIGHLIGHTS_SUPPLEMENT}\n\
+             {TYPESCRIPT_IDENTIFIER_SUPPLEMENT}\n{JAVASCRIPT_DEFINITION_SUPPLEMENT}\n\
+             {TYPESCRIPT_DEFINITION_SUPPLEMENT}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
             tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             tree_sitter_typescript::HIGHLIGHTS_QUERY
         ),
         Grammar::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY.to_string(),
         Grammar::Go => format!(
-            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}",
+            "{}\n{GO_HIGHLIGHTS_SUPPLEMENT}\n{GO_BRACKET_SUPPLEMENT}\n\
+             {GO_CLASSIFICATION_SUPPLEMENT}\n{GO_DEFINITION_SUPPLEMENT}",
             tree_sitter_go::HIGHLIGHTS_QUERY
         ),
         Grammar::Json => format!(
@@ -1192,7 +1554,10 @@ fn highlight_query_for(grammar: Grammar) -> String {
             tree_sitter_json::HIGHLIGHTS_QUERY
         ),
         Grammar::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
-        Grammar::C => format!("{}\n{C_BRACKET_SUPPLEMENT}", tree_sitter_c::HIGHLIGHT_QUERY),
+        Grammar::C => format!(
+            "{}\n{C_BRACKET_SUPPLEMENT}\n{C_DEFINITION_SUPPLEMENT}",
+            tree_sitter_c::HIGHLIGHT_QUERY
+        ),
         Grammar::Markdown => format!(
             "{}\n{MARKDOWN_BLOCK_HIGHLIGHTS_SUPPLEMENT}",
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK
@@ -1348,12 +1713,7 @@ const MARKDOWN_INLINE_INJECTION_QUERY: &str = r#"
 fn build_highlight_config(
     grammar: Grammar,
 ) -> Result<HighlightConfiguration, tree_sitter::QueryError> {
-    let injection_query = match grammar {
-        Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
-        Grammar::MarkdownInline => MARKDOWN_INLINE_INJECTION_QUERY,
-        Grammar::Html => tree_sitter_html::INJECTIONS_QUERY,
-        _ => "",
-    };
+    let injection_query = injection_query_source(grammar);
     let mut config = HighlightConfiguration::new(
         grammar.language(),
         grammar.name(),
@@ -1388,6 +1748,143 @@ fn build_highlight_config(
 /// which is cheap to construct and is created fresh per call.
 static HIGHLIGHT_CONFIGS: [OnceLock<Option<HighlightConfiguration>>; Grammar::COUNT] =
     [const { OnceLock::new() }; Grammar::COUNT];
+
+/// The real injection-query source `grammar` drives language injection with, or `""` for a grammar
+/// that injects nothing. The single source of truth for both consumers: the
+/// [`HighlightConfiguration`] the highlighting engine itself uses ([`build_highlight_config`]), and
+/// [`injection_scopes`]' own separate parse. Keeping them on one constant is what stops the two
+/// from ever disagreeing about where an injected region begins.
+fn injection_query_source(grammar: Grammar) -> &'static str {
+    match grammar {
+        Grammar::Markdown => MARKDOWN_INJECTION_QUERY,
+        Grammar::MarkdownInline => MARKDOWN_INLINE_INJECTION_QUERY,
+        Grammar::Html => tree_sitter_html::INJECTIONS_QUERY,
+        _ => "",
+    }
+}
+
+/// Compiled [`injection_query_source`]s, cached per grammar exactly like [`HIGHLIGHT_CONFIGS`] -
+/// building a `tree_sitter::Query` costs real work and must not happen per keystroke. `None` for a
+/// grammar with no injection query at all, and also for the (test-covered, not expected) case of
+/// one that fails to compile.
+static INJECTION_QUERIES: [OnceLock<Option<tree_sitter::Query>>; Grammar::COUNT] =
+    [const { OnceLock::new() }; Grammar::COUNT];
+
+fn injection_query(grammar: Grammar) -> Option<&'static tree_sitter::Query> {
+    INJECTION_QUERIES[grammar.index()]
+        .get_or_init(|| {
+            let source = injection_query_source(grammar);
+            if source.is_empty() {
+                return None;
+            }
+            match tree_sitter::Query::new(&grammar.language(), source) {
+                Ok(query) => Some(query),
+                Err(error) => {
+                    log::error!(
+                        "bracket-pair scoping disabled for {}: its injection query failed to \
+                         compile: {error}",
+                        grammar.name()
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Every real *injected region* in `source`, as byte ranges, in source order - one entry per
+/// ` ```rust ` fence body, per markdown `(inline)` node, per `<script>`/`<style>` body, and so on,
+/// taken from the grammar's own [`injection_query_source`]'s `@injection.content` captures.
+///
+/// ## Why this exists (GitHub issue: bracket pairs matched across fenced code blocks)
+///
+/// [`colorize_bracket_pairs`] is a stack matcher over the whole file's bracket tokens. Before this,
+/// it ran one single stack over every bracket in the document, which is wrong the moment a file
+/// contains more than one *independent* body of code. A markdown file with two ` ```rust ` fences
+/// is exactly that, and the bug it produced was real and reproducible: an unclosed `{` in the first
+/// fence paired with a `}` in the second, painting two brackets in two different code blocks - in
+/// two different languages, potentially - as one matched pair, and shifting every depth in the
+/// second fence by the first fence's leftover stack.
+///
+/// `tree_sitter_highlight::HighlightEvent` carries no layer identity (`Source`/`HighlightStart`/
+/// `HighlightEnd` only - `tree-sitter-highlight-0.26.9/src/highlight.rs:106-110`, read directly),
+/// and the engine flattens every injected layer into one event stream, so [`fold_highlight_events`]
+/// genuinely cannot tell which layer a byte came from. Recovering it needs a separate look at the
+/// tree, which is what this does.
+///
+/// ## Cost, stated plainly
+///
+/// This is a real second parse of `source`. It runs **only** for a grammar that actually has an
+/// injection query - Markdown, MarkdownInline and HTML, three of thirteen - and returns immediately
+/// with no parse at all for the other ten, so opening a Rust or TypeScript file costs exactly what
+/// it did before. For the three that do pay it, one extra parse is the honest price of not
+/// mis-pairing brackets across code blocks, and it is still amortised over a real content change
+/// rather than a frame.
+///
+/// Deliberately **one level deep**, not recursive: an injected region's own nested injections
+/// (HTML inside a markdown fence, CSS inside that HTML) are not sub-divided further. That is a real
+/// limitation rather than an oversight - it keeps this to a single parse, and one level is what
+/// separates the case that actually misbehaves (sibling fences). A bracket pair spanning two
+/// *nested* injected regions is not reachable in practice, since the inner region is entirely
+/// contained in the outer one.
+fn injection_scopes(source: &str, grammar: Grammar) -> Vec<(usize, usize)> {
+    use streaming_iterator::StreamingIterator;
+
+    let Some(query) = injection_query(grammar) else {
+        return Vec::new();
+    };
+    let Some(content_index) = query
+        .capture_names()
+        .iter()
+        .position(|name| *name == "injection.content")
+    else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar.language()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            if capture.index as usize == content_index {
+                let node = capture.node;
+                if node.start_byte() < node.end_byte() {
+                    ranges.push((node.start_byte(), node.end_byte()));
+                }
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+/// [`HighlightSpan::scope`] for a span starting at `start`, given `scopes` from
+/// [`injection_scopes`] - the index of the innermost containing range, plus one, or
+/// [`OUTER_SCOPE`] when no range contains it.
+///
+/// `scopes` is sorted by start byte, and the ranges are either disjoint or properly nested (they
+/// are syntax-node ranges), so the *last* range that starts at or before `start` and still contains
+/// it is the innermost one.
+fn scope_for_byte(scopes: &[(usize, usize)], start: usize) -> u32 {
+    let mut scope = OUTER_SCOPE;
+    for (index, (range_start, range_end)) in scopes.iter().enumerate() {
+        if *range_start > start {
+            break;
+        }
+        if start < *range_end {
+            scope = index as u32 + 1;
+        }
+    }
+    scope
+}
 
 /// `grammar`'s real, shared [`HighlightConfiguration`], compiling it on first use, or `None` if
 /// its query failed to compile.
@@ -1585,7 +2082,10 @@ fn highlight_with(source: &str, grammar: Grammar) -> Vec<HighlightSpan> {
     else {
         return Vec::new();
     };
-    fold_highlight_events(events)
+    // Empty (and free - no parse at all) for the ten grammars that inject nothing; see
+    // `injection_scopes` for why the three that do inject pay a second parse.
+    let scopes = injection_scopes(source, grammar);
+    fold_highlight_events(events, &scopes)
 }
 
 /// Parses `source` with `tree-sitter-md`'s real block grammar and classifies it through the same
@@ -1638,6 +2138,7 @@ pub fn highlight_markdown(source: &str) -> Vec<HighlightSpan> {
 /// posture [`highlight_block`] already documents for partial input.
 fn fold_highlight_events(
     events: impl Iterator<Item = Result<HighlightEvent, tree_sitter_highlight::Error>>,
+    scopes: &[(usize, usize)],
 ) -> Vec<HighlightSpan> {
     let mut spans: Vec<HighlightSpan> = Vec::new();
     let mut open: Vec<HighlightKind> = Vec::new();
@@ -1659,6 +2160,7 @@ fn fold_highlight_events(
                     continue;
                 }
                 let kind = open.last().copied().unwrap_or(HighlightKind::Text);
+                let scope = scope_for_byte(scopes, start);
                 // Coalesce with the previous span when it is both adjacent and the same bucket.
                 // Real, not cosmetic: the engine splits `Source` at every highlight boundary, so a
                 // keyword list like Rust's `"as" @keyword ... "async" @keyword ...` arrives as one
@@ -1671,10 +2173,19 @@ fn fold_highlight_events(
                 // rather than disappearing into the surrounding string - see
                 // `escapes_inside_a_string_are_their_own_real_string_escape_run`.
                 match spans.last_mut() {
-                    Some(previous) if previous.end == start && previous.kind == kind => {
+                    Some(previous)
+                        if previous.end == start
+                            && previous.kind == kind
+                            && previous.scope == scope =>
+                    {
                         previous.end = end;
                     }
-                    _ => spans.push(HighlightSpan { start, end, kind }),
+                    _ => spans.push(HighlightSpan {
+                        start,
+                        end,
+                        kind,
+                        scope,
+                    }),
                 }
             }
         }
@@ -1808,6 +2319,19 @@ fn is_tracked_closer(ch: char) -> bool {
 /// pairs it colours are all still really matched, and the offset resolves itself the moment the
 /// source balances again.
 ///
+/// ## Injected regions pair independently
+///
+/// Matching runs one **separate stack per [`HighlightSpan::scope`]**, so a `{` in one ` ```rust `
+/// fence can never pair with a `}` in the next one, and an unbalanced fence cannot shift the ring
+/// for the fences after it. Before that, one global stack ran over the whole document and did
+/// exactly both of those things - see [`injection_scopes`] for the real reproduction and for why
+/// the region has to be recovered from a separate parse rather than read off the highlight event
+/// stream.
+///
+/// Depth is counted *within* a scope, so every fence's outermost pair starts at ring colour 0
+/// regardless of what the fences before it did, and regardless of how deeply the host document
+/// nests the fence.
+///
 /// ## Why it re-splits spans
 ///
 /// [`fold_highlight_events`] coalesces adjacent same-bucket spans, so `}}` or `<(` arrive as *one*
@@ -1831,8 +2355,10 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
     // is what would catch them ever drifting apart and silently colouring the wrong characters.
     let mut bracket_bytes: Vec<usize> = Vec::new();
     let mut depths: Vec<Option<usize>> = Vec::new();
-    // (expected closer, index into `depths` of the opener, that opener's nesting depth).
-    let mut stack: Vec<(char, usize, usize)> = Vec::new();
+    // One independent stack per `HighlightSpan::scope` - see this function's own "Injected regions
+    // pair independently" docs. Each entry is (expected closer, index into `depths` of the opener,
+    // that opener's nesting depth *within its own scope*).
+    let mut stacks: HashMap<u32, Vec<(char, usize, usize)>> = HashMap::new();
 
     for span in &spans {
         if span.kind != HighlightKind::PunctuationBracket {
@@ -1841,6 +2367,7 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
         let Some(text) = source.get(span.start..span.end) else {
             continue;
         };
+        let stack = stacks.entry(span.scope).or_default();
         for (offset, ch) in text.char_indices() {
             if let Some(closer) = closer_for(ch) {
                 stack.push((closer, depths.len(), stack.len()));
@@ -1898,6 +2425,7 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
                     start,
                     end: start + ch.len_utf8(),
                     kind,
+                    scope: span.scope,
                 },
             );
         }
@@ -1910,7 +2438,11 @@ pub fn colorize_bracket_pairs(source: &str, spans: Vec<HighlightSpan>) -> Vec<Hi
 /// [`colorize_bracket_pairs`] splits a multi-character bracket run apart.
 fn push_coalesced(spans: &mut Vec<HighlightSpan>, span: HighlightSpan) {
     match spans.last_mut() {
-        Some(previous) if previous.end == span.start && previous.kind == span.kind => {
+        Some(previous)
+            if previous.end == span.start
+                && previous.kind == span.kind
+                && previous.scope == span.scope =>
+        {
             previous.end = span.end;
         }
         _ => spans.push(span),
@@ -2429,7 +2961,7 @@ mod tests {
     /// i.e. exactly the colour the File view would paint that token's first character. Falls back
     /// to [`HighlightKind::Text`] for a byte no span covers, matching [`build_lines`]' own
     /// gap-filling rule, so this always answers the same question the renderer does.
-    fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
+    pub(super) fn kind_at(spans: &[HighlightSpan], source: &str, text: &str) -> HighlightKind {
         let start = source.find(text).expect("substring present in source");
         spans
             .iter()
@@ -2458,7 +2990,7 @@ mod tests {
     fn a_function_name_is_classified_as_function() {
         let spans = highlight_rust(SAMPLE_RUST);
         let span = find_span(&spans, SAMPLE_RUST, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2530,7 +3062,7 @@ mod tests {
     fn typescript_function_declaration_name_is_classified_as_function() {
         let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
         let span = find_span(&spans, SAMPLE_TYPESCRIPT, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2608,7 +3140,7 @@ mod tests {
         let span = find_span(&spans, source, "length").expect("method name span");
         // `(method_definition name: (property_identifier) @function.method)` - its own
         // dedicated bucket since GitHub issue #31 (previously folded into plain `Function`).
-        assert_eq!(span.kind, HighlightKind::FunctionMethod);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     /// The same real collision, for a real function call's callee (`call_expression`'s
@@ -2622,9 +3154,17 @@ mod tests {
             .filter(|span| source[span.start..span.end] == *"top")
             .collect();
         assert_eq!(function_spans.len(), 2, "the declaration and the call site");
-        assert!(function_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::Function));
+        assert_eq!(
+            function_spans[0].kind,
+            HighlightKind::FunctionDefinition,
+            "the `function top()` declaration is a real definition site"
+        );
+        assert_eq!(
+            function_spans[1].kind,
+            HighlightKind::Function,
+            "the `top()` call site stays a plain function - this split is the whole point of \
+             JAVASCRIPT_DEFINITION_SUPPLEMENT"
+        );
     }
 
     /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
@@ -2671,7 +3211,7 @@ mod tests {
     fn python_function_definition_name_is_classified_as_function() {
         let spans = highlight_python(SAMPLE_PYTHON);
         let span = find_span(&spans, SAMPLE_PYTHON, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     #[test]
@@ -2738,7 +3278,7 @@ mod tests {
         let source = "class Foo:\n    def bar(self):\n        pass\n";
         let spans = highlight_python(source);
         let span = find_span(&spans, source, "bar").expect("method name span");
-        assert_eq!(span.kind, HighlightKind::Function);
+        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
     }
 
     /// The real call-expression collision one more time, for Python's own `call` node kind
@@ -2752,9 +3292,16 @@ mod tests {
             .filter(|span| source[span.start..span.end] == *"top")
             .collect();
         assert_eq!(function_spans.len(), 2, "the definition and the call site");
-        assert!(function_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::Function));
+        assert_eq!(
+            function_spans[0].kind,
+            HighlightKind::FunctionDefinition,
+            "the `def top()` name is a real definition site"
+        );
+        assert_eq!(
+            function_spans[1].kind,
+            HighlightKind::Function,
+            "the `top()` call site stays a plain function"
+        );
     }
 
     #[test]
@@ -2809,6 +3356,315 @@ mod tests {
     /// [`HIGHLIGHT_NAMES`] and [`HIGHLIGHT_KINDS`] are a positional parallel array pair, and the
     /// whole classification mapping is wrong-but-compiling if they ever drift. The array length is
     /// already tied together at compile time; this pins the *content* of every real mapping -
+    /// A plain Rust local is a real `Variable`, not unclassified `Text`.
+    ///
+    /// This is the regression test for the single most consequential bug in the whole theme
+    /// redesign, and for how it was found. `tree-sitter-rust` is the only grammar here whose
+    /// bundled query has no blanket `(identifier) @variable` rule, so before
+    /// `RUST_VARIABLE_PREFIX` every local in every Rust file classified as `Text` - which made
+    /// `theme::syntax::VARIABLE` literally unreachable in this app's own primary language. Two
+    /// rounds of palette work aimed at that token could not have changed a single pixel of a Rust
+    /// file, and the maintainer's "most of the text is just white" was exactly right both times.
+    ///
+    /// No amount of contrast maths could have caught it. What did was taking a screenshot after a
+    /// palette change, diffing it against the one before, and finding **zero** changed pixels in
+    /// the code area.
+    #[test]
+    fn a_plain_rust_local_is_a_real_variable_not_unclassified_text() {
+        let source = "fn f(input: u8) {\n    let child = compute(input);\n    use_it(child);\n}\n";
+        let spans = highlight_rust(source);
+
+        assert_eq!(
+            kind_at(&spans, source, "child ="),
+            HighlightKind::Variable,
+            "the binding site of a local must be a real Variable"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "child)"),
+            HighlightKind::Variable,
+            "and so must every later use of it"
+        );
+        // The blanket rule is a *fallback*, not an override: everything more specific still wins.
+        assert_eq!(
+            kind_at(&spans, source, "f(input"),
+            HighlightKind::FunctionDefinition
+        );
+        assert_eq!(kind_at(&spans, source, "compute("), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, source, "input:"),
+            HighlightKind::VariableParameter,
+            "a parameter must still beat the blanket rule"
+        );
+        assert_eq!(kind_at(&spans, source, "u8"), HighlightKind::TypeBuiltin);
+        assert_eq!(kind_at(&spans, source, "let"), HighlightKind::Keyword);
+    }
+
+    /// A Rust `const`/`static` is a real `Constant`, not a `Type`.
+    ///
+    /// The same class of bug as `a_plain_rust_local_is_a_real_variable_not_unclassified_text`, and
+    /// found by the same question - "which grammars can actually emit the token this colour is
+    /// attached to?". `tree-sitter-rust`'s own `@constant` rule carries a stray apostrophe inside
+    /// its `#match?` regex and can never fire, and its later `@constructor` heuristic then claims
+    /// the identifier. See `RUST_CONSTANT_SUPPLEMENT`.
+    ///
+    /// This was cosmetically invisible until the redesign gave `syntax.constant` its own orange and
+    /// `syntax.type` its own gold, at which point every Rust constant rendered in the type colour.
+    #[test]
+    fn a_rust_const_is_a_real_constant_not_a_type() {
+        let source =
+            "const MAX_SIZE: usize = 42;\nstatic LIMIT: u32 = 7;\nfn f() -> usize { MAX_SIZE }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(
+            kind_at(&spans, source, "MAX_SIZE:"),
+            HighlightKind::Constant,
+            "a const's declaration site must be a Constant, not a Type"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "MAX_SIZE }"),
+            HighlightKind::Constant,
+            "and so must every later use of it"
+        );
+        assert_eq!(kind_at(&spans, source, "LIMIT"), HighlightKind::Constant);
+        // The all-caps rule must not eat ordinary capitalised type names.
+        assert_eq!(kind_at(&spans, source, "usize"), HighlightKind::TypeBuiltin);
+    }
+
+    /// A capitalised *type* is still a type, and an attribute's own identifiers are still
+    /// attributes - the two things `RUST_CONSTANT_SUPPLEMENT`'s all-caps heuristic could plausibly
+    /// have broken.
+    #[test]
+    fn the_rust_constant_heuristic_does_not_claim_types_or_attributes() {
+        let source = "#[derive(Debug)]\nstruct Widget { id: u32 }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(kind_at(&spans, source, "Widget {"), HighlightKind::Type);
+        assert_eq!(kind_at(&spans, source, "derive"), HighlightKind::Attribute);
+        assert_eq!(kind_at(&spans, source, "Debug"), HighlightKind::Attribute);
+    }
+
+    /// A Python parameter is a real `VariableParameter`. `tree-sitter-python`'s bundled query has
+    /// **no** `@variable.parameter` pattern at all, so this token was unreachable in Python before
+    /// `PYTHON_PARAMETER_SUPPLEMENT` - the same gap class as the Rust `@variable` one.
+    #[test]
+    fn python_parameters_are_real_parameters_and_self_is_still_builtin() {
+        let source = "class C:\n    def f(self, a, b: int, c=1, d: str = \"x\", *args, **kw):\n        return self\n";
+        let spans = highlight_python(source);
+        for needle in ["a,", "b:", "c=1", "d: str", "args", "kw)"] {
+            assert_eq!(
+                kind_at(&spans, source, needle),
+                HighlightKind::VariableParameter,
+                "{needle:?} is a parameter binding site"
+            );
+        }
+        // Restated last on purpose - the parameter rules must not repaint `self`.
+        assert_eq!(
+            kind_at(&spans, source, "self,"),
+            HighlightKind::VariableBuiltin,
+            "`self` stays a builtin, not an ordinary parameter"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "self\n"),
+            HighlightKind::VariableBuiltin
+        );
+    }
+
+    /// Go's bundled query emits neither `@variable.parameter` nor `@constant`, and its
+    /// `@property` rule misses a composite literal's own keys. See `GO_CLASSIFICATION_SUPPLEMENT`.
+    #[test]
+    fn go_parameters_constants_and_literal_keys_are_really_classified() {
+        let source = "package main\n\nconst MaxRetries = 3\n\nfunc scale(n int, factor float64) int {\n\treturn n\n}\n\nfunc build() User { return User{Name: \"x\"} }\n";
+        let spans = highlight_go(source);
+        assert_eq!(
+            kind_at(&spans, source, "n int"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "factor"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "MaxRetries"),
+            HighlightKind::Constant,
+            "a Go const is a constant because the grammar says so, not because of its casing"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "Name:"),
+            HighlightKind::Property,
+            "a struct literal's key is a property, as it is in Rust and TypeScript"
+        );
+    }
+
+    /// A shorthand property had **no capture of any kind** in TypeScript/JavaScript - the closest
+    /// twin of the Rust `@variable` bug, and by blast radius the largest of the gaps this round
+    /// found. See `TYPESCRIPT_IDENTIFIER_SUPPLEMENT`.
+    #[test]
+    fn a_typescript_shorthand_property_is_a_real_variable_not_unclassified_text() {
+        let source = "const { alpha, beta } = config;\nconst obj = { alpha, gamma: 1 };\nconst { MAX_N } = limits;\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "alpha, beta"),
+            HighlightKind::Variable
+        );
+        assert_eq!(kind_at(&spans, source, "beta }"), HighlightKind::Variable);
+        assert_eq!(
+            kind_at(&spans, source, "alpha, gamma"),
+            HighlightKind::Variable
+        );
+        assert_eq!(kind_at(&spans, source, "gamma:"), HighlightKind::Property);
+        // The `#not-match?` guard: an all-caps shorthand still reaches JavaScript's own earlier
+        // `@constant` rule rather than being repainted a variable.
+        assert_eq!(kind_at(&spans, source, "MAX_N }"), HighlightKind::Constant);
+    }
+
+    /// The three parameter shapes `tree-sitter-typescript`'s own `required_parameter`/
+    /// `optional_parameter` rules miss, the arrow-function one being how most callbacks are
+    /// written. See `TYPESCRIPT_IDENTIFIER_SUPPLEMENT`.
+    #[test]
+    fn typescript_arrow_rest_and_destructured_parameters_are_real_parameters() {
+        let source = "const f = items.map(x => x + 1);\nfunction pick(a: number, ...rest: string[]) {}\nfunction g({ lo, hi }: Range) {}\n";
+        let spans = highlight_typescript(source, false);
+        assert_eq!(
+            kind_at(&spans, source, "x =>"),
+            HighlightKind::VariableParameter,
+            "an unparenthesized arrow parameter is still a parameter"
+        );
+        assert_eq!(
+            kind_at(&spans, source, "rest:"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "lo,"),
+            HighlightKind::VariableParameter
+        );
+        assert_eq!(
+            kind_at(&spans, source, "hi }"),
+            HighlightKind::VariableParameter
+        );
+        // The rules the bundled query already got right must be untouched.
+        assert_eq!(
+            kind_at(&spans, source, "a: number"),
+            HighlightKind::VariableParameter
+        );
+    }
+
+    /// The blanket variable rule must not swallow the contents of an attribute. See
+    /// `RUST_ATTRIBUTE_SUPPLEMENT` - the bundled query only captures the enclosing
+    /// `attribute_item`, and a leaf beats its ancestor when both are highlighted.
+    #[test]
+    fn an_attributes_own_identifiers_stay_attributes_not_variables() {
+        let source = "#[cfg(all(test, unix))]\n#[derive(Debug)]\nstruct S;\n";
+        let spans = highlight_rust(source);
+        for needle in ["cfg", "all(", "test,", "unix", "derive", "Debug"] {
+            assert_eq!(
+                kind_at(&spans, source, needle),
+                HighlightKind::Attribute,
+                "{needle:?} is inside an attribute and must render as one"
+            );
+        }
+    }
+
+    /// The other half of `RUST_ATTRIBUTE_SUPPLEMENT`'s anchoring: a **macro invocation** also
+    /// carries a `token_tree`, so an unanchored rule would repaint every `println!`/`assert!`
+    /// argument as an attribute. Its arguments must stay ordinary code.
+    #[test]
+    fn a_macro_invocations_arguments_are_ordinary_code_not_attributes() {
+        let source = "fn f() { let total = 1; assert_eq!(total, other(total)); }\n";
+        let spans = highlight_rust(source);
+        assert_eq!(
+            kind_at(&spans, source, "total,"),
+            HighlightKind::Variable,
+            "a variable inside a macro argument list is still a variable, not an attribute"
+        );
+        // `other` reads as a `Variable` rather than a `Function`, and that is honest rather than a
+        // gap: a macro's body parses as an opaque `token_tree`, so the grammar genuinely cannot
+        // tell a call from any other identifier in there. Before the blanket rule it was
+        // unclassified `Text`; a tint is strictly more informative than nothing, and crucially it
+        // is *not* `Attribute`, which is what this test exists to rule out.
+        assert_eq!(kind_at(&spans, source, "other("), HighlightKind::Variable);
+    }
+
+    /// The definition-site split, as one cross-language contract rather than six per-language
+    /// tests: in every language that has real definition-site rules, the *declared* name is a
+    /// `FunctionDefinition` and a *call* of that same name is a plain `Function`.
+    ///
+    /// This is what makes "colour definition sites, leave calls at plain foreground" implementable
+    /// at all - see `RUST_DEFINITION_SUPPLEMENT` for why no bundled grammar query gives it to us.
+    #[test]
+    fn a_definition_site_and_a_call_site_are_really_different_buckets_in_every_language() {
+        let cases: [(&str, crate::language::HighlighterFn, &str); 5] = [
+            (
+                "rust",
+                highlight_rust,
+                "fn zeta() {}\nfn caller() { zeta(); }\n",
+            ),
+            (
+                "python",
+                highlight_python,
+                "def zeta():\n    pass\n\nzeta()\n",
+            ),
+            ("typescript", highlight_ts, "function zeta() {}\nzeta();\n"),
+            (
+                "go",
+                highlight_go,
+                "package m\n\nfunc zeta() {}\n\nfunc caller() { zeta() }\n",
+            ),
+            (
+                "c",
+                highlight_c,
+                "int zeta(void) { return 0; }\nint caller(void) { return zeta(); }\n",
+            ),
+        ];
+        for (label, highlighter, source) in cases {
+            let spans = highlighter(source);
+            let kinds: Vec<HighlightKind> = spans
+                .iter()
+                .filter(|span| source[span.start..span.end] == *"zeta")
+                .map(|span| span.kind)
+                .collect();
+            assert_eq!(
+                kinds.len(),
+                2,
+                "{label}: premise - the definition and the call must both be classified spans, \
+                 got {kinds:?}"
+            );
+            assert_eq!(
+                kinds[0],
+                HighlightKind::FunctionDefinition,
+                "{label}: the declaration of `zeta` must be a definition site"
+            );
+            assert_eq!(
+                kinds[1],
+                HighlightKind::Function,
+                "{label}: the call to `zeta` must stay a plain function"
+            );
+        }
+    }
+
+    /// C is the one language whose definition rule had to anchor on the outer `function_definition`
+    /// node: the shape the bundled query uses for `@function` fires identically on a prototype and
+    /// on a definition, so the obvious rule would relabel every prototype in a header as a
+    /// definition. See `C_DEFINITION_SUPPLEMENT`.
+    #[test]
+    fn a_c_prototype_is_not_a_definition_site_but_the_definition_below_it_is() {
+        let source = "int zeta(int a);\nint zeta(int a) { return a; }\n";
+        let spans = highlight_c(source);
+        let kinds: Vec<HighlightKind> = spans
+            .iter()
+            .filter(|span| source[span.start..span.end] == *"zeta")
+            .map(|span| span.kind)
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            2,
+            "the prototype and the definition, got {kinds:?}"
+        );
+        assert_eq!(
+            kinds[0],
+            HighlightKind::Function,
+            "a prototype declares nothing here - it must not read as the definition site"
+        );
+        assert_eq!(kinds[1], HighlightKind::FunctionDefinition);
+    }
+
     /// GitHub issue #31's full extended scope list, not just the original six-bucket handful.
     #[test]
     fn recognized_highlight_names_map_to_the_intended_buckets() {
@@ -2822,6 +3678,10 @@ mod tests {
         assert_eq!(bucket("keyword"), HighlightKind::Keyword);
         assert_eq!(bucket("function"), HighlightKind::Function);
         assert_eq!(bucket("function.method"), HighlightKind::FunctionMethod);
+        assert_eq!(
+            bucket("function.definition"),
+            HighlightKind::FunctionDefinition
+        );
         assert_eq!(bucket("type"), HighlightKind::Type);
         assert_eq!(bucket("type.builtin"), HighlightKind::TypeBuiltin);
         assert_eq!(bucket("constant"), HighlightKind::Constant);
@@ -2846,14 +3706,14 @@ mod tests {
         );
         assert_eq!(bucket("attribute"), HighlightKind::Attribute);
         assert_eq!(bucket("embedded"), HighlightKind::Embedded);
-        // The real capture names verified directly against the grammars' own bundled query files
-        // (`escape`, `comment.documentation`), plus their checklist-name synonyms
-        // (`string.escape`, `comment.doc`) that no grammar here actually emits today - both sides
-        // of each pair resolve to the same bucket.
+        // The real capture names verified directly against the grammars' own bundled query
+        // files. `escape` is Rust's and Python's; `string.escape` is Markdown's own
+        // `(backslash_escape) @string.escape` - both sides of the pair resolve to one bucket.
+        // (`comment.doc` used to be asserted here too, until the coverage audit found no grammar
+        // emits it and it was removed from HIGHLIGHT_NAMES entirely.)
         assert_eq!(bucket("escape"), HighlightKind::StringEscape);
         assert_eq!(bucket("string.escape"), HighlightKind::StringEscape);
         assert_eq!(bucket("comment.documentation"), HighlightKind::CommentDoc);
-        assert_eq!(bucket("comment.doc"), HighlightKind::CommentDoc);
         // The non-obvious ones, each argued for in `HIGHLIGHT_KINDS`' own docs.
         assert_eq!(bucket("constructor"), HighlightKind::Type);
         assert_eq!(bucket("tag"), HighlightKind::Tag);
@@ -3066,7 +3926,10 @@ mod tests {
     #[test]
     fn go_function_definition_name_is_classified_as_function() {
         let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(kind_at(&spans, SAMPLE_GO, "add"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_GO, "add"),
+            HighlightKind::FunctionDefinition
+        );
     }
 
     /// `@function.builtin` (`len`) needs no new registration of its own - it already reads as
@@ -3162,7 +4025,10 @@ mod tests {
     #[test]
     fn c_function_definition_name_is_classified_as_function() {
         let spans = highlight_c(SAMPLE_C);
-        assert_eq!(kind_at(&spans, SAMPLE_C, "add"), HighlightKind::Function);
+        assert_eq!(
+            kind_at(&spans, SAMPLE_C, "add"),
+            HighlightKind::FunctionDefinition
+        );
     }
 
     /// `(statement_identifier) @label` - the new `"label"` registration's C half (a goto target,
@@ -3441,7 +4307,7 @@ mod tests {
         );
         assert_eq!(
             kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "main()"),
-            HighlightKind::Function
+            HighlightKind::FunctionDefinition
         );
     }
 
@@ -3540,7 +4406,7 @@ mod tests {
         );
         assert_eq!(
             kind_at(&list_spans, list, "main()"),
-            HighlightKind::Function
+            HighlightKind::FunctionDefinition
         );
 
         let quote = "> quote\n>\n> ```rust\n> fn main() {}\n> ```\n";
@@ -3650,13 +4516,15 @@ mod tests {
         let spans = highlight_typescript(source, false);
         assert_eq!(
             kind_at(&spans, source, "Badge"),
-            HighlightKind::Function,
+            HighlightKind::FunctionDefinition,
             "a capitalised function declaration is still a function, not a type"
         );
         assert_eq!(
             kind_at(&spans, source, "String("),
             HighlightKind::Function,
-            "a capitalised call is still a call, not a type"
+            "a capitalised *call* is still a call, not a type - and, since the definition-site \
+             supplements landed, still a plain `Function` rather than the `FunctionDefinition` \
+             the declaration above it gets"
         );
         assert_eq!(
             kind_at(&spans, source, "Widget = "),
@@ -4103,7 +4971,8 @@ mod tests {
             .iter()
             .flat_map(|line| &line.runs)
             .any(|(text, kind)| {
-                text.as_ref() == "highlighter_for_extension" && *kind == HighlightKind::Function
+                text.as_ref() == "highlighter_for_extension"
+                    && *kind == HighlightKind::FunctionDefinition
             });
         assert!(
             has_fn_name,
@@ -4222,6 +5091,8 @@ mod tests {
                     start: offset,
                     end: offset + ch.len_utf8(),
                     kind,
+                    // This helper models a single-language file, which is exactly one scope.
+                    scope: OUTER_SCOPE,
                 },
             );
         }
@@ -4331,31 +5202,37 @@ mod tests {
                 start: 0,
                 end: 1,
                 kind: HighlightKind::Function,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 1,
                 end: 2,
                 kind: HighlightKind::PunctuationBracket,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 2,
                 end: 5,
                 kind: HighlightKind::String,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 5,
                 end: 7,
                 kind: HighlightKind::PunctuationDelimiter,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 7,
                 end: 14,
                 kind: HighlightKind::Comment,
+                scope: OUTER_SCOPE,
             },
             HighlightSpan {
                 start: 14,
                 end: 15,
                 kind: HighlightKind::PunctuationBracket,
+                scope: OUTER_SCOPE,
             },
         ];
         let out = colorize_bracket_pairs(source, spans);
@@ -4385,6 +5262,67 @@ mod tests {
             HighlightKind::Comment,
             "the `)` inside the comment must stay part of the comment"
         );
+    }
+
+    /// Two independent ` ```rust ` fences in one markdown document must pair their brackets
+    /// **separately**. This is the real bug `HighlightSpan::scope` and `injection_scopes` exist to
+    /// fix, reproduced exactly as it was found: before the fix, `colorize_bracket_pairs` ran one
+    /// global stack over the whole document, so the unclosed `{` in the first fence paired with the
+    /// `}` that opens the second - two brackets in two different code blocks, painted as one
+    /// matched pair, with every depth in the second fence shifted by the first fence's leftovers.
+    #[test]
+    fn brackets_never_pair_across_two_separate_markdown_fences() {
+        let source = "```rust\nfn a() { // no closer\n```\n\nprose\n\n```rust\n} fn b() {}\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+
+        let unclosed_brace = nth_offset(source, '{', 0);
+        let stray_closer = nth_offset(source, '}', 0);
+        assert_eq!(
+            kind_at_byte(&spans, unclosed_brace),
+            HighlightKind::PunctuationBracket,
+            "the first fence's `{{` has no partner *inside its own fence* and must stay plain"
+        );
+        assert_eq!(
+            kind_at_byte(&spans, stray_closer),
+            HighlightKind::PunctuationBracket,
+            "the second fence's leading `}}` has no partner inside its own fence either - pairing \
+             it with the first fence's `{{` is exactly the bug this test pins"
+        );
+    }
+
+    /// The other half of the same fix: an *unbalanced* fence must not shift the depth ring for the
+    /// fences after it. `fn b`'s own braces are the outermost pair in their own fence, so they must
+    /// paint ring colour 0 - not 2, which is what the leaked global stack produced.
+    #[test]
+    fn an_unbalanced_fence_does_not_shift_the_ring_for_later_fences() {
+        let source = "```rust\nfn a() { let x = (;\n```\n\n```rust\nfn b() { c([1]); }\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+
+        // `fn b`'s body brace - the second `{` in the document.
+        let body_brace = nth_offset(source, '{', 1);
+        assert_eq!(
+            ring_index_at(&spans, body_brace),
+            Some(0),
+            "the second fence's outermost pair must start the ring over at 0"
+        );
+        // ...and the `(` of `c(` nested one level inside it. That is the *fourth* `(` in the
+        // document: `fn a(`, the unclosed `(`, `fn b(`, then this one.
+        let call_paren = nth_offset(source, '(', 3);
+        assert_eq!(
+            ring_index_at(&spans, call_paren),
+            Some(1),
+            "one level in from a depth-0 pair is ring 1, regardless of the previous fence"
+        );
+    }
+
+    /// A fence whose code is genuinely balanced is unaffected by this fix - both fences already
+    /// started at 0 before it, and must still.
+    #[test]
+    fn two_balanced_fences_each_start_the_ring_at_zero() {
+        let source = "```rust\nfn a() { b(); }\n```\n\n```rust\nfn c() { d(); }\n```\n";
+        let spans = ring_spans(source, highlight_markdown);
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 0)), Some(0));
+        assert_eq!(ring_index_at(&spans, nth_offset(source, '{', 1)), Some(0));
     }
 
     /// `<`/`>` really do arrive here as `PunctuationBracket` (Rust and TypeScript both capture a
@@ -4515,7 +5453,7 @@ mod tests {
     /// The bucket the span covering `byte` classifies it as. Deliberately *not* `kind_at`, which
     /// looks its argument up by substring search and so always finds the first `(` in the file -
     /// useless when the whole question is which of several identical characters this one is.
-    fn kind_at_byte(spans: &[HighlightSpan], byte: usize) -> HighlightKind {
+    pub(super) fn kind_at_byte(spans: &[HighlightSpan], byte: usize) -> HighlightKind {
         spans
             .iter()
             .find(|span| span.start <= byte && byte < span.end)
@@ -4523,7 +5461,7 @@ mod tests {
     }
 
     /// The ring colour a real bracket at `byte` got, or `None` if the pipeline left it plain.
-    fn ring_index_at(spans: &[HighlightSpan], byte: usize) -> Option<usize> {
+    pub(super) fn ring_index_at(spans: &[HighlightSpan], byte: usize) -> Option<usize> {
         let kind = spans
             .iter()
             .find(|span| span.start <= byte && byte < span.end)
@@ -4943,6 +5881,226 @@ mod tests {
         assert!(
             runs.contains(&HighlightKind::PunctuationBracket),
             "the trailing `}}`, whose partner is outside the hunk, must stay plain - got {runs:?}"
+        );
+    }
+}
+
+/// GitHub issue: syntax theme redesign - the real fixture corpus.
+///
+/// This module is the honest substitute for "before/after screenshots of each fixture". This
+/// environment *can* screenshot the running app (see `BUILD-LOG.md`), but it has no scripted way
+/// to open a chosen file in the editor, so per-fixture screenshots are not automatable. What is
+/// automatable, and is arguably better evidence, is a dump of exactly what the pipeline classifies
+/// each byte as and exactly what colour that resolves to - which is the thing a screenshot would
+/// have been inspected *for*, minus the eyes.
+///
+/// Each test below renders one real fixture through the real pipeline (`HighlightOptions::default`
+/// -> the real grammar -> the real bracket ring) and asserts the properties the redesign promises.
+/// Run with `--nocapture` to read the full per-line dump for review.
+#[cfg(test)]
+mod fixture_corpus_tests {
+    use super::tests::{kind_at, kind_at_byte, ring_index_at};
+    use super::*;
+    use crate::theme;
+
+    const RUST: &str = include_str!("testdata/fixture.rs.txt");
+    const TSX: &str = include_str!("testdata/fixture.tsx.txt");
+    const PYTHON: &str = include_str!("testdata/fixture.py.txt");
+    const MARKDOWN: &str = include_str!("testdata/fixture.md.txt");
+    const DEEP: &str = include_str!("testdata/fixture.deep.rs.txt");
+    const TORTURE: &str = include_str!("testdata/fixture.torture.rs.txt");
+
+    fn spans_of(source: &str, highlighter: crate::language::HighlighterFn) -> Vec<HighlightSpan> {
+        HighlightOptions::default().highlight(source, Some(highlighter))
+    }
+
+    /// Every distinct `(bucket, resolved colour, contrast against the editor background)` a fixture
+    /// actually produces - the reviewable table a screenshot would only have implied.
+    fn dump(
+        label: &str,
+        source: &str,
+        highlighter: crate::language::HighlighterFn,
+    ) -> Vec<HighlightKind> {
+        let spans = spans_of(source, highlighter);
+        let background = theme::surface::CENTER.resolve();
+        let mut seen: Vec<HighlightKind> = Vec::new();
+        for span in &spans {
+            if !seen.contains(&span.kind) {
+                seen.push(span.kind);
+            }
+        }
+        println!("\n=== {label} ===");
+        for kind in &seen {
+            let color = color_for_kind(*kind);
+            let rgba = color;
+            println!(
+                "  {:24} #{:02x}{:02x}{:02x}  contrast {:5.2}:1",
+                kind.name(),
+                (rgba.r * 255.0).round() as u32,
+                (rgba.g * 255.0).round() as u32,
+                (rgba.b * 255.0).round() as u32,
+                theme::contrast_ratio(rgba, background)
+            );
+        }
+        seen
+    }
+
+    /// Every bucket a fixture reaches must clear its own contrast floor. This is the property a
+    /// reviewer would otherwise be squinting at a screenshot to judge.
+    fn assert_every_bucket_is_readable(label: &str, seen: &[HighlightKind]) {
+        let background = theme::surface::CENTER.resolve();
+        for kind in seen {
+            let rgba: gpui::Rgba = color_for_kind(*kind);
+            let key: String = format!("syntax.{}", kind.name());
+            let Some(floor) = theme::syntax_contrast_floor_for_test(&key) else {
+                continue;
+            };
+            let ratio = theme::contrast_ratio(rgba, background);
+            assert!(
+                ratio >= floor,
+                "{label}: {} renders at {ratio:.2}:1, below its {floor}:1 floor",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn rust_fixture_is_fully_readable_and_colours_only_what_it_should() {
+        let seen = dump("Rust", RUST, highlight_rust);
+        assert_every_bucket_is_readable("Rust", &seen);
+        let spans = spans_of(RUST, highlight_rust);
+        // The definition site is coloured; the call sites are not.
+        assert_eq!(
+            kind_at(&spans, RUST, "parse(input"),
+            HighlightKind::FunctionDefinition
+        );
+        // `push` is a *method* call, so it lands in the FunctionMethod bucket. Both call buckets
+        // share one blue, and the definition site is a distinct violet-blue - the restraint
+        // revision held all three at plain foreground and this is the assertion that replaced it.
+        assert_eq!(
+            kind_at(&spans, RUST, "push("),
+            HighlightKind::FunctionMethod
+        );
+        for call in [HighlightKind::Function, HighlightKind::FunctionMethod] {
+            assert_ne!(
+                color_for_kind(call),
+                color_for_kind(HighlightKind::Text),
+                "a call site carries real colour"
+            );
+            assert_ne!(
+                color_for_kind(call),
+                color_for_kind(HighlightKind::FunctionDefinition),
+                "and is still tellable apart from a definition site"
+            );
+        }
+        // The brackets inside the string, char and raw string are never ring-coloured.
+        for needle in ["{ brace ) in", "] ["] {
+            let offset = RUST.find(needle).expect("fixture contains it");
+            assert!(
+                matches!(
+                    kind_at_byte(&spans, offset),
+                    HighlightKind::String | HighlightKind::StringEscape
+                ),
+                "the brackets in {needle:?} must stay part of the string"
+            );
+        }
+    }
+
+    #[test]
+    fn tsx_fixture_is_fully_readable_and_leaves_generics_plain() {
+        let seen = dump("TSX", TSX, highlight_tsx);
+        assert_every_bucket_is_readable("TSX", &seen);
+        let spans = spans_of(TSX, highlight_tsx);
+        // Every `<`/`>` stays the de-emphasized punctuation tone - never a ring colour.
+        for (index, _) in TSX.match_indices('<') {
+            assert_eq!(
+                kind_at_byte(&spans, index),
+                HighlightKind::PunctuationBracket,
+                "a `<` at byte {index} must never join the bracket ring"
+            );
+        }
+    }
+
+    #[test]
+    fn python_fixture_is_fully_readable() {
+        let seen = dump("Python", PYTHON, highlight_python);
+        assert_every_bucket_is_readable("Python", &seen);
+        let spans = spans_of(PYTHON, highlight_python);
+        assert_eq!(
+            kind_at(&spans, PYTHON, "parse(self"),
+            HighlightKind::FunctionDefinition
+        );
+    }
+
+    #[test]
+    fn markdown_fixture_is_fully_readable_and_pairs_each_fence_independently() {
+        let seen = dump("Markdown", MARKDOWN, highlight_markdown);
+        assert_every_bucket_is_readable("Markdown", &seen);
+        let spans = spans_of(MARKDOWN, highlight_markdown);
+        // Both fences are balanced, so each one's outermost pair starts the ring over at 0.
+        let rust_brace = MARKDOWN.find("fn a() {").expect("rust fence") + 7;
+        let python_brace = MARKDOWN.find("d = {").expect("python fence") + 4;
+        for offset in [rust_brace, python_brace] {
+            assert_eq!(
+                ring_index_at(&spans, offset),
+                Some(0),
+                "each fence's outermost pair must start at ring 0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deep_nesting_fixture_stays_legible_with_the_ring_on_and_off() {
+        let seen = dump("Deep nesting", DEEP, highlight_rust);
+        assert_every_bucket_is_readable("Deep nesting", &seen);
+
+        // Ring on: twelve levels really do cycle, and adjacent levels really do differ.
+        let on = spans_of(DEEP, highlight_rust);
+        let opens: Vec<usize> = DEEP.match_indices('(').map(|(index, _)| index).collect();
+        let ring: Vec<Option<usize>> = opens.iter().map(|o| ring_index_at(&on, *o)).collect();
+        let used: std::collections::HashSet<usize> = ring.iter().flatten().copied().collect();
+        assert_eq!(
+            used.len(),
+            6,
+            "a twelve-level fixture must exercise all six ring colours, got {used:?}"
+        );
+
+        // Ring off: every bracket falls back to the one de-emphasized punctuation tone, and that
+        // tone is still readable - which is what "legible with rainbow off" actually means.
+        let off = HighlightOptions {
+            bracket_pair_colorization: false,
+        }
+        .highlight(DEEP, Some(highlight_rust));
+        for (index, _) in DEEP.match_indices('(') {
+            assert_eq!(
+                kind_at_byte(&off, index),
+                HighlightKind::PunctuationBracket,
+                "with the ring off every bracket must be the plain punctuation tone"
+            );
+        }
+        let rgba: gpui::Rgba = color_for_kind(HighlightKind::PunctuationBracket);
+        assert!(
+            theme::contrast_ratio(rgba, theme::surface::CENTER.resolve()) >= 3.0,
+            "the ring-off bracket tone must still clear 3:1"
+        );
+    }
+
+    #[test]
+    fn the_torture_fixture_never_colours_a_bracket_that_is_not_real_code() {
+        let seen = dump("Bracket torture", TORTURE, highlight_rust);
+        assert_every_bucket_is_readable("Bracket torture", &seen);
+        let spans = spans_of(TORTURE, highlight_rust);
+
+        // The `(` inside the leading comment.
+        let comment_paren = TORTURE.find("Unmatched (").expect("fixture") + 10;
+        assert_eq!(kind_at_byte(&spans, comment_paren), HighlightKind::Comment);
+
+        // The mismatched `([)]`: the stray `)` is left plain rather than consuming the `[`.
+        let stray = TORTURE.find("([)]").expect("fixture") + 2;
+        assert_eq!(
+            kind_at_byte(&spans, stray),
+            HighlightKind::PunctuationBracket,
+            "a closer whose shape does not match the innermost opener must stay plain"
         );
     }
 }

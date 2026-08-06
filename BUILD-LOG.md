@@ -1645,6 +1645,31 @@ that PID. This is real evidence a genuine X11 window opens - stronger than the p
 "wayland-only, never screenshotted" state, and enough to fix the actual bug that mattered
 (the stock-X11-desktop black hole from `ASSESSMENT.md`).
 
+> **CORRECTION (syntax theme redesign, 2026-08).** The conclusion below - that this sandbox
+> cannot capture the app's painted content - is **wrong**, and it cost at least three later
+> sessions real time. The error was generalising from *root-window* capture to all capture.
+>
+> `scrot` against the root window really does return solid black; that part reproduces. But a
+> **per-window `XGetImage` against the app's own toplevel** works perfectly, and even survives
+> occlusion (Xwayland gives each toplevel its own backing pixmap, so an overlapping window does
+> not appear in the capture). Recipe: launch with `env -u WAYLAND_DISPLAY DISPLAY=:0 <binary>
+> <repo-path>`, find the window by `_NET_WM_PID`, then `XGetImage` and decode as BGRX.
+> `python-xlib`, `mss`, `Pillow` and `pyautogui` are all present under
+> `~/.local/lib/python3.10/site-packages`.
+>
+> This file already contained the evidence at Revision R8.5's own entry ("Per-window capture
+> (`xwd -id <id>`) works"), and a real 1440x928 render of the app exists from an earlier session
+> under `.claude/scratch/phase-a-screenshots/`. The pessimistic paragraph below was written later
+> and never reconciled with either.
+>
+> Two things that genuinely do **not** work, checked rather than assumed: `weston_screenshooter`
+> is advertised by WSLg's compositor but returns `permission denied. Debug protocol must be
+> enabled`, and GPUI's own `render_to_image` (`vendor/zed/crates/gpui/src/window.rs`) is real but
+> `gpui_platform.rs` returns `None` for the headless renderer on non-macOS - `gpui_linux` has no
+> implementation. What also remains unsolved is *scripted navigation*: the app takes a repo path
+> as `argv[1]`, not a file, so opening a chosen file for a screenshot still needs UI interaction,
+> and `xdotool type --window` reaches the app but mangles characters.
+
 What remains genuinely unverified: the window's *painted content*. `scrot` against `:0`
 repeatedly returned solid black across the entire captured display - not just the app's
 window area, but the whole framebuffer, including regions with no windows at all and

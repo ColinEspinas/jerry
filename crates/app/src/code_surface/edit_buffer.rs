@@ -279,6 +279,12 @@ fn spans_for_byte_window(
             start: start as usize,
             end: end as usize,
             kind: *kind,
+            // These spans are re-derived from already-rendered runs, not from a parse, and a
+            // `RenderedLine` run carries no injection scope to recover. `OUTER_SCOPE` is the honest
+            // value: the only consumer of the field is `colorize_bracket_pairs`, which has already
+            // run by the time these exist (this path re-splices *its* output while the debounced
+            // background re-highlight is still in flight), so nothing reads it back here.
+            scope: code_view::OUTER_SCOPE,
         });
     }
     spans
@@ -3093,10 +3099,17 @@ impl QueryBuilder {
         buf.replace_range(None, "fn ");
         assert_eq!(buf.content, "fn foo");
         assert!(buf.highlight_dirty);
-        assert!(buf.lines[0]
-            .runs
-            .iter()
-            .all(|(_, kind)| *kind == code_view::HighlightKind::Text));
+        // The spliced runs carry the *pre-edit* classification, not a fresh parse: `foo` on its own
+        // is a real `Variable` (Rust gained a blanket `(identifier) @variable` rule - see
+        // `RUST_VARIABLE_PREFIX`), and nothing here has yet re-parsed it as `fn foo`. What matters
+        // for this test's premise is only that the *new* meaning has not appeared yet.
+        let before: Vec<code_view::HighlightKind> =
+            buf.lines[0].runs.iter().map(|(_, kind)| *kind).collect();
+        assert!(
+            !before.contains(&code_view::HighlightKind::Keyword)
+                && !before.contains(&code_view::HighlightKind::FunctionDefinition),
+            "the edit's new syntax meaning must not appear until a real re-highlight: {before:?}"
+        );
 
         // A real re-highlight (as `AdeApp`'s debounced background task would apply) turns "fn"
         // into a real keyword and "foo" into a real function name.
@@ -3132,7 +3145,8 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function)
+            Some(code_view::HighlightKind::FunctionDefinition),
+            "`fn foo` is a declaration, so its name is a definition site"
         );
 
         // A real single-character keystroke inside the line, away from both "fn" and "foo" -
@@ -3164,7 +3178,7 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function),
+            Some(code_view::HighlightKind::FunctionDefinition),
             "the untouched \"foo\" function name must likewise keep its own real highlighting"
         );
 
@@ -3182,7 +3196,7 @@ impl QueryBuilder {
         );
         assert_eq!(
             find_kind(&buf, "foo"),
-            Some(code_view::HighlightKind::Function)
+            Some(code_view::HighlightKind::FunctionDefinition)
         );
     }
 

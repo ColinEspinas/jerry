@@ -1,0 +1,29 @@
+//! A doc comment on the module.
+use std::collections::HashMap;
+
+/// Parses `input` into tokens.
+pub fn parse(input: &str, limit: usize) -> Result<Vec<Token>, ParseError> {
+    let mut out = Vec::new();
+    let table: HashMap<String, Vec<u8>> = HashMap::new();
+    // A line comment with an unmatched ( paren inside it.
+    let literal = "a { brace ) in a string";
+    let escaped = "tab\there";
+    let raw = r#"raw ] ["#;
+    let ch = '{';
+    for (index, item) in input.chars().enumerate() {
+        if index >= limit || item == ch {
+            break;
+        }
+        out.push(Token::new(item, index as u32, true));
+    }
+    println!("{} {:?} {}", literal, escaped, raw);
+    Ok(out)
+}
+
+struct Token { value: char, offset: u32, valid: bool }
+
+impl Token {
+    fn new(value: char, offset: u32, valid: bool) -> Self {
+        Self { value, offset, valid }
+    }
+}

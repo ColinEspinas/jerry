@@ -88,6 +88,15 @@ unicode-segmentation = "1.13.3"
 # APIs, there is no in-tree call site to verify against, and `crate::code_view`'s docs instead cite
 # the real crate source on disk for every non-obvious behaviour they rely on.
 tree-sitter-highlight = "=0.26.9"
+# `tree_sitter::QueryCursor::matches` returns a `QueryMatches` that implements **only**
+# `streaming_iterator::StreamingIterator`, not `Iterator` - deliberately, because the underlying C
+# object is overwritten on each step, so handing out copies would be undefined behaviour (read
+# directly from `tree-sitter-0.26.9/binding_rust/lib.rs:3404-3436`). Iterating one therefore
+# requires this trait in scope. Already in the lockfile as `tree-sitter`'s and
+# `tree-sitter-highlight`'s own transitive dependency at this exact version, so naming it here adds
+# a real, direct use of a crate already being compiled rather than any new weight. Used by
+# `crate::code_surface::code_view::injection_scopes`.
+streaming-iterator = "0.1.9"
 # Depended on for its *query file*, not its grammar - this app never parses anything with the
 # JavaScript grammar (`.js`/`.jsx` deliberately reuse the TypeScript/TSX ones, see
 # `crate::code_view::highlight_typescript`). `tree-sitter-typescript`'s own `HIGHLIGHTS_QUERY` is

@@ -1,0 +1,20 @@
+"""Module docstring."""
+import json
+
+
+class Parser:
+    """A parser."""
+
+    def __init__(self, limit: int = 10) -> None:
+        self.limit = limit
+        self.cache: dict[str, list[int]] = {}
+
+    def parse(self, raw: str):
+        # A comment with a { brace and a ) paren.
+        data = json.loads(raw)
+        label = f"{data['name']} ({len(data)})"
+        return {k: [v for v in (1, 2)] for k in data if k not in self.cache}
+
+
+TOTAL = 42
+FLAG = True
