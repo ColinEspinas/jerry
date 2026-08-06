@@ -662,7 +662,9 @@ fn syntax_contrast_floor(key: &str) -> Option<f32> {
     match scope {
         // Real backgrounds and non-colour tokens - a floor against the background is meaningless.
         "diagnostic_row_bg" => None,
-        "operator" | "punctuation_bracket" | "punctuation_delimiter" => Some(3.0),
+        "operator" | "punctuation_bracket" | "punctuation_delimiter" | "punctuation_special" => {
+            Some(3.0)
+        }
         _ if scope.starts_with("bracket_") => Some(3.0),
         _ => Some(4.5),
     }
@@ -1421,6 +1423,39 @@ pub mod syntax {
     /// file has no keywords for it to collide with, exactly as [`HEADING`] shares [`TYPE`]'s gold.
     pub const EMPHASIS: ColorToken = token("syntax.emphasis", 0xc194d6);
 
+    /// GitHub issue #183's own seven classification-precision splits - each capture below was a
+    /// real, distinct grammar-level concept quietly folded into a coarser existing bucket. Every
+    /// one keeps its old parent's exact colour by default (the restraint palette has no reason to
+    /// tell them apart *visually* yet - see [`crate::code_surface::code_view::HighlightKind`]'s
+    /// own docs for each variant's real capture/grammar evidence), so this is purely a
+    /// classification fix: a future theme (or a future palette revision) now has a real,
+    /// independent token to differentiate any of them without this module changing again.
+    ///
+    /// `punctuation.special` (Markdown's ATX `#`/list bullets, JS/TS's `${`/`}` interpolation
+    /// delimiters, YAML's `---`/`&`/`*`) - defaults to [`OPERATOR`]'s own colour, its pre-issue
+    /// bucket.
+    pub const PUNCTUATION_SPECIAL: ColorToken = token("syntax.punctuation_special", 0x6f757e);
+    /// `label` (a Rust lifetime, a C goto target, a YAML anchor/alias) - defaults to
+    /// [`VARIABLE`]'s own colour, its pre-issue bucket. See `HighlightKind::Label`'s own docs for
+    /// why these three real, unrelated concepts still share this one token.
+    pub const LABEL: ColorToken = token("syntax.label", 0xda8db2);
+    /// `string.special` (a JS/TS regex literal, a TOML datetime, a CSS colour value) - defaults
+    /// to [`STRING`]'s own colour, its pre-issue bucket.
+    pub const STRING_SPECIAL: ColorToken = token("syntax.string_special", 0x98b46a);
+    /// `function.builtin` (Python's `len`/`print`, Go's `append`/`make`/`panic`, JavaScript's
+    /// `require`) - defaults to [`FUNCTION`]'s own colour, its pre-issue bucket.
+    pub const FUNCTION_BUILTIN: ColorToken = token("syntax.function_builtin", 0x74ade8);
+    /// `function.macro` (Rust's `println!`-style macro invocations) - defaults to [`FUNCTION`]'s
+    /// own colour, its pre-issue bucket.
+    pub const FUNCTION_MACRO: ColorToken = token("syntax.function_macro", 0x74ade8);
+    /// `tag.error` (HTML's mismatched/erroneous closing tag) - defaults to [`TAG`]'s own colour,
+    /// its pre-issue bucket.
+    pub const TAG_ERROR: ColorToken = token("syntax.tag_error", 0xc7a356);
+    /// `constructor` (Rust/Python/JavaScript's shared `^[A-Z]`-starts-with-a-capital heuristic for
+    /// an enum-variant/struct construction site) - defaults to [`TYPE`]'s own colour, its
+    /// pre-issue bucket.
+    pub const CONSTRUCTOR: ColorToken = token("syntax.constructor", 0xc7a356);
+
     pub const CARET: ColorToken = token("syntax.caret", 0x4d97de);
     /// The code editor's real selection fill opacity (GitHub issue #27) while genuinely
     /// focused - applied on top of [`CARET`], the same color the solid caret itself paints, so
@@ -1484,6 +1519,13 @@ pub mod syntax {
         ("LINK", LINK),
         ("STRONG", STRONG),
         ("EMPHASIS", EMPHASIS),
+        ("PUNCTUATION_SPECIAL", PUNCTUATION_SPECIAL),
+        ("LABEL", LABEL),
+        ("STRING_SPECIAL", STRING_SPECIAL),
+        ("FUNCTION_BUILTIN", FUNCTION_BUILTIN),
+        ("FUNCTION_MACRO", FUNCTION_MACRO),
+        ("TAG_ERROR", TAG_ERROR),
+        ("CONSTRUCTOR", CONSTRUCTOR),
         ("CARET", CARET),
         ("ERROR_UNDERLINE", ERROR_UNDERLINE),
         ("HOVER_UNDERLINE", HOVER_UNDERLINE),
