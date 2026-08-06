@@ -1249,6 +1249,14 @@ impl AdeApp {
         relative_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #189, and deliberately *before* the debounce below, not inside it: every
+        // real edit path in `crate::code_surface::editing` already funnels through this method
+        // synchronously, so this one call is what makes an already-open popup narrow on the very
+        // keystroke that was typed, with no round trip and no timer in between. The debounced
+        // request below still refreshes the underlying candidate set behind it - see
+        // `AdeApp::refilter_completions`' own docs for how the two compose.
+        self.refilter_completions(cx);
+
         let task = cx.spawn({
             let relative_path = relative_path.clone();
             async move |this, cx| {
@@ -1766,14 +1774,20 @@ impl AdeApp {
                     lsp_core::lsp_types::CompletionResponse::Array(items) => items,
                     lsp_core::lsp_types::CompletionResponse::List(list) => list.items,
                 };
-                if items.is_empty() {
-                    None
-                } else {
-                    Some(CompletionsEntry {
-                        path: relative_path.to_path_buf(),
-                        status: CompletionsStatus::Ready { items, selected: 0 },
-                    })
-                }
+                // Narrowed against the prefix typed at the caret *right now* (GitHub issue #189),
+                // not against the one that was there when this request went out - a response that
+                // took a real round trip to arrive must land already filtered to what the user has
+                // since typed, or the popup would visibly widen back out for one frame on every
+                // server reply. `CompletionsStatus::ready` returns `None` when nothing in the
+                // response matches, which is treated exactly like the genuinely-empty response
+                // below: no popup.
+                let query = self
+                    .completion_filter_query(relative_path)
+                    .unwrap_or_default();
+                CompletionsStatus::ready(items, &query).map(|status| CompletionsEntry {
+                    path: relative_path.to_path_buf(),
+                    status,
+                })
             }
             Ok(None) => None,
             Err(err) => Some(CompletionsEntry {

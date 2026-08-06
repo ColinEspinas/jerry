@@ -184,6 +184,190 @@ pub fn completion_kind_badge(
     }
 }
 
+/// The real text the user's typed prefix must be matched against for `item`: the server's own
+/// `filterText` whenever it supplied a non-empty one, else the item's `label` - exactly the
+/// fallback the LSP spec mandates for `CompletionItem.filterText` ("When `falsy` the label is used
+/// as the filter text"). This matters for real, live servers: rust-analyzer returns items whose
+/// *label* carries decoration a typed prefix will never match (`new(…)`, a leading `⚡` for a
+/// snippet-ish item) alongside a plain `filterText` that it will.
+pub fn completion_filter_text(item: &lsp_types::CompletionItem) -> &str {
+    item.filter_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .unwrap_or(item.label.as_str())
+}
+
+/// How *directly* a candidate matched the typed prefix. Ordered best-first by `derive(Ord)`'s own
+/// declaration order, and compared before every other component of a [`CompletionMatch`], so a
+/// real prefix hit always beats a mid-string one, which always beats a scattered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompletionMatchTier {
+    /// The query is a real leading prefix of the candidate (`ver` in `version`).
+    Prefix,
+    /// The query occurs contiguously, but not at the start (`ver` in `has_version`).
+    Substring,
+    /// The query's characters occur in order but with real gaps between them (`vrs` in
+    /// `version`).
+    Subsequence,
+}
+
+/// One candidate's real match quality, ordered best-first: `derive(Ord)` compares the fields in
+/// declaration order, which *is* the ranking policy, so the ordering rule lives in one place
+/// rather than in a hand-written `cmp`.
+///
+/// - `tier` first (see [`CompletionMatchTier`]).
+/// - `start` - an earlier match is a better one (`ver` in `xver` beats `ver` in `xxxxver`).
+/// - `gaps` - how many times the match had to skip characters at a position that *isn't* a real
+///   word start; skipping to a `snake_case`/`camelCase` boundary is free, since that is exactly
+///   the query shape (`rts` for `read_to_string`) a real fuzzy matcher is supposed to reward.
+/// - `span` - how much of the candidate the match had to stretch across; a tighter match wins.
+/// - `case_mismatches` - matching is case-insensitive, but an exactly-cased match wins the tie
+///   (`Ver` prefers `Version` over `version`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompletionMatch {
+    pub tier: CompletionMatchTier,
+    pub start: usize,
+    pub gaps: usize,
+    pub span: usize,
+    pub case_mismatches: usize,
+}
+
+/// Whether `index` starts a real word inside `chars` - the start of the string, anything right
+/// after a non-alphanumeric separator (`_`, `.`, `-`, `::`), or a `camelCase` lower-to-upper
+/// transition.
+fn is_word_start(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = chars[index - 1];
+    if !previous.is_alphanumeric() {
+        return true;
+    }
+    chars[index].is_uppercase() && !previous.is_uppercase()
+}
+
+/// The real match, if any, of `query` against `candidate` - `None` when `query`'s characters do
+/// not all occur in `candidate`, in order.
+///
+/// ## Why a real subsequence match, and why this isn't a second copy of the palette's matcher
+///
+/// The command palette (`crate::palette::state`) deliberately matches on *contiguous* substrings
+/// only, and says so in its own module docs: a palette row highlights one contiguous span, and
+/// scattered highlight characters would read as noise there. That decision is about the palette's
+/// own rendering, not about matching in general, so it can't simply be adopted here - every real
+/// LSP client (VSCode, coc.nvim, ...) filters completions by a real *subsequence* match against
+/// `filterText`, which is what GitHub issue #189 explicitly asks this popup to behave like.
+///
+/// So the palette's own real, tested [`crate::palette::state::substring_match`] is *reused as-is*
+/// for the two contiguous tiers rather than reimplemented here (it already does the leftmost,
+/// alignment-safe ASCII-folded search this needs), and only the genuinely new part - the scattered
+/// subsequence tier and the tier/gap/span ranking above it - is added. Nothing is duplicated.
+///
+/// The subsequence walk is a deterministic greedy leftmost one, not a full dynamic-programming
+/// optimum like VSCode's own `fuzzyScore`: for identifier-length strings the difference only ever
+/// affects the *ranking* of an already-matching item (never whether it matches at all), and the
+/// two tiers that carry real ranking weight - prefix and contiguous substring - are resolved
+/// exactly, before the greedy walk is ever reached.
+pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch> {
+    if query.is_empty() {
+        // Nothing typed past the trigger point yet: every candidate the server returned is
+        // equally, honestly relevant, and `rank_completion_items`' own index tiebreak then
+        // preserves the server's own ordering exactly.
+        return Some(CompletionMatch {
+            tier: CompletionMatchTier::Prefix,
+            start: 0,
+            gaps: 0,
+            span: 0,
+            case_mismatches: 0,
+        });
+    }
+
+    let haystack: Vec<char> = candidate.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    if let Some((start, len)) = crate::palette::state::substring_match(candidate, query) {
+        let case_mismatches = (0..len)
+            .filter(|offset| haystack[start + offset] != needle[*offset])
+            .count();
+        return Some(CompletionMatch {
+            tier: if start == 0 {
+                CompletionMatchTier::Prefix
+            } else {
+                CompletionMatchTier::Substring
+            },
+            start,
+            gaps: 0,
+            span: len,
+            case_mismatches,
+        });
+    }
+
+    let folded_haystack: Vec<char> = haystack.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let folded_needle: Vec<char> = needle.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mut positions = Vec::with_capacity(folded_needle.len());
+    let mut search_from = 0usize;
+    for wanted in &folded_needle {
+        let found = folded_haystack[search_from..]
+            .iter()
+            .position(|ch| ch == wanted)?
+            + search_from;
+        positions.push(found);
+        search_from = found + 1;
+    }
+
+    let start = positions[0];
+    let end = *positions
+        .last()
+        .expect("a non-empty query matched at least one char");
+    let gaps = positions
+        .windows(2)
+        .filter(|pair| pair[1] != pair[0] + 1 && !is_word_start(&haystack, pair[1]))
+        .count();
+    let case_mismatches = positions
+        .iter()
+        .enumerate()
+        .filter(|(index, position)| haystack[**position] != needle[*index])
+        .count();
+    Some(CompletionMatch {
+        tier: CompletionMatchTier::Subsequence,
+        start,
+        gaps,
+        span: end - start + 1,
+        case_mismatches,
+    })
+}
+
+/// The real, client-side narrowed and re-ranked view of `items` for the prefix the user has typed
+/// since the completion was triggered: indices into `items`, best match first, with every item
+/// that doesn't match `query` at all left out entirely.
+///
+/// This is the whole point of GitHub issue #189: real language servers (rust-analyzer included)
+/// answer a `textDocument/completion` request with a broad, position-relevant candidate set and
+/// expect the *client* to narrow it locally as more characters arrive, rather than re-narrowing it
+/// themselves on every keystroke. Returning indices (not cloned items) is what lets
+/// `crate::lsp::completion_popup` keep the server's full response intact underneath, so pressing
+/// Backspace genuinely widens the list back out instead of having to re-ask the server for what it
+/// already sent.
+///
+/// Ties (including *every* pair under an empty `query`) fall back to the item's own original index,
+/// so the server's own ordering is preserved wherever this ranking has nothing real to say about
+/// it - a deliberate choice not to start honoring `CompletionItem::sortText` here, which this app
+/// has never applied and which is a separate concern from narrowing by typed text.
+pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -> Vec<usize> {
+    let mut scored: Vec<(CompletionMatch, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            completion_match(completion_filter_text(item), query).map(|score| (score, index))
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().map(|(_, index)| index).collect()
+}
+
 /// A completion item's byte range, purely for a caller (`crate::lsp::completion_popup`) that already
 /// has a resolved fallback `Range<usize>` (the identifier prefix, per [`identifier_prefix_start`])
 /// and just needs a shared type - kept here only as a doc anchor; the real conversion from
@@ -410,6 +594,134 @@ mod tests {
         assert_eq!(CompletionKindBadge::Function.letter(), "f");
         assert_eq!(CompletionKindBadge::Variable.letter(), "v");
         assert_eq!(CompletionKindBadge::Type.letter(), "t");
+    }
+
+    fn item(label: &str) -> lsp_types::CompletionItem {
+        lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn ranked_labels(items: &[lsp_types::CompletionItem], query: &str) -> Vec<String> {
+        rank_completion_items(items, query)
+            .into_iter()
+            .map(|index| items[index].label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn completion_filter_text_prefers_a_real_server_supplied_filter_text() {
+        let mut with_filter = item("new(…)");
+        with_filter.filter_text = Some("new".to_string());
+        assert_eq!(completion_filter_text(&with_filter), "new");
+    }
+
+    #[test]
+    fn completion_filter_text_falls_back_to_the_label_when_absent_or_empty() {
+        assert_eq!(completion_filter_text(&item("version")), "version");
+        let mut blank = item("version");
+        blank.filter_text = Some(String::new());
+        assert_eq!(
+            completion_filter_text(&blank),
+            "version",
+            "the spec's own \"when falsy the label is used\" fallback must cover an empty string, \
+             not just a missing field"
+        );
+    }
+
+    #[test]
+    fn an_empty_query_matches_every_item_and_preserves_the_servers_own_order() {
+        let items = [item("zeta"), item("alpha"), item("version")];
+        assert_eq!(ranked_labels(&items, ""), ["zeta", "alpha", "version"]);
+    }
+
+    #[test]
+    fn a_real_typed_prefix_narrows_the_list_and_excludes_an_irrelevant_item() {
+        let items = [
+            item("version"),
+            item("verify"),
+            item("unwrap"),
+            item("clone"),
+        ];
+        assert_eq!(
+            ranked_labels(&items, "ver"),
+            ["version", "verify"],
+            "`unwrap`/`clone` carry no real `ver` match at all and must be filtered out entirely"
+        );
+    }
+
+    #[test]
+    fn matching_is_a_real_subsequence_match_not_only_a_contiguous_one() {
+        // "vrs" is genuinely non-contiguous inside "version" (v_0, r_2, s_3) - a plain
+        // substring/prefix matcher would reject it outright.
+        let items = [item("version"), item("verify")];
+        assert_eq!(
+            ranked_labels(&items, "vrs"),
+            ["version"],
+            "a real fuzzy client must keep `version` for `vrs` and still drop `verify`, which \
+             has no `s` at all"
+        );
+    }
+
+    #[test]
+    fn a_real_word_boundary_subsequence_match_is_kept() {
+        let items = [item("read_to_string"), item("replace")];
+        assert_eq!(
+            ranked_labels(&items, "rts"),
+            ["read_to_string"],
+            "snake_case initials are a real, everyday fuzzy query"
+        );
+    }
+
+    #[test]
+    fn a_real_prefix_match_outranks_a_substring_match_which_outranks_a_scattered_one() {
+        let items = [
+            // Deliberately server-ordered worst-first, so only real re-ranking can fix it.
+            item("vector_of_readers"), // scattered subsequence
+            item("has_version"),       // contiguous, but not at the start
+            item("version"),           // real prefix
+        ];
+        assert_eq!(
+            ranked_labels(&items, "ver"),
+            ["version", "has_version", "vector_of_readers"]
+        );
+    }
+
+    #[test]
+    fn ranking_prefers_the_earlier_and_tighter_of_two_real_matches_of_the_same_tier() {
+        let items = [item("xxxxver"), item("xver")];
+        assert_eq!(ranked_labels(&items, "ver"), ["xver", "xxxxver"]);
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_but_an_exact_case_match_ranks_first() {
+        let items = [item("Version"), item("version")];
+        assert_eq!(ranked_labels(&items, "ver"), ["version", "Version"]);
+        assert_eq!(ranked_labels(&items, "Ver"), ["Version", "version"]);
+    }
+
+    #[test]
+    fn ranking_matches_against_the_real_filter_text_not_the_label_when_the_server_supplied_one() {
+        let mut item_with_filter = item("⚡ insert version macro");
+        item_with_filter.filter_text = Some("version".to_string());
+        let items = [item_with_filter, item("unrelated")];
+        assert_eq!(
+            ranked_labels(&items, "ver"),
+            ["⚡ insert version macro"],
+            "the server's own `filterText` must be what the typed prefix is matched against"
+        );
+    }
+
+    #[test]
+    fn a_query_matching_nothing_ranks_nothing() {
+        let items = [item("version"), item("verify")];
+        assert!(rank_completion_items(&items, "zzz").is_empty());
+    }
+
+    #[test]
+    fn a_query_longer_than_a_candidate_never_matches_it() {
+        assert_eq!(completion_match("ab", "abc"), None);
     }
 
     #[test]
