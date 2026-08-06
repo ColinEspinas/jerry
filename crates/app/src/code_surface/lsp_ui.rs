@@ -1041,64 +1041,89 @@ fn render_hover_card_content(
 /// trait Into<T>: Sized` with real per-token colors - keyword purple, type gold - not one flat
 /// heading color).
 ///
-/// Runs `signature` through [`code_view::highlight_block`] as a single-line, standalone fragment,
-/// the exact same "highlight a fragment on its own, not as part of a real open file" recipe the
-/// Diff and Merge views already use for a hunk/conflict side (see that function's own docs), then
-/// walks the resulting runs the same way [`crate::code_surface::file_view::render_file_view_line`]
+/// Runs `signature` through [`code_view::highlight_block`] as a standalone fragment, the exact
+/// same "highlight a fragment on its own, not as part of a real open file" recipe the Diff and
+/// Merge views already use for a hunk/conflict side (see that function's own docs), then walks
+/// the resulting runs the same way [`crate::code_surface::file_view::render_file_view_line`]
 /// walks a real code row's `line.runs`: one `div` per run, colored via
 /// [`code_view::color_for_kind`]. `extension` comes from the active file
 /// ([`AdeApp::render_hover_card`]), so a Rust hover highlights as Rust, a TypeScript hover as
 /// TypeScript, and so on - never a guessed language.
+///
+/// A genuinely multi-line `signature` (a real, common shape - e.g. TypeScript pretty-printing a
+/// wide utility/generic type like `Pick<{\n    a: string;\n    b: number;\n}, "a">` across several
+/// real lines) gets one real stacked row per source line, each independently `flex_wrap`-ing its
+/// own tokens - not one `flex_wrap` row for the whole thing, which has no way to represent a real
+/// line break at all (wrapping there is purely a width overflow, not a semantic newline).
 ///
 /// `extension: None` (no active file extension resolved, which shouldn't happen in practice since
 /// a hover only exists for a file that's open) still renders correctly: `highlight_block` returns
 /// the text as one unhighlighted [`code_view::HighlightKind::Text`] run rather than nothing, so
 /// the signature is never silently dropped.
 fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::AnyElement {
-    let mut row = div()
+    let mut column = div()
         .flex()
-        .flex_wrap()
-        // See the header wrapper's own `.max_w(HOVER_CARD_MAX_WIDTH)` doc comment in
-        // `render_hover_card_content` for why this needs a real, hard max-width (not just
-        // `.w_full()`) to make `flex_wrap()` actually reflow. This row sits inside that header's
-        // own `HOVER_CARD_HORIZONTAL_PADDING` on both sides, so its own bound is narrower by
-        // twice that.
-        .max_w(HOVER_CARD_MAX_WIDTH - HOVER_CARD_HORIZONTAL_PADDING - HOVER_CARD_HORIZONTAL_PADDING)
+        .flex_col()
         .font(font(theme::font::MONO))
         .text_size(px(11.5));
-    for (run_index, (run_text, kind)) in
-        highlighted_signature_runs(signature, extension).into_iter().enumerate()
-    {
-        row = row.child(
-            div()
-                .id(("hover-signature-token", run_index))
-                // Lets a real test measure this real token's own painted bounds (`debug_bounds`
-                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
-                // `debug_selector` in this crate.
-                .debug_selector(move || format!("hover-signature-token-{run_index}"))
-                .text_color(code_view::color_for_kind(kind))
-                .child(run_text),
-        );
+    let mut run_index = 0usize;
+    for line_runs in highlighted_signature_lines(signature, extension) {
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            // See the header wrapper's own `.max_w(HOVER_CARD_MAX_WIDTH)` doc comment in
+            // `render_hover_card_content` for why this needs a real, hard max-width (not just
+            // `.w_full()`) to make `flex_wrap()` actually reflow. This row sits inside that
+            // header's own `HOVER_CARD_HORIZONTAL_PADDING` on both sides, so its own bound is
+            // narrower by twice that.
+            .max_w(
+                HOVER_CARD_MAX_WIDTH - HOVER_CARD_HORIZONTAL_PADDING - HOVER_CARD_HORIZONTAL_PADDING,
+            );
+        for (run_text, kind) in line_runs {
+            // A running index across every real line, not reset per line - a single-line
+            // signature (still the overwhelming common case) numbers identically to before this
+            // fix, so an existing `hover-signature-token-N` selector in a test keeps meaning the
+            // same real token it always did.
+            let index = run_index;
+            run_index += 1;
+            row = row.child(
+                div()
+                    .id(("hover-signature-token", index))
+                    // Lets a real test measure this real token's own painted bounds
+                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                    // matching every other `debug_selector` in this crate.
+                    .debug_selector(move || format!("hover-signature-token-{index}"))
+                    .text_color(code_view::color_for_kind(kind))
+                    .child(run_text),
+            );
+        }
+        column = column.child(row);
     }
-    row.into_any_element()
+    column.into_any_element()
 }
 
 /// The pure half of [`render_hover_signature`] - just the `signature` -> colored-run computation,
 /// split out so it's directly `#[test]`-able without a `gpui::Window`/`TestAppContext` (mirroring
-/// how `code_view::highlight_block` itself is tested at the pure level, not by painting).
-fn highlighted_signature_runs(
+/// how `code_view::highlight_block` itself is tested at the pure level, not by painting). One
+/// inner `Vec` per real source line in `signature` - see [`render_hover_signature`]'s own docs for
+/// why a multi-line signature can't be flattened into one.
+///
+/// Before this, the single `RenderedLine` `.next()` picked off `highlight_block`'s own real,
+/// correct multi-line output silently discarded every line past the first - a real, reported bug:
+/// a pretty-printed multi-line TypeScript type (e.g. `Pick<{...}>`) rendered as just its own first
+/// line, with everything after the first real newline gone.
+fn highlighted_signature_lines(
     signature: &str,
     extension: Option<&str>,
-) -> Vec<(gpui::SharedString, code_view::HighlightKind)> {
+) -> Vec<Vec<(gpui::SharedString, code_view::HighlightKind)>> {
     code_view::highlight_block(
         std::iter::once(signature),
         extension,
         code_view::HighlightOptions::default(),
     )
     .into_iter()
-    .next()
     .map(|line| line.runs)
-    .unwrap_or_default()
+    .collect()
 }
 
 /// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
@@ -3304,7 +3329,9 @@ mod hover_signature_and_diagnostic_chrome_tests {
     /// as one flat-colored string, which this would see as a single run.
     #[test]
     fn a_real_rust_signature_is_split_into_real_distinctly_kinded_runs() {
-        let runs = highlighted_signature_runs("pub fn where_eq(col: &str) -> Self", Some("rs"));
+        let lines = highlighted_signature_lines("pub fn where_eq(col: &str) -> Self", Some("rs"));
+        assert_eq!(lines.len(), 1, "a single-line signature must yield exactly one line group");
+        let runs = &lines[0];
         assert!(
             runs.len() > 1,
             "a real signature with a keyword, an identifier and a type must yield more than one \
@@ -3333,10 +3360,53 @@ mod hover_signature_and_diagnostic_chrome_tests {
     /// silently dropping the signature) still returns the full text, as a single unhighlighted run.
     #[test]
     fn no_extension_still_returns_the_real_full_text_as_one_unhighlighted_run() {
-        let runs = highlighted_signature_runs("let x: i32", None);
+        let lines = highlighted_signature_lines("let x: i32", None);
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let runs = &lines[0];
         assert_eq!(runs.len(), 1, "got: {runs:?}");
         assert_eq!(runs[0].0.as_ref(), "let x: i32");
         assert_eq!(runs[0].1, code_view::HighlightKind::Text);
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely multi-line signature -
+    /// the real shape `typescript-language-server` produces for a wide utility/generic type like
+    /// `Pick<{ a: string; b: number }, "a">` once it pretty-prints across several lines - used to
+    /// render as just its own first line, with every real line after the first newline silently
+    /// dropped (`highlighted_signature_lines`'s predecessor took only `highlight_block`'s first
+    /// `RenderedLine`). Every real line's own text must now survive intact.
+    #[test]
+    fn a_genuinely_multi_line_signature_keeps_every_real_line_not_just_the_first() {
+        let signature = "const x: Pick<{\n    a: string;\n    b: number;\n}, \"a\">";
+        let lines = highlighted_signature_lines(signature, Some("ts"));
+        assert_eq!(
+            lines.len(),
+            4,
+            "a real 4-line signature must yield exactly 4 line groups, got: {lines:?}"
+        );
+        let joined_text = |line: &Vec<(gpui::SharedString, code_view::HighlightKind)>| {
+            line.iter().map(|(text, _)| text.as_ref()).collect::<String>()
+        };
+        assert!(
+            joined_text(&lines[0]).contains("Pick"),
+            "the first real line must still contain its own real text, got: {:?}",
+            joined_text(&lines[0])
+        );
+        assert!(
+            joined_text(&lines[1]).contains("a: string"),
+            "the real second line - past the first newline the old bug truncated at - must \
+             survive, got: {:?}",
+            joined_text(&lines[1])
+        );
+        assert!(
+            joined_text(&lines[2]).contains("b: number"),
+            "got: {:?}",
+            joined_text(&lines[2])
+        );
+        assert!(
+            joined_text(&lines[3]).contains("\"a\""),
+            "got: {:?}",
+            joined_text(&lines[3])
+        );
     }
 
     /// The Diagnostic popover's own chrome must be the design's real red-tinted card, not a copy

@@ -1019,29 +1019,43 @@ fn render_completion_detail_pane(
         .map(|detail| detail.trim())
         .filter(|detail| !detail.is_empty())
         .unwrap_or(item.label.as_str());
-    let signature_runs = code_view::highlight_block(
+    // One real stacked row per source line in `signature_text`, not a single `flex_wrap` row for
+    // the whole thing - a genuinely multi-line signature (e.g. typescript-language-server pretty-
+    // printing a wide utility/generic type like `Pick<{...}>` across several real lines) has no
+    // way to show a real line break inside one `flex_wrap` row, since wrapping there is a width
+    // overflow, not a semantic newline. Mirrors `crate::code_surface::lsp_ui::render_hover_signature`'s
+    // own fix for the identical bug: consuming only `highlight_block`'s first `RenderedLine` used
+    // to silently drop every real line past the first.
+    let signature_lines = code_view::highlight_block(
         std::iter::once(signature_text),
         extension,
         code_view::HighlightOptions::default(),
-    )
-    .into_iter()
-    .next()
-    .map(|line| line.runs)
-    .unwrap_or_default();
-    let mut signature_row = gpui::div()
+    );
+    let mut signature_column = gpui::div()
         .flex()
-        .flex_wrap()
+        .flex_col()
         .font(gpui::font(theme::font::MONO))
         .text_size(gpui::px(11.0));
-    for (index, (run_text, kind)) in signature_runs.into_iter().enumerate() {
-        signature_row = signature_row.child(
-            gpui::div()
-                .id(("completion-detail-signature-token", index))
-                .text_color(code_view::color_for_kind(kind))
-                .child(run_text),
-        );
+    let mut run_index = 0usize;
+    for line in signature_lines {
+        let mut signature_row = gpui::div().flex().flex_wrap();
+        for (run_text, kind) in line.runs {
+            let index = run_index;
+            run_index += 1;
+            signature_row = signature_row.child(
+                gpui::div()
+                    .id(("completion-detail-signature-token", index))
+                    // Lets a real test measure this real token's own painted bounds
+                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                    // matching every other `debug_selector` in this crate.
+                    .debug_selector(move || format!("completion-detail-signature-token-{index}"))
+                    .text_color(code_view::color_for_kind(kind))
+                    .child(run_text),
+            );
+        }
+        signature_column = signature_column.child(signature_row);
     }
-    pane = pane.child(signature_row);
+    pane = pane.child(signature_column);
 
     if let Some(doc) = completion_view::completion_documentation_text(item) {
         pane = pane.child(
@@ -1868,6 +1882,39 @@ mod completion_detail_pane_tests {
             cx.debug_bounds("completions-footer-hints").is_none(),
             "a real Loading popup must never paint the real footer hint row either - it belongs \
              to the Ready list, not the loading message"
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely multi-line `detail` -
+    /// the real shape `typescript-language-server` produces for a wide utility/generic type like
+    /// `Pick<{ a: string; b: number }, "a">` once it pretty-prints across several lines - used to
+    /// render as just its own first line, with every real line after the first newline silently
+    /// dropped (the old code took only `highlight_block`'s first `RenderedLine`). A token from a
+    /// real *second* line must still paint.
+    #[gpui::test]
+    fn a_genuinely_multi_line_detail_keeps_every_real_line_not_just_the_first(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some("const x: Pick<{\n    a: string;\n    b: number;\n}, \"a\">".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completion-detail-signature-token-0").is_some(),
+            "sanity check: the first real line's own first token must have painted"
+        );
+        // The first real line ("const x: Pick<{") tokenizes into exactly 8 runs (indices 0..7),
+        // so index 9 - the real "a" identifier in "a: string;" - is unambiguously on the real
+        // second line, past the exact boundary the old `.next()` truncation dropped everything
+        // after.
+        assert!(
+            cx.debug_bounds("completion-detail-signature-token-9").is_some(),
+            "a token from a real line past the first newline (\"a\" in \"a: string;\", the real \
+             second line) must still paint, not have been silently dropped with the rest of the \
+             signature past the first line"
         );
     }
 }
