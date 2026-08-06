@@ -135,6 +135,46 @@ pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Opt
     (item.label.clone(), detail)
 }
 
+/// A completion item's real doc prose, for the detail pane's own body text
+/// (`design_handoff_jerry_ade/revision 3/README.md`: "Right 300: signature in mono, doc in 11px
+/// Plex Sans #7d848b, module path footer" - the Completions popup's own doc/module-path pane,
+/// mirroring `crate::lsp::hover::HoverRenderModel::doc` exactly). `None` for an item with no real
+/// documentation - an honest "nothing to show", never a fabricated empty string.
+///
+/// Reuses [`crate::lsp::hover::degrade_markdown_to_plain_text`] for a genuinely `Markdown`-kinded
+/// `MarkupContent` - the same real fenced-code/heading/bold-stripping pass that module's own docs
+/// describe, not a second, independently-maintained copy of it. `Documentation::String` (the
+/// LSP's older, deprecated shape) is passed through unmodified, same as that module's own
+/// `MarkedString::String` handling.
+pub fn completion_documentation_text(item: &lsp_types::CompletionItem) -> Option<String> {
+    let text = match item.documentation.as_ref()? {
+        lsp_types::Documentation::String(text) => text.clone(),
+        lsp_types::Documentation::MarkupContent(markup) => match markup.kind {
+            lsp_types::MarkupKind::Markdown => {
+                crate::lsp::hover::degrade_markdown_to_plain_text(&markup.value)
+            }
+            lsp_types::MarkupKind::PlainText => markup.value.clone(),
+        },
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// A completion item's real fully-qualified path/module, for the detail pane's own footer
+/// (`README.md`: "module path footer", mirroring `crate::lsp::hover::HoverRenderModel::module_path`).
+/// `CompletionItemLabelDetails::description` is the LSP spec's own documented slot for exactly
+/// this ("fully qualified names or file path"), which real servers (rust-analyzer's
+/// `use`-path-qualified completions, for one) populate. `None` when the server didn't send one -
+/// never a guessed or re-derived path.
+pub fn completion_module_path(item: &lsp_types::CompletionItem) -> Option<String> {
+    item.label_details
+        .as_ref()?
+        .description
+        .as_ref()
+        .map(|description| description.trim().to_string())
+        .filter(|description| !description.is_empty())
+}
+
 /// The Completions popup's real kind-badge category (design:
 /// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `f`/`v`/`t` kind badges, lines
 /// ~1792-1793 and ~467-473) - a coarse grouping of the much finer-grained real
@@ -741,5 +781,107 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(completion_item_display(&no_detail_item).1, None);
+    }
+
+    #[test]
+    fn completion_documentation_text_reads_a_real_plain_string_shape() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            documentation: Some(lsp_types::Documentation::String(
+                "Appends a given string slice.".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_documentation_text(&item).as_deref(),
+            Some("Appends a given string slice.")
+        );
+    }
+
+    #[test]
+    fn completion_documentation_text_degrades_a_real_markdown_markup_content() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            documentation: Some(lsp_types::Documentation::MarkupContent(
+                lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value: "Appends a **given** string slice.".to_string(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_documentation_text(&item).as_deref(),
+            Some("Appends a given string slice.")
+        );
+    }
+
+    #[test]
+    fn completion_documentation_text_passes_a_real_plain_text_markup_content_through_unmodified() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            documentation: Some(lsp_types::Documentation::MarkupContent(
+                lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::PlainText,
+                    value: "`not markdown` stays as-is".to_string(),
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_documentation_text(&item).as_deref(),
+            Some("`not markdown` stays as-is")
+        );
+    }
+
+    #[test]
+    fn completion_documentation_text_is_none_for_a_real_absent_or_blank_documentation() {
+        let no_doc = lsp_types::CompletionItem {
+            label: "foo".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(completion_documentation_text(&no_doc), None);
+
+        let blank_doc = lsp_types::CompletionItem {
+            label: "foo".to_string(),
+            documentation: Some(lsp_types::Documentation::String("   ".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(completion_documentation_text(&blank_doc), None);
+    }
+
+    #[test]
+    fn completion_module_path_reads_a_real_label_details_description() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("(&mut self, &str)".to_string()),
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_module_path(&item).as_deref(),
+            Some("alloc::string::String")
+        );
+    }
+
+    #[test]
+    fn completion_module_path_is_none_without_real_label_details_or_a_real_description() {
+        let no_label_details = lsp_types::CompletionItem {
+            label: "foo".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(completion_module_path(&no_label_details), None);
+
+        let no_description = lsp_types::CompletionItem {
+            label: "foo".to_string(),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("()".to_string()),
+                description: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(completion_module_path(&no_description), None);
     }
 }
