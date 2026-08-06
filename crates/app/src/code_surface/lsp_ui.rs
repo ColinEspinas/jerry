@@ -474,13 +474,20 @@ impl AdeApp {
     ///
     /// ## The one-at-a-time priority order
     ///
-    /// Completions first, then Hover, then Diagnostic. Both of the first two are *requested*: the
-    /// user typed, or rested the pointer on a symbol, and is waiting for that specific answer.
-    /// The Diagnostic card is ambient - it follows the caret with nothing asked for - so it is the
-    /// one that yields. (It also anchors to the same row Completions does, so without an order
-    /// they would paint on top of each other.)
+    /// Completions always wins outright - the user typed, and is waiting for that specific
+    /// answer. Hover and Diagnostic are more nuanced: both are ambient in the general case, but
+    /// hovering *directly over the offending span itself* is a real, deliberate ask for the
+    /// diagnostic, not for whatever generic symbol info Hover would otherwise show there - so the
+    /// diagnostic card wins that one specific case, not Hover, even though Hover is normally the
+    /// more "requested" of the two. Two real, live-reproduced bugs motivated this: hovering
+    /// directly over a real error span could show a genuinely empty `HoverStatus::Ready(None)`
+    /// card ("no symbol information here") - real, honest, but useless right where the user is
+    /// most likely looking for the diagnostic - and a real hover response that overlaps a real
+    /// diagnostic could show mostly-duplicate text right next to (previously, *instead of*) the
+    /// diagnostic's own message. Elsewhere on the same line - a different symbol the diagnostic
+    /// doesn't cover - Hover keeps its normal priority, the same as it always did.
     pub(crate) fn render_diagnostic_card(&self) -> Option<gpui::AnyElement> {
-        if self.completions.is_some() || self.hover.is_some() {
+        if self.completions.is_some() {
             return None;
         }
         let line_number = self.code_cursor?;
@@ -497,6 +504,9 @@ impl AdeApp {
         let diagnostic = diagnostics
             .iter()
             .find(|candidate| candidate.severity == worst)?;
+        if self.hover.is_some() && !self.hover_targets_a_real_diagnostic() {
+            return None;
+        }
         let (row_bounds, shaped) = self.file_view_row_layout.get(&line_number)?;
 
         let row_top = row_bounds.top();
@@ -521,6 +531,24 @@ impl AdeApp {
         let anchor_x = row_bounds.left() + shaped.x_for_index(diagnostic.byte_range.start);
 
         Some(render_diagnostic_card_content(diagnostic, anchor_x, top))
+    }
+
+    /// Whether [`Self::hover`]'s own hovered span genuinely overlaps a real diagnostic on the
+    /// same line - the one real condition that flips the usual Hover-over-Diagnostic priority
+    /// (see [`Self::render_diagnostic_card`]'s own docs for why). Shared between that method and
+    /// [`Self::render_hover_card`] so both sides of the swap agree on the exact same real
+    /// overlap, rather than two independently-computed checks that could disagree at the edges.
+    fn hover_targets_a_real_diagnostic(&self) -> bool {
+        let Some(hover) = self.hover.as_ref() else {
+            return false;
+        };
+        let Some(diagnostics) = self.file_view_diagnostics.get(&hover.line_number) else {
+            return false;
+        };
+        diagnostics.iter().any(|diagnostic| {
+            hover.byte_range.start < diagnostic.byte_range.end
+                && diagnostic.byte_range.start < hover.byte_range.end
+        })
     }
 }
 
@@ -698,14 +726,22 @@ impl AdeApp {
     /// real layout entry is the only correct anchor, not the caret row's.
     ///
     /// `None` whenever there's nothing real to anchor to: no [`Self::hover`] entry, the entry
-    /// belongs to a file that isn't the one currently on screen, or the hovered row's own real
+    /// belongs to a file that isn't the one currently on screen, the hovered row's own real
     /// layout isn't in [`Self::file_view_row_layout`] right now (e.g. scrolled out of view since
     /// the pointer landed) - the same honest "degrade to nothing rather than paint at a guessed
-    /// position" discipline [`Self::render_completions_popover`] already established.
+    /// position" discipline [`Self::render_completions_popover`] already established - or the
+    /// hovered span genuinely overlaps a real diagnostic (see [`Self::render_diagnostic_card`]'s
+    /// own docs for why that one real case flips the usual priority): a real, live-reproduced bug
+    /// otherwise let a genuinely empty `HoverStatus::Ready(None)` ("no symbol information here")
+    /// paint right over a real, useful diagnostic, and let a real hover response whose own text
+    /// happened to overlap the diagnostic's paint alongside it, reading as duplicated.
     pub(crate) fn render_hover_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let hover = self.hover.as_ref()?;
         let active_relative = self.active_editable_path()?;
         if hover.path != self.file_tree_root.join(&active_relative) {
+            return None;
+        }
+        if self.hover_targets_a_real_diagnostic() {
             return None;
         }
         let (row_bounds, shaped) = self.file_view_row_layout.get(&hover.line_number)?;
@@ -2791,6 +2827,134 @@ mod diagnostic_popover_tests {
             cx.debug_bounds("diagnostic-card").is_some(),
             "and the ambient Diagnostic card comes back once the requested popup it yielded to \
              has gone"
+        );
+    }
+
+    /// Direct regression coverage for the real, live-reported bug: hovering *directly over the
+    /// offending span itself* used to always show Hover's own card, even when that card had
+    /// genuinely nothing to say (`HoverStatus::Ready(None)`, "no symbol information here") - a
+    /// real, useless popup shown right where the user was almost certainly looking for the real
+    /// diagnostic instead. The real diagnostic card must win this one specific case now.
+    #[gpui::test]
+    fn hovering_directly_over_the_diagnostic_span_shows_the_diagnostic_not_an_empty_hover(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        // `"fn alpha() {}"` - `alpha` spans columns 3..8. The real diagnostic is published at
+        // exactly that span, and the real hover is seeded to genuinely overlap it.
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_at_and_wait(&client, &uri.to_string(), "cannot find value `alpha`", 3, 8);
+        set_caret(&app, cx, 1);
+        render_twice(&app, cx);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "sanity check: the caret is on the real offending line, so the card must be up \
+             before any hover is involved"
+        );
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 3..8,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+                status: HoverStatus::Ready(None),
+            });
+            cx.notify();
+        });
+        render_twice(&app, cx);
+
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "a real diagnostic card must keep showing while the pointer hovers its own real \
+             offending span, even though a real hover entry now exists for that exact position"
+        );
+        assert!(
+            cx.debug_bounds("hover-card").is_none(),
+            "a genuinely empty hover result (\"no symbol information here\") for the diagnostic's \
+             own span must never paint over the real, useful diagnostic card"
+        );
+    }
+
+    /// The other half: even a real, *non-empty* hover result must still yield to the diagnostic
+    /// card when it's genuinely describing the same span a diagnostic covers - real servers
+    /// sometimes do have something to say about an erroring expression (e.g. its inferred type),
+    /// and showing that instead of the diagnostic reads as the diagnostic's own message being
+    /// silently replaced by unrelated-looking text, which is exactly the second real complaint
+    /// this fix addresses.
+    #[gpui::test]
+    fn hovering_directly_over_the_diagnostic_span_shows_the_diagnostic_over_real_hover_content_too(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_at_and_wait(&client, &uri.to_string(), "cannot find value `alpha`", 3, 8);
+        set_caret(&app, cx, 1);
+        render_twice(&app, cx);
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 3..8,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn alpha()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        render_twice(&app, cx);
+
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "the real diagnostic card must win over a real, non-empty hover result too, once \
+             that hover genuinely overlaps the diagnostic's own span"
+        );
+        assert!(
+            cx.debug_bounds("hover-card").is_none(),
+            "and the real hover card must not paint alongside it, or the two would read as the \
+             same information duplicated"
         );
     }
 }
