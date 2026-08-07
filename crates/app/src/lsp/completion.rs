@@ -907,9 +907,16 @@ fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String,
 /// *Which* spelling survives is deliberately not decided here: [`rank_completion_items`] keeps the
 /// first row of each group, so it is whichever the server itself ranked first. In a live dump that
 /// is `node:fs` ahead of `fs` - the form Node's own documentation recommends, and the one
-/// `unicorn/prefer-node-protocol` enforces - but if a project configures
-/// `importModuleSpecifierPreference` the server's order changes and this follows it, rather than
-/// this app having an opinion of its own to be wrong about.
+/// `unicorn/prefer-node-protocol` enforces.
+///
+/// There is, checked rather than assumed, **no** setting anywhere that changes that order.
+/// TypeScript 5.9's own `UserPreferences` has no `node:`-protocol option at all, and
+/// `importModuleSpecifierPreference` - which sounds like the one - only chooses between
+/// `"shortest" | "project-relative" | "relative" | "non-relative"`, i.e. relative-path style. So
+/// this is the server's own fixed preference, and a project that wants the bare `fs` spelling has
+/// to suppress the other with `autoImportSpecifierExcludeRegexes` (an
+/// `initializationOptions.preferences` field this app does not forward yet) rather than reorder
+/// them.
 ///
 /// Nothing else is folded, on direct instruction after a broader version was tried and rejected.
 /// `fs` and `fs/promises` are two rows: same package, but the callback API and the promise API are
