@@ -852,31 +852,30 @@ pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -
 }
 
 /// What a completion row actually offers a user: this identifier, of this kind, spliced in as this
-/// text, out of this *package*. Two rows with equal keys put the same word in the file and would
-/// import it from the same package - so the only thing separating them is which of that package's
-/// entry points to use, which belongs on one row's import source rather than on a second row of an
-/// already-crowded list.
+/// text, out of this module. Two rows with equal keys put the same word in the file *and* import it
+/// from the same place - so there is genuinely nothing to choose between them, and the second is
+/// noise on an already-crowded list.
 ///
-/// This is the second, blunter half of the live-reported "the autocomplete has multiple
-/// suggestions for the same things", and the half the narrower
-/// [`interchangeable_completion_key`] deliberately does not touch. Typing `app` in a real Vue +
-/// `@types/node` project returns `appendFile` from `node:fs`, `fs` **and** `fs/promises`,
-/// `appendFileSync` from `node:fs` and `fs`, `asyncWrapProviders` from `async_hooks` and
-/// `node:async_hooks` - each a genuinely different auto-import, each inserting the identical word
-/// at the identical position, and together most of the list.
+/// This is the blunter half of the live-reported "the autocomplete has multiple suggestions for the
+/// same things", and the half the narrower [`interchangeable_completion_key`] does not touch.
+/// Typing `app` in a real Vue + `@types/node` project returns `appendFile` from `node:fs`, `fs`,
+/// `fs/promises` **and** `node:fs/promises`, `appendFileSync` from `node:fs` and `fs`,
+/// `asyncWrapProviders` from `async_hooks` and `node:async_hooks` - nine rows for five real
+/// choices, because Node ships every one of its modules under two spellings.
 ///
-/// The package - not just the label - is in the key because an earlier version of this left it out
-/// and collapsed too much (live-reported: "some things should not have counted as duplicates").
-/// Two same-named exports of two *unrelated* packages are two genuinely different symbols, and
-/// merging them would silently pick one: [`import_source_package`] is what keeps `Ref` from `vue`
-/// and `Ref` from somewhere else apart while still folding `fs`, `node:fs` and `fs/promises`
-/// together.
+/// The module is in the key, canonicalized only by [`canonical_import_source`], and this is
+/// deliberately the *narrowest* rule that removes the reported repeats. Two earlier versions were
+/// both too broad and both live-corrected:
 ///
-/// The trade this still makes, stated plainly rather than buried: within one package the popup no
-/// longer offers a *choice* of entry point - `fs` and `fs/promises` are one row. The row that
-/// survives is the one this ranking put first, which with `sortText` honored is the one the server
-/// itself recommends, and accepting it applies that entry point's own real `additionalTextEdits`,
-/// so the import written is a real one - just not one the user got to pick between.
+/// - Keyed on label/kind/text alone, it merged two same-named exports of two unrelated packages -
+///   a real hazard in a Vue project, where plenty of packages export a `Ref` or a `Component`, and
+///   the survivor would have imported from whichever ranked first.
+/// - Keyed on the *package*, it merged `fs` with `fs/promises` (the callback API and the promise
+///   API - genuinely different things a user picks between) and `std::io::Result` with
+///   `std::fmt::Result` (three different `use` lines).
+///
+/// So nothing is merged across modules any more. Only the two spellings of one module fold
+/// together, which is the only case where the two rows would have written the same import.
 fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String, Option<String>) {
     let inserted = match item.text_edit.as_ref() {
         Some(lsp_types::CompletionTextEdit::Edit(edit)) => edit.new_text.clone(),
@@ -894,32 +893,32 @@ fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String,
         inserted,
         completion_import_source(item)
             .as_deref()
-            .map(import_source_package),
+            .map(canonical_import_source),
     )
 }
 
-/// The *package* an import source names, with the entry point inside it dropped - what decides
-/// whether two same-named candidates are the same symbol reached two ways or two different symbols
-/// that happen to share a name. See [`same_choice_key`].
+/// One module, spelled one way: the `node:` prefix dropped, and nothing else touched.
 ///
-/// Two real reductions, both drawn from live dumps rather than from reasoning about specifiers:
+/// Node ships every builtin under two specifiers, and `typescript-language-server` offers both as
+/// separate candidates for the identical export - `appendFile` from `node:fs` and from `fs`,
+/// `appendFileSync` from both, `asyncWrapProviders` from `async_hooks` and `node:async_hooks`.
+/// Accepting either writes an import of the same module, so they are one row.
 ///
-/// - A leading `node:` is dropped. `typescript-language-server` offers `fs` and `node:fs` as
-///   separate candidates for the identical export of the identical package.
-/// - Everything from the first separator on is dropped. `fs/promises` is the same package as `fs`;
-///   `os.path` is the same package as `os` in a live `pyright-langserver` dump; `std::io::Result`,
-///   `std::fmt::Result` and `std::thread::Result` are all `std` in a live `rust-analyzer` one.
+/// *Which* spelling survives is deliberately not decided here: [`rank_completion_items`] keeps the
+/// first row of each group, so it is whichever the server itself ranked first. In a live dump that
+/// is `node:fs` ahead of `fs` - the form Node's own documentation recommends, and the one
+/// `unicorn/prefer-node-protocol` enforces - but if a project configures
+/// `importModuleSpecifierPreference` the server's order changes and this follows it, rather than
+/// this app having an opinion of its own to be wrong about.
 ///
-/// Deliberately *not* reduced past that: `typing` and `typing_extensions` stay different (they
-/// share no separator-delimited segment), and so do `vue` and any other package exporting the same
-/// name - which is exactly what the over-collapse report was about.
-fn import_source_package(source: &str) -> String {
-    let source = source.strip_prefix("node:").unwrap_or(source);
-    let end = source
-        .find(['/', '.'])
-        .or_else(|| source.find("::"))
-        .unwrap_or(source.len());
-    source[..end].to_string()
+/// Nothing else is folded, on direct instruction after a broader version was tried and rejected.
+/// `fs` and `fs/promises` are two rows: same package, but the callback API and the promise API are
+/// a real choice. `std::io::Result`, `std::fmt::Result` and `std::thread::Result` are three rows:
+/// three different `use` lines. `os` and `os.path`, `typing` and `typing_extensions`, `vue` and
+/// anything else exporting the same name - all kept apart. The row itself names its module (see
+/// [`completion_import_source`]), so telling them apart costs the user nothing.
+fn canonical_import_source(source: &str) -> String {
+    source.strip_prefix("node:").unwrap_or(source).to_string()
 }
 
 /// Everything about a completion item that a user can either *see* on its row or *get* by
@@ -1262,14 +1261,11 @@ mod tests {
     /// `"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`) and
     /// splice the identical `Result` over the identical range.
     ///
-    /// An earlier version of this test asserted the opposite - that all three keep their own rows,
-    /// on the reasoning that three imports are three real choices. They are, and the row that
-    /// survives now names its own (`completion_import_source`). But three rows reading `Result`
-    /// is the thing that was actually reported, twice, and reasoning about which is *technically*
-    /// a distinct candidate is not worth a list a user cannot read. See [`same_choice_key`] for
-    /// the trade this makes.
+    /// These are three real choices and keep three rows - directly instructed, after a broader
+    /// version of [`same_choice_key`] merged them by package. Each writes a different `use` line,
+    /// and each row names which (`completion_import_source`), so they are told apart on sight.
     #[test]
-    fn several_import_candidates_for_one_name_collapse_to_a_single_row() {
+    fn several_import_candidates_for_one_name_each_keep_their_row() {
         let import_candidate = |path: &str| lsp_types::CompletionItem {
             label: "Result".to_string(),
             kind: Some(lsp_types::CompletionItemKind::STRUCT),
@@ -1287,9 +1283,9 @@ mod tests {
         ];
         assert_eq!(
             rank_completion_items(&items, "Result"),
-            vec![0],
-            "one name the user can accept is one row; the surviving row is the one this ranking \
-             put first, and it still says which `use` it would add"
+            vec![0, 1, 2],
+            "three different `use` statements are three real choices - collapsing them would hide \
+             two and add whichever import ranked first"
         );
     }
 
@@ -1830,16 +1826,18 @@ mod tests {
             vec![
                 "app",
                 "App",
-                "appendFile",
+                "appendFile", // from `fs`, folding in the `node:fs` spelling of it
+                "appendFile", // from `fs/promises` - a different module, a real choice
                 "appendFileSync",
                 "createApp",
                 "SearchApplication",
                 "asyncWrapProviders",
                 "AudioParamMap",
             ],
-            "the two symbols the user fully typed must lead; each repeated auto-import must be \
-             one row, not four; and nothing the server ranked lowest may sit above what it ranked \
-             highest"
+            "the two symbols the user fully typed must lead; nine rows of auto-import must come \
+             down to the five real choices behind them - never fewer, so `fs/promises` keeps its \
+             own row against `fs` - and nothing the server ranked lowest may sit above what it \
+             ranked highest"
         );
     }
 
@@ -1947,38 +1945,38 @@ mod tests {
         ];
         assert_eq!(
             rank_completion_items(&node_items, "app"),
-            vec![0],
-            "all four name the same export of the same package by a different entry point"
+            vec![0, 2],
+            "four candidates, two real choices: `fs` and `node:fs` write the same import, and so \
+             do `fs/promises` and `node:fs/promises` - but the callback API and the promise API \
+             are two different things to pick between"
         );
     }
 
-    /// The reductions [`import_source_package`] does and does not make, each from a live dump.
+    /// What [`canonical_import_source`] does and, far more importantly, does not do. Every pair
+    /// below was decided against a live dump and then confirmed directly: only Node's two
+    /// spellings of one module fold together.
     #[test]
-    fn an_import_source_reduces_to_its_package_and_no_further() {
-        for (source, package) in [
-            // typescript-language-server, `@types/node`.
-            ("fs", "fs"),
+    fn only_nodes_two_spellings_of_one_module_are_the_same_import() {
+        for (source, canonical) in [
+            // The one fold: `typescript-language-server` offers both spellings of every builtin.
             ("node:fs", "fs"),
-            ("fs/promises", "fs"),
-            ("node:fs/promises", "fs"),
-            // pyright-langserver.
+            ("node:fs/promises", "fs/promises"),
+            ("node:async_hooks", "async_hooks"),
+            ("fs", "fs"),
+            // Same package, different module - the callback API and the promise API. Two rows.
+            ("fs/promises", "fs/promises"),
+            // Three different `use` lines, from a live `rust-analyzer` dump. Three rows.
+            ("std::io::Result", "std::io::Result"),
+            ("std::fmt::Result", "std::fmt::Result"),
+            // Everything else, untouched.
             ("os", "os"),
-            ("os.path", "os"),
-            // rust-analyzer's own `(use ...)` notes.
-            ("std::io::Result", "std"),
-            ("std::fmt::Result", "std"),
-            // Genuinely different packages, which must stay different.
+            ("os.path", "os.path"),
             ("typing", "typing"),
             ("typing_extensions", "typing_extensions"),
             ("vue", "vue"),
-            ("react", "react"),
-            ("@vue/reactivity", "@vue"),
+            ("@vue/reactivity", "@vue/reactivity"),
         ] {
-            assert_eq!(
-                import_source_package(source),
-                package,
-                "{source} belongs to package {package}"
-            );
+            assert_eq!(canonical_import_source(source), canonical, "{source}");
         }
     }
 
@@ -2002,8 +2000,8 @@ mod tests {
     ///
     /// The two `appendFile` items that come back are two genuinely different auto-import
     /// candidates - `import { appendFile } from 'fs'` and `import { appendFile } from
-    /// 'fs/promises'` - but they put the identical word in the file, so they get one row
-    /// ([`same_choice_key`]) and that row says where it comes from.
+    /// 'fs/promises'` - so they keep two rows, each naming its own module. Only Node's *other*
+    /// spelling of one of them (`node:fs`) folds in ([`canonical_import_source`]).
     ///
     /// Neither item carries a signature before `completionItem/resolve` (the whole 1029-item
     /// response carries not one multi-token `detail`), so a row showing the *type* would have been
@@ -2018,16 +2016,25 @@ mod tests {
             sort_text: Some("\u{ffff}16".to_string()),
             ..Default::default()
         };
-        let items = [candidate("fs"), candidate("fs/promises")];
+        let items = [
+            candidate("node:fs"),
+            candidate("fs"),
+            candidate("fs/promises"),
+        ];
         assert_eq!(
             rank_completion_items(&items, "app"),
-            vec![0],
-            "one name the user can accept is one row, however many modules could supply it"
+            vec![0, 2],
+            "`node:fs` and `fs` would write the same import and are one row; `fs/promises` is a \
+             different module and keeps its own"
         );
         assert_eq!(
             completion_row_hint(&items[0]).as_deref(),
-            Some("fs"),
-            "and that row names its own origin, up front, with no resolve needed"
+            Some("node:fs"),
+            "and each row names its own origin, up front, with no resolve needed"
+        );
+        assert_eq!(
+            completion_row_hint(&items[2]).as_deref(),
+            Some("fs/promises")
         );
     }
 

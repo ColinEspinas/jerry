@@ -2090,11 +2090,11 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The live-reported "`appendFile` appears four times", on screen. Two real
-    /// `typescript-language-server` items (dumped verbatim - see
+    /// The live-reported "`appendFile` appears four times", on screen. Node ships every builtin
+    /// under two specifiers and `typescript-language-server` offers both, so these two items
+    /// (dumped verbatim - see
     /// `completion_view::tests::a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated`)
-    /// that put the identical `appendFile` in the file by two different imports. One row survives,
-    /// and it paints the module it comes from.
+    /// would write the identical import. One row survives, and it paints the module it comes from.
     #[gpui::test]
     fn repeated_auto_import_candidates_paint_one_row_naming_its_module(cx: &mut TestAppContext) {
         let candidate = |module: &str| lsp_core::lsp_types::CompletionItem {
@@ -2104,7 +2104,7 @@ mod completion_detail_pane_tests {
             ..Default::default()
         };
         let (_app, cx, _relative) =
-            seed_ready_popup(cx, vec![candidate("fs"), candidate("fs/promises")]);
+            seed_ready_popup(cx, vec![candidate("node:fs"), candidate("fs")]);
 
         assert!(
             cx.debug_bounds("completion-item-0").is_some(),
