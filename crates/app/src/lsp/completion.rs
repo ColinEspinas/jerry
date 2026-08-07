@@ -842,13 +842,54 @@ pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -
         .collect();
     scored.sort();
     let mut interchangeable = std::collections::HashSet::with_capacity(scored.len());
-    let mut same_choice = std::collections::HashSet::with_capacity(scored.len());
-    scored
+    let ranked: Vec<usize> = scored
         .into_iter()
         .map(|(_, _, index)| index)
         .filter(|index| interchangeable.insert(interchangeable_completion_key(&items[*index])))
-        .filter(|index| same_choice.insert(same_choice_key(&items[*index])))
-        .collect()
+        .collect();
+
+    // Each group keeps its best-ranked row's *position*, but not necessarily that row's item - see
+    // `same_choice_key` and `prefers_this_spelling`.
+    let mut group_at: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+    let mut kept: Vec<usize> = Vec::with_capacity(ranked.len());
+    for index in ranked {
+        let key = same_choice_key(&items[index]);
+        match group_at.get(&key) {
+            Some(&slot) => {
+                if prefers_this_spelling(&items[index], &items[kept[slot]]) {
+                    kept[slot] = index;
+                }
+            }
+            None => {
+                group_at.insert(key, kept.len());
+                kept.push(index);
+            }
+        }
+    }
+    kept
+}
+
+/// Of two candidates that would write the same import, whether `candidate` is the one to show -
+/// which for Node's two spellings of a builtin means the `node:`-prefixed one.
+///
+/// Live-asked ("I am not sure removing the node: syntax is good because this is the best
+/// practice"), and the answer is that it is: `node:` cannot be shadowed by a userland package of
+/// the same name, and Node's newer builtins are prefix-only outright - checked in the installed
+/// `@types/node`, which declares `node:test`, `node:sea` and `node:sqlite` with **no bare form at
+/// all**, against `fs`/`path`/`os`/`async_hooks` which have both.
+///
+/// This was already the outcome, but only by accident: `typescript-language-server` happens to
+/// list `node:fs` ahead of `fs` and the group kept whichever came first. That is not a promise the
+/// server makes anywhere, and a reordering upstream would have silently started writing the bare
+/// form. Now it is decided here.
+fn prefers_this_spelling(
+    candidate: &lsp_types::CompletionItem,
+    incumbent: &lsp_types::CompletionItem,
+) -> bool {
+    let is_prefixed = |item: &lsp_types::CompletionItem| {
+        completion_import_source(item).is_some_and(|source| source.starts_with("node:"))
+    };
+    is_prefixed(candidate) && !is_prefixed(incumbent)
 }
 
 /// What a completion row actually offers a user: this identifier, of this kind, spliced in as this
@@ -1952,10 +1993,79 @@ mod tests {
         ];
         assert_eq!(
             rank_completion_items(&node_items, "app"),
-            vec![0, 2],
+            vec![0, 3],
             "four candidates, two real choices: `fs` and `node:fs` write the same import, and so \
              do `fs/promises` and `node:fs/promises` - but the callback API and the promise API \
-             are two different things to pick between"
+             are two different things to pick between. Each surviving row is its group's `node:` \
+             spelling, whichever order that arrived in"
+        );
+    }
+
+    /// When two spellings of one Node builtin collapse, the surviving row is the `node:` one -
+    /// decided here rather than inherited from whatever order the server happened to send.
+    ///
+    /// `node:` cannot be shadowed by a userland package of the same name, and Node's newer
+    /// builtins are prefix-only outright: the installed `@types/node` declares `node:test`,
+    /// `node:sea` and `node:sqlite` with no bare form at all, against `fs`/`path`/`os` which have
+    /// both. The second half of this test is the one that matters - it feeds the group in the
+    /// *opposite* order to the one a live `typescript-language-server` uses, which is exactly the
+    /// case the old "keep whichever came first" rule would have got wrong.
+    #[test]
+    fn the_node_prefixed_spelling_is_the_row_that_survives_whatever_order_it_arrives_in() {
+        let candidate = |module: &str| lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(module.to_string()),
+            sort_text: Some("\u{ffff}16".to_string()),
+            ..Default::default()
+        };
+
+        // The order a live server actually sends.
+        let items = [candidate("node:fs"), candidate("fs")];
+        let ranked = rank_completion_items(&items, "app");
+        assert_eq!(ranked, vec![0]);
+        assert_eq!(
+            completion_row_hint(&items[ranked[0]]).as_deref(),
+            Some("node:fs")
+        );
+
+        // And the reverse, which no longer changes the answer.
+        let items = [candidate("fs"), candidate("node:fs")];
+        let ranked = rank_completion_items(&items, "app");
+        assert_eq!(
+            ranked,
+            vec![1],
+            "the surviving row must be the `node:` one even when the bare spelling arrives first"
+        );
+        assert_eq!(
+            completion_row_hint(&items[ranked[0]]).as_deref(),
+            Some("node:fs"),
+            "`node:` is unshadowable and is the only spelling Node's newer builtins have"
+        );
+    }
+
+    /// The preference must not disturb the row's *position*: a group keeps the rank its best
+    /// member earned, so preferring a later member cannot float it above unrelated rows.
+    #[test]
+    fn preferring_a_spelling_does_not_move_the_row_up_or_down_the_list() {
+        let candidate = |label: &str, module: Option<&str>, sort: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: module.map(str::to_string),
+            sort_text: Some(sort.to_string()),
+            ..Default::default()
+        };
+        let items = [
+            candidate("appendFile", Some("fs"), "\u{ffff}16"),
+            candidate("appendZebra", None, "\u{ffff}17"),
+            candidate("appendFile", Some("node:fs"), "\u{ffff}16"),
+        ];
+        let ranked = rank_completion_items(&items, "append");
+        assert_eq!(
+            ranked,
+            vec![2, 1],
+            "the `appendFile` group keeps the first slot its own best rank earned - it must not \
+             fall behind `appendZebra` just because the spelling that won arrived later"
         );
     }
 
