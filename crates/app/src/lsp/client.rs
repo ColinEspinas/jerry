@@ -1917,10 +1917,7 @@ impl AdeApp {
         if self.completions_resolved.contains(&key) {
             return;
         }
-        let Some(absolute_path) = self
-            .edit_buffer(&path)
-            .map(|buffer| buffer.path.clone())
-        else {
+        let Some(absolute_path) = self.edit_buffer(&path).map(|buffer| buffer.path.clone()) else {
             return;
         };
         let Some(connection) = self.lsp_connection_for_path(&absolute_path) else {
@@ -1950,10 +1947,10 @@ impl AdeApp {
     }
 
     /// Merges a real `completionItem/resolve` response into the exact item
-    /// [`Self::maybe_resolve_selected_completion_item`] asked about, in place - never replacing
-    /// fields the original `textDocument/completion` response already populated (a server that
-    /// sent a real inline `detail` already made its own choice there; the resolve response is
-    /// additive, not authoritative). Refuses stale results the same way [`Self::
+    /// [`Self::maybe_resolve_selected_completion_item`] asked about, in place - each field the
+    /// resolve response genuinely carries replacing whatever arrived inline, and every field it
+    /// omits left exactly as it was (see the merge itself for the real, live-dumped case that
+    /// settled which way round this goes). Refuses stale results the same way [`Self::
     /// apply_completion_result`] does: a `completions_generation` mismatch means a fresh server
     /// response (or a dismiss) has already replaced whatever `items` this index used to point
     /// into, so writing into it now would either silently corrupt an unrelated item or panic on an
@@ -1984,13 +1981,22 @@ impl AdeApp {
         let Some(item) = items.get_mut(item_index) else {
             return;
         };
-        if item.detail.is_none() {
+        // A field the resolve response actually carries wins over whatever arrived inline. The
+        // LSP spec has `completionItem/resolve` return the item with its fields filled in, and a
+        // real dump against a live `typescript-language-server` shows why that matters here: an
+        // auto-import item arrives with `detail: "./helper"` - a bare module specifier standing in
+        // as a placeholder - and only the resolve response carries the real signature (`"Auto
+        // import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`). Keeping the inline
+        // value, as this merge used to, pinned such an item to a module path where the popup
+        // promises a type. A resolve response that omits a field still leaves the inline one
+        // alone, so nothing real is ever lost.
+        if resolved.detail.is_some() {
             item.detail = resolved.detail;
         }
-        if item.documentation.is_none() {
+        if resolved.documentation.is_some() {
             item.documentation = resolved.documentation;
         }
-        if item.label_details.is_none() {
+        if resolved.label_details.is_some() {
             item.label_details = resolved.label_details;
         }
         cx.notify();
@@ -3160,10 +3166,7 @@ process.stdin.on('data', (d) => {
                 "accepting a completion must genuinely dismiss the popup, got: {:?}",
                 app.completions.as_ref().map(|entry| &entry.status)
             );
-            let content = &app
-                .edit_buffer(&relative)
-                .expect("a real buffer")
-                .content;
+            let content = &app.edit_buffer(&relative).expect("a real buffer").content;
             assert!(
                 content.contains("println"),
                 "sanity check: the real accept must have spliced the real item's text into the \
@@ -3251,7 +3254,10 @@ process.stdin.on('data', (d) => {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            let entry = app.completions.as_ref().expect("popup should still be open");
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
@@ -3266,6 +3272,77 @@ process.stdin.on('data', (d) => {
                 doc.as_deref(),
                 Some("resolved doc for unresolved_item"),
                 "and its real documentation, which is what the detail pane's doc-prose body reads"
+            );
+        });
+    }
+
+    /// The real, live-reproduced bug behind "the shown things are still modules instead of real
+    /// types" surviving even after the detail-splitting fix: this merge used to keep the
+    /// *unresolved* `detail` whenever the server had sent one, on the theory that an inline
+    /// `detail` was the server's own considered choice and resolve was only ever additive.
+    ///
+    /// A real dump against a live `typescript-language-server` disproves that for the exact case
+    /// that matters. For an auto-import completion it sends `detail: "./helper"` inline - a bare
+    /// module specifier standing in as a placeholder - and only the `completionItem/resolve`
+    /// response carries the genuinely richer `"Auto import from './helper'\nconstructor
+    /// RemoteHelper(): RemoteHelper"` that actually contains the signature. Discarding the
+    /// resolved value pinned the item to the placeholder forever, so the popup had a module path
+    /// and no type no matter what the render path did with it. Per the LSP spec, resolve returns
+    /// the item with its fields filled in, so a resolved `detail` is the authoritative one.
+    #[gpui::test]
+    fn a_real_resolved_detail_replaces_a_placeholder_the_server_sent_inline(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "RemoteHelper".to_string(),
+                        // The real placeholder a live typescript-language-server sends inline.
+                        detail: Some("./helper".to_string()),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            assert_eq!(
+                items[0].detail.as_deref(),
+                Some("resolved detail for RemoteHelper"),
+                "a real resolve response must win over the placeholder detail the server sent \
+                 inline - that placeholder is exactly the bare module path the user reported \
+                 seeing where a type belongs"
             );
         });
     }

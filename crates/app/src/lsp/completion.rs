@@ -139,28 +139,128 @@ pub fn identifier_prefix_start(line_text: &str, cursor: usize) -> usize {
 /// `.clone()`). The legacy `detail` field, by contrast, is the one both real servers reliably
 /// populate with genuine type/signature text for every item tried.
 pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Option<String>) {
-    let detail = item
+    (item.label.clone(), split_completion_detail(item).signature)
+}
+
+/// The real, per-slot split of whatever a server packed into one `CompletionItem::detail` string.
+///
+/// The popup has three genuinely different slots - the row's own right-side type hint, the detail
+/// pane's signature line, and the pane's module-path footer - but the LSP gives one `detail`
+/// field, and a real dump against both servers this app supports showed that field carrying
+/// different *kinds* of thing depending on the item, not just different text:
+///
+/// - `rust-analyzer`, method/field: a genuine signature (`"fn(self) -> T"`, `"String"`).
+/// - `rust-analyzer`, type/primitive: the label over again (`label: "Widget"`, `detail:
+///   "Widget"`) - rendering it as a type hint printed `"Widget   Widget"`, pure redundancy.
+/// - `typescript-language-server`, resolved auto-import: two lines, an import note *then* the
+///   real signature (`"Auto import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`).
+/// - `typescript-language-server`, unresolved auto-import: the bare module specifier and nothing
+///   else (`"./helper"`).
+///
+/// The last two are the live-reported "the shown things are still modules instead of real types":
+/// a module path was landing in the slot the design reserves for a type. Splitting here means a
+/// path goes to the footer that exists for paths, a real signature goes to the type slot, and a
+/// slot with nothing genuine to show stays empty rather than showing a path or an echo of the
+/// label.
+struct CompletionDetail {
+    /// The type/signature slot - `None` when the server sent nothing that is genuinely one.
+    signature: Option<String>,
+    /// The module-path footer - `None` when the server sent no real path.
+    module_path: Option<String>,
+}
+
+fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail {
+    let described_path = item
+        .label_details
+        .as_ref()
+        .and_then(|label_details| label_details.description.as_deref())
+        .map(str::trim)
+        .filter(|description| looks_like_module_path(description))
+        .map(str::to_string);
+
+    let Some(raw) = item
         .detail
         .as_deref()
         .map(str::trim)
         .filter(|detail| !detail.is_empty())
-        .map(|detail| clean_completion_detail(detail, &item.label));
-    (item.label.clone(), detail)
+    else {
+        return CompletionDetail {
+            signature: None,
+            module_path: described_path,
+        };
+    };
+
+    let (import_path, rest) = split_auto_import_note(raw);
+    let cleaned = clean_completion_detail(rest, &item.label);
+    let cleaned = cleaned.trim();
+
+    // A detail that is just the label again carries no information the row doesn't already show.
+    let redundant = cleaned.is_empty() || cleaned == item.label;
+    let detail_is_path = !redundant && looks_like_module_path(cleaned);
+
+    CompletionDetail {
+        signature: (!redundant && !detail_is_path).then(|| cleaned.to_string()),
+        module_path: import_path
+            .or_else(|| detail_is_path.then(|| cleaned.to_string()))
+            .or(described_path),
+    }
+}
+
+/// Splits `typescript-language-server`'s own real two-line auto-import detail into the import path
+/// and the signature that follows it (`"Auto import from './helper'\nconstructor RemoteHelper():
+/// RemoteHelper"` -> `(Some("./helper"), "constructor RemoteHelper(): RemoteHelper")`), captured
+/// verbatim from a real resolved completion against a live server.
+///
+/// Without this the whole two-line string reached a single-line type slot, so the only part the
+/// user could actually read was the import note - a module path standing exactly where a type
+/// belongs. Returns the input untouched when there is no such note, which is every
+/// `rust-analyzer` item and every non-import TypeScript item.
+fn split_auto_import_note(detail: &str) -> (Option<String>, &str) {
+    let (first_line, rest) = match detail.split_once('\n') {
+        Some((first_line, rest)) => (first_line.trim(), rest.trim()),
+        None => (detail.trim(), ""),
+    };
+    let Some(path) = first_line
+        .strip_prefix("Auto import from ")
+        .map(|path| path.trim().trim_matches(['\'', '"']).trim())
+        .filter(|path| !path.is_empty())
+    else {
+        return (None, detail);
+    };
+    (Some(path.to_string()), rest)
+}
+
+/// Whether `text` genuinely reads as a module path/import specifier rather than a type or
+/// signature - a deliberately narrow test, since its whole job is to keep a path *out* of the type
+/// slot without ever exiling a real type into the footer.
+///
+/// Requires a real path separator (`::` or `/`) and rejects anything carrying the punctuation or
+/// whitespace a signature has, so the real strings observed live sort correctly:
+/// `"std::collections::HashMap"` and `"./helper"` are paths; `"String"`, `"Widget"`,
+/// `"fn(self) -> T"`, `"macro_rules! assert"` and `"bar: string"` are not.
+///
+/// This also guards the footer against `rust-analyzer`'s own real
+/// `CompletionItemLabelDetails::description`, which - despite the LSP spec describing that field
+/// as "fully qualified names or file path" - it fills with the *signature* for ordinary items
+/// (`description: "fn(self) -> T"` on `.into()`), which the footer used to print as if it were a
+/// module path.
+fn looks_like_module_path(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains(char::is_whitespace)
+        && !text.contains(['(', ')', '<', '>', '{', '}', '!', ','])
+        && (text.contains("::") || text.contains('/'))
 }
 
 /// The Completions detail pane's own real signature line (its top band, syntax-highlighted in
 /// mono - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s `fn push_str(&mut self, string:
-/// &str)` example) - the same [`clean_completion_detail`]-cleaned legacy `detail` string
-/// [`completion_item_display`] reads (see that function's own docs for why `label_details.detail`
-/// is deliberately not consulted here), falling back to the bare `label` for an item with no real
+/// &str)` example) - the same [`CompletionDetail::signature`] [`completion_item_display`] reads
+/// (see [`split_completion_detail`]'s own docs for why `label_details.detail` is deliberately not
+/// consulted here), falling back to the bare `label` for an item with no real
 /// detail at all (a bare `label`/`kind`-only item that hasn't been resolved yet, or a server that
 /// never sends one for this item's own kind).
 pub fn completion_signature_text(item: &lsp_types::CompletionItem) -> String {
-    item.detail
-        .as_deref()
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty())
-        .map(|detail| clean_completion_detail(detail, &item.label))
+    split_completion_detail(item)
+        .signature
         .unwrap_or_else(|| item.label.clone())
 }
 
@@ -249,17 +349,14 @@ pub fn completion_documentation_text(item: &lsp_types::CompletionItem) -> Option
 
 /// A completion item's real fully-qualified path/module, for the detail pane's own footer
 /// (`README.md`: "module path footer", mirroring `crate::lsp::hover::HoverRenderModel::module_path`).
-/// `CompletionItemLabelDetails::description` is the LSP spec's own documented slot for exactly
-/// this ("fully qualified names or file path"), which real servers (rust-analyzer's
-/// `use`-path-qualified completions, for one) populate. `None` when the server didn't send one -
-/// never a guessed or re-derived path.
+///
+/// Whichever real path [`split_completion_detail`] found - `typescript-language-server`'s own
+/// `"Auto import from './helper'"` note, an unresolved import item's bare specifier, or
+/// `CompletionItemLabelDetails::description` when that genuinely holds a path rather than the
+/// signature `rust-analyzer` actually puts there. `None` when the server sent no real path - never
+/// a guessed or re-derived one, and never a signature dressed up as a path.
 pub fn completion_module_path(item: &lsp_types::CompletionItem) -> Option<String> {
-    item.label_details
-        .as_ref()?
-        .description
-        .as_ref()
-        .map(|description| description.trim().to_string())
-        .filter(|description| !description.is_empty())
+    split_completion_detail(item).module_path
 }
 
 /// The Completions popup's real kind-badge category (design:
@@ -946,6 +1043,124 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(completion_signature_text(&item), "push_str");
+    }
+
+    /// The real, live-reported bug ("the shown things are still modules instead of real types"),
+    /// reproduced from a verbatim dump of a real resolved `typescript-language-server` auto-import
+    /// completion. Its `detail` is genuinely two lines - an import note, *then* the signature - so
+    /// a single-line type slot showed only the module path. The path belongs in the footer that
+    /// exists for paths; the type slot belongs to the real signature underneath it.
+    #[test]
+    fn a_real_typescript_auto_import_detail_splits_into_a_real_signature_and_a_real_path() {
+        let item = lsp_types::CompletionItem {
+            label: "RemoteHelper".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::CLASS),
+            detail: Some(
+                "Auto import from './helper'\nconstructor RemoteHelper(): RemoteHelper".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1.as_deref(),
+            Some("constructor RemoteHelper(): RemoteHelper"),
+            "the row's type hint must show the real signature, not the import note above it"
+        );
+        assert_eq!(
+            completion_signature_text(&item),
+            "constructor RemoteHelper(): RemoteHelper"
+        );
+        assert_eq!(
+            completion_module_path(&item).as_deref(),
+            Some("./helper"),
+            "the import path is a real module path and belongs in the footer"
+        );
+    }
+
+    /// The same real auto-import item *before* a `completionItem/resolve` round trip, dumped
+    /// verbatim from the live server: `detail` is then nothing but the bare module specifier. A
+    /// bare path is not a type, so the type slot must stay empty rather than showing a module
+    /// where the design promises a type.
+    #[test]
+    fn a_real_unresolved_typescript_auto_import_shows_no_type_and_a_real_path() {
+        let item = lsp_types::CompletionItem {
+            label: "RemoteHelper".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::CLASS),
+            detail: Some("./helper".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1,
+            None,
+            "a bare module specifier must never be rendered as this item's type"
+        );
+        assert_eq!(completion_module_path(&item).as_deref(), Some("./helper"));
+    }
+
+    /// A real `rust-analyzer` type completion, dumped verbatim from a live server: `detail` is the
+    /// label repeated (`label: "Widget"`, `detail: "Widget"`, and identically for every primitive:
+    /// `i32`, `str`, `bool`). Rendering it printed the name twice on one row for no information at
+    /// all; the type slot should simply stay empty.
+    #[test]
+    fn a_real_rust_analyzer_type_completion_does_not_echo_its_own_label_as_a_type() {
+        let item = lsp_types::CompletionItem {
+            label: "Widget".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::STRUCT),
+            detail: Some("Widget".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("Widget".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(completion_item_display(&item).1, None);
+        assert_eq!(
+            completion_module_path(&item),
+            None,
+            "a bare type name is not a module path, however the server labelled the field"
+        );
+    }
+
+    /// A real `rust-analyzer` method completion, dumped verbatim from a live server: it fills
+    /// `label_details.description` with the *signature*, not the "fully qualified names or file
+    /// path" the LSP spec describes that field as holding. The footer must not print a signature
+    /// as if it were a module path - while the type slot keeps showing that same real signature.
+    #[test]
+    fn a_real_rust_analyzer_signature_is_never_mistaken_for_a_module_path() {
+        let item = lsp_types::CompletionItem {
+            label: "into".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::METHOD),
+            detail: Some("fn(self) -> T".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("(as Into)".to_string()),
+                description: Some("fn(self) -> T".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1.as_deref(),
+            Some("fn(self) -> T")
+        );
+        assert_eq!(completion_module_path(&item), None);
+    }
+
+    /// A real `rust-analyzer` auto-import path *does* arrive in `label_details.description`, and
+    /// must still reach the footer - the guard above narrows that field to genuine paths, it does
+    /// not abandon it.
+    #[test]
+    fn a_real_qualified_path_description_still_reaches_the_footer() {
+        let item = lsp_types::CompletionItem {
+            label: "HashMap".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::STRUCT),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("std::collections::HashMap".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_module_path(&item).as_deref(),
+            Some("std::collections::HashMap")
+        );
     }
 
     /// Real, live-observed shapes from both servers this app supports - a real dump against a

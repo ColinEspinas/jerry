@@ -177,12 +177,22 @@ fn split_param_name(rest: &str) -> (String, String) {
     {
         name = bracketed.split('=').next().unwrap_or(bracketed).to_string();
     }
-    let description = rest[name_end..].trim_start();
-    let description = description
-        .strip_prefix('-')
-        .map(str::trim_start)
-        .unwrap_or(description);
+    let description = strip_separator_dash(rest[name_end..].trim_start());
     (name, description.to_string())
+}
+
+/// Drops the dash a doc tag's own prose is commonly separated from its tag/name by, so a rendered
+/// description never opens with a stray dangling dash.
+///
+/// Covers the real em dash a live `typescript-language-server` uses (`"@returns \u{2014} The
+/// formatted display name"`, captured verbatim in this module's own
+/// `REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER`) alongside the ASCII hyphen a hand-written JSDoc comment
+/// conventionally uses, and an en dash for good measure - all three are the same real convention,
+/// and only one of them was handled before.
+fn strip_separator_dash(text: &str) -> &str {
+    text.strip_prefix(['-', '\u{2013}', '\u{2014}'])
+        .map(str::trim_start)
+        .unwrap_or(text)
 }
 
 /// Appends a real continuation line (any line of `doc` that didn't itself start a new `@tag`) to
@@ -232,7 +242,7 @@ pub fn parse_doc_sections(doc: &str) -> ParsedDoc {
                         cursor = DocSectionCursor::Param(sections.params.len() - 1);
                     }
                     "returns" | "return" => {
-                        sections.returns = Some(rest.to_string());
+                        sections.returns = Some(strip_separator_dash(rest).to_string());
                         cursor = DocSectionCursor::Returns;
                     }
                     "example" | "examples" => {
@@ -240,7 +250,9 @@ pub fn parse_doc_sections(doc: &str) -> ParsedDoc {
                         cursor = DocSectionCursor::Example(sections.examples.len() - 1);
                     }
                     other => {
-                        sections.other.push((other.to_string(), rest.to_string()));
+                        sections
+                            .other
+                            .push((other.to_string(), strip_separator_dash(rest).to_string()));
                         cursor = DocSectionCursor::Other(sections.other.len() - 1);
                     }
                 }
@@ -471,11 +483,72 @@ pub(crate) fn degrade_markdown_to_plain_text(markdown: &str) -> String {
             // string at the end (this function's own previous shape), which stripped these bytes
             // unconditionally - real, live-reported corruption of example code.
             line = line.replace("**", "").replace('`', "");
+            line = unwrap_paired_emphasis(&line);
         }
         out_lines.push(line);
     }
 
     out_lines.join("\n")
+}
+
+/// Unwraps real single-`*` Markdown emphasis (`*@param*` -> `@param`), leaving an asterisk that
+/// isn't real emphasis exactly where it was.
+///
+/// Not cosmetic, and not covered by the `**` strip above: a real, live
+/// `typescript-language-server` wraps **every** JSDoc tag it reports in single-asterisk emphasis
+/// (`"*@param* `first` \u{2014} ..."`, captured verbatim in this module's own
+/// `REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER`). [`parse_doc_sections`] recognizes a tag only when the
+/// line's first non-whitespace byte is `@`, so before this unwrap not one real TypeScript doc tag
+/// was ever recognized - the entire structured `@param`/`@returns`/`@example` rendering silently
+/// degraded to a single flat paragraph with literal `*` characters in it, which is what the app
+/// genuinely put on screen.
+///
+/// Deliberately a paired-run scan rather than a blanket `replace('*', "")`: an opening marker
+/// must be immediately followed by a non-whitespace byte and have a later closing marker
+/// immediately preceded by one - real Markdown's own emphasis rule. A lone `*args`, a glob, or a
+/// `3 * 4` multiplication has no such pair and passes through untouched, so this can't corrupt
+/// real prose or real code the way an unconditional strip would.
+fn unwrap_paired_emphasis(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'*' {
+            let start = index;
+            while index < bytes.len() && bytes[index] != b'*' {
+                index += 1;
+            }
+            out.push_str(&line[start..index]);
+            continue;
+        }
+        // `index` is at a candidate opening marker: real emphasis never has whitespace (or
+        // another marker) directly inside it.
+        let content_start = index + 1;
+        let opens = bytes
+            .get(content_start)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'*');
+        let close = opens
+            .then(|| {
+                bytes[content_start..]
+                    .iter()
+                    .position(|byte| *byte == b'*')
+                    .map(|offset| content_start + offset)
+            })
+            .flatten()
+            .filter(|close| *close > content_start && !bytes[close - 1].is_ascii_whitespace());
+        match close {
+            Some(close) => {
+                out.push_str(&line[content_start..close]);
+                index = close + 1;
+            }
+            // Not a real pair - keep the byte verbatim.
+            None => {
+                out.push('*');
+                index += 1;
+            }
+        }
+    }
+    out
 }
 
 fn marked_string_text(marked: &lsp_types::MarkedString) -> String {
@@ -696,6 +769,95 @@ mod tests {
     /// stale) - not synthetic Markdown invented for this test.
     const REAL_TYPESCRIPT_MARKDOWN_HOVER: &str =
         "\n```typescript\nfunction addOne(x: number): number\n```\nAdds one to the given number.";
+
+    /// The exact real hover string a live `typescript-language-server` 5.3.0 returned for a
+    /// genuinely JSDoc-tagged function (captured verbatim from a real spawned server against a
+    /// real scratch project, not synthesized). The shape that matters, and that no synthetic
+    /// fixture in this module had ever exercised before: **every tag is wrapped in real Markdown
+    /// emphasis** (`*@param*`, not a bare `@param`), the name is inline code, the separator is a
+    /// real em dash, each line ends in a Markdown hard break (two trailing spaces), and the
+    /// `@example` body arrives as a real fenced code block rather than indented continuation
+    /// lines.
+    const REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER: &str = concat!(
+        "\n```typescript\nfunction formatName(first: string, last: string): string\n```\n",
+        "Formats a user's display name for the header bar.\n\n",
+        "*@param* `first` \u{2014} The user's given name.  \n\n",
+        "*@param* `last` \u{2014} The user's family name.  \n\n",
+        "*@returns* \u{2014} The formatted display name, trimmed.  \n\n",
+        "*@example*  \n```typescript\nconst name = formatName(\"Ada\", \"Lovelace\");\n",
+        "console.log(name);\n```"
+    );
+
+    /// The real, live-reproduced bug behind "JSDoc rendering does nothing" (verified on screen
+    /// against the real running app, not just here): because a real `typescript-language-server`
+    /// emphasizes its tags, every doc line reached [`parse_doc_sections`] as `*@param* ...`, whose
+    /// first non-whitespace byte is `*` and not `@`, so not one tag was ever recognized - the
+    /// whole structured-section feature silently degraded to one flat paragraph with literal
+    /// asterisks in it. Degrading must unwrap real paired emphasis so the tags survive as tags.
+    #[test]
+    fn degrade_markdown_unwraps_the_real_emphasis_typescript_wraps_every_jsdoc_tag_in() {
+        let plain = degrade_markdown_to_plain_text(REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER);
+        assert!(
+            plain.contains("\n@param first \u{2014} The user's given name."),
+            "a real emphasized tag must degrade to a bare, parseable tag line, got: {plain:?}"
+        );
+        assert!(
+            plain.contains("\n@returns \u{2014} The formatted display name, trimmed."),
+            "got: {plain:?}"
+        );
+        assert!(
+            !plain.contains('*'),
+            "no literal Markdown emphasis marker should survive degrading, got: {plain:?}"
+        );
+    }
+
+    /// A bare `*` that is not real paired emphasis (a multiplication sign, a glob, a `*args`-style
+    /// prefix with no closing partner) must survive untouched - the unwrap above must not become
+    /// a blanket asterisk strip that corrupts real prose or real code.
+    #[test]
+    fn degrade_markdown_leaves_a_real_unpaired_asterisk_alone() {
+        assert_eq!(
+            degrade_markdown_to_plain_text("the product 3 * 4 * 5 and a lone *args prefix"),
+            "the product 3 * 4 * 5 and a lone *args prefix"
+        );
+    }
+
+    /// The real end-to-end payoff of the two fixes above, driven by the exact real server string:
+    /// a genuinely JSDoc-tagged TypeScript hover must come back as real, separated sections -
+    /// two named params with their real prose, a real returns line, and a real multi-line example
+    /// body - rather than the one flat run-on paragraph the app actually rendered on screen.
+    #[test]
+    fn a_real_typescript_jsdoc_hover_parses_into_real_structured_sections() {
+        let hover = markdown_hover(REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER);
+        let model = build_hover_render_model(&hover).expect("a real, non-empty response");
+        assert_eq!(
+            model.signature,
+            "function formatName(first: string, last: string): string"
+        );
+        let sections = parse_doc_sections(model.doc.as_deref().expect("a real doc body"));
+        assert_eq!(
+            sections.description.as_deref(),
+            Some("Formats a user's display name for the header bar.")
+        );
+        assert_eq!(
+            sections.params,
+            vec![
+                ("first".to_string(), "The user's given name.".to_string()),
+                ("last".to_string(), "The user's family name.".to_string()),
+            ],
+            "the real em-dash separator typescript-language-server uses must be stripped the \
+             same way an ASCII hyphen already was, not left leading every description"
+        );
+        assert_eq!(
+            sections.returns.as_deref(),
+            Some("The formatted display name, trimmed.")
+        );
+        assert_eq!(
+            sections.examples,
+            vec!["const name = formatName(\"Ada\", \"Lovelace\");\nconsole.log(name);".to_string()],
+            "a real fenced @example body must survive as real, multi-line example code"
+        );
+    }
 
     #[test]
     fn degrade_markdown_to_plain_text_strips_a_real_fenced_code_block_and_starts_a_new_paragraph() {
