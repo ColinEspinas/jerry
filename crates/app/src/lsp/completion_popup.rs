@@ -1029,20 +1029,14 @@ impl AdeApp {
             // used to inset it on both sides.
             .py(gpui::px(8.0));
 
-        // Signature: `item.detail` when there is one - inline from the server's own
-        // `textDocument/completion` response for an item it already fully described, or filled in
-        // after the fact by a real `completionItem/resolve` round trip
-        // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
-        // much included) case where a server only sends a bare `label`/`kind` up front - the bare
-        // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
-        // same real way `crate::code_surface::code_view::highlight_block` highlights any other
-        // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
-        let signature_text = item
-            .detail
-            .as_ref()
-            .map(|detail| detail.trim())
-            .filter(|detail| !detail.is_empty())
-            .unwrap_or(item.label.as_str());
+        // Signature: see [`completion_view::completion_signature_text`]'s own docs for the real
+        // `label_details.detail`-first, `item.detail`-fallback, bare-`label`-last precedence - the
+        // bare label is never left blank for a real, selected item even before a real
+        // `completionItem/resolve` round trip (`AdeApp::maybe_resolve_selected_completion_item`)
+        // fills in a bare `label`/`kind`-only item's real `detail`. Highlighted the same real way
+        // `crate::code_surface::code_view::highlight_block` highlights any other standalone
+        // fragment (a diff hunk, a merge conflict side) - see that function's own docs.
+        let signature_text = completion_view::completion_signature_text(item);
         // One real stacked row per source line in `signature_text`, not a single `flex_wrap` row for
         // the whole thing - a genuinely multi-line signature (e.g. typescript-language-server pretty-
         // printing a wide utility/generic type like `Pick<{...}>` across several real lines) has no
@@ -1051,7 +1045,7 @@ impl AdeApp {
         // own fix for the identical bug: consuming only `highlight_block`'s first `RenderedLine` used
         // to silently drop every real line past the first.
         let signature_lines = code_view::highlight_block(
-            std::iter::once(signature_text),
+            std::iter::once(signature_text.as_str()),
             extension,
             code_view::HighlightOptions::default(),
         );

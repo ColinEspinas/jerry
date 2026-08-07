@@ -122,17 +122,56 @@ pub fn identifier_prefix_start(line_text: &str, cursor: usize) -> usize {
     start
 }
 
-/// A completion item's real display label plus an optional secondary detail string
-/// (`CompletionItem::detail`, e.g. a real inferred type/signature) - what `crate::root::
-/// completions`'s popover row actually renders, factored out here so it's testable without a
-/// live `gpui` window.
+/// A completion item's real display label plus an optional secondary detail string - what
+/// `crate::lsp::completion_popup`'s popover row actually renders on the row's own right side,
+/// factored out here so it's testable without a live `gpui` window.
+///
+/// Prefers `CompletionItemLabelDetails::detail` over the legacy top-level `CompletionItem::detail`
+/// whenever a server sent one: the LSP spec's own doc comment for that field is explicit -
+/// "rendered less prominently directly after the label ... function signatures or type
+/// annotations" - which is exactly this row's own job, and it's spec-designed to stay a clean
+/// type/signature fragment with no qualifier mixed in. The legacy top-level `detail` field has no
+/// such guarantee: real servers (typescript-language-server in particular) commonly pack a
+/// qualifier *and* a type into it together for pre-3.16 clients (`"(property) Foo.bar: string"`),
+/// which read as a genuinely confusing, mixed string when shown as a bare type hint - a real,
+/// live-reported bug. Falls back to the legacy field for a server that never sent
+/// `label_details` at all (rust-analyzer's own `detail` strings are already clean for most items).
 pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Option<String>) {
     let detail = item
-        .detail
+        .label_details
         .as_ref()
+        .and_then(|label_details| label_details.detail.as_ref())
+        .or(item.detail.as_ref())
         .map(|detail| detail.trim().to_string())
         .filter(|detail| !detail.is_empty());
     (item.label.clone(), detail)
+}
+
+/// The Completions detail pane's own real signature line (its top band, syntax-highlighted in
+/// mono - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s `fn push_str(&mut self, string:
+/// &str)` example) - `label` immediately followed by `label_details.detail` (no space between
+/// them, matching that field's own spec: "rendered ... directly after the label, without any
+/// spacing") whenever a server sent one, composing the same clean, module-free "typing of the
+/// suggestion" [`completion_item_display`]'s own docs describe, just spelled out in full rather
+/// than left implicit next to a separately-rendered label. Falls back to the legacy top-level
+/// `detail` string (already a real, complete, standalone signature for most rust-analyzer items),
+/// then to the bare `label`, for a server that never sent `label_details` at all.
+pub fn completion_signature_text(item: &lsp_types::CompletionItem) -> String {
+    if let Some(detail) = item
+        .label_details
+        .as_ref()
+        .and_then(|label_details| label_details.detail.as_deref())
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        return format!("{}{detail}", item.label);
+    }
+    item.detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or(item.label.as_str())
+        .to_string()
 }
 
 /// A completion item's real doc prose, for the detail pane's own body text
@@ -781,6 +820,111 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(completion_item_display(&no_detail_item).1, None);
+    }
+
+    /// The real, live-reported bug this session: a server (typescript-language-server, in
+    /// practice) sending a legacy top-level `detail` that mixes a qualifier and a type together
+    /// (`"(property) Foo.bar: string"`) must not win over a real `label_details.detail` the same
+    /// item also sent - the row's own right-side hint should read as the clean, spec-designed
+    /// type fragment (`"string"`), not the mixed legacy string.
+    #[test]
+    fn completion_item_display_prefers_a_real_label_details_detail_over_the_legacy_mixed_detail_string()
+     {
+        let item = lsp_types::CompletionItem {
+            label: "bar".to_string(),
+            detail: Some("(property) Foo.bar: string".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some(": string".to_string()),
+                description: Some("Foo".to_string()),
+            }),
+            ..Default::default()
+        };
+        let (label, detail) = completion_item_display(&item);
+        assert_eq!(label, "bar");
+        assert_eq!(
+            detail.as_deref(),
+            Some(": string"),
+            "the row's own right-side hint must read from the real label_details.detail field, \
+             never the legacy detail string it was designed to replace"
+        );
+    }
+
+    #[test]
+    fn completion_item_display_falls_back_to_the_legacy_detail_without_real_label_details() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn(&mut self, &str)".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1.as_deref(),
+            Some("fn(&mut self, &str)"),
+            "a server that never sent label_details at all must still get a real row hint from \
+             the legacy detail field"
+        );
+    }
+
+    #[test]
+    fn completion_item_display_falls_back_to_legacy_detail_when_label_details_detail_is_blank() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn(&mut self, &str)".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1.as_deref(),
+            Some("fn(&mut self, &str)"),
+            "a real label_details with no detail field of its own must not suppress the legacy \
+             detail string - only a real label_details.detail should ever win"
+        );
+    }
+
+    #[test]
+    fn completion_signature_text_composes_the_label_with_a_real_label_details_detail() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("this legacy string must lose to label_details".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("(&mut self, string: &str)".to_string()),
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_signature_text(&item),
+            "push_str(&mut self, string: &str)",
+            "the pane's own signature line must compose label + label_details.detail (no space, \
+             per that field's own spec) whenever a server sent one, never the legacy detail string"
+        );
+    }
+
+    #[test]
+    fn completion_signature_text_falls_back_to_the_legacy_detail_string() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_signature_text(&item),
+            "fn push_str(&mut self, string: &str)",
+            "rust-analyzer's own convention - a real, complete, standalone signature string in \
+             the legacy detail field - must still be used verbatim for a server that never sent \
+             label_details"
+        );
+    }
+
+    #[test]
+    fn completion_signature_text_falls_back_to_the_bare_label_with_nothing_else_real() {
+        let item = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(completion_signature_text(&item), "push_str");
     }
 
     #[test]
