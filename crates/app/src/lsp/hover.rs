@@ -121,6 +121,168 @@ pub struct HoverRenderModel {
     pub doc: Option<String>,
 }
 
+/// A doc body's real JSDoc-style structure (GitHub issue #200) - a leading, untagged description
+/// paragraph, then zero or more recognized block tags. Parsed from [`HoverRenderModel::doc`]/
+/// `crate::lsp::completion::completion_documentation_text`'s own already-degraded plain text (see
+/// [`parse_doc_sections`]'s own docs), not from raw Markdown - a real rustdoc-style doc comment
+/// (Rust's own convention: Markdown `#`-headers, no `@`-tags at all in the overwhelming majority
+/// of real crates) simply never matches any of these tags and comes back as `description` alone,
+/// unchanged from today's plain rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedDoc {
+    /// Everything before the first real `@tag` line - `None` for a doc body that is *only*
+    /// tags, with no leading prose at all (rare, but real - some hand-written JSDoc comments
+    /// open directly with `@param`).
+    pub description: Option<String>,
+    /// Each real `@param`/`@arg`/`@argument` tag, in source order, as `(name, description)` -
+    /// see [`split_param_name`] for how the name is separated from an optional `{Type}` prefix
+    /// and the description that follows it.
+    pub params: Vec<(String, String)>,
+    /// The real `@returns`/`@return` tag's own body, if the doc had one. Only the *last* one
+    /// survives if a (malformed) doc comment somehow has more than one - the same "last write
+    /// wins" a hand-authored doc comment with a real duplicate tag would produce from any real
+    /// JSDoc-aware tool, not a fabricated merge of both.
+    pub returns: Option<String>,
+    /// Each real `@example`/`@examples` tag's own body, in source order - deliberately a `Vec`,
+    /// not a single `Option`, since a real doc comment legitimately shows more than one usage
+    /// example.
+    pub examples: Vec<String>,
+    /// Every other real recognized `@tag` (`@throws`, `@deprecated`, `@see`, `@since`, `@default`,
+    /// `@template`, `@remarks`, ...) this parser has no dedicated bucket for, as `(tag, body)` -
+    /// still real, still worth showing, just without params/returns/examples' own specialized
+    /// layout.
+    pub other: Vec<(String, String)>,
+}
+
+/// Splits a real `@param`/`@arg`/`@argument` tag's own remainder (the text immediately after the
+/// tag word itself) into `(name, description)` - the real shapes JSDoc's own spec documents:
+/// `name description`, `name - description`, `{Type} name description`, and an optional
+/// `[name=default]` bracket form for an optional parameter. A leading `{Type}` annotation is
+/// dropped rather than shown - this app has no separate slot for a param's own declared type yet
+/// (the same real scope [`HoverRenderModel`] itself has always drawn: `name`/description, no
+/// type column). `[`/`]` around an optional name, and any trailing `=default` inside them, are
+/// stripped so `name` always reads as a plain bare identifier either way.
+fn split_param_name(rest: &str) -> (String, String) {
+    let mut rest = rest.trim_start();
+    if let Some(after_open_brace) = rest.strip_prefix('{') {
+        if let Some(close) = after_open_brace.find('}') {
+            rest = after_open_brace[close + 1..].trim_start();
+        }
+    }
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let mut name = rest[..name_end].to_string();
+    if let Some(bracketed) = name
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        name = bracketed.split('=').next().unwrap_or(bracketed).to_string();
+    }
+    let description = rest[name_end..].trim_start();
+    let description = description
+        .strip_prefix('-')
+        .map(str::trim_start)
+        .unwrap_or(description);
+    (name, description.to_string())
+}
+
+/// Appends a real continuation line (any line of `doc` that didn't itself start a new `@tag`) to
+/// `existing`, joined by a real newline rather than concatenated flat - a multi-line `@example`'s
+/// own internal line breaks are real structure (it's code), and even a prose tag's own wrapped
+/// second line reads better as a real paragraph break than run-on text.
+fn append_doc_line(existing: &mut String, line: &str) {
+    if !existing.is_empty() {
+        existing.push('\n');
+    }
+    existing.push_str(line);
+}
+
+/// Which real section of a [`ParsedDoc`] a continuation line currently being scanned belongs to -
+/// [`parse_doc_sections`]'s own scan state, updated every time a new `@tag` line starts a section.
+enum DocSectionCursor {
+    Description,
+    Param(usize),
+    Returns,
+    Example(usize),
+    Other(usize),
+}
+
+/// Parses `doc`'s own real JSDoc-style structure - see [`ParsedDoc`]'s own docs for the shape and
+/// why this reads already-degraded plain text, not raw Markdown. A real, line-oriented scan (not
+/// a regex/grammar): any line whose first non-whitespace character is `@` immediately followed by
+/// one or more ASCII letters starts a new tagged section; every line before the first one is the
+/// real `description`; every line after one, up to the next `@tag` line or the end of `doc`, is a
+/// real continuation of that same section (see [`append_doc_line`]).
+pub fn parse_doc_sections(doc: &str) -> ParsedDoc {
+    let mut sections = ParsedDoc::default();
+    let mut description_lines: Vec<&str> = Vec::new();
+    let mut cursor = DocSectionCursor::Description;
+
+    for raw_line in doc.lines() {
+        let trimmed = raw_line.trim_start();
+        if let Some(after_at) = trimmed.strip_prefix('@') {
+            let tag_len = after_at
+                .find(|character: char| !character.is_ascii_alphabetic())
+                .unwrap_or(after_at.len());
+            if tag_len > 0 {
+                let tag = &after_at[..tag_len];
+                let rest = after_at[tag_len..].trim_start();
+                match tag {
+                    "param" | "arg" | "argument" => {
+                        sections.params.push(split_param_name(rest));
+                        cursor = DocSectionCursor::Param(sections.params.len() - 1);
+                    }
+                    "returns" | "return" => {
+                        sections.returns = Some(rest.to_string());
+                        cursor = DocSectionCursor::Returns;
+                    }
+                    "example" | "examples" => {
+                        sections.examples.push(rest.to_string());
+                        cursor = DocSectionCursor::Example(sections.examples.len() - 1);
+                    }
+                    other => {
+                        sections.other.push((other.to_string(), rest.to_string()));
+                        cursor = DocSectionCursor::Other(sections.other.len() - 1);
+                    }
+                }
+                continue;
+            }
+        }
+        match &cursor {
+            DocSectionCursor::Description => description_lines.push(raw_line),
+            DocSectionCursor::Param(index) => {
+                append_doc_line(&mut sections.params[*index].1, raw_line)
+            }
+            DocSectionCursor::Returns => {
+                if let Some(returns) = &mut sections.returns {
+                    append_doc_line(returns, raw_line);
+                }
+            }
+            DocSectionCursor::Example(index) => {
+                append_doc_line(&mut sections.examples[*index], raw_line)
+            }
+            DocSectionCursor::Other(index) => {
+                append_doc_line(&mut sections.other[*index].1, raw_line)
+            }
+        }
+    }
+
+    let description = description_lines.join("\n").trim().to_string();
+    sections.description = (!description.is_empty()).then_some(description);
+    for param in &mut sections.params {
+        param.1 = param.1.trim().to_string();
+    }
+    if let Some(returns) = &mut sections.returns {
+        *returns = returns.trim().to_string();
+    }
+    for example in &mut sections.examples {
+        *example = example.trim().to_string();
+    }
+    for other in &mut sections.other {
+        other.1 = other.1.trim().to_string();
+    }
+    sections
+}
+
 /// Item-signature keywords `rust-analyzer`'s hover convention was observed to always start a
 /// signature paragraph with (see this module's top-level docs). Deliberately not `let ` - a
 /// local variable's hover (e.g. `"let result: i32"`) starts with it too, but a local has no
@@ -301,11 +463,19 @@ pub(crate) fn degrade_markdown_to_plain_text(markdown: &str) -> String {
             if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
                 line = rest.to_string();
             }
+            // `**`/`` ` `` markers are only ever real Markdown emphasis/inline-code syntax
+            // *outside* a fence - real code (a JS/TS template literal's own backtick, a Python
+            // `2 ** 10`) uses the exact same bytes with a completely different meaning, and a
+            // fenced `@example` block is exactly where that collision is most likely to appear.
+            // Stripped per line, guarded by `!in_fence`, rather than once over the whole joined
+            // string at the end (this function's own previous shape), which stripped these bytes
+            // unconditionally - real, live-reported corruption of example code.
+            line = line.replace("**", "").replace('`', "");
         }
         out_lines.push(line);
     }
 
-    out_lines.join("\n").replace("**", "").replace('`', "")
+    out_lines.join("\n")
 }
 
 fn marked_string_text(marked: &lsp_types::MarkedString) -> String {
@@ -381,6 +551,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_doc_sections_splits_a_real_typescript_jsdoc_shape() {
+        let doc = "Adds two numbers.\n\n@param left the first number\n@param right the second \
+                    number\n@returns the sum\n@example\nadd(1, 2); // 3";
+        let sections = parse_doc_sections(doc);
+        assert_eq!(sections.description.as_deref(), Some("Adds two numbers."));
+        assert_eq!(
+            sections.params,
+            vec![
+                ("left".to_string(), "the first number".to_string()),
+                ("right".to_string(), "the second number".to_string()),
+            ]
+        );
+        assert_eq!(sections.returns.as_deref(), Some("the sum"));
+        assert_eq!(sections.examples, vec!["add(1, 2); // 3".to_string()]);
+        assert!(sections.other.is_empty());
+    }
+
+    #[test]
+    fn parse_doc_sections_strips_a_real_type_annotation_and_bracketed_optional_name() {
+        let doc = "@param {number} x the value\n@param [y=0] an optional value";
+        let sections = parse_doc_sections(doc);
+        assert_eq!(
+            sections.params,
+            vec![
+                ("x".to_string(), "the value".to_string()),
+                ("y".to_string(), "an optional value".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_doc_sections_reads_a_real_dash_separated_param_description() {
+        let sections = parse_doc_sections("@param count - how many times");
+        assert_eq!(
+            sections.params,
+            vec![("count".to_string(), "how many times".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_doc_sections_keeps_a_real_multi_line_example_as_one_block_with_real_line_breaks() {
+        let doc = "@example\nconst x = 1;\nconst y = 2;\nconsole.log(x + y);";
+        let sections = parse_doc_sections(doc);
+        assert_eq!(
+            sections.examples,
+            vec!["const x = 1;\nconst y = 2;\nconsole.log(x + y);".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_doc_sections_collects_more_than_one_real_example() {
+        let doc = "@example\nfirst();\n@example\nsecond();";
+        let sections = parse_doc_sections(doc);
+        assert_eq!(
+            sections.examples,
+            vec!["first();".to_string(), "second();".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_doc_sections_buckets_an_unrecognized_real_tag_as_other() {
+        let sections = parse_doc_sections("@throws {Error} when x is negative");
+        assert_eq!(
+            sections.other,
+            vec![(
+                "throws".to_string(),
+                "{Error} when x is negative".to_string()
+            )]
+        );
+    }
+
+    /// A real rustdoc-style doc comment (Rust's own convention: no `@`-tags at all in the
+    /// overwhelming majority of real crates) must come back as `description` alone, unchanged -
+    /// GitHub issue #200's own explicit non-goal, not a parsing gap.
+    #[test]
+    fn parse_doc_sections_leaves_a_real_untagged_rustdoc_style_comment_as_plain_description() {
+        let doc = "Adds one to the given number.\n\nReturns the incremented value.";
+        let sections = parse_doc_sections(doc);
+        assert_eq!(sections.description.as_deref(), Some(doc));
+        assert!(sections.params.is_empty());
+        assert!(sections.returns.is_none());
+        assert!(sections.examples.is_empty());
+        assert!(sections.other.is_empty());
+    }
+
+    #[test]
+    fn parse_doc_sections_has_no_description_when_the_doc_opens_directly_with_a_tag() {
+        let sections = parse_doc_sections("@param x the value");
+        assert_eq!(sections.description, None);
+    }
+
+    #[test]
     fn byte_offset_to_utf16_offset_is_identity_for_pure_ascii() {
         assert_eq!(byte_offset_to_utf16_offset("let x = 1;", 4), 4);
     }
@@ -453,6 +715,32 @@ mod tests {
         assert_eq!(model.doc.as_deref(), Some("Adds one to the given number."));
         assert!(!model.signature.contains('`'));
         assert!(!model.doc.unwrap().contains('`'));
+    }
+
+    /// Real, live-reported corruption: a fenced `@example` code block's own real content (a JS
+    /// template literal's backtick, a `2 ** 10` exponent) used to be stripped right along with
+    /// genuine Markdown `` ` ``/`**` syntax, since the old blanket `.replace(...)` ran once over
+    /// the whole joined string with no notion of "was this line inside a fence". The fence's own
+    /// delimiter lines are still dropped (unrelated, separate code path), but real code between
+    /// them must survive byte-for-byte.
+    #[test]
+    fn degrade_markdown_to_plain_text_never_mangles_real_code_inside_a_fence() {
+        let plain = degrade_markdown_to_plain_text(
+            "```typescript\nconst greeting = `Hello, ${name}`;\nconst power = 2 ** 10;\n```\n\
+             \n@example\n```typescript\nconst x = `template`;\n```",
+        );
+        assert!(
+            plain.contains("const greeting = `Hello, ${name}`;"),
+            "a real template literal's own backticks must survive - got: {plain:?}"
+        );
+        assert!(
+            plain.contains("const power = 2 ** 10;"),
+            "a real exponent's own `**` must survive - got: {plain:?}"
+        );
+        assert!(
+            plain.contains("const x = `template`;"),
+            "a second, later fenced block's own content must survive too - got: {plain:?}"
+        );
     }
 
     #[test]

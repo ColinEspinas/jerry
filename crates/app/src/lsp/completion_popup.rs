@@ -1130,9 +1130,10 @@ impl AdeApp {
                     // render_hover_card_content`'s own doc paragraph, which has never clamped -
                     // real overflow, from either the signature or the doc, is what the scroll
                     // region and its scrollbar exist to handle.
-                    .child(crate::code_surface::lsp_ui::render_doc_prose(
+                    .child(crate::code_surface::lsp_ui::render_doc_sections(
                         &doc,
                         theme::text::DIMMER,
+                        extension,
                     )),
             );
         }
@@ -1630,7 +1631,7 @@ mod completion_detail_pane_tests {
             label: "push_str".to_string(),
             detail: Some("fn push_str(&mut self, string: &str)".to_string()),
             documentation: Some(lsp_core::lsp_types::Documentation::String(
-                "Appends a given string slice.\n\n@param string the slice to append".to_string(),
+                "Appends a given string slice. See {@link String::push} for more.".to_string(),
             )),
             ..Default::default()
         };
@@ -1638,8 +1639,39 @@ mod completion_detail_pane_tests {
 
         assert!(
             cx.debug_bounds("doc-prose-tag-0").is_some(),
-            "a real @param tag inside the completion doc body must paint its own real \
-             `doc-prose-tag` run"
+            "a real inline {{@link ...}} tag inside the completion doc body's own description \
+             must still paint its own real `doc-prose-tag` run, even after block tags moved into \
+             their own real sections"
+        );
+    }
+
+    /// GitHub issue #200's own real "params/returns/example ... displayed like code in their own
+    /// section" ask, mirroring `crate::code_surface::lsp_ui`'s identical hover coverage: a real
+    /// `@param`/`@example` block tag inside a completion item's own documentation must paint as
+    /// its own real, structured section here too, not just differently-coloured inline text.
+    #[gpui::test]
+    fn real_jsdoc_block_tags_in_the_completion_doc_body_paint_their_own_structured_sections(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "Appends a given string slice.\n\n@param string the slice to append\n@example\n\
+                 s.push_str(\"abc\")"
+                    .to_string(),
+            )),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("doc-param-row-0").is_some(),
+            "a real @param tag must paint its own real parameter row"
+        );
+        assert!(
+            cx.debug_bounds("doc-example-block").is_some(),
+            "a real @example tag must paint its own real, syntax-highlighted code block"
         );
     }
 

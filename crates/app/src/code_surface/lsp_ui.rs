@@ -1070,7 +1070,7 @@ impl AdeApp {
                             .px(px(10.0))
                             .py(px(7.0))
                             .text_size(px(11.5))
-                            .child(render_doc_prose(doc, theme::text::DIM)),
+                            .child(render_doc_sections(doc, theme::text::DIM, extension)),
                     );
                 }
                 // `.flex_1().min_h_0()`: absorbs whatever height the footer below doesn't need, up to
@@ -1310,6 +1310,168 @@ pub(crate) fn render_doc_prose(
         );
     }
     wrapper.into_any_element()
+}
+
+/// A doc body's own real, structured JSDoc rendering (GitHub issue #200: "params/returns/example
+/// ... displayed like code in their own section") - [`hover_view::parse_doc_sections`]'s own real
+/// description/params/returns/examples/other split, each painted as its own real, visually
+/// distinct block, replacing what used to be one flat, undifferentiated paragraph. Shared between
+/// the Hover card and the Completions detail pane, the same two real callers [`render_doc_prose`]
+/// already had.
+///
+/// `extension` drives real syntax highlighting for `@example` bodies
+/// (`code_view::highlight_block`, the same real highlighter every other code fragment this app
+/// renders already uses) - `None` degrades to plain mono text, never a blank/missing example.
+pub(crate) fn render_doc_sections(
+    doc: &str,
+    base_color: impl Into<gpui::Hsla> + Copy,
+    extension: Option<&str>,
+) -> gpui::AnyElement {
+    let sections = hover_view::parse_doc_sections(doc);
+    let mut column = div().flex().flex_col().gap(px(10.0));
+
+    if let Some(description) = &sections.description {
+        column = column.child(render_doc_prose(description, base_color));
+    }
+    if !sections.params.is_empty() {
+        column = column.child(render_doc_params_section(&sections.params, base_color));
+    }
+    if let Some(returns) = &sections.returns {
+        column = column.child(render_doc_labeled_section(
+            "Returns",
+            render_doc_prose(returns, base_color),
+        ));
+    }
+    for example in &sections.examples {
+        column = column.child(render_doc_example_section(example, extension));
+    }
+    for (tag, body) in &sections.other {
+        column = column.child(render_doc_labeled_section(
+            &doc_tag_section_label(tag),
+            render_doc_prose(body, base_color),
+        ));
+    }
+
+    column.into_any_element()
+}
+
+/// One doc-section header - `font:600 9.5px 'IBM Plex Sans', uppercase` - the exact real small-
+/// caps label idiom this app already uses for a group header (`crate::palette::render`'s own
+/// command-palette group headers, `crate::rail::render`'s own repo-name headers), reused here
+/// rather than inventing a second one, plus `body` below it.
+fn render_doc_labeled_section(label: &str, body: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .font(font(theme::font::SANS))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(px(9.5))
+                .text_color(theme::text::FAINT)
+                .child(label.to_uppercase()),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+/// `@throws`/`@deprecated`/`@see`/... - any tag [`render_doc_sections`] has no dedicated section
+/// for - as a real, readable section label: `"see"` -> `"See"`. ASCII-only (every real JSDoc tag
+/// word is a bare ASCII identifier), so a byte-index capitalize is safe here without a
+/// grapheme-aware pass.
+fn doc_tag_section_label(tag: &str) -> String {
+    let mut chars = tag.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The `@param` section - one row per real `(name, description)` pair, the name in mono/
+/// `HighlightKind::VariableParameter`'s own colour (matching how a real parameter reads inside a
+/// highlighted signature line elsewhere in this same card) immediately followed by its prose
+/// description, rather than either buried inline in a flat paragraph or missing the visual tie to
+/// "this is a parameter name" a plain-text render gave it before this fix.
+fn render_doc_params_section(
+    params: &[(String, String)],
+    base_color: impl Into<gpui::Hsla> + Copy,
+) -> gpui::AnyElement {
+    let label = if params.len() > 1 {
+        "Parameters"
+    } else {
+        "Parameter"
+    };
+    let mut rows = div().flex().flex_col().gap(px(3.0));
+    for (index, (name, description)) in params.iter().enumerate() {
+        let mut row = div()
+            .id(("doc-param-row", index))
+            // Lets a real test measure this real row's own painted bounds (`debug_bounds` reads
+            // this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(move || format!("doc-param-row-{index}"))
+            .flex()
+            .flex_wrap()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(code_view::color_for_kind(
+                        code_view::HighlightKind::VariableParameter,
+                    ))
+                    .child(name.clone()),
+            );
+        if !description.is_empty() {
+            row = row.child(render_doc_prose(description, base_color));
+        }
+        rows = rows.child(row);
+    }
+    render_doc_labeled_section(label, rows.into_any_element())
+}
+
+/// An `@example` body - a real, syntax-highlighted (when `extension` is known) code block, mono
+/// font over a tinted background, visually distinct from surrounding prose the same way a fenced
+/// code block reads in any other real doc-rendering tool - not flat, undifferentiated paragraph
+/// text the way this app rendered doc bodies before this fix. `code_view::highlight_block` is the
+/// exact same real highlighter [`render_hover_signature`] already uses for the signature line
+/// above it, so an example genuinely gets the same real per-token colours the rest of the popup
+/// does, not a second, separately-maintained rendering path.
+fn render_doc_example_section(example: &str, extension: Option<&str>) -> gpui::AnyElement {
+    let lines = code_view::highlight_block(
+        example.lines(),
+        extension,
+        code_view::HighlightOptions::default(),
+    );
+    let mut code = div().flex().flex_col();
+    for line in lines {
+        let mut row = div().flex().flex_wrap();
+        for (run_text, kind) in line.runs {
+            row = row.child(
+                div()
+                    .text_color(code_view::color_for_kind(kind))
+                    .child(run_text),
+            );
+        }
+        code = code.child(row);
+    }
+    render_doc_labeled_section(
+        "Example",
+        div()
+            .id("doc-example-block")
+            // Lets a real test measure this real code block's own painted bounds
+            // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds, matching
+            // every other `debug_selector` in this crate.
+            .debug_selector(|| "doc-example-block".to_string())
+            .rounded(theme::radius::CARD_SM)
+            .bg(theme::surface::CURRENT_LINE)
+            .px(px(8.0))
+            .py(px(6.0))
+            .font(font(theme::font::MONO))
+            .text_size(px(10.5))
+            .child(code)
+            .into_any_element(),
+    )
 }
 
 /// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
@@ -4059,7 +4221,7 @@ mod hover_card_footer_layout_tests {
                 status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
                     module_path: None,
                     signature: "fn add_one(x: i32) -> i32".to_string(),
-                    doc: Some("Adds one.\n\n@param x the input\n@returns x + 1".to_string()),
+                    doc: Some("Adds one. See {@link add_two} for more.".to_string()),
                 })),
             });
             cx.notify();
@@ -4068,13 +4230,63 @@ mod hover_card_footer_layout_tests {
 
         assert!(
             cx.debug_bounds("doc-prose-tag-0").is_some(),
-            "a real @param tag inside the hover doc body must paint its own real \
-             `doc-prose-tag` run"
+            "a real inline {{@link ...}} tag inside the hover doc body's own description must \
+             still paint its own real `doc-prose-tag` run, even after block tags moved into \
+             their own real sections"
+        );
+    }
+
+    /// GitHub issue #200's own real "params/returns/example ... displayed like code in their own
+    /// section" ask: a real `@param`/`@returns`/`@example` block tag must paint as its own real,
+    /// structured section - a real parameter row, a real "Returns" label, a real syntax-
+    /// highlighted code block - not just differently-coloured inline text inside one flat
+    /// paragraph.
+    #[gpui::test]
+    fn real_jsdoc_block_tags_in_the_hover_doc_body_paint_their_own_structured_sections(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: Some(
+                        "Adds one.\n\n@param x the input\n@returns x + 1\n@example\nadd_one(1)"
+                            .to_string(),
+                    ),
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("doc-param-row-0").is_some(),
+            "a real @param tag must paint its own real parameter row"
         );
         assert!(
-            cx.debug_bounds("doc-prose-tag-1").is_some(),
-            "a real @returns tag inside the same doc body must paint its own real, second \
-             `doc-prose-tag` run"
+            cx.debug_bounds("doc-example-block").is_some(),
+            "a real @example tag must paint its own real, syntax-highlighted code block"
         );
     }
 
