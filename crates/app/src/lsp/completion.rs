@@ -126,52 +126,100 @@ pub fn identifier_prefix_start(line_text: &str, cursor: usize) -> usize {
 /// `crate::lsp::completion_popup`'s popover row actually renders on the row's own right side,
 /// factored out here so it's testable without a live `gpui` window.
 ///
-/// Prefers `CompletionItemLabelDetails::detail` over the legacy top-level `CompletionItem::detail`
-/// whenever a server sent one: the LSP spec's own doc comment for that field is explicit -
-/// "rendered less prominently directly after the label ... function signatures or type
-/// annotations" - which is exactly this row's own job, and it's spec-designed to stay a clean
-/// type/signature fragment with no qualifier mixed in. The legacy top-level `detail` field has no
-/// such guarantee: real servers (typescript-language-server in particular) commonly pack a
-/// qualifier *and* a type into it together for pre-3.16 clients (`"(property) Foo.bar: string"`),
-/// which read as a genuinely confusing, mixed string when shown as a bare type hint - a real,
-/// live-reported bug. Falls back to the legacy field for a server that never sent
-/// `label_details` at all (rust-analyzer's own `detail` strings are already clean for most items).
+/// Reads the legacy top-level `CompletionItem::detail`, run through [`clean_completion_detail`] -
+/// **not** `CompletionItemLabelDetails::detail`, despite that field's own doc comment sounding
+/// like the right one ("rendered less prominently directly after the label ... function
+/// signatures or type annotations"). A real, live dump against both servers this app supports
+/// (see this function's own git history for the raw dump) found that field means two genuinely
+/// different, both-real-but-neither-matching-the-spec things: `typescript-language-server` never
+/// populates it at all, even after a real `completionItem/resolve` round trip; `rust-analyzer`
+/// populates it only for a trait-provided method, with a short trait-source annotation
+/// (`"(as Into)"`, `"(as TryInto)"`) that is not a type at all - preferring it there actively
+/// broke the row hint for some of the most common real completions (`.into()`, `.try_into()`,
+/// `.clone()`). The legacy `detail` field, by contrast, is the one both real servers reliably
+/// populate with genuine type/signature text for every item tried.
 pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Option<String>) {
     let detail = item
-        .label_details
-        .as_ref()
-        .and_then(|label_details| label_details.detail.as_ref())
-        .or(item.detail.as_ref())
-        .map(|detail| detail.trim().to_string())
-        .filter(|detail| !detail.is_empty());
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| clean_completion_detail(detail, &item.label));
     (item.label.clone(), detail)
 }
 
 /// The Completions detail pane's own real signature line (its top band, syntax-highlighted in
 /// mono - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s `fn push_str(&mut self, string:
-/// &str)` example) - `label` immediately followed by `label_details.detail` (no space between
-/// them, matching that field's own spec: "rendered ... directly after the label, without any
-/// spacing") whenever a server sent one, composing the same clean, module-free "typing of the
-/// suggestion" [`completion_item_display`]'s own docs describe, just spelled out in full rather
-/// than left implicit next to a separately-rendered label. Falls back to the legacy top-level
-/// `detail` string (already a real, complete, standalone signature for most rust-analyzer items),
-/// then to the bare `label`, for a server that never sent `label_details` at all.
+/// &str)` example) - the same [`clean_completion_detail`]-cleaned legacy `detail` string
+/// [`completion_item_display`] reads (see that function's own docs for why `label_details.detail`
+/// is deliberately not consulted here), falling back to the bare `label` for an item with no real
+/// detail at all (a bare `label`/`kind`-only item that hasn't been resolved yet, or a server that
+/// never sends one for this item's own kind).
 pub fn completion_signature_text(item: &lsp_types::CompletionItem) -> String {
-    if let Some(detail) = item
-        .label_details
-        .as_ref()
-        .and_then(|label_details| label_details.detail.as_deref())
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty())
-    {
-        return format!("{}{detail}", item.label);
-    }
     item.detail
         .as_deref()
         .map(str::trim)
         .filter(|detail| !detail.is_empty())
-        .unwrap_or(item.label.as_str())
-        .to_string()
+        .map(|detail| clean_completion_detail(detail, &item.label))
+        .unwrap_or_else(|| item.label.clone())
+}
+
+/// Strips `typescript-language-server`'s own real, live-observed `"(kind) Qualifier.member(...)"`
+/// convention (e.g. `"(method) QueryBuilder.pushStr(s: string): void"` -> `"pushStr(s: string):
+/// void"`, `"(property) Foo.bar: string"` -> `"bar: string"`) from a completion item's legacy
+/// `detail` string, when present - the real, server-baked-in source of "a weird mix of modules
+/// and typing" a user reported seeing, with no separate structured field (see
+/// [`completion_item_display`]'s own docs) this app could read the clean half from instead. Two
+/// independent, both-conservative steps:
+///
+/// 1. A leading `"(word[ word]) "` parenthetical is dropped only when its own content has no `:`
+///    or `,` - the real shape every one of TypeScript's own kind descriptors (`method`,
+///    `property`, `local var`, `alias`, `type parameter`, ...) takes, and never the shape a real
+///    parameter list or tuple type does (`"(x: number)"`, `"(number, string)"`) - so a real
+///    completion whose detail genuinely starts with a parenthesized *type* is never misread as a
+///    kind descriptor and mangled.
+/// 2. If `label` then occurs near the very start of what's left, preceded by a bare `"Qualifier."`
+///    (no whitespace before the `.`), that qualifier is dropped too - `rust-analyzer`'s own
+///    already-clean detail strings (`"fn(&mut self, &str)"`, `"fn(self) -> T"`) never match this
+///    shape at all (no `(word) ` prefix, and `label` never reappears inside them), so they pass
+///    through this function completely untouched.
+pub fn clean_completion_detail(detail: &str, label: &str) -> String {
+    let without_kind_prefix = strip_leading_kind_parenthetical(detail);
+    if let Some(label_start) = without_kind_prefix.find(label) {
+        if label_start > 0 && label_start <= without_kind_prefix.len().min(80) {
+            let before = &without_kind_prefix[..label_start];
+            if before.ends_with('.') && !before[..before.len() - 1].contains(char::is_whitespace) {
+                return without_kind_prefix[label_start..].to_string();
+            }
+        }
+    }
+    without_kind_prefix.to_string()
+}
+
+/// The first real step [`clean_completion_detail`] runs - see that function's own docs for the
+/// real shape this looks for and why a genuine parameter-list/tuple-type parenthetical is never
+/// mistaken for one.
+fn strip_leading_kind_parenthetical(detail: &str) -> &str {
+    let Some(inner) = detail.strip_prefix('(') else {
+        return detail;
+    };
+    let Some(close) = inner.find(')') else {
+        return detail;
+    };
+    let kind_word = &inner[..close];
+    if kind_word.is_empty()
+        || kind_word.contains(':')
+        || kind_word.contains(',')
+        || kind_word.contains('(')
+    {
+        return detail;
+    }
+    let rest = inner[close + 1..].trim_start();
+    if rest.is_empty() {
+        detail
+    } else {
+        rest
+    }
 }
 
 /// A completion item's real doc prose, for the detail pane's own body text
@@ -822,83 +870,57 @@ mod tests {
         assert_eq!(completion_item_display(&no_detail_item).1, None);
     }
 
-    /// The real, live-reported bug this session: a server (typescript-language-server, in
-    /// practice) sending a legacy top-level `detail` that mixes a qualifier and a type together
-    /// (`"(property) Foo.bar: string"`) must not win over a real `label_details.detail` the same
-    /// item also sent - the row's own right-side hint should read as the clean, spec-designed
-    /// type fragment (`"string"`), not the mixed legacy string.
+    /// The real, live-reported bug: `rust-analyzer`'s own real `label_details.detail` for a
+    /// trait-provided method (`.into()`, `.try_into()`, ...) is a short trait-source annotation
+    /// (`"(as Into)"`), not a type at all - a real, live dump proved preferring it over the
+    /// legacy `detail` field (which *is* the real, clean signature for these same items) broke
+    /// the row hint for some of the most common completions there are. Both
+    /// `completion_item_display` and `completion_signature_text` must ignore `label_details`
+    /// entirely and read the legacy field.
     #[test]
-    fn completion_item_display_prefers_a_real_label_details_detail_over_the_legacy_mixed_detail_string(
-    ) {
+    fn completion_item_display_ignores_a_real_rust_analyzer_trait_source_label_details_detail() {
         let item = lsp_types::CompletionItem {
-            label: "bar".to_string(),
-            detail: Some("(property) Foo.bar: string".to_string()),
+            label: "into".to_string(),
+            detail: Some("fn(self) -> T".to_string()),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: Some(": string".to_string()),
-                description: Some("Foo".to_string()),
-            }),
-            ..Default::default()
-        };
-        let (label, detail) = completion_item_display(&item);
-        assert_eq!(label, "bar");
-        assert_eq!(
-            detail.as_deref(),
-            Some(": string"),
-            "the row's own right-side hint must read from the real label_details.detail field, \
-             never the legacy detail string it was designed to replace"
-        );
-    }
-
-    #[test]
-    fn completion_item_display_falls_back_to_the_legacy_detail_without_real_label_details() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            detail: Some("fn(&mut self, &str)".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_item_display(&item).1.as_deref(),
-            Some("fn(&mut self, &str)"),
-            "a server that never sent label_details at all must still get a real row hint from \
-             the legacy detail field"
-        );
-    }
-
-    #[test]
-    fn completion_item_display_falls_back_to_legacy_detail_when_label_details_detail_is_blank() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            detail: Some("fn(&mut self, &str)".to_string()),
-            label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: None,
-                description: Some("alloc::string::String".to_string()),
+                detail: Some("(as Into)".to_string()),
+                description: Some("fn(self) -> T".to_string()),
             }),
             ..Default::default()
         };
         assert_eq!(
             completion_item_display(&item).1.as_deref(),
-            Some("fn(&mut self, &str)"),
-            "a real label_details with no detail field of its own must not suppress the legacy \
-             detail string - only a real label_details.detail should ever win"
+            Some("fn(self) -> T"),
+            "the row's own right-side hint must read the real legacy detail string, never the \
+             trait-source annotation rust-analyzer puts in label_details.detail"
         );
     }
 
     #[test]
-    fn completion_signature_text_composes_the_label_with_a_real_label_details_detail() {
+    fn completion_item_display_falls_back_to_the_bare_label_with_no_real_detail_at_all() {
         let item = lsp_types::CompletionItem {
             label: "push_str".to_string(),
-            detail: Some("this legacy string must lose to label_details".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(completion_item_display(&item).1, None);
+    }
+
+    #[test]
+    fn completion_signature_text_ignores_label_details_and_cleans_the_legacy_detail() {
+        let item = lsp_types::CompletionItem {
+            label: "pushStr".to_string(),
+            detail: Some("(method) QueryBuilder.pushStr(s: string): void".to_string()),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: Some("(&mut self, string: &str)".to_string()),
-                description: Some("alloc::string::String".to_string()),
+                detail: Some("this must never appear in the signature line".to_string()),
+                description: Some("also never".to_string()),
             }),
             ..Default::default()
         };
         assert_eq!(
             completion_signature_text(&item),
-            "push_str(&mut self, string: &str)",
-            "the pane's own signature line must compose label + label_details.detail (no space, \
-             per that field's own spec) whenever a server sent one, never the legacy detail string"
+            "pushStr(s: string): void",
+            "the pane's own signature line must clean the real legacy detail string, never read \
+             label_details at all"
         );
     }
 
@@ -912,9 +934,8 @@ mod tests {
         assert_eq!(
             completion_signature_text(&item),
             "fn push_str(&mut self, string: &str)",
-            "rust-analyzer's own convention - a real, complete, standalone signature string in \
-             the legacy detail field - must still be used verbatim for a server that never sent \
-             label_details"
+            "rust-analyzer's own convention - a real, complete, standalone signature string \
+             with no kind/qualifier prefix to clean - must pass through unchanged"
         );
     }
 
@@ -925,6 +946,63 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(completion_signature_text(&item), "push_str");
+    }
+
+    /// Real, live-observed shapes from both servers this app supports - a real dump against a
+    /// genuinely spawned rust-analyzer/typescript-language-server, not synthetic guesses (see
+    /// `clean_completion_detail`'s own docs).
+    #[test]
+    fn clean_completion_detail_strips_a_real_typescript_method_kind_and_qualifier_prefix() {
+        assert_eq!(
+            clean_completion_detail("(method) QueryBuilder.pushStr(s: string): void", "pushStr"),
+            "pushStr(s: string): void"
+        );
+    }
+
+    #[test]
+    fn clean_completion_detail_strips_a_real_typescript_property_kind_and_qualifier_prefix() {
+        assert_eq!(
+            clean_completion_detail("(property) Foo.bar: string", "bar"),
+            "bar: string"
+        );
+    }
+
+    #[test]
+    fn clean_completion_detail_leaves_a_real_rust_analyzer_signature_untouched() {
+        assert_eq!(
+            clean_completion_detail("fn(&mut self, &str)", "push_str"),
+            "fn(&mut self, &str)"
+        );
+        assert_eq!(
+            clean_completion_detail("fn(self) -> T", "into"),
+            "fn(self) -> T"
+        );
+    }
+
+    /// The real guard against a false-positive strip: a genuine parenthesized parameter list or
+    /// tuple type at the very start of `detail` must never be mistaken for a kind descriptor -
+    /// distinguished by the real presence of `:`/`,` inside the parens, which no real TypeScript
+    /// kind descriptor (`method`, `property`, `local var`, ...) ever contains.
+    #[test]
+    fn clean_completion_detail_never_strips_a_real_parenthesized_type() {
+        assert_eq!(
+            clean_completion_detail("(x: number) => void", "onClick"),
+            "(x: number) => void"
+        );
+        assert_eq!(
+            clean_completion_detail("(number, string)", "pair"),
+            "(number, string)"
+        );
+    }
+
+    #[test]
+    fn clean_completion_detail_only_strips_a_real_bare_dotted_qualifier() {
+        // The label reappearing deep inside a return type, with no real `Qualifier.` immediately
+        // before it, must not be mistaken for one.
+        assert_eq!(
+            clean_completion_detail("fn() -> Option<Table>", "Table"),
+            "fn() -> Option<Table>"
+        );
     }
 
     #[test]
