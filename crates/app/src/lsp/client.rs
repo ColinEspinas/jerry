@@ -789,19 +789,48 @@ impl AdeApp {
         let Some(binary) = crate::language::lsp_binary_for_extension(extension) else {
             return;
         };
+        // Read here, on the GPUI thread, and moved into the builders below - which run on the
+        // background executor and so cannot reach `self`. See
+        // `crate::settings::store::LspServerSettings`.
+        //
+        // Layered built-in -> this app's own auto-import suppression -> the user's own
+        // passthrough, so a hand-written `settings.toml` entry always has the last word over a
+        // settings-page toggle.
+        let user_lsp_settings = self.settings.lsp.clone();
+        let suggest_auto_imports = self.settings.editor.suggest_auto_imports;
+        let apply_user_options =
+            std::sync::Arc::new(move |config: &mut lsp_core::ServerSpawnConfig| {
+                if !suggest_auto_imports {
+                    config.initialization_options =
+                        crate::language::merge_initialization_options_json(
+                            config.initialization_options.take(),
+                            crate::language::auto_import_suppression_options(config.name),
+                        );
+                }
+                config.initialization_options = crate::language::merge_initialization_options(
+                    config.initialization_options.take(),
+                    user_lsp_settings
+                        .get(config.name)
+                        .and_then(|server| server.initialization_options.as_ref()),
+                );
+            });
         self.spawn_lsp_client(
             (repo_root.clone(), binary),
             repo_root.clone(),
             {
                 let repo_root = repo_root.clone();
+                let apply_user_options = std::sync::Arc::clone(&apply_user_options);
                 move || {
                     // The real `ServerSpawnConfig` (including any `$PATH`/filesystem probing it
                     // does - Pyright's `pythonPath` resolution, Vue's `--tsdk` resolution) is
                     // built here, off the GPUI thread - see this method's own docs for why that
                     // moved from the caller.
-                    crate::language::server_spawn_config(&repo_root, extension)?.ok_or_else(|| {
+                    let mut config = crate::language::server_spawn_config(&repo_root, extension)?
+                        .ok_or_else(|| {
                         format!("no LSP server is configured for extension {extension:?}")
-                    })
+                    })?;
+                    apply_user_options(&mut config);
+                    Ok(config)
                 }
             },
             cx,
@@ -811,7 +840,11 @@ impl AdeApp {
             self.spawn_lsp_client(
                 (repo_root.clone(), companion.client_key),
                 repo_root,
-                move || crate::language::companion_spawn_config(&companion),
+                move || {
+                    let mut config = crate::language::companion_spawn_config(&companion)?;
+                    apply_user_options(&mut config);
+                    Ok(config)
+                },
                 cx,
             );
         }

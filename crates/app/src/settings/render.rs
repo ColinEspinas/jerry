@@ -2669,6 +2669,19 @@ impl AdeApp {
                 |this, cx| this.toggle_minimap_enabled(cx),
             ),
         );
+        let suggest_auto_imports_row = self.render_settings_row(
+            "Suggest auto-imports",
+            "Offer completions for symbols this file hasn't imported yet. Turn this off in a \
+             browser project, where an installed @types/node drags Node's whole API into every \
+             list. Currently applies to TypeScript and JavaScript only - the equivalent for other \
+             servers isn't wired yet, and isn't faked.",
+            self.render_toggle_control(
+                "settings-editor-suggest-auto-imports",
+                self.settings.editor.suggest_auto_imports,
+                cx,
+                |this, cx| this.toggle_suggest_auto_imports(cx),
+            ),
+        );
         let auto_import_row = self.render_settings_row(
             "Auto-import on accept",
             "When a completion comes from a module this file doesn't import yet, accepting it \
@@ -2730,6 +2743,7 @@ impl AdeApp {
                     .text_color(theme::palette::GROUP_HEADER)
                     .child("Completions"),
             )
+            .child(suggest_auto_imports_row)
             .child(auto_import_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Editor))
     }
@@ -2838,6 +2852,15 @@ impl AdeApp {
     /// reads this directly every render.
     fn toggle_minimap_enabled(&mut self, cx: &mut Context<Self>) {
         self.settings.editor.minimap_enabled = !self.settings.editor.minimap_enabled;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// The Editor page's "suggest auto-imports" toggle. Applied at spawn time, so it takes effect
+    /// for servers started after it changes - see `crate::lsp::client::AdeApp::ensure_lsp_client`
+    /// and `crate::language::auto_import_suppression_options`.
+    fn toggle_suggest_auto_imports(&mut self, cx: &mut Context<Self>) {
+        self.settings.editor.suggest_auto_imports = !self.settings.editor.suggest_auto_imports;
         self.persist_settings(cx);
         cx.notify();
     }
