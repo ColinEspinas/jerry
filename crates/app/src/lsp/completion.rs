@@ -138,30 +138,48 @@ pub fn identifier_prefix_start(line_text: &str, cursor: usize) -> usize {
 /// broke the row hint for some of the most common real completions (`.into()`, `.try_into()`,
 /// `.clone()`). The legacy `detail` field, by contrast, is the one both real servers reliably
 /// populate with genuine type/signature text for every item tried.
+///
+/// `CompletionItemLabelDetails::**description**` is a third field again, deliberately read only
+/// for the import source and never for the type slot: under this app's own real handshake
+/// (`labelDetailsSupport` advertised, `resolveSupport` deliberately not - see
+/// `lsp_core::client`'s capabilities) a live `rust-analyzer` fills it with a verbatim copy of
+/// `detail`, so consulting it would add nothing, while `pyright-langserver` fills it with the
+/// *module* an auto-import would come from. See [`split_completion_detail`] for the full
+/// per-server field survey, dumped live through that exact handshake.
 pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Option<String>) {
     (item.label.clone(), split_completion_detail(item).signature)
 }
 
-/// The real, per-slot split of whatever a server packed into one `CompletionItem::detail` string.
+/// The real, per-slot split of whatever a server packed into `CompletionItem`'s three descriptive
+/// fields.
 ///
-/// The popup has three genuinely different slots - the row's own right-side type hint, the detail
-/// pane's signature line, and the pane's module-path footer - but the LSP gives one `detail`
-/// field, and a real dump against both servers this app supports showed that field carrying
-/// different *kinds* of thing depending on the item, not just different text:
+/// The popup has three genuinely different slots - the row's own type hint, the row's import
+/// source (also the detail pane's module footer), and the pane's signature line - and the LSP
+/// gives `detail`, `labelDetails.detail` and `labelDetails.description` to fill them. Dumped live
+/// from every server this app spawns that can also be spawned here, each through this app's own
+/// exact handshake (`labelDetailsSupport` advertised, `resolveSupport` deliberately not - see
+/// `lsp_core::client`'s `ClientCapabilities`), no two agree on which field means what:
 ///
-/// - `rust-analyzer`, method/field: a genuine signature (`"fn(self) -> T"`, `"String"`).
-/// - `rust-analyzer`, type/primitive: the label over again (`label: "Widget"`, `detail:
-///   "Widget"`) - rendering it as a type hint printed `"Widget   Widget"`, pure redundancy.
-/// - `typescript-language-server`, resolved auto-import: two lines, an import note *then* the
-///   real signature (`"Auto import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`).
-/// - `typescript-language-server`, unresolved auto-import: the bare module specifier and nothing
-///   else (`"./helper"`).
+/// | | `detail`, unresolved | `labelDetails.detail` | `labelDetails.description` |
+/// |---|---|---|---|
+/// | `rust-analyzer` | the real signature/type (`usize`, `const fn(&self) -> usize`), or the label again for a type item | `(use std::io::Result)`, `(as Into)`, `(alias ==, !=)` | a verbatim copy of `detail` |
+/// | `typescript-language-server` | `null`, or a bare module specifier on an auto-import (`fs`, `fs/promises`, `vue`) | never set | never set |
+/// | `pyright-langserver` | `null`, or the literal marker `Auto-import` | never set | the module (`os`) on an auto-import |
 ///
-/// The last two are the live-reported "the shown things are still modules instead of real types":
-/// a module path was landing in the slot the design reserves for a type. Splitting here means a
-/// path goes to the footer that exists for paths, a real signature goes to the type slot, and a
-/// slot with nothing genuine to show stays empty rather than showing a path or an echo of the
-/// label.
+/// (That handshake matters: told `resolveSupport` covers `detail`, `rust-analyzer` sends `null`
+/// there instead and defers the type to `completionItem/resolve`. This app doesn't tell it that,
+/// which is why every `rust-analyzer` row genuinely does carry its type on the very first
+/// response.)
+///
+/// So each slot is filled from whichever field genuinely holds that kind of thing:
+///
+/// - **type**: `detail`, when it is a real signature rather than a path, a marker, or the label
+///   over again.
+/// - **import source**: `typescript-language-server`'s `"Auto import from 'X'"` note or bare
+///   specifier, `rust-analyzer`'s `(use path)` note, `pyright`'s `description` beside an
+///   `Auto-import` marker. See [`completion_import_source`] for why a row needs this at all.
+/// - and a slot with nothing genuine to show stays empty rather than showing a path, a marker, or
+///   an echo of the label.
 struct CompletionDetail {
     /// The type/signature slot - `None` when the server sent nothing that is genuinely one.
     signature: Option<String>,
@@ -170,13 +188,23 @@ struct CompletionDetail {
 }
 
 fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail {
-    let described_path = item
-        .label_details
-        .as_ref()
+    let label_details = item.label_details.as_ref();
+    let description = label_details
         .and_then(|label_details| label_details.description.as_deref())
         .map(str::trim)
-        .filter(|description| looks_like_module_path(description))
+        .filter(|description| !description.is_empty() && *description != item.label);
+    // `pyright-langserver` puts no module path in `detail` at all - just the literal marker
+    // `"Auto-import"` - and names the real module in `description`. See
+    // [`detail_is_auto_import_marker`].
+    let described_path = description
+        .filter(|description| {
+            looks_like_module_path(description) || detail_is_auto_import_marker(item)
+        })
         .map(str::to_string);
+    let use_note_path = label_details
+        .and_then(|label_details| label_details.detail.as_deref())
+        .and_then(use_note_module_path);
+    let annotated_path = use_note_path.or(described_path);
 
     let Some(raw) = item
         .detail
@@ -186,7 +214,7 @@ fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail
     else {
         return CompletionDetail {
             signature: None,
-            module_path: described_path,
+            module_path: annotated_path,
         };
     };
 
@@ -194,16 +222,65 @@ fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail
     let cleaned = clean_completion_detail(rest, &item.label);
     let cleaned = cleaned.trim();
 
-    // A detail that is just the label again carries no information the row doesn't already show.
-    let redundant = cleaned.is_empty() || cleaned == item.label;
+    // A detail that is just the label again carries no information the row doesn't already show -
+    // and neither does `pyright`'s bare `"Auto-import"` marker, which names no type of any kind.
+    let redundant =
+        cleaned.is_empty() || cleaned == item.label || detail_is_auto_import_marker(item);
     let detail_is_path = !redundant && detail_is_module_specifier(cleaned, item.kind);
 
     CompletionDetail {
         signature: (!redundant && !detail_is_path).then(|| cleaned.to_string()),
         module_path: import_path
             .or_else(|| detail_is_path.then(|| cleaned.to_string()))
-            .or(described_path),
+            .or(annotated_path),
     }
+}
+
+/// Whether this item's `detail` is `pyright-langserver`'s own literal `"Auto-import"` marker,
+/// which is neither a type nor a path and must not be printed as either.
+///
+/// Live dump against a real `pyright-langserver`: across four completion positions, every single
+/// `detail` it sent was either `null` or exactly this one string, on every kind it offers -
+/// `{"label":"path","kind":6,"detail":"Auto-import","labelDetails":{"description":"os"}}`,
+/// `{"label":"PathLike","kind":7,...}`, `{"label":"_path","kind":9,...}`,
+/// `{"label":"P_NOWAIT","kind":21,...}`. The real module always sits in
+/// `labelDetails.description` (`"os"`) instead.
+///
+/// It carries no whitespace and no path separator, so without this the module-specifier rule filed
+/// it as a module path on the kinds [`kind_has_no_one_word_type`] covers and as a *type* on the
+/// rest: a literal `Auto-import` printed across a whole Python completion list in two different
+/// slots, neither of which it belongs in, while `os` went unread. Matched exactly, not by prefix -
+/// this is a fixed marker string, and anything longer is real prose that deserves its own reading.
+fn detail_is_auto_import_marker(item: &lsp_types::CompletionItem) -> bool {
+    item.detail.as_deref().map(str::trim) == Some("Auto-import")
+}
+
+/// The path out of `rust-analyzer`'s own real `"(use std::io::Result)"` import note, which it puts
+/// in `CompletionItemLabelDetails::detail` - `Some("std::io::Result")` here, and `None` for
+/// anything else that field carries.
+///
+/// Live dump, completing `let r: Resu` against a real `rust-analyzer`: **four** items labelled
+/// `Result` come back, three of them auto-import candidates whose only difference at all is this
+/// note (`"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`).
+/// `detail` is `null` on all three and their `textEdit`s are byte-identical, so nothing else could
+/// have told those rows apart - and this field was read nowhere, leaving three rows a user cannot
+/// choose between for three genuinely different `use` statements.
+///
+/// Narrow on purpose: of the 14 items carrying a `label_details.detail` in that same dump, 8 were
+/// `(use ...)` notes and the rest were doc-alias notes (`"(alias ==, !=)"`, `"(alias ?, ?Sized)"`,
+/// `"(alias list, vector)"`), with an ordinary trait method carrying `"(as Into)"`. None of those
+/// names a module, so only the literal `use` form is accepted, and the extracted text still has to
+/// pass [`looks_like_module_path`] before it counts.
+///
+/// Searched for rather than anchored at the start, because `rust-analyzer` really does concatenate
+/// the two kinds of note when an item has both - verbatim from that same dump:
+/// `"(alias GetTempPath, GetTempPath2) (use std::env::temp_dir)"` on `std::env::temp_dir`. An
+/// anchored match would have dropped the import source on exactly the items carrying the most
+/// annotation.
+fn use_note_module_path(note: &str) -> Option<String> {
+    let after_use = note.split_once("(use ")?.1;
+    let path = after_use[..after_use.find(')')?].trim();
+    looks_like_module_path(path).then(|| path.to_string())
 }
 
 /// Splits `typescript-language-server`'s own real two-line auto-import detail into the import path
@@ -301,6 +378,17 @@ fn detail_is_module_specifier(text: &str, kind: Option<lsp_types::CompletionItem
 /// `FIELD`/`VARIABLE`/`PROPERTY`/`CONSTANT` and friends are deliberately absent: a real one-word
 /// type on those is the common case, and misrouting it into the module-path footer would be a
 /// worse bug than the one this fixes.
+///
+/// A known, still-unhandled case, recorded here rather than guessed at: a live
+/// `typescript-language-server` *does* send a bare package specifier on a `VARIABLE` too
+/// (`{"label":"createApp","kind":6,"detail":"vue"}` for an unresolved auto-import from `vue`, seen
+/// on screen), so `vue` shows in that row's type slot until the resolve moves it to the import
+/// source. Widening this list to `VARIABLE` would fix that and break `rust-analyzer`'s own real
+/// `{"label":"text","kind":6,"detail":"String"}` in the same stroke. The one discriminator that
+/// separates them in every dump taken here - `typescript-language-server` never sends
+/// `labelDetails` at all, `rust-analyzer` always does - holds for the three servers that could be
+/// spawned and probed in this sandbox, but `gopls` (also in `crate::language`'s registry) could
+/// not be, so it is left unused rather than adopted on two thirds of a survey.
 fn kind_has_no_one_word_type(kind: Option<lsp_types::CompletionItemKind>) -> bool {
     matches!(
         kind,
@@ -423,6 +511,35 @@ pub fn completion_documentation_text(item: &lsp_types::CompletionItem) -> Option
 /// a guessed or re-derived one, and never a signature dressed up as a path.
 pub fn completion_module_path(item: &lsp_types::CompletionItem) -> Option<String> {
     split_completion_detail(item).module_path
+}
+
+/// The module a completion *row* says this item would be imported from - the same real path
+/// [`completion_module_path`] gives the detail pane's footer, surfaced on the row itself.
+///
+/// Exists because the footer describes the **selected** row alone, and the real, live-reported
+/// duplicates are precisely rows that differ in nothing else. Two verbatim dumps:
+///
+/// - `typescript-language-server`, completing `app` in a real project with `@types/node`: two
+///   `appendFile` items, both `kind: FUNCTION`, both with no `labelDetails`, `filterText`,
+///   `insertText` or `textEdit` at all, differing only in `detail` - `"fs"` against
+///   `"fs/promises"`. Two genuinely different `import` statements.
+/// - `rust-analyzer`, completing `let r: Resu`: three `Result` items differing only in
+///   `labelDetails.detail` - `"(use std::fmt::Result)"`, `"(use std::io::Result)"`,
+///   `"(use std::thread::Result)"`. Three genuinely different `use` statements.
+///
+/// Both sets are real choices, so [`rank_completion_items`] deliberately keeps every row (see
+/// [`interchangeable_completion_key`]). But neither server sends a signature for any of them
+/// before `completionItem/resolve` - of a real 1029-item TypeScript response, not one item carried
+/// a multi-token `detail` - so the type slot was empty on all of them and the rows painted
+/// identically. The fix is not fewer rows; it is a row that shows the one thing that differs.
+///
+/// A separate span from the type hint on purpose: this string must read the same before and after
+/// `completionItem/resolve` (`"fs"` unresolved, `"Auto import from 'fs'\nnamespace appendFile..."`
+/// resolved, both yielding `"fs"`), where the type slot legitimately goes from empty to a
+/// signature. Sharing one slot would put the module name where a type belongs and then visibly
+/// swap it - the exact behaviour [`detail_is_module_specifier`] exists to stop.
+pub fn completion_import_source(item: &lsp_types::CompletionItem) -> Option<String> {
+    completion_module_path(item)
 }
 
 /// The Completions popup's real kind-badge category (design:
@@ -1467,6 +1584,243 @@ mod tests {
             completion_module_path(&item).as_deref(),
             Some("std::collections::HashMap")
         );
+    }
+
+    /// `pyright-langserver`, the third real server this app spawns, uses `detail` for neither a
+    /// type nor a path: a live dump shows it holds the literal marker string `"Auto-import"` and
+    /// nothing else, with the real module in `labelDetails.description`:
+    ///
+    /// ```text
+    /// {"label":"_path","kind":9,"detail":"Auto-import","labelDetails":{"description":"os"}}
+    /// {"label":"path","kind":6,"detail":"Auto-import","labelDetails":{"description":"os"}}
+    /// ```
+    ///
+    /// `"Auto-import"` is a single token with no path separator, so the module-specifier rule was
+    /// filing it as this item's *module path* on class/function/module-kinded rows and as its
+    /// *type* on variable/constant-kinded ones - a literal `Auto-import` printed in both slots
+    /// across a whole Python completion list, while the real module name (`os`) went unread.
+    #[test]
+    fn a_real_pyright_auto_import_marker_is_neither_a_type_nor_a_module_path() {
+        for (label, kind) in [
+            ("_path", lsp_types::CompletionItemKind::MODULE),
+            ("path", lsp_types::CompletionItemKind::VARIABLE),
+            ("PathLike", lsp_types::CompletionItemKind::CLASS),
+            ("P_NOWAIT", lsp_types::CompletionItemKind::CONSTANT),
+        ] {
+            let item = lsp_types::CompletionItem {
+                label: label.to_string(),
+                kind: Some(kind),
+                detail: Some("Auto-import".to_string()),
+                label_details: Some(lsp_types::CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some("os".to_string()),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_item_display(&item).1,
+                None,
+                "{label}: `Auto-import` is a marker, not this item's type"
+            );
+            assert_eq!(
+                completion_import_source(&item).as_deref(),
+                Some("os"),
+                "{label}: the module it would import from is the real one the server named, not \
+                 the marker"
+            );
+        }
+    }
+
+    /// The live-reported "`appendFile` appears four times", dumped verbatim from a real
+    /// `typescript-language-server` against a real scratch project with a real `@types/node`
+    /// installed, completing `app` at `const other = app`.
+    ///
+    /// The two `appendFile` items that come back are **not** duplicates: they are two genuinely
+    /// different auto-import candidates - `import { appendFile } from 'fs'` (callback-style) and
+    /// `import { appendFile } from 'fs/promises'` (promise-style) - and accepting one inserts a
+    /// genuinely different `import` line from the other. So [`rank_completion_items`] is right to
+    /// keep both rows; `detail` differs, and `detail` is part of
+    /// [`interchangeable_completion_key`].
+    ///
+    /// What was wrong is that the row painted *nothing* to tell them apart. Neither item has a
+    /// signature before `completionItem/resolve` (the whole 1029-item response carries not one
+    /// multi-token `detail`), so the type slot is empty on both, and the only field that differs
+    /// went to the detail pane's module footer - visible for the *selected* row alone. Two
+    /// identical-looking rows, exactly as reported. The module the item would be imported from now
+    /// reaches the row itself.
+    #[test]
+    fn two_real_auto_import_candidates_for_one_label_show_which_module_each_comes_from() {
+        let candidate = |module: &str| lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(module.to_string()),
+            sort_text: Some("\u{ffff}16".to_string()),
+            ..Default::default()
+        };
+        let items = [candidate("fs"), candidate("fs/promises")];
+        assert_eq!(
+            rank_completion_items(&items, "app"),
+            vec![0, 1],
+            "two different importable candidates are two real choices, not one duplicated row"
+        );
+        assert_eq!(
+            completion_import_source(&items[0]).as_deref(),
+            Some("fs"),
+            "the row must say which module this candidate would import from - without it the two \
+             rows are byte-identical on screen"
+        );
+        assert_eq!(
+            completion_import_source(&items[1]).as_deref(),
+            Some("fs/promises")
+        );
+        assert_eq!(
+            completion_item_display(&items[0]).1,
+            None,
+            "and it must still not be shown in the slot reserved for a type"
+        );
+    }
+
+    /// The same import source must read identically before and after `completionItem/resolve`, or
+    /// the row would visibly swap one string for another under the user - the exact complaint
+    /// `detail_is_module_specifier` was added for. Both halves dumped verbatim from the same live
+    /// `typescript-language-server` response above.
+    #[test]
+    fn a_resolved_auto_import_candidate_keeps_the_very_same_import_source_on_its_row() {
+        let unresolved = lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fs".to_string()),
+            ..Default::default()
+        };
+        let resolved = lsp_types::CompletionItem {
+            detail: Some(
+                "Auto import from 'fs'\nnamespace appendFile\nfunction appendFile(path: \
+                 fs.PathOrFileDescriptor, data: string | Uint8Array, options: fs.WriteFileOptions, \
+                 callback: fs.NoParamCallback): void (+1 overload)"
+                    .to_string(),
+            ),
+            ..unresolved.clone()
+        };
+        assert_eq!(
+            completion_import_source(&unresolved),
+            completion_import_source(&resolved),
+            "resolving must only ever *add* a type to the row, never move or rewrite the import \
+             source already printed on it"
+        );
+        assert_eq!(completion_import_source(&resolved).as_deref(), Some("fs"));
+        assert!(
+            completion_item_display(&resolved)
+                .1
+                .is_some_and(|signature| signature.starts_with("namespace appendFile")),
+            "and the type slot gains the signature the resolve finally supplied"
+        );
+    }
+
+    /// `rust-analyzer`'s own version of the same thing, dumped verbatim from a live server at
+    /// `let r: Resu`: **four** items labelled `Result`, three of them auto-import candidates that
+    /// differ in nothing but `labelDetails.detail` - `"(use std::fmt::Result)"`,
+    /// `"(use std::io::Result)"`, `"(use std::thread::Result)"`. Their `detail` is `null` and
+    /// their `textEdit` is byte-identical, so every one of those rows painted a bare `Result` and
+    /// an empty type slot: three rows a user genuinely cannot choose between, for three genuinely
+    /// different `use` statements.
+    ///
+    /// That note is the one field carrying the difference, and nothing rendered it anywhere -
+    /// [`split_completion_detail`] only ever consulted `label_details.description`, which these
+    /// items leave unset.
+    #[test]
+    fn three_real_rust_analyzer_import_candidates_each_name_the_use_they_would_add() {
+        let candidate = |path: &str| lsp_types::CompletionItem {
+            label: "Result".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::STRUCT),
+            filter_text: Some("Result".to_string()),
+            sort_text: Some("80000000".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some(format!("(use {path})")),
+                description: None,
+            }),
+            ..Default::default()
+        };
+        for path in ["std::fmt::Result", "std::io::Result", "std::thread::Result"] {
+            let item = candidate(path);
+            assert_eq!(
+                completion_import_source(&item).as_deref(),
+                Some(path),
+                "{path}: the `use` this candidate would add is the only thing distinguishing it \
+                 from its siblings, so the row has to show it"
+            );
+            assert_eq!(
+                completion_module_path(&item).as_deref(),
+                Some(path),
+                "{path}: and the detail pane's own module footer, empty until now, shows the same"
+            );
+            assert_eq!(
+                completion_item_display(&item).1,
+                None,
+                "{path}: a `use` path is not this item's type"
+            );
+        }
+    }
+
+    /// `rust-analyzer` really does concatenate a doc-alias note and an import note on one item, so
+    /// the import source has to be found inside the string rather than anchored at its start.
+    /// Verbatim from the same live dump, on `std::env::temp_dir`.
+    #[test]
+    fn a_real_combined_alias_and_use_note_still_yields_the_import_source() {
+        let item = lsp_types::CompletionItem {
+            label: "temp_dir".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fn() -> PathBuf".to_string()),
+            filter_text: Some("temp_dirGetTempPathGetTempPath2".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("(alias GetTempPath, GetTempPath2) (use std::env::temp_dir)".into()),
+                description: Some("fn() -> PathBuf".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_import_source(&item).as_deref(),
+            Some("std::env::temp_dir"),
+            "an item carrying both kinds of note is still an import candidate, and is exactly the \
+             kind that most needs saying so"
+        );
+        assert_eq!(
+            completion_item_display(&item).1.as_deref(),
+            Some("fn() -> PathBuf"),
+            "and its real signature still reaches the type slot"
+        );
+    }
+
+    /// The narrowness that rule needs, from the same live `rust-analyzer` dump: of the 14 items
+    /// carrying a `labelDetails.detail` at that position, 8 were `"(use ...)"` import notes and
+    /// the other 6 were `"(alias ==, !=)"`, `"(alias <, >, <=, >=)"`, `"(alias ?, ?Sized)"`,
+    /// `"(alias list, vector)"` - doc aliases, not imports - and an ordinary method carries
+    /// `"(as Into)"` there (see
+    /// [`a_real_rust_analyzer_signature_is_never_mistaken_for_a_module_path`]). None of those is a
+    /// path, and printing one as an import source would be a fresh version of the same bug.
+    #[test]
+    fn a_real_alias_or_trait_note_is_not_an_import_source() {
+        for note in [
+            "(alias ==, !=)",
+            "(alias <, >, <=, >=)",
+            "(alias ?, ?Sized)",
+            "(alias list, vector)",
+            "(as Into)",
+        ] {
+            let item = lsp_types::CompletionItem {
+                label: "eq".to_string(),
+                kind: Some(lsp_types::CompletionItemKind::METHOD),
+                label_details: Some(lsp_types::CompletionItemLabelDetails {
+                    detail: Some(note.to_string()),
+                    description: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_import_source(&item),
+                None,
+                "{note}: only a genuine `(use path)` note names a module this item comes from"
+            );
+        }
     }
 
     /// Real, live-observed shapes from both servers this app supports - a real dump against a

@@ -868,6 +868,7 @@ fn render_completion_row(
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
     let (label, detail) = completion_view::completion_item_display(item);
+    let import_source = completion_view::completion_import_source(item);
     let kind_badge = completion_view::completion_kind_badge(item.kind);
     gpui::div()
         .id(("completion-item", index))
@@ -914,6 +915,31 @@ fn render_completion_row(
                 })
                 .child(label),
         )
+        // The module this item would be imported from, when it genuinely has one - see
+        // `completion_view::completion_import_source`'s own docs for the two live dumps this
+        // exists for. Its own span rather than the type hint below, in a dimmer colour and to the
+        // left of it: this text must read identically before and after `completionItem/resolve`,
+        // where the type hint legitimately goes from nothing to a signature, so sharing one slot
+        // would visibly swap a module name for a type under the user.
+        .children(import_source.map(|source| {
+            gpui::div()
+                .id(("completion-item-import-source", index))
+                // Lets a real test measure this real span's own painted bounds (`debug_bounds`
+                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+                // `debug_selector` in this crate.
+                .debug_selector(move || format!("completion-item-{index}-import-source"))
+                .flex_none()
+                // Narrower than the type hint's own 120px cap beside it: a real specifier is
+                // short (`fs`, `fs/promises`, `std::io::Result`), and the two spans share one row
+                // with the label, so this one yields the wider share to the type.
+                .max_w(gpui::px(90.0))
+                .truncate()
+                .text_size(gpui::px(10.0))
+                // One step dimmer than the type hint's own `text::GHOST`, so a glance can tell
+                // "comes from" apart from "is of type" without reading either.
+                .text_color(theme::text::HINT)
+                .child(source)
+        }))
         .children(detail.map(|detail| {
             gpui::div()
                 .id(("completion-item-detail", index))
@@ -1859,6 +1885,78 @@ mod completion_detail_pane_tests {
              (got {:?}, expected close to {:?})",
             row.size.width,
             LIST_WIDTH
+        );
+    }
+
+    /// The live-reported "`appendFile` appears four times", on screen. The two real
+    /// `typescript-language-server` items behind it (dumped verbatim - see
+    /// `completion_view::tests::two_real_auto_import_candidates_for_one_label_show_which_module_each_comes_from`)
+    /// differ in exactly one field: the module each would be imported from. Every other row field
+    /// is identical, and neither carries a signature before `completionItem/resolve`, so both rows
+    /// painted a bare `appendFile` and an empty type slot - two rows a user genuinely cannot
+    /// choose between, for two genuinely different `import` statements.
+    ///
+    /// Both rows must now paint a real import-source span, and the *selected* row must paint one
+    /// too rather than delegating the whole job to the detail pane's footer (which only ever
+    /// describes one row at a time, and so can never distinguish two).
+    #[gpui::test]
+    fn each_auto_import_candidate_row_paints_the_module_it_would_import_from(
+        cx: &mut TestAppContext,
+    ) {
+        let candidate = |module: &str| lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(module.to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) =
+            seed_ready_popup(cx, vec![candidate("fs"), candidate("fs/promises")]);
+
+        for (index, selector) in [
+            (0, "completion-item-0-import-source"),
+            (1, "completion-item-1-import-source"),
+        ] {
+            let source = cx.debug_bounds(selector).unwrap_or_else(|| {
+                panic!(
+                    "row {index} is a real auto-import candidate and must paint the module it \
+                         would import from - without it this row is byte-identical on screen to \
+                         its sibling, which is the reported duplicate"
+                )
+            });
+            assert!(
+                source.size.width > gpui::px(0.0),
+                "row {index}'s import source must be genuinely painted, not a zero-width span"
+            );
+        }
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_none(),
+            "and the module must still not be painted in the slot reserved for a type - that swap \
+             (module name, then the signature replacing it once the resolve lands) is the \
+             separately-reported bug this must not reintroduce"
+        );
+    }
+
+    /// The other side of that: an ordinary item with a real type and no import at all must paint
+    /// no import-source span, so the row gains nothing it doesn't genuinely have. Dumped from a
+    /// live `rust-analyzer` (`label: "count"`, `kind: FIELD`, `detail: "usize"`).
+    #[gpui::test]
+    fn an_ordinary_item_with_no_import_paints_no_import_source(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "count".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FIELD),
+            detail: Some("usize".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_some(),
+            "sanity check: a real one-word field type still paints in the type slot"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-0-import-source").is_none(),
+            "an item that would import nothing must paint no import source - the span exists to \
+             carry a real, server-supplied module, never a placeholder"
         );
     }
 
