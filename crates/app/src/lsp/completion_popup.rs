@@ -1053,7 +1053,14 @@ impl AdeApp {
             .flex()
             .flex_col()
             .font(gpui::font(theme::font::MONO))
-            .text_size(gpui::px(11.0));
+            .text_size(gpui::px(11.0))
+            // A real seam between the signature and the doc/footer below it, matching
+            // `crate::code_surface::lsp_ui::render_hover_card_content`'s own header exactly
+            // (`.pb(px(6.0)).border_b_1().border_color(theme::border::CARD)`) - this pane never
+            // had one at all before, unlike the Hover card it otherwise mirrors band-for-band.
+            .pb(gpui::px(6.0))
+            .border_b_1()
+            .border_color(theme::border::CARD);
         let mut run_index = 0usize;
         for line in signature_lines {
             let mut signature_row = gpui::div().flex().flex_wrap();
@@ -1103,13 +1110,15 @@ impl AdeApp {
                     .font(gpui::font(theme::font::SANS))
                     .text_size(gpui::px(11.0))
                     .text_color(theme::text::DIMMER)
-                    // A real doc comment can run to many paragraphs (rustdoc examples, long
-                    // prose) - `.line_clamp(6)` still caps it at a real, bounded number of
-                    // visible lines with an ellipsis on the last one, so an ordinary long doc
-                    // paragraph reads as a clean truncation rather than needing the scrollbar
-                    // above at all; the scroll region is real headroom for the rarer case where
-                    // the signature *itself* is what's tall.
-                    .line_clamp(6)
+                    // No `.line_clamp(...)` here (an earlier version of this fix kept one) - a
+                    // real doc comment can run to many paragraphs (rustdoc examples, long prose),
+                    // and clamping it silently truncated the rest with no way to reach it at all:
+                    // `.line_clamp` bounds the div's own painted height directly, so it never
+                    // actually overflows the scroll region above into something the real
+                    // scrollbar could reach. Matches `crate::code_surface::lsp_ui::
+                    // render_hover_card_content`'s own doc paragraph, which has never clamped -
+                    // real overflow, from either the signature or the doc, is what the scroll
+                    // region and its scrollbar exist to handle.
                     .child(doc),
             );
         }
@@ -1827,9 +1836,11 @@ mod completion_detail_pane_tests {
     }
 
     /// A real, long documentation string (a multi-paragraph rustdoc comment is common) must not
-    /// grow the detail pane without bound - `.line_clamp(6)` caps the doc paragraph at a real,
-    /// fixed number of visible lines instead of leaving the outer popup's own `overflow_hidden()`
-    /// to cut it off at an arbitrary point mid-sentence.
+    /// grow the detail pane past the popup's own real maximum height - `.max_h(popover_max_height())`
+    /// on the pane itself is the real, hard backstop - and, unlike an earlier version of this fix
+    /// that clamped the doc paragraph to 6 visible lines with no way to read the rest, the real
+    /// overflow must be reachable through the same real scrollbar a tall signature gets: a doc
+    /// this long never fits, so it must show one.
     #[gpui::test]
     fn a_very_long_documentation_string_does_not_grow_the_pane_without_bound(
         cx: &mut TestAppContext,
@@ -1840,7 +1851,12 @@ mod completion_detail_pane_tests {
             documentation: Some(lsp_core::lsp_types::Documentation::String(long_doc)),
             ..Default::default()
         };
-        let (_app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        let (app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        // See `a_tall_signature_keeps_the_module_path_footer_pinned_and_shows_a_real_scrollbar`'s
+        // own docs for why this second real frame is needed before the scrollbar assertion below.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
         let pane = cx
             .debug_bounds("completions-detail-pane")
             .expect("the real detail pane must have painted for the long-doc item");
@@ -1848,7 +1864,7 @@ mod completion_detail_pane_tests {
         // Unclamped, 60 real repetitions of that sentence wrapped inside the pane's own ~280px
         // real content width would run to dozens of real lines - hundreds of real pixels tall.
         // `popover_max_height()` (the outer popup's own cap) is comfortably less than that, so a
-        // pane genuinely respecting its own `.line_clamp(6)` must paint well under it.
+        // pane genuinely respecting its own `.max_h()` must paint well under it.
         assert!(
             pane.size.height < popover_max_height(),
             "a real, genuinely long documentation string (many repeated sentences) must not \
@@ -1856,6 +1872,11 @@ mod completion_detail_pane_tests {
              pane height {:?}, popover_max_height() {:?}",
             pane.size.height,
             popover_max_height()
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_some(),
+            "a real, genuinely long documentation string that can't fully fit must be reachable \
+             through the real scrollbar, not silently truncated with no way to read the rest"
         );
     }
 

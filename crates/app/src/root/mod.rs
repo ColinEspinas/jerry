@@ -1420,6 +1420,15 @@ pub struct AdeApp {
     /// now", which is what keeps the card alive while the user moves onto it to press its own
     /// `F12 definition` footer instead of dismissing it out from under them.
     pub(crate) hover_card_bounds: Option<gpui::Bounds<Pixels>>,
+    /// The real painted bounds of the Diagnostic card, mirroring [`Self::hover_card_bounds`]'s
+    /// own idiom exactly (captured every frame by its own `gpui::canvas`).
+    /// [`Self::track_hover_pointer`] reads it the same way: the Diagnostic card floats over the
+    /// code area just like the Hover card, and can just as easily cover a real, different
+    /// hoverable token underneath it - a real, reported bug let moving the pointer onto the
+    /// card's own painted area trigger that covered token's own hover, which (per
+    /// `Self::render_diagnostic_card`'s own hover-vs-diagnostic priority rule) hid the diagnostic
+    /// card the user was actually looking at, right out from under them.
+    pub(crate) diagnostic_card_bounds: Option<gpui::Bounds<Pixels>>,
     /// GitHub issue #30's real overlay scrollbar for the Hover card's own scrollable header+doc
     /// region (`crate::code_surface::lsp_ui::AdeApp::render_hover_card_content`) reads its
     /// geometry straight off this handle - the same `gpui::ScrollHandle` pattern every other
@@ -2483,7 +2492,7 @@ impl Render for AdeApp {
             // painted after them so that if the one-at-a-time gate in `render_diagnostic_card`
             // ever failed to hold, the ambient card would be the one on top to notice, not the
             // requested one it would be hiding.
-            .children(self.render_diagnostic_card())
+            .children(self.render_diagnostic_card(cx))
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })

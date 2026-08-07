@@ -208,6 +208,21 @@ impl AdeApp {
             self._hover_hide_task = None;
             return;
         }
+        // The Diagnostic card floats over the code area exactly like the Hover card does, and can
+        // just as easily cover a real, different hoverable token underneath it. Without this, the
+        // pointer resting on the Diagnostic card's own chrome would still resolve to that covered
+        // token and call `Self::hover_over_token` for it - which, per `Self::render_diagnostic_card`'s
+        // own hover-vs-diagnostic priority rule, hides the diagnostic the user is actually looking
+        // at right now. `Self::diagnostic_target().is_some()` (not just the bounds alone) is the
+        // same "is this stale" guard `hover_card_bounds` gets from `self.hover.is_some()` above -
+        // see `Self::diagnostic_card_bounds`'s own docs for the dead-zone this prevents.
+        if self.diagnostic_target().is_some()
+            && self
+                .diagnostic_card_bounds
+                .is_some_and(|bounds| bounds.contains(&event.position))
+        {
+            return;
+        }
         if event.pressed_button.is_some() {
             self.dismiss_hover_and_notify(cx);
             return;
@@ -555,10 +570,10 @@ impl AdeApp {
     /// diagnostic could show mostly-duplicate text right next to (previously, *instead of*) the
     /// diagnostic's own message. Elsewhere on the same line - a different symbol the diagnostic
     /// doesn't cover - Hover keeps its normal priority, the same as it always did.
-    pub(crate) fn render_diagnostic_card(&self) -> Option<gpui::AnyElement> {
-        if self.completions.is_some() {
-            return None;
-        }
+    pub(crate) fn render_diagnostic_card(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let relative_path = self.active_editable_path()?;
         let (last_path, _) = self.file_view_last_layout_for.as_ref()?;
         if last_path != &relative_path {
@@ -567,25 +582,7 @@ impl AdeApp {
             // than guess one.
             return None;
         }
-        // Two real triggers, not one: the caret's own line (keyboard nav, or a click that moved
-        // it there) still shows the card exactly as before, and - since the follow-up to GitHub
-        // issue #186 - the pointer resting directly on a diagnostic's own span shows it too, even
-        // when the caret is sitting somewhere else entirely. A real hover showing something else
-        // (an unrelated symbol) still wins the screen rather than stacking a caret-driven
-        // diagnostic underneath it.
-        let (line_number, diagnostic) = match (self.hover.as_ref(), self.hovered_diagnostic()) {
-            (Some(hover), Some(diagnostic)) => (hover.line_number, diagnostic),
-            (Some(_), None) => return None,
-            (None, _) => {
-                let line_number = self.code_cursor?;
-                let diagnostics = self.file_view_diagnostics.get(&line_number)?;
-                let worst = diagnostics_view::Severity::worst(diagnostics)?;
-                let diagnostic = diagnostics
-                    .iter()
-                    .find(|candidate| candidate.severity == worst)?;
-                (line_number, diagnostic)
-            }
-        };
+        let (line_number, diagnostic) = self.diagnostic_target()?;
         let (row_bounds, shaped) = self.file_view_row_layout.get(&line_number)?;
 
         let row_top = row_bounds.top();
@@ -609,7 +606,43 @@ impl AdeApp {
         // own internal chrome, never its position.
         let anchor_x = row_bounds.left() + shaped.x_for_index(diagnostic.byte_range.start);
 
-        Some(render_diagnostic_card_content(diagnostic, anchor_x, top))
+        Some(render_diagnostic_card_content(
+            diagnostic, anchor_x, top, cx,
+        ))
+    }
+
+    /// Whether the Diagnostic card is conceptually active right now, and if so, which real
+    /// `(line_number, diagnostic)` it describes - the trigger-resolution half of
+    /// [`Self::render_diagnostic_card`], split out so [`Self::track_hover_pointer`] can ask the
+    /// exact same real question (`Self::diagnostic_card_bounds` is a real, painted rectangle, but
+    /// it's only trustworthy while a real trigger for it still holds - the same real "is
+    /// `Self::hover_card_bounds` even still meaningful" guard `self.hover.is_some()` gives the
+    /// Hover card, since a stale rectangle from a card that stopped showing would otherwise
+    /// silently swallow every real hover inside it forever, a dead zone with no way out).
+    ///
+    /// Two real triggers, not one: the caret's own line (keyboard nav, or a click that moved it
+    /// there) still shows the card exactly as before, and - since the follow-up to GitHub issue
+    /// #186 - the pointer resting directly on a diagnostic's own span shows it too, even when the
+    /// caret is sitting somewhere else entirely. A real hover showing something else (an
+    /// unrelated symbol) still wins the screen rather than stacking a caret-driven diagnostic
+    /// underneath it.
+    fn diagnostic_target(&self) -> Option<(usize, &diagnostics_view::LineDiagnostic)> {
+        if self.completions.is_some() {
+            return None;
+        }
+        match (self.hover.as_ref(), self.hovered_diagnostic()) {
+            (Some(hover), Some(diagnostic)) => Some((hover.line_number, diagnostic)),
+            (Some(_), None) => None,
+            (None, _) => {
+                let line_number = self.code_cursor?;
+                let diagnostics = self.file_view_diagnostics.get(&line_number)?;
+                let worst = diagnostics_view::Severity::worst(diagnostics)?;
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|candidate| candidate.severity == worst)?;
+                Some((line_number, diagnostic))
+            }
+        }
     }
 
     /// The real diagnostic [`Self::hover`]'s own hovered span genuinely overlaps on the same
@@ -651,6 +684,7 @@ fn render_diagnostic_card_content(
     diagnostic: &diagnostics_view::LineDiagnostic,
     anchor_x: Pixels,
     top: Pixels,
+    cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
     let source_code = match (&diagnostic.source, &diagnostic.code) {
         (Some(source), Some(code)) => format!("{source} · {code}"),
@@ -687,12 +721,31 @@ fn render_diagnostic_card_content(
         );
     }
 
+    // Captures this card's own real painted bounds into `AdeApp::diagnostic_card_bounds` every
+    // frame, mirroring `render_hover_card_content`'s own identical `bounds_probe` idiom -
+    // `AdeApp::track_hover_pointer` reads it to keep the card alive while the pointer rests on it
+    // even when it happens to be covering a real, different hoverable token underneath.
+    let bounds_probe = {
+        let entity = cx.entity();
+        gpui::canvas(
+            move |bounds, _window, cx| {
+                entity.update(cx, |this, _cx| {
+                    this.diagnostic_card_bounds = Some(bounds);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    };
+
     let mut card = div()
         .id("diagnostic-card")
         // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
         // this, not `.id(..)`) - a no-op outside test builds, matching `"hover-card"` and every
         // other `debug_selector` in this crate.
         .debug_selector(|| "diagnostic-card".to_string())
+        .child(bounds_probe)
         .absolute()
         .left(anchor_x)
         .top(top)
@@ -2776,6 +2829,59 @@ mod hover_pointer_tests {
         assert!(cx.debug_bounds("hover-card").is_some());
     }
 
+    /// Direct regression coverage for the real, reported bug: the card floats over the code area
+    /// as a real, absolutely-positioned overlay (GitHub issue #186), which means it can visually
+    /// sit *on top of* a real, different hoverable token on another line - the card anchored under
+    /// line 1 is comfortably taller than one code row, so it covers line 2 underneath it. Moving
+    /// the pointer to a point that is both genuinely inside the card's own bounds *and* would
+    /// resolve to that different, covered token if the card weren't there must still keep the
+    /// original card open - the card bounds check in `Self::track_hover_pointer` has to win
+    /// outright, not just delay the switch by one debounce cycle. A real `.rs` file (not the
+    /// `.txt` fixture this module's other pointer tests use) is required for this: `.txt` has no
+    /// real LSP language identity at all, so `Self::hover_anchor_at` always answers `None`
+    /// everywhere in it, which could never have caught this - there was never a real "different
+    /// token underneath" for it to resolve to.
+    #[gpui::test]
+    fn hovering_a_real_token_visually_covered_by_the_card_does_not_switch_or_dismiss_it(
+        cx: &mut TestAppContext,
+    ) {
+        // `"fn alpha() {}\nfn beta() {}\n"` - `alpha` is on line 1 (bytes 3..8), `beta` on line 2
+        // (bytes 3..7), directly beneath it.
+        let (_repo, file_path, app, cx) =
+            open_file(cx, "sample.rs", "fn alpha() {}\nfn beta() {}\n");
+        seed_ready_hover(&app, cx, file_path, 1, 3..8);
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real card must be painted before this test moves within it");
+        let beta_point = point_on_token(&app, cx, 2, 3..7);
+        assert!(
+            card.contains(&beta_point),
+            "sanity check: the real card anchored under line 1 must genuinely cover line 2's own \
+             real row underneath it for this test to prove anything - card {card:?}, beta's real \
+             point {beta_point:?}"
+        );
+
+        cx.simulate_mouse_move(beta_point, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .hover
+                .as_ref()
+                .is_some_and(
+                    |entry| entry.line_number == 1 && entry.byte_range == (3..8)
+                )),
+            "the original card (line 1's real \"alpha\" token) must survive a pointer move that \
+             lands on a real, different token the card merely happens to be covering - it must \
+             neither dismiss nor switch to describing \"beta\" instead"
+        );
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "and the real card must still be painting, not just its state surviving"
+        );
+    }
+
     /// Dismissal route 2: a real click elsewhere in the editor.
     #[gpui::test]
     fn a_real_click_in_the_editor_dismisses_the_real_card(cx: &mut TestAppContext) {
@@ -3089,6 +3195,75 @@ mod diagnostic_popover_tests {
             cx.debug_bounds("diagnostic-card").is_some(),
             "and the ambient Diagnostic card comes back once the requested popup it yielded to \
              has gone"
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: the Diagnostic card floats over
+    /// the code area exactly like the Hover card does (GitHub issue #186), and - being anchored
+    /// under the caret's own line - can genuinely cover a real, different hoverable token on the
+    /// row right underneath it. Moving the real pointer onto the card's own painted chrome must
+    /// not let that covered token's own real hover request supersede the card and hide it; before
+    /// this fix, the Diagnostic card had no equivalent of `Self::hover_card_bounds` protecting it
+    /// at all, so it disappeared the instant the pointer rested on it if anything hoverable
+    /// happened to be underneath.
+    #[gpui::test]
+    fn moving_the_real_pointer_onto_the_diagnostic_card_does_not_hide_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path).expect("a real file:// uri");
+        publish_and_wait(&client, &uri.to_string(), "mismatched types");
+        set_caret(&app, cx, 1);
+
+        let card = cx.debug_bounds("diagnostic-card").expect(
+            "sanity check: the caret is on the real offending line, so the card must be \
+                      up before this test moves the pointer onto it",
+        );
+        // `"fn beta() {}"` - `beta` spans bytes 3..7 on line 2, the row directly under line 1.
+        let (row_2_bounds, row_2_shaped) = app
+            .read_with(cx, |app, _| app.file_view_row_layout.get(&2).cloned())
+            .expect("line 2's real row should have painted real layout");
+        let beta_point = gpui::point(
+            row_2_bounds.left() + (row_2_shaped.x_for_index(3) + row_2_shaped.x_for_index(7)) / 2.0,
+            row_2_bounds.center().y,
+        );
+        assert!(
+            card.contains(&beta_point),
+            "sanity check: the real card anchored under line 1 must genuinely cover line 2's own \
+             real \"beta\" token underneath it for this test to prove anything - card {card:?}, \
+             beta's real point {beta_point:?}"
+        );
+
+        cx.simulate_mouse_move(beta_point, None, gpui::Modifiers::none());
+        render_twice(&app, cx);
+        // The real pointer resting on the diagnostic card's own chrome must survive not just the
+        // instant it lands, but genuinely resting there - `Self::hover_over_token`'s own real
+        // `HOVER_TRIGGER_DELAY` debounce means the covered "beta" token's own hover request would
+        // only actually fire after this real delay elapses; without this, the test would pass
+        // trivially regardless of whether the real bounds guard exists at all.
+        cx.background_executor
+            .advance_clock(HOVER_TRIGGER_DELAY + std::time::Duration::from_millis(10));
+        render_twice(&app, cx);
+
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "the Diagnostic card must survive a real pointer move that lands on a real, \
+             different token it merely happens to be covering - it must not be hidden by that \
+             covered token's own hover superseding it"
         );
     }
 
