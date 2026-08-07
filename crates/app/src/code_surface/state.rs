@@ -168,11 +168,13 @@ mod hover_entry_underline_tests {
     fn every_other_real_status_is_still_worth_underlining() {
         assert!(entry_with(HoverStatus::Loading).worth_underlining());
         assert!(entry_with(HoverStatus::Failed("timed out".to_string())).worth_underlining());
-        assert!(entry_with(HoverStatus::Ready(Some(hover_view::HoverRenderModel {
-            module_path: None,
-            signature: "fn alpha()".to_string(),
-            doc: None,
-        })))
-        .worth_underlining());
+        assert!(
+            entry_with(HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                module_path: None,
+                signature: "fn alpha()".to_string(),
+                doc: None,
+            })))
+            .worth_underlining()
+        );
     }
 }

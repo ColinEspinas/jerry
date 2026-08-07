@@ -96,7 +96,11 @@ impl AdeApp {
         self.hover_pending = None;
         self._hover_debounce_task = None;
         let Some(showing) = self.hover.as_ref().map(|entry| {
-            (entry.path.clone(), entry.line_number, entry.byte_range.clone())
+            (
+                entry.path.clone(),
+                entry.line_number,
+                entry.byte_range.clone(),
+            )
         }) else {
             return;
         };
@@ -108,7 +112,11 @@ impl AdeApp {
             let _ = this.update(cx, |this, cx| {
                 this._hover_hide_task = None;
                 let still_showing_old = this.hover.as_ref().is_some_and(|entry| {
-                    (entry.path.clone(), entry.line_number, entry.byte_range.clone()) == showing
+                    (
+                        entry.path.clone(),
+                        entry.line_number,
+                        entry.byte_range.clone(),
+                    ) == showing
                 });
                 if still_showing_old {
                     this.hover = None;
@@ -846,194 +854,238 @@ impl AdeApp {
             .extension()
             .and_then(|extension| extension.to_str());
 
-        Some(render_hover_card_content(hover, extension, anchor_x, top, cx))
+        Some(self.render_hover_card_content(hover, extension, anchor_x, top, cx))
     }
-}
 
-/// The real Hover popover's own content - split out of [`AdeApp::render_hover_card`] purely so
-/// the real positioning math above (which needs `&self`) stays visually separate from the real
-/// per-status content build below (which doesn't) - mirrors
-/// [`AdeApp::render_completions_popover`]'s own inline match, just factored into its own function
-/// since this one has a real early-return position/anchor computation ahead of it.
-fn render_hover_card_content(
-    hover: &HoverEntry,
-    extension: Option<&str>,
-    anchor_x: Pixels,
-    top: Pixels,
-    cx: &mut Context<AdeApp>,
-) -> gpui::AnyElement {
-    // GitHub issue #186: captures this card's own real painted bounds into
-    // `AdeApp::hover_card_bounds` every frame, the same `gpui::canvas` idiom
-    // `crate::root::AdeApp::render_workspace_body` already uses for `AdeApp::body_bounds`.
-    // `AdeApp::track_hover_pointer` reads it to keep the card alive while the pointer is on it.
-    let bounds_probe = {
-        let entity = cx.entity();
-        gpui::canvas(
-            move |bounds, _window, cx| {
-                entity.update(cx, |this, _cx| {
-                    this.hover_card_bounds = Some(bounds);
-                });
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full()
-    };
-    // No `.p()`/`.gap()` here (unlike the pre-review version) - the design's own hover card has
-    // no uniform padding at all: it is three independently-padded/bordered bands (signature
-    // header, doc body, `module::path` + `F12 definition` footer), not a single padded flex
-    // column. Only `HoverStatus::Ready(Some(_))` below builds those three bands; every other
-    // status is a single line of plain text with no real card structure to speak of, so it gets
-    // its own one-off `.p(px(10.0))` wrapper instead.
-    let mut card = div()
-        .id("hover-card")
-        // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
-        // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
-        // builds, matching every other `debug_selector` in this crate.
-        .debug_selector(|| "hover-card".to_string())
-        .child(bounds_probe)
-        .absolute()
-        .left(anchor_x)
-        .top(top)
-        .flex_none()
-        .flex()
-        .flex_col()
-        .max_w(HOVER_CARD_MAX_WIDTH)
-        .max_h(HOVER_CARD_MAX_HEIGHT)
-        .overflow_hidden()
-        .rounded(theme::radius::CARD_SM)
-        .bg(theme::surface::POPOVER)
-        .border_1()
-        .border_color(theme::border::POPOVER);
+    /// The real Hover popover's own content - split out of [`Self::render_hover_card`] purely so
+    /// the real positioning math there (an early-return chain resolving *whether*/*where* to
+    /// anchor) stays visually separate from the real per-status content build here - mirrors
+    /// [`Self::render_completions_popover`]'s own inline match, just factored into its own method
+    /// since that one has a real early-return position/anchor computation ahead of it. Still a
+    /// method, not a free function, since a genuinely tall `Ready(Some(_))` card needs
+    /// [`Self::hover_card_scroll_handle`] and [`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`],
+    /// both of which need `&self`.
+    fn render_hover_card_content(
+        &self,
+        hover: &HoverEntry,
+        extension: Option<&str>,
+        anchor_x: Pixels,
+        top: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // GitHub issue #186: captures this card's own real painted bounds into
+        // `AdeApp::hover_card_bounds` every frame, the same `gpui::canvas` idiom
+        // `crate::root::AdeApp::render_workspace_body` already uses for `AdeApp::body_bounds`.
+        // `AdeApp::track_hover_pointer` reads it to keep the card alive while the pointer is on it.
+        let bounds_probe = {
+            let entity = cx.entity();
+            gpui::canvas(
+                move |bounds, _window, cx| {
+                    entity.update(cx, |this, _cx| {
+                        this.hover_card_bounds = Some(bounds);
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        };
+        // No `.p()`/`.gap()` here (unlike the pre-review version) - the design's own hover card has
+        // no uniform padding at all: it is three independently-padded/bordered bands (signature
+        // header, doc body, `module::path` + `F12 definition` footer), not a single padded flex
+        // column. Only `HoverStatus::Ready(Some(_))` below builds those three bands; every other
+        // status is a single line of plain text with no real card structure to speak of, so it gets
+        // its own one-off `.p(px(10.0))` wrapper instead.
+        let mut card = div()
+            .id("hover-card")
+            // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
+            // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
+            // builds, matching every other `debug_selector` in this crate.
+            .debug_selector(|| "hover-card".to_string())
+            .child(bounds_probe)
+            .absolute()
+            .left(anchor_x)
+            .top(top)
+            .flex_none()
+            .flex()
+            .flex_col()
+            .max_w(HOVER_CARD_MAX_WIDTH)
+            .max_h(HOVER_CARD_MAX_HEIGHT)
+            .overflow_hidden()
+            .rounded(theme::radius::CARD_SM)
+            .bg(theme::surface::POPOVER)
+            .border_1()
+            .border_color(theme::border::POPOVER);
 
-    match &hover.status {
-        HoverStatus::Loading => {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::text::FAINT)
-                    .child("loading hover..."),
-            );
-        }
-        HoverStatus::Failed(message) => {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::status::FAIL)
-                    .child(format!("hover failed: {message}")),
-            );
-        }
-        // Unreachable in practice - `Self::render_hover_card` returns `None` itself for
-        // `Ready(None)` rather than calling this function, so a genuinely empty hover shows no
-        // popup at all.
-        HoverStatus::Ready(None) => {}
-        HoverStatus::Ready(Some(model)) => {
-            // Header: the signature, `padding:7px 10px 6px;border-bottom:1px solid #23282c` in
-            // the mockup - `theme::border::CARD` is that exact hex, already registered for
-            // exactly this kind of internal card seam elsewhere in the app.
-            card = card.child(
-                div()
-                    // `.max_w(HOVER_CARD_MAX_WIDTH)` is load-bearing, not decoration. A GPUI
-                    // element with no explicit width sizes itself to its own content (shrink-to-
-                    // fit) rather than stretching to fill its parent the way a CSS block element
-                    // would - the same real bug class `crate::code_surface::editing`'s own
-                    // `text_row` docs describe for an identical shrink-to-fit failure - so a
-                    // plain `.w_full()` here turned out *not* to be enough on its own: percentage
-                    // width resolves against a parent's own *resolved* width, and the card above
-                    // is itself only `max_w`-bounded (auto/shrink-to-fit otherwise), so `100%` of
-                    // an unresolved auto width is still effectively unbounded. A real, hard
-                    // `max_w` gives this header (and `render_hover_signature`'s own row below it)
-                    // a genuinely definite upper bound to wrap `flex_wrap()`'s content within,
-                    // regardless of what the card's own width resolves to. Without it, a
-                    // signature longer than 430px never gets a real width to wrap within, so
-                    // `render_hover_signature`'s own `flex_wrap()` never actually reflows - the
-                    // row just grows past 430px and the card's `overflow_hidden()` silently
-                    // hard-clips it instead (a real, live-reproduced TypeScript symptom: a long
-                    // union/generic type painted cut off mid-glyph).
-                    .max_w(HOVER_CARD_MAX_WIDTH)
-                    .pt(px(7.0))
-                    .px(px(10.0))
-                    .pb(px(6.0))
-                    .border_b_1()
-                    .border_color(theme::border::CARD)
-                    .child(render_hover_signature(&model.signature, extension)),
-            );
-            if let Some(doc) = &model.doc {
-                // Body: `padding:7px 10px;font:...'IBM Plex Sans';color:#8b9197` - `theme::
-                // text::DIM` is that exact hex (distinct from `DIMMER`/`FAINT`, which are darker
-                // and belong to other elements in this same card, not this one).
+        match &hover.status {
+            HoverStatus::Loading => {
                 card = card.child(
                     div()
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::text::DIM)
-                        .child(doc.clone()),
-                );
-            }
-            // Footer: its own `background:#141719;border-top:1px solid #23282c` band, not a
-            // transparent strip inside the card's own padding - `theme::surface::
-            // LSP_POPOVER_FOOTER` is that exact background hex. `module::path` sits at the far
-            // left and `F12 definition` at the far right (`gap:10px`, a `flex:1` spacer between
-            // them in the mockup) - the pre-review version bunched both together with a plain
-            // `gap`, which is the layout difference a purely color-focused pass missed.
-            let mut footer = div()
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .px(px(10.0))
-                .py(px(6.0))
-                .bg(theme::surface::LSP_POPOVER_FOOTER)
-                .border_t_1()
-                .border_color(theme::border::CARD);
-            if let Some(module_path) = &model.module_path {
-                // `color:#5e646a` in the mockup - `theme::text::FAINTER`, not `FAINT`
-                // (`#6b7178`), which the pre-review version used.
-                footer = footer.child(
-                    div()
+                        .p(px(10.0))
                         .font(font(theme::font::MONO))
-                        .text_size(px(10.0))
-                        .text_color(theme::text::FAINTER)
-                        .child(module_path.clone()),
+                        .text_size(px(10.5))
+                        .text_color(theme::text::FAINT)
+                        .child("loading hover..."),
                 );
             }
-            footer = footer.child(div().flex_1());
-            footer = footer.child(
-                div()
-                    .id("hover-card-goto-definition")
-                    // Lets a real test measure this real chip's own painted bounds
-                    // (`hover_card_footer_layout_tests`) - a no-op outside test builds, matching
-                    // every other `debug_selector` in this crate.
-                    .debug_selector(|| "hover-card-goto-definition".to_string())
+            HoverStatus::Failed(message) => {
+                card = card.child(
+                    div()
+                        .p(px(10.0))
+                        .font(font(theme::font::MONO))
+                        .text_size(px(10.5))
+                        .text_color(theme::status::FAIL)
+                        .child(format!("hover failed: {message}")),
+                );
+            }
+            // Unreachable in practice - `Self::render_hover_card` returns `None` itself for
+            // `Ready(None)` rather than calling this function, so a genuinely empty hover shows no
+            // popup at all.
+            HoverStatus::Ready(None) => {}
+            HoverStatus::Ready(Some(model)) => {
+                // Header: the signature, `padding:7px 10px 6px;border-bottom:1px solid #23282c` in
+                // the mockup - `theme::border::CARD` is that exact hex, already registered for
+                // exactly this kind of internal card seam elsewhere in the app.
+                let mut scroll_body = div()
+                    .id("hover-card-scroll-body")
                     .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .cursor_pointer()
-                    // `F12` is a function key, not one of `crate::keymap`'s modifier tokens, and
-                    // is identical on both platforms, so it bypasses `keymap::resolve_combo`.
-                    .child(render_keycap("F12"))
+                    .flex_col()
+                    // `.flex_1().min_h_0()` directly on the scrolling element itself, not just on
+                    // its `.relative()` wrapper below - a flex item's default `min-height: auto`
+                    // otherwise refuses to shrink below its own content's natural size, which
+                    // silently defeated `overflow_y_scroll()` here: the element measured its real,
+                    // painted box at the wrapper's bound (matching `crate::rail::render`'s own
+                    // identical `"agent-rail-list"` scrollable list, the precedent this mirrors).
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    // GitHub issue #30's real overlay scrollbar (below) reads its geometry straight
+                    // off this same handle.
+                    .track_scroll(&self.hover_card_scroll_handle)
                     .child(
                         div()
-                            // `color:#4a5057` in the mockup - `theme::text::PATH` is that exact
-                            // hex (an existing token named for its other use elsewhere; the value
-                            // is what matters here, not the name).
+                            // `.max_w(HOVER_CARD_MAX_WIDTH)` is load-bearing, not decoration. A GPUI
+                            // element with no explicit width sizes itself to its own content (shrink-
+                            // to-fit) rather than stretching to fill its parent the way a CSS block
+                            // element would - the same real bug class `crate::code_surface::editing`'s
+                            // own `text_row` docs describe for an identical shrink-to-fit failure - so
+                            // a plain `.w_full()` here turned out *not* to be enough on its own:
+                            // percentage width resolves against a parent's own *resolved* width, and
+                            // the card above is itself only `max_w`-bounded (auto/shrink-to-fit
+                            // otherwise), so `100%` of an unresolved auto width is still effectively
+                            // unbounded. A real, hard `max_w` gives this header (and
+                            // `render_hover_signature`'s own row below it) a genuinely definite upper
+                            // bound to wrap `flex_wrap()`'s content within, regardless of what the
+                            // card's own width resolves to. Without it, a signature longer than 430px
+                            // never gets a real width to wrap within, so `render_hover_signature`'s
+                            // own `flex_wrap()` never actually reflows - the row just grows past 430px
+                            // and the card's `overflow_hidden()` silently hard-clips it instead (a
+                            // real, live-reproduced TypeScript symptom: a long union/generic type
+                            // painted cut off mid-glyph).
+                            .max_w(HOVER_CARD_MAX_WIDTH)
+                            .pt(px(7.0))
+                            .px(px(10.0))
+                            .pb(px(6.0))
+                            .border_b_1()
+                            .border_color(theme::border::CARD)
+                            .child(render_hover_signature(&model.signature, extension)),
+                    );
+                if let Some(doc) = &model.doc {
+                    // Body: `padding:7px 10px;font:...'IBM Plex Sans';color:#8b9197` - `theme::
+                    // text::DIM` is that exact hex (distinct from `DIMMER`/`FAINT`, which are darker
+                    // and belong to other elements in this same card, not this one).
+                    scroll_body = scroll_body.child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .text_size(px(11.5))
+                            .text_color(theme::text::DIM)
+                            .child(doc.clone()),
+                    );
+                }
+                // `.flex_1().min_h_0()`: absorbs whatever height the footer below doesn't need, up to
+                // the card's own real `max_h` - a genuinely multi-line signature (a pretty-printed
+                // TypeScript utility/generic type) or a long doc comment can now overflow *this*
+                // region and scroll, rather than the footer being pushed below the card's own visible
+                // clip and simply disappearing (the real, reported bug this fix addresses). `.relative()`
+                // is the positioning root the overlay scrollbar below anchors `.absolute()` against -
+                // it must NOT be the same element as `scroll_body` itself, or the scrollbar would
+                // scroll away with the content it's supposed to stay fixed against.
+                card = card.child(
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .child(scroll_body)
+                        .children(self.render_vertical_scrollbar(
+                            "hover-card-scrollbar",
+                            &self.hover_card_scroll_handle,
+                            &[],
+                            cx,
+                        )),
+                );
+                // Footer: its own `background:#141719;border-top:1px solid #23282c` band, not a
+                // transparent strip inside the card's own padding - `theme::surface::
+                // LSP_POPOVER_FOOTER` is that exact background hex. `module::path` sits at the far
+                // left and `F12 definition` at the far right (`gap:10px`, a `flex:1` spacer between
+                // them in the mockup) - the pre-review version bunched both together with a plain
+                // `gap`, which is the layout difference a purely color-focused pass missed.
+                let mut footer = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .bg(theme::surface::LSP_POPOVER_FOOTER)
+                    .border_t_1()
+                    .border_color(theme::border::CARD);
+                if let Some(module_path) = &model.module_path {
+                    // `color:#5e646a` in the mockup - `theme::text::FAINTER`, not `FAINT`
+                    // (`#6b7178`), which the pre-review version used.
+                    footer = footer.child(
+                        div()
+                            .font(font(theme::font::MONO))
                             .text_size(px(10.0))
-                            .text_color(theme::text::PATH)
-                            .child("definition"),
-                    )
-                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.trigger_goto_definition(cx);
-                    })),
-            );
-            card = card.child(footer);
+                            .text_color(theme::text::FAINTER)
+                            .child(module_path.clone()),
+                    );
+                }
+                footer = footer.child(div().flex_1());
+                footer = footer.child(
+                    div()
+                        .id("hover-card-goto-definition")
+                        // Lets a real test measure this real chip's own painted bounds
+                        // (`hover_card_footer_layout_tests`) - a no-op outside test builds, matching
+                        // every other `debug_selector` in this crate.
+                        .debug_selector(|| "hover-card-goto-definition".to_string())
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .cursor_pointer()
+                        // `F12` is a function key, not one of `crate::keymap`'s modifier tokens, and
+                        // is identical on both platforms, so it bypasses `keymap::resolve_combo`.
+                        .child(render_keycap("F12"))
+                        .child(
+                            div()
+                                // `color:#4a5057` in the mockup - `theme::text::PATH` is that exact
+                                // hex (an existing token named for its other use elsewhere; the value
+                                // is what matters here, not the name).
+                                .text_size(px(10.0))
+                                .text_color(theme::text::PATH)
+                                .child("definition"),
+                        )
+                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.trigger_goto_definition(cx);
+                        })),
+                );
+                card = card.child(footer);
+            }
         }
-    }
 
-    card.into_any_element()
+        card.into_any_element()
+    }
 }
 
 /// The Hover popover's own signature line, syntax-highlighted like real code rather than painted
@@ -1077,7 +1129,9 @@ fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::Any
             // header's own `HOVER_CARD_HORIZONTAL_PADDING` on both sides, so its own bound is
             // narrower by twice that.
             .max_w(
-                HOVER_CARD_MAX_WIDTH - HOVER_CARD_HORIZONTAL_PADDING - HOVER_CARD_HORIZONTAL_PADDING,
+                HOVER_CARD_MAX_WIDTH
+                    - HOVER_CARD_HORIZONTAL_PADDING
+                    - HOVER_CARD_HORIZONTAL_PADDING,
             );
         for (run_text, kind) in line_runs {
             // A running index across every real line, not reset per line - a single-line
@@ -3330,7 +3384,11 @@ mod hover_signature_and_diagnostic_chrome_tests {
     #[test]
     fn a_real_rust_signature_is_split_into_real_distinctly_kinded_runs() {
         let lines = highlighted_signature_lines("pub fn where_eq(col: &str) -> Self", Some("rs"));
-        assert_eq!(lines.len(), 1, "a single-line signature must yield exactly one line group");
+        assert_eq!(
+            lines.len(),
+            1,
+            "a single-line signature must yield exactly one line group"
+        );
         let runs = &lines[0];
         assert!(
             runs.len() > 1,
@@ -3384,7 +3442,9 @@ mod hover_signature_and_diagnostic_chrome_tests {
             "a real 4-line signature must yield exactly 4 line groups, got: {lines:?}"
         );
         let joined_text = |line: &Vec<(gpui::SharedString, code_view::HighlightKind)>| {
-            line.iter().map(|(text, _)| text.as_ref()).collect::<String>()
+            line.iter()
+                .map(|(text, _)| text.as_ref())
+                .collect::<String>()
         };
         assert!(
             joined_text(&lines[0]).contains("Pick"),
@@ -3559,6 +3619,134 @@ mod hover_card_footer_layout_tests {
              far short of the edge",
             card.right(),
             definition_chip.right()
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely tall signature (a
+    /// real, live shape - `typescript-language-server` pretty-printing a wide object/union type
+    /// across many real lines) used to grow the card's header past `HOVER_CARD_MAX_HEIGHT`,
+    /// pushing the footer below the card's own `overflow_hidden()` clip and hiding it entirely.
+    /// The footer must now stay pinned near the real bottom regardless of content height, and a
+    /// real scrollbar must appear for the overflowing header/doc region.
+    #[gpui::test]
+    fn a_tall_signature_keeps_the_footer_pinned_and_shows_a_real_scrollbar(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        // A real, many-real-line signature - comfortably taller than `HOVER_CARD_MAX_HEIGHT`
+        // (220px) at any plausible line height, the same real shape a wide TypeScript object/
+        // union type pretty-prints as.
+        let tall_signature = (0..30)
+            .map(|index| format!("    field_{index}: string;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let signature = format!("const x: {{\n{tall_signature}\n}}");
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature,
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // `AdeApp::render_vertical_scrollbar` reads its geometry off the scroll handle's *last
+        // painted* bounds/`max_offset` (see that method's own docs) - the very first frame after
+        // the tall signature appears never has a scrollbar yet, by design. A second real frame
+        // (matching `completion_popup`'s own identical `open_with_seeded_popup` settling step)
+        // lets that settle before the scrollbar-visibility assertion below reads it.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let definition_chip = cx.debug_bounds("hover-card-goto-definition").expect(
+            "the real F12/definition footer chip must still paint even though the real \
+             signature above it is far taller than the card's own max height",
+        );
+        assert!(
+            (card.bottom() - definition_chip.bottom()).abs() < px(10.0),
+            "the footer must stay pinned near the card's own real bottom edge regardless of how \
+             tall the content above it is (card bottom {:?}, chip bottom {:?}) - the old bug \
+             pushed it below the card's own overflow_hidden() clip instead",
+            card.bottom(),
+            definition_chip.bottom()
+        );
+        assert!(
+            cx.debug_bounds("hover-card-scrollbar").is_some(),
+            "a real scrollbar must appear for the header/doc region once its own real content \
+             genuinely overflows"
+        );
+    }
+
+    /// The other half: an ordinary, short signature that fits comfortably within
+    /// `HOVER_CARD_MAX_HEIGHT` must never paint a scrollbar - the common case stays exactly as
+    /// unadorned as it always was.
+    #[gpui::test]
+    fn a_short_signature_paints_no_scrollbar(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: Some("core".to_string()),
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("hover-card-goto-definition").is_some(),
+            "sanity check: the real card must have painted"
+        );
+        assert!(
+            cx.debug_bounds("hover-card-scrollbar").is_none(),
+            "an ordinary short signature must never paint a real scrollbar - only genuinely \
+             overflowing content should"
         );
     }
 }

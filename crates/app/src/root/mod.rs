@@ -1412,6 +1412,14 @@ pub struct AdeApp {
     /// now", which is what keeps the card alive while the user moves onto it to press its own
     /// `F12 definition` footer instead of dismissing it out from under them.
     pub(crate) hover_card_bounds: Option<gpui::Bounds<Pixels>>,
+    /// GitHub issue #30's real overlay scrollbar for the Hover card's own scrollable header+doc
+    /// region (`crate::code_surface::lsp_ui::AdeApp::render_hover_card_content`) reads its
+    /// geometry straight off this handle - the same `gpui::ScrollHandle` pattern every other
+    /// plain (non-virtualized) scrollable region in this app already uses. Follow-up to the fix
+    /// for a genuinely multi-line signature (a pretty-printed TypeScript utility/generic type)
+    /// overflowing the card's own fixed height and hiding the footer underneath it - before that
+    /// fix landed, nothing in the Hover card could ever overflow, which is why it had none.
+    pub(crate) hover_card_scroll_handle: gpui::ScrollHandle,
     /// The single in-flight [`Self::request_hover`] background task, if any - a single slot
     /// (not a [`TaskPool`]) because hover requests are never independent: [`Self::hover`] shows
     /// only one entry at a time, so a new click always supersedes an in-flight one. Assigning a

@@ -1903,7 +1903,8 @@ mod completion_detail_pane_tests {
         let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
 
         assert!(
-            cx.debug_bounds("completion-detail-signature-token-0").is_some(),
+            cx.debug_bounds("completion-detail-signature-token-0")
+                .is_some(),
             "sanity check: the first real line's own first token must have painted"
         );
         // The first real line ("const x: Pick<{") tokenizes into exactly 8 runs (indices 0..7),
@@ -1911,7 +1912,8 @@ mod completion_detail_pane_tests {
         // second line, past the exact boundary the old `.next()` truncation dropped everything
         // after.
         assert!(
-            cx.debug_bounds("completion-detail-signature-token-9").is_some(),
+            cx.debug_bounds("completion-detail-signature-token-9")
+                .is_some(),
             "a token from a real line past the first newline (\"a\" in \"a: string;\", the real \
              second line) must still paint, not have been silently dropped with the rest of the \
              signature past the first line"

@@ -79,7 +79,11 @@
 //!   (`"completions-scrollbar"`) exactly like every other region here. Its keyboard nav
 //!   (`crate::lsp::completion_popup::AdeApp::move_completions_selection`) scrolls the viewport to
 //!   follow the selection, which is what the old `MAX_RENDERED_COMPLETION_ITEMS` (12) render cap
-//!   was standing in for. The remaining popovers (the hover card, the plus menu, dropdown menus)
+//!   was standing in for. The Hover card also has one now, for the same real reason: a genuinely
+//!   multi-line signature (a pretty-printed TypeScript utility/generic type) or a long doc
+//!   comment can overflow its header+doc region (`"hover-card-scrollbar"`, `AdeApp::
+//!   hover_card_scroll_handle`) - before that region could overflow at all, nothing in the card
+//!   could, which is why it had none. The remaining popovers (the plus menu, dropdown menus)
 //!   still have no scroll region of their own - none of them has content that can overflow: each
 //!   sizes to a fixed, bounded body.
 //! - **Horizontal.** No region in this app has real horizontal content overflow today (`grep -rn
