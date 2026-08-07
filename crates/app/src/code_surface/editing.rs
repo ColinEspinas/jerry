@@ -5418,10 +5418,11 @@ let last = 5;
             cx.debug_bounds("file-view-fold-marker-1").is_none(),
             "an expanded row must not keep claiming lines are hidden"
         );
-        assert!(app.read_with(cx, |app, _| app
-            .file_view_folds
-            .get(&path)
-            .is_none_or(|folded| folded.is_empty())));
+        assert!(
+            app.read_with(cx, |app, _| !app.file_view_folds.contains_key(&path)),
+            "expanding the last fold in a file must drop its now-empty entry entirely, not just \
+             empty it - the same unbounded-growth discipline the popup-anchor map follows"
+        );
     }
 
     /// Regression guard for the one real hazard `render_fold_chevron`'s `cx.stop_propagation()`
@@ -5570,6 +5571,133 @@ let last = 5;
         assert!(
             cx.debug_bounds("file-view-text-row-3").is_none(),
             "coming back to the folded file must find it still folded"
+        );
+    }
+
+    /// Lines (1-based): 1 is an ordinary statement, 2 opens a block that closes on 4 - the file's
+    /// own last line. Built specifically so folding line 2 leaves the collapsed region's closer
+    /// sitting on the buffer's real end, which is exactly the case a click in the blank space
+    /// below the content has to reveal correctly.
+    ///
+    /// Deliberately **no** trailing newline: `EditBuffer::lines` treats content ending in `\n` as
+    /// carrying one further, real, empty trailing line (`"a\n".split('\n')` is `["a", ""]`) - and
+    /// that phantom-looking-but-real line always sits *outside* any fold's own `hidden_lines()`,
+    /// so a source ending in `\n` cannot exercise this bug at all: the click's target line would
+    /// be the empty line after the fold, never the folded line itself.
+    const LAST_LINE_FOLD_SOURCE: &str = "let a = 1;\nfn main() {\n    let b = 2;\n}";
+
+    /// Real regression test for a bug a review caught before this ever shipped: clicking the
+    /// blank space below a short file's content places the caret at the real end of the buffer
+    /// (`file_view.rs`'s own "click past the end of the buffer" fallback), but that fallback only
+    /// moved the caret - it never called [`AdeApp::scroll_file_view_to_line`]. Whenever the
+    /// collapsed region closest to the end of the file is still folded, the caret's own line
+    /// never gets expanded back into view, its row never paints, and
+    /// [`AdeApp::render_editable_file_view_line`]'s own `window.handle_input` registration (which
+    /// only exists on the caret's painted row) never fires - so typing after that click would
+    /// silently do nothing at all.
+    #[gpui::test]
+    fn clicking_below_a_folded_files_content_still_reveals_the_caret_row(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", LAST_LINE_FOLD_SOURCE);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        click_fold_chevron(cx, 2);
+        assert!(
+            cx.debug_bounds("file-view-text-row-4").is_none(),
+            "line 4 (the block's own closing brace, and the file's real last line) must be \
+             hidden once line 2 is folded, or this test cannot tell a real reveal from a line \
+             that was never hidden"
+        );
+
+        let marker_row_bounds = cx
+            .debug_bounds("file-view-text-row-2")
+            .expect("the fold's own start line stays visible and carries the marker");
+        let list_bounds = cx
+            .debug_bounds("file-view-code-list")
+            .expect("the real code list container should have painted real bounds");
+        let click_point = gpui::point(
+            marker_row_bounds.center().x,
+            (marker_row_bounds.bottom() + gpui::px(20.0)).min(list_bounds.bottom() - gpui::px(1.0)),
+        );
+        cx.simulate_click(click_point, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("file-view-text-row-4").is_some(),
+            "a click below the content must reveal the caret's own line - the real last line of \
+             the buffer - not leave it hidden inside the fold it landed in"
+        );
+        let relative = PathBuf::from("sample.rs");
+        let (cursor_offset, expected_end) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("buffer");
+            (buffer.cursor_offset(), buffer.content.len())
+        });
+        assert_eq!(
+            cursor_offset, expected_end,
+            "the caret itself must still land at the real end of the buffer, exactly as it does \
+             in an unfolded file"
+        );
+    }
+
+    /// Real regression test for a second bug the same review caught: fold state is a plain line
+    /// index, and a real external rewrite of the open file (an agent CLI or formatter, not the
+    /// user's own edit) replaces `lines` wholesale without touching `AdeApp::file_view_folds` at
+    /// all. A stale index can end up naming a *different*, larger region than the one the user
+    /// actually folded - silently swallowing whatever line the caret is on, with nothing left to
+    /// expand it back into view.
+    #[gpui::test]
+    fn a_real_external_rewrite_clears_stale_fold_state_for_that_file(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.rs", FOLDABLE_SOURCE);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+
+        click_fold_chevron(cx, 1);
+        assert!(
+            cx.debug_bounds("file-view-text-row-3").is_none(),
+            "line 1 must be folded"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.file_view_folds
+                    .get(&file_path)
+                    .is_some_and(|folded| !folded.is_empty()),
+                "the fold must be really recorded before the rewrite, or this test proves nothing"
+            );
+        });
+
+        // A real external rewrite of the file the user has open and has made no edits to - the
+        // same real content-change path `a_real_on_disk_change_to_the_open_file_invalidates_the_
+        // cache` (this module's own `tabs.rs` precedent) drives, past the same real throttle.
+        std::fs::write(
+            &file_path,
+            "fn alpha() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n",
+        )
+        .expect("rewrite sample.rs");
+        std::thread::sleep(
+            crate::root::FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50),
+        );
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.file_view_folds
+                    .get(&file_path)
+                    .is_none_or(|folded| folded.is_empty()),
+                "a real external rewrite must drop this file's fold state rather than leave a \
+                 stale line index that could silently swallow a line nobody chose to hide"
+            );
+        });
+        assert!(
+            cx.debug_bounds("file-view-text-row-5").is_some(),
+            "with the fold cleared, every real line of the rewritten file must paint"
         );
     }
 

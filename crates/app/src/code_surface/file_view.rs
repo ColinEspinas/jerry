@@ -63,6 +63,12 @@ impl AdeApp {
             .or_default();
         if folded.remove(&start_line) {
             // Expanding can never hide anything, so there is nothing to protect the caret from.
+            // An empty set left behind is pure bookkeeping debt - nothing reads it as
+            // "this file is still folded" - so it goes with the last fold it held, the same
+            // "don't grow this map forever" discipline `Self::file_view_row_layout` follows.
+            if folded.is_empty() {
+                self.file_view_folds.remove(absolute_path);
+            }
             return;
         }
         folded.insert(start_line);
@@ -799,7 +805,28 @@ impl AdeApp {
                     } else {
                         buffer.move_to(end);
                     }
+                    // The buffer's own real last line, 0-based - not
+                    // `line_col_for_offset(cursor_offset())`, whose documented boundary
+                    // convention rounds an offset sitting exactly on a line break up to the
+                    // *start of the next line*. For content ending in a trailing newline (the
+                    // ordinary case) `end` is exactly such a boundary, so that call would resolve
+                    // to one line past the buffer's real content - never a folded line, so the
+                    // reveal below would silently do nothing.
+                    let line = buffer.lines.len().saturating_sub(1);
                     this.code_cursor = Some(click_line_count.max(1));
+                    // GitHub issue #202: the caret can land on a line hidden inside a collapsed
+                    // fold whenever that region's closer sits on (or near) the buffer's own last
+                    // line - real, reachable content this app edits every day (`fn main() { ... }`
+                    // as the last block in a short file). A row that never paints never registers
+                    // `window.handle_input`, so without this the click would silently strand
+                    // typing - the same class of bug `Self::sync_cursor_and_scroll` exists to
+                    // prevent for every other caret-moving action.
+                    let absolute_path = this.file_tree_root.join(&click_path);
+                    this.scroll_file_view_to_line(
+                        &absolute_path,
+                        line,
+                        gpui::ScrollStrategy::Nearest,
+                    );
                     cx.stop_propagation();
                     cx.notify();
                 }),
