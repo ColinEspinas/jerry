@@ -2592,6 +2592,7 @@ mod vue_two_server_wiring_tests {
 #[cfg(test)]
 mod hover_pointer_tests {
     use super::*;
+    use crate::lsp::client::lsp_connection_facade_tests::spawn_fake_server;
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     fn open_file<'a>(
@@ -2875,6 +2876,92 @@ mod hover_pointer_tests {
             "the original card (line 1's real \"alpha\" token) must survive a pointer move that \
              lands on a real, different token the card merely happens to be covering - it must \
              neither dismiss nor switch to describing \"beta\" instead"
+        );
+        assert!(
+            cx.debug_bounds("hover-card").is_some(),
+            "and the real card must still be painting, not just its state surviving"
+        );
+    }
+
+    /// The same real regression as [`hovering_a_real_token_visually_covered_by_the_card_does_not_switch_or_dismiss_it`],
+    /// but driven through the *complete* real pipeline end to end - a real mouse move onto
+    /// "alpha", the real [`HOVER_TRIGGER_DELAY`] debounce, a real `textDocument/hover` round trip
+    /// to a real (fake) server, then a real mouse move onto "beta" (covered by the resulting
+    /// card), the real debounce/hide machinery, and only then the assertion - rather than
+    /// synthetically seeding [`AdeApp::hover`] directly and skipping straight to the interaction
+    /// under test. `seed_ready_hover`-based tests prove the bounds-check logic in isolation; this
+    /// one proves nothing upstream of it (the debounced trigger, the real async resolution, the
+    /// first real paint) quietly reintroduces the same bug through a different door.
+    #[gpui::test]
+    fn the_full_real_pipeline_also_survives_hovering_a_covered_token(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "hover");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let alpha_point = point_on_token(&app, cx, 1, 3..8);
+        cx.simulate_mouse_move(alpha_point, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(HOVER_TRIGGER_DELAY + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("hover-card").expect(
+            "the real card must have painted after a real trigger delay and a real, resolved \
+             hover round trip",
+        );
+        let beta_point = point_on_token(&app, cx, 2, 3..7);
+        assert!(
+            card.contains(&beta_point),
+            "sanity check: the real card anchored under line 1 must genuinely cover line 2's own \
+             real row underneath it for this test to prove anything - card {card:?}, beta's real \
+             point {beta_point:?}"
+        );
+
+        cx.simulate_mouse_move(beta_point, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        // Advance past both real delays - the trigger delay (in case anything tried to arm a real
+        // request for "beta") and the hide delay (in case anything tried to hide the card for
+        // "alpha") - so this assertion reflects where things genuinely settle, not a snapshot
+        // mid-debounce that happens to still look right.
+        cx.background_executor.advance_clock(
+            HOVER_TRIGGER_DELAY.max(HOVER_HIDE_DELAY) + std::time::Duration::from_millis(10),
+        );
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .hover
+                .as_ref()
+                .is_some_and(
+                    |entry| entry.line_number == 1 && entry.byte_range == (3..8)
+                )),
+            "the original real card (line 1's real \"alpha\" token) must survive the real \
+             pipeline's own debounce/hide machinery once the pointer rests on a real, different \
+             token the card merely happens to be covering"
         );
         assert!(
             cx.debug_bounds("hover-card").is_some(),

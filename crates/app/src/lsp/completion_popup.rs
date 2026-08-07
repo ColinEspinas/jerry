@@ -1020,7 +1020,13 @@ impl AdeApp {
             // line) could grow the pane past the popup's own `overflow_hidden()` clip and hide
             // the module-path footer beneath it - the same real bug the Hover card had.
             .max_h(popover_max_height())
-            .px(gpui::px(10.0))
+            // No `.px(...)` here (an earlier version of this fix had one, applied uniformly to
+            // the whole pane) - matching `crate::code_surface::lsp_ui::render_hover_card_content`'s
+            // own three independently-padded bands exactly: each section below carries its own
+            // `.px(10.0)` instead, so the signature's own real bottom border can span the pane's
+            // full real width edge-to-edge, the way the Hover card's own header border does,
+            // rather than stopping short at a real, visible gap where the pane's uniform padding
+            // used to inset it on both sides.
             .py(gpui::px(8.0));
 
         // Signature: `item.detail` when there is one - inline from the server's own
@@ -1050,10 +1056,16 @@ impl AdeApp {
             code_view::HighlightOptions::default(),
         );
         let mut signature_column = gpui::div()
+            .id("completion-detail-signature-column")
+            // Lets a real test measure this real column's own painted bounds (`debug_bounds`
+            // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(|| "completion-detail-signature-column".to_string())
             .flex()
             .flex_col()
             .font(gpui::font(theme::font::MONO))
             .text_size(gpui::px(11.0))
+            .px(gpui::px(10.0))
             // A real seam between the signature and the doc/footer below it, matching
             // `crate::code_surface::lsp_ui::render_hover_card_content`'s own header exactly
             // (`.pb(px(6.0)).border_b_1().border_color(theme::border::CARD)`) - this pane never
@@ -1107,6 +1119,7 @@ impl AdeApp {
             scroll_body = scroll_body.child(
                 gpui::div()
                     .mt(gpui::px(7.0))
+                    .px(gpui::px(10.0))
                     .font(gpui::font(theme::font::SANS))
                     .text_size(gpui::px(11.0))
                     .text_color(theme::text::DIMMER)
@@ -1150,6 +1163,7 @@ impl AdeApp {
                     .flex_none()
                     .mt(gpui::px(9.0))
                     .pt(gpui::px(7.0))
+                    .px(gpui::px(10.0))
                     .border_t_1()
                     .border_color(theme::border::CARD)
                     .font(gpui::font(theme::font::MONO))
@@ -1997,6 +2011,40 @@ mod completion_detail_pane_tests {
             cx.debug_bounds("completions-detail-scrollbar").is_none(),
             "an ordinary short signature must never paint a real scrollbar - only genuinely \
              overflowing content should"
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: the signature column had no
+    /// explicit width, so it shrank to fit its own (often much narrower) text - a short signature
+    /// like `"fn x()"` left the real `.border_b_1()` seam below it visibly short of the pane's
+    /// own real 300px-wide right edge, a real gap on the side the design mockup's own Hover card
+    /// equivalent never has.
+    #[gpui::test]
+    fn the_signature_border_spans_the_full_pane_width_not_just_its_text(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some("fn x()".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted");
+        let signature_column = cx
+            .debug_bounds("completion-detail-signature-column")
+            .expect("the real signature column must have painted");
+
+        // The pane itself carries no horizontal padding (each section owns its own, matching
+        // `render_hover_card_content`'s independently-padded bands) - the column's own outer box
+        // must span the pane's real edge-to-edge width, so its own bottom border does too.
+        assert!(
+            (pane.size.width - signature_column.size.width).abs() < gpui::px(1.0),
+            "the real signature column - and so its own real bottom border - must span the \
+             pane's full real edge-to-edge width, not just its own short text (pane width {:?}, \
+             column width {:?})",
+            pane.size.width,
+            signature_column.size.width
         );
     }
 
