@@ -1333,6 +1333,24 @@ pub struct AdeApp {
     /// bounded by how many distinct items a user has actually looked at, not by anything
     /// unbounded.
     pub(crate) completions_resolved: std::collections::HashSet<(PathBuf, u64, usize)>,
+    /// Every `completionItem/resolve` response that has landed for the *current*
+    /// [`Self::completions_generation`], keyed by its index into
+    /// `crate::lsp::completion_popup::CompletionsStatus::Ready::items` and already merged over the
+    /// item that response describes. Read by the detail pane and by accept; **never** by a row.
+    ///
+    /// It lives beside the server's response rather than being merged into it, and that is the
+    /// whole point. Merging into `items` was what made a completion row visibly fill in - and, for
+    /// a `typescript-language-server` auto-import whose inline `detail` is a bare module specifier
+    /// and whose resolved `detail` is a signature, visibly *change* - the moment the user arrowed
+    /// onto it. Live-reported: "it should not be like this, all data should be here without
+    /// needing to select the suggestion." A row now reads only the untouched response, so it is
+    /// complete when the popup opens and frozen from then on, by construction rather than by
+    /// convention; the detail pane is the one thing a resolve is allowed to fill in.
+    ///
+    /// Cleared wherever [`Self::completions_generation`] stops describing the same response - the
+    /// same points that clear [`Self::completions_resolved`].
+    pub(crate) completions_resolved_items:
+        std::collections::HashMap<usize, lsp_core::lsp_types::CompletionItem>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
     /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
     /// [`CompletionsEntry::path`] names; a stale entry for a file that's no

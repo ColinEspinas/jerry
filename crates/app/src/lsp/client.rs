@@ -1753,6 +1753,7 @@ impl AdeApp {
         let completion = match (completion_context, cached_uri) {
             (Some(context), Some(uri)) => {
                 self.completions_generation = self.completions_generation.wrapping_add(1);
+                self.completions_resolved_items.clear();
                 // Only actually drop to `Loading` when there's nothing real to show yet for this
                 // path - not unconditionally, as an earlier version did. `Self::schedule_lsp_sync`
                 // already called `Self::refilter_completions` synchronously just before this
@@ -1966,7 +1967,7 @@ impl AdeApp {
     /// response (or a dismiss) has already replaced whatever `items` this index used to point
     /// into, so writing into it now would either silently corrupt an unrelated item or panic on an
     /// out-of-bounds index.
-    fn apply_resolved_completion_item(
+    pub(crate) fn apply_resolved_completion_item(
         &mut self,
         path: &Path,
         generation: u64,
@@ -1995,31 +1996,55 @@ impl AdeApp {
         if entry.path != path {
             return;
         }
-        let CompletionsStatus::Ready { items, .. } = &mut entry.status else {
+        let CompletionsStatus::Ready { items, .. } = &entry.status else {
             return;
         };
-        let Some(item) = items.get_mut(item_index) else {
+        let Some(item) = items.get(item_index) else {
             return;
         };
+        // Merged over a *copy* and filed in `completions_resolved_items`, leaving the server's own
+        // response untouched. See that field's own docs: writing back into `items` is what let a
+        // resolve rewrite a row the user was already looking at, and rows must be complete and
+        // final the moment the popup opens.
+        //
         // A field the resolve response actually carries wins over whatever arrived inline. The
         // LSP spec has `completionItem/resolve` return the item with its fields filled in, and a
         // real dump against a live `typescript-language-server` shows why that matters here: an
         // auto-import item arrives with `detail: "./helper"` - a bare module specifier standing in
         // as a placeholder - and only the resolve response carries the real signature (`"Auto
-        // import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`). Keeping the inline
-        // value, as this merge used to, pinned such an item to a module path where the popup
-        // promises a type. A resolve response that omits a field still leaves the inline one
-        // alone, so nothing real is ever lost.
+        // import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`), which is exactly
+        // what the detail pane exists to show. A resolve response that omits a field still leaves
+        // the inline one alone, so nothing real is ever lost.
+        let mut merged = item.clone();
         if resolved.detail.is_some() {
-            item.detail = resolved.detail;
+            merged.detail = resolved.detail;
         }
         if resolved.documentation.is_some() {
-            item.documentation = resolved.documentation;
+            merged.documentation = resolved.documentation;
         }
         if resolved.label_details.is_some() {
-            item.label_details = resolved.label_details;
+            merged.label_details = resolved.label_details;
         }
+        if resolved.additional_text_edits.is_some() {
+            merged.additional_text_edits = resolved.additional_text_edits;
+        }
+        self.completions_resolved_items.insert(item_index, merged);
         cx.notify();
+    }
+
+    /// The best real description this app has of the item at `item_index` **for the detail pane
+    /// and for accepting it** - the merged `completionItem/resolve` response when one has landed
+    /// for the current generation, and the server's own inline item otherwise.
+    ///
+    /// Deliberately not what a row reads. See [`Self::completions_resolved_items`].
+    pub(crate) fn described_completion_item<'a>(
+        &'a self,
+        items: &'a [lsp_core::lsp_types::CompletionItem],
+        item_index: usize,
+    ) -> Option<&'a lsp_core::lsp_types::CompletionItem> {
+        self.completions_resolved_items
+            .get(&item_index)
+            .or_else(|| items.get(item_index))
     }
 }
 
@@ -3281,13 +3306,22 @@ process.stdin.on('data', (d) => {
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
             assert_eq!(
-                items[0].detail.as_deref(),
+                described(0).detail.as_deref(),
                 Some("resolved detail for unresolved_item"),
                 "a real completionItem/resolve response must fill in the item's real detail, \
                  which is what the detail pane's signature line reads"
             );
-            let doc = crate::lsp::completion::completion_documentation_text(&items[0]);
+            let doc = crate::lsp::completion::completion_documentation_text(&described(0));
             assert_eq!(
                 doc.as_deref(),
                 Some("resolved doc for unresolved_item"),
@@ -3357,8 +3391,17 @@ process.stdin.on('data', (d) => {
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
             assert_eq!(
-                items[0].detail.as_deref(),
+                described(0).detail.as_deref(),
                 Some("resolved detail for RemoteHelper"),
                 "a real resolve response must win over the placeholder detail the server sent \
                  inline - that placeholder is exactly the bare module path the user reported \
@@ -3445,13 +3488,22 @@ process.stdin.on('data', (d) => {
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
             assert_eq!(
-                items[1].detail.as_deref(),
+                described(1).detail.as_deref(),
                 Some("resolved detail for second_item"),
                 "sanity check: the resolve that was *not* cancelled must have landed"
             );
             assert_eq!(
-                items[0].detail.as_deref(),
+                described(0).detail.as_deref(),
                 Some("resolved detail for first_item"),
                 "an item whose resolve was aborted by moving the selection on must be asked \
                  again when the user comes back to it - otherwise arrowing past a row silently \
@@ -3519,8 +3571,17 @@ process.stdin.on('data', (d) => {
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
             assert_eq!(
-                items[0].detail.as_deref(),
+                described(0).detail.as_deref(),
                 Some("resolved detail for only_item")
             );
             assert!(

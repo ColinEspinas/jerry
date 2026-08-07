@@ -542,6 +542,35 @@ pub fn completion_import_source(item: &lsp_types::CompletionItem) -> Option<Stri
     completion_module_path(item)
 }
 
+/// The one secondary string a completion **row** shows beside its label - the origin/module the
+/// item comes from when the server named one, and the signature it sent inline otherwise.
+///
+/// The rule this exists to enforce is not about which string is nicer; it is that a row must be
+/// complete when the popup opens and must never change afterwards. Live-reported, twice: "the
+/// types are loading only after in a weird way replacing the module names", then "it should not be
+/// like this, all data should be here without needing to select the suggestion". Both were the
+/// same mechanism - the row showed the *type*, `typescript-language-server` sends no type inline
+/// for any item, and so every row sat blank until its own `completionItem/resolve` landed, which
+/// only ever happens for the row the user has selected.
+///
+/// So the type left the row and moved to the detail pane, where filling in on selection is what a
+/// detail pane is *for*, and the row took the thing servers do send up front:
+///
+/// - `typescript-language-server`: the auto-import specifier (`fs`, `fs/promises`, `vue`) - which
+///   is what the row showed before any of this, and what VS Code shows in the same place.
+/// - `pyright-langserver`: the module out of `labelDetails.description` (`os`), rather than the
+///   literal `Auto-import` marker it puts in `detail`.
+/// - `rust-analyzer`: no module for an in-scope item, but a real signature inline
+///   (`const fn(&self) -> usize`), sent on the very first response and byte-identical in the
+///   resolve - so showing it costs nothing and changes nothing.
+///
+/// Callers must pass the server's **untouched** item, never a resolve-merged one; the app keeps
+/// those apart in `crate::root::AdeApp::completions_resolved_items` precisely so this can't be got
+/// wrong by accident.
+pub fn completion_row_hint(item: &lsp_types::CompletionItem) -> Option<String> {
+    completion_import_source(item).or_else(|| split_completion_detail(item).signature)
+}
+
 /// The Completions popup's real kind-badge category (design:
 /// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `f`/`v`/`t` kind badges, lines
 /// ~1792-1793 and ~467-473) - a coarse grouping of the much finer-grained real
@@ -609,6 +638,18 @@ pub fn completion_filter_text(item: &lsp_types::CompletionItem) -> &str {
 /// real prefix hit always beats a mid-string one, which always beats a scattered one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompletionMatchTier {
+    /// The query *is* the candidate, ignoring case (`app` against `app`, or against `App`) - the
+    /// user has already typed the whole identifier, and nothing that merely starts with it can be
+    /// a better answer.
+    ///
+    /// Live-reported, and the reason this tier exists: typing `app` in a real Vue + `@types/node`
+    /// project put `app` and `App` - the local `const app` and the imported `App` type, both of
+    /// them exactly what was typed - *below* `appendFile`, `appendFile`, `appendFile`,
+    /// `appendFile`, `appendFileSync`, `appendFileSync`. Every one of those is a real prefix
+    /// match too, so with only a `Prefix` tier to separate them the tiebreak fell to how the
+    /// server happened to order its response, and seven rows of `@types/node` noise sat between
+    /// the user and the two symbols they had fully spelled out.
+    Exact,
     /// The query is a real leading prefix of the candidate (`ver` in `version`).
     Prefix,
     /// The query occurs contiguously, but not at the start (`ver` in `has_version`).
@@ -700,7 +741,9 @@ pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch>
             .filter(|offset| haystack[start + offset] != needle[*offset])
             .count();
         return Some(CompletionMatch {
-            tier: if start == 0 {
+            tier: if start == 0 && len == haystack.len() {
+                CompletionMatchTier::Exact
+            } else if start == 0 {
                 CompletionMatchTier::Prefix
             } else {
                 CompletionMatchTier::Substring
@@ -759,33 +802,86 @@ pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch>
 /// Backspace genuinely widens the list back out instead of having to re-ask the server for what it
 /// already sent.
 ///
-/// Ties (including *every* pair under an empty `query`) fall back to the item's own original index,
-/// so the server's own ordering is preserved wherever this ranking has nothing real to say about
-/// it - a deliberate choice not to start honoring `CompletionItem::sortText` here, which this app
-/// has never applied and which is a separate concern from narrowing by typed text.
+/// Where this ranking genuinely cannot tell two candidates apart, the server's own
+/// `CompletionItem::sortText` breaks the tie before the response's own arbitrary order does - the
+/// spec's exact rule, including its "when omitted the label is used" fallback. This is what keeps
+/// `@types/node` auto-import candidates (`typescript-language-server` gives every one of them
+/// `sortText: "\u{ffff}16"`, its lowest band) below the in-scope and already-imported symbols it
+/// marks `"11"`, instead of wherever they happened to land in a 1029-item response.
 ///
-/// Also drops any item that is *interchangeable* with one already kept - see
-/// [`interchangeable_completion_key`] for the live `rust-analyzer` dump ("the autocomplete has
-/// multiple suggestions for the same things") that this exists for, and for exactly how narrow
-/// "interchangeable" is. Deduping here rather than over `items` keeps
-/// `crate::lsp::completion_popup::CompletionsStatus::Ready::items` the server's untouched
+/// Skipped entirely when *no* item carries a `sortText`: falling back to the label there would
+/// silently re-sort the whole list alphabetically and destroy the server's own ordering, which for
+/// a server that expresses priority through response order alone is the only signal there is.
+///
+/// Ties past that fall back to the item's own original index, so the server's ordering still
+/// decides wherever nothing above it has anything real to say.
+///
+/// Two dedupe passes run over the ranked list, both keeping the best-ranked row of each group and
+/// dropping the rest: [`interchangeable_completion_key`] (rows a user cannot tell apart *or* act
+/// on differently) and [`same_choice_key`] (rows offering the same completed identifier by a
+/// different route - the live-reported `appendFile` x4). Deduping here rather than over `items`
+/// keeps `crate::lsp::completion_popup::CompletionsStatus::Ready::items` the server's untouched
 /// response, so every index the resolve path holds stays valid and Backspace still widens back out
 /// of the same list.
 pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -> Vec<usize> {
-    let mut scored: Vec<(CompletionMatch, usize)> = items
+    let server_ranks = items.iter().any(|item| item.sort_text.is_some());
+    let sort_text = |item: &'_ lsp_types::CompletionItem| -> String {
+        if server_ranks {
+            item.sort_text.clone().unwrap_or_else(|| item.label.clone())
+        } else {
+            String::new()
+        }
+    };
+    let mut scored: Vec<(CompletionMatch, String, usize)> = items
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            completion_match(completion_filter_text(item), query).map(|score| (score, index))
+            completion_match(completion_filter_text(item), query)
+                .map(|score| (score, sort_text(item), index))
         })
         .collect();
     scored.sort();
-    let mut kept = std::collections::HashSet::with_capacity(scored.len());
+    let mut interchangeable = std::collections::HashSet::with_capacity(scored.len());
+    let mut same_choice = std::collections::HashSet::with_capacity(scored.len());
     scored
         .into_iter()
-        .filter(|(_, index)| kept.insert(interchangeable_completion_key(&items[*index])))
-        .map(|(_, index)| index)
+        .map(|(_, _, index)| index)
+        .filter(|index| interchangeable.insert(interchangeable_completion_key(&items[*index])))
+        .filter(|index| same_choice.insert(same_choice_key(&items[*index])))
         .collect()
+}
+
+/// What a completion row actually offers a user: this identifier, of this kind, spliced in as this
+/// text. Two rows with equal keys put the same word in the file; the only thing that differs is
+/// which module the editor would import it from, and that difference belongs on *one* row's import
+/// source, not on a second row of an already-crowded list.
+///
+/// This is the second, blunter half of the live-reported "the autocomplete has multiple
+/// suggestions for the same things", and the half the earlier, narrower
+/// [`interchangeable_completion_key`] deliberately did not touch. Typing `app` in a real Vue +
+/// `@types/node` project returns `appendFile` **four** times, `appendFileSync` twice and
+/// `asyncWrapProviders` twice - every one of them a genuinely different auto-import (`fs`,
+/// `node:fs`, `fs/promises`, `node:fs/promises`), and every one of them inserting the identical
+/// `appendFile` at the identical position. Seven of those nine rows were noise between the user
+/// and the symbol they meant.
+///
+/// The trade this makes, stated plainly rather than buried: the popup no longer offers a *choice*
+/// of import source for one name. The row that survives is the one this ranking put first, which
+/// with `sortText` honored is the one the server itself recommends - and the accepted item still
+/// carries that module's own real `additionalTextEdits`, so the import written is a real one, just
+/// not one the user got to pick between. Reversing this would mean bringing all four rows back.
+fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String) {
+    let inserted = match item.text_edit.as_ref() {
+        Some(lsp_types::CompletionTextEdit::Edit(edit)) => edit.new_text.clone(),
+        Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => edit.new_text.clone(),
+        None => item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| item.label.clone()),
+    };
+    // `CompletionItemKind` is neither `Hash` nor castable to an integer, and its `Debug` is the
+    // real variant name - a stable, unambiguous identity for a key that never leaves this pass.
+    (item.label.clone(), format!("{:?}", item.kind), inserted)
 }
 
 /// Everything about a completion item that a user can either *see* on its row or *get* by
@@ -1123,12 +1219,19 @@ mod tests {
         );
     }
 
-    /// The other side of that rule, from the same live `rust-analyzer` dump: three `Result` items
-    /// that share a label but genuinely differ in what they'd import (`labelDetails.detail` reads
-    /// `"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`).
-    /// Those are three real, different choices - collapsing them would silently hide two of them.
+    /// `rust-analyzer`'s own version of the same pile-up, from a live dump at `let r: Resu`: three
+    /// `Result` items that differ only in what they'd import (`labelDetails.detail` reads
+    /// `"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`) and
+    /// splice the identical `Result` over the identical range.
+    ///
+    /// An earlier version of this test asserted the opposite - that all three keep their own rows,
+    /// on the reasoning that three imports are three real choices. They are, and the row that
+    /// survives now names its own (`completion_import_source`). But three rows reading `Result`
+    /// is the thing that was actually reported, twice, and reasoning about which is *technically*
+    /// a distinct candidate is not worth a list a user cannot read. See [`same_choice_key`] for
+    /// the trade this makes.
     #[test]
-    fn same_label_but_a_genuinely_different_item_keeps_its_own_row() {
+    fn several_import_candidates_for_one_name_collapse_to_a_single_row() {
         let import_candidate = |path: &str| lsp_types::CompletionItem {
             label: "Result".to_string(),
             kind: Some(lsp_types::CompletionItemKind::STRUCT),
@@ -1146,8 +1249,9 @@ mod tests {
         ];
         assert_eq!(
             rank_completion_items(&items, "Result"),
-            vec![0, 1, 2],
-            "three different imports are three real choices, not one duplicated row"
+            vec![0],
+            "one name the user can accept is one row; the surviving row is the one this ranking \
+             put first, and it still says which `use` it would add"
         );
     }
 
@@ -1631,25 +1735,168 @@ mod tests {
         }
     }
 
+    /// The whole live-reported list, end to end: what typing `app` in a real Vue + `@types/node`
+    /// project actually returned, and what the popup has to make of it.
+    ///
+    /// Every label, kind and `sortText` below is verbatim from a live `typescript-language-server`
+    /// at that caret (`"11"` = in scope or already imported, `"15"` = a global, `"\u{ffff}16"` =
+    /// an auto-import candidate, which is the server's own lowest band). What the user saw was
+    /// twelve rows led by *seven* `@types/node` auto-imports - `appendFile` four times - with the
+    /// local `app` and the imported `App` and `createApp` scattered among and below them.
+    ///
+    /// Three separate rules have to hold for this list to come out usable, and this pins the
+    /// result of all three together because any one of them alone still leaves it unreadable:
+    /// `app`/`App` are fully-typed matches and lead ([`CompletionMatchTier::Exact`]); the
+    /// auto-imports drop below everything the server ranked higher (`sortText`); and the repeats
+    /// collapse to one row each ([`same_choice_key`]).
+    #[test]
+    fn the_real_reported_app_completion_list_comes_out_readable() {
+        let item =
+            |label: &str, kind: lsp_types::CompletionItemKind, sort: &str, detail: Option<&str>| {
+                lsp_types::CompletionItem {
+                    label: label.to_string(),
+                    kind: Some(kind),
+                    sort_text: Some(sort.to_string()),
+                    detail: detail.map(str::to_string),
+                    ..Default::default()
+                }
+            };
+        use lsp_types::CompletionItemKind as K;
+        let auto = "\u{ffff}16";
+        let items = [
+            item("appendFile", K::FUNCTION, auto, Some("fs")),
+            item("appendFile", K::FUNCTION, auto, Some("node:fs")),
+            item("appendFile", K::FUNCTION, auto, Some("fs/promises")),
+            item("appendFile", K::FUNCTION, auto, Some("node:fs/promises")),
+            item("appendFileSync", K::FUNCTION, auto, Some("fs")),
+            item("appendFileSync", K::FUNCTION, auto, Some("node:fs")),
+            item("asyncWrapProviders", K::MODULE, auto, Some("async_hooks")),
+            item(
+                "asyncWrapProviders",
+                K::MODULE,
+                auto,
+                Some("node:async_hooks"),
+            ),
+            item("AudioParamMap", K::VARIABLE, "15", None),
+            item("app", K::VARIABLE, "11", None),
+            item("App", K::VARIABLE, "11", None),
+            item("createApp", K::VARIABLE, "11", None),
+            item("SearchApplication", K::CLASS, "15", None),
+        ];
+        let ranked: Vec<&str> = rank_completion_items(&items, "app")
+            .into_iter()
+            .map(|index| items[index].label.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                "app",
+                "App",
+                "appendFile",
+                "appendFileSync",
+                "createApp",
+                "SearchApplication",
+                "asyncWrapProviders",
+                "AudioParamMap",
+            ],
+            "the two symbols the user fully typed must lead; each repeated auto-import must be \
+             one row, not four; and nothing the server ranked lowest may sit above what it ranked \
+             highest"
+        );
+    }
+
+    /// The rule underneath that, on its own: a candidate the query spells out in full outranks one
+    /// that merely starts with it, however the server ordered them. `app` and `App` are both fully
+    /// typed; `App` follows only because its case doesn't match exactly.
+    #[test]
+    fn a_fully_typed_candidate_outranks_one_that_merely_starts_with_it() {
+        let bare = |label: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        let items = [bare("appendFile"), bare("App"), bare("app")];
+        let ranked: Vec<&str> = rank_completion_items(&items, "app")
+            .into_iter()
+            .map(|index| items[index].label.as_str())
+            .collect();
+        assert_eq!(ranked, vec!["app", "App", "appendFile"]);
+    }
+
+    /// A server that expresses priority through response order alone - no `sortText` on any item -
+    /// must keep that order exactly. The spec's "when omitted the label is used" fallback, applied
+    /// to a list where *nothing* carries one, would quietly re-sort everything alphabetically.
+    #[test]
+    fn a_response_with_no_sort_text_at_all_keeps_the_servers_own_order() {
+        let bare = |label: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        let items = [
+            bare("zebra_value"),
+            bare("alpha_value"),
+            bare("middle_value"),
+        ];
+        let ranked: Vec<&str> = rank_completion_items(&items, "value")
+            .into_iter()
+            .map(|index| items[index].label.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            vec!["zebra_value", "alpha_value", "middle_value"],
+            "no item claimed a rank, so the server's own order is the only real signal there is"
+        );
+    }
+
+    /// And the reverse: once the server *does* rank its items, that ranking decides between two
+    /// candidates this matcher scores identically - here two exact-quality prefix matches, one of
+    /// which the server put in its lowest band.
+    #[test]
+    fn a_real_server_sort_text_outranks_the_responses_own_arbitrary_order() {
+        let ranked_item = |label: &str, sort: &str| lsp_types::CompletionItem {
+            label: label.to_string(),
+            sort_text: Some(sort.to_string()),
+            ..Default::default()
+        };
+        let items = [
+            ranked_item("valueFromNodeTypes", "\u{ffff}16"),
+            ranked_item("valueInScope", "11"),
+        ];
+        let ranked: Vec<&str> = rank_completion_items(&items, "value")
+            .into_iter()
+            .map(|index| items[index].label.as_str())
+            .collect();
+        assert_eq!(ranked, vec!["valueInScope", "valueFromNodeTypes"]);
+    }
+
+    /// Collapsing is by what a row *inserts*, not by its label: two items that share a label but
+    /// would splice genuinely different text are two real choices and keep their own rows.
+    #[test]
+    fn two_rows_that_insert_different_text_are_never_collapsed() {
+        let with_insert = |insert: &str| lsp_types::CompletionItem {
+            label: "new".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            insert_text: Some(insert.to_string()),
+            ..Default::default()
+        };
+        let items = [with_insert("new()"), with_insert("new($1)")];
+        assert_eq!(rank_completion_items(&items, "new"), vec![0, 1]);
+    }
+
     /// The live-reported "`appendFile` appears four times", dumped verbatim from a real
     /// `typescript-language-server` against a real scratch project with a real `@types/node`
     /// installed, completing `app` at `const other = app`.
     ///
-    /// The two `appendFile` items that come back are **not** duplicates: they are two genuinely
-    /// different auto-import candidates - `import { appendFile } from 'fs'` (callback-style) and
-    /// `import { appendFile } from 'fs/promises'` (promise-style) - and accepting one inserts a
-    /// genuinely different `import` line from the other. So [`rank_completion_items`] is right to
-    /// keep both rows; `detail` differs, and `detail` is part of
-    /// [`interchangeable_completion_key`].
+    /// The two `appendFile` items that come back are two genuinely different auto-import
+    /// candidates - `import { appendFile } from 'fs'` and `import { appendFile } from
+    /// 'fs/promises'` - but they put the identical word in the file, so they get one row
+    /// ([`same_choice_key`]) and that row says where it comes from.
     ///
-    /// What was wrong is that the row painted *nothing* to tell them apart. Neither item has a
-    /// signature before `completionItem/resolve` (the whole 1029-item response carries not one
-    /// multi-token `detail`), so the type slot is empty on both, and the only field that differs
-    /// went to the detail pane's module footer - visible for the *selected* row alone. Two
-    /// identical-looking rows, exactly as reported. The module the item would be imported from now
-    /// reaches the row itself.
+    /// Neither item carries a signature before `completionItem/resolve` (the whole 1029-item
+    /// response carries not one multi-token `detail`), so a row showing the *type* would have been
+    /// blank until selected. The module is right there in the first response, which is why it -
+    /// and not the type - is what a row shows. See [`completion_row_hint`].
     #[test]
-    fn two_real_auto_import_candidates_for_one_label_show_which_module_each_comes_from() {
+    fn a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated() {
         let candidate = |module: &str| lsp_types::CompletionItem {
             label: "appendFile".to_string(),
             kind: Some(lsp_types::CompletionItemKind::FUNCTION),
@@ -1660,23 +1907,75 @@ mod tests {
         let items = [candidate("fs"), candidate("fs/promises")];
         assert_eq!(
             rank_completion_items(&items, "app"),
-            vec![0, 1],
-            "two different importable candidates are two real choices, not one duplicated row"
+            vec![0],
+            "one name the user can accept is one row, however many modules could supply it"
         );
         assert_eq!(
-            completion_import_source(&items[0]).as_deref(),
+            completion_row_hint(&items[0]).as_deref(),
             Some("fs"),
-            "the row must say which module this candidate would import from - without it the two \
-             rows are byte-identical on screen"
+            "and that row names its own origin, up front, with no resolve needed"
         );
+    }
+
+    /// `rust-analyzer`'s in-scope items name no module at all, but do carry a real signature
+    /// inline, on the first response - so that is what their row shows, and it is complete
+    /// immediately. Verbatim from a live dump at `text.le` and `w.c`.
+    #[test]
+    fn a_real_rust_analyzer_row_shows_the_signature_it_was_sent_inline() {
+        for (label, kind, detail) in [
+            (
+                "len",
+                lsp_types::CompletionItemKind::METHOD,
+                "const fn(&self) -> usize",
+            ),
+            ("count", lsp_types::CompletionItemKind::FIELD, "usize"),
+        ] {
+            let item = lsp_types::CompletionItem {
+                label: label.to_string(),
+                kind: Some(kind),
+                detail: Some(detail.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_row_hint(&item).as_deref(),
+                Some(detail),
+                "{label}: the server sent this up front, so the row shows it up front"
+            );
+        }
+    }
+
+    /// The rule that makes a row genuinely frozen: an item with **no** origin and **no** inline
+    /// signature paints nothing, and keeps painting nothing no matter what a later resolve says.
+    /// This is the live-reported "all data should be here without needing to select the
+    /// suggestion" - a row that fills in on selection is the bug, not the cure.
+    ///
+    /// `app` here is verbatim: a real `typescript-language-server` sends it bare
+    /// (`{"label":"app","kind":6}`), and its resolve returns `detail: "const app: App<Element>"` -
+    /// which belongs to the detail pane, and which [`completion_row_hint`] must not put on a row
+    /// even when handed the resolved item.
+    #[test]
+    fn a_resolve_response_can_never_put_anything_new_on_a_row() {
+        let inline = lsp_types::CompletionItem {
+            label: "app".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::VARIABLE),
+            sort_text: Some("11".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            completion_import_source(&items[1]).as_deref(),
-            Some("fs/promises")
-        );
-        assert_eq!(
-            completion_item_display(&items[0]).1,
+            completion_row_hint(&inline),
             None,
-            "and it must still not be shown in the slot reserved for a type"
+            "the server said nothing about this item up front, so its row says nothing"
+        );
+        // What the row would have become had the resolve been merged back into the server's list,
+        // which is exactly what `AdeApp::completions_resolved_items` exists to prevent.
+        let resolved = lsp_types::CompletionItem {
+            detail: Some("const app: App<Element>".to_string()),
+            ..inline.clone()
+        };
+        assert_eq!(
+            completion_signature_text(&resolved),
+            "const app: App<Element>",
+            "the detail pane is where that type belongs, and it does reach it"
         );
     }
 

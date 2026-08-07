@@ -269,6 +269,7 @@ impl AdeApp {
     pub(crate) fn dismiss_completions(&mut self) {
         self.completions = None;
         self.completions_generation = self.completions_generation.wrapping_add(1);
+        self.completions_resolved_items.clear();
     }
 
     /// The real text the user has typed since the completion was triggered, as a live-completions
@@ -501,6 +502,10 @@ impl AdeApp {
             return;
         };
         self.completions_generation = self.completions_generation.wrapping_add(1);
+        // Taken, not read: the generation bump above has already retired this response, so the map
+        // has to be emptied - but the item being accepted right now still needs whatever resolve
+        // landed for it, so it is moved out rather than dropped.
+        let resolved_items = std::mem::take(&mut self.completions_resolved_items);
         let CompletionsStatus::Ready {
             items,
             visible,
@@ -515,8 +520,18 @@ impl AdeApp {
         };
         // `selected` indexes the filtered view, so it must be resolved *through* `visible` back
         // into the real server list - accepting "the row I can see" and "the item that gets
-        // inserted" are the same item by construction.
-        let Some(item) = visible.get(selected).and_then(|index| items.get(*index)) else {
+        // inserted" are the same item by construction. Prefers the merged
+        // `completionItem/resolve` response when one has landed, because that is where a real
+        // server puts the `additionalTextEdits` that write an auto-import's own `import` line -
+        // accepting the inline item instead would insert the name and silently skip the import.
+        let resolved_selected = visible
+            .get(selected)
+            .and_then(|index| resolved_items.get(index))
+            .cloned();
+        let Some(item) = resolved_selected
+            .as_ref()
+            .or_else(|| visible.get(selected).and_then(|index| items.get(*index)))
+        else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
@@ -532,13 +547,55 @@ impl AdeApp {
         };
 
         let (range, text) = resolve_completion_edit(buffer, item);
+        // The item's own `additionalTextEdits` - which for every real server is where an
+        // auto-import's `import`/`use` line lives, and which nothing in this app used to apply at
+        // all. Accepting `appendFile` from `@types/node` therefore wrote the identifier and left
+        // the file without the import that makes it mean anything: code that does not compile,
+        // from a completion the popup had offered. Resolved into this buffer's own offsets here,
+        // while it is still in its pre-edit state, because that is the document the server's own
+        // line/character coordinates describe.
+        let mut import_edits: Vec<(std::ops::Range<usize>, String)> = item
+            .additional_text_edits
+            .iter()
+            .flatten()
+            .map(|edit| {
+                let start =
+                    buffer.offset_for_position(edit.range.start.line, edit.range.start.character);
+                let end = buffer.offset_for_position(edit.range.end.line, edit.range.end.character);
+                (start.min(end)..start.max(end), edit.new_text.clone())
+            })
+            .collect();
+        // Applied after the main edit and in descending document order, so no edit ever shifts a
+        // later one's offsets out from under it. The spec guarantees these never overlap the main
+        // edit, so ordering is the only real hazard.
+        import_edits.sort_by_key(|(edit_range, _)| std::cmp::Reverse(edit_range.start));
+
         let path = entry.path.clone();
         // Accepting a completion is a programmatic, whole-token edit, not a typed character - one
         // of GitHub issue #17's four named undo-group boundaries. Sealed on both sides so it is
         // its own real step: the partial word typed before it doesn't absorb it, and neither does
-        // whatever is typed after. See `crate::text_history`'s own docs for the policy.
+        // whatever is typed after. See `crate::text_history`'s own docs for the policy. The import
+        // edits sit inside the same seal, because accepting a completion and writing the import it
+        // needs are one action to a user and must undo as one.
         buffer.seal_history();
         buffer.replace_range(Some(range), &text);
+        // `replace_range` leaves the caret just past whatever it inserted - which is what the user
+        // wants for the completion itself, and exactly what must *not* be left behind after an
+        // import edit at the top of the file. So the caret the user should end on is remembered
+        // here, carried across each import edit by that edit's own length change, and restored.
+        // Without it, accepting an auto-import parks the caret up in the `import` line it just
+        // wrote.
+        let mut caret = buffer.cursor_offset();
+        for (edit_range, edit_text) in &import_edits {
+            buffer.replace_range(Some(edit_range.clone()), edit_text);
+            if edit_range.start <= caret {
+                caret = (caret + edit_text.len()).saturating_sub(edit_range.len());
+            }
+        }
+        if !import_edits.is_empty() {
+            let caret = caret.min(buffer.content.len());
+            buffer.selected_range = caret..caret;
+        }
         buffer.seal_history();
         self.schedule_rehighlight(path.clone(), cx);
         // The accepted text routinely still ends in a real identifier character (accepting a
@@ -646,7 +703,14 @@ impl AdeApp {
                 visible,
                 selected,
             } => {
-                selected_item = visible.get(*selected).and_then(|index| items.get(*index));
+                // The *described* item - the merged `completionItem/resolve` response when one has
+                // landed, the inline item until then. This is the one place in the popup that
+                // reads resolved data: the detail pane is what a resolve is allowed to fill in,
+                // and the rows below deliberately are not. See
+                // `crate::root::AdeApp::completions_resolved_items`.
+                selected_item = visible
+                    .get(*selected)
+                    .and_then(|index| self.described_completion_item(items, *index));
                 // `border-right:1px solid #23282c` in the mockup, on the list column's own right
                 // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
                 // while there's a real detail pane beside it to divide from.
@@ -867,8 +931,11 @@ fn render_completion_row(
     is_selected: bool,
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
-    let (label, detail) = completion_view::completion_item_display(item);
-    let import_source = completion_view::completion_import_source(item);
+    // `item` here is the server's own untouched response entry - never a resolve-merged one (see
+    // `crate::root::AdeApp::completions_resolved_items`), so everything this row paints is known
+    // the instant the popup opens and none of it can change under the user afterwards.
+    let label = item.label.clone();
+    let row_hint = completion_view::completion_row_hint(item);
     let kind_badge = completion_view::completion_kind_badge(item.kind);
     gpui::div()
         .id(("completion-item", index))
@@ -915,32 +982,12 @@ fn render_completion_row(
                 })
                 .child(label),
         )
-        // The module this item would be imported from, when it genuinely has one - see
-        // `completion_view::completion_import_source`'s own docs for the two live dumps this
-        // exists for. Its own span rather than the type hint below, in a dimmer colour and to the
-        // left of it: this text must read identically before and after `completionItem/resolve`,
-        // where the type hint legitimately goes from nothing to a signature, so sharing one slot
-        // would visibly swap a module name for a type under the user.
-        .children(import_source.map(|source| {
-            gpui::div()
-                .id(("completion-item-import-source", index))
-                // Lets a real test measure this real span's own painted bounds (`debug_bounds`
-                // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
-                // `debug_selector` in this crate.
-                .debug_selector(move || format!("completion-item-{index}-import-source"))
-                .flex_none()
-                // Narrower than the type hint's own 120px cap beside it: a real specifier is
-                // short (`fs`, `fs/promises`, `std::io::Result`), and the two spans share one row
-                // with the label, so this one yields the wider share to the type.
-                .max_w(gpui::px(90.0))
-                .truncate()
-                .text_size(gpui::px(10.0))
-                // One step dimmer than the type hint's own `text::GHOST`, so a glance can tell
-                // "comes from" apart from "is of type" without reading either.
-                .text_color(theme::text::HINT)
-                .child(source)
-        }))
-        .children(detail.map(|detail| {
+        // The row's one secondary string: where this item comes from, or the signature the server
+        // sent inline when it named no origin - see `completion_view::completion_row_hint` for
+        // which, per server, and for why the *type* is deliberately not this. It is read off the
+        // server's untouched response, so it is here the instant the popup opens and no resolve
+        // can rewrite it.
+        .children(row_hint.map(|hint| {
             gpui::div()
                 .id(("completion-item-detail", index))
                 // Lets a real test measure this real span's own painted bounds (`debug_bounds`
@@ -949,14 +996,14 @@ fn render_completion_row(
                 .debug_selector(move || format!("completion-item-{index}-detail"))
                 .flex_none()
                 // Same real overflow the label just above needs to guard against, on the
-                // right-hand type/detail hint instead - a real, unbounded type string (a deeply
-                // nested generic, a long tuple) capped to a reasonable share of the row rather
-                // than left free to push the row's total content wider than the popup itself.
+                // right-hand hint instead - a real, unbounded signature (a deeply nested generic,
+                // a long tuple) capped to a reasonable share of the row rather than left free to
+                // push the row's total content wider than the popup itself.
                 .max_w(gpui::px(120.0))
                 .truncate()
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
-                .child(detail)
+                .child(hint)
         }))
         // A real click both selects *and* accepts this row in one step - `on_mouse_down`, not
         // `on_click`, matching this app's own established idiom for a popover row that both
@@ -1888,21 +1935,98 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The live-reported "`appendFile` appears four times", on screen. The two real
-    /// `typescript-language-server` items behind it (dumped verbatim - see
-    /// `completion_view::tests::two_real_auto_import_candidates_for_one_label_show_which_module_each_comes_from`)
-    /// differ in exactly one field: the module each would be imported from. Every other row field
-    /// is identical, and neither carries a signature before `completionItem/resolve`, so both rows
-    /// painted a bare `appendFile` and an empty type slot - two rows a user genuinely cannot
-    /// choose between, for two genuinely different `import` statements.
+    /// Accepting an auto-import must write the import, not just the name.
     ///
-    /// Both rows must now paint a real import-source span, and the *selected* row must paint one
-    /// too rather than delegating the whole job to the detail pane's footer (which only ever
-    /// describes one row at a time, and so can never distinguish two).
+    /// Verbatim from a live `typescript-language-server`, resolving the `appendFile` candidate the
+    /// duplicate report was about: alongside the completion itself it returns
+    /// `additionalTextEdits: [{range: 1:0-1:0, newText: "import { appendFile } from 'fs';\n"}]`.
+    /// Nothing in this app applied that field, so accepting the row inserted `appendFile` into a
+    /// file with no import of it - an identifier that does not resolve, written by the editor
+    /// itself. It is also what makes collapsing several import candidates into one row honest:
+    /// the surviving row names a module, and now genuinely adds that module's import.
+    ///
+    /// Also pins the caret. The import lands *above* the caret, so every character it inserts
+    /// shifts the whole document under it; leaving the caret where `replace_range` put it would
+    /// park it back inside the `import` line it had just written.
     #[gpui::test]
-    fn each_auto_import_candidate_row_paints_the_module_it_would_import_from(
+    fn accepting_a_real_auto_import_writes_its_import_line_and_keeps_the_caret(
         cx: &mut TestAppContext,
     ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("main.ts");
+        std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("main.ts");
+
+        // Caret at the end of `const other = app`, exactly where the popup would have opened.
+        let caret_before = app.update(cx, |app, _| {
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
+            let caret = buffer.content.find("= app").expect("the fixture line") + "= app".len();
+            buffer.selected_range = caret..caret;
+            caret
+        });
+
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fs".to_string()),
+            additional_text_edits: Some(vec![lsp_core::lsp_types::TextEdit {
+                range: lsp_core::lsp_types::Range {
+                    start: lsp_core::lsp_types::Position::new(1, 0),
+                    end: lsp_core::lsp_types::Position::new(1, 0),
+                },
+                new_text: "import { appendFile } from 'fs';\n".to_string(),
+            }]),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::ready(vec![item], "app").expect("a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.accept_active_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        let (content, caret_after) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("a real buffer");
+            (buffer.content.clone(), buffer.cursor_offset())
+        });
+        assert!(
+            content.contains("import { appendFile } from 'fs';"),
+            "accepting an auto-import has to write the import the server said it needs - without \
+             it the editor has just typed an identifier that does not resolve. Got: {content:?}"
+        );
+        assert!(
+            content.contains("const other = appendFile"),
+            "and the completion itself still lands at the caret. Got: {content:?}"
+        );
+        let import_len = "import { appendFile } from 'fs';\n".len();
+        let typed_growth = "appendFile".len() - "app".len();
+        assert_eq!(
+            caret_after,
+            caret_before + typed_growth + import_len,
+            "the caret must end just past the accepted word, having moved down by exactly what \
+             the import inserted above it - not left sitting inside the import line. Got: \
+             {content:?}"
+        );
+    }
+
+    /// The live-reported "`appendFile` appears four times", on screen. Two real
+    /// `typescript-language-server` items (dumped verbatim - see
+    /// `completion_view::tests::a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated`)
+    /// that put the identical `appendFile` in the file by two different imports. One row survives,
+    /// and it paints the module it comes from.
+    #[gpui::test]
+    fn repeated_auto_import_candidates_paint_one_row_naming_its_module(cx: &mut TestAppContext) {
         let candidate = |module: &str| lsp_core::lsp_types::CompletionItem {
             label: "appendFile".to_string(),
             kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
@@ -1912,28 +2036,85 @@ mod completion_detail_pane_tests {
         let (_app, cx, _relative) =
             seed_ready_popup(cx, vec![candidate("fs"), candidate("fs/promises")]);
 
-        for (index, selector) in [
-            (0, "completion-item-0-import-source"),
-            (1, "completion-item-1-import-source"),
-        ] {
-            let source = cx.debug_bounds(selector).unwrap_or_else(|| {
-                panic!(
-                    "row {index} is a real auto-import candidate and must paint the module it \
-                         would import from - without it this row is byte-identical on screen to \
-                         its sibling, which is the reported duplicate"
-                )
-            });
-            assert!(
-                source.size.width > gpui::px(0.0),
-                "row {index}'s import source must be genuinely painted, not a zero-width span"
-            );
-        }
+        assert!(
+            cx.debug_bounds("completion-item-0").is_some(),
+            "the surviving row must have painted"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-1").is_none(),
+            "and the row that would have read `appendFile` a second time must not exist at all - \
+             that repeat is the whole report"
+        );
+        let hint = cx.debug_bounds("completion-item-0-detail").expect(
+            "an auto-import row has to name its own module, up front - it is the only thing \
+             distinguishing it from the candidates collapsed into it",
+        );
+        assert!(
+            hint.size.width > gpui::px(0.0),
+            "the module must be genuinely painted, not a zero-width span"
+        );
+    }
+
+    /// The load-bearing rule behind the live-reported "all data should be here without needing to
+    /// select the suggestion": a row is built from the server's own untouched response, so a
+    /// `completionItem/resolve` landing later cannot add anything to it or change it.
+    ///
+    /// Verbatim from a live `typescript-language-server`: `app` arrives bare
+    /// (`{"label":"app","kind":6}`) and only its resolve carries `detail: "const app:
+    /// App<Element>"`. This drives that merge through the real path
+    /// (`AdeApp::apply_resolved_completion_item`) and then re-reads the painted row.
+    #[gpui::test]
+    fn a_landed_resolve_fills_the_detail_pane_and_leaves_the_row_alone(cx: &mut TestAppContext) {
+        let bare = lsp_core::lsp_types::CompletionItem {
+            label: "app".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::VARIABLE),
+            ..Default::default()
+        };
+        let (app, cx, relative) = seed_ready_popup(cx, vec![bare.clone()]);
+
         assert!(
             cx.debug_bounds("completion-item-0-detail").is_none(),
-            "and the module must still not be painted in the slot reserved for a type - that swap \
-             (module name, then the signature replacing it once the resolve lands) is the \
-             separately-reported bug this must not reintroduce"
+            "sanity check: the server said nothing about this item up front, so its row says \
+             nothing up front"
         );
+
+        let generation = app.read_with(cx, |app, _| app.completions_generation);
+        app.update(cx, |app, cx| {
+            app.apply_resolved_completion_item(
+                &relative,
+                generation,
+                0,
+                Ok(lsp_core::lsp_types::CompletionItem {
+                    detail: Some("const app: App<Element>".to_string()),
+                    ..bare.clone()
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_none(),
+            "a resolve must never put anything on a row - a row that fills in once you select it \
+             is the reported bug itself"
+        );
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("popup still open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                items[0].detail, None,
+                "the server's own response must be left exactly as it arrived"
+            );
+            assert_eq!(
+                app.described_completion_item(items, 0)
+                    .and_then(|item| item.detail.as_deref()),
+                Some("const app: App<Element>"),
+                "while the detail pane's own view of that item - the one thing a resolve is for - \
+                 genuinely gains the type"
+            );
+        });
     }
 
     /// The other side of that: an ordinary item with a real type and no import at all must paint
