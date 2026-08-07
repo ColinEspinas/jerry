@@ -799,6 +799,22 @@ pub struct AdeApp {
     /// only ever read for a row-click hit test, and a scrolled-away row can't be clicked), so this
     /// is cleared wholesale only on a worktree switch, not pruned every frame.
     pub(crate) file_view_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    /// GitHub issue #202: which code blocks the user has currently collapsed, keyed by absolute
+    /// path, each value a set of 0-based [`code_surface::fold::FoldRange::start_line`]s.
+    ///
+    /// **Deliberately ephemeral** - in memory only, never written to disk. This app does persist
+    /// comparable per-worktree view state elsewhere (`crate::sidebar::fold_state` for the *file
+    /// tree*'s expanded directories, `crate::work_surface::tab_order_state` for tab order), but
+    /// neither of those precedents applies cleanly here: both key off a stable identity (a
+    /// directory path, a tab), while a code fold is a plain line index that a single edit made
+    /// outside the app invalidates. Restoring one across a restart would just as often collapse
+    /// the wrong block as the right one. Not even scroll position is persisted per file (see
+    /// `crate::code_surface::tabs`' own note), so this matches the surrounding discipline.
+    ///
+    /// Keyed by *absolute* path rather than by the `(worktree cwd, relative path)` pair
+    /// [`Self::edit_buffers`] uses, since an absolute path is already unambiguous across
+    /// worktrees - so unlike `edit_buffers` this needs no worktree-switch reset to stay honest.
+    pub(crate) file_view_folds: HashMap<PathBuf, std::collections::HashSet<usize>>,
     /// The real shaped line, bounds, and 0-indexed buffer line that painted the *caret's own* row
     /// most recently - `crate::code_surface::editing`'s `EntityInputHandler::bounds_for_range`/
     /// `character_index_for_point` read these three together (never `file_view_row_layout`, which

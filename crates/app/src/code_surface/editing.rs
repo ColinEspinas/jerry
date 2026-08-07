@@ -173,8 +173,13 @@ impl AdeApp {
                 };
                 let (line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
                 self.code_cursor = Some(line + 1);
-                self.file_view_scroll_handle
-                    .scroll_to_item(line, gpui::ScrollStrategy::Nearest);
+                // GitHub issue #202: `scroll_to_item` indexes *visual rows*, which stop being
+                // line indices once anything is collapsed - and a caret that ended up inside a
+                // collapsed region is expanded back into view here, since only the caret's own
+                // painted row registers the real `window.handle_input` wiring. See
+                // `AdeApp::scroll_file_view_to_line`.
+                let absolute_path = self.file_tree_root.join(&path);
+                self.scroll_file_view_to_line(&absolute_path, line, gpui::ScrollStrategy::Nearest);
             }
             Some(EditTarget::Merge) => {
                 let Some(edit) = self.merge_edit.as_ref() else {
@@ -1492,6 +1497,115 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
     /// text origin (the same origin `cursor_local`'s `x_for_index` measurements below use), of
     /// one real indent level's own guide line.
     pub indent_guide_xs: Vec<Pixels>,
+    /// GitHub issue #202: `Some` only on a row whose line really opens a collapsible region -
+    /// that row grows a gutter chevron, and a `⋯ N lines` marker while collapsed. Every other
+    /// row is `None` and paints exactly as it always did.
+    pub fold_state: Option<RowFoldState>,
+}
+
+/// One row's fold affordance - see [`EditableLineContext::fold_state`].
+///
+/// Carries the *absolute* path rather than reusing [`EditableLineContext::path`] (which is
+/// worktree-relative) because `AdeApp::file_view_folds` is keyed absolutely; both are needed at
+/// the click, so the chevron's handler gets one of each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::code_surface) struct RowFoldState {
+    pub path: PathBuf,
+    /// 0-based start line of the region this row opens - the key the fold set stores.
+    pub start_line: usize,
+    /// How many real lines the region hides while collapsed; reported verbatim by the marker, so
+    /// the number on screen is never an estimate.
+    pub hidden_count: usize,
+    /// Whether the region is collapsed right now, which decides both the chevron's direction and
+    /// whether the marker is drawn at all.
+    pub folded: bool,
+}
+
+/// The `▾`/`▸` fold chevron in a foldable row's line-number gutter (GitHub issue #202).
+///
+/// Absolutely positioned inside the gutter's own fixed 52px box rather than added as a flex
+/// sibling of the line number: the gutter's exact width is test-locked
+/// (`crate::code_surface::zoom::code_zoom_tests::zoom_scales_text_but_not_the_gutter_width`) and
+/// widening it would shift every row's code column. An absolute child contributes nothing to its
+/// parent's layout, so the number keeps its existing right-aligned position and the chevron sits
+/// in the empty space to its left.
+///
+/// Uses the same `▾`/`▸` glyph pair the file tree's own expand caret uses
+/// (`crate::sidebar::render::render_tree_caret`) so "this thing collapses" reads the same way in
+/// both surfaces, and the same `editor::GUTTER_TEXT`/`GUTTER_TEXT_ACTIVE` pair the line numbers
+/// beside it already use, so a collapsed region reads as active without a new colour token.
+fn render_fold_chevron(
+    fold: &RowFoldState,
+    relative_path: PathBuf,
+    line_number: usize,
+    cx: &mut Context<AdeApp>,
+) -> impl IntoElement {
+    let absolute_path = fold.path.clone();
+    let start_line = fold.start_line;
+    let folded = fold.folded;
+    gpui::div()
+        .id(("file-view-fold-chevron", line_number))
+        // Lets a real GPUI test find and click this exact affordance - a no-op outside test
+        // builds, matching every other `debug_selector` in this crate.
+        .debug_selector(move || format!("file-view-fold-chevron-{line_number}"))
+        .absolute()
+        .left(gpui::px(3.0))
+        .top_0()
+        .h_full()
+        .w(gpui::px(12.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_size(gpui::px(9.0))
+        .text_color(if folded {
+            theme::editor::GUTTER_TEXT_ACTIVE
+        } else {
+            theme::editor::GUTTER_TEXT
+        })
+        .hover(|style| style.text_color(theme::editor::GUTTER_TEXT_ACTIVE))
+        .child(if folded { "\u{25b8}" } else { "\u{25be}" })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
+                this.toggle_code_fold(&absolute_path, &relative_path, start_line);
+                // Mandatory, not defensive. Nothing else in the gutter handles a click, so
+                // without this the event bubbles all the way to the `uniform_list`
+                // container's own "clicked below the last line" fallback
+                // (`crate::code_surface::file_view::AdeApp::render_file_view`), which would
+                // fling the caret to the end of the buffer on every fold.
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+}
+
+/// The `⋯ N lines` marker a collapsed row grows at the end of its own text (GitHub issue #202) -
+/// the visible evidence that content is hidden here rather than simply absent.
+///
+/// Reuses the Diff view's own `theme::diff::FOLD_BG`/`FOLD_FG` pair
+/// (`crate::code_surface::diff_view::render_fold_marker`, the `⋯ N unchanged lines` band between
+/// hunks), so the app's two "content is collapsed here" affordances read identically.
+///
+/// `N` is the region's real hidden line count, straight from
+/// `crate::code_surface::fold::FoldRange::hidden_count` - never an estimate.
+fn render_fold_marker(hidden_count: usize, line_number: usize) -> impl IntoElement {
+    gpui::div()
+        .debug_selector(move || format!("file-view-fold-marker-{line_number}"))
+        .flex_none()
+        .ml(gpui::px(8.0))
+        .px(gpui::px(6.0))
+        .rounded(gpui::px(3.0))
+        .bg(theme::diff::FOLD_BG)
+        .text_color(theme::diff::FOLD_FG)
+        // `rems()`, matching the code text beside it, so the marker scales with editor zoom
+        // instead of becoming a fixed-size sliver - the same reasoning the Diff view's own
+        // marker documents.
+        .text_size(gpui::rems(0.85))
+        .child(format!(
+            "\u{22ef} {hidden_count} line{}",
+            if hidden_count == 1 { "" } else { "s" }
+        ))
 }
 
 /// The real quad(s) to paint for a caret at pixel range `[start_x, end_x)` on a row spanning
@@ -1599,7 +1713,11 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         caret_style,
         caret_blink_visible,
         indent_guide_xs,
+        fold_state,
     } = context;
+    // A third independent owned copy of this row's relative path, for the fold chevron's own
+    // `move` click closure - the same reason `row_path`/`drag_row_path` below are separate clones.
+    let fold_relative_path = path.clone();
 
     let gutter_color = if is_current {
         theme::editor::GUTTER_TEXT_ACTIVE
@@ -1861,6 +1979,13 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
     // own, overflowed and painted over the glyphs on a narrow pane. Here the code text is the
     // `flex_none` child and this is the shrinkable one, so it takes exactly whatever width is
     // left after the code and ellipsizes - see `render_inline_diagnostic_message`'s own docs.
+    // GitHub issue #202: the `⋯ N lines` marker for a row whose region is collapsed, placed
+    // immediately after the `flex_none` code text - so it reads as a continuation of the line the
+    // way VS Code's own collapsed-region badge does - and before the shrinkable diagnostic
+    // message below, which must stay the element that yields on a narrow pane.
+    if let Some(fold) = fold_state.as_ref().filter(|fold| fold.folded) {
+        text_row = text_row.child(render_fold_marker(fold.hidden_count, line_number));
+    }
     if let Some(first) = diagnostics.first() {
         let first_line = first.message.lines().next().unwrap_or_default();
         text_row = text_row.child(render_inline_diagnostic_message(
@@ -2062,6 +2187,10 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 .flex_none()
                 .w(gpui::px(52.0))
                 .pr(gpui::px(12.0))
+                // GitHub issue #202: the positioning context the fold chevron below anchors to.
+                // The gutter's own fixed width and right-aligned number are untouched - see
+                // `render_fold_chevron`'s own docs for why it must not become a flex sibling.
+                .relative()
                 .text_right()
                 .text_color(gutter_color)
                 .text_size(gpui::px(11.0))
@@ -2069,7 +2198,12 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
                 // that function's docs (`code_zoom_tests::zoom_scales_text_but_not_the_gutter_
                 // width` measures this exact id against both rendering paths).
                 .debug_selector(move || format!("file-view-gutter-{line_number}"))
-                .child(line_number.to_string()),
+                .child(line_number.to_string())
+                .children(
+                    fold_state
+                        .as_ref()
+                        .map(|fold| render_fold_chevron(fold, fold_relative_path, line_number, cx)),
+                ),
         )
         .child(
             gpui::div()
@@ -5120,6 +5254,350 @@ mod editing_tests {
         assert!(
             ring_runs(&app, cx) > 0,
             "turning it back on must restore the ring on the same already-open buffer"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // GitHub issue #202 ("Collapse code blocks")
+    //
+    // Every one of these drives the real File view: a real file on disk, opened through
+    // `open_file_view`, rendered through the real `uniform_list` row builder, and folded by a
+    // real `simulate_click` on the real painted bounds of the real gutter chevron. Nothing here
+    // calls `AdeApp::toggle_code_fold` directly - a test that did could not tell a working
+    // chevron from one bound to nothing.
+    // ---------------------------------------------------------------------------------------
+
+    /// Lines (1-based): 1 opens a block that closes on 4, so folding it hides 2, 3 and 4.
+    /// Line 5 is a complete `{}` pair on one line - deliberately present, because it must *not*
+    /// offer a chevron. Lines 6-8 are the tail that has to shift up when the block collapses.
+    const FOLDABLE_SOURCE: &str = "\
+fn alpha() {
+    let a = 1;
+    let b = 2;
+}
+fn beta() {}
+let tail = 3;
+let more = 4;
+let last = 5;
+";
+
+    /// `VisualTestContext::debug_bounds` takes a `&'static str`, but these tests build selector
+    /// names per line number. Leaking the handful of short strings a test produces is the
+    /// simplest honest way to satisfy that, and the test binary exits moments later.
+    fn selector(name: String) -> &'static str {
+        Box::leak(name.into_boxed_str())
+    }
+
+    fn open_foldable_file(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let repo_path = repo.path().to_path_buf();
+        // The tempdir must outlive the test body; every other test in this module keeps it in a
+        // local, but these need the app *and* the context back, so it is leaked deliberately -
+        // the process exits at the end of the test binary anyway.
+        std::mem::forget(repo);
+        let file_path = write_file(&repo_path, "sample.rs", FOLDABLE_SOURCE);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_path);
+        open_file_for_editing(&app, cx, file_path.clone());
+        (app, cx, file_path)
+    }
+
+    /// Clicks the middle of whatever the fold chevron on `line_number` actually painted, failing
+    /// loudly if no such element was painted at all - so a chevron that silently stopped
+    /// rendering can never be mistaken for a fold that did nothing.
+    fn click_fold_chevron(cx: &mut gpui::VisualTestContext, line_number: usize) {
+        let bounds = cx
+            .debug_bounds(selector(format!("file-view-fold-chevron-{line_number}")))
+            .unwrap_or_else(|| {
+                panic!("line {line_number} should have painted a real fold chevron")
+            });
+        assert!(
+            bounds.size.width > gpui::px(0.0) && bounds.size.height > gpui::px(0.0),
+            "the chevron must have real clickable area, measured {:?}",
+            bounds.size
+        );
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn only_a_line_that_really_opens_a_block_draws_a_fold_chevron(cx: &mut TestAppContext) {
+        let (_app, cx, _path) = open_foldable_file(cx);
+
+        assert!(
+            cx.debug_bounds("file-view-fold-chevron-1").is_some(),
+            "line 1 opens a block that closes on line 4, so it must offer a chevron"
+        );
+        assert!(
+            cx.debug_bounds("file-view-fold-chevron-2").is_none(),
+            "line 2 is an ordinary statement - no chevron"
+        );
+        assert!(
+            cx.debug_bounds("file-view-fold-chevron-5").is_none(),
+            "`fn beta() {{}}` opens and closes on one line, so there is nothing to hide and it \
+             must not offer a chevron that would do nothing"
+        );
+        assert!(
+            cx.debug_bounds("file-view-fold-marker-1").is_none(),
+            "nothing is folded yet, so no `⋯ N lines` marker may be drawn"
+        );
+    }
+
+    /// The core of the feature: a real click on the real chevron makes the block's rows stop
+    /// existing on screen, leaves the block's own first line in place with a marker reporting the
+    /// real hidden count, and keeps everything after the block rendering.
+    #[gpui::test]
+    fn clicking_the_chevron_really_collapses_the_block(cx: &mut TestAppContext) {
+        let (app, cx, path) = open_foldable_file(cx);
+
+        for line_number in 1..=8 {
+            assert!(
+                cx.debug_bounds(selector(format!("file-view-text-row-{line_number}")))
+                    .is_some(),
+                "line {line_number} must be on screen before the fold, or this test cannot tell \
+                 a real collapse from a row that was never rendered"
+            );
+        }
+
+        click_fold_chevron(cx, 1);
+
+        assert!(
+            cx.debug_bounds("file-view-text-row-1").is_some(),
+            "the block's own first line stays visible - it is what carries the marker"
+        );
+        for hidden in 2..=4 {
+            assert!(
+                cx.debug_bounds(selector(format!("file-view-text-row-{hidden}")))
+                    .is_none(),
+                "line {hidden} is inside the collapsed block and must no longer paint"
+            );
+        }
+        for still_visible in 5..=8 {
+            assert!(
+                cx.debug_bounds(selector(format!("file-view-text-row-{still_visible}")))
+                    .is_some(),
+                "line {still_visible} is past the collapsed block and must still paint"
+            );
+        }
+        assert!(
+            cx.debug_bounds("file-view-fold-marker-1").is_some(),
+            "a collapsed row must show the `⋯ N lines` marker - the only on-screen evidence that \
+             content is hidden rather than absent"
+        );
+
+        // And the real state behind it, so a marker drawn without a real fold would still fail.
+        let folded = app.read_with(cx, |app, _| {
+            app.file_view_folds.get(&path).cloned().unwrap_or_default()
+        });
+        assert_eq!(
+            folded,
+            std::collections::HashSet::from([0]),
+            "the 0-based start line of the collapsed region"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_chevron_again_brings_every_hidden_row_back(cx: &mut TestAppContext) {
+        let (app, cx, path) = open_foldable_file(cx);
+
+        click_fold_chevron(cx, 1);
+        assert!(cx.debug_bounds("file-view-text-row-3").is_none());
+
+        // The chevron is still there (now pointing right) on the collapsed row.
+        click_fold_chevron(cx, 1);
+
+        for line_number in 1..=8 {
+            assert!(
+                cx.debug_bounds(selector(format!("file-view-text-row-{line_number}")))
+                    .is_some(),
+                "line {line_number} must be back after expanding"
+            );
+        }
+        assert!(
+            cx.debug_bounds("file-view-fold-marker-1").is_none(),
+            "an expanded row must not keep claiming lines are hidden"
+        );
+        assert!(app.read_with(cx, |app, _| app
+            .file_view_folds
+            .get(&path)
+            .is_none_or(|folded| folded.is_empty())));
+    }
+
+    /// Regression guard for the one real hazard `render_fold_chevron`'s `cx.stop_propagation()`
+    /// exists for: nothing else in the gutter handles a click, so without it the event reaches
+    /// the `uniform_list` container's own "clicked below the last line" fallback and slams the
+    /// caret to the end of the buffer.
+    #[gpui::test]
+    fn folding_does_not_fling_the_caret_to_the_end_of_the_buffer(cx: &mut TestAppContext) {
+        let (app, cx, _path) = open_foldable_file(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        let before = app.read_with(cx, |app, _| {
+            app.edit_buffer(&relative).expect("buffer").cursor_offset()
+        });
+        assert_eq!(
+            before, 0,
+            "a freshly opened file starts with the caret at 0"
+        );
+
+        click_fold_chevron(cx, 1);
+
+        let after = app.read_with(cx, |app, _| {
+            app.edit_buffer(&relative).expect("buffer").cursor_offset()
+        });
+        assert_eq!(
+            after, before,
+            "the caret was outside the collapsed block, so folding must leave it exactly where \
+             it was - not at the end of the buffer"
+        );
+    }
+
+    /// Collapsing the block the caret is sitting in is not merely a cosmetic problem: only the
+    /// caret's *own* painted row registers the real `window.handle_input` wiring, so a caret left
+    /// on a row that no longer paints would make typing silently stop working. The caret must be
+    /// lifted onto the collapsed region's own still-visible line.
+    #[gpui::test]
+    fn folding_the_block_the_caret_is_inside_lifts_the_caret_onto_the_visible_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _path) = open_foldable_file(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        // Click a real row inside the block to put the caret there, the way a user would.
+        let row_bounds = cx
+            .debug_bounds("file-view-text-row-3")
+            .expect("line 3 should paint");
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| {
+                app.edit_buffer(&relative)
+                    .expect("buffer")
+                    .line_col_for_offset(app.edit_buffer(&relative).unwrap().cursor_offset())
+                    .0
+            }),
+            2,
+            "the caret must really be on 0-based line 2 before folding"
+        );
+
+        click_fold_chevron(cx, 1);
+
+        let caret_line = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("buffer");
+            buffer.line_col_for_offset(buffer.cursor_offset()).0
+        });
+        assert_eq!(
+            caret_line, 0,
+            "the caret must move onto the collapsed region's own visible start line"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(1));
+        assert!(
+            cx.debug_bounds("file-view-text-row-1").is_some(),
+            "and that row really is on screen, so it can still register input handling"
+        );
+    }
+
+    /// Folding must not break where the hover/diagnostic cards anchor. Those read
+    /// `AdeApp::file_view_row_layout`, which is keyed by *buffer line number* and written by each
+    /// row's own paint - so this measures a real line's real painted row before and after a fold
+    /// and asserts it is still filed under its own line number, at the row it actually moved to.
+    #[gpui::test]
+    fn a_row_below_a_fold_keeps_its_own_line_number_in_the_popup_anchor_map(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _path) = open_foldable_file(cx);
+
+        let row_top = |app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext, line: usize| {
+            app.read_with(cx, |app, _| {
+                app.file_view_row_layout
+                    .get(&line)
+                    .map(|(bounds, _)| bounds.top())
+            })
+        };
+
+        let line_5_before = row_top(&app, cx, 5).expect("line 5 painted before the fold");
+        let line_6_before = row_top(&app, cx, 6).expect("line 6 painted before the fold");
+        let row_height = line_6_before - line_5_before;
+        assert!(
+            row_height > gpui::px(0.0),
+            "two adjacent rows must be a real row height apart, measured {row_height:?}"
+        );
+
+        click_fold_chevron(cx, 1);
+
+        // Lines 2..=4 are hidden, so line 5 must have climbed exactly three rows - and must
+        // still be filed under 5, not under its new row index of 1.
+        let line_5_after = row_top(&app, cx, 5).expect("line 5 must still be anchored, under 5");
+        let climbed = line_5_before - line_5_after;
+        assert!(
+            (climbed - row_height * 3.0).abs() < gpui::px(1.0),
+            "line 5 should have moved up exactly three rows ({:?}), moved {climbed:?}",
+            row_height * 3.0
+        );
+
+        for hidden in 2..=4 {
+            assert!(
+                row_top(&app, cx, hidden).is_none(),
+                "line {hidden} no longer paints, so its stale anchor entry must have been pruned \
+                 - a popup anchored to it would otherwise point at a row that isn't there"
+            );
+        }
+    }
+
+    /// Folding is per file, and reopening a file keeps whatever was collapsed in it (the fold set
+    /// is keyed by absolute path, like `edit_buffers` is keyed per worktree) - while a *different*
+    /// file opened in between is entirely unaffected.
+    #[gpui::test]
+    fn fold_state_is_per_file(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let folded_file = write_file(repo.path(), "sample.rs", FOLDABLE_SOURCE);
+        let other_file = write_file(repo.path(), "other.rs", FOLDABLE_SOURCE);
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        open_file_for_editing(&app, cx, folded_file.clone());
+        click_fold_chevron(cx, 1);
+        assert!(cx.debug_bounds("file-view-text-row-3").is_none());
+
+        open_file_for_editing(&app, cx, other_file);
+        assert!(
+            cx.debug_bounds("file-view-text-row-3").is_some(),
+            "a different file with identical content must open fully expanded"
+        );
+        assert!(cx.debug_bounds("file-view-fold-marker-1").is_none());
+
+        open_file_for_editing(&app, cx, folded_file);
+        assert!(
+            cx.debug_bounds("file-view-text-row-3").is_none(),
+            "coming back to the folded file must find it still folded"
+        );
+    }
+
+    /// The rows the list actually builds come from the fold map, so a collapsed file really is a
+    /// shorter list - not the same rows with some of them painted invisibly.
+    #[gpui::test]
+    fn a_collapsed_file_really_has_fewer_visual_rows(cx: &mut TestAppContext) {
+        let (app, cx, path) = open_foldable_file(cx);
+        let relative = PathBuf::from("sample.rs");
+
+        let row_count = |app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext| {
+            app.update(cx, |app, _| {
+                let line_count = app.edit_buffer(&relative).expect("buffer").lines.len();
+                app.file_view_fold_map(&path, &relative, line_count)
+                    .visible_row_count()
+            })
+        };
+
+        assert_eq!(
+            row_count(&app, cx),
+            9,
+            "8 real lines plus the trailing empty"
+        );
+        click_fold_chevron(cx, 1);
+        assert_eq!(
+            row_count(&app, cx),
+            6,
+            "three lines collapsed away, and nothing else changed"
         );
     }
 }

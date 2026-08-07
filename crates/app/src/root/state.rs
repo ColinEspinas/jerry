@@ -295,6 +295,7 @@ impl AdeApp {
             _blame_message_tasks: HashMap::new(),
             edit_buffers: HashMap::new(),
             file_view_row_layout: HashMap::new(),
+            file_view_folds: HashMap::new(),
             file_view_last_layout: None,
             file_view_last_bounds: None,
             file_view_last_layout_for: None,

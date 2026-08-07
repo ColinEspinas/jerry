@@ -715,14 +715,25 @@ impl AdeApp {
                             });
                         let cursor_line =
                             target_line.or(reloaded_cursor_line).or(buffer_cursor_line);
+                        // GitHub issue #202: both of these now scroll to a *visual row*, not a
+                        // line index (the two differ once anything in this file is collapsed -
+                        // fold state is keyed by absolute path, so it survives a tab close and is
+                        // still here when the file is reopened), expanding the destination first.
+                        // See `AdeApp::scroll_file_view_to_line`.
                         if let Some(line) = target_line {
                             this.pending_cursor_line = None;
-                            this.file_view_scroll_handle
-                                .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                            this.scroll_file_view_to_line(
+                                &path,
+                                line.saturating_sub(1),
+                                ScrollStrategy::Center,
+                            );
                         } else if newly_in_view {
                             if let Some(line) = buffer_cursor_line {
-                                this.file_view_scroll_handle
-                                    .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                                this.scroll_file_view_to_line(
+                                    &path,
+                                    line.saturating_sub(1),
+                                    ScrollStrategy::Center,
+                                );
                             }
                         }
                         this.code_cursor = Some(cursor_line.unwrap_or(1));

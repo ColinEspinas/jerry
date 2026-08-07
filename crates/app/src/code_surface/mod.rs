@@ -13,6 +13,9 @@
 //!   shown for the current line (GitHub issue #29).
 //! - [`indent`] - Tab/Shift+Tab indentation resolution (tabs vs. spaces, width), including a
 //!   real, minimal `.editorconfig` reader (GitHub issue #26).
+//! - [`fold`] - which bracket-delimited regions of one file can be collapsed, and the
+//!   visual-row <-> buffer-line translation the File view's `uniform_list` needs once some of
+//!   them are (GitHub issue #202).
 //!
 //! GPUI-facing:
 //! - [`state`] - the load-state enums the surface's own fields are typed with.
@@ -68,6 +71,7 @@ use wt_core::diff::{DiffBase, DiffFile, DiffLineKind, WorktreeDiff};
 pub mod blame;
 pub mod code_view;
 pub mod edit_buffer;
+pub mod fold;
 pub mod indent;
 pub mod symbols;
 

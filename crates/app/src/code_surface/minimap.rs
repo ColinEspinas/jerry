@@ -175,6 +175,34 @@ fn visible_line_range(
     (first, count)
 }
 
+/// [`visible_line_range`]'s answer translated out of *visual row* space into the *buffer line*
+/// space every other helper in this module works in (GitHub issue #202).
+///
+/// [`visible_line_range`] divides a real scroll offset by the real row height, so what it really
+/// returns is which `uniform_list` rows are on screen. This panel draws one bar per real line of
+/// the file - collapsed or not, see this module's own "compress the whole file to fit" docs - so
+/// the viewport slider has to be placed over the *lines* those rows show. With nothing folded
+/// `FoldMap::line_for_row` is the identity and this returns exactly what
+/// [`visible_line_range`] did.
+///
+/// Returns `(first_visible_line, visible_line_count)`, `0`-indexed/counted, matching
+/// [`visible_line_range`]'s own convention so [`slider_geometry`]/[`line_for_pointer`] take it
+/// unchanged.
+fn visible_line_range_through_folds(
+    viewport_height: f32,
+    scrolled_px: f32,
+    row_line_height: f32,
+    fold_map: &fold::FoldMap,
+) -> (usize, usize) {
+    let (first_row, row_count) = visible_line_range(viewport_height, scrolled_px, row_line_height);
+    if row_count == 0 {
+        return (0, 0);
+    }
+    let first_line = fold_map.line_for_row(first_row);
+    let last_line = fold_map.line_for_row(first_row + row_count - 1);
+    (first_line, (last_line + 1).saturating_sub(first_line))
+}
+
 /// The viewport slider's own `(top, height)` in the minimap panel's local coordinates, given the
 /// real, effective per-line height (`effective_line_height`) and the code column's real visible
 /// range (`visible_line_range`). Floored at `MINIMAP_MIN_SLIDER_HEIGHT_PX` and clamped so the
@@ -326,11 +354,23 @@ impl gpui::Render for MinimapSliderDrag {
 }
 
 impl AdeApp {
+    /// GitHub issue #202: `fold_map` is what keeps this panel honest once a block is collapsed.
+    ///
+    /// Every helper in this module works in *buffer line* space (it draws one bar per real line
+    /// of the file, collapsed or not - see this module's own "compress the whole file to fit"
+    /// docs), while `file_view_scroll_handle` works in *visual row* space. Those were the same
+    /// number until folding existed, and this method is the only boundary where they meet: the
+    /// viewport slider is derived from a scroll offset (rows -> lines), and both the drag and the
+    /// track click produce a line the code column must scroll to (lines -> rows). Left
+    /// unconverted, a fold would put the slider over the wrong band and send a click to the wrong
+    /// place. With nothing folded both conversions are the identity, so an unfolded file's
+    /// minimap behaves exactly as it did.
     pub(in crate::code_surface) fn render_minimap(
         &self,
         lines: &[code_view::RenderedLine],
         changed_lines: &HashSet<usize>,
         row_line_height: f32,
+        fold_map: &fold::FoldMap,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let total_lines = lines.len();
@@ -346,8 +386,12 @@ impl AdeApp {
         let base = self.file_view_scroll_handle.base_handle();
         let scrolled_px = (-base.offset().y.as_f32()).max(0.0);
         let viewport_height_px = base.bounds().size.height.as_f32();
-        let (first_visible_line, visible_line_count) =
-            visible_line_range(viewport_height_px, scrolled_px, row_line_height);
+        let (first_visible_line, visible_line_count) = visible_line_range_through_folds(
+            viewport_height_px,
+            scrolled_px,
+            row_line_height,
+            fold_map,
+        );
 
         let line_rects = build_line_rects(lines, line_height, char_width(scale_percent), width);
         let git_rects = build_git_overlay_rects(changed_lines, total_lines, line_height);
@@ -367,6 +411,10 @@ impl AdeApp {
         let drag_total_lines = total_lines;
         let drag_line_height = line_height;
         let drag_visible_line_count = visible_line_count;
+        // Both handlers below resolve a real *buffer line* and must hand `scroll_to_item` a
+        // *visual row*; each closure needs its own owned map.
+        let click_fold_map = fold_map.clone();
+        let drag_fold_map = fold_map.clone();
 
         let bounds_entity = cx.entity();
 
@@ -443,7 +491,10 @@ impl AdeApp {
                             drag_visible_line_count,
                             local_y,
                         );
-                        drag_scroll_handle.scroll_to_item_strict(target_line, ScrollStrategy::Top);
+                        drag_scroll_handle.scroll_to_item_strict(
+                            drag_fold_map.row_for_line(target_line),
+                            ScrollStrategy::Top,
+                        );
                         cx.notify();
                     },
                 ))
@@ -467,7 +518,10 @@ impl AdeApp {
                             event.position.y.as_f32() - this.minimap_panel_bounds.origin.y.as_f32();
                         let target_line =
                             line_for_click(click_total_lines, click_line_height, local_y);
-                        click_scroll_handle.scroll_to_item(target_line, ScrollStrategy::Center);
+                        click_scroll_handle.scroll_to_item(
+                            click_fold_map.row_for_line(target_line),
+                            ScrollStrategy::Center,
+                        );
                         cx.notify();
                     }),
                 )
@@ -492,6 +546,50 @@ mod geometry_tests {
     #[test]
     fn a_disabled_setting_hides_the_minimap_even_for_a_tiny_file() {
         assert!(!should_render_minimap(false, 10));
+    }
+
+    /// GitHub issue #202. With nothing collapsed the row->line translation must be a no-op, or
+    /// this fix would have silently moved every existing minimap's slider.
+    #[test]
+    fn with_nothing_folded_the_slider_range_is_exactly_what_it_always_was() {
+        let unfolded = fold::FoldMap::unfolded(100);
+        // 10 rows of 20px scrolled 200px: rows 10..=19, i.e. lines 10..=19.
+        assert_eq!(
+            visible_line_range_through_folds(200.0, 200.0, 20.0, &unfolded),
+            (10, 10)
+        );
+        assert_eq!(visible_line_range(200.0, 200.0, 20.0), (10, 10));
+    }
+
+    /// The real point of the translation: the ten rows on screen span a much wider band of the
+    /// *file* when a collapsed region sits inside them, and the minimap draws the whole file - so
+    /// the slider must cover that wider band, not ten lines' worth of it.
+    #[test]
+    fn a_collapsed_region_inside_the_viewport_widens_the_slider_to_the_lines_it_spans() {
+        let ranges = [fold::FoldRange {
+            start_line: 12,
+            end_line: 41,
+        }];
+        let folded: std::collections::HashSet<usize> = [12].into_iter().collect();
+        let map = fold::FoldMap::new(100, &ranges, &folded);
+
+        // Same scroll and viewport as above: rows 10..=19. Rows 10, 11 and 12 are lines 10, 11
+        // and 12; row 13 is line 42 (lines 13..=41 are collapsed away), so row 19 is line 48.
+        assert_eq!(map.line_for_row(10), 10);
+        assert_eq!(map.line_for_row(13), 42);
+        assert_eq!(
+            visible_line_range_through_folds(200.0, 200.0, 20.0, &map),
+            (10, 39),
+            "ten rows on screen really do span lines 10 through 48 of the file"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_row_height_still_produces_no_range_through_the_fold_translation() {
+        assert_eq!(
+            visible_line_range_through_folds(200.0, 200.0, 0.0, &fold::FoldMap::unfolded(100)),
+            (0, 0)
+        );
     }
 
     #[test]
