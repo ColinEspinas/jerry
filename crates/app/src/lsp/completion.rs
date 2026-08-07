@@ -852,25 +852,32 @@ pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -
 }
 
 /// What a completion row actually offers a user: this identifier, of this kind, spliced in as this
-/// text. Two rows with equal keys put the same word in the file; the only thing that differs is
-/// which module the editor would import it from, and that difference belongs on *one* row's import
-/// source, not on a second row of an already-crowded list.
+/// text, out of this *package*. Two rows with equal keys put the same word in the file and would
+/// import it from the same package - so the only thing separating them is which of that package's
+/// entry points to use, which belongs on one row's import source rather than on a second row of an
+/// already-crowded list.
 ///
 /// This is the second, blunter half of the live-reported "the autocomplete has multiple
-/// suggestions for the same things", and the half the earlier, narrower
-/// [`interchangeable_completion_key`] deliberately did not touch. Typing `app` in a real Vue +
-/// `@types/node` project returns `appendFile` **four** times, `appendFileSync` twice and
-/// `asyncWrapProviders` twice - every one of them a genuinely different auto-import (`fs`,
-/// `node:fs`, `fs/promises`, `node:fs/promises`), and every one of them inserting the identical
-/// `appendFile` at the identical position. Seven of those nine rows were noise between the user
-/// and the symbol they meant.
+/// suggestions for the same things", and the half the narrower
+/// [`interchangeable_completion_key`] deliberately does not touch. Typing `app` in a real Vue +
+/// `@types/node` project returns `appendFile` from `node:fs`, `fs` **and** `fs/promises`,
+/// `appendFileSync` from `node:fs` and `fs`, `asyncWrapProviders` from `async_hooks` and
+/// `node:async_hooks` - each a genuinely different auto-import, each inserting the identical word
+/// at the identical position, and together most of the list.
 ///
-/// The trade this makes, stated plainly rather than buried: the popup no longer offers a *choice*
-/// of import source for one name. The row that survives is the one this ranking put first, which
-/// with `sortText` honored is the one the server itself recommends - and the accepted item still
-/// carries that module's own real `additionalTextEdits`, so the import written is a real one, just
-/// not one the user got to pick between. Reversing this would mean bringing all four rows back.
-fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String) {
+/// The package - not just the label - is in the key because an earlier version of this left it out
+/// and collapsed too much (live-reported: "some things should not have counted as duplicates").
+/// Two same-named exports of two *unrelated* packages are two genuinely different symbols, and
+/// merging them would silently pick one: [`import_source_package`] is what keeps `Ref` from `vue`
+/// and `Ref` from somewhere else apart while still folding `fs`, `node:fs` and `fs/promises`
+/// together.
+///
+/// The trade this still makes, stated plainly rather than buried: within one package the popup no
+/// longer offers a *choice* of entry point - `fs` and `fs/promises` are one row. The row that
+/// survives is the one this ranking put first, which with `sortText` honored is the one the server
+/// itself recommends, and accepting it applies that entry point's own real `additionalTextEdits`,
+/// so the import written is a real one - just not one the user got to pick between.
+fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String, Option<String>) {
     let inserted = match item.text_edit.as_ref() {
         Some(lsp_types::CompletionTextEdit::Edit(edit)) => edit.new_text.clone(),
         Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => edit.new_text.clone(),
@@ -881,7 +888,38 @@ fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String)
     };
     // `CompletionItemKind` is neither `Hash` nor castable to an integer, and its `Debug` is the
     // real variant name - a stable, unambiguous identity for a key that never leaves this pass.
-    (item.label.clone(), format!("{:?}", item.kind), inserted)
+    (
+        item.label.clone(),
+        format!("{:?}", item.kind),
+        inserted,
+        completion_import_source(item)
+            .as_deref()
+            .map(import_source_package),
+    )
+}
+
+/// The *package* an import source names, with the entry point inside it dropped - what decides
+/// whether two same-named candidates are the same symbol reached two ways or two different symbols
+/// that happen to share a name. See [`same_choice_key`].
+///
+/// Two real reductions, both drawn from live dumps rather than from reasoning about specifiers:
+///
+/// - A leading `node:` is dropped. `typescript-language-server` offers `fs` and `node:fs` as
+///   separate candidates for the identical export of the identical package.
+/// - Everything from the first separator on is dropped. `fs/promises` is the same package as `fs`;
+///   `os.path` is the same package as `os` in a live `pyright-langserver` dump; `std::io::Result`,
+///   `std::fmt::Result` and `std::thread::Result` are all `std` in a live `rust-analyzer` one.
+///
+/// Deliberately *not* reduced past that: `typing` and `typing_extensions` stay different (they
+/// share no separator-delimited segment), and so do `vue` and any other package exporting the same
+/// name - which is exactly what the over-collapse report was about.
+fn import_source_package(source: &str) -> String {
+    let source = source.strip_prefix("node:").unwrap_or(source);
+    let end = source
+        .find(['/', '.'])
+        .or_else(|| source.find("::"))
+        .unwrap_or(source.len());
+    source[..end].to_string()
 }
 
 /// Everything about a completion item that a user can either *see* on its row or *get* by
@@ -1866,6 +1904,82 @@ mod tests {
             .map(|index| items[index].label.as_str())
             .collect();
         assert_eq!(ranked, vec!["valueInScope", "valueFromNodeTypes"]);
+    }
+
+    /// The live-reported over-collapse: "some things should not have counted as duplicates."
+    ///
+    /// An earlier version of [`same_choice_key`] keyed on label, kind and inserted text alone, so
+    /// two same-named exports of two *unrelated* packages were merged and one silently vanished.
+    /// In a Vue project that is a real hazard - plenty of packages export a `Ref`, a `Component`,
+    /// a `Plugin` - and the surviving row would have imported from whichever the ranking happened
+    /// to put first.
+    #[test]
+    fn two_same_named_exports_of_unrelated_packages_keep_their_own_rows() {
+        let from = |module: &str| lsp_types::CompletionItem {
+            label: "Ref".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::INTERFACE),
+            detail: Some(module.to_string()),
+            sort_text: Some("\u{ffff}16".to_string()),
+            ..Default::default()
+        };
+        let items = [from("vue"), from("react"), from("preact")];
+        assert_eq!(
+            rank_completion_items(&items, "Ref"),
+            vec![0, 1, 2],
+            "three packages exporting a `Ref` are three genuinely different symbols - merging \
+             them would hide two and import a third the user never chose"
+        );
+
+        // ...while the entry points of one package still collapse, which is the case that was
+        // reported first. Verbatim from a live `typescript-language-server`.
+        let node = |module: &str| lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(module.to_string()),
+            sort_text: Some("\u{ffff}16".to_string()),
+            ..Default::default()
+        };
+        let node_items = [
+            node("node:fs"),
+            node("fs"),
+            node("fs/promises"),
+            node("node:fs/promises"),
+        ];
+        assert_eq!(
+            rank_completion_items(&node_items, "app"),
+            vec![0],
+            "all four name the same export of the same package by a different entry point"
+        );
+    }
+
+    /// The reductions [`import_source_package`] does and does not make, each from a live dump.
+    #[test]
+    fn an_import_source_reduces_to_its_package_and_no_further() {
+        for (source, package) in [
+            // typescript-language-server, `@types/node`.
+            ("fs", "fs"),
+            ("node:fs", "fs"),
+            ("fs/promises", "fs"),
+            ("node:fs/promises", "fs"),
+            // pyright-langserver.
+            ("os", "os"),
+            ("os.path", "os"),
+            // rust-analyzer's own `(use ...)` notes.
+            ("std::io::Result", "std"),
+            ("std::fmt::Result", "std"),
+            // Genuinely different packages, which must stay different.
+            ("typing", "typing"),
+            ("typing_extensions", "typing_extensions"),
+            ("vue", "vue"),
+            ("react", "react"),
+            ("@vue/reactivity", "@vue"),
+        ] {
+            assert_eq!(
+                import_source_package(source),
+                package,
+                "{source} belongs to package {package}"
+            );
+        }
     }
 
     /// Collapsing is by what a row *inserts*, not by its label: two items that share a label but

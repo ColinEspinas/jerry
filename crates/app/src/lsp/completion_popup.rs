@@ -538,6 +538,8 @@ impl AdeApp {
             self.reset_caret_blink(cx);
             return;
         };
+        // Read before the buffer is borrowed mutably below.
+        let auto_import = self.settings.editor.auto_import;
         let Some(buffer) = self.edit_buffer_mut(&entry.path) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
@@ -557,6 +559,7 @@ impl AdeApp {
         let mut import_edits: Vec<(std::ops::Range<usize>, String)> = item
             .additional_text_edits
             .iter()
+            .filter(|_| auto_import)
             .flatten()
             .map(|edit| {
                 let start =
@@ -2016,6 +2019,73 @@ mod completion_detail_pane_tests {
             caret_before + typed_growth + import_len,
             "the caret must end just past the accepted word, having moved down by exactly what \
              the import inserted above it - not left sitting inside the import line. Got: \
+             {content:?}"
+        );
+    }
+
+    /// The live-requested setting: with `editor.auto_import` off, accepting the very same item
+    /// inserts the name and nothing else - no `import` line - while everything else about the
+    /// accept is unchanged.
+    ///
+    /// It exists because a language server offers auto-imports for everything its own index can
+    /// reach, which in a browser project includes `@types/node`: `import { appendFile } from
+    /// 'node:fs'` is valid TypeScript there (verified against a live server - it raises no
+    /// diagnostic at all) and still cannot be bundled.
+    #[gpui::test]
+    fn the_auto_import_setting_off_inserts_the_name_without_the_import(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("main.ts");
+        std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("main.ts");
+
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("node:fs".to_string()),
+            additional_text_edits: Some(vec![lsp_core::lsp_types::TextEdit {
+                range: lsp_core::lsp_types::Range {
+                    start: lsp_core::lsp_types::Position::new(1, 0),
+                    end: lsp_core::lsp_types::Position::new(1, 0),
+                },
+                new_text: "import { appendFile } from 'node:fs'\n".to_string(),
+            }]),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.settings.editor.auto_import = false;
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
+            let caret = buffer.content.find("= app").expect("the fixture line") + "= app".len();
+            buffer.selected_range = caret..caret;
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::ready(vec![item], "app").expect("a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.accept_active_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        let content = app.read_with(cx, |app, _| {
+            app.edit_buffer(&relative)
+                .expect("a real buffer")
+                .content
+                .clone()
+        });
+        assert!(
+            content.contains("const other = appendFile"),
+            "the completion itself is still accepted. Got: {content:?}"
+        );
+        assert!(
+            !content.contains("import"),
+            "with auto-import off, no import may be written - that is the whole switch. Got: \
              {content:?}"
         );
     }

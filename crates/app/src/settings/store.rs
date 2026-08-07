@@ -365,6 +365,16 @@ pub struct EditorSettings {
     pub minimap_scale_percent: u16,
     pub insert_spaces: bool,
     pub tab_width: u8,
+    /// Whether accepting a completion also applies the item's own `additionalTextEdits` - in
+    /// practice, the `import`/`use` line a language server wants added for a symbol that isn't in
+    /// scope yet. Read by `crate::lsp::completion_popup::AdeApp::accept_active_completion`.
+    ///
+    /// On by default, because the alternative is inserting a name that doesn't resolve. Worth a
+    /// switch anyway, and live-requested: a server offers auto-imports for everything its own
+    /// index can reach, which in a browser project means `@types/node` - `import { appendFile }
+    /// from 'node:fs'` is valid TypeScript there and still cannot be bundled. Off, an accepted
+    /// completion inserts the name alone and leaves the import to the user.
+    pub auto_import: bool,
 }
 
 impl Default for EditorSettings {
@@ -374,6 +384,7 @@ impl Default for EditorSettings {
             minimap_scale_percent: MINIMAP_SCALE_PERCENT_DEFAULT,
             insert_spaces: true,
             tab_width: EDITOR_TAB_WIDTH_DEFAULT,
+            auto_import: true,
         }
     }
 }
