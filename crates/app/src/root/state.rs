@@ -391,6 +391,7 @@ impl AdeApp {
             completions_resolved: std::collections::HashSet::new(),
             completions: None,
             completions_scroll_handle: UniformListScrollHandle::new(),
+            completions_detail_scroll_handle: gpui::ScrollHandle::new(),
             completions_generation: 0,
             completions_suppress_next_trigger: false,
             file_view_diagnostics: HashMap::new(),

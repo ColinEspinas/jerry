@@ -1337,6 +1337,14 @@ pub struct AdeApp {
     /// overlay-scrollbar geometry straight off the same handle - not a second, parallel tracking
     /// mechanism, exactly like [`Self::file_tree_scroll_handle`].
     pub(crate) completions_scroll_handle: UniformListScrollHandle,
+    /// GitHub issue #30's real overlay scrollbar for the Completions popup's own detail pane -
+    /// `crate::lsp::completion_popup::AdeApp::render_completion_detail_pane`'s scrollable
+    /// signature+doc region reads its geometry straight off this handle, mirroring
+    /// [`Self::hover_card_scroll_handle`]'s identical role for the Hover card's own scrollable
+    /// region. Follow-up to the same fix: a genuinely multi-line signature (a pretty-printed
+    /// TypeScript utility/generic type) in the detail pane could overflow past the popup's own
+    /// height budget and hide the module-path footer beneath it, the same bug the Hover card had.
+    pub(crate) completions_detail_scroll_handle: gpui::ScrollHandle,
     /// A real generation counter bumped every time a completions request is dispatched or the
     /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
     /// docs for the real, live race this closes: an in-flight `textDocument/completion` request

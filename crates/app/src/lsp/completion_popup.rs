@@ -852,7 +852,7 @@ impl AdeApp {
         // applied to `list_column` above only when there's a real detail pane beside it to
         // divide from; a lone list column (Loading/Failed) has no seam to draw.
         if let Some(item) = selected_item {
-            popover = popover.child(render_completion_detail_pane(item, extension));
+            popover = popover.child(self.render_completion_detail_pane(item, extension, cx));
         }
 
         Some(popover.into_any_element())
@@ -981,118 +981,181 @@ fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> g
         .into_any_element()
 }
 
-/// The Completions popup's own detail pane - the design mockup's real, 300px right column
-/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
-/// describing whichever item is currently selected: a syntax-highlighted signature line, doc
-/// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
-/// exactly (same three-piece shape, same reasoning for showing it), just for the selected
-/// completion item instead of a `textDocument/hover` response.
-///
-/// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
-/// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
-fn render_completion_detail_pane(
-    item: &lsp_core::lsp_types::CompletionItem,
-    extension: Option<&str>,
-) -> gpui::AnyElement {
-    let mut pane = gpui::div()
-        .id("completions-detail-pane")
-        // Lets a real test measure this real pane's own painted bounds (`debug_bounds` reads
-        // this, not `.id(..)`) - a no-op outside test builds, matching every other
-        // `debug_selector` in this crate.
-        .debug_selector(|| "completions-detail-pane".to_string())
-        .flex_none()
-        .w(DETAIL_WIDTH)
-        .px(gpui::px(10.0))
-        .py(gpui::px(8.0));
+impl AdeApp {
+    /// The Completions popup's own detail pane - the design mockup's real, 300px right column
+    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
+    /// describing whichever item is currently selected: a syntax-highlighted signature line, doc
+    /// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
+    /// exactly (same three-piece shape, same reasoning for showing it), just for the selected
+    /// completion item instead of a `textDocument/hover` response.
+    ///
+    /// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
+    /// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
+    ///
+    /// A method, not a free function, since the signature+doc region below now needs
+    /// [`Self::completions_detail_scroll_handle`] and [`crate::root::scrollbar::
+    /// AdeApp::render_vertical_scrollbar`], both of which need `&self` - the identical reason
+    /// `crate::code_surface::lsp_ui::AdeApp::render_hover_card_content` stopped being a free
+    /// function.
+    fn render_completion_detail_pane(
+        &self,
+        item: &lsp_core::lsp_types::CompletionItem,
+        extension: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut pane = gpui::div()
+            .id("completions-detail-pane")
+            // Lets a real test measure this real pane's own painted bounds (`debug_bounds` reads
+            // this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(|| "completions-detail-pane".to_string())
+            .flex_none()
+            .w(DETAIL_WIDTH)
+            .flex()
+            .flex_col()
+            // A real ceiling on the pane's own total height, matching the popup's own overall
+            // budget - without it, a genuinely multi-line signature (typescript-language-server
+            // pretty-printing a wide utility/generic type like `Pick<{...}>` across several real
+            // lines, now that it renders in full instead of being truncated to its own first
+            // line) could grow the pane past the popup's own `overflow_hidden()` clip and hide
+            // the module-path footer beneath it - the same real bug the Hover card had.
+            .max_h(popover_max_height())
+            .px(gpui::px(10.0))
+            .py(gpui::px(8.0));
 
-    // Signature: `item.detail` when there is one - inline from the server's own
-    // `textDocument/completion` response for an item it already fully described, or filled in
-    // after the fact by a real `completionItem/resolve` round trip
-    // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
-    // much included) case where a server only sends a bare `label`/`kind` up front - the bare
-    // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
-    // same real way `crate::code_surface::code_view::highlight_block` highlights any other
-    // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
-    let signature_text = item
-        .detail
-        .as_ref()
-        .map(|detail| detail.trim())
-        .filter(|detail| !detail.is_empty())
-        .unwrap_or(item.label.as_str());
-    // One real stacked row per source line in `signature_text`, not a single `flex_wrap` row for
-    // the whole thing - a genuinely multi-line signature (e.g. typescript-language-server pretty-
-    // printing a wide utility/generic type like `Pick<{...}>` across several real lines) has no
-    // way to show a real line break inside one `flex_wrap` row, since wrapping there is a width
-    // overflow, not a semantic newline. Mirrors `crate::code_surface::lsp_ui::render_hover_signature`'s
-    // own fix for the identical bug: consuming only `highlight_block`'s first `RenderedLine` used
-    // to silently drop every real line past the first.
-    let signature_lines = code_view::highlight_block(
-        std::iter::once(signature_text),
-        extension,
-        code_view::HighlightOptions::default(),
-    );
-    let mut signature_column = gpui::div()
-        .flex()
-        .flex_col()
-        .font(gpui::font(theme::font::MONO))
-        .text_size(gpui::px(11.0));
-    let mut run_index = 0usize;
-    for line in signature_lines {
-        let mut signature_row = gpui::div().flex().flex_wrap();
-        for (run_text, kind) in line.runs {
-            let index = run_index;
-            run_index += 1;
-            signature_row = signature_row.child(
+        // Signature: `item.detail` when there is one - inline from the server's own
+        // `textDocument/completion` response for an item it already fully described, or filled in
+        // after the fact by a real `completionItem/resolve` round trip
+        // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
+        // much included) case where a server only sends a bare `label`/`kind` up front - the bare
+        // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
+        // same real way `crate::code_surface::code_view::highlight_block` highlights any other
+        // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
+        let signature_text = item
+            .detail
+            .as_ref()
+            .map(|detail| detail.trim())
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or(item.label.as_str());
+        // One real stacked row per source line in `signature_text`, not a single `flex_wrap` row for
+        // the whole thing - a genuinely multi-line signature (e.g. typescript-language-server pretty-
+        // printing a wide utility/generic type like `Pick<{...}>` across several real lines) has no
+        // way to show a real line break inside one `flex_wrap` row, since wrapping there is a width
+        // overflow, not a semantic newline. Mirrors `crate::code_surface::lsp_ui::render_hover_signature`'s
+        // own fix for the identical bug: consuming only `highlight_block`'s first `RenderedLine` used
+        // to silently drop every real line past the first.
+        let signature_lines = code_view::highlight_block(
+            std::iter::once(signature_text),
+            extension,
+            code_view::HighlightOptions::default(),
+        );
+        let mut signature_column = gpui::div()
+            .flex()
+            .flex_col()
+            .font(gpui::font(theme::font::MONO))
+            .text_size(gpui::px(11.0));
+        let mut run_index = 0usize;
+        for line in signature_lines {
+            let mut signature_row = gpui::div().flex().flex_wrap();
+            for (run_text, kind) in line.runs {
+                let index = run_index;
+                run_index += 1;
+                signature_row = signature_row.child(
+                    gpui::div()
+                        .id(("completion-detail-signature-token", index))
+                        // Lets a real test measure this real token's own painted bounds
+                        // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                        // matching every other `debug_selector` in this crate.
+                        .debug_selector(move || {
+                            format!("completion-detail-signature-token-{index}")
+                        })
+                        .text_color(code_view::color_for_kind(kind))
+                        .child(run_text),
+                );
+            }
+            signature_column = signature_column.child(signature_row);
+        }
+
+        // The scrollable region: the signature (now potentially many real lines tall) plus the
+        // doc paragraph, wrapped in a real `overflow_y_scroll()` area rather than left to grow
+        // the pane without bound. `.flex_1().min_h_0()` directly on this element, not just on its
+        // `.relative()` wrapper below - a flex item's default `min-height: auto` otherwise
+        // refuses to shrink below its own content's natural size, which would silently defeat
+        // `overflow_y_scroll()` here (see `crate::code_surface::lsp_ui::render_hover_card_content`'s
+        // own docs for the identical real GPUI gotcha this mirrors, and
+        // `crate::rail::render`'s own `"agent-rail-list"` scrollable list for the working
+        // precedent both follow).
+        let mut scroll_body = gpui::div()
+            .id("completions-detail-scroll-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            // The overlay scrollbar below reads its geometry straight off this same handle.
+            .track_scroll(&self.completions_detail_scroll_handle)
+            .child(signature_column);
+
+        if let Some(doc) = completion_view::completion_documentation_text(item) {
+            scroll_body = scroll_body.child(
                 gpui::div()
-                    .id(("completion-detail-signature-token", index))
-                    // Lets a real test measure this real token's own painted bounds
-                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
-                    // matching every other `debug_selector` in this crate.
-                    .debug_selector(move || format!("completion-detail-signature-token-{index}"))
-                    .text_color(code_view::color_for_kind(kind))
-                    .child(run_text),
+                    .mt(gpui::px(7.0))
+                    .font(gpui::font(theme::font::SANS))
+                    .text_size(gpui::px(11.0))
+                    .text_color(theme::text::DIMMER)
+                    // A real doc comment can run to many paragraphs (rustdoc examples, long
+                    // prose) - `.line_clamp(6)` still caps it at a real, bounded number of
+                    // visible lines with an ellipsis on the last one, so an ordinary long doc
+                    // paragraph reads as a clean truncation rather than needing the scrollbar
+                    // above at all; the scroll region is real headroom for the rarer case where
+                    // the signature *itself* is what's tall.
+                    .line_clamp(6)
+                    .child(doc),
             );
         }
-        signature_column = signature_column.child(signature_row);
-    }
-    pane = pane.child(signature_column);
 
-    if let Some(doc) = completion_view::completion_documentation_text(item) {
         pane = pane.child(
             gpui::div()
-                .mt(gpui::px(7.0))
-                .font(gpui::font(theme::font::SANS))
-                .text_size(gpui::px(11.0))
-                .text_color(theme::text::DIMMER)
-                // A real doc comment can run to many paragraphs (rustdoc examples, long prose) -
-                // `.line_clamp(6)` caps it at a real, bounded number of visible lines with an
-                // ellipsis on the last one, rather than growing the pane past `popover_max_height()`
-                // and having the outer popup's own `overflow_hidden()` cut it off mid-sentence at
-                // an arbitrary point.
-                .line_clamp(6)
-                .child(doc),
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(scroll_body)
+                .children(self.render_vertical_scrollbar(
+                    "completions-detail-scrollbar",
+                    &self.completions_detail_scroll_handle,
+                    &[],
+                    cx,
+                )),
         );
-    }
 
-    if let Some(module_path) = completion_view::completion_module_path(item) {
-        pane = pane.child(
-            gpui::div()
-                .mt(gpui::px(9.0))
-                .pt(gpui::px(7.0))
-                .border_t_1()
-                .border_color(theme::border::CARD)
-                .font(gpui::font(theme::font::MONO))
-                .text_size(gpui::px(10.0))
-                .text_color(theme::text::GHOST)
-                // A real, fully-qualified module path can be long enough to wrap onto a second
-                // line on its own - `.truncate()` keeps this footer the real, fixed single line
-                // the design's own mockup shows.
-                .truncate()
-                .child(module_path),
-        );
-    }
+        if let Some(module_path) = completion_view::completion_module_path(item) {
+            pane = pane.child(
+                gpui::div()
+                    .id("completion-detail-module-path")
+                    // Lets a real test measure this real footer's own painted bounds
+                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                    // matching every other `debug_selector` in this crate.
+                    .debug_selector(|| "completion-detail-module-path".to_string())
+                    .flex_none()
+                    .mt(gpui::px(9.0))
+                    .pt(gpui::px(7.0))
+                    .border_t_1()
+                    .border_color(theme::border::CARD)
+                    .font(gpui::font(theme::font::MONO))
+                    .text_size(gpui::px(10.0))
+                    .text_color(theme::text::GHOST)
+                    // A real, fully-qualified module path can be long enough to wrap onto a
+                    // second line on its own - `.truncate()` keeps this footer the real, fixed
+                    // single line the design's own mockup shows.
+                    .truncate()
+                    .child(module_path),
+            );
+        }
 
-    pane.into_any_element()
+        pane.into_any_element()
+    }
 }
 
 fn popover_message_row(text: &str) -> gpui::AnyElement {
@@ -1835,6 +1898,84 @@ mod completion_detail_pane_tests {
             popover.bottom(),
             footer.bottom(),
             popover.bottom() - footer.bottom()
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely tall signature (the
+    /// real shape typescript-language-server produces pretty-printing a wide object/union type
+    /// across many real lines, now that it renders in full instead of being truncated to its own
+    /// first line) used to grow the detail pane's own content past the popup's `overflow_hidden()`
+    /// clip, hiding the module-path footer beneath it - the same real bug the Hover card had. The
+    /// module-path footer must stay pinned near the pane's own real bottom regardless of how tall
+    /// the signature above it is, and a real scrollbar must appear for the overflowing region.
+    #[gpui::test]
+    fn a_tall_signature_keeps_the_module_path_footer_pinned_and_shows_a_real_scrollbar(
+        cx: &mut TestAppContext,
+    ) {
+        let tall_signature = (0..30)
+            .map(|index| format!("    field_{index}: string;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some(format!("const x: {{\n{tall_signature}\n}}")),
+            label_details: Some(lsp_core::lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        let (app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+        // `AdeApp::render_vertical_scrollbar` reads its geometry off the scroll handle's *last
+        // painted* bounds/`max_offset` (see that method's own docs) - the very first frame after
+        // the tall signature appears never has a scrollbar yet, by design. A second real frame
+        // (mirroring `completions_scroll_tests::open_with_seeded_popup`'s own identical settling
+        // step) lets that settle before the assertions below read it.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted for the tall-signature item");
+        let module_path = cx.debug_bounds("completion-detail-module-path").expect(
+            "the real module-path footer must still paint even though the real signature above \
+             it is far taller than the pane's own max height",
+        );
+        assert!(
+            (pane.bottom() - module_path.bottom()).abs() < gpui::px(10.0),
+            "the module-path footer must stay pinned near the pane's own real bottom edge \
+             regardless of how tall the content above it is (pane bottom {:?}, footer bottom \
+             {:?}) - the old bug pushed it below the pane's own overflow clip instead",
+            pane.bottom(),
+            module_path.bottom()
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_some(),
+            "a real scrollbar must appear for the signature/doc region once its own real content \
+             genuinely overflows"
+        );
+    }
+
+    /// The other half: an ordinary, short signature that fits comfortably within the pane's own
+    /// max height must never paint a scrollbar - the common case stays exactly as unadorned as it
+    /// always was.
+    #[gpui::test]
+    fn a_short_signature_paints_no_detail_scrollbar(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completions-detail-pane").is_some(),
+            "sanity check: the real detail pane must have painted"
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_none(),
+            "an ordinary short signature must never paint a real scrollbar - only genuinely \
+             overflowing content should"
         );
     }
 
