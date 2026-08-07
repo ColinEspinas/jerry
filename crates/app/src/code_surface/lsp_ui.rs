@@ -1329,13 +1329,54 @@ fn highlighted_signature_lines(
     .collect()
 }
 
+/// One run of [`render_doc_prose`]' output that is not ordinary prose.
+enum DocSpan {
+    /// A JSDoc tag (`@param`, `{@link ...}`) - painted in its own accent colour.
+    Tag(std::ops::Range<usize>),
+    /// A real Markdown inline link - painted as just its visible text, underlined, and genuinely
+    /// clickable (GitHub issue #201).
+    Link(markdown_preview::InlineLinkSpan),
+}
+
+impl DocSpan {
+    fn range(&self) -> std::ops::Range<usize> {
+        match self {
+            DocSpan::Tag(range) => range.clone(),
+            DocSpan::Link(span) => span.markup.clone(),
+        }
+    }
+}
+
+/// GitHub issue #201's hover/completion half: every real Markdown inline link in `doc`, plus every
+/// real JSDoc tag range that doesn't sit inside one, sorted into a single ordered span list.
+///
+/// Links win over tags on overlap, because a link's markup is what actually has to be *replaced*
+/// on screen (its `[...](...)` syntax must stop rendering literally), whereas a tag is only ever
+/// recoloured in place. A real overlap is possible: `[{@link Foo}](https://example.com)`.
+fn doc_spans(doc: &str) -> Vec<DocSpan> {
+    let links = markdown_preview::inline_link_spans(doc);
+    let mut spans: Vec<DocSpan> = code_view::doc_tag_ranges(doc)
+        .into_iter()
+        .filter(|tag| {
+            !links
+                .iter()
+                .any(|link| tag.start < link.markup.end && link.markup.start < tag.end)
+        })
+        .map(DocSpan::Tag)
+        .collect();
+    spans.extend(links.into_iter().map(DocSpan::Link));
+    spans.sort_by_key(|span| span.range().start);
+    spans
+}
+
 /// A doc paragraph's own plain-text body (`HoverRenderModel::doc`/`completion_documentation_text`,
 /// see either's own docs for why this is plain text, not real Markdown, in the first place), with
 /// every real `code_view::doc_tag_ranges` span (`@param`, `{@link ...}`, ...) painted in
 /// `HighlightKind::CommentDocTag`'s own accent colour and a heavier weight - GitHub issue #200's
-/// rendered-side half. `base_color` is every non-tag run's own colour, so the Hover card
-/// (`theme::text::DIM`) and the Completions detail pane (`theme::text::DIMMER`) each keep their own
-/// already-designed doc-paragraph colour for ordinary prose.
+/// rendered-side half - and every real Markdown inline link painted as a real, clickable link
+/// (GitHub issue #201, see [`render_doc_link`]). `base_color` is every ordinary-prose run's own
+/// colour, so the Hover card (`theme::text::DIM`) and the Completions detail pane
+/// (`theme::text::DIMMER`) each keep their own already-designed doc-paragraph colour.
 ///
 /// Shared between the two real places LSP doc prose is rendered as free text, rather than
 /// duplicated - `crate::lsp::completion_popup` calls this directly instead of growing its own
@@ -1348,9 +1389,10 @@ fn highlighted_signature_lines(
 pub(crate) fn render_doc_prose(
     doc: &str,
     base_color: impl Into<gpui::Hsla> + Copy,
+    next_id: &mut usize,
 ) -> gpui::AnyElement {
-    let tag_ranges = code_view::doc_tag_ranges(doc);
-    if tag_ranges.is_empty() {
+    let spans = doc_spans(doc);
+    if spans.is_empty() {
         return div()
             .text_color(base_color)
             .child(doc.to_string())
@@ -1358,28 +1400,34 @@ pub(crate) fn render_doc_prose(
     }
     let mut wrapper = div().flex().flex_wrap();
     let mut cursor = 0;
-    for (index, tag_range) in tag_ranges.into_iter().enumerate() {
-        if tag_range.start > cursor {
+    for span in spans {
+        let range = span.range();
+        if range.start > cursor {
             wrapper = wrapper.child(
                 div()
                     .text_color(base_color)
-                    .child(doc[cursor..tag_range.start].to_string()),
+                    .child(doc[cursor..range.start].to_string()),
             );
         }
-        wrapper = wrapper.child(
-            div()
-                .id(("doc-prose-tag", index))
-                // Lets a real test measure this real tag run's own painted bounds
-                // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
-                // matching every other `debug_selector` in this crate.
-                .debug_selector(move || format!("doc-prose-tag-{index}"))
-                .text_color(code_view::color_for_kind(
-                    code_view::HighlightKind::CommentDocTag,
-                ))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child(doc[tag_range.clone()].to_string()),
-        );
-        cursor = tag_range.end;
+        wrapper = wrapper.child(match span {
+            DocSpan::Tag(_) => {
+                let index = take_doc_span_id(next_id);
+                div()
+                    .id(("doc-prose-tag", index))
+                    // Lets a real test measure this real tag run's own painted bounds
+                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                    // matching every other `debug_selector` in this crate.
+                    .debug_selector(move || format!("doc-prose-tag-{index}"))
+                    .text_color(code_view::color_for_kind(
+                        code_view::HighlightKind::CommentDocTag,
+                    ))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(doc[range.clone()].to_string())
+                    .into_any_element()
+            }
+            DocSpan::Link(link) => render_doc_link(&link, base_color, next_id),
+        });
+        cursor = range.end;
     }
     if cursor < doc.len() {
         wrapper = wrapper.child(
@@ -1389,6 +1437,65 @@ pub(crate) fn render_doc_prose(
         );
     }
     wrapper.into_any_element()
+}
+
+/// Hands out the next card-unique doc-span id - see [`render_doc_link`]'s own docs for why these
+/// have to be unique across the *whole* card rather than per `render_doc_prose` call.
+fn take_doc_span_id(next_id: &mut usize) -> usize {
+    let id = *next_id;
+    *next_id += 1;
+    id
+}
+
+/// One real Markdown link inside an LSP doc body (GitHub issue #201: "In markdown preview but also
+/// other places where we render it"). Before this, a link in a real docstring - `[MDN](https://
+/// developer.mozilla.org/...)`, which is exactly how TypeScript's own lib docs and countless
+/// rustdoc comments cite references - reached the hover card as *literal* `[...](...)` bracket and
+/// paren syntax: `crate::lsp::hover::degrade_markdown_to_plain_text` strips `**`, backticks,
+/// headings and bullets, but has never touched link markup. It now renders as just its visible
+/// text, underlined in the link colour, and really opens.
+///
+/// A plain `div` with `.on_click`, not the [`gpui::InteractiveText`] the Markdown *preview* uses,
+/// because this render site was already built as a `flex_wrap` row of separate `div` runs (see
+/// [`render_doc_prose`]'s own docs) - so a link is just one more run in that row, and no
+/// sub-range hit testing is needed.
+///
+/// `next_id` is threaded from the card's own single counter rather than restarting per call: one
+/// hover card really does call [`render_doc_prose`] many times (description, each `@param` row,
+/// `@returns`, each other tag), and a stateful `.id(..)` element's own state is keyed by its id
+/// path - two links sharing one would be a real, not cosmetic, collision.
+fn render_doc_link(
+    link: &markdown_preview::InlineLinkSpan,
+    base_color: impl Into<gpui::Hsla> + Copy,
+    next_id: &mut usize,
+) -> gpui::AnyElement {
+    let index = take_doc_span_id(next_id);
+    // A destination this app cannot honestly open (a relative path, a bare fragment - see
+    // `markdown_preview::openable_url`) still sheds its literal `[...](...)` syntax, which was the
+    // visible half of the bug, but is painted as ordinary prose rather than advertised as a link.
+    let Some(url) = markdown_preview::openable_url(&link.destination) else {
+        return div()
+            .text_color(base_color)
+            .child(link.text.clone())
+            .into_any_element();
+    };
+    let url = url.to_string();
+    div()
+        .id(("doc-prose-link", index))
+        // Lets a real test measure this real link run's own painted bounds and click it
+        // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds.
+        .debug_selector(move || format!("doc-prose-link-{index}"))
+        .cursor_pointer()
+        .text_color(theme::syntax::LINK)
+        .border_b_1()
+        .border_color(theme::syntax::LINK)
+        .child(link.text.clone())
+        .on_click(move |_event, _window, cx| {
+            // The same real `gpui::App::open_url` the Markdown preview and
+            // `crate::title_bar::menu` open URLs with - one mechanism, not a third copy.
+            cx.open_url(&url);
+        })
+        .into_any_element()
 }
 
 /// A doc body's own real, structured JSDoc rendering (GitHub issue #200: "params/returns/example
@@ -1408,26 +1515,32 @@ pub(crate) fn render_doc_sections(
 ) -> gpui::AnyElement {
     let sections = hover_view::parse_doc_sections(doc);
     let mut column = div().flex().flex_col().gap(px(10.0));
+    // One counter for the whole card - see `render_doc_link`'s own docs for why every interactive
+    // doc span across every section below has to draw its id from the same sequence.
+    let next_id = &mut 0usize;
 
     if let Some(description) = &sections.description {
-        column = column.child(render_doc_prose(description, base_color));
+        column = column.child(render_doc_prose(description, base_color, next_id));
     }
     if !sections.params.is_empty() {
-        column = column.child(render_doc_params_section(&sections.params, base_color));
+        column = column.child(render_doc_params_section(
+            &sections.params,
+            base_color,
+            next_id,
+        ));
     }
     if let Some(returns) = &sections.returns {
-        column = column.child(render_doc_labeled_section(
-            "Returns",
-            render_doc_prose(returns, base_color),
-        ));
+        let body = render_doc_prose(returns, base_color, next_id);
+        column = column.child(render_doc_labeled_section("Returns", body));
     }
     for example in &sections.examples {
         column = column.child(render_doc_example_section(example, extension));
     }
     for (tag, body) in &sections.other {
+        let body = render_doc_prose(body, base_color, next_id);
         column = column.child(render_doc_labeled_section(
             &doc_tag_section_label(tag),
-            render_doc_prose(body, base_color),
+            body,
         ));
     }
 
@@ -1475,6 +1588,7 @@ fn doc_tag_section_label(tag: &str) -> String {
 fn render_doc_params_section(
     params: &[(String, String)],
     base_color: impl Into<gpui::Hsla> + Copy,
+    next_id: &mut usize,
 ) -> gpui::AnyElement {
     let label = if params.len() > 1 {
         "Parameters"
@@ -1502,7 +1616,7 @@ fn render_doc_params_section(
                     .child(name.clone()),
             );
         if !description.is_empty() {
-            row = row.child(render_doc_prose(description, base_color));
+            row = row.child(render_doc_prose(description, base_color, next_id));
         }
         rows = rows.child(row);
     }
@@ -4344,6 +4458,96 @@ mod hover_card_footer_layout_tests {
             "a real click over the hover card must never also reach a real File view row \
              underneath it - the same real hitbox-blocking mechanism a scroll wheel event relies \
              on to avoid also scrolling the content behind the card"
+        );
+    }
+
+    /// Mounts a real hover card carrying `doc` as its real doc body, exactly as
+    /// `a_real_jsdoc_tag_in_the_hover_doc_body_paints_its_own_tag_run` does - shared so the link
+    /// tests below differ only in the doc text they exercise.
+    fn show_hover_with_doc<'a>(
+        cx: &'a mut TestAppContext,
+        doc: &str,
+    ) -> (
+        gpui::Entity<AdeApp>,
+        &'a mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        let doc = doc.to_string();
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: Some(doc),
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (app, cx, repo)
+    }
+
+    /// GitHub issue #201's second render site - "In markdown preview but also other places where
+    /// we render it". A real Markdown link in an LSP docstring (exactly how TypeScript's own lib
+    /// docs and countless rustdoc comments cite references) used to reach this card as *literal*
+    /// `[MDN](https://...)` bracket-and-paren syntax: `hover::degrade_markdown_to_plain_text`
+    /// strips `**`, backticks, headings and bullets, but never touched link markup, and nothing
+    /// downstream parsed it either. It must now paint as its own real link run and really open.
+    #[gpui::test]
+    fn a_real_markdown_link_in_a_hover_doc_body_really_opens(cx: &mut TestAppContext) {
+        let (_app, cx, _repo) = show_hover_with_doc(
+            cx,
+            "Fetches a resource. See [MDN](https://developer.mozilla.org/fetch) for details.",
+        );
+
+        let link = cx
+            .debug_bounds("doc-prose-link-0")
+            .expect("a real Markdown link in the hover doc body must paint its own real link run");
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "sanity: nothing has been opened before the click"
+        );
+
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://developer.mozilla.org/fetch"),
+            "clicking a real link in a real hover card must really open its real destination"
+        );
+    }
+
+    /// The same deliberate limit the preview honours: a destination this app cannot resolve still
+    /// sheds its literal `[...](...)` syntax (the visible half of the bug), but is painted as
+    /// ordinary prose rather than advertised as a clickable link it could not actually follow.
+    #[gpui::test]
+    fn a_relative_link_in_a_hover_doc_body_is_not_painted_as_clickable(cx: &mut TestAppContext) {
+        let (_app, cx, _repo) = show_hover_with_doc(cx, "See [the guide](./guide.md) for details.");
+
+        assert!(
+            cx.debug_bounds("doc-prose-link-0").is_none(),
+            "a relative destination must not be advertised as a clickable link"
         );
     }
 

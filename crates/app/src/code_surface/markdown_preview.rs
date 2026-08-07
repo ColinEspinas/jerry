@@ -14,6 +14,14 @@
 //!   links. A reference/shortcut link's visible text still renders (as plain text via the generic
 //!   gap-capture in [`build_inline_run`]), just without link styling or a destination - not
 //!   dropped, just not specially recognized.
+//! - An inline link with an absolute `http`/`https`/`mailto` destination is really clickable and
+//!   really opens in the OS default browser (GitHub issue #201, see [`openable_url`] and
+//!   [`render_prose_font`]). A *relative* destination (`./CONTRIBUTING.md`, `#a-heading`) is
+//!   deliberately **not** clickable: resolving it needs the previewed file's own directory as a
+//!   base, and handing a bare relative path to the OS handler would silently open the wrong
+//!   thing. Those still render as styled link text, exactly as before - the app just never
+//!   advertises a click it cannot honour. Opening a relative link *inside this editor* would be a
+//!   real feature, but it is a navigation feature, not this bug fix.
 //! - Table cells render as plain trimmed text, not further inline-parsed - a cell containing
 //!   `**bold**` shows the literal asterisks rather than real bold text.
 //! - Images render as a small `[image: alt]` placeholder, not the fetched picture - this is a
@@ -383,13 +391,130 @@ fn build_image(image: Node, text: &str) -> MdInline {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Link destinations: which ones this app can genuinely open, and finding them in loose prose.
+// ---------------------------------------------------------------------------------------------
+
+/// GitHub issue #201 ("Markdown links do not work"): whether `destination` is a real absolute URL
+/// this app can honestly hand to the OS default browser (`gpui::App::open_url`, the same real
+/// mechanism `crate::title_bar::menu` already opens this project's own GitHub links with).
+///
+/// Deliberately scheme-gated rather than "open whatever the link says". A relative destination
+/// (`./CONTRIBUTING.md`, `#a-heading`) is a real and common thing to find in a README, but it is
+/// *not* something a browser can resolve on its own: the resolution base is the previewed file's
+/// own directory, which this function doesn't have, and handing a bare relative path to
+/// `xdg-open` would resolve it against the app's working directory instead - silently opening the
+/// wrong file, or nothing. Those destinations keep rendering as styled link text (exactly as
+/// before this fix) but are not painted as clickable, so the app never advertises a click it
+/// can't honour. See this module's own "Scope" docs.
+///
+/// `mailto:` is included because it is the one non-`http` scheme that genuinely appears in real
+/// prose docs and that every desktop's default-handler chain really does route (to a mail
+/// client). Every other scheme is rejected rather than passed through, so a `javascript:` or
+/// `file:` destination embedded in a downloaded/untrusted Markdown file can never be handed to
+/// the OS handler by a single click in this app.
+pub(crate) fn openable_url(destination: &str) -> Option<&str> {
+    let trimmed = destination.trim();
+    // Angle-bracket destinations (`[x](<https://example.com/a b>)`) are real CommonMark - the
+    // brackets are the destination's own delimiters, never part of the URL.
+    let trimmed = trimmed
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(trimmed);
+    let is_openable = ["http://", "https://", "mailto:"].iter().any(|scheme| {
+        trimmed.len() > scheme.len() && trimmed.to_ascii_lowercase().starts_with(scheme)
+    });
+    is_openable.then_some(trimmed)
+}
+
+/// One real inline link found in a run of loose prose - the byte range its whole `[text](url)`
+/// markup covers, the visible text it should render as, and where it points.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InlineLinkSpan {
+    /// Byte range of the entire `[text](destination)` markup within the scanned string.
+    pub(crate) markup: std::ops::Range<usize>,
+    pub(crate) text: String,
+    pub(crate) destination: String,
+}
+
+/// Every real inline link in `text`, in source order - the other half of GitHub issue #201, for
+/// the render sites that only ever see already-flattened prose rather than a parsed block tree
+/// (`crate::code_surface::lsp_ui::render_doc_prose`'s LSP hover/completion doc bodies, which
+/// arrive as one plain `String` from `crate::lsp::hover::degrade_markdown_to_plain_text`).
+///
+/// Runs the *same* real `tree-sitter-md` inline grammar [`parse_inline_node`] uses rather than a
+/// hand-rolled bracket/paren scanner, so exactly the constructs CommonMark calls a link are
+/// recognized here and in the preview - one grammar, one answer. A hand-rolled scan would have to
+/// re-derive nesting, escaping (`\[not a link\](x)`) and code-span exclusion for itself and would
+/// inevitably disagree with the preview about some real document.
+///
+/// Returns an empty `Vec` (never panics) if the inline grammar fails to load, matching
+/// [`parse_markdown`]'s own posture for the same should-never-happen case.
+pub(crate) fn inline_link_spans(text: &str) -> Vec<InlineLinkSpan> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_md::INLINE_LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    collect_inline_links(tree.root_node(), text, &mut spans);
+    spans.sort_by_key(|span| span.markup.start);
+    spans
+}
+
+fn collect_inline_links(node: Node, text: &str, out: &mut Vec<InlineLinkSpan>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "inline_link" {
+            let MdInline::Link {
+                text: link_text,
+                destination,
+            } = build_link(child, text)
+            else {
+                continue;
+            };
+            out.push(InlineLinkSpan {
+                markup: child.byte_range(),
+                text: flatten_inline_text(&link_text),
+                destination,
+            });
+            continue;
+        }
+        collect_inline_links(child, text, out);
+    }
+}
+
+/// Every real visible character of `inlines`, emphasis/strong nesting flattened away - unlike
+/// [`flatten_text`], which only reads the top level and so would silently return an empty string
+/// for a link whose text is entirely `**bold**`.
+fn flatten_inline_text(inlines: &[MdInline]) -> String {
+    inlines
+        .iter()
+        .map(|inline| match inline {
+            MdInline::Text(text) | MdInline::Code(text) => text.clone(),
+            MdInline::Strong(children) | MdInline::Emphasis(children) => {
+                flatten_inline_text(children)
+            }
+            MdInline::Image { alt } => alt.clone(),
+            MdInline::Link { text, .. } => flatten_inline_text(text),
+            MdInline::LineBreak => " ".to_string(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
 // Rendering: `Vec<MdBlock>` -> nested styled GPUI elements.
 // ---------------------------------------------------------------------------------------------
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, font, px, rems, AnyElement, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledText, TextRun,
+    div, font, px, rems, AnyElement, Context, FontWeight, Hsla, InteractiveElement,
+    InteractiveText, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, TextRun, UnderlineStyle,
 };
 
 use super::code_view;
@@ -434,6 +559,11 @@ impl AdeApp {
     ) -> AnyElement {
         let blocks = parse_markdown(source);
         let options = self.highlight_options();
+        let mut next_id = 0usize;
+        let block_elements: Vec<AnyElement> = blocks
+            .iter()
+            .map(|block| render_block(block, options, &mut next_id))
+            .collect();
         let content = div()
             .id("markdown-preview-content")
             // Test-only lookup key for `VisualTestContext::debug_bounds` - matches
@@ -450,7 +580,7 @@ impl AdeApp {
             .px(px(28.0))
             .py(px(20.0))
             .gap(px(10.0))
-            .children(blocks.iter().map(|block| render_block(block, options)));
+            .children(block_elements);
         let scrolled = div()
             .relative()
             .flex()
@@ -472,10 +602,22 @@ impl AdeApp {
 /// `options` is threaded down from [`AdeApp::render_markdown_preview`]'s own `&self` rather than
 /// read from ambient state, so a fenced code block honours `appearance.bracket_pair_colorization`
 /// exactly like the source view does - see `code_view::HighlightOptions`' own docs.
-fn render_block(block: &MdBlock, options: code_view::HighlightOptions) -> AnyElement {
+///
+/// `next_id` is a document-wide running counter handing every prose run its own unique
+/// [`InteractiveText`] element id - see [`render_prose_font`]'s own docs for why sharing one
+/// would be a real bug rather than a cosmetic one. A counter, rather than hashing each block's
+/// text, because two identical paragraphs in one document are perfectly legal and must still get
+/// distinct ids.
+fn render_block(
+    block: &MdBlock,
+    options: code_view::HighlightOptions,
+    next_id: &mut usize,
+) -> AnyElement {
     match block {
-        MdBlock::Heading { level, inline } => render_heading(*level, inline),
-        MdBlock::Paragraph(inline) => render_prose(inline, theme::text::BODY, prose_font()),
+        MdBlock::Heading { level, inline } => render_heading(*level, inline, next_id),
+        MdBlock::Paragraph(inline) => {
+            render_prose(inline, theme::text::BODY, prose_font(), next_id)
+        }
         MdBlock::CodeBlock { language, text } => {
             render_code_block(language.as_deref(), text, options)
         }
@@ -483,11 +625,18 @@ fn render_block(block: &MdBlock, options: code_view::HighlightOptions) -> AnyEle
             ordered,
             start,
             items,
-        } => render_list(*ordered, *start, items, options),
-        MdBlock::BlockQuote(blocks) => render_block_quote(blocks, options),
+        } => render_list(*ordered, *start, items, options, next_id),
+        MdBlock::BlockQuote(blocks) => render_block_quote(blocks, options, next_id),
         MdBlock::ThematicBreak => render_thematic_break(),
         MdBlock::Table { header, rows } => render_table(header, rows),
     }
+}
+
+/// Hands out the next document-unique prose-run id.
+fn take_id(next_id: &mut usize) -> usize {
+    let id = *next_id;
+    *next_id += 1;
+    id
 }
 
 fn heading_size_rems(level: u8) -> f32 {
@@ -501,7 +650,7 @@ fn heading_size_rems(level: u8) -> f32 {
     }
 }
 
-fn render_heading(level: u8, inline: &[MdInline]) -> AnyElement {
+fn render_heading(level: u8, inline: &[MdInline], next_id: &mut usize) -> AnyElement {
     let mut el = div()
         .flex()
         .flex_col()
@@ -511,6 +660,7 @@ fn render_heading(level: u8, inline: &[MdInline]) -> AnyElement {
             inline,
             theme::text::HEADING,
             prose_font().bold(),
+            take_id(next_id),
         ));
     if level <= 2 {
         el = el
@@ -522,11 +672,21 @@ fn render_heading(level: u8, inline: &[MdInline]) -> AnyElement {
 }
 
 /// A plain prose block (paragraph body, list item text) at the ambient body text size.
-fn render_prose(inline: &[MdInline], color: theme::ColorToken, font: gpui::Font) -> AnyElement {
+fn render_prose(
+    inline: &[MdInline],
+    color: theme::ColorToken,
+    font: gpui::Font,
+    next_id: &mut usize,
+) -> AnyElement {
+    let id = take_id(next_id);
     div()
         .text_size(rems(0.95))
         .line_height(rems(1.55))
-        .child(render_prose_font(inline, color, font))
+        // Lets a real test measure this real paragraph's own painted bounds and click inside it
+        // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds, matching every
+        // other `debug_selector` in this crate.
+        .debug_selector(move || format!("markdown-prose-{id}"))
+        .child(render_prose_font(inline, color, font, id))
         .into_any_element()
 }
 
@@ -534,18 +694,56 @@ fn render_prose(inline: &[MdInline], color: theme::ColorToken, font: gpui::Font)
 /// (bold/italic/code/link spans flowing together on the same line), not a `flex()` row of
 /// separate divs, which GPUI does not word-wrap the way inline HTML does. `base_color`/`base_font`
 /// are this run's own default styling before any nested emphasis/strong/link/code override.
+///
+/// GitHub issue #201 ("Markdown links do not work"): when this run contains at least one link
+/// with a genuinely openable destination, the `StyledText` is wrapped in a real
+/// [`InteractiveText`], whose `on_click` fires only for a press *and* release inside the same
+/// registered byte range (`vendor/zed/crates/gpui/src/elements/text.rs:1022`) - so clicking the
+/// link text opens it, and clicking the prose around it does nothing. `InteractiveText` is the
+/// only GPUI element that can make a sub-range of one wrapped text element clickable; splitting
+/// the paragraph into per-span `div`s to hang an `on_click` on instead would have destroyed the
+/// word wrapping this single-`StyledText` shape exists to preserve.
+///
+/// `id` must be unique across the whole rendered document - [`InteractiveText`] is a *stateful*
+/// element that stores its in-progress mouse-down byte index under this id
+/// (`InteractiveTextState`), so two paragraphs sharing an id would share that state and misreport
+/// which range a click landed in.
 fn render_prose_font(
     inline: &[MdInline],
     base_color: theme::ColorToken,
     base_font: gpui::Font,
+    id: usize,
 ) -> AnyElement {
-    let mut text = String::new();
-    let mut runs = Vec::new();
-    build_text_runs(inline, hsla(base_color), &base_font, &mut text, &mut runs);
-    if text.is_empty() {
+    let mut out = ProseRuns::default();
+    build_text_runs(
+        inline,
+        &RunStyle {
+            color: hsla(base_color),
+            font: base_font,
+            underline: None,
+        },
+        &mut out,
+    );
+    if out.text.is_empty() {
         return div().into_any_element();
     }
-    StyledText::new(text).with_runs(runs).into_any_element()
+    let styled = StyledText::new(out.text).with_runs(out.runs);
+    if out.link_ranges.is_empty() {
+        return styled.into_any_element();
+    }
+    let destinations = out.link_destinations;
+    InteractiveText::new(("markdown-prose", id), styled)
+        .on_click(out.link_ranges, move |index, _window, cx| {
+            let Some(url) = destinations.get(index) else {
+                return;
+            };
+            // The same real "hand this URL to the platform's default browser" call
+            // `crate::title_bar::menu` already opens this project's own GitHub links with
+            // (`gpui::App::open_url` -> `vendor/zed/crates/gpui_linux/src/linux/platform.rs:387`'s
+            // real `open_uri`), not a second, independent implementation of it.
+            cx.open_url(url);
+        })
+        .into_any_element()
 }
 
 fn push_run(
@@ -555,6 +753,7 @@ fn push_run(
     font: &gpui::Font,
     color: Hsla,
     background: Option<Hsla>,
+    underline: Option<UnderlineStyle>,
 ) {
     if run_text.is_empty() {
         return;
@@ -565,56 +764,128 @@ fn push_run(
         font: font.clone(),
         color,
         background_color: background,
-        underline: None,
+        underline,
         strikethrough: None,
     });
 }
 
-fn build_text_runs(
-    inlines: &[MdInline],
+/// One prose block's accumulated text and styling runs, plus the real clickable link spans found
+/// inside it - byte ranges into `text`, paired positionally with the destination each one opens
+/// (GitHub issue #201). Collected during the same single walk that builds the runs, because a
+/// link's range is only knowable as the text is appended: it is exactly the stretch of `text`
+/// that its own nested inlines contributed.
+#[derive(Default)]
+struct ProseRuns {
+    text: String,
+    runs: Vec<TextRun>,
+    link_ranges: Vec<std::ops::Range<usize>>,
+    link_destinations: Vec<String>,
+}
+
+/// The styling in force at one nesting level of [`build_text_runs`]' walk.
+#[derive(Clone)]
+struct RunStyle {
     color: Hsla,
-    font: &gpui::Font,
-    text: &mut String,
-    runs: &mut Vec<TextRun>,
-) {
+    font: gpui::Font,
+    underline: Option<UnderlineStyle>,
+}
+
+/// A real link's own underline, in the link colour - the standard, unmissable "this is a link"
+/// affordance, and the only visual cue distinguishing a *clickable* link from the merely
+/// colour-shifted text this app painted before issue #201. Applied per [`TextRun`] rather than as
+/// a container border, because a link is an inline span inside a wrapping paragraph, not a box.
+fn link_underline() -> UnderlineStyle {
+    UnderlineStyle {
+        thickness: px(1.0),
+        color: Some(hsla(theme::syntax::LINK)),
+        wavy: false,
+    }
+}
+
+fn build_text_runs(inlines: &[MdInline], style: &RunStyle, out: &mut ProseRuns) {
     for inline in inlines {
         match inline {
-            MdInline::Text(run_text) => push_run(text, runs, run_text, font, color, None),
+            MdInline::Text(run_text) => push_run(
+                &mut out.text,
+                &mut out.runs,
+                run_text,
+                &style.font,
+                style.color,
+                None,
+                style.underline,
+            ),
             MdInline::Strong(children) => build_text_runs(
                 children,
-                hsla(theme::syntax::STRONG),
-                &font.clone().bold(),
-                text,
-                runs,
+                &RunStyle {
+                    color: hsla(theme::syntax::STRONG),
+                    font: style.font.clone().bold(),
+                    underline: style.underline,
+                },
+                out,
             ),
             MdInline::Emphasis(children) => build_text_runs(
                 children,
-                hsla(theme::syntax::EMPHASIS),
-                &font.clone().italic(),
-                text,
-                runs,
+                &RunStyle {
+                    color: hsla(theme::syntax::EMPHASIS),
+                    font: style.font.clone().italic(),
+                    underline: style.underline,
+                },
+                out,
             ),
             MdInline::Code(code_text) => push_run(
-                text,
-                runs,
+                &mut out.text,
+                &mut out.runs,
                 code_text,
                 &mono_font(),
                 hsla(theme::text::PATH),
                 Some(hsla(theme::surface::ROW_HOVER_ALT)),
+                style.underline,
             ),
             MdInline::Link {
                 text: link_text,
-                destination: _,
-            } => build_text_runs(link_text, hsla(theme::syntax::LINK), font, text, runs),
+                destination,
+            } => {
+                // Only a destination this app can genuinely open gets the underline and a
+                // clickable range - see [`openable_url`] for why a relative destination is
+                // deliberately left as inert styled text rather than advertised as clickable.
+                let url = openable_url(destination);
+                let start = out.text.len();
+                build_text_runs(
+                    link_text,
+                    &RunStyle {
+                        color: hsla(theme::syntax::LINK),
+                        font: style.font.clone(),
+                        underline: url.map(|_| link_underline()),
+                    },
+                    out,
+                );
+                if let Some(url) = url {
+                    let url = url.to_string();
+                    let end = out.text.len();
+                    if end > start {
+                        out.link_ranges.push(start..end);
+                        out.link_destinations.push(url);
+                    }
+                }
+            }
             MdInline::Image { alt } => push_run(
-                text,
-                runs,
+                &mut out.text,
+                &mut out.runs,
                 &format!("[image: {alt}]"),
-                font,
+                &style.font,
                 hsla(theme::text::GHOST),
                 None,
+                style.underline,
             ),
-            MdInline::LineBreak => push_run(text, runs, "\n", font, color, None),
+            MdInline::LineBreak => push_run(
+                &mut out.text,
+                &mut out.runs,
+                "\n",
+                &style.font,
+                style.color,
+                None,
+                style.underline,
+            ),
         }
     }
 }
@@ -672,6 +943,7 @@ fn render_code_line(line: &code_view::RenderedLine) -> AnyElement {
             &mono_font(),
             code_view::color_for_kind(*kind).into(),
             None,
+            None,
         );
     }
     if text.is_empty() {
@@ -694,6 +966,7 @@ fn render_list(
     start: u64,
     items: &[Vec<MdBlock>],
     options: code_view::HighlightOptions,
+    next_id: &mut usize,
 ) -> AnyElement {
     let mut list = div().flex().flex_col().gap(px(4.0));
     for (index, item_blocks) in items.iter().enumerate() {
@@ -721,14 +994,23 @@ fn render_list(
                     .flex_1()
                     .min_w_0()
                     .gap(px(6.0))
-                    .children(item_blocks.iter().map(|block| render_block(block, options))),
+                    .children(
+                        item_blocks
+                            .iter()
+                            .map(|block| render_block(block, options, next_id))
+                            .collect::<Vec<_>>(),
+                    ),
             );
         list = list.child(row);
     }
     div().pl(px(INDENT_PX * 0.0)).child(list).into_any_element()
 }
 
-fn render_block_quote(blocks: &[MdBlock], options: code_view::HighlightOptions) -> AnyElement {
+fn render_block_quote(
+    blocks: &[MdBlock],
+    options: code_view::HighlightOptions,
+    next_id: &mut usize,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -738,7 +1020,12 @@ fn render_block_quote(blocks: &[MdBlock], options: code_view::HighlightOptions) 
         .border_l_2()
         .border_color(theme::border::DIVIDER)
         .text_color(theme::text::SECONDARY)
-        .children(blocks.iter().map(|block| render_block(block, options)))
+        .children(
+            blocks
+                .iter()
+                .map(|block| render_block(block, options, next_id))
+                .collect::<Vec<_>>(),
+        )
         .into_any_element()
 }
 
@@ -1115,5 +1402,146 @@ mod parse_tests {
     #[test]
     fn an_empty_document_parses_to_no_blocks() {
         assert_eq!(parse_markdown(""), Vec::new());
+    }
+}
+
+/// GitHub issue #201, "Markdown links do not work". The parse side already produced a real
+/// [`MdInline::Link`] carrying a real destination (`an_inline_link_carries_its_real_text_and_
+/// destination`, above) - what was missing was everything after it: the destination was dropped
+/// on the floor at render time (`build_text_runs` matched `destination: _`), so a link painted as
+/// inert coloured text with no click target at all. These cover the two new pieces that fix
+/// closes: which destinations this app will really open, and finding links in loose prose for the
+/// LSP hover/completion render sites.
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_web_url_is_openable_and_keeps_its_exact_text() {
+        for url in [
+            "https://example.com/x",
+            "http://example.com",
+            "https://developer.mozilla.org/en-US/docs/Web/API/fetch#options",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(openable_url(url), Some(url), "{url}");
+        }
+    }
+
+    /// Scheme matching is case-insensitive (`HTTPS://` is a real, legal URL), but the returned
+    /// destination is never normalized - it is handed to the OS handler byte-for-byte as written.
+    #[test]
+    fn scheme_matching_ignores_case_without_rewriting_the_url() {
+        assert_eq!(
+            openable_url("HTTPS://Example.COM/Path"),
+            Some("HTTPS://Example.COM/Path")
+        );
+    }
+
+    /// CommonMark's own angle-bracket destination form: the brackets delimit the destination and
+    /// are never part of the URL handed to the browser.
+    #[test]
+    fn an_angle_bracketed_destination_sheds_its_delimiters() {
+        assert_eq!(
+            openable_url("<https://example.com/a>"),
+            Some("https://example.com/a")
+        );
+    }
+
+    /// The deliberate limit, stated honestly rather than silently: a destination this app cannot
+    /// resolve on its own is *not* openable, so it never gets painted as a clickable link. See
+    /// [`openable_url`]'s own docs.
+    #[test]
+    fn a_destination_this_app_cannot_honestly_resolve_is_not_openable() {
+        for destination in [
+            "./CONTRIBUTING.md",
+            "../other/file.md",
+            "#a-heading",
+            "docs/guide.md",
+            "",
+            // Not a navigation at all - never handed to the OS default handler on one click.
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>alert(1)</script>",
+            // Scheme present but nothing after it.
+            "https://",
+        ] {
+            assert_eq!(openable_url(destination), None, "{destination:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_in_loose_prose_reports_its_real_markup_range_text_and_destination() {
+        let doc = "see [the docs](https://example.com/x) now";
+        let spans = inline_link_spans(doc);
+        assert_eq!(
+            spans,
+            vec![InlineLinkSpan {
+                markup: 4..37,
+                text: "the docs".to_string(),
+                destination: "https://example.com/x".to_string(),
+            }]
+        );
+        // The reported range must really cover the whole `[text](url)` markup - this is exactly
+        // the slice `lsp_ui::render_doc_prose` replaces, so an off-by-one here would leave a
+        // stray bracket or paren visible on the hover card.
+        assert_eq!(
+            &doc[spans[0].markup.clone()],
+            "[the docs](https://example.com/x)"
+        );
+    }
+
+    /// A real LSP hover body is multi-line plain text with several sections, not one tidy line -
+    /// every link in it must still be found, in source order.
+    #[test]
+    fn every_link_across_a_real_multi_line_doc_body_is_found_in_order() {
+        let doc = "Fetches a resource.\n\nSee [MDN](https://developer.mozilla.org/x) for \
+                   details.\n\n@returns a [Response](https://example.com/response)";
+        let spans = inline_link_spans(doc);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| (span.text.as_str(), span.destination.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("MDN", "https://developer.mozilla.org/x"),
+                ("Response", "https://example.com/response"),
+            ]
+        );
+        for span in &spans {
+            assert_eq!(&doc[span.markup.clone()][..1], "[");
+            assert_eq!(&doc[span.markup.clone()][span.markup.len() - 1..], ")");
+        }
+    }
+
+    /// A link whose visible text is itself emphasized must report the real *visible* text, not an
+    /// empty string - `flatten_text` only ever read the top level, which is exactly the shape
+    /// (`[**bold link**](url)`) that would have silently rendered as a blank clickable gap.
+    #[test]
+    fn a_link_whose_text_is_emphasized_still_reports_its_real_visible_text() {
+        let spans = inline_link_spans("[**bold link**](https://example.com)");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "bold link");
+    }
+
+    #[test]
+    fn prose_with_no_links_reports_none() {
+        assert!(inline_link_spans("just some ordinary prose, 3 * 4 = 12").is_empty());
+        assert!(inline_link_spans("").is_empty());
+    }
+
+    /// The real reason this scans with `tree-sitter-md`'s own inline grammar rather than a
+    /// hand-rolled bracket/paren scan: a bracketed span that is *not* a CommonMark inline link
+    /// must not be mistaken for one. A hand-rolled `[`-then-`](` scan would happily match inside
+    /// a code span.
+    #[test]
+    fn a_bracketed_span_that_is_not_a_real_link_is_not_reported() {
+        assert!(
+            inline_link_spans("an array index like list[0] and a footnote [1] stay put").is_empty()
+        );
+        assert!(
+            inline_link_spans("`[not a link](https://example.com)` inside a code span").is_empty(),
+            "a code span's contents are not links - the real grammar knows this, a regex would not"
+        );
     }
 }

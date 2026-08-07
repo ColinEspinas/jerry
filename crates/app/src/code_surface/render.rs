@@ -585,4 +585,112 @@ mod markdown_preview_toggle_tests {
             "a newly opened file must never inherit a different file's stray Preview selection"
         );
     }
+
+    /// Opens `contents` as a real `.md` file already switched to Preview, by really clicking the
+    /// real toggle - the same path a user takes, not a direct field poke.
+    fn open_markdown_preview<'a>(
+        cx: &'a mut TestAppContext,
+        contents: &str,
+    ) -> (
+        gpui::Entity<AdeApp>,
+        &'a mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("readme.md"), contents).expect("write readme.md");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("readme.md"), window, cx);
+        });
+        cx.run_until_parked();
+        let preview_bounds = cx
+            .debug_bounds("choice-markdown-view-toggle-1")
+            .expect("the Preview segment must have painted");
+        cx.simulate_click(preview_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        (app, cx, repo)
+    }
+
+    /// A real click a few pixels into the first rendered paragraph - i.e. on its own first word,
+    /// which every test below arranges to be the link text (or deliberately not). Deliberately not
+    /// `bounds.center()`: a prose paragraph's `div` stretches the full content width, so its
+    /// centre lands in empty space well past the end of a short line, where
+    /// `TextLayout::index_for_position` (`vendor/zed/crates/gpui/src/elements/text.rs:829`)
+    /// genuinely returns `Err` and no click range can match.
+    fn click_first_paragraph_start(cx: &mut gpui::VisualTestContext) {
+        let bounds = cx
+            .debug_bounds("markdown-prose-0")
+            .expect("the first preview paragraph must have painted");
+        let point = bounds.origin + gpui::point(gpui::px(6.0), bounds.size.height / 2.0);
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// GitHub issue #201, "Markdown links do not work" - the real, reported bug, end to end.
+    ///
+    /// The parse side already produced a real destination; the render side threw it away
+    /// (`build_text_runs` matched `destination: _`), so a link painted as coloured text that did
+    /// nothing at all when clicked. This clicks a real rendered link in a real Preview tab and
+    /// asserts the app really asked the platform to open that exact URL - `cx.opened_url()` reads
+    /// what `gpui::App::open_url` actually handed the platform layer
+    /// (`vendor/zed/crates/gpui/src/platform/test/platform.rs:418`), so nothing here is stubbed on
+    /// this app's side of the call.
+    #[gpui::test]
+    fn clicking_a_real_preview_link_really_opens_its_url(cx: &mut TestAppContext) {
+        let (_app, cx, _repo) = open_markdown_preview(
+            cx,
+            "[the real documentation](https://example.com/real-target)\n",
+        );
+
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "sanity: nothing has been opened before the click"
+        );
+        click_first_paragraph_start(cx);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/real-target"),
+            "clicking a real rendered Markdown link must really open its real destination"
+        );
+    }
+
+    /// The other half of "clickable": clicking the ordinary prose *around* a link must not open
+    /// anything. Without this, a test that only ever clicks a link cannot tell a real per-range
+    /// hit test apart from a paragraph-wide "any click opens the first URL" handler - which would
+    /// be exactly the kind of fake this fix must not be.
+    #[gpui::test]
+    fn clicking_ordinary_prose_next_to_a_link_opens_nothing(cx: &mut TestAppContext) {
+        let (_app, cx, _repo) = open_markdown_preview(
+            cx,
+            "ordinary words first, then [a link](https://example.com/should-not-open)\n",
+        );
+
+        click_first_paragraph_start(cx);
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a click on the plain prose at the start of the paragraph must not open the link \
+             that happens to sit later in the same paragraph"
+        );
+    }
+
+    /// The deliberate, documented limit (`markdown_preview::openable_url`), pinned as real
+    /// behaviour rather than left to drift: a relative destination is not something this app can
+    /// resolve, so clicking it must do *nothing* rather than hand a bare relative path to the OS
+    /// default handler, which would resolve it against the app's working directory and open the
+    /// wrong thing.
+    #[gpui::test]
+    fn clicking_a_relative_link_opens_nothing_rather_than_the_wrong_thing(cx: &mut TestAppContext) {
+        let (_app, cx, _repo) =
+            open_markdown_preview(cx, "[the contributing guide](./CONTRIBUTING.md)\n");
+
+        click_first_paragraph_start(cx);
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a relative destination must never reach the OS default-open handler"
+        );
+    }
 }
