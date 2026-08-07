@@ -1313,8 +1313,19 @@ pub struct AdeApp {
     /// *currently* looking at in the detail pane is ever worth resolving, so a fresh selection
     /// always supersedes an in-flight resolve for a previous one.
     pub(crate) _completions_resolve_task: Option<Task<()>>,
+    /// Which `(path, completions_generation, item index)` triple [`Self::_completions_resolve_task`]
+    /// is currently out asking about, if any - cleared when that request's response lands.
+    ///
+    /// Exists because "superseded" and "answered" are genuinely different states, and conflating
+    /// them cost real data: superseding a resolve *cancels* it (dropping a `Task` cancels it), so
+    /// an item the user arrowed past never gets an answer. Recording it in
+    /// [`Self::completions_resolved`] at dispatch time therefore marked an item answered that
+    /// never was, and coming back to it produced no second request - its row and detail pane
+    /// stayed pinned to the unresolved item's own fields for as long as the popup lived. Only a
+    /// request that is genuinely still on its way is skipped here; a cancelled one is retried.
+    pub(crate) completions_resolve_in_flight: Option<(PathBuf, u64, usize)>,
     /// Which `(path, completions_generation, item index into `CompletionsStatus::Ready::items`)`
-    /// triples this app has already dispatched a real `completionItem/resolve` request for -
+    /// triples this app has already *had a real answer* for from `completionItem/resolve` -
     /// keyed by [`Self::completions_generation`] (not cleared explicitly) so a stale entry from a
     /// since-replaced server response is simply never looked up again rather than needing its own
     /// cleanup pass. Exists purely to avoid re-requesting the same already-resolved (or

@@ -196,7 +196,7 @@ fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail
 
     // A detail that is just the label again carries no information the row doesn't already show.
     let redundant = cleaned.is_empty() || cleaned == item.label;
-    let detail_is_path = !redundant && looks_like_module_path(cleaned);
+    let detail_is_path = !redundant && detail_is_module_specifier(cleaned, item.kind);
 
     CompletionDetail {
         signature: (!redundant && !detail_is_path).then(|| cleaned.to_string()),
@@ -249,6 +249,72 @@ fn looks_like_module_path(text: &str) -> bool {
         && !text.contains(char::is_whitespace)
         && !text.contains(['(', ')', '<', '>', '{', '}', '!', ','])
         && (text.contains("::") || text.contains('/'))
+}
+
+/// The same question for `CompletionItem::detail` specifically, where a real separator is *not*
+/// required - the live-reported "the types are loading only after in a weird way replacing the
+/// module names".
+///
+/// In a project using the ordinary `"moduleResolution": "node"`, `typescript-language-server`
+/// reports an auto-import from an installed package as that package's **bare** specifier, with no
+/// separator at all. Dumped verbatim from a live server: `label: "createProgram", kind: FUNCTION,
+/// detail: "typescript"`, whose `completionItem/resolve` response is `"Auto import from
+/// 'typescript'\nfunction ts.createProgram(...): ts.Program"`. [`looks_like_module_path`] called
+/// that a type, so the row printed the module name in its type slot until the resolve landed and
+/// visibly overwrote it with the signature - a swap, where the design promises the type slot only
+/// ever gains a type it didn't have.
+///
+/// A bare `typescript` is indistinguishable *as a string* from a one-word type like `usize`, so
+/// [`CompletionItemKind`](lsp_types::CompletionItemKind) settles it - see
+/// [`kind_has_no_one_word_type`]. Deliberately scoped to `detail`: `label_details.description` has
+/// never been observed carrying a bare package specifier (`typescript-language-server` doesn't
+/// populate `label_details` at all), while `rust-analyzer` genuinely does put a bare type name
+/// there for a type item, so widening the rule to that field would exile real types into the
+/// footer.
+fn detail_is_module_specifier(text: &str, kind: Option<lsp_types::CompletionItemKind>) -> bool {
+    if looks_like_module_path(text) {
+        return true;
+    }
+    !text.is_empty()
+        && !text.contains(char::is_whitespace)
+        && !text.contains(['(', ')', '<', '>', '{', '}', '!', ','])
+        && kind_has_no_one_word_type(kind)
+}
+
+/// Whether an item of this kind could ever have a genuine *one-word* type/signature in `detail` -
+/// `false` here means a separator-less `detail` on such an item can only be a module specifier.
+///
+/// Decided by a real survey rather than by reasoning about the spec: every single-token `detail`
+/// (no whitespace, no punctuation, not just the label again) that a live `rust-analyzer` and a
+/// live `typescript-language-server` emit across method/field/path/type positions falls into
+/// exactly two disjoint groups.
+///
+/// - `rust-analyzer` sends one only on `FIELD` (`"usize"`, `"String"`, `"bool"`) and `VARIABLE`
+///   (`"String"`, `"Widget"`) - value-shaped items whose type genuinely *is* one word. Its
+///   functions and methods always carry a real signature there instead (`"const fn(&self) ->
+///   usize"`), which the whitespace test in [`detail_is_module_specifier`] has already excluded.
+/// - `typescript-language-server` sends one only on `FUNCTION`, and every one observed was a bare
+///   package specifier (`"typescript"`) on an unresolved auto-import.
+///
+/// So the kinds listed here are the ones that cannot name a type in one word - a function, method,
+/// constructor, class, interface, enum, struct or module has either a signature or nothing.
+/// `FIELD`/`VARIABLE`/`PROPERTY`/`CONSTANT` and friends are deliberately absent: a real one-word
+/// type on those is the common case, and misrouting it into the module-path footer would be a
+/// worse bug than the one this fixes.
+fn kind_has_no_one_word_type(kind: Option<lsp_types::CompletionItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            lsp_types::CompletionItemKind::FUNCTION
+                | lsp_types::CompletionItemKind::METHOD
+                | lsp_types::CompletionItemKind::CONSTRUCTOR
+                | lsp_types::CompletionItemKind::CLASS
+                | lsp_types::CompletionItemKind::INTERFACE
+                | lsp_types::CompletionItemKind::ENUM
+                | lsp_types::CompletionItemKind::STRUCT
+                | lsp_types::CompletionItemKind::MODULE
+        )
+    )
 }
 
 /// The Completions detail pane's own real signature line (its top band, syntax-highlighted in
@@ -580,6 +646,14 @@ pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch>
 /// so the server's own ordering is preserved wherever this ranking has nothing real to say about
 /// it - a deliberate choice not to start honoring `CompletionItem::sortText` here, which this app
 /// has never applied and which is a separate concern from narrowing by typed text.
+///
+/// Also drops any item that is *interchangeable* with one already kept - see
+/// [`interchangeable_completion_key`] for the live `rust-analyzer` dump ("the autocomplete has
+/// multiple suggestions for the same things") that this exists for, and for exactly how narrow
+/// "interchangeable" is. Deduping here rather than over `items` keeps
+/// `crate::lsp::completion_popup::CompletionsStatus::Ready::items` the server's untouched
+/// response, so every index the resolve path holds stays valid and Backspace still widens back out
+/// of the same list.
 pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -> Vec<usize> {
     let mut scored: Vec<(CompletionMatch, usize)> = items
         .iter()
@@ -589,7 +663,69 @@ pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -
         })
         .collect();
     scored.sort();
-    scored.into_iter().map(|(_, index)| index).collect()
+    let mut kept = std::collections::HashSet::with_capacity(scored.len());
+    scored
+        .into_iter()
+        .filter(|(_, index)| kept.insert(interchangeable_completion_key(&items[*index])))
+        .map(|(_, index)| index)
+        .collect()
+}
+
+/// Everything about a completion item that a user can either *see* on its row or *get* by
+/// accepting it. Two items with equal keys offer no choice at all: they paint the same row and
+/// splice the same text over the same range, so a second row for the second one is pure noise.
+///
+/// This is the real, live-reproduced "the autocomplete has multiple suggestions for the same
+/// things". Completing `.` on a `String` against a live `rust-analyzer` returns `len`, `is_empty`
+/// and `as_bytes` **twice each** - once as the inherent `String` method and once through
+/// `Deref<Target = str>` - and the two copies of each are identical in `label`, `kind`, `detail`,
+/// `labelDetails`, `filterText`, `sortText` and `textEdit`. Only `documentation` differs
+/// ("Returns the length of this `String`, in bytes" vs "Returns the length of `self`").
+///
+/// `documentation` is therefore deliberately *not* part of the key. It is the one thing that
+/// differs, but it is invisible until an item is selected, so keeping both rows would not let a
+/// user pick the doc they wanted - it would only make them scroll past a row that does the same
+/// thing. Server order decides which survives, which for the case above keeps the inherent
+/// method's own doc. `data` is left out for the same reason (an opaque server token, never
+/// rendered); everything else that could change the row or the edit is in.
+///
+/// A `String` rather than a derived `Hash`: `lsp_types::CompletionItem`'s own fields are not
+/// `Hash`, and the fields that matter here (`CompletionTextEdit`, `CompletionItemLabelDetails`,
+/// `Command`, `TextEdit`) are all `Serialize`, so their real wire form is the honest identity -
+/// no hand-written field-by-field comparison to drift out of sync with `lsp_types`.
+fn interchangeable_completion_key(item: &lsp_types::CompletionItem) -> String {
+    #[derive(serde::Serialize)]
+    struct Key<'a> {
+        label: &'a str,
+        kind: Option<lsp_types::CompletionItemKind>,
+        detail: Option<&'a String>,
+        label_details: Option<&'a lsp_types::CompletionItemLabelDetails>,
+        filter_text: Option<&'a String>,
+        insert_text: Option<&'a String>,
+        insert_text_format: Option<lsp_types::InsertTextFormat>,
+        insert_text_mode: Option<lsp_types::InsertTextMode>,
+        text_edit: Option<&'a lsp_types::CompletionTextEdit>,
+        additional_text_edits: Option<&'a Vec<lsp_types::TextEdit>>,
+        command: Option<&'a lsp_types::Command>,
+    }
+    let key = Key {
+        label: &item.label,
+        kind: item.kind,
+        detail: item.detail.as_ref(),
+        label_details: item.label_details.as_ref(),
+        filter_text: item.filter_text.as_ref(),
+        insert_text: item.insert_text.as_ref(),
+        insert_text_format: item.insert_text_format,
+        insert_text_mode: item.insert_text_mode,
+        text_edit: item.text_edit.as_ref(),
+        additional_text_edits: item.additional_text_edits.as_ref(),
+        command: item.command.as_ref(),
+    };
+    // A `CompletionItem`'s own fields all round-trip through `serde_json` by construction (that is
+    // how they arrived off the wire), so this cannot realistically fail. If it somehow did, an
+    // unforgeable per-item key is the honest fallback: it keeps the item rather than silently
+    // collapsing it into an unrelated one.
+    serde_json::to_string(&key).unwrap_or_else(|_| format!("\u{0}unserializable-{:p}", item))
 }
 
 /// A completion item's byte range, purely for a caller (`crate::lsp::completion_popup`) that already
@@ -832,6 +968,85 @@ mod tests {
             .into_iter()
             .map(|index| items[index].label.clone())
             .collect()
+    }
+
+    /// The real, live-reported "the autocomplete has multiple suggestions for the same things",
+    /// reproduced verbatim against a live `rust-analyzer` at the single most ordinary position
+    /// there is - `.` on a `String`. `String::len` and `str::len` (reachable through `Deref`) both
+    /// come back, and the two items are identical in `label`, `kind`, `detail`, `labelDetails`,
+    /// `filterText`, `sortText` **and** `textEdit`; the only field that differs at all is
+    /// `documentation` ("Returns the length of this `String`, in bytes" vs "Returns the length of
+    /// `self`"). `is_empty` and `as_bytes` arrive doubled the same way.
+    ///
+    /// So the popup painted two rows a user cannot tell apart and cannot choose between: same
+    /// badge, same label, same right-hand type hint, and accepting either splices the identical
+    /// `"len"` over the identical range. The first one wins because the server's own order puts
+    /// the inherent method ahead of the deref'd one.
+    #[test]
+    fn two_rows_a_user_cannot_tell_apart_or_choose_between_collapse_into_one() {
+        let deref_twin = |doc: &str| lsp_types::CompletionItem {
+            label: "len".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::METHOD),
+            detail: Some("const fn(&self) -> usize".to_string()),
+            filter_text: Some("len".to_string()),
+            sort_text: Some("7fffffff".to_string()),
+            documentation: Some(lsp_types::Documentation::String(doc.to_string())),
+            ..Default::default()
+        };
+        let items = [
+            deref_twin("Returns the length of this `String`, in bytes."),
+            deref_twin("Returns the length of `self`."),
+            item("lines_any"),
+        ];
+        assert_eq!(
+            rank_completion_items(&items, "len"),
+            vec![0, 2],
+            "the second `len` is interchangeable with the first in everything the user can see or \
+             act on, so it must not occupy a row of its own"
+        );
+    }
+
+    /// The other side of that rule, from the same live `rust-analyzer` dump: three `Result` items
+    /// that share a label but genuinely differ in what they'd import (`labelDetails.detail` reads
+    /// `"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`).
+    /// Those are three real, different choices - collapsing them would silently hide two of them.
+    #[test]
+    fn same_label_but_a_genuinely_different_item_keeps_its_own_row() {
+        let import_candidate = |path: &str| lsp_types::CompletionItem {
+            label: "Result".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::STRUCT),
+            filter_text: Some("Result".to_string()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some(format!("(use {path})")),
+                description: None,
+            }),
+            ..Default::default()
+        };
+        let items = [
+            import_candidate("std::fmt::Result"),
+            import_candidate("std::io::Result"),
+            import_candidate("std::thread::Result"),
+        ];
+        assert_eq!(
+            rank_completion_items(&items, "Result"),
+            vec![0, 1, 2],
+            "three different imports are three real choices, not one duplicated row"
+        );
+    }
+
+    /// Two items that would insert genuinely different text are never collapsed either, however
+    /// alike their rows look - the dedupe is about rows a user cannot choose between, not about
+    /// labels that happen to match.
+    #[test]
+    fn an_identical_looking_row_with_a_different_edit_keeps_its_own_row() {
+        let with_insert = |insert: &str| lsp_types::CompletionItem {
+            label: "new".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            insert_text: Some(insert.to_string()),
+            ..Default::default()
+        };
+        let items = [with_insert("new()"), with_insert("new($1)")];
+        assert_eq!(rank_completion_items(&items, "new"), vec![0, 1]);
     }
 
     #[test]
@@ -1094,6 +1309,97 @@ mod tests {
             "a bare module specifier must never be rendered as this item's type"
         );
         assert_eq!(completion_module_path(&item).as_deref(), Some("./helper"));
+    }
+
+    /// The live-reported "the types are loading only after in a weird way replacing the module
+    /// names", dumped verbatim from a real `typescript-language-server` in a project configured
+    /// with the ordinary `"moduleResolution": "node"`: an auto-import from an installed *package*
+    /// carries that package's bare specifier - `detail: "typescript"`, with no separator of any
+    /// kind - and only the `completionItem/resolve` response carries the real signature. A
+    /// separator-only path test called that a type, so the row printed the module name in its type
+    /// slot until the resolve landed and visibly overwrote it with the signature.
+    #[test]
+    fn a_real_bare_package_specifier_is_a_module_path_not_a_type() {
+        let item = lsp_types::CompletionItem {
+            label: "createProgram".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("typescript".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&item).1,
+            None,
+            "a bare package specifier is a module, not this function's type - showing it in the \
+             type slot is exactly the module name the resolve response was then seen to replace"
+        );
+        assert_eq!(
+            completion_module_path(&item).as_deref(),
+            Some("typescript"),
+            "it belongs in the footer that exists for module paths"
+        );
+    }
+
+    /// The other half of the same real dump: the resolved form of that exact item, so the only
+    /// thing the resolve round trip changes is that a type *appears* where there was none - never
+    /// that one visible string is swapped for a different one.
+    #[test]
+    fn resolving_a_bare_package_import_only_adds_a_type_and_keeps_the_same_path() {
+        let resolved = lsp_types::CompletionItem {
+            label: "createProgram".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(
+                "Auto import from 'typescript'\nfunction ts.createProgram(rootNames: readonly \
+                 string[], options: ts.CompilerOptions): ts.Program"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_display(&resolved).1.as_deref(),
+            Some(
+                "function ts.createProgram(rootNames: readonly string[], options: \
+                 ts.CompilerOptions): ts.Program"
+            )
+        );
+        assert_eq!(
+            completion_module_path(&resolved).as_deref(),
+            Some("typescript"),
+            "the footer must read the same module before and after the resolve, so the pane's \
+             module path never visibly changes under the user"
+        );
+    }
+
+    /// The regression this must never cause, dumped verbatim from a live `rust-analyzer`: a real
+    /// *field* completion's `detail` genuinely is a one-word type (`pub count: usize` ->
+    /// `label: "count"`, `detail: "usize"`), and so is a local variable's. A survey of every
+    /// single-token `detail` both servers emit found them only ever on those two value-shaped
+    /// kinds, which is exactly why the module-specifier rule is scoped to the kinds that cannot
+    /// have a one-word type at all.
+    #[test]
+    fn a_real_one_word_field_type_is_still_a_type() {
+        for (label, kind, detail) in [
+            ("count", lsp_types::CompletionItemKind::FIELD, "usize"),
+            ("name", lsp_types::CompletionItemKind::FIELD, "String"),
+            ("on", lsp_types::CompletionItemKind::FIELD, "bool"),
+            ("w", lsp_types::CompletionItemKind::VARIABLE, "Widget"),
+        ] {
+            let item = lsp_types::CompletionItem {
+                label: label.to_string(),
+                kind: Some(kind),
+                detail: Some(detail.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_item_display(&item).1.as_deref(),
+                Some(detail),
+                "{label}: a real one-word type must stay in the type slot"
+            );
+            assert_eq!(
+                completion_module_path(&item),
+                None,
+                "{label}: and must never be exiled into the module-path footer"
+            );
+        }
     }
 
     /// A real `rust-analyzer` type completion, dumped verbatim from a live server: `detail` is the

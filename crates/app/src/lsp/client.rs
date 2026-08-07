@@ -701,6 +701,7 @@ impl AdeApp {
         self._lsp_sync_tasks = std::collections::HashMap::new();
         self._completions_request_task = None;
         self._completions_resolve_task = None;
+        self.completions_resolve_in_flight = None;
 
         let keys: Vec<LspClientKey> = self
             .lsp_clients
@@ -1888,9 +1889,14 @@ impl AdeApp {
     ///
     /// A real no-op whenever: there's no `Ready` popup, the currently selected item already has
     /// both a `detail` and real `documentation` (nothing more a resolve could usefully add), this
-    /// exact `(path, generation, item index)` was already asked about once (successfully or not -
-    /// see [`Self::completions_resolved`]'s own docs), or the connection's own primary server
+    /// exact `(path, generation, item index)` has already been *answered* once (successfully or
+    /// not - see [`Self::completions_resolved`]'s own docs) or is the one currently still in
+    /// flight ([`Self::completions_resolve_in_flight`]), or the connection's own primary server
     /// doesn't advertise `completionProvider.resolveProvider` at all.
+    ///
+    /// Deliberately *not* a no-op for an item whose earlier request a later selection cancelled:
+    /// that item has no answer, so asking again is the only way it ever gets one. See
+    /// [`Self::completions_resolve_in_flight`]'s own docs for the real data that used to cost.
     pub(crate) fn maybe_resolve_selected_completion_item(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.as_ref() else {
             return;
@@ -1914,7 +1920,9 @@ impl AdeApp {
         }
         let path = entry.path.clone();
         let key = (path.clone(), self.completions_generation, item_index);
-        if self.completions_resolved.contains(&key) {
+        if self.completions_resolved.contains(&key)
+            || self.completions_resolve_in_flight.as_ref() == Some(&key)
+        {
             return;
         }
         let Some(absolute_path) = self.edit_buffer(&path).map(|buffer| buffer.path.clone()) else {
@@ -1926,7 +1934,10 @@ impl AdeApp {
         if !connection.primary().supports_completion_resolve() {
             return;
         }
-        self.completions_resolved.insert(key);
+        // Overwriting this is exactly right: assigning `_completions_resolve_task` below drops -
+        // and so cancels - whatever request the previous key was waiting on, which leaves that key
+        // genuinely unanswered and therefore genuinely retryable.
+        self.completions_resolve_in_flight = Some(key);
         let item_to_resolve = item.clone();
         let generation = self.completions_generation;
         let task = cx.spawn(async move |this, cx| {
@@ -1963,6 +1974,15 @@ impl AdeApp {
         result: Result<lsp_core::lsp_types::CompletionItem, lsp_core::LspError>,
         cx: &mut Context<Self>,
     ) {
+        // Recorded here, not at dispatch time: this is the point at which the request the app sent
+        // has genuinely been answered (an `Err` counts - re-asking a server that just failed would
+        // only fail again). A request that never reaches this point was cancelled rather than
+        // answered, and must stay retryable. See [`Self::completions_resolve_in_flight`].
+        let key = (path.to_path_buf(), generation, item_index);
+        if self.completions_resolve_in_flight.as_ref() == Some(&key) {
+            self.completions_resolve_in_flight = None;
+        }
+        self.completions_resolved.insert(key);
         if self.completions_generation != generation {
             return;
         }
@@ -3343,6 +3363,170 @@ process.stdin.on('data', (d) => {
                 "a real resolve response must win over the placeholder detail the server sent \
                  inline - that placeholder is exactly the bare module path the user reported \
                  seeing where a type belongs"
+            );
+        });
+    }
+
+    /// Arrowing past an item must not permanently cost that item its type and documentation.
+    ///
+    /// Only one resolve request is ever in flight ([`AdeApp::_completions_resolve_task`] is a
+    /// single slot), so moving the selection replaces - and therefore, since dropping a `Task`
+    /// cancels it, *aborts* - whatever resolve the previous item had going. That is the intended
+    /// economy. The bug was that the aborted item had already been written into
+    /// [`AdeApp::completions_resolved`] at dispatch time, so it counted as answered forever: come
+    /// back to it and no second request would ever go out, and its row and detail pane stayed
+    /// pinned to whatever the unresolved item happened to carry - for a real
+    /// `typescript-language-server` auto-import, a bare module specifier and no type at all.
+    ///
+    /// This walks that exact sequence: select item 0 and dispatch, move to item 1 and dispatch
+    /// (killing item 0's request before it can land), let that settle, then come back to item 0.
+    #[gpui::test]
+    fn an_item_whose_resolve_was_cancelled_by_moving_on_is_resolved_again_on_return(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        let bare = |label: &str| lsp_core::lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        // Both dispatches happen inside one `update`, so item 0's request is genuinely still in
+        // flight when item 1's replaces its task slot - the real fast-arrow-key sequence.
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![bare("first_item"), bare("second_item")],
+                    visible: vec![0, 1],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+            if let Some(CompletionsStatus::Ready { selected, .. }) =
+                app.completions.as_mut().map(|entry| &mut entry.status)
+            {
+                *selected = 1;
+            }
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            if let Some(CompletionsStatus::Ready { selected, .. }) =
+                app.completions.as_mut().map(|entry| &mut entry.status)
+            {
+                *selected = 0;
+            }
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            assert_eq!(
+                items[1].detail.as_deref(),
+                Some("resolved detail for second_item"),
+                "sanity check: the resolve that was *not* cancelled must have landed"
+            );
+            assert_eq!(
+                items[0].detail.as_deref(),
+                Some("resolved detail for first_item"),
+                "an item whose resolve was aborted by moving the selection on must be asked \
+                 again when the user comes back to it - otherwise arrowing past a row silently \
+                 costs it its type and documentation for as long as the popup is open"
+            );
+        });
+    }
+
+    /// The economy that fix must not undo: re-selecting an item whose resolve is *still in flight*
+    /// must not fire a second, redundant request for the same thing.
+    #[gpui::test]
+    fn an_item_with_a_resolve_already_in_flight_is_not_asked_twice(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "only_item".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+            let in_flight = app.completions_resolve_in_flight.clone();
+            assert_eq!(
+                in_flight,
+                Some((relative.clone(), app.completions_generation, 0)),
+                "the first dispatch must record exactly which item it is waiting on"
+            );
+            // A re-render/re-selection of the same item while that request is still out.
+            app.maybe_resolve_selected_completion_item(cx);
+            assert_eq!(
+                app.completions_resolve_in_flight, in_flight,
+                "a second dispatch for the same in-flight item would have replaced the task slot, \
+                 cancelling the request that was already on its way for no reason at all"
+            );
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            assert_eq!(
+                items[0].detail.as_deref(),
+                Some("resolved detail for only_item")
+            );
+            assert!(
+                app.completions_resolve_in_flight.is_none(),
+                "a landed response must clear the in-flight marker rather than leaving the item \
+                 looking forever pending"
             );
         });
     }

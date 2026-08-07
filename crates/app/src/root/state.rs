@@ -388,6 +388,7 @@ impl AdeApp {
             _lsp_sync_tasks: HashMap::new(),
             _completions_request_task: None,
             _completions_resolve_task: None,
+            completions_resolve_in_flight: None,
             completions_resolved: std::collections::HashSet::new(),
             completions: None,
             completions_scroll_handle: UniformListScrollHandle::new(),
@@ -1089,6 +1090,7 @@ impl AdeApp {
         self._lsp_sync_tasks = HashMap::new();
         self._completions_request_task = None;
         self._completions_resolve_task = None;
+        self.completions_resolve_in_flight = None;
         self.completions_resolved = std::collections::HashSet::new();
         self.completions_suppress_next_trigger = false;
         self.lsp_last_synced_content = HashMap::new();
