@@ -529,6 +529,14 @@ const DIAGNOSTIC_CARD_MAX_HEIGHT: gpui::Pixels = px(190.0);
 /// Jerry.dc.html`: `width:470px` on the card itself).
 const DIAGNOSTIC_CARD_WIDTH: gpui::Pixels = px(470.0);
 
+/// How long the Diagnostic card's `copy` button reads `copied` after a real click before flipping
+/// back (GitHub issue #204). Long enough to be genuinely readable if the pointer is already
+/// leaving the card, short enough that a stale confirmation isn't still sitting there next time
+/// the user looks. Not borrowed from any `vendor/zed` constant - Zed's own copy affordances
+/// (`vendor/zed/crates/markdown`'s selection copy, the editor's `Copy` action) give no visual
+/// confirmation at all, so there was nothing to match.
+pub(crate) const DIAGNOSTIC_COPY_CONFIRM_DURATION: Duration = Duration::from_millis(1200);
+
 impl AdeApp {
     /// Surface C's real, caret-anchored Diagnostic popover (GitHub issue #186).
     ///
@@ -610,9 +618,56 @@ impl AdeApp {
         // own internal chrome, never its position.
         let anchor_x = row_bounds.left() + shaped.x_for_index(diagnostic.byte_range.start);
 
+        // Built here rather than inside the content renderer so the "is *this* card the one whose
+        // text is really on the clipboard" comparison can be made against `&self` (see
+        // `Self::diagnostic_copy_confirmed`'s own docs for why the comparison is on the payload
+        // rather than a bare flag).
+        let copy_text = diagnostic_copy_text(diagnostic);
+        let copy_confirmed = self.diagnostic_copy_confirmed.as_deref() == Some(copy_text.as_str());
+
         Some(render_diagnostic_card_content(
-            diagnostic, anchor_x, anchor, max_height, cx,
+            diagnostic,
+            anchor_x,
+            anchor,
+            max_height,
+            copy_text,
+            copy_confirmed,
+            cx,
         ))
+    }
+
+    /// GitHub issue #204's real clipboard write: puts one diagnostic's own text on the real system
+    /// clipboard (`gpui::App::write_to_clipboard`, the same call
+    /// `crate::terminal::pane`'s terminal copy and `crate::sidebar::tree_ops::AdeApp::
+    /// copy_path_to_system_clipboard` already make - there is one real clipboard mechanism in this
+    /// app and this is it), then arms the momentary `copied` confirmation the button paints.
+    ///
+    /// The confirmation is stored as the copied payload itself and cleared by a single-slot timer;
+    /// both choices are explained on [`AdeApp::diagnostic_copy_confirmed`] and
+    /// [`AdeApp::_diagnostic_copy_confirm_task`].
+    pub(in crate::code_surface) fn copy_diagnostic_to_clipboard(
+        &mut self,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        self.diagnostic_copy_confirmed = Some(text.clone());
+        self._diagnostic_copy_confirm_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(DIAGNOSTIC_COPY_CONFIRM_DURATION)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this._diagnostic_copy_confirm_task = None;
+                // A newer click may have replaced the payload while this timer ran (a fresh click
+                // drops this task, but the two can still race by a frame) - a stale timer must
+                // never reach in and cut the *new* confirmation short.
+                if this.diagnostic_copy_confirmed.as_deref() == Some(text.as_str()) {
+                    this.diagnostic_copy_confirmed = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
     }
 
     /// Whether the Diagnostic card is conceptually active right now, and if so, which real
@@ -754,14 +809,11 @@ fn render_diagnostic_card_content(
     anchor_x: Pixels,
     anchor: CardAnchor,
     max_height: Pixels,
+    copy_text: String,
+    copy_confirmed: bool,
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
-    let source_code = match (&diagnostic.source, &diagnostic.code) {
-        (Some(source), Some(code)) => format!("{source} · {code}"),
-        (Some(source), None) => source.clone(),
-        (None, Some(code)) => code.clone(),
-        (None, None) => String::new(),
-    };
+    let source_code = diagnostic_source_code(diagnostic);
     // `rustc`/`rust-analyzer` messages are routinely multi-line: the first line is the headline
     // the design calls "message", everything after it is the design's dimmer "note".
     let mut lines = diagnostic.message.lines();
@@ -853,32 +905,136 @@ fn render_diagnostic_card_content(
                 .child(body),
         );
 
+    // `background:#141719;border-top:1px solid #2b2224` in the mockup - its own footer band,
+    // the same `LSP_POPOVER_FOOTER` background the Hover card's footer uses, but with this
+    // card's own darker `DIAGNOSTIC_CARD_FOOTER` border rather than the neutral `border::
+    // INNER` the pre-review version used (which also painted no background band at all).
+    //
+    // Unconditional since GitHub issue #204, where it used to be drawn only for a diagnostic that
+    // really had a `source`/`code`: the band now also carries the `copy` button, and a diagnostic
+    // with no source and no code (real servers do send those) is exactly as worth copying as one
+    // that has both. The `source · code` text itself is still conditional, so such a card gets a
+    // band holding only the button rather than a band with an empty label in it.
+    let mut footer_label = div().flex_1().min_w_0();
     if !source_code.is_empty() {
-        // `background:#141719;border-top:1px solid #2b2224` in the mockup - its own footer band,
-        // the same `LSP_POPOVER_FOOTER` background the Hover card's footer uses, but with this
-        // card's own darker `DIAGNOSTIC_CARD_FOOTER` border rather than the neutral `border::
-        // INNER` the pre-review version used (which also painted no background band at all).
-        card = card.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .py(px(6.0))
-                .bg(theme::surface::LSP_POPOVER_FOOTER)
-                .border_t_1()
-                .border_color(theme::border::DIAGNOSTIC_CARD_FOOTER)
-                .child(
-                    div()
-                        .font(font(theme::font::MONO))
-                        .text_size(px(10.0))
-                        .text_color(theme::text::FAINTER)
-                        .child(source_code),
-                ),
-        );
+        footer_label = footer_label
+            .font(font(theme::font::MONO))
+            .text_size(px(10.0))
+            .text_color(theme::text::FAINTER)
+            .child(source_code);
     }
+    card = card.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .bg(theme::surface::LSP_POPOVER_FOOTER)
+            .border_t_1()
+            .border_color(theme::border::DIAGNOSTIC_CARD_FOOTER)
+            .child(footer_label)
+            .child(render_diagnostic_copy_button(copy_text, copy_confirmed, cx)),
+    );
 
     card.into_any_element()
+}
+
+/// The `source · code` line the Diagnostic card's footer shows, e.g. `rust-analyzer · E0277` or
+/// `eslint · no-unused-vars`. Empty when the server sent neither, which is a real case.
+///
+/// Split out of [`render_diagnostic_card_content`] so [`diagnostic_copy_text`] can build the same
+/// string the card is really showing rather than a second, independently-formatted version of it -
+/// the whole point of the copy button being that what lands on the clipboard is what is on screen.
+fn diagnostic_source_code(diagnostic: &diagnostics_view::LineDiagnostic) -> String {
+    match (&diagnostic.source, &diagnostic.code) {
+        (Some(source), Some(code)) => format!("{source} · {code}"),
+        (Some(source), None) => source.clone(),
+        (None, Some(code)) => code.clone(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Exactly the text one Diagnostic card paints, as one clipboard payload (GitHub issue #204): the
+/// server's full multi-line `message` - both the headline the card shows in the severity colour
+/// *and* the dimmer "note" lines under it, which are one `message` split for display only - then
+/// the footer's own `source · code` line when there is one.
+///
+/// Deliberately not a prettier re-formatting (no `eslint(no-unused-vars)` reflow, no severity
+/// prefix, no file/line header): the user is copying this to paste into a search box, an issue, or
+/// a chat with someone else, and text that doesn't match what they were looking at is worse than
+/// plain. A diagnostic with no source and no code copies its message alone, with no trailing
+/// newline left behind.
+fn diagnostic_copy_text(diagnostic: &diagnostics_view::LineDiagnostic) -> String {
+    let source_code = diagnostic_source_code(diagnostic);
+    if source_code.is_empty() {
+        diagnostic.message.clone()
+    } else {
+        format!("{}\n{source_code}", diagnostic.message)
+    }
+}
+
+/// The Diagnostic card's own real copy button (GitHub issue #204), and the only affordance on this
+/// card that does anything at all.
+///
+/// ## Why a word and not an icon
+///
+/// This app deliberately ships no icon font and no bundled icon assets (see `crate::icon_pack`'s
+/// own module docs: default icons are "styled `div()` shapes and Unicode glyphs, never image
+/// assets"), and there is no established copy glyph anywhere in it - the nearest things in use are
+/// `#` for the graph's "Copy SHA" menu row and `⎘`, already spoken for as the cherry-pick chip.
+/// A word costs one line of the footer band it already shares with `source · code`, reads at 10px
+/// where a hand-drawn two-squares shape would not, and cannot be mistaken for the cherry-pick
+/// chip. It also makes the confirmation state self-describing rather than a glyph swap.
+///
+/// ## Why the confirmation is a label swap
+///
+/// This is the app's first copy-with-confirmation button - the three existing clipboard writes
+/// (`crate::graph_view`'s Copy SHA/subject, `crate::sidebar::tree_ops`'s Copy Path, the terminal's
+/// own copy keybinding) are all menu rows or keybindings whose only feedback is the menu closing,
+/// so there was no established confirmation language to match here. Swapping the label to `copied`
+/// for [`DIAGNOSTIC_COPY_CONFIRM_DURATION`] is the smallest thing that is genuinely visible: it
+/// changes the button's painted width, not just its colour, so it reads at a glance and a real
+/// test can measure it.
+///
+/// Chrome is `crate::settings::render`'s own small outline-button idiom (`h`, `px`,
+/// `radius::BUTTON`, `border::BUTTON`, `surface::ROW_HOVER_ALT` on hover), sized down to sit
+/// inside a 10px footer band rather than a settings row.
+fn render_diagnostic_copy_button(
+    copy_text: String,
+    copy_confirmed: bool,
+    cx: &mut Context<AdeApp>,
+) -> impl IntoElement {
+    div()
+        .id("diagnostic-card-copy")
+        // Lets a real test measure this button's own painted box - both to click it and to prove
+        // the `copied` state genuinely repaints (it is visibly wider than `copy`).
+        .debug_selector(|| "diagnostic-card-copy".to_string())
+        .flex_none()
+        .h(px(16.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .rounded(theme::radius::BUTTON)
+        .border_1()
+        .border_color(theme::border::BUTTON)
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+        .font(font(theme::font::MONO))
+        .text_size(px(10.0))
+        .text_color(if copy_confirmed {
+            theme::text::SECONDARY
+        } else {
+            theme::text::MUTED
+        })
+        .child(if copy_confirmed { "copied" } else { "copy" })
+        // The card is `.occlude()`d, so this never reaches the editor behind it, but the footer
+        // band under the button is still a real parent - `stop_propagation` matches every other
+        // button in this app painted on top of a clickable ancestor.
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            this.copy_diagnostic_to_clipboard(copy_text.clone(), cx);
+        }))
 }
 
 /// The Diagnostic popover's headline colour for one severity - `Error` keeps the design's own
@@ -3422,7 +3578,7 @@ mod hover_pointer_tests {
 mod diagnostic_popover_tests {
     use super::*;
     use crate::lsp::client::lsp_connection_facade_tests::{
-        publish_and_wait, publish_at_and_wait, spawn_fake_server,
+        publish_and_wait, publish_at_and_wait, publish_with_source_and_wait, spawn_fake_server,
     };
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
@@ -3936,6 +4092,256 @@ mod diagnostic_popover_tests {
             "the real pointer is resting directly on the diagnostic's own span - the card must \
              show even though the caret never moved off the clean line"
         );
+    }
+
+    /// Everything GitHub issue #204's copy button needs to exist, driven all the way from a real
+    /// `publishDiagnostics` push: a real file open in a real window, the caret on the offending
+    /// line, and the card genuinely painted. Returns the app and its window so each test below can
+    /// click the real button rather than re-deriving this setup five times.
+    fn open_with_real_diagnostic<'a>(
+        cx: &'a mut TestAppContext,
+        message: &str,
+        source_and_code: Option<(&str, &str)>,
+    ) -> (
+        Entity<AdeApp>,
+        &'a mut VisualTestContext,
+        tempfile::TempDir,
+        std::sync::Arc<lsp_core::LspClient>,
+        String,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, SOURCE).expect("write sample.rs");
+        let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (repo.path().to_path_buf(), "rust-analyzer"),
+                LspClientState::Ready(client.clone()),
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let uri = lsp_core::LspClient::uri_for_path(&file_path)
+            .expect("a real file:// uri")
+            .to_string();
+        match source_and_code {
+            Some((source, code)) => {
+                publish_with_source_and_wait(&client, &uri, message, source, code)
+            }
+            None => publish_and_wait(&client, &uri, message),
+        }
+        set_caret(&app, cx, 1);
+        assert!(
+            cx.debug_bounds("diagnostic-card").is_some(),
+            "sanity check: the caret is on the real offending line, so the card must be up before \
+             any of these tests touch its copy button"
+        );
+        (app, cx, repo, client, uri)
+    }
+
+    /// GitHub issue #204's core claim: a real mouse click on the card's own real painted `copy`
+    /// button puts the diagnostic's real text - the server's message *and* the `source · code`
+    /// line the card shows under it - on the real system clipboard.
+    ///
+    /// Every step is real: a real child-process LSP server pushes a real `publishDiagnostics`
+    /// carrying real `source`/`code` fields, the card paints for real, the click is a real
+    /// `simulate_click` against the button's own real painted bounds, and the assertion reads the
+    /// real clipboard back through `gpui::App::read_from_clipboard`. The clipboard is seeded with
+    /// unrelated text first so a passing assertion cannot be an empty clipboard read.
+    #[gpui::test]
+    fn clicking_the_real_copy_button_puts_the_real_diagnostic_text_on_the_real_clipboard(
+        cx: &mut TestAppContext,
+    ) {
+        let message = "the trait bound `&str: Into<Column>` is not satisfied";
+        let (_app, cx, _repo, _client, _uri) =
+            open_with_real_diagnostic(cx, message, Some(("rust-analyzer", "E0277")));
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        });
+
+        let button = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("a real diagnostic card must paint a real copy button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copied = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            copied.as_deref(),
+            Some(format!("{message}\nrust-analyzer · E0277").as_str()),
+            "a real click on the card's copy button must put exactly what the card shows - the \
+             server's own message plus its `source · code` line - on the real system clipboard"
+        );
+    }
+
+    /// The same real click, on a diagnostic the server sent with neither a `source` nor a `code`.
+    ///
+    /// This is a real case (the fake server's own default push is exactly that shape, and real
+    /// servers do it too), and before this change it was the case with *no footer band at all* -
+    /// the band used to be drawn only when there was a `source · code` line to put in it. A card
+    /// like this is exactly as worth copying as one with both, so the button has to be there, and
+    /// what it copies must be the bare message with no stray trailing separator or newline.
+    #[gpui::test]
+    fn a_diagnostic_with_no_source_or_code_still_gets_a_real_working_copy_button(
+        cx: &mut TestAppContext,
+    ) {
+        let message = "mismatched types";
+        let (_app, cx, _repo, _client, _uri) = open_with_real_diagnostic(cx, message, None);
+
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        });
+
+        let button = cx.debug_bounds("diagnostic-card-copy").expect(
+            "a diagnostic with no source and no code must still paint a real copy button - it \
+             used to paint no footer band at all",
+        );
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copied = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            copied.as_deref(),
+            Some(message),
+            "with no source and no code there is nothing to append - the clipboard must hold the \
+             bare message, not a message with a dangling newline after it"
+        );
+    }
+
+    /// The confirmation is genuinely *visible*, not just a field that flipped: `copied` is a wider
+    /// word than `copy`, so the button's own real painted box grows after a real click and shrinks
+    /// back to exactly its original size once [`DIAGNOSTIC_COPY_CONFIRM_DURATION`] has really
+    /// elapsed on the test clock. Measuring the painted box is the point - an assertion on
+    /// `AdeApp::diagnostic_copy_confirmed` alone would pass just as well if the button rendered
+    /// the same label either way.
+    #[gpui::test]
+    fn the_real_copy_button_shows_a_real_confirmation_and_then_really_goes_back(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _repo, _client, _uri) =
+            open_with_real_diagnostic(cx, "mismatched types", Some(("rustc", "E0308")));
+
+        let before = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("a real diagnostic card must paint a real copy button");
+        cx.simulate_click(before.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let confirming = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("the copy button must still be painted while it confirms");
+        assert!(
+            confirming.size.width > before.size.width + px(4.0),
+            "the confirmation must be genuinely visible on screen: `copied` is a wider word than \
+             `copy`, so the real painted button must grow (was {:?}, now {:?})",
+            before.size.width,
+            confirming.size.width
+        );
+
+        // The confirmation is time-limited, on a real timer rather than left up until something
+        // else happens to clear it.
+        cx.executor()
+            .advance_clock(DIAGNOSTIC_COPY_CONFIRM_DURATION + Duration::from_millis(50));
+        cx.run_until_parked();
+        render_twice(&app, cx);
+
+        let after = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("the copy button must still be painted after the confirmation lapses");
+        assert_eq!(
+            after.size.width, before.size.width,
+            "once the confirmation window has really elapsed the button must be back to exactly \
+             its `copy` size, not left reading `copied` forever"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.diagnostic_copy_confirmed.is_none(),
+                "and the armed confirmation state must genuinely have been cleared by its own \
+                 timer, not merely stopped being rendered"
+            );
+        });
+    }
+
+    /// Why [`AdeApp::diagnostic_copy_confirmed`] stores the copied *text* and not a bare `bool`.
+    ///
+    /// One card is re-anchored to whatever diagnostic is under the caret or the pointer right now,
+    /// so within the confirmation window the card can end up describing a completely different
+    /// diagnostic than the one that was copied. A flag would keep that new card reading `copied`,
+    /// claiming a copy that never happened for its own text. Driven for real: a second real
+    /// `publishDiagnostics` replaces the first, and the still-painted button must be back to
+    /// `copy` immediately, without waiting for any timer.
+    #[gpui::test]
+    fn the_confirmation_does_not_leak_onto_a_different_diagnostic(cx: &mut TestAppContext) {
+        let (app, cx, _repo, client, uri) =
+            open_with_real_diagnostic(cx, "mismatched types", Some(("rustc", "E0308")));
+
+        let unconfirmed = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("a real diagnostic card must paint a real copy button");
+        cx.simulate_click(unconfirmed.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        render_twice(&app, cx);
+        let confirming = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("the copy button must still be painted while it confirms");
+        assert!(
+            confirming.size.width > unconfirmed.size.width + px(4.0),
+            "sanity check: the click must genuinely have armed a visible confirmation, or the \
+             rest of this test proves nothing"
+        );
+
+        // A real, different diagnostic replaces the first one on the same real line. `publish_*`'s
+        // own wait only proves *some* diagnostic has landed for this uri, and one already had - so
+        // this polls the real render path's own index for the new message specifically.
+        let replacement = "cannot find value `alpha` in this scope";
+        publish_with_source_and_wait(&client, &uri, replacement, "rustc", "E0425");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            render_twice(&app, cx);
+            let showing = app.read_with(cx, |app, _| {
+                app.file_view_diagnostics
+                    .get(&1)
+                    .and_then(|line| line.first())
+                    .map(|diagnostic| diagnostic.message.clone())
+            });
+            if showing.as_deref() == Some(replacement) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the replacement diagnostic never reached the real render path's own per-line \
+                 index (showing {showing:?})"
+            );
+        }
+        // The loop above breaks on *state*, and the frame painted during the `render_twice` that
+        // observed it can predate the diagnostic actually landing - `debug_bounds` reads the last
+        // painted frame, so without this the assertion below can measure the old card. Caught for
+        // real: this test passed standalone and failed in the full suite, where the replacement
+        // arrives later relative to the renders.
+        render_twice(&app, cx);
+
+        let other_card = cx
+            .debug_bounds("diagnostic-card-copy")
+            .expect("the replacement diagnostic's card must paint its own copy button");
+        assert_eq!(
+            other_card.size.width, unconfirmed.size.width,
+            "a different diagnostic's card must read `copy`, not inherit the previous card's \
+             `copied` - nothing of *this* diagnostic's text is on the clipboard"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.diagnostic_copy_confirmed.is_some(),
+                "sanity check: the armed confirmation must still be live (its timer has not been \
+                 advanced) - this test must be proving the payload comparison, not a lapsed timer"
+            );
+        });
     }
 }
 

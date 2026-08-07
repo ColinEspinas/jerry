@@ -1458,6 +1458,24 @@ pub struct AdeApp {
     /// `Self::render_diagnostic_card`'s own hover-vs-diagnostic priority rule) hid the diagnostic
     /// card the user was actually looking at, right out from under them.
     pub(crate) diagnostic_card_bounds: Option<gpui::Bounds<Pixels>>,
+    /// GitHub issue #204: the exact text the Diagnostic card's own `copy` button most recently
+    /// put on the real system clipboard, for as long as that card should still be showing its
+    /// momentary `copied` confirmation (see
+    /// [`crate::code_surface::lsp_ui::DIAGNOSTIC_COPY_CONFIRM_DURATION`]).
+    ///
+    /// The *text* rather than a bare `bool` on purpose, and it is what the button compares
+    /// itself against: the card is re-anchored to whatever diagnostic is under the caret or the
+    /// pointer right now, so a bare flag would keep reading as "copied" if the caret moved to a
+    /// different broken line inside the confirmation window - a confirmation for a copy that
+    /// never happened on *that* diagnostic. Comparing the payload means only the card whose own
+    /// content genuinely is on the clipboard says so.
+    pub(crate) diagnostic_copy_confirmed: Option<String>,
+    /// The single in-flight timer that clears [`Self::diagnostic_copy_confirmed`], a single slot
+    /// for the same reason [`Self::_hover_hide_task`] is one: assigning a fresh task drops
+    /// (cancels) the previous one, so repeatedly clicking `copy` leaves exactly one armed timer
+    /// and each click genuinely restarts the confirmation rather than inheriting the first
+    /// click's remaining time.
+    pub(crate) _diagnostic_copy_confirm_task: Option<Task<()>>,
     /// GitHub issue #30's real overlay scrollbar for the Hover card's own scrollable header+doc
     /// region (`crate::code_surface::lsp_ui::AdeApp::render_hover_card_content`) reads its
     /// geometry straight off this handle - the same `gpui::ScrollHandle` pattern every other

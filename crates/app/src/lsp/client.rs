@@ -2539,11 +2539,13 @@ function send(o) {
   const s = JSON.stringify(o);
   process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\r\n\r\n' + s);
 }
-function publish(uri, message, character, characterEnd) {
+function publish(uri, message, character, characterEnd, source, code) {
   const start = character === undefined ? 0 : character;
   const end = characterEnd === undefined ? start + 1 : characterEnd;
+  // `source`/`code` are left off the object entirely when undefined (JSON.stringify drops
+  // undefined values), so a caller that doesn't ask for them sends the exact same bytes as before.
   send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [
-    { range: { start: { line: 0, character: start }, end: { line: 0, character: end } }, severity: 1, message }
+    { range: { start: { line: 0, character: start }, end: { line: 0, character: end } }, severity: 1, message, source, code }
   ] } });
 }
 function handle(msg) {
@@ -2562,7 +2564,7 @@ function handle(msg) {
   if (msg.method === 'shutdown') { send({ jsonrpc: '2.0', id: msg.id, result: null }); return; }
   if (msg.method === 'exit' || msg.method === 'test/die') { process.exit(0); }
   if (msg.method === 'test/publish') {
-    publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd);
+    publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd, msg.params.source, msg.params.code);
     return;
   }
   if (msg.method === 'completionItem/resolve') {
@@ -2733,6 +2735,40 @@ process.stdin.on('data', (d) => {
                     "message": message,
                     "character": character,
                     "characterEnd": character_end,
+                }),
+            )
+            .expect("the fake server should accept a real notification");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let target = uri(target);
+        while !client.has_diagnostics_result_uri(&target) {
+            assert!(
+                Instant::now() < deadline,
+                "the real publishDiagnostics push never landed in the client's own sink"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Same real push as [`publish_and_wait`], but carrying the `source` and `code` fields a real
+    /// server sends alongside its message (`rustc`/`E0277`, `eslint`/`no-unused-vars`) - the two
+    /// fields the Diagnostic card renders as its `source · code` footer and copies to the
+    /// clipboard with the message. [`publish_and_wait`] omits both, which is also a real case, so
+    /// this exists rather than changing that helper's own payload out from under its callers.
+    pub(crate) fn publish_with_source_and_wait(
+        client: &lsp_core::LspClient,
+        target: &str,
+        message: &str,
+        source: &str,
+        code: &str,
+    ) {
+        client
+            .notify_raw(
+                "test/publish",
+                serde_json::json!({
+                    "uri": target,
+                    "message": message,
+                    "source": source,
+                    "code": code,
                 }),
             )
             .expect("the fake server should accept a real notification");
