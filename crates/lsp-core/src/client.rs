@@ -66,12 +66,12 @@ use std::time::{Duration, Instant};
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::request::Request as LspRequest;
 use lsp_types::{
-    ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    HoverClientCapabilities, InitializeParams, InitializedParams, MarkupKind,
-    PublishDiagnosticsClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
-    TextDocumentContentChangeEvent, TextDocumentItem, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier, WorkspaceClientCapabilities,
-    WorkspaceFolder,
+    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, HoverClientCapabilities,
+    InitializeParams, InitializedParams, MarkupKind, PublishDiagnosticsClientCapabilities,
+    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentItem, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceFolder,
 };
 
 #[cfg(unix)]
@@ -644,6 +644,20 @@ impl LspClient {
                 // that don't require it.
                 publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                     related_information: Some(true),
+                    ..Default::default()
+                }),
+                // `CompletionItemLabelDetails` (a completion item's own clean, split
+                // signature/qualifier pair - see `crate::lsp::completion::completion_signature_text`
+                // in the `app` crate for the real UI bug this fixes) is a 3.17.0 addition a server
+                // is only supposed to populate once the client has said it understands the field -
+                // left unset, a well-behaved server has no reason to ever send `labelDetails` at
+                // all, silently defeating that fix regardless of what the response's legacy
+                // `detail` string looks like.
+                completion: Some(CompletionClientCapabilities {
+                    completion_item: Some(CompletionItemCapability {
+                        label_details_support: Some(true),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
