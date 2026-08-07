@@ -21,14 +21,16 @@ use std::time::Duration;
 pub(crate) const HOVER_TRIGGER_DELAY: Duration = Duration::from_millis(300);
 
 /// How long an already-visible [`AdeApp::hover`] card stays up after the pointer leaves its token
-/// before it actually clears - the hide-side mirror of [`HOVER_TRIGGER_DELAY`], matching
-/// `vendor/zed/crates/editor/src/hover_popover.rs`'s own separate `hover_popover_hiding_delay`
-/// setting, whose real default (`vendor/zed/assets/settings/default.json`) is also `300`ms.
-/// Without this, every real token boundary - or the plain whitespace between two words on the
-/// same line - the pointer crosses while sweeping toward some other target synchronously cleared
-/// an already-resolved, visible card: a real, reported flash on every sweep, not just on a
-/// deliberate re-hover.
-pub(crate) const HOVER_HIDE_DELAY: Duration = Duration::from_millis(300);
+/// before it actually clears - the hide-side mirror of [`HOVER_TRIGGER_DELAY`]. Deliberately
+/// shorter than that one (and shorter than `vendor/zed/crates/editor/src/hover_popover.rs`'s own
+/// separate `hover_popover_hiding_delay` setting, whose real default is `300`ms, matching
+/// [`HOVER_TRIGGER_DELAY`]) - real, reported feedback that a full 300ms hide made the whole
+/// interaction feel unresponsive, lingering visibly after the pointer had genuinely moved on.
+/// Still real, non-zero debounce: without *some* delay here, every real token boundary - or the
+/// plain whitespace between two words on the same line - the pointer crosses while sweeping
+/// toward some other target synchronously cleared an already-resolved, visible card, flashing on
+/// every sweep rather than only on a deliberate re-hover.
+pub(crate) const HOVER_HIDE_DELAY: Duration = Duration::from_millis(150);
 
 impl AdeApp {
     /// Real, pointer-driven hover trigger (GitHub issue #186): arms [`HOVER_TRIGGER_DELAY`] for
