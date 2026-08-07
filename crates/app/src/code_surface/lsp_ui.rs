@@ -574,6 +574,7 @@ impl AdeApp {
     /// doesn't cover - Hover keeps its normal priority, the same as it always did.
     pub(crate) fn render_diagnostic_card(
         &self,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let relative_path = self.active_editable_path()?;
@@ -587,17 +588,18 @@ impl AdeApp {
         let (line_number, diagnostic) = self.diagnostic_target()?;
         let (row_bounds, shaped) = self.file_view_row_layout.get(&line_number)?;
 
-        let row_top = row_bounds.top();
-        let row_bottom = row_bounds.bottom();
         // Flip above the offending row when there isn't real room below it - the same real
         // measurement `Self::render_hover_card` and `render_completions_popover` already make,
-        // against the same real `Self::body_bounds`.
-        let space_below = self.body_bounds.bottom() - row_bottom;
-        let top = if space_below >= DIAGNOSTIC_CARD_MAX_HEIGHT {
-            row_bottom
-        } else {
-            (row_top - DIAGNOSTIC_CARD_MAX_HEIGHT).max(self.body_bounds.top())
-        };
+        // against the same real `Self::body_bounds`. See [`CardAnchor`] for why flipping pins the
+        // card's *bottom* edge rather than computing a top from a worst-case height.
+        let (anchor, max_height) = CardAnchor::for_row(
+            row_bounds.top(),
+            row_bounds.bottom(),
+            self.body_bounds.top(),
+            self.body_bounds.bottom(),
+            window.viewport_size().height,
+            DIAGNOSTIC_CARD_MAX_HEIGHT,
+        );
         // Anchored under the real, offending span's own start column - the same real
         // `shaped.x_for_index(byte_range.start)` measurement `Self::render_hover_card` already
         // makes off the identical `(Bounds, ShapedLine)` pair, not the row's bare left edge. An
@@ -609,7 +611,7 @@ impl AdeApp {
         let anchor_x = row_bounds.left() + shaped.x_for_index(diagnostic.byte_range.start);
 
         Some(render_diagnostic_card_content(
-            diagnostic, anchor_x, top, cx,
+            diagnostic, anchor_x, anchor, max_height, cx,
         ))
     }
 
@@ -664,6 +666,71 @@ impl AdeApp {
     }
 }
 
+/// Where a popover card sits relative to the row it describes, and - crucially - **which of its
+/// own edges** that position pins.
+///
+/// A card that fits below its row is positioned by its top edge, which is exact. A card that has
+/// to flip above one cannot be: its height depends on how much text the server sent and how that
+/// text wraps, neither of which is known before layout runs. Both cards used to guess with their
+/// own worst-case constant, and a short card - which is nearly all of them - was left floating
+/// that constant's full height above the row.
+///
+/// Live-reported ("when a diagnostic window opens on the last line the position is bugged") and
+/// measured before this existed: a real one-line `Type 'string' is not assignable to type
+/// 'number'` card, roughly 68px tall, flipped above with `row_top - 190` and so painted with
+/// **122px of empty space** between it and the error it described, covering nine unrelated lines
+/// on the way up.
+///
+/// [`Above`](Self::Above) fixes that by pinning the card's *bottom* edge instead, which is the one
+/// edge whose correct position is known without knowing the height at all. GPUI resolves
+/// `bottom` against the same window-space box `top` is resolved against for these root-level
+/// overlays (see `crate::root::AdeApp::render`'s own docs on why they are siblings there), so the
+/// offset is measured from the window's own bottom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CardAnchor {
+    /// Pin the card's top edge this far down the window - the row's own bottom.
+    Below(Pixels),
+    /// Pin the card's bottom edge this far up from the window's bottom, so the card grows upward
+    /// away from the row rather than downward onto it.
+    Above(Pixels),
+}
+
+impl CardAnchor {
+    /// Resolves the flip for a card of at most `max_height`, given the row it describes and the
+    /// window it lives in.
+    ///
+    /// `available` is the real height the card may occupy once flipped - the space between the
+    /// body's top and the row - so a card with more content than that clips inside its own
+    /// `overflow_hidden` rather than growing off the top of the window, which pinning the bottom
+    /// edge would otherwise let it do.
+    fn for_row(
+        row_top: Pixels,
+        row_bottom: Pixels,
+        body_top: Pixels,
+        body_bottom: Pixels,
+        window_bottom: Pixels,
+        max_height: Pixels,
+    ) -> (Self, Pixels) {
+        if body_bottom - row_bottom >= max_height {
+            return (Self::Below(row_bottom), max_height);
+        }
+        let available = (row_top - body_top).max(Pixels::ZERO);
+        (
+            Self::Above(window_bottom - row_top),
+            max_height.min(available),
+        )
+    }
+
+    /// Applies this anchor to a real card element - generic over the element type because
+    /// `.id(..)` has already turned these cards into a `Stateful<Div>` by the time it is called.
+    fn apply<E: gpui::Styled>(self, card: E) -> E {
+        match self {
+            Self::Below(top) => card.top(top),
+            Self::Above(bottom) => card.bottom(bottom),
+        }
+    }
+}
+
 /// The real Diagnostic popover's own content, split out of [`AdeApp::render_diagnostic_card`] for
 /// exactly the reason [`render_hover_card_content`] is split out of [`AdeApp::render_hover_card`]:
 /// the positioning math needs `&self` and this doesn't.
@@ -685,7 +752,8 @@ impl AdeApp {
 fn render_diagnostic_card_content(
     diagnostic: &diagnostics_view::LineDiagnostic,
     anchor_x: Pixels,
-    top: Pixels,
+    anchor: CardAnchor,
+    max_height: Pixels,
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
     let source_code = match (&diagnostic.source, &diagnostic.code) {
@@ -741,21 +809,23 @@ fn render_diagnostic_card_content(
         .size_full()
     };
 
-    let mut card = div()
-        .id("diagnostic-card")
-        // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
-        // this, not `.id(..)`) - a no-op outside test builds, matching `"hover-card"` and every
-        // other `debug_selector` in this crate.
-        .debug_selector(|| "diagnostic-card".to_string())
-        .child(bounds_probe)
-        .absolute()
-        .left(anchor_x)
-        .top(top)
-        .flex_none()
-        .flex()
-        .flex_col()
-        .w(DIAGNOSTIC_CARD_WIDTH)
-        .max_h(DIAGNOSTIC_CARD_MAX_HEIGHT)
+    let mut card = anchor
+        .apply(
+            div()
+                .id("diagnostic-card")
+                // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
+                // this, not `.id(..)`) - a no-op outside test builds, matching `"hover-card"` and every
+                // other `debug_selector` in this crate.
+                .debug_selector(|| "diagnostic-card".to_string())
+                .child(bounds_probe)
+                .absolute()
+                .left(anchor_x)
+                .flex_none()
+                .flex()
+                .flex_col()
+                .w(DIAGNOSTIC_CARD_WIDTH)
+                .max_h(max_height),
+        )
         .overflow_hidden()
         .rounded(theme::radius::CARD_SM)
         .bg(theme::syntax::DIAGNOSTIC_ROW_BG)
@@ -870,7 +940,11 @@ impl AdeApp {
     /// otherwise let a genuinely empty `HoverStatus::Ready(None)` ("no symbol information here")
     /// paint right over a real, useful diagnostic, and let a real hover response whose own text
     /// happened to overlap the diagnostic's paint alongside it, reading as duplicated.
-    pub(crate) fn render_hover_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(crate) fn render_hover_card(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let hover = self.hover.as_ref()?;
         let active_relative = self.active_editable_path()?;
         if hover.path != self.file_tree_root.join(&active_relative) {
@@ -896,14 +970,16 @@ impl AdeApp {
         // Flip above the hovered row when there isn't real room below it in the window body -
         // the same real "measure real available space, flip if it doesn't fit" judgment
         // `Self::render_completions_popover` already makes (see that method's own docs for the
-        // `vendor/zed` precedent this follows).
-        let space_below = self.body_bounds.bottom() - row_bottom;
-        let fits_below = space_below >= HOVER_CARD_MAX_HEIGHT;
-        let top = if fits_below {
-            row_bottom
-        } else {
-            (row_top - HOVER_CARD_MAX_HEIGHT).max(self.body_bounds.top())
-        };
+        // `vendor/zed` precedent this follows), and the same [`CardAnchor`] the Diagnostic card
+        // uses so a flipped card sits *against* its row rather than a worst-case height above it.
+        let (anchor, max_height) = CardAnchor::for_row(
+            row_top,
+            row_bottom,
+            self.body_bounds.top(),
+            self.body_bounds.bottom(),
+            window.viewport_size().height,
+            HOVER_CARD_MAX_HEIGHT,
+        );
 
         // The active file's own extension - the same one `Self::request_hover` resolved a
         // highlighter for when the code line itself was painted - so the signature reads with
@@ -912,7 +988,7 @@ impl AdeApp {
             .extension()
             .and_then(|extension| extension.to_str());
 
-        Some(self.render_hover_card_content(hover, extension, anchor_x, top, cx))
+        Some(self.render_hover_card_content(hover, extension, anchor_x, anchor, max_height, cx))
     }
 
     /// The real Hover popover's own content - split out of [`Self::render_hover_card`] purely so
@@ -928,7 +1004,8 @@ impl AdeApp {
         hover: &HoverEntry,
         extension: Option<&str>,
         anchor_x: Pixels,
-        top: Pixels,
+        anchor: CardAnchor,
+        max_height: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // GitHub issue #186: captures this card's own real painted bounds into
@@ -954,21 +1031,23 @@ impl AdeApp {
         // column. Only `HoverStatus::Ready(Some(_))` below builds those three bands; every other
         // status is a single line of plain text with no real card structure to speak of, so it gets
         // its own one-off `.p(px(10.0))` wrapper instead.
-        let mut card = div()
-            .id("hover-card")
-            // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
-            // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
-            // builds, matching every other `debug_selector` in this crate.
-            .debug_selector(|| "hover-card".to_string())
-            .child(bounds_probe)
-            .absolute()
-            .left(anchor_x)
-            .top(top)
-            .flex_none()
-            .flex()
-            .flex_col()
-            .max_w(HOVER_CARD_MAX_WIDTH)
-            .max_h(HOVER_CARD_MAX_HEIGHT)
+        let mut card = anchor
+            .apply(
+                div()
+                    .id("hover-card")
+                    // Lets a real test measure this real popover's own painted bounds (`debug_bounds` reads
+                    // this, not `.id(..)` - see `hover_popover_position_tests`) - a no-op outside test
+                    // builds, matching every other `debug_selector` in this crate.
+                    .debug_selector(|| "hover-card".to_string())
+                    .child(bounds_probe)
+                    .absolute()
+                    .left(anchor_x)
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .max_w(HOVER_CARD_MAX_WIDTH)
+                    .max_h(max_height),
+            )
             .overflow_hidden()
             .rounded(theme::radius::CARD_SM)
             .bg(theme::surface::POPOVER)
@@ -2260,6 +2339,83 @@ mod hover_popover_position_tests {
              card's own painted height well past a single line's (~31px) - a card that stayed \
              short would mean the wrap never really happened (got {:?})",
             card.size.height
+        );
+    }
+
+    /// The live-reported "when a diagnostic window opens on the last line the position is bugged",
+    /// pinned on the card that can be driven without a live server. Both cards share
+    /// [`CardAnchor`], so this covers the same mechanism the Diagnostic card was reported for.
+    ///
+    /// A row too near the bottom of the body has no room for its card below it, so the card flips
+    /// above. It used to be positioned at `row_top - MAX_HEIGHT` - the *worst-case* height - so a
+    /// short card, which is nearly all of them, floated the difference above the thing it
+    /// described. Measured in the running app before this was fixed: a one-line diagnostic card
+    /// about 68px tall, flipped with a 190px constant, painted **122px clear** of its own row and
+    /// covered nine unrelated lines on the way up.
+    ///
+    /// Pinning the card's *bottom* edge needs no height at all, which is the whole fix. This drives
+    /// a real render, finds the lowest row that genuinely painted, and measures both real boxes.
+    #[gpui::test]
+    fn a_card_with_no_room_below_sits_against_its_row_not_a_card_height_above_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.txt");
+        // Long enough that its later rows are genuinely near the bottom of the painted body -
+        // the only way to make a card flip for real rather than by faking bounds.
+        let source: String = (1..=200).map(|index| format!("line {index}\n")).collect();
+        std::fs::write(&file_path, &source).expect("write sample.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        // The lowest row this frame actually painted - by construction the one with the least
+        // room beneath it, so it is the row whose card must flip.
+        let (target, row_top, body_bottom) = app.read_with(cx, |app, _| {
+            let body_bottom = app.body_bounds.bottom();
+            let (line, (bounds, _)) = app
+                .file_view_row_layout
+                .iter()
+                .filter(|(_, (bounds, _))| bounds.bottom() <= body_bottom)
+                .max_by(|left, right| {
+                    f32::from(left.1 .0.top())
+                        .partial_cmp(&f32::from(right.1 .0.top()))
+                        .expect("real, finite painted bounds")
+                })
+                .expect("a real painted row");
+            (*line, bounds.top(), body_bottom)
+        });
+
+        seed_ready_hover_for_line(&app, cx, file_path, target);
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("a real hover on a real row must paint a real card");
+
+        assert!(
+            body_bottom - row_top < HOVER_CARD_MAX_HEIGHT,
+            "sanity check: this row must genuinely have too little room below it, or the test is \
+             measuring the un-flipped case (row top {row_top:?}, body bottom {body_bottom:?})"
+        );
+        assert!(
+            card.bottom() <= row_top + px(1.0),
+            "a flipped card must sit above the row it describes, not over it (card bottom {:?}, \
+             row top {row_top:?})",
+            card.bottom()
+        );
+        let gap = row_top - card.bottom();
+        assert!(
+            gap <= px(2.0),
+            "a flipped card must sit *against* its row, not a worst-case card height above it - \
+             got a {gap:?} gap, which is the reported bug (card {card:?}, row top {row_top:?})"
         );
     }
 

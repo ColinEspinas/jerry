@@ -2514,14 +2514,14 @@ impl Render for AdeApp {
                     && self.current_diff().is_some(),
                 |el| el.child(self.render_commit_menu(window, cx)),
             )
-            .children(self.render_hover_card(cx))
+            .children(self.render_hover_card(window, cx))
             .children(self.render_completions_popover(cx))
             // GitHub issue #186's real Diagnostic popover - a top-level sibling of the other two
             // for exactly the same reason they are (see `render_hover_card`'s own docs), and
             // painted after them so that if the one-at-a-time gate in `render_diagnostic_card`
             // ever failed to hold, the ambient card would be the one on top to notice, not the
             // requested one it would be hiding.
-            .children(self.render_diagnostic_card(cx))
+            .children(self.render_diagnostic_card(window, cx))
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })
