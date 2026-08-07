@@ -116,7 +116,6 @@ impl CompletionsStatus {
     }
 }
 
-
 /// 290px - the design mockup's own real completions-list column width
 /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:290px` on the list column), plus
 /// its own `1px` right divider. Design-review follow-up: this used to be the popup's *entire*
@@ -196,7 +195,10 @@ fn popover_list_max_height() -> gpui::Pixels {
 /// content, leaving a large, visibly wrong gap between it and the real caret row it was supposed
 /// to anchor to).
 fn popover_max_height() -> gpui::Pixels {
-    popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT + POPOVER_FOOTER_HEIGHT
+    popover_list_max_height()
+        + POPOVER_VERTICAL_PADDING
+        + POPOVER_BORDER_HEIGHT
+        + POPOVER_FOOTER_HEIGHT
 }
 
 /// A real, tighter *estimate* of what [`AdeApp::render_completions_popover`] is actually about to
@@ -649,9 +651,7 @@ impl AdeApp {
                 // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
                 // while there's a real detail pane beside it to divide from.
                 if selected_item.is_some() {
-                    list_column = list_column
-                        .border_r_1()
-                        .border_color(theme::border::CARD);
+                    list_column = list_column.border_r_1().border_color(theme::border::CARD);
                 }
 
                 // Real virtualization, not a render cap (GitHub issue #185): `uniform_list` only
@@ -704,12 +704,7 @@ impl AdeApp {
                                 .filter_map(|(offset, item_index)| {
                                     let index = start + offset;
                                     let item = items.get(*item_index)?;
-                                    Some(render_completion_row(
-                                        index,
-                                        item,
-                                        index == selected,
-                                        cx,
-                                    ))
+                                    Some(render_completion_row(index, item, index == selected, cx))
                                 })
                                 .collect::<Vec<_>>()
                         },
@@ -799,10 +794,7 @@ impl AdeApp {
                         .items_center()
                         .child(render_hint_row(
                             [
-                                (
-                                    keymap::resolve_combo("\u{2191}\u{2193}", macos),
-                                    "move",
-                                ),
+                                (keymap::resolve_combo("\u{2191}\u{2193}", macos), "move"),
                                 (keymap::resolve_combo("enter", macos), "accept"),
                                 (keymap::resolve_combo("tab", macos), "snippet"),
                             ]
@@ -1592,11 +1584,7 @@ mod completion_detail_pane_tests {
     fn seed_ready_popup(
         cx: &mut TestAppContext,
         items: Vec<lsp_core::lsp_types::CompletionItem>,
-    ) -> (
-        gpui::Entity<AdeApp>,
-        &mut gpui::VisualTestContext,
-        PathBuf,
-    ) {
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
         let repo = tempfile::tempdir().expect("tempdir");
         let file = repo.path().join("sample.rs");
         std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
@@ -1704,10 +1692,10 @@ mod completion_detail_pane_tests {
         let popover = cx
             .debug_bounds("completions-popover")
             .expect("the real popover must have painted");
-        let detail_pane = cx
-            .debug_bounds("completions-detail-pane")
-            .expect("a real selected item with real detail/documentation must paint a real \
-                     detail pane, not silently stay list-only");
+        let detail_pane = cx.debug_bounds("completions-detail-pane").expect(
+            "a real selected item with real detail/documentation must paint a real \
+                     detail pane, not silently stay list-only",
+        );
         let footer_hints = cx
             .debug_bounds("completions-footer-hints")
             .expect("the real footer hint row must have painted alongside the item rows");
