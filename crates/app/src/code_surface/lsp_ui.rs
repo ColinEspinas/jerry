@@ -761,6 +761,9 @@ fn render_diagnostic_card_content(
         .bg(theme::syntax::DIAGNOSTIC_ROW_BG)
         .border_1()
         .border_color(theme::border::DIAGNOSTIC_CARD)
+        // See `render_hover_card_content`'s own identical `.occlude()` docs for why - a real
+        // scroll/click over this card must never also reach the editor content behind it.
+        .occlude()
         .child(
             div()
                 .flex()
@@ -970,7 +973,20 @@ impl AdeApp {
             .rounded(theme::radius::CARD_SM)
             .bg(theme::surface::POPOVER)
             .border_1()
-            .border_color(theme::border::POPOVER);
+            .border_color(theme::border::POPOVER)
+            // Without this, a scroll over the card's own `overflow_y_scroll()` doc region also
+            // reached the File view's own scrollable content behind it - `gpui`'s internal scroll
+            // listener (`vendor/zed/crates/gpui/src/elements/div.rs`'s `paint_scroll_listener`)
+            // never calls `cx.stop_propagation()` on its own, it only ever updates its own offset,
+            // so *every* hitbox under the pointer that also registered a scroll listener handles
+            // the same wheel event unless one of them is occluded. `.occlude()`
+            // (`gpui::InteractiveElement::occlude`, `HitboxBehavior::BlockMouse`) is this app's own
+            // established fix for exactly this class of bug (`crate::sidebar::render::
+            // render_tree_context_menu`'s own scrim docs) - `Hitbox::should_handle_scroll`'s own
+            // docs confirm it's scroll-aware, not just click-aware: "if a hitbox in front of this
+            // sets HitboxBehavior::BlockMouse ... concretely, this is due to use-cases like
+            // overlays".
+            .occlude();
 
         match &hover.status {
             HoverStatus::Loading => {
@@ -3944,6 +3960,72 @@ mod hover_card_footer_layout_tests {
              far short of the edge",
             card.right(),
             definition_chip.right()
+        );
+    }
+
+    /// The real, live-reported bug: scrolling (or clicking) over a floating popup used to also
+    /// reach whatever real content sits behind it - `gpui`'s own internal scroll listener
+    /// (`vendor/zed/crates/gpui/src/elements/div.rs`'s `paint_scroll_listener`) never calls
+    /// `cx.stop_propagation()`, so every hitbox under the pointer handles the same event unless
+    /// one of them is `.occlude()`d. A raw `ScrollWheelEvent` can't be driven end-to-end through
+    /// this test harness (the File view's own `UniformListScrollHandle` never updates from a
+    /// synthetic wheel event here, with or without occlusion - a real test-infra gap, not
+    /// something this fix could prove around), so this proves the same real mechanism
+    /// (`HitboxBehavior::BlockMouse`, set by `.occlude()`) the fix relies on via a click instead:
+    /// a real mouse-down at a point inside the hover card's own painted bounds must never reach a
+    /// real token underneath it (`AdeApp::code_cursor`, set by clicking a File view row, must stay
+    /// unmoved) - see `Hitbox::should_handle_scroll`'s own doc comment for why click-blocking and
+    /// scroll-blocking are the same real hitbox behaviour, not two independent mechanisms.
+    #[gpui::test]
+    fn clicking_through_the_hover_card_never_also_reaches_the_file_view_row_behind_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn line_one() {}\nfn line_two() {}\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn line_one()".to_string(),
+                    doc: None,
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let card = cx
+            .debug_bounds("hover-card")
+            .expect("the real hover card should have painted real bounds");
+        let cursor_before = app.read_with(cx, |app, _| app.code_cursor);
+
+        cx.simulate_click(card.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let cursor_after = app.read_with(cx, |app, _| app.code_cursor);
+        assert_eq!(
+            cursor_before, cursor_after,
+            "a real click over the hover card must never also reach a real File view row \
+             underneath it - the same real hitbox-blocking mechanism a scroll wheel event relies \
+             on to avoid also scrolling the content behind the card"
         );
     }
 

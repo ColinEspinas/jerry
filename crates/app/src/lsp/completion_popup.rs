@@ -845,6 +845,11 @@ impl AdeApp {
             .blur_radius(shadow_blur)])
             .font(gpui::font(theme::font::MONO))
             .text_size(gpui::px(11.5))
+            // See `crate::code_surface::lsp_ui::render_hover_card_content`'s own identical
+            // `.occlude()` docs for why - a real scroll (over the list column or the detail
+            // pane's own doc region) or click over this popover must never also reach the File
+            // view content behind it.
+            .occlude()
             .child(list_column);
 
         // The detail pane - `border-right` lives on the list column's own right edge in the
