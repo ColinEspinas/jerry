@@ -211,6 +211,7 @@ string_escape             = "#9c9948"  # string.escape
 number                    = "#b7695c"
 comment                   = "#758086"
 comment_doc               = "#768086"  # comment.doc
+comment_doc_tag           = "#8674b7"  # GitHub issue #200's own doc-comment tag bucket
 variable                  = "#a56b9e"  # variable
 variable_parameter        = "#b36785"
 variable_builtin          = "#b7695c"  # variable.builtin (self/this/super/cls)

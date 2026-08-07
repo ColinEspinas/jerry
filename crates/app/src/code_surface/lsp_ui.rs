@@ -1054,8 +1054,7 @@ impl AdeApp {
                             .px(px(10.0))
                             .py(px(7.0))
                             .text_size(px(11.5))
-                            .text_color(theme::text::DIM)
-                            .child(doc.clone()),
+                            .child(render_doc_prose(doc, theme::text::DIM)),
                     );
                 }
                 // `.flex_1().min_h_0()`: absorbs whatever height the footer below doesn't need, up to
@@ -1233,6 +1232,68 @@ fn highlighted_signature_lines(
     .into_iter()
     .map(|line| line.runs)
     .collect()
+}
+
+/// A doc paragraph's own plain-text body (`HoverRenderModel::doc`/`completion_documentation_text`,
+/// see either's own docs for why this is plain text, not real Markdown, in the first place), with
+/// every real `code_view::doc_tag_ranges` span (`@param`, `{@link ...}`, ...) painted in
+/// `HighlightKind::CommentDocTag`'s own accent colour and a heavier weight - GitHub issue #200's
+/// rendered-side half. `base_color` is every non-tag run's own colour, so the Hover card
+/// (`theme::text::DIM`) and the Completions detail pane (`theme::text::DIMMER`) each keep their own
+/// already-designed doc-paragraph colour for ordinary prose.
+///
+/// Shared between the two real places LSP doc prose is rendered as free text, rather than
+/// duplicated - `crate::lsp::completion_popup` calls this directly instead of growing its own
+/// second copy.
+///
+/// Multiple adjacent `div` runs inside one `.flex().flex_wrap()` row, not a single text child -
+/// the same real idiom [`render_hover_signature`]'s own `signature_row` already uses to paint a
+/// mixed-colour line: GPUI wraps naturally at each run's own internal whitespace, so splicing in an
+/// extra differently-coloured run doesn't disturb the paragraph's own natural word wrapping.
+pub(crate) fn render_doc_prose(
+    doc: &str,
+    base_color: impl Into<gpui::Hsla> + Copy,
+) -> gpui::AnyElement {
+    let tag_ranges = code_view::doc_tag_ranges(doc);
+    if tag_ranges.is_empty() {
+        return div()
+            .text_color(base_color)
+            .child(doc.to_string())
+            .into_any_element();
+    }
+    let mut wrapper = div().flex().flex_wrap();
+    let mut cursor = 0;
+    for (index, tag_range) in tag_ranges.into_iter().enumerate() {
+        if tag_range.start > cursor {
+            wrapper = wrapper.child(
+                div()
+                    .text_color(base_color)
+                    .child(doc[cursor..tag_range.start].to_string()),
+            );
+        }
+        wrapper = wrapper.child(
+            div()
+                .id(("doc-prose-tag", index))
+                // Lets a real test measure this real tag run's own painted bounds
+                // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                // matching every other `debug_selector` in this crate.
+                .debug_selector(move || format!("doc-prose-tag-{index}"))
+                .text_color(code_view::color_for_kind(
+                    code_view::HighlightKind::CommentDocTag,
+                ))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(doc[tag_range.clone()].to_string()),
+        );
+        cursor = tag_range.end;
+    }
+    if cursor < doc.len() {
+        wrapper = wrapper.child(
+            div()
+                .text_color(base_color)
+                .child(doc[cursor..].to_string()),
+        );
+    }
+    wrapper.into_any_element()
 }
 
 /// One File view code row: a 52px right-aligned line-number gutter, a 3px git-gutter marker
@@ -3883,6 +3944,55 @@ mod hover_card_footer_layout_tests {
              far short of the edge",
             card.right(),
             definition_chip.right()
+        );
+    }
+
+    /// GitHub issue #200's rendered-side coverage: a real hover doc body containing real JSDoc-
+    /// style block tags must paint each one as its own real, separately-coloured
+    /// `render_doc_prose` run - not just as part of the ordinary flat doc-paragraph text.
+    #[gpui::test]
+    fn a_real_jsdoc_tag_in_the_hover_doc_body_paints_its_own_tag_run(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("sample.rs");
+        std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.hover = Some(HoverEntry {
+                path: file_path,
+                line_number: 1,
+                byte_range: 0..2,
+                position: lsp_core::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                status: HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                    module_path: None,
+                    signature: "fn add_one(x: i32) -> i32".to_string(),
+                    doc: Some("Adds one.\n\n@param x the input\n@returns x + 1".to_string()),
+                })),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("doc-prose-tag-0").is_some(),
+            "a real @param tag inside the hover doc body must paint its own real \
+             `doc-prose-tag` run"
+        );
+        assert!(
+            cx.debug_bounds("doc-prose-tag-1").is_some(),
+            "a real @returns tag inside the same doc body must paint its own real, second \
+             `doc-prose-tag` run"
         );
     }
 

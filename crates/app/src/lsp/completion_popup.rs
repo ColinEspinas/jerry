@@ -1116,7 +1116,6 @@ impl AdeApp {
                     .px(gpui::px(10.0))
                     .font(gpui::font(theme::font::SANS))
                     .text_size(gpui::px(11.0))
-                    .text_color(theme::text::DIMMER)
                     // No `.line_clamp(...)` here (an earlier version of this fix kept one) - a
                     // real doc comment can run to many paragraphs (rustdoc examples, long prose),
                     // and clamping it silently truncated the rest with no way to reach it at all:
@@ -1126,7 +1125,10 @@ impl AdeApp {
                     // render_hover_card_content`'s own doc paragraph, which has never clamped -
                     // real overflow, from either the signature or the doc, is what the scroll
                     // region and its scrollbar exist to handle.
-                    .child(doc),
+                    .child(crate::code_surface::lsp_ui::render_doc_prose(
+                        &doc,
+                        theme::text::DIMMER,
+                    )),
             );
         }
 
@@ -1611,6 +1613,29 @@ mod completion_detail_pane_tests {
         });
         cx.run_until_parked();
         (app, cx, relative)
+    }
+
+    /// GitHub issue #200's rendered-side coverage: a real completion item whose documentation
+    /// contains a real JSDoc-style block tag must paint each tag as its own real, separately-
+    /// coloured `render_doc_prose` run, mirroring `crate::code_surface::lsp_ui`'s identical hover
+    /// coverage - the two real places this shared render helper is called from.
+    #[gpui::test]
+    fn a_real_jsdoc_tag_in_the_completion_doc_body_paints_its_own_tag_run(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "Appends a given string slice.\n\n@param string the slice to append".to_string(),
+            )),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("doc-prose-tag-0").is_some(),
+            "a real @param tag inside the completion doc body must paint its own real \
+             `doc-prose-tag` run"
+        );
     }
 
     /// A real, fully-populated item (a real `detail`, `documentation`, and `label_details`

@@ -828,8 +828,8 @@ mod tests {
     /// item also sent - the row's own right-side hint should read as the clean, spec-designed
     /// type fragment (`"string"`), not the mixed legacy string.
     #[test]
-    fn completion_item_display_prefers_a_real_label_details_detail_over_the_legacy_mixed_detail_string()
-     {
+    fn completion_item_display_prefers_a_real_label_details_detail_over_the_legacy_mixed_detail_string(
+    ) {
         let item = lsp_types::CompletionItem {
             label: "bar".to_string(),
             detail: Some("(property) Foo.bar: string".to_string()),
