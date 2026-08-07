@@ -923,6 +923,91 @@ pub fn companion_for_primary_binary(binary: &str) -> Option<CompanionServer> {
         .and_then(|lsp| lsp.companion)
 }
 
+/// The `initializationOptions` fragment that turns a server's auto-import completions off, for a
+/// server where that is known - by direct verification, not by reading a settings reference - to
+/// actually work. `None` for every other server, so nothing is sent on a guess.
+///
+/// Backs `crate::settings::store::EditorSettings::suggest_auto_imports`. Only
+/// `typescript-language-server` is here, and each of these was checked against a live server in a
+/// real project rather than assumed:
+///
+/// - `includeCompletionsForModuleExports: false` **works**: at the reported caret it takes the
+///   response from 1029 items with 7 Node auto-import candidates down to 1019 with none.
+/// - `includePackageJsonAutoImports: "off"` does **not**, despite its name: byte-identical
+///   response, all 7 candidates still there. Not sent.
+/// - `pyright-langserver` ignores its own `python.analysis.autoImportCompletions` here entirely -
+///   it reads that over `workspace/configuration` instead, where the same value really does work
+///   (48 items down to 7). Reaching that path needs a `WorkspaceConfigFn` that can see settings,
+///   which is a real change to `lsp_core`'s own API and is deliberately not in this commit.
+/// - `rust-analyzer` is unverified: its probe needs a fully primed index and did not finish here.
+///   Nothing is sent for it rather than a plausible-looking key.
+pub fn auto_import_suppression_options(server_name: &str) -> Option<serde_json::Value> {
+    // Both the standalone TypeScript server and the one Vue runs as a companion, which is the
+    // same binary answering for the `<script>` half of an SFC.
+    if server_name.starts_with("typescript-language-server") {
+        return Some(serde_json::json!({
+            "preferences": { "includeCompletionsForModuleExports": false },
+        }));
+    }
+    None
+}
+
+/// Deep-merges a user's own `settings.toml` `initializationOptions` **over** whatever this
+/// registry built for that server, and hands back what should actually be sent.
+///
+/// Merged rather than substituted, because the registry's own options are load-bearing and a user
+/// setting one unrelated key must not silently drop them: Pyright's real resolved `pythonPath`,
+/// `vue-language-server`'s real resolved `--tsdk`. Objects merge key by key, recursively; anything
+/// else (a string, a number, an **array**) the user supplied replaces what was there, since a
+/// half-overridden array is nobody's intent.
+///
+/// Exists because there is no other way to configure a server here. `initializationOptions` is
+/// where a real server takes its own behavioural settings, it is emphatically *not* something a
+/// `tsconfig.json` can reach (checked directly against a real `typescript-language-server`, which
+/// reads them from `initializationOptions.preferences` at startup and asks the client for nothing
+/// but `formattingOptions` afterwards), and this app previously sent `None` for every server that
+/// had no built-in options of its own.
+pub fn merge_initialization_options(
+    built_in: Option<serde_json::Value>,
+    user: Option<&toml::Value>,
+) -> Option<serde_json::Value> {
+    merge_initialization_options_json(
+        built_in,
+        user.and_then(|user| serde_json::to_value(user).ok()),
+    )
+}
+
+/// [`merge_initialization_options`] over an overlay this app built itself rather than one read out
+/// of a TOML file - the same merge rule, shared so a toggle and a `settings.toml` entry can be
+/// layered one after the other.
+pub fn merge_initialization_options_json(
+    built_in: Option<serde_json::Value>,
+    overlay: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (built_in, overlay) {
+        (base, None) => base,
+        (None, Some(overlay)) => Some(overlay),
+        (Some(base), Some(overlay)) => Some(merge_json(base, overlay)),
+    }
+}
+
+/// [`merge_initialization_options`]'s recursive half - see its own docs for the merge rule.
+fn merge_json(base: serde_json::Value, user: serde_json::Value) -> serde_json::Value {
+    match (base, user) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(user)) => {
+            for (key, value) in user {
+                let merged = match base.remove(&key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => value,
+                };
+                base.insert(key, merged);
+            }
+            serde_json::Value::Object(base)
+        }
+        (_, user) => user,
+    }
+}
+
 /// Builds a real, owned [`ServerSpawnConfig`] for `companion`. `Err(reason)` when its own real,
 /// checked prerequisite is genuinely missing (see [`CompanionServer::initialization_options`]) -
 /// which the caller surfaces as that companion's own `Failed` state without preventing the primary
@@ -1528,5 +1613,141 @@ mod tests {
             crate::code_surface::code_view::highlight_tsx,
             "jsx",
         );
+    }
+
+    /// The "Suggest auto-imports" toggle sends only what was directly verified to work, and only
+    /// to the server it was verified against.
+    ///
+    /// Against a live `typescript-language-server` at the reported caret,
+    /// `includeCompletionsForModuleExports: false` took the response from 1029 items carrying 7
+    /// Node auto-import candidates to 1019 carrying none. `includePackageJsonAutoImports: "off"`,
+    /// which sounds like it should do the same job, changed nothing at all - byte-identical
+    /// response, all 7 still there - so it is deliberately not sent.
+    #[test]
+    fn the_auto_import_toggle_sends_only_the_preference_that_was_verified_to_work() {
+        let options = auto_import_suppression_options("typescript-language-server")
+            .expect("TypeScript is the one server this is wired for");
+        assert_eq!(
+            options["preferences"]["includeCompletionsForModuleExports"],
+            serde_json::json!(false)
+        );
+        assert!(
+            options["preferences"]
+                .get("includePackageJsonAutoImports")
+                .is_none(),
+            "a preference observed to have no effect must not be sent as though it had one"
+        );
+        // The same binary, run as Vue's companion for the `<script>` half of an SFC.
+        assert!(auto_import_suppression_options("typescript-language-server (vue)").is_some());
+    }
+
+    /// And nothing is sent on a guess. `pyright-langserver` really does honour
+    /// `analysis.autoImportCompletions` (48 items down to 7, verified) - but over
+    /// `workspace/configuration`, not here, and reaching that path needs a `lsp_core` API change
+    /// this does not make. `rust-analyzer`'s own equivalent was never verified at all.
+    #[test]
+    fn a_server_whose_switch_is_unverified_is_sent_nothing() {
+        for server in [
+            "pyright-langserver",
+            "rust-analyzer",
+            "gopls",
+            "vue-language-server",
+        ] {
+            assert_eq!(
+                auto_import_suppression_options(server),
+                None,
+                "{server}: sending a plausible-looking key that was never checked is how a \
+                 setting ends up quietly doing nothing"
+            );
+        }
+    }
+
+    /// The live-reported case this whole passthrough exists for, end to end.
+    ///
+    /// A browser project with `@types/node` installed gets Node's entire API offered as
+    /// auto-imports; accepting one writes `import { appendFile } from 'node:fs'`, which is valid
+    /// TypeScript (verified against a live server - it raises no diagnostic) and which no browser
+    /// bundler can resolve. `tsconfig.json` cannot turn that off: it configures the *compiler*,
+    /// while auto-import behaviour is a tsserver `UserPreferences` field that
+    /// `typescript-language-server` reads from `initializationOptions.preferences` at startup
+    /// (read directly out of the installed server:
+    /// `mergeTsPreferences(userInitializationOptions.preferences || {})`). This app sent nothing
+    /// there, so there was no way to reach it at all.
+    #[test]
+    fn a_user_can_suppress_node_auto_imports_that_no_tsconfig_could_reach() {
+        let user: toml::Value = toml::from_str(
+            "[preferences]\n\
+             autoImportSpecifierExcludeRegexes = [\"^node:\", \"^fs$\"]\n\
+             includePackageJsonAutoImports = \"off\"\n",
+        )
+        .expect("a real settings.toml fragment");
+        // `typescript-language-server` has no built-in options of its own in this registry.
+        let merged = merge_initialization_options(None, Some(&user))
+            .expect("a user-supplied set must reach the handshake even with nothing to merge over");
+        assert_eq!(
+            merged["preferences"]["autoImportSpecifierExcludeRegexes"],
+            serde_json::json!(["^node:", "^fs$"])
+        );
+        assert_eq!(
+            merged["preferences"]["includePackageJsonAutoImports"],
+            serde_json::json!("off")
+        );
+    }
+
+    /// The merge must never cost a server the options this registry resolved for it - Pyright's
+    /// real `pythonPath` is discovered by probing the filesystem and cannot be reconstructed from
+    /// a config file, so a user setting one unrelated key must leave it alone.
+    #[test]
+    fn a_user_override_adds_to_the_registrys_own_options_rather_than_replacing_them() {
+        let built_in = serde_json::json!({
+            "python": {
+                "pythonPath": "/usr/bin/python3",
+                "analysis": { "autoSearchPaths": true },
+            },
+        });
+        let user: toml::Value =
+            toml::from_str("[python.analysis]\ntypeCheckingMode = \"strict\"\n")
+                .expect("a real settings.toml fragment");
+        let merged = merge_initialization_options(Some(built_in), Some(&user))
+            .expect("both halves are present");
+        assert_eq!(
+            merged["python"]["pythonPath"],
+            serde_json::json!("/usr/bin/python3"),
+            "a real, probed path the user never mentioned must survive their edit"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["autoSearchPaths"],
+            serde_json::json!(true),
+            "and so must a sibling key inside the object they did edit"
+        );
+        assert_eq!(
+            merged["python"]["analysis"]["typeCheckingMode"],
+            serde_json::json!("strict"),
+            "while what they actually set is applied"
+        );
+    }
+
+    /// A user value wins at the leaf, and an array is a leaf: half-merging two arrays is nobody's
+    /// intent, and would produce a list neither side asked for.
+    #[test]
+    fn a_user_supplied_scalar_or_array_replaces_rather_than_blends() {
+        let built_in = serde_json::json!({ "flags": ["a", "b"], "level": 1 });
+        let user: toml::Value =
+            toml::from_str("flags = [\"c\"]\nlevel = 2\n").expect("a real fragment");
+        let merged =
+            merge_initialization_options(Some(built_in), Some(&user)).expect("both present");
+        assert_eq!(merged["flags"], serde_json::json!(["c"]));
+        assert_eq!(merged["level"], serde_json::json!(2));
+    }
+
+    /// And with nothing configured, every server's handshake is byte-for-byte what it was.
+    #[test]
+    fn no_user_settings_leaves_a_servers_own_options_exactly_as_they_were() {
+        let built_in = serde_json::json!({ "python": { "pythonPath": "/usr/bin/python3" } });
+        assert_eq!(
+            merge_initialization_options(Some(built_in.clone()), None),
+            Some(built_in)
+        );
+        assert_eq!(merge_initialization_options(None, None), None);
     }
 }

@@ -1313,8 +1313,19 @@ pub struct AdeApp {
     /// *currently* looking at in the detail pane is ever worth resolving, so a fresh selection
     /// always supersedes an in-flight resolve for a previous one.
     pub(crate) _completions_resolve_task: Option<Task<()>>,
+    /// Which `(path, completions_generation, item index)` triple [`Self::_completions_resolve_task`]
+    /// is currently out asking about, if any - cleared when that request's response lands.
+    ///
+    /// Exists because "superseded" and "answered" are genuinely different states, and conflating
+    /// them cost real data: superseding a resolve *cancels* it (dropping a `Task` cancels it), so
+    /// an item the user arrowed past never gets an answer. Recording it in
+    /// [`Self::completions_resolved`] at dispatch time therefore marked an item answered that
+    /// never was, and coming back to it produced no second request - its row and detail pane
+    /// stayed pinned to the unresolved item's own fields for as long as the popup lived. Only a
+    /// request that is genuinely still on its way is skipped here; a cancelled one is retried.
+    pub(crate) completions_resolve_in_flight: Option<(PathBuf, u64, usize)>,
     /// Which `(path, completions_generation, item index into `CompletionsStatus::Ready::items`)`
-    /// triples this app has already dispatched a real `completionItem/resolve` request for -
+    /// triples this app has already *had a real answer* for from `completionItem/resolve` -
     /// keyed by [`Self::completions_generation`] (not cleared explicitly) so a stale entry from a
     /// since-replaced server response is simply never looked up again rather than needing its own
     /// cleanup pass. Exists purely to avoid re-requesting the same already-resolved (or
@@ -1322,6 +1333,24 @@ pub struct AdeApp {
     /// bounded by how many distinct items a user has actually looked at, not by anything
     /// unbounded.
     pub(crate) completions_resolved: std::collections::HashSet<(PathBuf, u64, usize)>,
+    /// Every `completionItem/resolve` response that has landed for the *current*
+    /// [`Self::completions_generation`], keyed by its index into
+    /// `crate::lsp::completion_popup::CompletionsStatus::Ready::items` and already merged over the
+    /// item that response describes. Read by the detail pane and by accept; **never** by a row.
+    ///
+    /// It lives beside the server's response rather than being merged into it, and that is the
+    /// whole point. Merging into `items` was what made a completion row visibly fill in - and, for
+    /// a `typescript-language-server` auto-import whose inline `detail` is a bare module specifier
+    /// and whose resolved `detail` is a signature, visibly *change* - the moment the user arrowed
+    /// onto it. Live-reported: "it should not be like this, all data should be here without
+    /// needing to select the suggestion." A row now reads only the untouched response, so it is
+    /// complete when the popup opens and frozen from then on, by construction rather than by
+    /// convention; the detail pane is the one thing a resolve is allowed to fill in.
+    ///
+    /// Cleared wherever [`Self::completions_generation`] stops describing the same response - the
+    /// same points that clear [`Self::completions_resolved`].
+    pub(crate) completions_resolved_items:
+        std::collections::HashMap<usize, lsp_core::lsp_types::CompletionItem>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
     /// showing. Keyed implicitly to whichever [`Self::edit_buffers`] path
     /// [`CompletionsEntry::path`] names; a stale entry for a file that's no
@@ -1337,6 +1366,14 @@ pub struct AdeApp {
     /// overlay-scrollbar geometry straight off the same handle - not a second, parallel tracking
     /// mechanism, exactly like [`Self::file_tree_scroll_handle`].
     pub(crate) completions_scroll_handle: UniformListScrollHandle,
+    /// GitHub issue #30's real overlay scrollbar for the Completions popup's own detail pane -
+    /// `crate::lsp::completion_popup::AdeApp::render_completion_detail_pane`'s scrollable
+    /// signature+doc region reads its geometry straight off this handle, mirroring
+    /// [`Self::hover_card_scroll_handle`]'s identical role for the Hover card's own scrollable
+    /// region. Follow-up to the same fix: a genuinely multi-line signature (a pretty-printed
+    /// TypeScript utility/generic type) in the detail pane could overflow past the popup's own
+    /// height budget and hide the module-path footer beneath it, the same bug the Hover card had.
+    pub(crate) completions_detail_scroll_handle: gpui::ScrollHandle,
     /// A real generation counter bumped every time a completions request is dispatched or the
     /// popup is dismissed (`Self::dismiss_completions`) - see [`Self::schedule_lsp_sync`]'s own
     /// docs for the real, live race this closes: an in-flight `textDocument/completion` request
@@ -1398,12 +1435,37 @@ pub struct AdeApp {
     /// (cancels) the previous one, so a pointer sweeping across ten tokens leaves exactly one
     /// armed timer, not ten.
     pub(crate) _hover_debounce_task: Option<Task<()>>,
+    /// The single in-flight [`HOVER_HIDE_DELAY`] timer that debounces *clearing* an already-
+    /// visible [`Self::hover`] - the hide-side mirror of [`Self::_hover_debounce_task`]'s show-
+    /// side delay. Without this, every real token boundary (or plain whitespace gap) the pointer
+    /// crosses while sweeping toward some other target synchronously cleared an already-resolved,
+    /// visible card, producing a real, reported flash on every sweep rather than only on a
+    /// deliberate re-hover. Assigning a fresh task drops the previous one, matching every other
+    /// single-slot task field here.
+    pub(crate) _hover_hide_task: Option<Task<()>>,
     /// The real painted bounds of the Hover card (GitHub issue #186), captured every frame by its
     /// own `gpui::canvas` - the same one-frame-lag idiom [`Self::body_bounds`] already uses.
     /// [`Self::track_hover_pointer`] reads it to answer "is the pointer on the card itself right
     /// now", which is what keeps the card alive while the user moves onto it to press its own
     /// `F12 definition` footer instead of dismissing it out from under them.
     pub(crate) hover_card_bounds: Option<gpui::Bounds<Pixels>>,
+    /// The real painted bounds of the Diagnostic card, mirroring [`Self::hover_card_bounds`]'s
+    /// own idiom exactly (captured every frame by its own `gpui::canvas`).
+    /// [`Self::track_hover_pointer`] reads it the same way: the Diagnostic card floats over the
+    /// code area just like the Hover card, and can just as easily cover a real, different
+    /// hoverable token underneath it - a real, reported bug let moving the pointer onto the
+    /// card's own painted area trigger that covered token's own hover, which (per
+    /// `Self::render_diagnostic_card`'s own hover-vs-diagnostic priority rule) hid the diagnostic
+    /// card the user was actually looking at, right out from under them.
+    pub(crate) diagnostic_card_bounds: Option<gpui::Bounds<Pixels>>,
+    /// GitHub issue #30's real overlay scrollbar for the Hover card's own scrollable header+doc
+    /// region (`crate::code_surface::lsp_ui::AdeApp::render_hover_card_content`) reads its
+    /// geometry straight off this handle - the same `gpui::ScrollHandle` pattern every other
+    /// plain (non-virtualized) scrollable region in this app already uses. Follow-up to the fix
+    /// for a genuinely multi-line signature (a pretty-printed TypeScript utility/generic type)
+    /// overflowing the card's own fixed height and hiding the footer underneath it - before that
+    /// fix landed, nothing in the Hover card could ever overflow, which is why it had none.
+    pub(crate) hover_card_scroll_handle: gpui::ScrollHandle,
     /// The single in-flight [`Self::request_hover`] background task, if any - a single slot
     /// (not a [`TaskPool`]) because hover requests are never independent: [`Self::hover`] shows
     /// only one entry at a time, so a new click always supersedes an in-flight one. Assigning a
@@ -2452,14 +2514,14 @@ impl Render for AdeApp {
                     && self.current_diff().is_some(),
                 |el| el.child(self.render_commit_menu(window, cx)),
             )
-            .children(self.render_hover_card(cx))
+            .children(self.render_hover_card(window, cx))
             .children(self.render_completions_popover(cx))
             // GitHub issue #186's real Diagnostic popover - a top-level sibling of the other two
             // for exactly the same reason they are (see `render_hover_card`'s own docs), and
             // painted after them so that if the one-at-a-time gate in `render_diagnostic_card`
             // ever failed to hold, the ambient card would be the one on top to notice, not the
             // requested one it would be hiding.
-            .children(self.render_diagnostic_card())
+            .children(self.render_diagnostic_card(window, cx))
             .when(self.new_file_input.is_some(), |el| {
                 el.child(self.render_new_file_prompt(cx))
             })

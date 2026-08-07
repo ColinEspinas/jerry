@@ -78,6 +78,7 @@
 //! `Window::observe_window_appearance` subscription). `high_contrast_diff` stays persisted-only -
 //! no real diff-colour-intensity mechanism exists yet to apply it through.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -99,6 +100,35 @@ pub struct Settings {
     pub blame: BlameSettings,
     pub editor: EditorSettings,
     pub icon_pack: IconPackSettings,
+    pub lsp: BTreeMap<String, LspServerSettings>,
+}
+
+/// Per-language-server overrides, keyed by the server's own name as this app knows it -
+/// `"typescript-language-server"`, `"pyright-langserver"`, `"rust-analyzer"`,
+/// `"vue-language-server"`, `"gopls"`, or a companion's own distinct client key
+/// (`"typescript-language-server (vue)"`). Hand-edited in `settings.toml`; there is no UI for it.
+///
+/// ```toml
+/// [lsp."typescript-language-server".initialization_options.preferences]
+/// autoImportSpecifierExcludeRegexes = ["^node:"]
+/// includePackageJsonAutoImports = "off"
+/// ```
+///
+/// Exists because a real, live-hit limitation has no other way out: a server's own behaviour is
+/// frequently configured through `initializationOptions`, that is **not** a `tsconfig.json` (or
+/// equivalent) concern, and this app previously sent nothing at all. The example above is the
+/// verbatim answer to "imports from node:fs, fs etc have a module not found error" - a browser
+/// project where `@types/node` is installed gets Node's whole API offered as auto-imports, and
+/// `autoImportSpecifierExcludeRegexes` (a real `typescript-language-server` preference, read out
+/// of TypeScript's own `UserPreferences`) is what stops them being offered.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerSettings {
+    /// Deep-merged **over** whatever `crate::language`'s own registry builds for that server, so a
+    /// user setting one key never discards the rest (Pyright's real `pythonPath` resolution, Vue's
+    /// real `--tsdk` path). A value the user supplies wins at the leaf; every key they leave alone
+    /// keeps the app's own. See `crate::language::merge_initialization_options`.
+    pub initialization_options: Option<toml::Value>,
 }
 
 /// `crate::icon_pack`'s persisted backing (GitHub issue #5's "custom icon packs") - `None` means
@@ -365,6 +395,28 @@ pub struct EditorSettings {
     pub minimap_scale_percent: u16,
     pub insert_spaces: bool,
     pub tab_width: u8,
+    /// Whether accepting a completion also applies the item's own `additionalTextEdits` - in
+    /// practice, the `import`/`use` line a language server wants added for a symbol that isn't in
+    /// scope yet. Read by `crate::lsp::completion_popup::AdeApp::accept_active_completion`.
+    ///
+    /// On by default, because the alternative is inserting a name that doesn't resolve. Worth a
+    /// switch anyway, and live-requested: a server offers auto-imports for everything its own
+    /// index can reach, which in a browser project means `@types/node` - `import { appendFile }
+    /// from 'node:fs'` is valid TypeScript there and still cannot be bundled. Off, an accepted
+    /// completion inserts the name alone and leaves the import to the user.
+    pub auto_import: bool,
+    /// Whether language servers are asked to offer completions for symbols this file hasn't
+    /// imported yet at all. On by default; off, the popup only ever suggests what is already in
+    /// scope.
+    ///
+    /// Distinct from [`Self::auto_import`], which is about what happens when you *accept* such a
+    /// completion. This one is about whether they are offered, and it is the blunt answer to a
+    /// browser project where `@types/node` drags Node's whole API into the list.
+    ///
+    /// Only applied to servers where turning it off was directly verified to work - see
+    /// `crate::language::auto_import_suppression_options`, which currently means
+    /// `typescript-language-server` and no one else.
+    pub suggest_auto_imports: bool,
 }
 
 impl Default for EditorSettings {
@@ -374,6 +426,8 @@ impl Default for EditorSettings {
             minimap_scale_percent: MINIMAP_SCALE_PERCENT_DEFAULT,
             insert_spaces: true,
             tab_width: EDITOR_TAB_WIDTH_DEFAULT,
+            auto_import: true,
+            suggest_auto_imports: true,
         }
     }
 }
@@ -805,6 +859,47 @@ mod tests {
         let loaded = Settings::load_or_init_at(&path);
 
         assert!(loaded.keymap.overrides.is_empty());
+    }
+
+    /// A hand-written `[lsp.*]` section - the only way to configure a language server here -
+    /// must load, survive a save the app makes for some unrelated reason, and reach the spawn path
+    /// intact. Written exactly as the docs on [`LspServerSettings`] show it.
+    #[test]
+    fn a_hand_written_lsp_preferences_section_round_trips_through_toml_save_and_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[lsp.\"typescript-language-server\".initialization_options.preferences]\n\
+             autoImportSpecifierExcludeRegexes = [\"^node:\"]\n\
+             includePackageJsonAutoImports = \"off\"\n",
+        )
+        .expect("write a hand-edited settings.toml");
+
+        let loaded = Settings::load_or_init_at(&path);
+        let server = loaded
+            .lsp
+            .get("typescript-language-server")
+            .expect("the hand-written section must load");
+        let options = server
+            .initialization_options
+            .as_ref()
+            .expect("its initialization options must load");
+
+        // Exactly what `crate::language::merge_initialization_options` will send.
+        let json = serde_json::to_value(options).expect("a real TOML value crosses to JSON");
+        assert_eq!(
+            json["preferences"]["autoImportSpecifierExcludeRegexes"],
+            serde_json::json!(["^node:"])
+        );
+        assert_eq!(
+            json["preferences"]["includePackageJsonAutoImports"],
+            serde_json::json!("off")
+        );
+
+        // And an unrelated save (toggling anything in the UI writes the whole file) keeps it.
+        loaded.save_at(&path).expect("save should succeed");
+        assert_eq!(Settings::load_or_init_at(&path), loaded);
     }
 
     #[test]

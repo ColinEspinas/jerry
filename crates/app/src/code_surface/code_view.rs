@@ -232,6 +232,14 @@ pub enum HighlightKind {
     Number,
     Comment,
     CommentDoc,
+    /// A JSDoc-style `@param`/`@returns`/`@example` block tag, or a `{@link ...}` inline tag,
+    /// found inside an already-[`CommentDoc`](Self::CommentDoc) span - GitHub issue #200. Not a
+    /// real capture from any bundled grammar's own query (none of this app's grammars parses
+    /// *inside* a comment body), so it is never registered in [`HIGHLIGHT_NAMES`] - it only ever
+    /// comes from [`doc_tag_ranges`] splitting an existing `Comment`/`CommentDoc` span after the
+    /// real tree-sitter pass, the same "post-process on top of the grammar's own output" idiom
+    /// [`colorize_bracket_pairs`] already established for the bracket-pair ring.
+    CommentDocTag,
     Variable,
     VariableParameter,
     VariableBuiltin,
@@ -358,6 +366,7 @@ impl HighlightKind {
             HighlightKind::Number => "number",
             HighlightKind::Comment => "comment",
             HighlightKind::CommentDoc => "comment_doc",
+            HighlightKind::CommentDocTag => "comment_doc_tag",
             HighlightKind::Variable => "variable",
             HighlightKind::VariableParameter => "variable_parameter",
             HighlightKind::VariableBuiltin => "variable_builtin",
@@ -400,7 +409,7 @@ impl HighlightKind {
     /// source [`Self::from_name`] searches and
     /// `crate::settings::custom_theme::tests::every_highlight_kind_name_round_trips_through_from_name`
     /// checks exhaustively against.
-    pub const ALL: [HighlightKind; 41] = [
+    pub const ALL: [HighlightKind; 42] = [
         HighlightKind::Keyword,
         HighlightKind::Function,
         HighlightKind::FunctionMethod,
@@ -414,6 +423,7 @@ impl HighlightKind {
         HighlightKind::Number,
         HighlightKind::Comment,
         HighlightKind::CommentDoc,
+        HighlightKind::CommentDocTag,
         HighlightKind::Variable,
         HighlightKind::VariableParameter,
         HighlightKind::VariableBuiltin,
@@ -493,6 +503,7 @@ pub fn color_for_kind(kind: HighlightKind) -> Rgba {
         HighlightKind::Number => theme::syntax::NUMBER.into(),
         HighlightKind::Comment => theme::syntax::COMMENT.into(),
         HighlightKind::CommentDoc => theme::syntax::COMMENT_DOC.into(),
+        HighlightKind::CommentDocTag => theme::syntax::COMMENT_DOC_TAG.into(),
         HighlightKind::Variable => theme::syntax::VARIABLE.into(),
         HighlightKind::VariableParameter => theme::syntax::VARIABLE_PARAMETER.into(),
         HighlightKind::VariableBuiltin => theme::syntax::VARIABLE_BUILTIN.into(),
@@ -2291,6 +2302,140 @@ fn fold_highlight_events(
     spans
 }
 
+/// Byte ranges within `text` that look like a JSDoc-style doc-comment tag - GitHub issue #200. Two
+/// real shapes, matching the JSDoc spec's own syntax:
+///
+/// - A **block tag** (`@param foo`, `@returns`, `@example`) - `@` immediately followed by one or
+///   more ASCII letters, with the byte immediately before the `@` (if any) not itself an
+///   identifier byte. `foo@bar.com` never matches this way: its `@` sits directly after `o`, while
+///   a real block tag's `@` always starts a fresh word (line start, or right after whitespace/`*`).
+/// - An **inline tag** (`{@link Foo#bar}`, `{@see ...}`) - the whole `{@word ...}` span, brace to
+///   brace, so a reader-visible inline reference reads as one unit rather than just its own `@word`
+///   prefix. A `{` with no matching `}` before the text ends is left alone entirely (a real,
+///   well-formed inline tag is always closed) rather than swallowing the rest of the comment.
+///
+/// Deliberately a plain text scan, not a real grammar parse - no bundled tree-sitter grammar this
+/// app ships parses *inside* a comment/doc-string body at all (see [`HighlightKind::CommentDocTag`]'s
+/// own docs), and a hand-authored JSDoc tag vocabulary is genuinely unbounded (real projects invent
+/// their own `@internal`/`@beta`-style tags constantly) - matching "looks like a tag" structurally
+/// is what stays correct for all of them, at the cost of occasionally accenting a real `@` used
+/// some other way inside prose (rare in practice, and never mis-renders anything - it just gets an
+/// accent colour it didn't strictly need).
+///
+/// Byte-index (not `char`) ranges, but always land on real `char` boundaries: every marker this
+/// scan looks for (`{`, `@`, `}`, ASCII letters) is itself a single ASCII byte, and an ASCII byte
+/// can never be a UTF-8 continuation byte, so a `text[range]` slice on the result never panics.
+pub(crate) fn doc_tag_ranges(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'{'
+            && bytes.get(index + 1) == Some(&b'@')
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_alphabetic)
+        {
+            if let Some(relative_close) = text[index..].find('}') {
+                let end = index + relative_close + 1;
+                ranges.push(index..end);
+                index = end;
+                continue;
+            }
+        }
+        let preceded_by_identifier_byte = index
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if bytes[index] == b'@'
+            && !preceded_by_identifier_byte
+            && bytes.get(index + 1).is_some_and(u8::is_ascii_alphabetic)
+        {
+            let start = index;
+            let mut end = index + 1;
+            while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+                end += 1;
+            }
+            ranges.push(start..end);
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    ranges
+}
+
+/// Reclassifies a `/** ... */`-shaped [`HighlightKind::Comment`] span as
+/// [`HighlightKind::CommentDoc`], then splits every `Comment`/`CommentDoc` span's own real
+/// [`doc_tag_ranges`] out into separate [`HighlightKind::CommentDocTag`] sub-spans - GitHub issue
+/// #200's editor-side half. Runs unconditionally (not gated by [`HighlightOptions`] the way
+/// [`colorize_bracket_pairs`] is - there's no real reason a user would want doc tags left flat)
+/// after the grammar's own query, since no bundled grammar this app ships parses *inside* a
+/// comment body at all - the same "post-process on top of the grammar's own output" shape
+/// [`colorize_bracket_pairs`] already established for the bracket-pair ring.
+///
+/// Language-agnostic by construction: the `/** */` shape check only ever matches a real C-style
+/// block comment (Rust, TypeScript, JavaScript, Go, ...) and simply never fires for a `#`-style
+/// Python comment or any other shape - no per-language branch needed. Worth noting as a side
+/// effect rather than a bug: this also promotes a Rust `/** ... */` block doc comment, which
+/// `tree-sitter-rust`'s own bundled query captures only the `///` line-comment shape of (see
+/// [`HighlightKind::CommentDoc`]'s own docs) - a real, previously-uncovered gap this closes for
+/// free.
+fn split_doc_comment_tags(source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
+    let mut result = Vec::with_capacity(spans.len());
+    for span in spans {
+        if !matches!(
+            span.kind,
+            HighlightKind::Comment | HighlightKind::CommentDoc
+        ) {
+            result.push(span);
+            continue;
+        }
+        let Some(text) = source.get(span.start..span.end) else {
+            result.push(span);
+            continue;
+        };
+        let kind = if span.kind == HighlightKind::Comment
+            && text.starts_with("/**")
+            && !text.starts_with("/**/")
+        {
+            HighlightKind::CommentDoc
+        } else {
+            span.kind
+        };
+        let tag_ranges = doc_tag_ranges(text);
+        if tag_ranges.is_empty() {
+            result.push(HighlightSpan { kind, ..span });
+            continue;
+        }
+        let mut cursor = 0;
+        for tag_range in tag_ranges {
+            if tag_range.start > cursor {
+                result.push(HighlightSpan {
+                    start: span.start + cursor,
+                    end: span.start + tag_range.start,
+                    kind,
+                    scope: span.scope,
+                });
+            }
+            result.push(HighlightSpan {
+                start: span.start + tag_range.start,
+                end: span.start + tag_range.end,
+                kind: HighlightKind::CommentDocTag,
+                scope: span.scope,
+            });
+            cursor = tag_range.end;
+        }
+        if cursor < text.len() {
+            result.push(HighlightSpan {
+                start: span.start + cursor,
+                end: span.end,
+                kind,
+                scope: span.scope,
+            });
+        }
+    }
+    result
+}
+
 /// Which optional, settings-gated post-processes run over a freshly classified span list.
 ///
 /// Everything a `tree-sitter-highlight` query itself produces is unconditional - a keyword is a
@@ -2327,6 +2472,7 @@ impl HighlightOptions {
     /// that have a `Settings` to consult go through here; callers that don't get
     /// [`HighlightOptions::default`], which is every option on.
     pub fn apply(self, source: &str, spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
+        let spans = split_doc_comment_tags(source, spans);
         if self.bracket_pair_colorization {
             colorize_bracket_pairs(source, spans)
         } else {
@@ -3239,6 +3385,121 @@ mod tests {
         let span =
             find_span(&spans, SAMPLE_TYPESCRIPT, "/** Adds one. */").expect("doc comment span");
         assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    // GitHub issue #200's own doc-tag coverage. `typescript_doc_comment_is_classified_as_comment`
+    // just above deliberately calls `highlight_typescript` directly - the raw grammar layer,
+    // bypassing `HighlightOptions::apply` entirely (same reason `colorize_bracket_pairs`'s own
+    // tests do this) - so it stays correct unchanged: `split_doc_comment_tags` only ever runs
+    // inside `apply()`, which every real, live rendering path (`load_file_with_options`,
+    // `highlight_block`) goes through but this one pinned raw-grammar test doesn't.
+
+    #[test]
+    fn doc_tag_ranges_finds_a_real_block_tag_preceded_by_whitespace() {
+        let text = "Adds one.\n@param left the number to add to\n@returns the sum";
+        let ranges: Vec<&str> = doc_tag_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(ranges, vec!["@param", "@returns"]);
+    }
+
+    #[test]
+    fn doc_tag_ranges_never_matches_an_email_style_at_sign() {
+        let text = "Contact foo@example.com for details.";
+        assert!(
+            doc_tag_ranges(text).is_empty(),
+            "an `@` directly preceded by an identifier byte (the `o` in `foo`) is not a real \
+             doc tag - got: {:?}",
+            doc_tag_ranges(text)
+        );
+    }
+
+    #[test]
+    fn doc_tag_ranges_finds_a_real_inline_link_tag_brace_to_brace() {
+        let text = "See {@link Foo#bar} for more.";
+        let ranges: Vec<&str> = doc_tag_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(ranges, vec!["{@link Foo#bar}"]);
+    }
+
+    /// An unclosed `{@link` never matches the *inline*-tag shape (no real `}` to close it), but
+    /// still degrades gracefully to the plain block-tag rule for the `@link` word itself, rather
+    /// than emitting nothing at all for an honest, if malformed, doc comment.
+    #[test]
+    fn doc_tag_ranges_falls_back_to_a_bare_block_tag_for_an_unclosed_inline_tag() {
+        let text = "See {@link Foo#bar for more.";
+        let ranges: Vec<&str> = doc_tag_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(ranges, vec!["@link"]);
+    }
+
+    /// The real, full pipeline (`HighlightOptions::default().highlight(..)`, the same call
+    /// [`load_file_with_options`] itself makes) - unlike `typescript_doc_comment_is_classified_as_comment`
+    /// just above, this one *does* run [`split_doc_comment_tags`], and is the real, live-user-facing
+    /// behavior a `.ts`/`.js` file's own doc comment actually gets: promoted from plain `Comment` to
+    /// `CommentDoc`, the same bucket a Rust `///` comment already got before this issue.
+    #[test]
+    fn a_real_typescript_block_doc_comment_is_promoted_to_comment_doc_through_the_real_pipeline() {
+        let spans = HighlightOptions::default().highlight(SAMPLE_TYPESCRIPT, Some(highlight_ts));
+        let span =
+            find_span(&spans, SAMPLE_TYPESCRIPT, "/** Adds one. */").expect("doc comment span");
+        assert_eq!(span.kind, HighlightKind::CommentDoc);
+    }
+
+    #[test]
+    fn a_plain_typescript_line_comment_is_not_promoted_to_comment_doc() {
+        let source = "// just a plain comment\nconst x = 1;\n";
+        let spans = HighlightOptions::default().highlight(source, Some(highlight_ts));
+        let span = find_span(&spans, source, "// just a plain comment").expect("comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    #[test]
+    fn an_empty_block_comment_is_not_misclassified_as_a_doc_comment() {
+        let source = "/**/\nconst x = 1;\n";
+        let spans = HighlightOptions::default().highlight(source, Some(highlight_ts));
+        let span = find_span(&spans, source, "/**/").expect("comment span");
+        assert_eq!(span.kind, HighlightKind::Comment);
+    }
+
+    #[test]
+    fn a_real_jsdoc_block_tag_inside_a_typescript_doc_comment_gets_its_own_tag_span() {
+        let source = "/**\n * Adds two numbers.\n * @param left the first number\n * @returns the sum\n */\nfunction add(left: number, right: number): number {\n    return left + right;\n}\n";
+        let spans = HighlightOptions::default().highlight(source, Some(highlight_ts));
+        assert_eq!(
+            kind_at(&spans, source, "@param"),
+            HighlightKind::CommentDocTag
+        );
+        assert_eq!(
+            kind_at(&spans, source, "@returns"),
+            HighlightKind::CommentDocTag
+        );
+        // The prose right after a tag must still read as ordinary doc-comment text, not also get
+        // swept into the tag's own span.
+        assert_eq!(
+            kind_at(&spans, source, "the first number"),
+            HighlightKind::CommentDoc
+        );
+    }
+
+    /// A real Rust `///` doc comment already reaches [`HighlightKind::CommentDoc`] through
+    /// `tree-sitter-rust`'s own grammar capture (see `a_doc_comment_is_classified_as_comment_doc`
+    /// above) - this proves [`split_doc_comment_tags`] still finds and splits out a real tag
+    /// *inside* that already-correctly-classified span, not just when it's the one doing the
+    /// Comment -> CommentDoc promotion itself.
+    #[test]
+    fn a_real_jsdoc_style_tag_inside_a_rust_doc_comment_still_gets_its_own_tag_span() {
+        let source = "/// Adds one.\n///\n/// @param left the number to add to\nfn add(left: i32) -> i32 {\n    left + 1\n}\n";
+        let spans = HighlightOptions::default().highlight(source, Some(highlight_rust));
+        assert_eq!(
+            kind_at(&spans, source, "@param"),
+            HighlightKind::CommentDocTag
+        );
     }
 
     /// The real, live-verified regression this fix addresses: a `variable_declarator`'s own

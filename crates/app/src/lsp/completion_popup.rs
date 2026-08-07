@@ -116,7 +116,6 @@ impl CompletionsStatus {
     }
 }
 
-
 /// 290px - the design mockup's own real completions-list column width
 /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:290px` on the list column), plus
 /// its own `1px` right divider. Design-review follow-up: this used to be the popup's *entire*
@@ -196,7 +195,10 @@ fn popover_list_max_height() -> gpui::Pixels {
 /// content, leaving a large, visibly wrong gap between it and the real caret row it was supposed
 /// to anchor to).
 fn popover_max_height() -> gpui::Pixels {
-    popover_list_max_height() + POPOVER_VERTICAL_PADDING + POPOVER_BORDER_HEIGHT + POPOVER_FOOTER_HEIGHT
+    popover_list_max_height()
+        + POPOVER_VERTICAL_PADDING
+        + POPOVER_BORDER_HEIGHT
+        + POPOVER_FOOTER_HEIGHT
 }
 
 /// A real, tighter *estimate* of what [`AdeApp::render_completions_popover`] is actually about to
@@ -267,6 +269,7 @@ impl AdeApp {
     pub(crate) fn dismiss_completions(&mut self) {
         self.completions = None;
         self.completions_generation = self.completions_generation.wrapping_add(1);
+        self.completions_resolved_items.clear();
     }
 
     /// The real text the user has typed since the completion was triggered, as a live-completions
@@ -499,6 +502,10 @@ impl AdeApp {
             return;
         };
         self.completions_generation = self.completions_generation.wrapping_add(1);
+        // Taken, not read: the generation bump above has already retired this response, so the map
+        // has to be emptied - but the item being accepted right now still needs whatever resolve
+        // landed for it, so it is moved out rather than dropped.
+        let resolved_items = std::mem::take(&mut self.completions_resolved_items);
         let CompletionsStatus::Ready {
             items,
             visible,
@@ -513,14 +520,26 @@ impl AdeApp {
         };
         // `selected` indexes the filtered view, so it must be resolved *through* `visible` back
         // into the real server list - accepting "the row I can see" and "the item that gets
-        // inserted" are the same item by construction.
-        let Some(item) = visible.get(selected).and_then(|index| items.get(*index)) else {
+        // inserted" are the same item by construction. Prefers the merged
+        // `completionItem/resolve` response when one has landed, because that is where a real
+        // server puts the `additionalTextEdits` that write an auto-import's own `import` line -
+        // accepting the inline item instead would insert the name and silently skip the import.
+        let resolved_selected = visible
+            .get(selected)
+            .and_then(|index| resolved_items.get(index))
+            .cloned();
+        let Some(item) = resolved_selected
+            .as_ref()
+            .or_else(|| visible.get(selected).and_then(|index| items.get(*index)))
+        else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
             self.sync_cursor_and_scroll();
             self.reset_caret_blink(cx);
             return;
         };
+        // Read before the buffer is borrowed mutably below.
+        let auto_import = self.settings.editor.auto_import;
         let Some(buffer) = self.edit_buffer_mut(&entry.path) else {
             cx.notify();
             self.replace_text_in_range(None, "\n", window, cx);
@@ -530,13 +549,56 @@ impl AdeApp {
         };
 
         let (range, text) = resolve_completion_edit(buffer, item);
+        // The item's own `additionalTextEdits` - which for every real server is where an
+        // auto-import's `import`/`use` line lives, and which nothing in this app used to apply at
+        // all. Accepting `appendFile` from `@types/node` therefore wrote the identifier and left
+        // the file without the import that makes it mean anything: code that does not compile,
+        // from a completion the popup had offered. Resolved into this buffer's own offsets here,
+        // while it is still in its pre-edit state, because that is the document the server's own
+        // line/character coordinates describe.
+        let mut import_edits: Vec<(std::ops::Range<usize>, String)> = item
+            .additional_text_edits
+            .iter()
+            .filter(|_| auto_import)
+            .flatten()
+            .map(|edit| {
+                let start =
+                    buffer.offset_for_position(edit.range.start.line, edit.range.start.character);
+                let end = buffer.offset_for_position(edit.range.end.line, edit.range.end.character);
+                (start.min(end)..start.max(end), edit.new_text.clone())
+            })
+            .collect();
+        // Applied after the main edit and in descending document order, so no edit ever shifts a
+        // later one's offsets out from under it. The spec guarantees these never overlap the main
+        // edit, so ordering is the only real hazard.
+        import_edits.sort_by_key(|(edit_range, _)| std::cmp::Reverse(edit_range.start));
+
         let path = entry.path.clone();
         // Accepting a completion is a programmatic, whole-token edit, not a typed character - one
         // of GitHub issue #17's four named undo-group boundaries. Sealed on both sides so it is
         // its own real step: the partial word typed before it doesn't absorb it, and neither does
-        // whatever is typed after. See `crate::text_history`'s own docs for the policy.
+        // whatever is typed after. See `crate::text_history`'s own docs for the policy. The import
+        // edits sit inside the same seal, because accepting a completion and writing the import it
+        // needs are one action to a user and must undo as one.
         buffer.seal_history();
         buffer.replace_range(Some(range), &text);
+        // `replace_range` leaves the caret just past whatever it inserted - which is what the user
+        // wants for the completion itself, and exactly what must *not* be left behind after an
+        // import edit at the top of the file. So the caret the user should end on is remembered
+        // here, carried across each import edit by that edit's own length change, and restored.
+        // Without it, accepting an auto-import parks the caret up in the `import` line it just
+        // wrote.
+        let mut caret = buffer.cursor_offset();
+        for (edit_range, edit_text) in &import_edits {
+            buffer.replace_range(Some(edit_range.clone()), edit_text);
+            if edit_range.start <= caret {
+                caret = (caret + edit_text.len()).saturating_sub(edit_range.len());
+            }
+        }
+        if !import_edits.is_empty() {
+            let caret = caret.min(buffer.content.len());
+            buffer.selected_range = caret..caret;
+        }
         buffer.seal_history();
         self.schedule_rehighlight(path.clone(), cx);
         // The accepted text routinely still ends in a real identifier character (accepting a
@@ -644,14 +706,19 @@ impl AdeApp {
                 visible,
                 selected,
             } => {
-                selected_item = visible.get(*selected).and_then(|index| items.get(*index));
+                // The *described* item - the merged `completionItem/resolve` response when one has
+                // landed, the inline item until then. This is the one place in the popup that
+                // reads resolved data: the detail pane is what a resolve is allowed to fill in,
+                // and the rows below deliberately are not. See
+                // `crate::root::AdeApp::completions_resolved_items`.
+                selected_item = visible
+                    .get(*selected)
+                    .and_then(|index| self.described_completion_item(items, *index));
                 // `border-right:1px solid #23282c` in the mockup, on the list column's own right
                 // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
                 // while there's a real detail pane beside it to divide from.
                 if selected_item.is_some() {
-                    list_column = list_column
-                        .border_r_1()
-                        .border_color(theme::border::CARD);
+                    list_column = list_column.border_r_1().border_color(theme::border::CARD);
                 }
 
                 // Real virtualization, not a render cap (GitHub issue #185): `uniform_list` only
@@ -704,12 +771,7 @@ impl AdeApp {
                                 .filter_map(|(offset, item_index)| {
                                     let index = start + offset;
                                     let item = items.get(*item_index)?;
-                                    Some(render_completion_row(
-                                        index,
-                                        item,
-                                        index == selected,
-                                        cx,
-                                    ))
+                                    Some(render_completion_row(index, item, index == selected, cx))
                                 })
                                 .collect::<Vec<_>>()
                         },
@@ -799,10 +861,7 @@ impl AdeApp {
                         .items_center()
                         .child(render_hint_row(
                             [
-                                (
-                                    keymap::resolve_combo("\u{2191}\u{2193}", macos),
-                                    "move",
-                                ),
+                                (keymap::resolve_combo("\u{2191}\u{2193}", macos), "move"),
                                 (keymap::resolve_combo("enter", macos), "accept"),
                                 (keymap::resolve_combo("tab", macos), "snippet"),
                             ]
@@ -845,6 +904,11 @@ impl AdeApp {
             .blur_radius(shadow_blur)])
             .font(gpui::font(theme::font::MONO))
             .text_size(gpui::px(11.5))
+            // See `crate::code_surface::lsp_ui::render_hover_card_content`'s own identical
+            // `.occlude()` docs for why - a real scroll (over the list column or the detail
+            // pane's own doc region) or click over this popover must never also reach the File
+            // view content behind it.
+            .occlude()
             .child(list_column);
 
         // The detail pane - `border-right` lives on the list column's own right edge in the
@@ -852,7 +916,7 @@ impl AdeApp {
         // applied to `list_column` above only when there's a real detail pane beside it to
         // divide from; a lone list column (Loading/Failed) has no seam to draw.
         if let Some(item) = selected_item {
-            popover = popover.child(render_completion_detail_pane(item, extension));
+            popover = popover.child(self.render_completion_detail_pane(item, extension, cx));
         }
 
         Some(popover.into_any_element())
@@ -870,7 +934,11 @@ fn render_completion_row(
     is_selected: bool,
     cx: &mut Context<AdeApp>,
 ) -> gpui::AnyElement {
-    let (label, detail) = completion_view::completion_item_display(item);
+    // `item` here is the server's own untouched response entry - never a resolve-merged one (see
+    // `crate::root::AdeApp::completions_resolved_items`), so everything this row paints is known
+    // the instant the popup opens and none of it can change under the user afterwards.
+    let label = item.label.clone();
+    let row_hint = completion_view::completion_row_hint(item);
     let kind_badge = completion_view::completion_kind_badge(item.kind);
     gpui::div()
         .id(("completion-item", index))
@@ -917,7 +985,12 @@ fn render_completion_row(
                 })
                 .child(label),
         )
-        .children(detail.map(|detail| {
+        // The row's one secondary string: where this item comes from, or the signature the server
+        // sent inline when it named no origin - see `completion_view::completion_row_hint` for
+        // which, per server, and for why the *type* is deliberately not this. It is read off the
+        // server's untouched response, so it is here the instant the popup opens and no resolve
+        // can rewrite it.
+        .children(row_hint.map(|hint| {
             gpui::div()
                 .id(("completion-item-detail", index))
                 // Lets a real test measure this real span's own painted bounds (`debug_bounds`
@@ -926,14 +999,14 @@ fn render_completion_row(
                 .debug_selector(move || format!("completion-item-{index}-detail"))
                 .flex_none()
                 // Same real overflow the label just above needs to guard against, on the
-                // right-hand type/detail hint instead - a real, unbounded type string (a deeply
-                // nested generic, a long tuple) capped to a reasonable share of the row rather
-                // than left free to push the row's total content wider than the popup itself.
+                // right-hand hint instead - a real, unbounded signature (a deeply nested generic,
+                // a long tuple) capped to a reasonable share of the row rather than left free to
+                // push the row's total content wider than the popup itself.
                 .max_w(gpui::px(120.0))
                 .truncate()
                 .text_size(gpui::px(10.0))
                 .text_color(theme::text::GHOST)
-                .child(detail)
+                .child(hint)
         }))
         // A real click both selects *and* accepts this row in one step - `on_mouse_down`, not
         // `on_click`, matching this app's own established idiom for a popover row that both
@@ -981,104 +1054,201 @@ fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> g
         .into_any_element()
 }
 
-/// The Completions popup's own detail pane - the design mockup's real, 300px right column
-/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
-/// describing whichever item is currently selected: a syntax-highlighted signature line, doc
-/// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
-/// exactly (same three-piece shape, same reasoning for showing it), just for the selected
-/// completion item instead of a `textDocument/hover` response.
-///
-/// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
-/// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
-fn render_completion_detail_pane(
-    item: &lsp_core::lsp_types::CompletionItem,
-    extension: Option<&str>,
-) -> gpui::AnyElement {
-    let mut pane = gpui::div()
-        .id("completions-detail-pane")
-        // Lets a real test measure this real pane's own painted bounds (`debug_bounds` reads
-        // this, not `.id(..)`) - a no-op outside test builds, matching every other
-        // `debug_selector` in this crate.
-        .debug_selector(|| "completions-detail-pane".to_string())
-        .flex_none()
-        .w(DETAIL_WIDTH)
-        .px(gpui::px(10.0))
-        .py(gpui::px(8.0));
+impl AdeApp {
+    /// The Completions popup's own detail pane - the design mockup's real, 300px right column
+    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
+    /// describing whichever item is currently selected: a syntax-highlighted signature line, doc
+    /// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
+    /// exactly (same three-piece shape, same reasoning for showing it), just for the selected
+    /// completion item instead of a `textDocument/hover` response.
+    ///
+    /// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
+    /// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
+    ///
+    /// A method, not a free function, since the signature+doc region below now needs
+    /// [`Self::completions_detail_scroll_handle`] and [`crate::root::scrollbar::
+    /// AdeApp::render_vertical_scrollbar`], both of which need `&self` - the identical reason
+    /// `crate::code_surface::lsp_ui::AdeApp::render_hover_card_content` stopped being a free
+    /// function.
+    fn render_completion_detail_pane(
+        &self,
+        item: &lsp_core::lsp_types::CompletionItem,
+        extension: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut pane = gpui::div()
+            .id("completions-detail-pane")
+            // Lets a real test measure this real pane's own painted bounds (`debug_bounds` reads
+            // this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(|| "completions-detail-pane".to_string())
+            .flex_none()
+            .w(DETAIL_WIDTH)
+            .flex()
+            .flex_col()
+            // A real ceiling on the pane's own total height, matching the popup's own overall
+            // budget - without it, a genuinely multi-line signature (typescript-language-server
+            // pretty-printing a wide utility/generic type like `Pick<{...}>` across several real
+            // lines, now that it renders in full instead of being truncated to its own first
+            // line) could grow the pane past the popup's own `overflow_hidden()` clip and hide
+            // the module-path footer beneath it - the same real bug the Hover card had.
+            .max_h(popover_max_height())
+            // No `.px(...)` here (an earlier version of this fix had one, applied uniformly to
+            // the whole pane) - matching `crate::code_surface::lsp_ui::render_hover_card_content`'s
+            // own three independently-padded bands exactly: each section below carries its own
+            // `.px(10.0)` instead, so the signature's own real bottom border can span the pane's
+            // full real width edge-to-edge, the way the Hover card's own header border does,
+            // rather than stopping short at a real, visible gap where the pane's uniform padding
+            // used to inset it on both sides.
+            .py(gpui::px(8.0));
 
-    // Signature: `item.detail` when there is one - inline from the server's own
-    // `textDocument/completion` response for an item it already fully described, or filled in
-    // after the fact by a real `completionItem/resolve` round trip
-    // (`AdeApp::maybe_resolve_selected_completion_item`) for the (very common, rust-analyzer very
-    // much included) case where a server only sends a bare `label`/`kind` up front - the bare
-    // label otherwise, so the pane is never left blank for a real, selected item. Highlighted the
-    // same real way `crate::code_surface::code_view::highlight_block` highlights any other
-    // standalone fragment (a diff hunk, a merge conflict side) - see that function's own docs.
-    let signature_text = item
-        .detail
-        .as_ref()
-        .map(|detail| detail.trim())
-        .filter(|detail| !detail.is_empty())
-        .unwrap_or(item.label.as_str());
-    let signature_runs = code_view::highlight_block(
-        std::iter::once(signature_text),
-        extension,
-        code_view::HighlightOptions::default(),
-    )
-    .into_iter()
-    .next()
-    .map(|line| line.runs)
-    .unwrap_or_default();
-    let mut signature_row = gpui::div()
-        .flex()
-        .flex_wrap()
-        .font(gpui::font(theme::font::MONO))
-        .text_size(gpui::px(11.0));
-    for (index, (run_text, kind)) in signature_runs.into_iter().enumerate() {
-        signature_row = signature_row.child(
-            gpui::div()
-                .id(("completion-detail-signature-token", index))
-                .text_color(code_view::color_for_kind(kind))
-                .child(run_text),
+        // Signature: see [`completion_view::completion_signature_text`]'s own docs for the real
+        // `label_details.detail`-first, `item.detail`-fallback, bare-`label`-last precedence - the
+        // bare label is never left blank for a real, selected item even before a real
+        // `completionItem/resolve` round trip (`AdeApp::maybe_resolve_selected_completion_item`)
+        // fills in a bare `label`/`kind`-only item's real `detail`. Highlighted the same real way
+        // `crate::code_surface::code_view::highlight_block` highlights any other standalone
+        // fragment (a diff hunk, a merge conflict side) - see that function's own docs.
+        let signature_text = completion_view::completion_signature_text(item);
+        // One real stacked row per source line in `signature_text`, not a single `flex_wrap` row for
+        // the whole thing - a genuinely multi-line signature (e.g. typescript-language-server pretty-
+        // printing a wide utility/generic type like `Pick<{...}>` across several real lines) has no
+        // way to show a real line break inside one `flex_wrap` row, since wrapping there is a width
+        // overflow, not a semantic newline. Mirrors `crate::code_surface::lsp_ui::render_hover_signature`'s
+        // own fix for the identical bug: consuming only `highlight_block`'s first `RenderedLine` used
+        // to silently drop every real line past the first.
+        let signature_lines = code_view::highlight_block(
+            std::iter::once(signature_text.as_str()),
+            extension,
+            code_view::HighlightOptions::default(),
         );
-    }
-    pane = pane.child(signature_row);
+        let mut signature_column = gpui::div()
+            .id("completion-detail-signature-column")
+            // Lets a real test measure this real column's own painted bounds (`debug_bounds`
+            // reads this, not `.id(..)`) - a no-op outside test builds, matching every other
+            // `debug_selector` in this crate.
+            .debug_selector(|| "completion-detail-signature-column".to_string())
+            .flex()
+            .flex_col()
+            .font(gpui::font(theme::font::MONO))
+            .text_size(gpui::px(11.0))
+            .px(gpui::px(10.0))
+            // A real seam between the signature and the doc/footer below it, matching
+            // `crate::code_surface::lsp_ui::render_hover_card_content`'s own header exactly
+            // (`.pb(px(6.0)).border_b_1().border_color(theme::border::CARD)`) - this pane never
+            // had one at all before, unlike the Hover card it otherwise mirrors band-for-band.
+            .pb(gpui::px(6.0))
+            .border_b_1()
+            .border_color(theme::border::CARD);
+        let mut run_index = 0usize;
+        for line in signature_lines {
+            let mut signature_row = gpui::div().flex().flex_wrap();
+            for (run_text, kind) in line.runs {
+                let index = run_index;
+                run_index += 1;
+                signature_row = signature_row.child(
+                    gpui::div()
+                        .id(("completion-detail-signature-token", index))
+                        // Lets a real test measure this real token's own painted bounds
+                        // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                        // matching every other `debug_selector` in this crate.
+                        .debug_selector(move || {
+                            format!("completion-detail-signature-token-{index}")
+                        })
+                        .text_color(code_view::color_for_kind(kind))
+                        .child(run_text),
+                );
+            }
+            signature_column = signature_column.child(signature_row);
+        }
 
-    if let Some(doc) = completion_view::completion_documentation_text(item) {
+        // The scrollable region: the signature (now potentially many real lines tall) plus the
+        // doc paragraph, wrapped in a real `overflow_y_scroll()` area rather than left to grow
+        // the pane without bound. `.flex_1().min_h_0()` directly on this element, not just on its
+        // `.relative()` wrapper below - a flex item's default `min-height: auto` otherwise
+        // refuses to shrink below its own content's natural size, which would silently defeat
+        // `overflow_y_scroll()` here (see `crate::code_surface::lsp_ui::render_hover_card_content`'s
+        // own docs for the identical real GPUI gotcha this mirrors, and
+        // `crate::rail::render`'s own `"agent-rail-list"` scrollable list for the working
+        // precedent both follow).
+        let mut scroll_body = gpui::div()
+            .id("completions-detail-scroll-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            // The overlay scrollbar below reads its geometry straight off this same handle.
+            .track_scroll(&self.completions_detail_scroll_handle)
+            .child(signature_column);
+
+        if let Some(doc) = completion_view::completion_documentation_text(item) {
+            scroll_body = scroll_body.child(
+                gpui::div()
+                    .mt(gpui::px(7.0))
+                    .px(gpui::px(10.0))
+                    .font(gpui::font(theme::font::SANS))
+                    .text_size(gpui::px(11.0))
+                    // No `.line_clamp(...)` here (an earlier version of this fix kept one) - a
+                    // real doc comment can run to many paragraphs (rustdoc examples, long prose),
+                    // and clamping it silently truncated the rest with no way to reach it at all:
+                    // `.line_clamp` bounds the div's own painted height directly, so it never
+                    // actually overflows the scroll region above into something the real
+                    // scrollbar could reach. Matches `crate::code_surface::lsp_ui::
+                    // render_hover_card_content`'s own doc paragraph, which has never clamped -
+                    // real overflow, from either the signature or the doc, is what the scroll
+                    // region and its scrollbar exist to handle.
+                    .child(crate::code_surface::lsp_ui::render_doc_sections(
+                        &doc,
+                        theme::text::DIMMER,
+                        extension,
+                    )),
+            );
+        }
+
         pane = pane.child(
             gpui::div()
-                .mt(gpui::px(7.0))
-                .font(gpui::font(theme::font::SANS))
-                .text_size(gpui::px(11.0))
-                .text_color(theme::text::DIMMER)
-                // A real doc comment can run to many paragraphs (rustdoc examples, long prose) -
-                // `.line_clamp(6)` caps it at a real, bounded number of visible lines with an
-                // ellipsis on the last one, rather than growing the pane past `popover_max_height()`
-                // and having the outer popup's own `overflow_hidden()` cut it off mid-sentence at
-                // an arbitrary point.
-                .line_clamp(6)
-                .child(doc),
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(scroll_body)
+                .children(self.render_vertical_scrollbar(
+                    "completions-detail-scrollbar",
+                    &self.completions_detail_scroll_handle,
+                    &[],
+                    cx,
+                )),
         );
-    }
 
-    if let Some(module_path) = completion_view::completion_module_path(item) {
-        pane = pane.child(
-            gpui::div()
-                .mt(gpui::px(9.0))
-                .pt(gpui::px(7.0))
-                .border_t_1()
-                .border_color(theme::border::CARD)
-                .font(gpui::font(theme::font::MONO))
-                .text_size(gpui::px(10.0))
-                .text_color(theme::text::GHOST)
-                // A real, fully-qualified module path can be long enough to wrap onto a second
-                // line on its own - `.truncate()` keeps this footer the real, fixed single line
-                // the design's own mockup shows.
-                .truncate()
-                .child(module_path),
-        );
-    }
+        if let Some(module_path) = completion_view::completion_module_path(item) {
+            pane = pane.child(
+                gpui::div()
+                    .id("completion-detail-module-path")
+                    // Lets a real test measure this real footer's own painted bounds
+                    // (`debug_bounds` reads this, not `.id(..)`) - a no-op outside test builds,
+                    // matching every other `debug_selector` in this crate.
+                    .debug_selector(|| "completion-detail-module-path".to_string())
+                    .flex_none()
+                    .mt(gpui::px(9.0))
+                    .pt(gpui::px(7.0))
+                    .px(gpui::px(10.0))
+                    .border_t_1()
+                    .border_color(theme::border::CARD)
+                    .font(gpui::font(theme::font::MONO))
+                    .text_size(gpui::px(10.0))
+                    .text_color(theme::text::GHOST)
+                    // A real, fully-qualified module path can be long enough to wrap onto a
+                    // second line on its own - `.truncate()` keeps this footer the real, fixed
+                    // single line the design's own mockup shows.
+                    .truncate()
+                    .child(module_path),
+            );
+        }
 
-    pane.into_any_element()
+        pane.into_any_element()
+    }
 }
 
 fn popover_message_row(text: &str) -> gpui::AnyElement {
@@ -1490,11 +1660,7 @@ mod completion_detail_pane_tests {
     fn seed_ready_popup(
         cx: &mut TestAppContext,
         items: Vec<lsp_core::lsp_types::CompletionItem>,
-    ) -> (
-        gpui::Entity<AdeApp>,
-        &mut gpui::VisualTestContext,
-        PathBuf,
-    ) {
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
         let repo = tempfile::tempdir().expect("tempdir");
         let file = repo.path().join("sample.rs");
         std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
@@ -1517,6 +1683,60 @@ mod completion_detail_pane_tests {
         });
         cx.run_until_parked();
         (app, cx, relative)
+    }
+
+    /// GitHub issue #200's rendered-side coverage: a real completion item whose documentation
+    /// contains a real JSDoc-style block tag must paint each tag as its own real, separately-
+    /// coloured `render_doc_prose` run, mirroring `crate::code_surface::lsp_ui`'s identical hover
+    /// coverage - the two real places this shared render helper is called from.
+    #[gpui::test]
+    fn a_real_jsdoc_tag_in_the_completion_doc_body_paints_its_own_tag_run(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "Appends a given string slice. See {@link String::push} for more.".to_string(),
+            )),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("doc-prose-tag-0").is_some(),
+            "a real inline {{@link ...}} tag inside the completion doc body's own description \
+             must still paint its own real `doc-prose-tag` run, even after block tags moved into \
+             their own real sections"
+        );
+    }
+
+    /// GitHub issue #200's own real "params/returns/example ... displayed like code in their own
+    /// section" ask, mirroring `crate::code_surface::lsp_ui`'s identical hover coverage: a real
+    /// `@param`/`@example` block tag inside a completion item's own documentation must paint as
+    /// its own real, structured section here too, not just differently-coloured inline text.
+    #[gpui::test]
+    fn real_jsdoc_block_tags_in_the_completion_doc_body_paint_their_own_structured_sections(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            documentation: Some(lsp_core::lsp_types::Documentation::String(
+                "Appends a given string slice.\n\n@param string the slice to append\n@example\n\
+                 s.push_str(\"abc\")"
+                    .to_string(),
+            )),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("doc-param-row-0").is_some(),
+            "a real @param tag must paint its own real parameter row"
+        );
+        assert!(
+            cx.debug_bounds("doc-example-block").is_some(),
+            "a real @example tag must paint its own real, syntax-highlighted code block"
+        );
     }
 
     /// A real, fully-populated item (a real `detail`, `documentation`, and `label_details`
@@ -1548,10 +1768,10 @@ mod completion_detail_pane_tests {
         let popover = cx
             .debug_bounds("completions-popover")
             .expect("the real popover must have painted");
-        let detail_pane = cx
-            .debug_bounds("completions-detail-pane")
-            .expect("a real selected item with real detail/documentation must paint a real \
-                     detail pane, not silently stay list-only");
+        let detail_pane = cx.debug_bounds("completions-detail-pane").expect(
+            "a real selected item with real detail/documentation must paint a real \
+                     detail pane, not silently stay list-only",
+        );
         let footer_hints = cx
             .debug_bounds("completions-footer-hints")
             .expect("the real footer hint row must have painted alongside the item rows");
@@ -1718,6 +1938,279 @@ mod completion_detail_pane_tests {
         );
     }
 
+    /// Accepting an auto-import must write the import, not just the name.
+    ///
+    /// Verbatim from a live `typescript-language-server`, resolving the `appendFile` candidate the
+    /// duplicate report was about: alongside the completion itself it returns
+    /// `additionalTextEdits: [{range: 1:0-1:0, newText: "import { appendFile } from 'fs';\n"}]`.
+    /// Nothing in this app applied that field, so accepting the row inserted `appendFile` into a
+    /// file with no import of it - an identifier that does not resolve, written by the editor
+    /// itself. It is also what makes collapsing several import candidates into one row honest:
+    /// the surviving row names a module, and now genuinely adds that module's import.
+    ///
+    /// Also pins the caret. The import lands *above* the caret, so every character it inserts
+    /// shifts the whole document under it; leaving the caret where `replace_range` put it would
+    /// park it back inside the `import` line it had just written.
+    #[gpui::test]
+    fn accepting_a_real_auto_import_writes_its_import_line_and_keeps_the_caret(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("main.ts");
+        std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("main.ts");
+
+        // Caret at the end of `const other = app`, exactly where the popup would have opened.
+        let caret_before = app.update(cx, |app, _| {
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
+            let caret = buffer.content.find("= app").expect("the fixture line") + "= app".len();
+            buffer.selected_range = caret..caret;
+            caret
+        });
+
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fs".to_string()),
+            additional_text_edits: Some(vec![lsp_core::lsp_types::TextEdit {
+                range: lsp_core::lsp_types::Range {
+                    start: lsp_core::lsp_types::Position::new(1, 0),
+                    end: lsp_core::lsp_types::Position::new(1, 0),
+                },
+                new_text: "import { appendFile } from 'fs';\n".to_string(),
+            }]),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::ready(vec![item], "app").expect("a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.accept_active_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        let (content, caret_after) = app.read_with(cx, |app, _| {
+            let buffer = app.edit_buffer(&relative).expect("a real buffer");
+            (buffer.content.clone(), buffer.cursor_offset())
+        });
+        assert!(
+            content.contains("import { appendFile } from 'fs';"),
+            "accepting an auto-import has to write the import the server said it needs - without \
+             it the editor has just typed an identifier that does not resolve. Got: {content:?}"
+        );
+        assert!(
+            content.contains("const other = appendFile"),
+            "and the completion itself still lands at the caret. Got: {content:?}"
+        );
+        let import_len = "import { appendFile } from 'fs';\n".len();
+        let typed_growth = "appendFile".len() - "app".len();
+        assert_eq!(
+            caret_after,
+            caret_before + typed_growth + import_len,
+            "the caret must end just past the accepted word, having moved down by exactly what \
+             the import inserted above it - not left sitting inside the import line. Got: \
+             {content:?}"
+        );
+    }
+
+    /// The live-requested setting: with `editor.auto_import` off, accepting the very same item
+    /// inserts the name and nothing else - no `import` line - while everything else about the
+    /// accept is unchanged.
+    ///
+    /// It exists because a language server offers auto-imports for everything its own index can
+    /// reach, which in a browser project includes `@types/node`: `import { appendFile } from
+    /// 'node:fs'` is valid TypeScript there (verified against a live server - it raises no
+    /// diagnostic at all) and still cannot be bundled.
+    #[gpui::test]
+    fn the_auto_import_setting_off_inserts_the_name_without_the_import(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("main.ts");
+        std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file, window, cx);
+        });
+        cx.run_until_parked();
+        let relative = PathBuf::from("main.ts");
+
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("node:fs".to_string()),
+            additional_text_edits: Some(vec![lsp_core::lsp_types::TextEdit {
+                range: lsp_core::lsp_types::Range {
+                    start: lsp_core::lsp_types::Position::new(1, 0),
+                    end: lsp_core::lsp_types::Position::new(1, 0),
+                },
+                new_text: "import { appendFile } from 'node:fs'\n".to_string(),
+            }]),
+            ..Default::default()
+        };
+        app.update(cx, |app, cx| {
+            app.settings.editor.auto_import = false;
+            let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
+            let caret = buffer.content.find("= app").expect("the fixture line") + "= app".len();
+            buffer.selected_range = caret..caret;
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::ready(vec![item], "app").expect("a real Ready state"),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.accept_active_completion(window, cx);
+        });
+        cx.run_until_parked();
+
+        let content = app.read_with(cx, |app, _| {
+            app.edit_buffer(&relative)
+                .expect("a real buffer")
+                .content
+                .clone()
+        });
+        assert!(
+            content.contains("const other = appendFile"),
+            "the completion itself is still accepted. Got: {content:?}"
+        );
+        assert!(
+            !content.contains("import"),
+            "with auto-import off, no import may be written - that is the whole switch. Got: \
+             {content:?}"
+        );
+    }
+
+    /// The live-reported "`appendFile` appears four times", on screen. Node ships every builtin
+    /// under two specifiers and `typescript-language-server` offers both, so these two items
+    /// (dumped verbatim - see
+    /// `completion_view::tests::a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated`)
+    /// would write the identical import. One row survives, and it paints the module it comes from.
+    #[gpui::test]
+    fn repeated_auto_import_candidates_paint_one_row_naming_its_module(cx: &mut TestAppContext) {
+        let candidate = |module: &str| lsp_core::lsp_types::CompletionItem {
+            label: "appendFile".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some(module.to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) =
+            seed_ready_popup(cx, vec![candidate("node:fs"), candidate("fs")]);
+
+        assert!(
+            cx.debug_bounds("completion-item-0").is_some(),
+            "the surviving row must have painted"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-1").is_none(),
+            "and the row that would have read `appendFile` a second time must not exist at all - \
+             that repeat is the whole report"
+        );
+        let hint = cx.debug_bounds("completion-item-0-detail").expect(
+            "an auto-import row has to name its own module, up front - it is the only thing \
+             distinguishing it from the candidates collapsed into it",
+        );
+        assert!(
+            hint.size.width > gpui::px(0.0),
+            "the module must be genuinely painted, not a zero-width span"
+        );
+    }
+
+    /// The load-bearing rule behind the live-reported "all data should be here without needing to
+    /// select the suggestion": a row is built from the server's own untouched response, so a
+    /// `completionItem/resolve` landing later cannot add anything to it or change it.
+    ///
+    /// Verbatim from a live `typescript-language-server`: `app` arrives bare
+    /// (`{"label":"app","kind":6}`) and only its resolve carries `detail: "const app:
+    /// App<Element>"`. This drives that merge through the real path
+    /// (`AdeApp::apply_resolved_completion_item`) and then re-reads the painted row.
+    #[gpui::test]
+    fn a_landed_resolve_fills_the_detail_pane_and_leaves_the_row_alone(cx: &mut TestAppContext) {
+        let bare = lsp_core::lsp_types::CompletionItem {
+            label: "app".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::VARIABLE),
+            ..Default::default()
+        };
+        let (app, cx, relative) = seed_ready_popup(cx, vec![bare.clone()]);
+
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_none(),
+            "sanity check: the server said nothing about this item up front, so its row says \
+             nothing up front"
+        );
+
+        let generation = app.read_with(cx, |app, _| app.completions_generation);
+        app.update(cx, |app, cx| {
+            app.apply_resolved_completion_item(
+                &relative,
+                generation,
+                0,
+                Ok(lsp_core::lsp_types::CompletionItem {
+                    detail: Some("const app: App<Element>".to_string()),
+                    ..bare.clone()
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_none(),
+            "a resolve must never put anything on a row - a row that fills in once you select it \
+             is the reported bug itself"
+        );
+        app.read_with(cx, |app, _| {
+            let entry = app.completions.as_ref().expect("popup still open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected Ready");
+            };
+            assert_eq!(
+                items[0].detail, None,
+                "the server's own response must be left exactly as it arrived"
+            );
+            assert_eq!(
+                app.described_completion_item(items, 0)
+                    .and_then(|item| item.detail.as_deref()),
+                Some("const app: App<Element>"),
+                "while the detail pane's own view of that item - the one thing a resolve is for - \
+                 genuinely gains the type"
+            );
+        });
+    }
+
+    /// The other side of that: an ordinary item with a real type and no import at all must paint
+    /// no import-source span, so the row gains nothing it doesn't genuinely have. Dumped from a
+    /// live `rust-analyzer` (`label: "count"`, `kind: FIELD`, `detail: "usize"`).
+    #[gpui::test]
+    fn an_ordinary_item_with_no_import_paints_no_import_source(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "count".to_string(),
+            kind: Some(lsp_core::lsp_types::CompletionItemKind::FIELD),
+            detail: Some("usize".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completion-item-0-detail").is_some(),
+            "sanity check: a real one-word field type still paints in the type slot"
+        );
+        assert!(
+            cx.debug_bounds("completion-item-0-import-source").is_none(),
+            "an item that would import nothing must paint no import source - the span exists to \
+             carry a real, server-supplied module, never a placeholder"
+        );
+    }
+
     /// A real, unusually long detail/type hint (a deeply nested generic, a long tuple return
     /// type) must not be left free to grow the right-hand hint span past a real, bounded width -
     /// unbounded, it would push the row's total content wider than the list column itself
@@ -1750,9 +2243,11 @@ mod completion_detail_pane_tests {
     }
 
     /// A real, long documentation string (a multi-paragraph rustdoc comment is common) must not
-    /// grow the detail pane without bound - `.line_clamp(6)` caps the doc paragraph at a real,
-    /// fixed number of visible lines instead of leaving the outer popup's own `overflow_hidden()`
-    /// to cut it off at an arbitrary point mid-sentence.
+    /// grow the detail pane past the popup's own real maximum height - `.max_h(popover_max_height())`
+    /// on the pane itself is the real, hard backstop - and, unlike an earlier version of this fix
+    /// that clamped the doc paragraph to 6 visible lines with no way to read the rest, the real
+    /// overflow must be reachable through the same real scrollbar a tall signature gets: a doc
+    /// this long never fits, so it must show one.
     #[gpui::test]
     fn a_very_long_documentation_string_does_not_grow_the_pane_without_bound(
         cx: &mut TestAppContext,
@@ -1763,7 +2258,12 @@ mod completion_detail_pane_tests {
             documentation: Some(lsp_core::lsp_types::Documentation::String(long_doc)),
             ..Default::default()
         };
-        let (_app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        let (app, cx, _relative) = seed_ready_popup(cx, vec![long_doc_item]);
+        // See `a_tall_signature_keeps_the_module_path_footer_pinned_and_shows_a_real_scrollbar`'s
+        // own docs for why this second real frame is needed before the scrollbar assertion below.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
         let pane = cx
             .debug_bounds("completions-detail-pane")
             .expect("the real detail pane must have painted for the long-doc item");
@@ -1771,7 +2271,7 @@ mod completion_detail_pane_tests {
         // Unclamped, 60 real repetitions of that sentence wrapped inside the pane's own ~280px
         // real content width would run to dozens of real lines - hundreds of real pixels tall.
         // `popover_max_height()` (the outer popup's own cap) is comfortably less than that, so a
-        // pane genuinely respecting its own `.line_clamp(6)` must paint well under it.
+        // pane genuinely respecting its own `.max_h()` must paint well under it.
         assert!(
             pane.size.height < popover_max_height(),
             "a real, genuinely long documentation string (many repeated sentences) must not \
@@ -1779,6 +2279,11 @@ mod completion_detail_pane_tests {
              pane height {:?}, popover_max_height() {:?}",
             pane.size.height,
             popover_max_height()
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_some(),
+            "a real, genuinely long documentation string that can't fully fit must be reachable \
+             through the real scrollbar, not silently truncated with no way to read the rest"
         );
     }
 
@@ -1821,6 +2326,118 @@ mod completion_detail_pane_tests {
             popover.bottom(),
             footer.bottom(),
             popover.bottom() - footer.bottom()
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely tall signature (the
+    /// real shape typescript-language-server produces pretty-printing a wide object/union type
+    /// across many real lines, now that it renders in full instead of being truncated to its own
+    /// first line) used to grow the detail pane's own content past the popup's `overflow_hidden()`
+    /// clip, hiding the module-path footer beneath it - the same real bug the Hover card had. The
+    /// module-path footer must stay pinned near the pane's own real bottom regardless of how tall
+    /// the signature above it is, and a real scrollbar must appear for the overflowing region.
+    #[gpui::test]
+    fn a_tall_signature_keeps_the_module_path_footer_pinned_and_shows_a_real_scrollbar(
+        cx: &mut TestAppContext,
+    ) {
+        let tall_signature = (0..30)
+            .map(|index| format!("    field_{index}: string;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some(format!("const x: {{\n{tall_signature}\n}}")),
+            label_details: Some(lsp_core::lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("alloc::string::String".to_string()),
+            }),
+            ..Default::default()
+        };
+        let (app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+        // `AdeApp::render_vertical_scrollbar` reads its geometry off the scroll handle's *last
+        // painted* bounds/`max_offset` (see that method's own docs) - the very first frame after
+        // the tall signature appears never has a scrollbar yet, by design. A second real frame
+        // (mirroring `completions_scroll_tests::open_with_seeded_popup`'s own identical settling
+        // step) lets that settle before the assertions below read it.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted for the tall-signature item");
+        let module_path = cx.debug_bounds("completion-detail-module-path").expect(
+            "the real module-path footer must still paint even though the real signature above \
+             it is far taller than the pane's own max height",
+        );
+        assert!(
+            (pane.bottom() - module_path.bottom()).abs() < gpui::px(10.0),
+            "the module-path footer must stay pinned near the pane's own real bottom edge \
+             regardless of how tall the content above it is (pane bottom {:?}, footer bottom \
+             {:?}) - the old bug pushed it below the pane's own overflow clip instead",
+            pane.bottom(),
+            module_path.bottom()
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_some(),
+            "a real scrollbar must appear for the signature/doc region once its own real content \
+             genuinely overflows"
+        );
+    }
+
+    /// The other half: an ordinary, short signature that fits comfortably within the pane's own
+    /// max height must never paint a scrollbar - the common case stays exactly as unadorned as it
+    /// always was.
+    #[gpui::test]
+    fn a_short_signature_paints_no_detail_scrollbar(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            detail: Some("fn push_str(&mut self, string: &str)".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completions-detail-pane").is_some(),
+            "sanity check: the real detail pane must have painted"
+        );
+        assert!(
+            cx.debug_bounds("completions-detail-scrollbar").is_none(),
+            "an ordinary short signature must never paint a real scrollbar - only genuinely \
+             overflowing content should"
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: the signature column had no
+    /// explicit width, so it shrank to fit its own (often much narrower) text - a short signature
+    /// like `"fn x()"` left the real `.border_b_1()` seam below it visibly short of the pane's
+    /// own real 300px-wide right edge, a real gap on the side the design mockup's own Hover card
+    /// equivalent never has.
+    #[gpui::test]
+    fn the_signature_border_spans_the_full_pane_width_not_just_its_text(cx: &mut TestAppContext) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some("fn x()".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        let pane = cx
+            .debug_bounds("completions-detail-pane")
+            .expect("the real detail pane must have painted");
+        let signature_column = cx
+            .debug_bounds("completion-detail-signature-column")
+            .expect("the real signature column must have painted");
+
+        // The pane itself carries no horizontal padding (each section owns its own, matching
+        // `render_hover_card_content`'s independently-padded bands) - the column's own outer box
+        // must span the pane's real edge-to-edge width, so its own bottom border does too.
+        assert!(
+            (pane.size.width - signature_column.size.width).abs() < gpui::px(1.0),
+            "the real signature column - and so its own real bottom border - must span the \
+             pane's full real edge-to-edge width, not just its own short text (pane width {:?}, \
+             column width {:?})",
+            pane.size.width,
+            signature_column.size.width
         );
     }
 
@@ -1868,6 +2485,41 @@ mod completion_detail_pane_tests {
             cx.debug_bounds("completions-footer-hints").is_none(),
             "a real Loading popup must never paint the real footer hint row either - it belongs \
              to the Ready list, not the loading message"
+        );
+    }
+
+    /// Direct regression coverage for the real, reported bug: a genuinely multi-line `detail` -
+    /// the real shape `typescript-language-server` produces for a wide utility/generic type like
+    /// `Pick<{ a: string; b: number }, "a">` once it pretty-prints across several lines - used to
+    /// render as just its own first line, with every real line after the first newline silently
+    /// dropped (the old code took only `highlight_block`'s first `RenderedLine`). A token from a
+    /// real *second* line must still paint.
+    #[gpui::test]
+    fn a_genuinely_multi_line_detail_keeps_every_real_line_not_just_the_first(
+        cx: &mut TestAppContext,
+    ) {
+        let item = lsp_core::lsp_types::CompletionItem {
+            label: "x".to_string(),
+            detail: Some("const x: Pick<{\n    a: string;\n    b: number;\n}, \"a\">".to_string()),
+            ..Default::default()
+        };
+        let (_app, cx, _relative) = seed_ready_popup(cx, vec![item]);
+
+        assert!(
+            cx.debug_bounds("completion-detail-signature-token-0")
+                .is_some(),
+            "sanity check: the first real line's own first token must have painted"
+        );
+        // The first real line ("const x: Pick<{") tokenizes into exactly 8 runs (indices 0..7),
+        // so index 9 - the real "a" identifier in "a: string;" - is unambiguously on the real
+        // second line, past the exact boundary the old `.next()` truncation dropped everything
+        // after.
+        assert!(
+            cx.debug_bounds("completion-detail-signature-token-9")
+                .is_some(),
+            "a token from a real line past the first newline (\"a\" in \"a: string;\", the real \
+             second line) must still paint, not have been silently dropped with the rest of the \
+             signature past the first line"
         );
     }
 }

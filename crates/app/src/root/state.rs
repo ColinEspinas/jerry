@@ -388,9 +388,12 @@ impl AdeApp {
             _lsp_sync_tasks: HashMap::new(),
             _completions_request_task: None,
             _completions_resolve_task: None,
+            completions_resolve_in_flight: None,
             completions_resolved: std::collections::HashSet::new(),
+            completions_resolved_items: std::collections::HashMap::new(),
             completions: None,
             completions_scroll_handle: UniformListScrollHandle::new(),
+            completions_detail_scroll_handle: gpui::ScrollHandle::new(),
             completions_generation: 0,
             completions_suppress_next_trigger: false,
             file_view_diagnostics: HashMap::new(),
@@ -400,7 +403,10 @@ impl AdeApp {
             hover: None,
             hover_pending: None,
             _hover_debounce_task: None,
+            _hover_hide_task: None,
             hover_card_bounds: None,
+            diagnostic_card_bounds: None,
+            hover_card_scroll_handle: gpui::ScrollHandle::new(),
             _hover_request_task: None,
             _goto_definition_tasks: TaskPool::new(),
             pending_cursor_line: None,
@@ -1085,7 +1091,9 @@ impl AdeApp {
         self._lsp_sync_tasks = HashMap::new();
         self._completions_request_task = None;
         self._completions_resolve_task = None;
+        self.completions_resolve_in_flight = None;
         self.completions_resolved = std::collections::HashSet::new();
+        self.completions_resolved_items = std::collections::HashMap::new();
         self.completions_suppress_next_trigger = false;
         self.lsp_last_synced_content = HashMap::new();
         self.lsp_synced_version = HashMap::new();

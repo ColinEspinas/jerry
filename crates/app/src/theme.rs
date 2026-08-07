@@ -1351,6 +1351,15 @@ pub mod syntax {
     /// (not a plain alias) so a `///` doc comment reads as more prominent than an ordinary `//`
     /// one, the same real distinction most editors make.
     pub const COMMENT_DOC: ColorToken = token("syntax.comment_doc", 0x8c939c);
+    /// GitHub issue #200's own doc-comment tag bucket - a JSDoc-style `@param`/`@returns`/
+    /// `@example` block tag, or a `{@link ...}`-style inline tag, within an already-[`COMMENT_DOC`]
+    /// comment. Not a real tree-sitter capture (no bundled grammar this app ships parses *inside*
+    /// a comment body at all - see `crate::code_surface::code_view::doc_tag_ranges`'s own docs for
+    /// the plain text scan that finds these instead), so it never appears in [`HIGHLIGHT_NAMES`].
+    /// Shares [`KEYWORD`]'s own purple rather than inventing a new hue: a doc tag really is playing
+    /// a keyword's role (a fixed, structural vocabulary word) just inside prose instead of code,
+    /// the same reasoning [`EMPHASIS`] gives for reusing that same purple in Markdown italics.
+    pub const COMMENT_DOC_TAG: ColorToken = token("syntax.comment_doc_tag", 0xc194d6);
     /// `variable` - a real, live-classified bucket (`-python`'s own blanket `(identifier)
     /// @variable`, `-javascript`'s identical blanket rule). A dusty rose on the shared accent
     /// tier, warm against [`PROPERTY`]'s cool cyan-blue so an `a.b.c` chain reads at a glance.
@@ -1531,6 +1540,7 @@ pub mod syntax {
         ("NUMBER", NUMBER),
         ("COMMENT", COMMENT),
         ("COMMENT_DOC", COMMENT_DOC),
+        ("COMMENT_DOC_TAG", COMMENT_DOC_TAG),
         ("VARIABLE", VARIABLE),
         ("VARIABLE_PARAMETER", VARIABLE_PARAMETER),
         ("VARIABLE_BUILTIN", VARIABLE_BUILTIN),

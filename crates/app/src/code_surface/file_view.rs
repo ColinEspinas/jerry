@@ -449,8 +449,10 @@ impl AdeApp {
                             .unwrap_or(&empty_diagnostics)
                             .clone();
                         let hovered_byte_range = this.hover.as_ref().and_then(|entry| {
-                            (entry.path == absolute_path && entry.line_number == line_number)
-                                .then(|| entry.byte_range.clone())
+                            (entry.path == absolute_path
+                                && entry.line_number == line_number
+                                && entry.worth_underlining())
+                            .then(|| entry.byte_range.clone())
                         });
                         let selection_local = buffer.selection_within_line(index);
                         let cursor_local = buffer.cursor_within_line(index);
@@ -1166,8 +1168,10 @@ pub(in crate::code_surface) fn render_file_view_line(
     let worst_severity = diagnostics_view::Severity::worst(diagnostics);
     // The hovered span on this line, if any, compared by run-level byte range rather than a
     // re-derived UTF-16 conversion of rust-analyzer's own `Hover::range`.
-    let hovered_byte_range = hover_entry
-        .and_then(|entry| (entry.line_number == line_number).then(|| entry.byte_range.clone()));
+    let hovered_byte_range = hover_entry.and_then(|entry| {
+        (entry.line_number == line_number && entry.worth_underlining())
+            .then(|| entry.byte_range.clone())
+    });
 
     // The code runs keep their natural width in their own `flex_none` box, so they never shrink.
     // The inline diagnostic message is deliberately **not** in here (GitHub issue #186): inside a

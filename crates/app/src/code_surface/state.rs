@@ -65,6 +65,21 @@ pub(crate) struct HoverEntry {
     pub(in crate::code_surface) status: HoverStatus,
 }
 
+impl HoverEntry {
+    /// Whether this entry is worth the real `theme::syntax::HOVER_UNDERLINE` affordance at all -
+    /// `false` only for a genuinely empty, already-answered [`HoverStatus::Ready(None)`]. Loading
+    /// and Failed both still underline (matching the popup itself, which still shows a real
+    /// "loading hover..."/"hover failed: ..." card for those - see
+    /// `crate::code_surface::lsp_ui::AdeApp::render_hover_card`'s own docs), since the underline's
+    /// whole job is signalling "there is something real here to look at", and both of those are.
+    /// Before this, every hovered token underlined identically regardless of outcome, which read
+    /// as "this is a real, hoverable symbol" even for the (very common - most identifiers rust-
+    /// analyzer has nothing to say about) case where the real answer was nothing at all.
+    pub(in crate::code_surface) fn worth_underlining(&self) -> bool {
+        !matches!(self.status, HoverStatus::Ready(None))
+    }
+}
+
 /// The outcomes of one [`HoverEntry`]'s request, mirroring [`LspClientState`]'s three-state
 /// shape, so `render_hover_card` can show the right state instead of a blank card while loading.
 #[derive(Debug, Clone, PartialEq)]
@@ -121,4 +136,45 @@ pub(crate) enum CommitMessageState {
     /// back to the one-line blame summary it already has (see
     /// `crate::code_surface::blame::inline_blame_label`'s own `full_message` fallback).
     Failed(String),
+}
+
+#[cfg(test)]
+mod hover_entry_underline_tests {
+    use super::*;
+
+    fn entry_with(status: HoverStatus) -> HoverEntry {
+        HoverEntry {
+            path: PathBuf::from("/scratch/sample.rs"),
+            line_number: 1,
+            byte_range: 0..5,
+            position: lsp_core::lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+            status,
+        }
+    }
+
+    /// The one real behavior change this test exists for: a genuinely empty, already-answered
+    /// hover must not underline - see `HoverEntry::worth_underlining`'s own docs.
+    #[test]
+    fn a_genuinely_empty_answered_hover_is_not_worth_underlining() {
+        assert!(!entry_with(HoverStatus::Ready(None)).worth_underlining());
+    }
+
+    /// Every other real status still is - `Loading`/`Failed` both still show a real popover of
+    /// their own (see `render_hover_card`), so the underline affordance pointing at it must too.
+    #[test]
+    fn every_other_real_status_is_still_worth_underlining() {
+        assert!(entry_with(HoverStatus::Loading).worth_underlining());
+        assert!(entry_with(HoverStatus::Failed("timed out".to_string())).worth_underlining());
+        assert!(
+            entry_with(HoverStatus::Ready(Some(hover_view::HoverRenderModel {
+                module_path: None,
+                signature: "fn alpha()".to_string(),
+                doc: None,
+            })))
+            .worth_underlining()
+        );
+    }
 }

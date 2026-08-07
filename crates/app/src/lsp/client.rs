@@ -701,6 +701,7 @@ impl AdeApp {
         self._lsp_sync_tasks = std::collections::HashMap::new();
         self._completions_request_task = None;
         self._completions_resolve_task = None;
+        self.completions_resolve_in_flight = None;
 
         let keys: Vec<LspClientKey> = self
             .lsp_clients
@@ -788,19 +789,48 @@ impl AdeApp {
         let Some(binary) = crate::language::lsp_binary_for_extension(extension) else {
             return;
         };
+        // Read here, on the GPUI thread, and moved into the builders below - which run on the
+        // background executor and so cannot reach `self`. See
+        // `crate::settings::store::LspServerSettings`.
+        //
+        // Layered built-in -> this app's own auto-import suppression -> the user's own
+        // passthrough, so a hand-written `settings.toml` entry always has the last word over a
+        // settings-page toggle.
+        let user_lsp_settings = self.settings.lsp.clone();
+        let suggest_auto_imports = self.settings.editor.suggest_auto_imports;
+        let apply_user_options =
+            std::sync::Arc::new(move |config: &mut lsp_core::ServerSpawnConfig| {
+                if !suggest_auto_imports {
+                    config.initialization_options =
+                        crate::language::merge_initialization_options_json(
+                            config.initialization_options.take(),
+                            crate::language::auto_import_suppression_options(config.name),
+                        );
+                }
+                config.initialization_options = crate::language::merge_initialization_options(
+                    config.initialization_options.take(),
+                    user_lsp_settings
+                        .get(config.name)
+                        .and_then(|server| server.initialization_options.as_ref()),
+                );
+            });
         self.spawn_lsp_client(
             (repo_root.clone(), binary),
             repo_root.clone(),
             {
                 let repo_root = repo_root.clone();
+                let apply_user_options = std::sync::Arc::clone(&apply_user_options);
                 move || {
                     // The real `ServerSpawnConfig` (including any `$PATH`/filesystem probing it
                     // does - Pyright's `pythonPath` resolution, Vue's `--tsdk` resolution) is
                     // built here, off the GPUI thread - see this method's own docs for why that
                     // moved from the caller.
-                    crate::language::server_spawn_config(&repo_root, extension)?.ok_or_else(|| {
+                    let mut config = crate::language::server_spawn_config(&repo_root, extension)?
+                        .ok_or_else(|| {
                         format!("no LSP server is configured for extension {extension:?}")
-                    })
+                    })?;
+                    apply_user_options(&mut config);
+                    Ok(config)
                 }
             },
             cx,
@@ -810,7 +840,11 @@ impl AdeApp {
             self.spawn_lsp_client(
                 (repo_root.clone(), companion.client_key),
                 repo_root,
-                move || crate::language::companion_spawn_config(&companion),
+                move || {
+                    let mut config = crate::language::companion_spawn_config(&companion)?;
+                    apply_user_options(&mut config);
+                    Ok(config)
+                },
                 cx,
             );
         }
@@ -1752,6 +1786,7 @@ impl AdeApp {
         let completion = match (completion_context, cached_uri) {
             (Some(context), Some(uri)) => {
                 self.completions_generation = self.completions_generation.wrapping_add(1);
+                self.completions_resolved_items.clear();
                 // Only actually drop to `Loading` when there's nothing real to show yet for this
                 // path - not unconditionally, as an earlier version did. `Self::schedule_lsp_sync`
                 // already called `Self::refilter_completions` synchronously just before this
@@ -1888,9 +1923,14 @@ impl AdeApp {
     ///
     /// A real no-op whenever: there's no `Ready` popup, the currently selected item already has
     /// both a `detail` and real `documentation` (nothing more a resolve could usefully add), this
-    /// exact `(path, generation, item index)` was already asked about once (successfully or not -
-    /// see [`Self::completions_resolved`]'s own docs), or the connection's own primary server
+    /// exact `(path, generation, item index)` has already been *answered* once (successfully or
+    /// not - see [`Self::completions_resolved`]'s own docs) or is the one currently still in
+    /// flight ([`Self::completions_resolve_in_flight`]), or the connection's own primary server
     /// doesn't advertise `completionProvider.resolveProvider` at all.
+    ///
+    /// Deliberately *not* a no-op for an item whose earlier request a later selection cancelled:
+    /// that item has no answer, so asking again is the only way it ever gets one. See
+    /// [`Self::completions_resolve_in_flight`]'s own docs for the real data that used to cost.
     pub(crate) fn maybe_resolve_selected_completion_item(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.as_ref() else {
             return;
@@ -1914,13 +1954,12 @@ impl AdeApp {
         }
         let path = entry.path.clone();
         let key = (path.clone(), self.completions_generation, item_index);
-        if self.completions_resolved.contains(&key) {
+        if self.completions_resolved.contains(&key)
+            || self.completions_resolve_in_flight.as_ref() == Some(&key)
+        {
             return;
         }
-        let Some(absolute_path) = self
-            .edit_buffer(&path)
-            .map(|buffer| buffer.path.clone())
-        else {
+        let Some(absolute_path) = self.edit_buffer(&path).map(|buffer| buffer.path.clone()) else {
             return;
         };
         let Some(connection) = self.lsp_connection_for_path(&absolute_path) else {
@@ -1929,7 +1968,10 @@ impl AdeApp {
         if !connection.primary().supports_completion_resolve() {
             return;
         }
-        self.completions_resolved.insert(key);
+        // Overwriting this is exactly right: assigning `_completions_resolve_task` below drops -
+        // and so cancels - whatever request the previous key was waiting on, which leaves that key
+        // genuinely unanswered and therefore genuinely retryable.
+        self.completions_resolve_in_flight = Some(key);
         let item_to_resolve = item.clone();
         let generation = self.completions_generation;
         let task = cx.spawn(async move |this, cx| {
@@ -1950,15 +1992,15 @@ impl AdeApp {
     }
 
     /// Merges a real `completionItem/resolve` response into the exact item
-    /// [`Self::maybe_resolve_selected_completion_item`] asked about, in place - never replacing
-    /// fields the original `textDocument/completion` response already populated (a server that
-    /// sent a real inline `detail` already made its own choice there; the resolve response is
-    /// additive, not authoritative). Refuses stale results the same way [`Self::
+    /// [`Self::maybe_resolve_selected_completion_item`] asked about, in place - each field the
+    /// resolve response genuinely carries replacing whatever arrived inline, and every field it
+    /// omits left exactly as it was (see the merge itself for the real, live-dumped case that
+    /// settled which way round this goes). Refuses stale results the same way [`Self::
     /// apply_completion_result`] does: a `completions_generation` mismatch means a fresh server
     /// response (or a dismiss) has already replaced whatever `items` this index used to point
     /// into, so writing into it now would either silently corrupt an unrelated item or panic on an
     /// out-of-bounds index.
-    fn apply_resolved_completion_item(
+    pub(crate) fn apply_resolved_completion_item(
         &mut self,
         path: &Path,
         generation: u64,
@@ -1966,6 +2008,15 @@ impl AdeApp {
         result: Result<lsp_core::lsp_types::CompletionItem, lsp_core::LspError>,
         cx: &mut Context<Self>,
     ) {
+        // Recorded here, not at dispatch time: this is the point at which the request the app sent
+        // has genuinely been answered (an `Err` counts - re-asking a server that just failed would
+        // only fail again). A request that never reaches this point was cancelled rather than
+        // answered, and must stay retryable. See [`Self::completions_resolve_in_flight`].
+        let key = (path.to_path_buf(), generation, item_index);
+        if self.completions_resolve_in_flight.as_ref() == Some(&key) {
+            self.completions_resolve_in_flight = None;
+        }
+        self.completions_resolved.insert(key);
         if self.completions_generation != generation {
             return;
         }
@@ -1978,22 +2029,55 @@ impl AdeApp {
         if entry.path != path {
             return;
         }
-        let CompletionsStatus::Ready { items, .. } = &mut entry.status else {
+        let CompletionsStatus::Ready { items, .. } = &entry.status else {
             return;
         };
-        let Some(item) = items.get_mut(item_index) else {
+        let Some(item) = items.get(item_index) else {
             return;
         };
-        if item.detail.is_none() {
-            item.detail = resolved.detail;
+        // Merged over a *copy* and filed in `completions_resolved_items`, leaving the server's own
+        // response untouched. See that field's own docs: writing back into `items` is what let a
+        // resolve rewrite a row the user was already looking at, and rows must be complete and
+        // final the moment the popup opens.
+        //
+        // A field the resolve response actually carries wins over whatever arrived inline. The
+        // LSP spec has `completionItem/resolve` return the item with its fields filled in, and a
+        // real dump against a live `typescript-language-server` shows why that matters here: an
+        // auto-import item arrives with `detail: "./helper"` - a bare module specifier standing in
+        // as a placeholder - and only the resolve response carries the real signature (`"Auto
+        // import from './helper'\nconstructor RemoteHelper(): RemoteHelper"`), which is exactly
+        // what the detail pane exists to show. A resolve response that omits a field still leaves
+        // the inline one alone, so nothing real is ever lost.
+        let mut merged = item.clone();
+        if resolved.detail.is_some() {
+            merged.detail = resolved.detail;
         }
-        if item.documentation.is_none() {
-            item.documentation = resolved.documentation;
+        if resolved.documentation.is_some() {
+            merged.documentation = resolved.documentation;
         }
-        if item.label_details.is_none() {
-            item.label_details = resolved.label_details;
+        if resolved.label_details.is_some() {
+            merged.label_details = resolved.label_details;
         }
+        if resolved.additional_text_edits.is_some() {
+            merged.additional_text_edits = resolved.additional_text_edits;
+        }
+        self.completions_resolved_items.insert(item_index, merged);
         cx.notify();
+    }
+
+    /// The best real description this app has of the item at `item_index` **for the detail pane
+    /// and for accepting it** - the merged `completionItem/resolve` response when one has landed
+    /// for the current generation, and the server's own inline item otherwise.
+    ///
+    /// Deliberately not what a row reads. See [`Self::completions_resolved_items`].
+    pub(crate) fn described_completion_item<'a>(
+        &'a self,
+        items: &'a [lsp_core::lsp_types::CompletionItem],
+        item_index: usize,
+    ) -> Option<&'a lsp_core::lsp_types::CompletionItem> {
+        self.completions_resolved_items
+            .get(&item_index)
+            .or_else(|| items.get(item_index))
     }
 }
 
@@ -3160,10 +3244,7 @@ process.stdin.on('data', (d) => {
                 "accepting a completion must genuinely dismiss the popup, got: {:?}",
                 app.completions.as_ref().map(|entry| &entry.status)
             );
-            let content = &app
-                .edit_buffer(&relative)
-                .expect("a real buffer")
-                .content;
+            let content = &app.edit_buffer(&relative).expect("a real buffer").content;
             assert!(
                 content.contains("println"),
                 "sanity check: the real accept must have spliced the real item's text into the \
@@ -3251,21 +3332,295 @@ process.stdin.on('data', (d) => {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            let entry = app.completions.as_ref().expect("popup should still be open");
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
             let CompletionsStatus::Ready { items, .. } = &entry.status else {
                 panic!("expected a Ready popup, got {:?}", entry.status);
             };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
             assert_eq!(
-                items[0].detail.as_deref(),
+                described(0).detail.as_deref(),
                 Some("resolved detail for unresolved_item"),
                 "a real completionItem/resolve response must fill in the item's real detail, \
                  which is what the detail pane's signature line reads"
             );
-            let doc = crate::lsp::completion::completion_documentation_text(&items[0]);
+            let doc = crate::lsp::completion::completion_documentation_text(&described(0));
             assert_eq!(
                 doc.as_deref(),
                 Some("resolved doc for unresolved_item"),
                 "and its real documentation, which is what the detail pane's doc-prose body reads"
+            );
+        });
+    }
+
+    /// The real, live-reproduced bug behind "the shown things are still modules instead of real
+    /// types" surviving even after the detail-splitting fix: this merge used to keep the
+    /// *unresolved* `detail` whenever the server had sent one, on the theory that an inline
+    /// `detail` was the server's own considered choice and resolve was only ever additive.
+    ///
+    /// A real dump against a live `typescript-language-server` disproves that for the exact case
+    /// that matters. For an auto-import completion it sends `detail: "./helper"` inline - a bare
+    /// module specifier standing in as a placeholder - and only the `completionItem/resolve`
+    /// response carries the genuinely richer `"Auto import from './helper'\nconstructor
+    /// RemoteHelper(): RemoteHelper"` that actually contains the signature. Discarding the
+    /// resolved value pinned the item to the placeholder forever, so the popup had a module path
+    /// and no type no matter what the render path did with it. Per the LSP spec, resolve returns
+    /// the item with its fields filled in, so a resolved `detail` is the authoritative one.
+    #[gpui::test]
+    fn a_real_resolved_detail_replaces_a_placeholder_the_server_sent_inline(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "RemoteHelper".to_string(),
+                        // The real placeholder a live typescript-language-server sends inline.
+                        detail: Some("./helper".to_string()),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
+            assert_eq!(
+                described(0).detail.as_deref(),
+                Some("resolved detail for RemoteHelper"),
+                "a real resolve response must win over the placeholder detail the server sent \
+                 inline - that placeholder is exactly the bare module path the user reported \
+                 seeing where a type belongs"
+            );
+        });
+    }
+
+    /// Arrowing past an item must not permanently cost that item its type and documentation.
+    ///
+    /// Only one resolve request is ever in flight ([`AdeApp::_completions_resolve_task`] is a
+    /// single slot), so moving the selection replaces - and therefore, since dropping a `Task`
+    /// cancels it, *aborts* - whatever resolve the previous item had going. That is the intended
+    /// economy. The bug was that the aborted item had already been written into
+    /// [`AdeApp::completions_resolved`] at dispatch time, so it counted as answered forever: come
+    /// back to it and no second request would ever go out, and its row and detail pane stayed
+    /// pinned to whatever the unresolved item happened to carry - for a real
+    /// `typescript-language-server` auto-import, a bare module specifier and no type at all.
+    ///
+    /// This walks that exact sequence: select item 0 and dispatch, move to item 1 and dispatch
+    /// (killing item 0's request before it can land), let that settle, then come back to item 0.
+    #[gpui::test]
+    fn an_item_whose_resolve_was_cancelled_by_moving_on_is_resolved_again_on_return(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        let bare = |label: &str| lsp_core::lsp_types::CompletionItem {
+            label: label.to_string(),
+            ..Default::default()
+        };
+        // Both dispatches happen inside one `update`, so item 0's request is genuinely still in
+        // flight when item 1's replaces its task slot - the real fast-arrow-key sequence.
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![bare("first_item"), bare("second_item")],
+                    visible: vec![0, 1],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+            if let Some(CompletionsStatus::Ready { selected, .. }) =
+                app.completions.as_mut().map(|entry| &mut entry.status)
+            {
+                *selected = 1;
+            }
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            if let Some(CompletionsStatus::Ready { selected, .. }) =
+                app.completions.as_mut().map(|entry| &mut entry.status)
+            {
+                *selected = 0;
+            }
+            app.maybe_resolve_selected_completion_item(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
+            assert_eq!(
+                described(1).detail.as_deref(),
+                Some("resolved detail for second_item"),
+                "sanity check: the resolve that was *not* cancelled must have landed"
+            );
+            assert_eq!(
+                described(0).detail.as_deref(),
+                Some("resolved detail for first_item"),
+                "an item whose resolve was aborted by moving the selection on must be asked \
+                 again when the user comes back to it - otherwise arrowing past a row silently \
+                 costs it its type and documentation for as long as the popup is open"
+            );
+        });
+    }
+
+    /// The economy that fix must not undo: re-selecting an item whose resolve is *still in flight*
+    /// must not fire a second, redundant request for the same thing.
+    #[gpui::test]
+    fn an_item_with_a_resolve_already_in_flight_is_not_asked_twice(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let absolute = root.join("main.rs");
+        std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
+        let relative = PathBuf::from("main.rs");
+
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
+            palette_focus_tests::open_test_app(cx, root.clone());
+        let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server),
+            );
+            app.open_file_view(absolute, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.completions = Some(CompletionsEntry {
+                path: relative.clone(),
+                status: CompletionsStatus::Ready {
+                    items: vec![lsp_core::lsp_types::CompletionItem {
+                        label: "only_item".to_string(),
+                        ..Default::default()
+                    }],
+                    visible: vec![0],
+                    selected: 0,
+                },
+            });
+            app.maybe_resolve_selected_completion_item(cx);
+            let in_flight = app.completions_resolve_in_flight.clone();
+            assert_eq!(
+                in_flight,
+                Some((relative.clone(), app.completions_generation, 0)),
+                "the first dispatch must record exactly which item it is waiting on"
+            );
+            // A re-render/re-selection of the same item while that request is still out.
+            app.maybe_resolve_selected_completion_item(cx);
+            assert_eq!(
+                app.completions_resolve_in_flight, in_flight,
+                "a second dispatch for the same in-flight item would have replaced the task slot, \
+                 cancelling the request that was already on its way for no reason at all"
+            );
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .completions
+                .as_ref()
+                .expect("popup should still be open");
+            let CompletionsStatus::Ready { items, .. } = &entry.status else {
+                panic!("expected a Ready popup, got {:?}", entry.status);
+            };
+            // The detail pane's own view of each item: the merged `completionItem/resolve`
+            // response where one landed, the untouched inline item until then. `items` itself is
+            // deliberately never written to, so that a row can't change under the user - see
+            // `AdeApp::completions_resolved_items`.
+            let described = |index: usize| {
+                app.described_completion_item(items, index)
+                    .expect("every index here is a real one")
+                    .clone()
+            };
+            assert_eq!(
+                described(0).detail.as_deref(),
+                Some("resolved detail for only_item")
+            );
+            assert!(
+                app.completions_resolve_in_flight.is_none(),
+                "a landed response must clear the in-flight marker rather than leaving the item \
+                 looking forever pending"
             );
         });
     }

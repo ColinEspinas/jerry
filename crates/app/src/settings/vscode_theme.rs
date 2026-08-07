@@ -1003,6 +1003,18 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
             &["comment.block.documentation", "comment.documentation"],
             Some(Comment),
         ),
+        // VSCode's own bundled JS/TS grammar (`textmate/JavaScript.tmLanguage.json`) styles a
+        // `@param`/`@returns` block tag as `storage.type.class.jsdoc` and its punctuation as
+        // `punctuation.definition.block.tag.jsdoc` - the two real scopes most themes that bother
+        // styling JSDoc tags at all actually set.
+        CommentDocTag => (
+            &[
+                "storage.type.class.jsdoc",
+                "punctuation.definition.block.tag.jsdoc",
+                "keyword.other.documentation",
+            ],
+            Some(CommentDoc),
+        ),
         Variable => (&["variable.other.readwrite", "variable"], Some(Text)),
         VariableParameter => (&["variable.parameter"], Some(Variable)),
         VariableBuiltin => (
