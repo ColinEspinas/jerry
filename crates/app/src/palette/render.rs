@@ -123,6 +123,16 @@ impl AdeApp {
     /// which is refreshed only at the two points its inputs really change (see
     /// [`Self::rebuild_palette_file_candidates`] and [`Self::load_file_tree`]).
     pub(crate) fn build_palette_groups(&self, cx: &App) -> Vec<palette::PaletteGroup> {
+        // A drill-down step replaces the root list entirely rather than adding a group to it -
+        // the palette is asking one question ("which server?") and every row on screen has to be
+        // a real answer to it. Same builder shape, so typing/`↑`/`↓`/`⏎` behave identically.
+        if self.palette_step == palette::PaletteStep::PickLanguageServer {
+            return palette::build_language_server_groups(
+                self.palette_query.as_str(),
+                &self.language_server_candidates(),
+            );
+        }
+
         let agents: Vec<palette::AgentCandidate> = self
             .agents
             .iter()
@@ -229,6 +239,38 @@ impl AdeApp {
                 secondary: "commit history, branches, lanes".to_string(),
             });
         }
+        // Listed only while there is genuinely something to pick - same reasoning as
+        // `OpenGitGraph` right above: with no live client under this worktree, "Restart Language
+        // Server" would open a step with nothing in it, which is a command that does nothing.
+        // The secondary line says which real thing will happen, since with exactly one server
+        // running this restarts it outright instead of asking (see
+        // [`Self::begin_language_server_pick`]).
+        let servers = self.restartable_language_servers();
+        if let Some(secondary) = match servers.as_slice() {
+            [] => None,
+            [only] => Some(format!("restart {}", only.client_key)),
+            many => Some(format!("pick one of {} running servers", many.len())),
+        } {
+            // Inserted beside the other recovery/utility commands rather than appended: with an
+            // empty query every command ranks equally, so the group's own
+            // `MAX_ENTRIES_PER_GROUP` cap silently drops whatever sits past the eighth row - a
+            // recovery command a user can only reach by already knowing to type its name is the
+            // same discoverability failure `PaletteCommand::RestartLanguageServers`' own docs
+            // argue against. Positional rather than a magic index so reordering the list above
+            // can't quietly move this somewhere else.
+            let beside_settings = commands
+                .iter()
+                .position(|candidate| candidate.command == palette::PaletteCommand::OpenSettings)
+                .map(|index| index + 1)
+                .unwrap_or(commands.len());
+            commands.insert(
+                beside_settings,
+                palette::CommandCandidate {
+                    command: palette::PaletteCommand::RestartLanguageServer,
+                    secondary,
+                },
+            );
+        }
 
         palette::build_groups(
             self.palette_scope,
@@ -237,6 +279,95 @@ impl AdeApp {
             &commands,
             &self.palette_file_candidates,
         )
+    }
+
+    /// The [`palette::PaletteStep::PickLanguageServer`] step's rows, built fresh from the real
+    /// live clients [`Self::restartable_language_servers`] reports - never a fixed menu of the
+    /// server names this app knows how to spawn, so a row exists exactly when a real process (or
+    /// a real failed spawn) does.
+    ///
+    /// The label is the client key itself; the language display name is looked up from the real
+    /// registry (`crate::language::language_for_lsp_client_key`) and shown beside the server's
+    /// live state, which is what a user picking "the broken one" is actually reading. A failed
+    /// client shows its own real failure text rather than the word "failed".
+    pub(in crate::palette) fn language_server_candidates(
+        &self,
+    ) -> Vec<palette::LanguageServerCandidate> {
+        self.restartable_language_servers()
+            .into_iter()
+            .map(|server| {
+                let language =
+                    crate::language::language_for_lsp_client_key(server.client_key).map(|found| {
+                        if found.is_companion {
+                            // Vue runs two processes under two keys; without this both rows
+                            // would read "Vue" and only the key would tell them apart.
+                            format!("{} companion", found.display_name)
+                        } else {
+                            found.display_name.to_string()
+                        }
+                    });
+                let (state, status) = match &server.state {
+                    crate::lsp::client::LanguageServerRunState::Ready => {
+                        ("ready".to_string(), crate::rail::status::Status::Run)
+                    }
+                    crate::lsp::client::LanguageServerRunState::Failed(reason) => {
+                        (reason.clone(), crate::rail::status::Status::Fail)
+                    }
+                };
+                palette::LanguageServerCandidate {
+                    client_key: server.client_key,
+                    secondary: match &language {
+                        Some(language) => format!("{language} \u{b7} {state}"),
+                        None => state,
+                    },
+                    keywords: language.unwrap_or_default(),
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    /// Runs [`palette::PaletteCommand::RestartLanguageServer`]: either restarts the one server
+    /// there is, or moves the palette into its "which server?" step.
+    ///
+    /// Skipping the step for a single server is deliberate. A one-row menu isn't a choice, and
+    /// making the user confirm it would be the same fake ceremony this app refuses elsewhere -
+    /// the command's own secondary line already named exactly which server it would restart, so
+    /// nothing is hidden by doing it.
+    pub(in crate::palette) fn begin_language_server_pick(&mut self, cx: &mut Context<Self>) {
+        let servers = self.restartable_language_servers();
+        match servers.as_slice() {
+            // Not reachable through the palette (the entry isn't listed with no servers), but a
+            // real no-op rather than an empty step if it ever is.
+            [] => {}
+            [only] => {
+                let client_key = only.client_key;
+                self.restart_lsp_client(client_key, cx);
+            }
+            _ => {
+                self.palette_step = palette::PaletteStep::PickLanguageServer;
+                // The query that found "Restart Language Server" would otherwise filter the
+                // server list it just opened, which is a different list of different words - a
+                // step starts from the same clean slate a freshly opened palette does.
+                self.palette_query.reset();
+                self.palette_selected = 0;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Leaves a drill-down step for the root command list (`Esc` inside a step, which is
+    /// deliberately *not* the same as `Esc` on the root list - that closes the palette). Returns
+    /// `true` if there really was a step to leave.
+    pub(in crate::palette) fn leave_palette_step(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.palette_step == palette::PaletteStep::Root {
+            return false;
+        }
+        self.palette_step = palette::PaletteStep::Root;
+        self.palette_query.reset();
+        self.palette_selected = 0;
+        cx.notify();
+        true
     }
 
     /// Rebuilds [`Self::palette_file_candidates`] from the current real [`Self::file_tree`]/
@@ -309,6 +440,7 @@ impl AdeApp {
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
             palette::PaletteCommand::RestartLanguageServers => self.restart_lsp_clients(cx),
+            palette::PaletteCommand::RestartLanguageServer => self.begin_language_server_pick(cx),
             // Also reachable from the Settings "General" page - both entry points call
             // `Self::set_window_controls_style`, never two independent copies.
             palette::PaletteCommand::WindowControlsSystem => {
@@ -420,7 +552,23 @@ impl AdeApp {
                 }
                 palette::EntryTarget::Agent(id) => self.select_agent(id, window, cx),
                 palette::EntryTarget::File(path) => self.open_palette_file_result(path, window, cx),
+                palette::EntryTarget::LanguageServer(client_key) => {
+                    // Back to the root list *before* the restart, so the closing rule below sees
+                    // an answered question rather than an open one.
+                    self.palette_step = palette::PaletteStep::Root;
+                    self.restart_lsp_client(client_key, cx);
+                }
             }
+        }
+        // An entry that opened a drill-down step didn't run anything yet - it asked which thing
+        // to run, and the answer is on screen in this same overlay. Closing here would throw that
+        // question away the instant it was asked. Only a command that enters a step can leave
+        // `palette_step` non-root at this point (every step row resets it above), so this is a
+        // real observation of what just happened rather than a per-entry flag to keep in sync -
+        // the same reasoning this method's own focus rule is built on.
+        if self.palette_step != palette::PaletteStep::Root {
+            cx.notify();
+            return;
         }
         if window.focused(cx) == focus_before {
             self.close_palette(window, cx);
@@ -477,7 +625,12 @@ impl AdeApp {
         self.reset_caret_blink(cx);
         match keystroke.key.as_str() {
             "escape" => {
-                self.close_palette(window, cx);
+                // Inside a drill-down step, `Esc` is "back to the command list" - what a real
+                // nested menu does, and the reason the step is worth having in the same overlay
+                // rather than as a second widget. On the root list it still closes the palette.
+                if !self.leave_palette_step(cx) {
+                    self.close_palette(window, cx);
+                }
                 cx.stop_propagation();
             }
             "backspace" => {
@@ -499,9 +652,13 @@ impl AdeApp {
                 cx.stop_propagation();
             }
             "tab" => {
-                self.palette_scope = self.palette_scope.cycle();
-                self.palette_selected = 0;
-                cx.notify();
+                // A step lists one kind of thing, so there are no scopes to cycle - swallowed
+                // rather than left to bubble, since the palette owns the keyboard while it's up.
+                if self.palette_step == palette::PaletteStep::Root {
+                    self.palette_scope = self.palette_scope.cycle();
+                    self.palette_selected = 0;
+                    cx.notify();
+                }
                 cx.stop_propagation();
             }
             _ => {
@@ -511,7 +668,8 @@ impl AdeApp {
                 if text.is_empty() {
                     return;
                 }
-                if self.palette_query.is_empty() {
+                if self.palette_query.is_empty() && self.palette_step == palette::PaletteStep::Root
+                {
                     if let Some(first_char) = text.chars().next() {
                         if let Some(scope) = palette::typed_scope_prefix(first_char) {
                             self.palette_scope = scope;
@@ -639,11 +797,20 @@ impl AdeApp {
     /// audit's own wording). It now sits before the placeholder while the query is empty, and
     /// immediately after the real typed text once something has been entered - matching
     /// `Jerry.dc.html`'s own two-position fixture.
+    ///
+    /// In a drill-down step the placeholder states the question being asked and the segmented
+    /// scope control is dropped: scopes filter the root list's three candidate kinds, and a step
+    /// lists exactly one kind, so leaving the control up would offer three switches that either
+    /// do nothing or silently abandon the question.
     pub(in crate::palette) fn render_palette_input_row(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_query = !self.palette_query.is_empty();
+        let placeholder = match self.palette_step {
+            palette::PaletteStep::Root => "Type a command, file or agent\u{2026}",
+            palette::PaletteStep::PickLanguageServer => "Which language server?",
+        };
 
         div()
             .id("palette-input-row")
@@ -685,7 +852,7 @@ impl AdeApp {
                             .child(if has_query {
                                 self.palette_query.as_str().to_string()
                             } else {
-                                "Type a command, file or agent\u{2026}".to_string()
+                                placeholder.to_string()
                             })
                             .debug_selector(|| "palette-query-text".to_string()),
                     )
@@ -693,7 +860,9 @@ impl AdeApp {
                         el.child(self.render_palette_caret(px(0.0), px(2.0)))
                     }),
             )
-            .child(self.render_palette_scope_control(cx))
+            .when(self.palette_step == palette::PaletteStep::Root, |el| {
+                el.child(self.render_palette_scope_control(cx))
+            })
     }
 
     /// The `All ⇥ / Commands › / Files @` segmented scope control - reachable by clicking here
@@ -850,7 +1019,11 @@ impl AdeApp {
         } else {
             theme::text::STRONG
         };
-        let mono = matches!(entry.target, palette::EntryTarget::File(_));
+        // Mono for a real on-disk identifier - a file name, or a server binary's own name.
+        let mono = matches!(
+            entry.target,
+            palette::EntryTarget::File(_) | palette::EntryTarget::LanguageServer(_)
+        );
 
         let chip = match &entry.target {
             palette::EntryTarget::Command(_) => render_palette_command_chip().into_any_element(),
@@ -864,6 +1037,11 @@ impl AdeApp {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 render_palette_file_chip(file_tree::lang_chip_for_name(&name)).into_any_element()
+            }
+            // A step row is still an action the palette performs, so it wears the same generic
+            // command chip - the row's own status dot carries the per-server information.
+            palette::EntryTarget::LanguageServer(_) => {
+                render_palette_command_chip().into_any_element()
             }
         };
 
@@ -943,16 +1121,27 @@ impl AdeApp {
     /// Each hint is a `[keycap] label` pair resolved through `crate::keymap::resolve_combo`.
     /// `↑↓` isn't one of `resolve_combo`'s recognized modifier/key tokens, so it passes through
     /// unchanged - the same path a bare letter like `N` takes.
+    ///
+    /// A drill-down step gets its own three hints, and every one of them is a real difference in
+    /// what those keys do there: `⏎` restarts the highlighted server rather than "running" a
+    /// command, `esc` goes back to the command list rather than closing, and `⇥` has no scopes to
+    /// cycle so it isn't offered at all (see [`Self::handle_palette_key_down`]).
     pub(in crate::palette) fn render_palette_footer(&self, total: usize) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
-        let hints = [
-            ("\u{2191}\u{2193}", "move"),
-            ("enter", "run"),
-            ("tab", "next scope"),
-            ("esc", "close"),
-        ]
-        .into_iter()
-        .map(|(spec, label)| {
+        let hints: &[(&str, &str)] = match self.palette_step {
+            palette::PaletteStep::Root => &[
+                ("\u{2191}\u{2193}", "move"),
+                ("enter", "run"),
+                ("tab", "next scope"),
+                ("esc", "close"),
+            ],
+            palette::PaletteStep::PickLanguageServer => &[
+                ("\u{2191}\u{2193}", "move"),
+                ("enter", "restart"),
+                ("esc", "back"),
+            ],
+        };
+        let hints = hints.iter().copied().map(|(spec, label)| {
             render_hint_pair(&keymap::resolve_combo(spec, macos), label).into_any_element()
         });
 
@@ -1167,5 +1356,322 @@ mod palette_caret_tests {
             short_caret.origin.x,
             long_caret.origin.x,
         );
+    }
+}
+
+/// Real end-to-end coverage for the palette's one drill-down step (`Restart Language Server…`):
+/// entering it, filtering/leaving it with the same keys the rest of the palette uses, and picking
+/// a row actually restarting that one server and nothing else.
+///
+/// Driven through the real overlay - real `TogglePalette`, real keystrokes into the real
+/// `handle_palette_key_down`, real `run_selected_palette_entry` - against real
+/// `AdeApp::lsp_clients` entries (one of them a genuinely spawned server process), never by
+/// calling the step's own helpers directly.
+#[cfg(test)]
+mod palette_language_server_step_tests {
+    use super::*;
+    use crate::lsp::client::lsp_connection_facade_tests::spawn_fake_server;
+    use crate::lsp::client::LspClientState;
+    use gpui::{Entity, TestAppContext};
+
+    const TS_FAILURE: &str = "typescript-language-server's connection was lost";
+
+    /// Two real live clients under the active root: a genuinely spawned `rust-analyzer` process
+    /// and a `typescript-language-server` in the same real `Failed` state
+    /// `AdeApp::reap_dead_lsp_clients` produces when a server dies.
+    fn app_with_two_servers<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (
+        Entity<AdeApp>,
+        std::sync::Arc<lsp_core::LspClient>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let (app, cx) =
+            crate::root::focus::palette_focus_tests::open_test_app(cx, root.to_path_buf());
+        let server = spawn_fake_server(root, "rust-analyzer", "normal");
+        app.update(cx, |app, _cx| {
+            let root = app.file_tree_root.clone();
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(server.clone()),
+            );
+            app.lsp_clients.insert(
+                (root, "typescript-language-server"),
+                LspClientState::Failed(TS_FAILURE.to_string()),
+            );
+        });
+        (app, server, cx)
+    }
+
+    /// The flat row index of the first entry with this target, in the same order
+    /// `run_selected_palette_entry` flattens - i.e. exactly what `palette_selected` means.
+    fn row_index(app: &AdeApp, cx: &App, target: &palette::EntryTarget) -> Option<usize> {
+        let groups = app.build_palette_groups(cx);
+        palette::flatten(&groups)
+            .iter()
+            .position(|entry| &entry.target == target)
+    }
+
+    /// Selects the row with this target and runs it with a real `⏎` through the real key handler.
+    fn press_enter_on(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        target: palette::EntryTarget,
+    ) {
+        let index = app
+            .read_with(cx, |app, cx| row_index(app, cx, &target))
+            .unwrap_or_else(|| panic!("{target:?} should be a real, listed palette row"));
+        app.update(cx, |app, _cx| app.palette_selected = index);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn restarting_one_server_asks_which_one_inside_the_same_palette(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, _server, cx) = app_with_two_servers(cx, repo.path());
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        press_enter_on(
+            &app,
+            cx,
+            palette::EntryTarget::Command(palette::PaletteCommand::RestartLanguageServer),
+        );
+
+        app.read_with(cx, |app, cx| {
+            assert!(
+                app.palette_open,
+                "the command asked a question - closing the palette would throw the answer away \
+                 before it could be given"
+            );
+            assert_eq!(app.palette_step, palette::PaletteStep::PickLanguageServer);
+            assert_eq!(
+                app.lsp_clients.len(),
+                2,
+                "nothing may be restarted merely by *asking* which server to restart"
+            );
+
+            let groups = app.build_palette_groups(cx);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].label, "Language Servers");
+            let rows: Vec<(&palette::EntryTarget, &str)> = groups[0]
+                .entries
+                .iter()
+                .map(|entry| (&entry.target, entry.secondary.as_str()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        &palette::EntryTarget::LanguageServer("rust-analyzer"),
+                        "Rust \u{b7} ready"
+                    ),
+                    (
+                        &palette::EntryTarget::LanguageServer("typescript-language-server"),
+                        &format!("TypeScript \u{b7} {TS_FAILURE}")[..]
+                    ),
+                ],
+                "the step lists the real live clients, each with its registry language name and \
+                 its own real state - the broken one has to be identifiable to be pickable"
+            );
+        });
+    }
+
+    /// The step is filterable and navigable with the same keys as the root list, and `Esc` inside
+    /// it means "back", not "close" - the whole reason this is a step in the existing overlay
+    /// rather than a second widget.
+    #[gpui::test]
+    fn typing_filters_the_step_and_escape_goes_back_before_it_closes(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, _server, cx) = app_with_two_servers(cx, repo.path());
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        cx.simulate_input("restart language");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.palette_query.as_str(), "restart language");
+        });
+        press_enter_on(
+            &app,
+            cx,
+            palette::EntryTarget::Command(palette::PaletteCommand::RestartLanguageServer),
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.palette_query.is_empty(),
+                "the query that found the command would otherwise filter the server list it just \
+                 opened, which is a list of entirely different words"
+            );
+        });
+
+        cx.simulate_input("types");
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let groups = app.build_palette_groups(cx);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(
+                groups[0]
+                    .entries
+                    .iter()
+                    .map(|entry| entry.target.clone())
+                    .collect::<Vec<_>>(),
+                vec![palette::EntryTarget::LanguageServer(
+                    "typescript-language-server"
+                )],
+                "typing narrows the step's own rows, exactly like every other palette list"
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.palette_open,
+                "Esc inside a step goes back to the command list, the way a real nested menu does"
+            );
+            assert_eq!(app.palette_step, palette::PaletteStep::Root);
+            assert!(app.palette_query.is_empty());
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.palette_open,
+                "Esc on the root list still closes the whole palette"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn picking_a_row_restarts_exactly_that_server_and_closes_the_palette(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, _server, cx) = app_with_two_servers(cx, repo.path());
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        press_enter_on(
+            &app,
+            cx,
+            palette::EntryTarget::Command(palette::PaletteCommand::RestartLanguageServer),
+        );
+        press_enter_on(
+            &app,
+            cx,
+            palette::EntryTarget::LanguageServer("rust-analyzer"),
+        );
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "picking a row must run the real restart for that key - a freed key is what lets \
+                 the next render genuinely spawn a fresh process"
+            );
+            assert!(
+                matches!(
+                    app.lsp_clients
+                        .get(&(root.clone(), "typescript-language-server")),
+                    Some(LspClientState::Failed(reason)) if reason == TS_FAILURE
+                ),
+                "the server the user did not pick is left exactly as it was"
+            );
+            assert!(
+                !app.palette_open,
+                "the question was answered, so the palette closes"
+            );
+            assert_eq!(app.palette_step, palette::PaletteStep::Root);
+        });
+    }
+
+    /// One running server is not a choice. The command's own secondary line already names it, so
+    /// asking would be ceremony rather than information.
+    #[gpui::test]
+    fn a_single_running_server_is_restarted_without_a_pointless_second_step(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = crate::root::focus::palette_focus_tests::open_test_app(cx, root.clone());
+        app.update(cx, |app, _cx| {
+            let root = app.file_tree_root.clone();
+            app.lsp_clients.insert(
+                (root, "rust-analyzer"),
+                LspClientState::Failed("rust-analyzer's connection was lost".to_string()),
+            );
+        });
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let groups = app.build_palette_groups(cx);
+            let entry = palette::flatten(&groups)
+                .into_iter()
+                .find(|entry| {
+                    entry.target
+                        == palette::EntryTarget::Command(
+                            palette::PaletteCommand::RestartLanguageServer,
+                        )
+                })
+                .expect("the command is listed while a real server is running")
+                .clone();
+            assert_eq!(
+                entry.secondary, "restart rust-analyzer",
+                "with nothing to choose between, the row says exactly what running it will do"
+            );
+        });
+
+        press_enter_on(
+            &app,
+            cx,
+            palette::EntryTarget::Command(palette::PaletteCommand::RestartLanguageServer),
+        );
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "the one server really restarted"
+            );
+            assert_eq!(
+                app.palette_step,
+                palette::PaletteStep::Root,
+                "no step was entered for a choice that isn't one"
+            );
+            assert!(!app.palette_open);
+        });
+    }
+
+    #[gpui::test]
+    fn the_command_is_not_listed_when_no_server_is_running_at_all(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) =
+            crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        // Typed, so the absence below is a real filter miss rather than the group's own
+        // eight-row cap hiding a row that is in fact listed.
+        cx.simulate_input("restart");
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            assert!(
+                app.lsp_clients.is_empty(),
+                "sanity check: this window really has no live client"
+            );
+            assert_eq!(
+                row_index(
+                    app,
+                    cx,
+                    &palette::EntryTarget::Command(palette::PaletteCommand::RestartLanguageServer)
+                ),
+                None,
+                "a command whose whole job is picking among running servers must not be offered \
+                 when there are none - it would open an empty step and do nothing"
+            );
+        });
     }
 }

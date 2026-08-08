@@ -308,6 +308,7 @@ impl AdeApp {
             palette_open: false,
             palette_results_scroll_handle: gpui::ScrollHandle::new(),
             palette_scope: palette::PaletteScope::default(),
+            palette_step: palette::PaletteStep::default(),
             palette_query: text_history::TextField::new(),
             palette_selected: 0,
             palette_focus_handle,

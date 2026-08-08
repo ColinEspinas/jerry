@@ -85,6 +85,25 @@ pub fn typed_scope_prefix(ch: char) -> Option<PaletteScope> {
     }
 }
 
+/// Which step of the palette is showing. The palette is normally a flat list ([`Self::Root`]);
+/// a step is the one real drill-down shape it has, entered by running a command that needs an
+/// argument rather than doing something immediately.
+///
+/// Deliberately *not* a fourth [`PaletteScope`]: a scope is a user-switchable filter over the
+/// same three candidate kinds (`⇥` cycles them, and every scope is reachable at any time), while
+/// a step is entered only by picking a specific command, lists something else entirely, and is
+/// left with `Esc` - which here means "back to the command list", not "close the palette". See
+/// `crate::root::AdeApp::handle_palette_key_down`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteStep {
+    #[default]
+    Root,
+    /// [`PaletteCommand::RestartLanguageServer`]'s "which server?" step - lists the real live
+    /// clients `crate::lsp::client::AdeApp::restartable_language_servers` reports, and running a
+    /// row restarts exactly that one.
+    PickLanguageServer,
+}
+
 /// An already-open agent, reduced to what a palette row needs - built from the same live
 /// `crate::work_surface::agents::Agents` list the rail (`crate::rail::state::AgentRow`) renders.
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +140,20 @@ pub enum PaletteCommand {
     /// *before* they know which server died, and a command that appears only once the app has
     /// already diagnosed the problem is not a recovery path they can find.
     RestartLanguageServers,
+    /// The single-server half of the same recovery: instead of throwing away *every* server for
+    /// the worktree, this asks which one - `crate::root::AdeApp::begin_language_server_pick`
+    /// moves the palette into [`PaletteStep::PickLanguageServer`], listing the real live clients,
+    /// and picking a row runs `crate::lsp::client::AdeApp::restart_lsp_client` for exactly that
+    /// one. With only one server actually running there is no choice to make, so it restarts that
+    /// one immediately rather than showing a one-row menu; with none running it isn't listed at
+    /// all (the same "never list a command that would silently do nothing" rule
+    /// `crate::root::AdeApp::build_palette_groups` already applies to `OpenGitGraph`).
+    ///
+    /// Worth having beside [`Self::RestartLanguageServers`] because the servers under one root
+    /// are genuinely independent processes: a dead `rust-analyzer` says nothing about the
+    /// `typescript-language-server` beside it, and restarting a healthy multi-GB rust-analyzer to
+    /// recover an unrelated one is real, minutes-long re-indexing a user didn't ask for.
+    RestartLanguageServer,
     /// Pins `crate::keymap::WindowControlsStyle::System`. These three variants and the
     /// Settings "General" page's `Window controls` row both call
     /// `crate::root::AdeApp::set_window_controls_style`, which mutates and persists the same
@@ -146,7 +179,7 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 12] = [
+    pub const ALL: [PaletteCommand; 13] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
@@ -154,6 +187,7 @@ impl PaletteCommand {
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
         PaletteCommand::RestartLanguageServers,
+        PaletteCommand::RestartLanguageServer,
         PaletteCommand::WindowControlsSystem,
         PaletteCommand::WindowControlsMacos,
         PaletteCommand::WindowControlsWindowsLinux,
@@ -176,6 +210,7 @@ impl PaletteCommand {
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
             PaletteCommand::RestartLanguageServers => "Restart Language Servers",
+            PaletteCommand::RestartLanguageServer => "Restart Language Server\u{2026}",
             PaletteCommand::WindowControlsSystem => "Window Controls: System Default",
             PaletteCommand::WindowControlsMacos => "Window Controls: macOS Style",
             PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
@@ -197,6 +232,10 @@ impl PaletteCommand {
             PaletteCommand::RestartLanguageServers => {
                 "lsp language server restart reconnect reload crashed died dead disconnected \
                  hung stuck diagnostics hover completions rust-analyzer typescript pyright vue"
+            }
+            PaletteCommand::RestartLanguageServer => {
+                "lsp language server restart reconnect reload crashed died dead disconnected \
+                 hung stuck one single pick choose which rust-analyzer typescript pyright vue"
             }
             PaletteCommand::WindowControlsSystem => {
                 "window controls title bar caption buttons dots platform override reset"
@@ -237,6 +276,30 @@ pub struct CommandCandidate {
     pub secondary: String,
 }
 
+/// One real, live language server client under the active worktree root - a
+/// [`PaletteStep::PickLanguageServer`] row, built by `crate::root::AdeApp::build_palette_groups`
+/// from `crate::lsp::client::AdeApp::restartable_language_servers`.
+///
+/// The primary label is the real client key (`"rust-analyzer"`,
+/// `"typescript-language-server (vue)"`) rather than the language's display name, because the key
+/// is what is actually unique: Vue runs two processes, and both would otherwise render as "Vue".
+/// The language name is not lost - it goes in [`Self::secondary`] alongside the server's real
+/// state, and into [`Self::keywords`] so typing "vue" or "rust" still finds the row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageServerCandidate {
+    /// The `crate::root::AdeApp::lsp_clients` key's own binary half - what
+    /// `crate::lsp::client::AdeApp::restart_lsp_client` is called with.
+    pub client_key: &'static str,
+    /// Language plus real live state, e.g. `"Rust \u{b7} ready"` or the failure's own text.
+    pub secondary: String,
+    /// Extra search terms (the language's registry display name) - matched, never highlighted,
+    /// exactly like [`PaletteCommand::keywords`].
+    pub keywords: String,
+    /// The rail's status colour for this server's real state, reused verbatim the same way an
+    /// agent row reuses it: [`Status::Run`] for a ready client, [`Status::Fail`] for a failed one.
+    pub status: Status,
+}
+
 /// Whether a file result was added or deleted in the currently loaded diff - the palette row's
 /// optional status dot. `None` for a modified/renamed/unchanged file (no dot colour is defined
 /// for those).
@@ -270,6 +333,12 @@ pub enum EntryTarget {
     /// resolved to repo-relative; see `crate::root::AdeApp::open_palette_file_result`'s docs
     /// for how it decides between opening a real diff and revealing the file in the real tree.
     File(PathBuf),
+    /// A [`PaletteStep::PickLanguageServer`] row: restart exactly this one live client
+    /// (`crate::lsp::client::AdeApp::restart_lsp_client`), never the others running beside it.
+    /// Carries only the client key - the root is always the active worktree's, since these rows
+    /// are rebuilt from live state on every render and there is no way to select a row belonging
+    /// to a root that has since stopped being active.
+    LanguageServer(&'static str),
 }
 
 /// A label split around its matched substring, for `pre`/`mid`/`post` rendering (three adjacent
@@ -313,8 +382,10 @@ pub struct PaletteEntry {
     pub label: MatchedText,
     pub secondary: String,
     pub shortcut: Option<&'static str>,
-    /// Only set for an [`EntryTarget::Agent`] row - the rail's status colour, reused verbatim
-    /// so the palette inherits the rail's colour coding.
+    /// The rail's status colour, reused verbatim so the palette inherits the rail's colour
+    /// coding - set for an [`EntryTarget::Agent`] row (that agent's real status) and for an
+    /// [`EntryTarget::LanguageServer`] row (see [`LanguageServerCandidate::status`]), `None` for
+    /// everything else.
     pub status: Option<Status>,
     /// Only set for an [`EntryTarget::File`] row that is an add/delete in the loaded diff.
     pub file_change: Option<FileChangeKind>,
@@ -494,6 +565,46 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
         ));
     }
     finish_group(scored)
+}
+
+/// Builds the [`PaletteStep::PickLanguageServer`] step's single group - the same
+/// filter/rank/highlight/cap pipeline every other group goes through ([`match_against`],
+/// [`finish_group`]), so typing filters this list, `↑`/`↓` walk it and `⏎` runs it exactly like
+/// the command list a keystroke ago.
+///
+/// Returns no group at all (rather than an empty one) when nothing matches, matching
+/// [`build_groups`]' own convention - the palette then renders its ordinary "no results" state.
+pub fn build_language_server_groups(
+    query: &str,
+    servers: &[LanguageServerCandidate],
+) -> Vec<PaletteGroup> {
+    let mut scored = Vec::new();
+    for candidate in servers {
+        let aux = [candidate.keywords.as_str(), candidate.secondary.as_str()];
+        let Some((span, rank)) = match_against(candidate.client_key, &aux, query) else {
+            continue;
+        };
+        scored.push((
+            rank,
+            PaletteEntry {
+                label: MatchedText::from_match(candidate.client_key, span),
+                secondary: candidate.secondary.clone(),
+                shortcut: None,
+                status: Some(candidate.status),
+                file_change: None,
+                agent_kind: None,
+                target: EntryTarget::LanguageServer(candidate.client_key),
+            },
+        ));
+    }
+    let entries = finish_group(scored);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    vec![PaletteGroup {
+        label: "Language Servers",
+        entries,
+    }]
 }
 
 /// Builds the palette's result groups for the current `scope`/`query`. Group order is always
@@ -861,6 +972,145 @@ mod tests {
             names,
             vec!["logger.rs", "my_logger.rs"],
             "an earlier substring match (offset 0) should rank ahead of a later one (offset 3)"
+        );
+    }
+
+    fn server(
+        client_key: &'static str,
+        secondary: &str,
+        keywords: &str,
+        status: Status,
+    ) -> LanguageServerCandidate {
+        LanguageServerCandidate {
+            client_key,
+            secondary: secondary.to_string(),
+            keywords: keywords.to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn the_language_server_step_lists_every_running_server_as_a_real_restart_target() {
+        let servers = vec![
+            server("rust-analyzer", "Rust \u{b7} ready", "Rust", Status::Run),
+            server(
+                "typescript-language-server",
+                "TypeScript \u{b7} connection lost",
+                "TypeScript",
+                Status::Fail,
+            ),
+        ];
+
+        let groups = build_language_server_groups("", &servers);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Language Servers");
+        let targets: Vec<&EntryTarget> = groups[0].entries.iter().map(|e| &e.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                &EntryTarget::LanguageServer("rust-analyzer"),
+                &EntryTarget::LanguageServer("typescript-language-server"),
+            ],
+            "each row must carry the real client key its restart is keyed by"
+        );
+        assert_eq!(
+            groups[0].entries[1].secondary, "TypeScript \u{b7} connection lost",
+            "the row shows the server's own real state, not a generic label"
+        );
+        assert_eq!(
+            groups[0].entries[1].status,
+            Some(Status::Fail),
+            "a failed server carries the rail's failure colour, so the broken one is the one \
+             that stands out in a list a user is picking from"
+        );
+    }
+
+    /// The step is not a second, differently-behaved widget: the same typing filters it, with the
+    /// same leftmost-match highlighting every other palette row gets.
+    #[test]
+    fn typing_filters_the_language_server_step_and_highlights_the_match() {
+        let servers = vec![
+            server("rust-analyzer", "Rust \u{b7} ready", "Rust", Status::Run),
+            server(
+                "typescript-language-server",
+                "TypeScript \u{b7} ready",
+                "TypeScript",
+                Status::Run,
+            ),
+        ];
+
+        let groups = build_language_server_groups("analyzer", &servers);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].entries.len(), 1);
+        assert_eq!(groups[0].entries[0].label.mid, "analyzer");
+        assert_eq!(
+            groups[0].entries[0].target,
+            EntryTarget::LanguageServer("rust-analyzer")
+        );
+
+        assert!(
+            build_language_server_groups("zzz", &servers).is_empty(),
+            "a query matching no server yields no group at all, so the palette shows its own \
+             'no results' state rather than an empty header"
+        );
+    }
+
+    /// A `.vue` project runs two processes whose keys differ but whose language name doesn't -
+    /// the language name is still searchable, and both rows stay individually pickable.
+    #[test]
+    fn a_language_name_matches_through_keywords_without_collapsing_two_real_servers() {
+        let servers = vec![
+            server(
+                "vue-language-server",
+                "Vue \u{b7} ready",
+                "Vue",
+                Status::Run,
+            ),
+            server(
+                "typescript-language-server (vue)",
+                "Vue companion \u{b7} ready",
+                "Vue companion",
+                Status::Run,
+            ),
+        ];
+
+        let groups = build_language_server_groups("vue", &servers);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].entries.len(),
+            2,
+            "both real processes stay pickable - restarting one must not be a choice the palette \
+             quietly merges into the other"
+        );
+        let targets: Vec<&EntryTarget> = groups[0].entries.iter().map(|e| &e.target).collect();
+        assert!(targets.contains(&&EntryTarget::LanguageServer("vue-language-server")));
+        assert!(targets.contains(&&EntryTarget::LanguageServer(
+            "typescript-language-server (vue)"
+        )));
+    }
+
+    /// `PaletteCommand::ALL` only enumerates the enum - it is read by tests, never by
+    /// `AdeApp::build_palette_groups` (the hand-built `Vec<CommandCandidate>` in
+    /// `palette::render` is the one thing the palette actually searches), so a variant appearing
+    /// here is not proof a user can ever find it. That gap is exactly the live-reported bug fixed
+    /// separately (issue #203's own visibility fix): `RestartLanguageServers` and
+    /// `CheckForUpdates` both have real labels here and were still unreachable. This test is
+    /// deliberately scoped to what *is* true at the enum level - two distinct variants with two
+    /// distinct labels - not to whether either is listed; whether the new singular
+    /// `RestartLanguageServer` really is listed is covered live, against the real
+    /// `build_palette_groups` output, by `render::palette_language_server_step_tests` instead.
+    #[test]
+    fn restart_one_and_restart_all_are_two_distinct_commands_with_their_own_labels() {
+        assert_ne!(
+            PaletteCommand::RestartLanguageServer,
+            PaletteCommand::RestartLanguageServers,
+            "the bulk recovery and the single-server one are genuinely different actions"
+        );
+        assert_ne!(
+            PaletteCommand::RestartLanguageServer.label(),
+            PaletteCommand::RestartLanguageServers.label(),
+            "two different actions must not read as the same command in a search result"
         );
     }
 
