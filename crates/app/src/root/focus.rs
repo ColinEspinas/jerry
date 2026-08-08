@@ -2059,4 +2059,58 @@ mod palette_result_focus_tests {
              non-opening palette command would silently strand the next keystroke"
         );
     }
+
+    /// Live-reported: "restart lsp server" wasn't findable in the palette at all. Real root
+    /// cause, found by reading the actual list `AdeApp::build_palette_groups` hands the palette
+    /// rather than `PaletteCommand::ALL` (which only enumerates the enum, not what a user can
+    /// actually reach): `RestartLanguageServers` and `CheckForUpdates` had a real label, real
+    /// search keywords, and a real click handler in `handle_palette_command` since the commits
+    /// that introduced them, but neither was ever pushed into the hand-built `commands` vec in
+    /// `render.rs` - so the palette never listed either one, under any query.
+    ///
+    /// Searches by each command's own label rather than checking an unfiltered, empty-query
+    /// listing: `MAX_ENTRIES_PER_GROUP` (8) caps the plain "Commands" group, and this app now
+    /// defines 11 non-git commands - more than that cap - so an empty-query browse can never show
+    /// all of them at once even in a fully working palette. That's real, pre-existing, unrelated
+    /// behavior, not the bug; typing a command's own name to find it is how a user actually
+    /// reaches one they don't see in the unfiltered top-8, and is what this test drives instead.
+    ///
+    /// One deliberate, documented exception: `OpenGitGraph` only appears with a focused repo
+    /// (GitHub issue #90 - see `build_palette_groups`'s own comment on why that entry is dropped
+    /// rather than shown disabled). This drives a real, empty window, so that guard is the one
+    /// gap this test itself expects and excludes.
+    #[gpui::test]
+    fn every_palette_command_is_findable_by_its_own_label(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        for command in palette::PaletteCommand::ALL {
+            if command == palette::PaletteCommand::OpenGitGraph {
+                continue;
+            }
+            app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
+            app.update(cx, |app, _| {
+                app.palette_query
+                    .push_str(command.label(), std::time::Instant::now());
+            });
+            cx.run_until_parked();
+
+            let found = app.update(cx, |app, cx| {
+                let groups = app.build_palette_groups(cx);
+                palette::flatten(&groups)
+                    .iter()
+                    .any(|entry| entry.target == palette::EntryTarget::Command(command))
+            });
+            assert!(
+                found,
+                "{:?} has a real handler but searching its own label {:?} finds nothing in the \
+                 palette - the exact shape of the live-reported bug",
+                command,
+                command.label()
+            );
+
+            app.update_in(cx, |app, window, cx| app.close_palette(window, cx));
+            cx.run_until_parked();
+        }
+    }
 }
