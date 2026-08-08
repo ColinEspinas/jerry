@@ -406,6 +406,8 @@ impl AdeApp {
             _hover_hide_task: None,
             hover_card_bounds: None,
             diagnostic_card_bounds: None,
+            diagnostic_copy_confirmed: None,
+            _diagnostic_copy_confirm_task: None,
             hover_card_scroll_handle: gpui::ScrollHandle::new(),
             _hover_request_task: None,
             _goto_definition_tasks: TaskPool::new(),
