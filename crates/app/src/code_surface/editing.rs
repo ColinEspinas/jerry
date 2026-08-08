@@ -1549,15 +1549,18 @@ fn render_fold_chevron(
         // builds, matching every other `debug_selector` in this crate.
         .debug_selector(move || format!("file-view-fold-chevron-{line_number}"))
         .absolute()
-        .left(gpui::px(3.0))
+        .left(gpui::px(2.0))
         .top_0()
         .h_full()
-        .w(gpui::px(12.0))
+        .w(gpui::px(16.0))
         .flex()
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .text_size(gpui::px(9.0))
+        // Live-reported: too small to notice at the original 9px/12px box - bumped to match the
+        // line number's own 11px (`text_size(gpui::px(11.0))` on the gutter container above) so
+        // the chevron reads at a glance rather than disappearing next to it.
+        .text_size(gpui::px(11.0))
         .text_color(if folded {
             theme::editor::GUTTER_TEXT_ACTIVE
         } else {
@@ -5341,6 +5344,44 @@ let last = 5;
         assert!(
             cx.debug_bounds("file-view-fold-marker-1").is_none(),
             "nothing is folded yet, so no `⋯ N lines` marker may be drawn"
+        );
+    }
+
+    /// Live-reported: the chevron was too small to notice, sized up in response
+    /// (`render_fold_chevron`: 9px/12px box -> 11px/16px box, `left` 3px -> 2px). A real
+    /// regression guard that the bigger box still sits where it's coded to, inside the gutter's
+    /// own real measured bounds - not a claim about the line number's own glyph bounds, which
+    /// nothing paints a separately-measurable box for, but the arithmetic the comment below
+    /// gives is real: the gutter is a fixed 52px box with 12px of right padding
+    /// (`render_editable_file_view_line`), so real text has 40px to paint in; the chevron's own
+    /// right edge at 2+16=18px inside that box leaves 22px clear before it, comfortably more
+    /// than a real 3-digit line number needs at the gutter's 11px mono font.
+    #[gpui::test]
+    fn the_bigger_fold_chevron_still_sits_inside_the_gutters_own_left_margin(
+        cx: &mut TestAppContext,
+    ) {
+        let (_app, cx, _path) = open_foldable_file(cx);
+
+        let gutter = cx
+            .debug_bounds("file-view-gutter-1")
+            .expect("line 1's real gutter box must be painted");
+        let chevron = cx
+            .debug_bounds("file-view-fold-chevron-1")
+            .expect("line 1 opens a block, so it must offer a chevron");
+
+        assert_eq!(
+            chevron.left() - gutter.left(),
+            gpui::px(2.0),
+            "the chevron's real left offset inside its real gutter parent must match what \
+             `render_fold_chevron` is coded to paint"
+        );
+        assert_eq!(
+            chevron.right() - gutter.left(),
+            gpui::px(18.0),
+            "the chevron's real right edge (2px left + 16px wide) must land inside the \
+             documented 22px of clearance before the gutter's own 40px text region \
+             (52px box - 12px right padding), not creep into where a real 3-digit line number \
+             paints"
         );
     }
 
