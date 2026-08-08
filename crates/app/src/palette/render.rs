@@ -201,6 +201,21 @@ impl AdeApp {
                     WindowControlsStyle::WindowsLinuxStyle,
                 ),
             },
+            // Real, previously-reported bug: `PaletteCommand::RestartLanguageServers` and
+            // `PaletteCommand::CheckForUpdates` have carried a real label, real search keywords,
+            // and a real click handler (see the `handle_palette_command` match below) since the
+            // commits that introduced them - but neither was ever pushed into this hand-built
+            // list, so the palette never actually listed either one. `PaletteCommand::ALL`
+            // (used by this module's own exhaustive-listing test) didn't catch the gap because
+            // it enumerates the enum, not what actually reaches a user.
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::RestartLanguageServers,
+                secondary: "recover a language server that stopped responding".to_string(),
+            },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::CheckForUpdates,
+                secondary: "check GitHub for a newer release".to_string(),
+            },
         ];
         // GitHub issue #90: a genuinely empty window has no real repo to graph -
         // `crate::graph_view::render::AdeApp::open_git_graph`'s own guard now refuses outright
