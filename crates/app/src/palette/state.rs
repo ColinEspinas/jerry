@@ -1090,15 +1090,27 @@ mod tests {
         )));
     }
 
+    /// `PaletteCommand::ALL` only enumerates the enum - it is read by tests, never by
+    /// `AdeApp::build_palette_groups` (the hand-built `Vec<CommandCandidate>` in
+    /// `palette::render` is the one thing the palette actually searches), so a variant appearing
+    /// here is not proof a user can ever find it. That gap is exactly the live-reported bug fixed
+    /// separately (issue #203's own visibility fix): `RestartLanguageServers` and
+    /// `CheckForUpdates` both have real labels here and were still unreachable. This test is
+    /// deliberately scoped to what *is* true at the enum level - two distinct variants with two
+    /// distinct labels - not to whether either is listed; whether the new singular
+    /// `RestartLanguageServer` really is listed is covered live, against the real
+    /// `build_palette_groups` output, by `render::palette_language_server_step_tests` instead.
     #[test]
-    fn restart_one_and_restart_all_are_two_distinct_listed_commands() {
-        let labels: Vec<&str> = PaletteCommand::ALL.iter().map(|c| c.label()).collect();
-        assert!(labels.contains(&"Restart Language Servers"));
-        assert!(labels.contains(&"Restart Language Server\u{2026}"));
+    fn restart_one_and_restart_all_are_two_distinct_commands_with_their_own_labels() {
         assert_ne!(
             PaletteCommand::RestartLanguageServer,
             PaletteCommand::RestartLanguageServers,
             "the bulk recovery and the single-server one are genuinely different actions"
+        );
+        assert_ne!(
+            PaletteCommand::RestartLanguageServer.label(),
+            PaletteCommand::RestartLanguageServers.label(),
+            "two different actions must not read as the same command in a search result"
         );
     }
 
