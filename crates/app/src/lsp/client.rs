@@ -682,7 +682,60 @@ impl AdeApp {
     /// no server state in it at all, and dropping it would needlessly stall the next tick's
     /// completions (see [`Self::prepare_lsp_sync`]'s own cache-miss branch).
     pub(crate) fn restart_lsp_clients(&mut self, cx: &mut Context<Self>) {
+        self.restart_lsp_scope(LspRestartScope::EveryServer, cx);
+    }
+
+    /// Restarts exactly one live client under the active worktree root - the real action behind
+    /// [`crate::palette::state::PaletteCommand::RestartLanguageServer`]'s "which server?" step,
+    /// where `binary` is an [`AdeApp::lsp_clients`] key's own second half (an
+    /// [`crate::language::LspIdentity::binary`], or a
+    /// [`crate::language::CompanionServer::client_key`] such as
+    /// `"typescript-language-server (vue)"`).
+    ///
+    /// Runs [`Self::restart_lsp_clients`]' teardown discipline verbatim - same code, same order -
+    /// but scoped to this one server: see [`Self::restart_lsp_scope`], which both go through, and
+    /// [`restart_scope_owns_path`] for how "this server's own documents" is decided. A no-op for
+    /// a key that isn't currently live (or is still `Spawning`, which
+    /// [`Self::restart_lsp_clients`]' own docs explain must never be torn down mid-spawn).
+    pub(crate) fn restart_lsp_client(&mut self, binary: &'static str, cx: &mut Context<Self>) {
+        self.restart_lsp_scope(LspRestartScope::OneServer(binary), cx);
+    }
+
+    /// The shared body of both restarts, so the ordering discipline
+    /// [`Self::restart_lsp_clients`]' docs describe exists in exactly one place and the
+    /// single-server path can never drift from it.
+    ///
+    /// The only thing `scope` changes is *how much* is forgotten. Restarting everything forgets
+    /// the whole active root's conversation (what this method did when it was the only restart
+    /// there was); restarting one server forgets only the paths that server was ever told about
+    /// ([`restart_scope_owns_path`]), and touches another live client's sync bookkeeping,
+    /// diagnostics and completions not at all - a `rust-analyzer` restart must not silently
+    /// desync the `typescript-language-server` running beside it.
+    ///
+    /// ## The one honest gap in the single-server case
+    ///
+    /// The completions/hover/diagnostics half is decided by whether the *file on screen*
+    /// ([`AdeApp::active_editable_path`]) belongs to the restarted server, since all three
+    /// describe that file. If a completion request was dispatched against this server and the
+    /// user then switched to another language's file before clicking restart, its task is left
+    /// running: its captured `Arc` clone will defeat `Arc::try_unwrap` in the teardown below, so
+    /// the old process is dropped rather than shut down gracefully (`lsp_core::LspClient`'s own
+    /// `Drop` still kills it once that task finishes or is cancelled). The alternative -
+    /// cancelling completion work unconditionally - would break the "restarting one server never
+    /// disturbs another's live state" guarantee for a much more common case, so this narrow,
+    /// self-healing one is accepted rather than hidden.
+    fn restart_lsp_scope(&mut self, scope: LspRestartScope, cx: &mut Context<Self>) {
         let root = self.file_tree_root.clone();
+        // Whether what is currently on screen was computed by a server this restart is tearing
+        // down - read before anything is dropped, and `true` for the whole-root restart, which
+        // by definition owns everything the active worktree's file view is showing.
+        let on_screen_is_ours = match scope {
+            LspRestartScope::EveryServer => true,
+            LspRestartScope::OneServer(_) => self
+                .active_editable_path()
+                .is_some_and(|path| restart_scope_owns_path(scope, &path)),
+        };
+
         // Dropped *first*, before a single map is cleared. Each of these is a real in-flight
         // background task that ends by writing back into exactly the bookkeeping cleared below:
         // `schedule_lsp_sync`'s continuation re-inserts `lsp_last_synced_content`/
@@ -698,15 +751,22 @@ impl AdeApp {
         // `Arc<LspConnection>` clone from defeating `Arc::try_unwrap` in the teardown below and
         // leaving the old server process alive alongside the new one. Same discipline, and the
         // same ordering, as `AdeApp::select_worktree`'s own worktree-switch reset.
-        self._lsp_sync_tasks = std::collections::HashMap::new();
-        self._completions_request_task = None;
-        self._completions_resolve_task = None;
-        self.completions_resolve_in_flight = None;
+        self._lsp_sync_tasks
+            .retain(|relative, _| !restart_scope_owns_path(scope, relative));
+        if on_screen_is_ours {
+            self._completions_request_task = None;
+            self._completions_resolve_task = None;
+            self.completions_resolve_in_flight = None;
+        }
 
         let keys: Vec<LspClientKey> = self
             .lsp_clients
             .keys()
             .filter(|(key_root, _)| *key_root == root)
+            .filter(|(_, key_binary)| match scope {
+                LspRestartScope::EveryServer => true,
+                LspRestartScope::OneServer(binary) => *key_binary == binary,
+            })
             // A `Spawning` entry is deliberately left in place. Its own background task is still
             // in flight and will re-insert under this key when it resolves, so removing it here
             // would free the key for the next render to spawn a *second* real process for the
@@ -715,7 +775,9 @@ impl AdeApp {
             // no longer the active root's; that reasoning does not carry over here.) Nothing is
             // lost by waiting: a spawn in flight is already the fresh start a restart is asking
             // for, and if it resolves into a client that is itself dead, the poll loop's own
-            // `reap_dead_lsp_clients` catches it on the next tick.
+            // `reap_dead_lsp_clients` catches it on the next tick. It is also why the palette's
+            // own picker never offers a `Spawning` server as a choice (see
+            // [`Self::restartable_language_servers`]) - picking one would do nothing at all.
             .filter(|key| !matches!(self.lsp_clients.get(key), Some(LspClientState::Spawning)))
             .cloned()
             .collect();
@@ -727,24 +789,61 @@ impl AdeApp {
         }
 
         self.lsp_opened_files
-            .retain(|path| !path.starts_with(&root));
+            .retain(|path| !(path.starts_with(&root) && restart_scope_owns_path(scope, path)));
         self.lsp_document_versions
-            .retain(|path, _| !path.starts_with(&root));
+            .retain(|path, _| !(path.starts_with(&root) && restart_scope_owns_path(scope, path)));
         // Worktree-relative-keyed, and only ever holding the *active* worktree's paths (see
-        // `AdeApp::select_worktree`, which clears all three on a switch) - so
-        // clearing them outright is exactly "forget this root's conversation", not an
-        // over-broad reset.
-        self.lsp_last_synced_content.clear();
-        self.lsp_synced_version.clear();
-        self.lsp_diagnostics_confirmed_version.clear();
-        // Anything still on screen was computed from the connection just torn down - the same
-        // set `AdeApp::select_worktree` clears for the same reason.
-        self.dismiss_completions();
-        self.dismiss_hover();
-        self.file_view_diagnostics = std::collections::HashMap::new();
+        // `AdeApp::select_worktree`, which clears all three on a switch) - so for
+        // `EveryServer` (where `restart_scope_owns_path` is unconditionally true) this is exactly
+        // "forget this root's conversation", not an over-broad reset.
+        self.lsp_last_synced_content
+            .retain(|relative, _| !restart_scope_owns_path(scope, relative));
+        self.lsp_synced_version
+            .retain(|relative, _| !restart_scope_owns_path(scope, relative));
+        self.lsp_diagnostics_confirmed_version
+            .retain(|relative, _| !restart_scope_owns_path(scope, relative));
+        if on_screen_is_ours {
+            // Anything still on screen was computed from the connection just torn down - the same
+            // set `AdeApp::select_worktree` clears for the same reason.
+            self.dismiss_completions();
+            self.dismiss_hover();
+            self.file_view_diagnostics = std::collections::HashMap::new();
+        }
         // The next render's own `ensure_lsp_client`/`dispatch_did_open` calls do the real
         // respawn and re-open, through exactly the same code path a cold start uses.
         cx.notify();
+    }
+
+    /// Every live client under the active worktree root a user could meaningfully restart right
+    /// now, newest state and all - what the palette's "which server?" step lists, and the reason
+    /// it can list something real rather than a hardcoded menu of server names.
+    ///
+    /// Sorted by client key so the rows have a stable order across renders ([`AdeApp::lsp_clients`]
+    /// is a `HashMap`, whose iteration order is not). `Spawning` entries are deliberately absent -
+    /// see [`Self::restart_lsp_scope`]'s own filter for why restarting one is a no-op, and offering
+    /// a choice that does nothing would be exactly the fake affordance this app refuses.
+    pub(crate) fn restartable_language_servers(&self) -> Vec<RunningLanguageServer> {
+        let root = self.file_tree_root.clone();
+        let mut servers: Vec<RunningLanguageServer> = self
+            .lsp_clients
+            .iter()
+            .filter(|((key_root, _), _)| *key_root == root)
+            .filter_map(|((_, binary), state)| {
+                let state = match state {
+                    LspClientState::Spawning => return None,
+                    LspClientState::Ready(_) => LanguageServerRunState::Ready,
+                    LspClientState::Failed(reason) => {
+                        LanguageServerRunState::Failed(reason.clone())
+                    }
+                };
+                Some(RunningLanguageServer {
+                    client_key: binary,
+                    state,
+                })
+            })
+            .collect();
+        servers.sort_by_key(|server| server.client_key);
+        servers
     }
 
     /// Lazily spawns (or reuses) an `lsp_core::LspClient` for `repo_root` running the server for
@@ -2079,6 +2178,61 @@ impl AdeApp {
             .get(&item_index)
             .or_else(|| items.get(item_index))
     }
+}
+
+/// How much of the active worktree root's LSP state one restart covers - see
+/// [`AdeApp::restart_lsp_scope`], the one place this is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::lsp) enum LspRestartScope {
+    /// Every restartable client under the active root - `AdeApp::restart_lsp_clients`, the bulk
+    /// "something is wrong, start over" recovery.
+    EveryServer,
+    /// Exactly one client, named by its [`LspClientKey`]'s own binary half -
+    /// `AdeApp::restart_lsp_client`.
+    OneServer(&'static str),
+}
+
+/// Whether `path` (absolute or worktree-relative - only its extension is read) is one of the
+/// documents `scope`'s servers were ever told about, and therefore whose bookkeeping this restart
+/// must forget. Unconditionally true for [`LspRestartScope::EveryServer`], which is what keeps
+/// the whole-root restart byte-for-byte the pass it always was.
+///
+/// Extension-keyed via `crate::language::lsp_client_key_owns_extension`, so the sharing cases are
+/// the registry's answer rather than a second opinion: `.ts`/`.tsx`/`.js`/`.jsx` all belong to one
+/// `typescript-language-server`, and a `.vue` file belongs to *both* `vue-language-server` and its
+/// distinctly-keyed companion, because both were genuinely sent its `didOpen`.
+fn restart_scope_owns_path(scope: LspRestartScope, path: &Path) -> bool {
+    match scope {
+        LspRestartScope::EveryServer => true,
+        LspRestartScope::OneServer(binary) => crate::language::lsp_client_key_owns_extension(
+            binary,
+            path.extension().and_then(|extension| extension.to_str()),
+        ),
+    }
+}
+
+/// One live [`AdeApp::lsp_clients`] entry under the active worktree root, reduced to what a
+/// "which server do you want to restart?" row needs - see
+/// [`AdeApp::restartable_language_servers`], which is the only thing that builds these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningLanguageServer {
+    /// The real [`LspClientKey`] binary half this client is keyed by - what
+    /// [`AdeApp::restart_lsp_client`] takes, and (via
+    /// `crate::language::language_for_lsp_client_key`) what its language display name is looked
+    /// up from.
+    pub client_key: &'static str,
+    pub state: LanguageServerRunState,
+}
+
+/// A [`RunningLanguageServer`]'s real current state - [`LspClientState`] minus the two things a
+/// picker row can't use: the live `Arc` (a row only needs to say "ready"), and `Spawning`, which
+/// is deliberately never offered as a choice at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LanguageServerRunState {
+    Ready,
+    /// The real `lsp_core::LspError`/connection-lost text, shown as-is - the same string
+    /// [`LspClientState::Failed`] carries and the File view's own status chip renders.
+    Failed(String),
 }
 
 /// The state of one repository root's `lsp_core::LspClient` across its asynchronous
@@ -4294,6 +4448,328 @@ process.stdin.on('data', (d) => {
                 "the real spawn error must be surfaced as-is, naming the binary that was actually \
                  attempted - anything vaguer would let this pass without a real attempt having \
                  been made: {message}"
+            );
+        });
+    }
+
+    /// The single-server restart's whole point, and the thing that would make it worse than
+    /// useless if it were wrong: restarting one server must not disturb another one running
+    /// beside it. Both clients here are genuinely spawned processes with real armed sync tasks
+    /// and real bookkeeping, and only one of them is restarted.
+    #[gpui::test]
+    async fn restarting_one_server_leaves_every_other_live_client_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let rust_absolute = root.join("src").join("main.rs");
+        let ts_absolute = root.join("src").join("app.ts");
+        std::fs::write(&rust_absolute, "fn main() {}\n").expect("write main.rs");
+        std::fs::write(&ts_absolute, "export const a = 1;\n").expect("write app.ts");
+        let rust_relative = PathBuf::from("src/main.rs");
+        let ts_relative = PathBuf::from("src/app.ts");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let rust_server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let ts_server = spawn_fake_server(repo.path(), "typescript-language-server", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(rust_server.clone()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), "typescript-language-server"),
+                LspClientState::Ready(ts_server.clone()),
+            );
+            app.open_file_view(rust_absolute.clone(), window, cx);
+            app.open_file_view(ts_absolute.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        // Real armed sync tasks through the real production entry point, plus the document
+        // bookkeeping a real conversation with each server would have left behind.
+        app.update(cx, |app, cx| {
+            app.schedule_lsp_sync(root.clone(), rust_relative.clone(), cx);
+            app.schedule_lsp_sync(root.clone(), ts_relative.clone(), cx);
+            app.lsp_opened_files.insert(rust_absolute.clone());
+            app.lsp_opened_files.insert(ts_absolute.clone());
+            app.lsp_document_versions.insert(rust_absolute.clone(), 7);
+            app.lsp_document_versions.insert(ts_absolute.clone(), 9);
+            app.lsp_last_synced_content
+                .insert(rust_relative.clone(), "fn main() {}".to_string());
+            app.lsp_last_synced_content
+                .insert(ts_relative.clone(), "export const a = 1;".to_string());
+            app.lsp_synced_version.insert(rust_relative.clone(), 7);
+            app.lsp_synced_version.insert(ts_relative.clone(), 9);
+            app.lsp_diagnostics_confirmed_version
+                .insert(rust_relative.clone(), 7);
+            app.lsp_diagnostics_confirmed_version
+                .insert(ts_relative.clone(), 9);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._lsp_sync_tasks.contains_key(&rust_relative)
+                    && app._lsp_sync_tasks.contains_key(&ts_relative),
+                "sanity check: both real production sync tasks must genuinely be armed, or the \
+                 assertions below prove nothing"
+            );
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_client("rust-analyzer", cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "the restarted server's own key has to be genuinely freed, or the next render's \
+                 `ensure_lsp_client` no-ops and the restart did nothing"
+            );
+            assert!(
+                matches!(
+                    app.lsp_clients
+                        .get(&(root.clone(), "typescript-language-server")),
+                    Some(LspClientState::Ready(_))
+                ),
+                "the other language's client is a separate process that was working fine - \
+                 restarting rust-analyzer must not take it down with it"
+            );
+
+            assert!(
+                !app._lsp_sync_tasks.contains_key(&rust_relative),
+                "the restarted server's in-flight sync would re-record 'the server already has \
+                 this content' for a process that no longer exists"
+            );
+            assert!(
+                app._lsp_sync_tasks.contains_key(&ts_relative),
+                "the other server's in-flight sync is real work against a live connection - \
+                 cancelling it would silently desync a server nobody asked to restart"
+            );
+
+            assert!(!app.lsp_opened_files.contains(&rust_absolute));
+            assert!(
+                app.lsp_opened_files.contains(&ts_absolute),
+                "the surviving server was really told about this file and still remembers it - \
+                 forgetting it here would suppress nothing and re-open nothing, but would make \
+                 `didOpen` fire a second time for a document it already has"
+            );
+            assert!(!app.lsp_document_versions.contains_key(&rust_absolute));
+            assert_eq!(app.lsp_document_versions.get(&ts_absolute), Some(&9));
+            assert!(!app.lsp_last_synced_content.contains_key(&rust_relative));
+            assert_eq!(
+                app.lsp_last_synced_content
+                    .get(&ts_relative)
+                    .map(String::as_str),
+                Some("export const a = 1;"),
+                "clearing this for a server that is still live is the exact failure the bulk \
+                 restart's own docs describe, just aimed at the wrong server"
+            );
+            assert!(!app.lsp_synced_version.contains_key(&rust_relative));
+            assert_eq!(app.lsp_synced_version.get(&ts_relative), Some(&9));
+            assert!(!app
+                .lsp_diagnostics_confirmed_version
+                .contains_key(&rust_relative));
+            assert_eq!(
+                app.lsp_diagnostics_confirmed_version.get(&ts_relative),
+                Some(&9)
+            );
+        });
+    }
+
+    /// Restarting everything still means everything, including a language whose files the
+    /// single-server path would have scoped away - this is the same fixture as the test above,
+    /// run through the bulk command instead.
+    #[gpui::test]
+    async fn restarting_every_server_still_forgets_the_whole_roots_conversation(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let rust_absolute = root.join("src").join("main.rs");
+        let ts_absolute = root.join("src").join("app.ts");
+        std::fs::write(&rust_absolute, "fn main() {}\n").expect("write main.rs");
+        std::fs::write(&ts_absolute, "export const a = 1;\n").expect("write app.ts");
+        let rust_relative = PathBuf::from("src/main.rs");
+        let ts_relative = PathBuf::from("src/app.ts");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let rust_server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+        let ts_server = spawn_fake_server(repo.path(), "typescript-language-server", "normal");
+        app.update_in(cx, |app, window, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(rust_server.clone()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), "typescript-language-server"),
+                LspClientState::Ready(ts_server.clone()),
+            );
+            app.open_file_view(rust_absolute.clone(), window, cx);
+            app.open_file_view(ts_absolute.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.schedule_lsp_sync(root.clone(), rust_relative.clone(), cx);
+            app.schedule_lsp_sync(root.clone(), ts_relative.clone(), cx);
+            app.lsp_opened_files.insert(rust_absolute.clone());
+            app.lsp_opened_files.insert(ts_absolute.clone());
+            app.lsp_document_versions.insert(rust_absolute.clone(), 7);
+            app.lsp_document_versions.insert(ts_absolute.clone(), 9);
+            app.lsp_last_synced_content
+                .insert(rust_relative.clone(), "fn main() {}".to_string());
+            app.lsp_last_synced_content
+                .insert(ts_relative.clone(), "export const a = 1;".to_string());
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_clients(cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), "rust-analyzer")),
+                "every client under the active root goes, not just the active file's"
+            );
+            // The file on screen is the `.ts` one, so the very next render has already begun a
+            // genuinely fresh spawn under its key - the real respawn path a restart exists to
+            // trigger. What must never survive is the *old* client: `Ready` here would mean the
+            // torn-down connection was still being handed out.
+            assert!(
+                !matches!(
+                    app.lsp_clients
+                        .get(&(root.clone(), "typescript-language-server")),
+                    Some(LspClientState::Ready(_))
+                ),
+                "the old TypeScript client must be gone too - only a fresh spawn may hold this key"
+            );
+            assert!(app._lsp_sync_tasks.is_empty());
+            assert!(app.lsp_opened_files.is_empty());
+            assert!(app.lsp_document_versions.is_empty());
+            assert!(app.lsp_last_synced_content.is_empty());
+            assert!(app.lsp_synced_version.is_empty());
+            assert!(app.lsp_diagnostics_confirmed_version.is_empty());
+        });
+    }
+
+    /// Vue is the one language whose files belong to two clients at once, so it is the one place
+    /// "which documents does this server own" can go wrong in both directions: restarting the
+    /// companion must forget the `.vue` bookkeeping (the companion really was sent that file) and
+    /// must not take the primary's own client down with it.
+    #[gpui::test]
+    fn restarting_a_companion_forgets_its_own_documents_without_touching_its_primary(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let spec = vue_companion_spec();
+        let vue_absolute = root.join("src").join("App.vue");
+        let vue_relative = PathBuf::from("src/App.vue");
+        let ts_absolute = root.join("src").join("util.ts");
+        let ts_relative = PathBuf::from("src/util.ts");
+
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "vue-language-server"),
+                LspClientState::Failed("vue-language-server's connection was lost".to_string()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), spec.client_key),
+                LspClientState::Failed("the companion's connection was lost".to_string()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), "typescript-language-server"),
+                LspClientState::Failed("plain tsserver".to_string()),
+            );
+            app.lsp_opened_files.insert(vue_absolute.clone());
+            app.lsp_opened_files.insert(ts_absolute.clone());
+            app.lsp_last_synced_content
+                .insert(vue_relative.clone(), "<template/>".to_string());
+            app.lsp_last_synced_content
+                .insert(ts_relative.clone(), "export const a = 1;".to_string());
+        });
+
+        app.update(cx, |app, cx| app.restart_lsp_client(spec.client_key, cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.lsp_clients
+                    .contains_key(&(root.clone(), spec.client_key)),
+                "the companion is a genuinely separate process under its own key, so it is \
+                 restartable on its own"
+            );
+            assert!(
+                app.lsp_clients
+                    .contains_key(&(root.clone(), "vue-language-server")),
+                "its primary is a different process that was not asked to restart"
+            );
+            assert!(
+                app.lsp_clients
+                    .contains_key(&(root.clone(), "typescript-language-server")),
+                "and the plain TypeScript client shares the companion's *binary* but not its \
+                 key - conflating the two would restart a client the user never picked"
+            );
+            assert!(
+                !app.lsp_opened_files.contains(&vue_absolute),
+                "the companion really was sent this .vue file's didOpen, so a fresh one owes it \
+                 another"
+            );
+            assert!(
+                app.lsp_opened_files.contains(&ts_absolute),
+                "a .ts file is never opened in the Vue-flavoured companion at all"
+            );
+            assert!(!app.lsp_last_synced_content.contains_key(&vue_relative));
+            assert!(app.lsp_last_synced_content.contains_key(&ts_relative));
+        });
+    }
+
+    /// What the palette's "which server?" step actually reads. `Spawning` is deliberately absent:
+    /// the restart itself skips those keys, so offering one would be a row that does nothing.
+    #[gpui::test]
+    fn the_restartable_server_list_is_the_real_live_client_map(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let ready = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
+
+        app.update(cx, |app, _cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(ready.clone()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), "typescript-language-server"),
+                LspClientState::Failed("typescript-language-server's connection was lost".into()),
+            );
+            app.lsp_clients.insert(
+                (root.clone(), "pyright-langserver"),
+                LspClientState::Spawning,
+            );
+            // A different worktree's client, which this worktree's restart never touches.
+            app.lsp_clients.insert(
+                (root.join("other"), "gopls"),
+                LspClientState::Failed("elsewhere".to_string()),
+            );
+        });
+
+        app.read_with(cx, |app, _| {
+            let servers = app.restartable_language_servers();
+            assert_eq!(
+                servers,
+                vec![
+                    RunningLanguageServer {
+                        client_key: "rust-analyzer",
+                        state: LanguageServerRunState::Ready,
+                    },
+                    RunningLanguageServer {
+                        client_key: "typescript-language-server",
+                        state: LanguageServerRunState::Failed(
+                            "typescript-language-server's connection was lost".to_string()
+                        ),
+                    },
+                ],
+                "only this root's non-spawning clients, in a stable order, each carrying its own \
+                 real state - a failed one keeps the server's own message so the row can show it"
             );
         });
     }

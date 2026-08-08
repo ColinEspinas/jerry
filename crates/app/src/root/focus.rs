@@ -66,6 +66,9 @@ impl AdeApp {
         self.new_file_input = None;
         self.palette_focus.capture(window, &self.agents, cx);
         self.palette_scope = palette::PaletteScope::default();
+        // A reopened palette always starts on its root list, never inside a half-answered
+        // drill-down step (`crate::palette::state::PaletteStep`).
+        self.palette_step = palette::PaletteStep::Root;
         // A reopened palette is a genuinely new widget instance, so its predecessor's undo
         // history must not be reachable from it - `reset`, not `clear` (which is itself a real,
         // undoable step). See `crate::text_history::TextField`'s own docs.
@@ -83,6 +86,7 @@ impl AdeApp {
     /// [`crate::palette::render::AdeApp::run_selected_palette_entry`].
     pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
+        self.palette_step = palette::PaletteStep::Root;
         if self.settings_open {
             // Settings is showing underneath (either `OpenSettings` just opened it, or the
             // palette was opened while Settings was already open and is now dismissing back
@@ -123,6 +127,7 @@ impl AdeApp {
     /// Settings after asking for a file.
     pub(crate) fn close_palette_keeping_result_focus(&mut self, cx: &mut Context<Self>) {
         self.palette_open = false;
+        self.palette_step = palette::PaletteStep::Root;
         self.palette_focus.clear();
         cx.notify();
     }

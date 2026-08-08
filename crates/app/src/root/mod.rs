@@ -884,6 +884,11 @@ pub struct AdeApp {
     pub(crate) palette_results_scroll_handle: gpui::ScrollHandle,
     /// The palette's active scope (`All`/`Commands`/`Files`).
     pub(crate) palette_scope: palette::PaletteScope,
+    /// Which step the palette is showing - the flat root list, or a command's own drill-down
+    /// (`crate::palette::state::PaletteStep`). Reset to `Root` by
+    /// [`Self::open_palette`]/[`Self::close_palette`], so a palette never reopens mid-question,
+    /// and by `Esc` inside a step, which goes back rather than closing.
+    pub(crate) palette_step: palette::PaletteStep,
     /// The palette's currently typed query - the same minimal hand-rolled append/backspace text
     /// field as [`Self::filter_query`] (see [`Self::handle_filter_key_down`]'s docs for why, over
     /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`), with a real

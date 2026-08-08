@@ -923,6 +923,77 @@ pub fn companion_for_primary_binary(binary: &str) -> Option<CompanionServer> {
         .and_then(|lsp| lsp.companion)
 }
 
+/// Which language a real, live `crate::root::AdeApp::lsp_clients` key belongs to - see
+/// [`language_for_lsp_client_key`], which is the only thing that builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LspClientKeyLanguage {
+    /// The owning [`ExtensionEntry::display_name`] (`"Rust"`, `"TypeScript"`, `"Vue"`) - a real
+    /// registry field, never a prettified spelling of the binary name.
+    pub display_name: &'static str,
+    /// `true` when the key is a [`CompanionServer::client_key`] rather than an
+    /// [`LspIdentity::binary`] - i.e. the second, coordinated process of a two-server language,
+    /// which is a genuinely different thing to restart from its primary.
+    pub is_companion: bool,
+}
+
+/// The language behind a live client key (an [`LspIdentity::binary`], or a
+/// [`CompanionServer::client_key`] such as `"typescript-language-server (vue)"`), or `None` for a
+/// key this registry doesn't spawn at all.
+///
+/// This registry is keyed by *file extension*, not by server binary, so there is no direct
+/// binary-to-name table to read - this is the real search for the entry whose LSP identity
+/// actually names `client_key`, which is the honest way to get a display name rather than
+/// maintaining a second table that could drift from [`EXTENSIONS`]. Several extensions can share
+/// one binary (`.ts`/`.tsx`/`.js`/`.jsx`); the first match in [`EXTENSIONS`]' own order wins, which
+/// is the family's primary row (`"TypeScript"`), matching how
+/// [`ExtensionEntry::settings_row`] already picks one row per family rather than per extension.
+///
+/// Callers that show this to a user are expected to show the real key alongside it (see
+/// `crate::root::AdeApp::build_palette_groups`' language-server rows): `"Vue"` alone cannot
+/// distinguish `vue-language-server` from its companion, and the key can.
+pub fn language_for_lsp_client_key(client_key: &str) -> Option<LspClientKeyLanguage> {
+    if let Some(entry) = EXTENSIONS
+        .iter()
+        .find(|entry| entry.lsp.is_some_and(|lsp| lsp.binary == client_key))
+    {
+        return Some(LspClientKeyLanguage {
+            display_name: entry.display_name,
+            is_companion: false,
+        });
+    }
+    EXTENSIONS
+        .iter()
+        .find(|entry| {
+            entry
+                .lsp
+                .and_then(|lsp| lsp.companion)
+                .is_some_and(|companion| companion.client_key == client_key)
+        })
+        .map(|entry| LspClientKeyLanguage {
+            display_name: entry.display_name,
+            is_companion: true,
+        })
+}
+
+/// Whether a file with this `extension` is one the client keyed by `client_key` actually talks
+/// about - true for the extension's own primary server, and for that primary's
+/// [`CompanionServer`] (a `.vue` file is genuinely opened in *both*
+/// `vue-language-server` and `"typescript-language-server (vue)"`, so both own it).
+///
+/// The real, per-server half of `crate::lsp::client::AdeApp::restart_lsp_client`: restarting one
+/// server must forget exactly that server's own document bookkeeping and leave every other live
+/// client's alone, and "which paths were this server ever told about" is a registry question, not
+/// one the LSP plumbing can answer for itself.
+pub fn lsp_client_key_owns_extension(client_key: &str, extension: Option<&str>) -> bool {
+    let Some(lsp) = entry_for_extension(extension).and_then(|entry| entry.lsp) else {
+        return false;
+    };
+    lsp.binary == client_key
+        || lsp
+            .companion
+            .is_some_and(|companion| companion.client_key == client_key)
+}
+
 /// The `initializationOptions` fragment that turns a server's auto-import completions off, for a
 /// server where that is known - by direct verification, not by reading a settings reference - to
 /// actually work. `None` for every other server, so nothing is sent on a guess.
@@ -1749,5 +1820,99 @@ mod tests {
             Some(built_in)
         );
         assert_eq!(merge_initialization_options(None, None), None);
+    }
+
+    /// The palette's "which server?" rows read a real display name off this registry rather than
+    /// showing a bare binary - and the one two-process language is exactly where a naive
+    /// binary-to-name guess would go wrong, so both of its keys are pinned here.
+    #[test]
+    fn every_real_client_key_resolves_to_its_own_registry_language() {
+        assert_eq!(
+            language_for_lsp_client_key("rust-analyzer"),
+            Some(LspClientKeyLanguage {
+                display_name: "Rust",
+                is_companion: false
+            })
+        );
+        assert_eq!(
+            language_for_lsp_client_key("typescript-language-server"),
+            Some(LspClientKeyLanguage {
+                display_name: "TypeScript",
+                is_companion: false
+            }),
+            "four extensions share this binary; the family's own primary row is the answer"
+        );
+        assert_eq!(
+            language_for_lsp_client_key("pyright-langserver"),
+            Some(LspClientKeyLanguage {
+                display_name: "Python",
+                is_companion: false
+            })
+        );
+        assert_eq!(
+            language_for_lsp_client_key("vue-language-server"),
+            Some(LspClientKeyLanguage {
+                display_name: "Vue",
+                is_companion: false
+            })
+        );
+        let companion = companion_for_extension(Some("vue")).expect("vue has a real companion");
+        assert_eq!(
+            language_for_lsp_client_key(companion.client_key),
+            Some(LspClientKeyLanguage {
+                display_name: "Vue",
+                is_companion: true
+            }),
+            "the companion's own distinct key must resolve to Vue and be flagged as the \
+             companion - it is a genuinely separate process to restart, not the primary"
+        );
+        assert_eq!(
+            language_for_lsp_client_key("gopls"),
+            None,
+            "gopls is a real detectable binary this app deliberately never spawns a client for, \
+             so no live client key can name it"
+        );
+        assert_eq!(language_for_lsp_client_key("ade-no-such-server"), None);
+    }
+
+    /// Restarting one server forgets exactly that server's own documents, so "does this server
+    /// own this file" has to be right for the sharing cases: four extensions on one TypeScript
+    /// binary, and a `.vue` file that genuinely belongs to two different clients at once.
+    #[test]
+    fn a_client_key_owns_exactly_the_extensions_it_really_talks_about() {
+        assert!(lsp_client_key_owns_extension("rust-analyzer", Some("rs")));
+        assert!(!lsp_client_key_owns_extension("rust-analyzer", Some("ts")));
+
+        for extension in ["ts", "tsx", "js", "jsx"] {
+            assert!(
+                lsp_client_key_owns_extension("typescript-language-server", Some(extension)),
+                "{extension} routes to the shared typescript-language-server client"
+            );
+        }
+        assert!(
+            !lsp_client_key_owns_extension("typescript-language-server", Some("vue")),
+            "a .vue file is never opened in the *plain* TypeScript client - only in the \
+             Vue-flavoured companion, under its own distinct key"
+        );
+
+        let companion = companion_for_extension(Some("vue")).expect("vue has a real companion");
+        assert!(lsp_client_key_owns_extension(
+            "vue-language-server",
+            Some("vue")
+        ));
+        assert!(
+            lsp_client_key_owns_extension(companion.client_key, Some("vue")),
+            "a .vue file is really opened in both processes, so both own its bookkeeping"
+        );
+        assert!(!lsp_client_key_owns_extension(
+            companion.client_key,
+            Some("ts")
+        ));
+
+        assert!(
+            !lsp_client_key_owns_extension("rust-analyzer", Some("toml")),
+            "an extension with no server at all is owned by nobody"
+        );
+        assert!(!lsp_client_key_owns_extension("rust-analyzer", None));
     }
 }
