@@ -2080,17 +2080,25 @@ mod palette_result_focus_tests {
     /// behavior, not the bug; typing a command's own name to find it is how a user actually
     /// reaches one they don't see in the unfiltered top-8, and is what this test drives instead.
     ///
-    /// One deliberate, documented exception: `OpenGitGraph` only appears with a focused repo
-    /// (GitHub issue #90 - see `build_palette_groups`'s own comment on why that entry is dropped
-    /// rather than shown disabled). This drives a real, empty window, so that guard is the one
-    /// gap this test itself expects and excludes.
+    /// Two deliberate, documented exceptions, both real conditional-visibility rules rather than
+    /// gaps: `OpenGitGraph` only appears with a focused repo (GitHub issue #90 - see
+    /// `build_palette_groups`'s own comment on why that entry is dropped rather than shown
+    /// disabled), and `RestartLanguageServer` only appears while at least one server is running
+    /// under the active root (see `AdeApp::restartable_language_servers` - offering a picker with
+    /// nothing to pick would be exactly the fake affordance this app refuses). This drives a
+    /// real, empty window with no repo and no running server, so both guards are gaps this test
+    /// itself expects and excludes.
     #[gpui::test]
     fn every_palette_command_is_findable_by_its_own_label(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
         for command in palette::PaletteCommand::ALL {
-            if command == palette::PaletteCommand::OpenGitGraph {
+            if matches!(
+                command,
+                palette::PaletteCommand::OpenGitGraph
+                    | palette::PaletteCommand::RestartLanguageServer
+            ) {
                 continue;
             }
             app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
