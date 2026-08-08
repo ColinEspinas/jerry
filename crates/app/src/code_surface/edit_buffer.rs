@@ -182,6 +182,7 @@ use std::time::{Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::code_surface::code_view;
+use crate::code_surface::fold;
 use crate::code_surface::indent;
 use crate::code_surface::symbols;
 use crate::language::HighlighterFn;
@@ -384,6 +385,12 @@ pub struct EditBuffer {
     /// revisions of the text. Empty - never fabricated - for a language with no symbol support;
     /// see `crate::code_surface::symbols` for which those are and why.
     pub symbols: Vec<symbols::SymbolSpan>,
+    /// GitHub issue #202: this buffer's collapsible regions as of [`Self::lines`], memoized.
+    /// `None` means "owed a recompute" - see [`Self::fold_ranges`].
+    ///
+    /// Private, and only ever read through that accessor, so no call site can look at a list
+    /// that describes a revision of the text this buffer has already moved past.
+    fold_ranges: Option<Vec<fold::FoldRange>>,
 }
 
 /// One additional cursor/selection beyond the primary `EditBuffer::selected_range`/
@@ -495,7 +502,24 @@ impl EditBuffer {
             replaying: false,
             secondary_cursors: Vec::new(),
             symbols,
+            fold_ranges: None,
         }
+    }
+
+    /// GitHub issue #202: this buffer's real collapsible regions
+    /// (`crate::code_surface::fold::foldable_ranges` over [`Self::lines`]), computed at most once
+    /// per revision of the text rather than on every repaint.
+    ///
+    /// `&mut self` purely because of that memoization. The scan is a linear pass over the whole
+    /// buffer's runs, which is fine once per keystroke but genuinely not fine at 60fps on a large
+    /// file - and the File view's row builder needs to ask "is this line a fold start" for every
+    /// visible row, every frame. Every site that assigns or splices [`Self::lines`] clears the
+    /// cache; `folding_ranges_track_real_edits` (this module's own tests) drives a real edit
+    /// through `replace_range` and asserts the answer really moved, so a missed invalidation
+    /// would fail rather than silently serve a stale chevron.
+    pub fn fold_ranges(&mut self) -> &[fold::FoldRange] {
+        self.fold_ranges
+            .get_or_insert_with(|| fold::foldable_ranges(&self.lines))
     }
 
     /// The real, local (i.e. relative to `source`'s own start, not any wider buffer)
@@ -571,6 +595,7 @@ impl EditBuffer {
         self.utf16_line_starts =
             Self::cumulative_utf16_line_starts(&self.content, &self.line_ranges);
         self.highlight_dirty = true;
+        self.fold_ranges = None;
     }
 
     /// Splices `new_text` into `self.content` at `range` (byte offsets into the *old* content,
@@ -727,6 +752,9 @@ impl EditBuffer {
         }
 
         self.highlight_dirty = true;
+        // GitHub issue #202: `lines` just changed, so the memoized fold ranges describe text this
+        // buffer has moved past - see `Self::fold_ranges`.
+        self.fold_ranges = None;
     }
 
     /// Best-effort real highlight spans, in `region_source`-local byte coordinates, carried over
@@ -832,6 +860,10 @@ impl EditBuffer {
             return false;
         }
         self.lines = lines;
+        // A fresh highlight can genuinely change which brackets are foldable - a `{` the plain
+        // fallback runs counted may now sit in a real string/comment run (see
+        // `crate::code_surface::fold`'s own docs), so this must be invalidated with `lines`.
+        self.fold_ranges = None;
         // Installed under the exact same content-snapshot guard as `lines`, and only together
         // with them: a symbol outline whose byte ranges describe text this buffer has already
         // moved past would put the breadcrumb inside a function the caret isn't in. Rejecting
@@ -1419,6 +1451,7 @@ impl EditBuffer {
         self.utf16_line_starts =
             Self::cumulative_utf16_line_starts(&self.content, &self.line_ranges);
         self.lines = lines;
+        self.fold_ranges = None;
         // The reloaded text is genuinely different bytes at genuinely different offsets, so the
         // outline this buffer was holding describes content that no longer exists - replaced
         // here, from the same background parse that produced `lines`, rather than left stale
@@ -2741,6 +2774,40 @@ impl QueryBuilder {
     }
 }
 ";
+
+    /// GitHub issue #202: the memoized fold-range cache must be invalidated by a real edit, or
+    /// the File view would keep drawing a chevron on a line that no longer opens a block (and,
+    /// worse, hide the wrong lines when it is clicked). Driven through `replace_range` - the same
+    /// real mutation a keystroke takes, which reaches the cache only via `splice_lines`' own
+    /// invalidation - rather than by poking the field.
+    #[test]
+    fn fold_ranges_track_real_edits() {
+        let mut buf = buffer("fn alpha() {\n    let x = 1;\n}\n");
+        assert_eq!(
+            buf.fold_ranges(),
+            [fold::FoldRange {
+                start_line: 0,
+                end_line: 2
+            }]
+        );
+
+        // Insert a whole new line at the very top; every region shifts down by one.
+        buf.move_to(0);
+        buf.replace_range(Some(0..0), "// header\n");
+        assert_eq!(
+            buf.fold_ranges(),
+            [fold::FoldRange {
+                start_line: 1,
+                end_line: 3
+            }],
+            "a stale cache would still claim line 0 opens the block"
+        );
+
+        // Delete the opening brace: nothing is foldable any more.
+        let brace = buf.content.find('{').expect("brace present");
+        buf.replace_range(Some(brace..brace + 1), "");
+        assert!(buf.fold_ranges().is_empty());
+    }
 
     #[test]
     fn a_freshly_constructed_buffer_already_holds_a_real_symbol_outline() {

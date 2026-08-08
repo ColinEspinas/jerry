@@ -496,8 +496,13 @@ impl AdeApp {
             // Already cached (e.g. navigating within the open file), so render_file_view won't
             // reload and there's no completion handler to consume `pending_cursor_line`.
             self.code_cursor = Some(one_based_line);
-            self.file_view_scroll_handle
-                .scroll_to_item(one_based_line.saturating_sub(1), ScrollStrategy::Center);
+            // GitHub issue #202: a visual row, not a line index, and the destination is expanded
+            // first if a collapsed region is hiding it - see `AdeApp::scroll_file_view_to_line`.
+            self.scroll_file_view_to_line(
+                &absolute_target_path,
+                one_based_line.saturating_sub(1),
+                ScrollStrategy::Center,
+            );
         } else {
             self.pending_cursor_line = Some((absolute_target_path, one_based_line));
         }

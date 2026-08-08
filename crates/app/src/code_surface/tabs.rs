@@ -678,6 +678,18 @@ impl AdeApp {
                             }
                         }
                         if reloaded {
+                            // GitHub issue #202: fold state is plain line indices into content
+                            // this reload just replaced wholesale (an agent CLI or formatter
+                            // rewriting the file the user has open - this app's own core domain,
+                            // not an edge case). A stale index can point at a *different*, larger
+                            // region than the one the user actually folded, silently swallowing
+                            // the caret's line with nothing left to expand it - the same
+                            // `window.handle_input` breakage `Self::scroll_file_view_to_line`
+                            // exists to prevent for every other caret-moving action. Dropping the
+                            // folds here is the same "not persisted, self-healing" posture
+                            // `AdeApp::file_view_folds` already documents for a restart; a real
+                            // external rewrite is exactly as much a break in continuity as one.
+                            this.file_view_folds.remove(&path);
                             this.schedule_lsp_sync(cwd.clone(), relative_path.clone(), cx);
                         }
                         // Whether this load is a *different* file arriving in the view, as
@@ -715,14 +727,25 @@ impl AdeApp {
                             });
                         let cursor_line =
                             target_line.or(reloaded_cursor_line).or(buffer_cursor_line);
+                        // GitHub issue #202: both of these now scroll to a *visual row*, not a
+                        // line index (the two differ once anything in this file is collapsed -
+                        // fold state is keyed by absolute path, so it survives a tab close and is
+                        // still here when the file is reopened), expanding the destination first.
+                        // See `AdeApp::scroll_file_view_to_line`.
                         if let Some(line) = target_line {
                             this.pending_cursor_line = None;
-                            this.file_view_scroll_handle
-                                .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                            this.scroll_file_view_to_line(
+                                &path,
+                                line.saturating_sub(1),
+                                ScrollStrategy::Center,
+                            );
                         } else if newly_in_view {
                             if let Some(line) = buffer_cursor_line {
-                                this.file_view_scroll_handle
-                                    .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                                this.scroll_file_view_to_line(
+                                    &path,
+                                    line.saturating_sub(1),
+                                    ScrollStrategy::Center,
+                                );
                             }
                         }
                         this.code_cursor = Some(cursor_line.unwrap_or(1));

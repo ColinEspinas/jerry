@@ -14,6 +14,150 @@ use crate::root::widgets::render_sidebar_message;
 use std::collections::HashSet;
 
 impl AdeApp {
+    /// GitHub issue #202: the visual-row <-> buffer-line translation this file needs *right now*,
+    /// given whichever of its blocks the user has collapsed (`AdeApp::file_view_folds`).
+    ///
+    /// [`fold::FoldMap::unfolded`] - the identity, and the fast path every method on it
+    /// short-circuits on - whenever nothing is folded here, or whenever there is no live edit
+    /// buffer at all. That second case is deliberate rather than a gap: the read-only fallback
+    /// view (a truncated or non-UTF-8 file, which `EditBuffer` refuses to open at all) carries no
+    /// fold affordances, so it can never have a non-empty fold set to honour.
+    ///
+    /// `&mut self` because the fold ranges themselves are memoized on the buffer - see
+    /// [`edit_buffer::EditBuffer::fold_ranges`] for why they must not be recomputed per frame.
+    pub(in crate::code_surface) fn file_view_fold_map(
+        &mut self,
+        absolute_path: &Path,
+        relative_path: &Path,
+        line_count: usize,
+    ) -> fold::FoldMap {
+        let folded = match self.file_view_folds.get(absolute_path) {
+            Some(folded) if !folded.is_empty() => folded.clone(),
+            _ => return fold::FoldMap::unfolded(line_count),
+        };
+        let Some(buffer) = self.edit_buffer_mut(relative_path) else {
+            return fold::FoldMap::unfolded(line_count);
+        };
+        let total_lines = buffer.lines.len();
+        fold::FoldMap::new(total_lines, buffer.fold_ranges(), &folded)
+    }
+
+    /// Collapses the region starting at 0-based `start_line`, or expands it if it is already
+    /// collapsed - the whole behavior behind one click on a gutter chevron
+    /// (`crate::code_surface::editing::render_fold_chevron`).
+    ///
+    /// Collapsing can swallow the row the caret is sitting on, which is not merely cosmetic: only
+    /// the caret's *own* row registers the real `window.handle_input` wiring
+    /// (`render_editable_file_view_line`'s paint callback), so a caret on a row that no longer
+    /// paints would leave typing silently doing nothing. [`Self::lift_caret_out_of_folds`] is what
+    /// makes that unreachable.
+    pub(in crate::code_surface) fn toggle_code_fold(
+        &mut self,
+        absolute_path: &Path,
+        relative_path: &Path,
+        start_line: usize,
+    ) {
+        let folded = self
+            .file_view_folds
+            .entry(absolute_path.to_path_buf())
+            .or_default();
+        if folded.remove(&start_line) {
+            // Expanding can never hide anything, so there is nothing to protect the caret from.
+            // An empty set left behind is pure bookkeeping debt - nothing reads it as
+            // "this file is still folded" - so it goes with the last fold it held, the same
+            // "don't grow this map forever" discipline `Self::file_view_row_layout` follows.
+            if folded.is_empty() {
+                self.file_view_folds.remove(absolute_path);
+            }
+            return;
+        }
+        folded.insert(start_line);
+        self.lift_caret_out_of_folds(absolute_path, relative_path);
+    }
+
+    /// Moves the caret to the end of the collapsed region's own (still visible) start line if it
+    /// currently sits on a line some collapsed region hides. A no-op in every other case.
+    fn lift_caret_out_of_folds(&mut self, absolute_path: &Path, relative_path: &Path) {
+        let Some(folded) = self.file_view_folds.get(absolute_path).cloned() else {
+            return;
+        };
+        if folded.is_empty() {
+            return;
+        }
+        let Some(buffer) = self.edit_buffer_mut(relative_path) else {
+            return;
+        };
+        let total_lines = buffer.lines.len();
+        let (caret_line, _) = buffer.line_col_for_offset(buffer.cursor_offset());
+        let map = fold::FoldMap::new(total_lines, buffer.fold_ranges(), &folded);
+        if !map.is_hidden(caret_line) {
+            return;
+        }
+        // `row_for_line` resolves a hidden line to the row of the region that swallowed it, and
+        // `line_for_row` back to that region's own start line - the line that stays on screen.
+        let visible_line = map.line_for_row(map.row_for_line(caret_line));
+        let offset = buffer.offset_for_line_col(visible_line, buffer.line_len(visible_line));
+        buffer.move_to(offset);
+        self.code_cursor = Some(visible_line + 1);
+    }
+
+    /// Scrolls the File view so 0-based buffer line `line` is in view, first *expanding* any
+    /// collapsed region currently hiding it.
+    ///
+    /// Every caller used to hand `line` straight to `UniformListScrollHandle::scroll_to_item`,
+    /// which indexes *visual rows*; with a fold active those two numbers differ and the list
+    /// would scroll somewhere unrelated. Routing all of them through here is what keeps go-to-
+    /// definition, caret-follow and file-open landing on the right row.
+    ///
+    /// Expanding rather than merely scrolling to the collapsed row is deliberate: every caller is
+    /// putting the caret on `line`, and a caret on a row that does not paint has no
+    /// `window.handle_input` registration, so typing would silently stop working. See this
+    /// module's own fold tests for the coverage that pins this down.
+    pub(crate) fn scroll_file_view_to_line(
+        &mut self,
+        absolute_path: &Path,
+        line: usize,
+        strategy: ScrollStrategy,
+    ) {
+        let row = self.reveal_folded_line(absolute_path, line);
+        self.file_view_scroll_handle.scroll_to_item(row, strategy);
+    }
+
+    /// Expands every collapsed region hiding 0-based `line`, and returns the visual row that
+    /// line then occupies. Returns `line` unchanged - the identity every call site had before
+    /// folding existed - whenever this file has nothing folded.
+    fn reveal_folded_line(&mut self, absolute_path: &Path, line: usize) -> usize {
+        let folded = match self.file_view_folds.get(absolute_path) {
+            Some(folded) if !folded.is_empty() => folded.clone(),
+            _ => return line,
+        };
+        let Ok(relative_path) = absolute_path.strip_prefix(&self.file_tree_root) else {
+            return line;
+        };
+        let relative_path = relative_path.to_path_buf();
+        let Some(buffer) = self.edit_buffer_mut(&relative_path) else {
+            return line;
+        };
+        let total_lines = buffer.lines.len();
+        let ranges = buffer.fold_ranges().to_vec();
+
+        let mut folded = folded;
+        let expanded: Vec<usize> = ranges
+            .iter()
+            .filter(|range| {
+                folded.contains(&range.start_line) && range.hidden_lines().contains(&line)
+            })
+            .map(|range| range.start_line)
+            .collect();
+        for start_line in expanded {
+            folded.remove(&start_line);
+        }
+        let row = fold::FoldMap::new(total_lines, &ranges, &folded).row_for_line(line);
+        self.file_view_folds
+            .insert(absolute_path.to_path_buf(), folded);
+        row
+    }
+
     /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
     /// (`crate::code_surface::code_view`), and a status bar for whichever file `relative_path` (resolved
     /// against [`Self::file_tree_root`]) names on disk.
@@ -162,8 +306,13 @@ impl AdeApp {
             if let Some(line) = target_line {
                 self.pending_cursor_line = None;
                 self.code_cursor = Some(line);
-                self.file_view_scroll_handle
-                    .scroll_to_item(line.saturating_sub(1), ScrollStrategy::Center);
+                // GitHub issue #202: a visual row, not a line index, and the target is expanded
+                // first if a collapsed region is hiding it - see `Self::scroll_file_view_to_line`.
+                self.scroll_file_view_to_line(
+                    &absolute_path,
+                    line.saturating_sub(1),
+                    ScrollStrategy::Center,
+                );
             }
         }
 
@@ -377,29 +526,69 @@ impl AdeApp {
         let show_indent_guides = self.settings.appearance.show_indent_guides;
         let indent_settings = self.resolved_indent_settings_for_target();
         let code_font_size_px = self.effective_code_rem_px();
+        // GitHub issue #202: resolved once per frame, here, and then used both for
+        // `uniform_list`'s own item count and inside its row builder, so the count the list is
+        // sized by and the mapping its rows are built from can never describe different fold
+        // states. `fold::FoldMap::unfolded` (a cheap, allocation-free identity that every method
+        // on it short-circuits on) whenever this file has nothing collapsed, which is the
+        // overwhelmingly common case.
+        let fold_map = self.file_view_fold_map(&absolute_path, &relative_path_buf, line_count);
+        let row_count = fold_map.visible_row_count();
+        let row_fold_map = fold_map.clone();
+        // The path the gutter chevrons' own click handlers toggle folds against - a separate
+        // owned clone, since `absolute_path` itself is borrowed further down this function.
+        let fold_absolute_path = absolute_path.clone();
+        // Which regions are collapsed right now, read directly rather than re-derived from
+        // `row_fold_map`, so a chevron's own direction says exactly what the fold set says.
+        let folded_starts: HashSet<usize> = self
+            .file_view_folds
+            .get(&absolute_path)
+            .cloned()
+            .unwrap_or_default();
 
         let mut code = uniform_list(
             "file-view-code",
-            line_count,
+            row_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, window, cx| {
                 let relative_path = relative_path_buf.clone();
                 let has_buffer = this.edit_buffer_contains(&relative_path);
                 if has_buffer {
-                    let total = this
-                        .edit_buffer(&relative_path)
-                        .map(|buffer| buffer.lines.len())
-                        .unwrap_or(0);
-                    let start = range.start.min(total);
-                    let end = range.end.min(total);
+                    let start = range.start.min(row_count);
+                    let end = range.end.min(row_count);
+                    // GitHub issue #202: `uniform_list` hands out *visual row* indices, which stop
+                    // being buffer line indices the moment anything is collapsed. This is the one
+                    // place that translation happens for the row list; everything below works in
+                    // real buffer line indices exactly as it always did.
+                    let visible_lines: Vec<usize> = (start..end)
+                        .map(|row| row_fold_map.line_for_row(row))
+                        .collect();
+                    // Each visible line's own collapsible region, if it starts one - what decides
+                    // whether that row grows a gutter chevron, and (when collapsed) how many lines
+                    // its `⋯ N lines` marker reports. Looked up only for the handful of rows
+                    // actually on screen, against the buffer's own memoized range list.
+                    let visible_folds: Vec<Option<fold::FoldRange>> = {
+                        let ranges = this
+                            .edit_buffer_mut(&relative_path)
+                            .map(|buffer| buffer.fold_ranges())
+                            .unwrap_or(&[]);
+                        visible_lines
+                            .iter()
+                            .map(|&line| fold::range_starting_at(ranges, line))
+                            .collect()
+                    };
                     // `AdeApp::file_view_row_layout` is transient/best-effort (see its own docs)
                     // but was never pruned per-frame, only cleared wholesale on a worktree
                     // switch - a real, measured unbounded-growth risk (one `(Bounds, ShapedLine)`
                     // retained per line ever scrolled past, for the life of the worktree
-                    // agent). Pruned here to just this frame's own visible range (1-based, to
+                    // agent). Pruned here to just this frame's own visible rows (1-based, to
                     // match the map's own key convention): any entry this drops for a row that's
                     // about to be rebuilt below is harmless - that row's own real paint, moments
-                    // later this same pass, reinserts it fresh anyway.
-                    let visible_line_numbers = (start + 1)..=end;
+                    // later this same pass, reinserts it fresh anyway. Built from
+                    // `visible_lines`, not from the row range: with a fold active those are
+                    // different sets, and pruning by row index would evict the layout entries the
+                    // hover/diagnostic cards anchor to.
+                    let visible_line_numbers: HashSet<usize> =
+                        visible_lines.iter().map(|line| line + 1).collect();
                     this.file_view_row_layout
                         .retain(|line_number, _| visible_line_numbers.contains(line_number));
                     let cursor_line = this.code_cursor;
@@ -427,7 +616,7 @@ impl AdeApp {
                         None
                     };
                     let mut rows = Vec::with_capacity(end.saturating_sub(start));
-                    for index in start..end {
+                    for (visible_index, &index) in visible_lines.iter().enumerate() {
                         let Some(buffer) = this.edit_buffer(&relative_path) else {
                             break;
                         };
@@ -435,6 +624,17 @@ impl AdeApp {
                             break;
                         };
                         let line_number = index + 1;
+                        // GitHub issue #202: `Some` only on a line that really opens a
+                        // collapsible region - that row draws a chevron; every other row draws
+                        // the same blank gutter it always did.
+                        let fold_range = visible_folds[visible_index];
+                        let fold_state =
+                            fold_range.map(|range| crate::code_surface::editing::RowFoldState {
+                                path: fold_absolute_path.clone(),
+                                start_line: range.start_line,
+                                hidden_count: range.hidden_count(),
+                                folded: folded_starts.contains(&range.start_line),
+                            });
                         let is_current = cursor_line == Some(line_number);
                         // Still suppressed while dirty - see `buffer_dirty`'s own docs, above,
                         // for why this one (the git-gutter changed-line stripe, sourced from a
@@ -505,6 +705,7 @@ impl AdeApp {
                             caret_style: this.settings.appearance.caret_style,
                             caret_blink_visible: this.caret_blink_visible,
                             indent_guide_xs,
+                            fold_state,
                         };
                         rows.push(
                             crate::code_surface::editing::render_editable_file_view_line(
@@ -604,7 +805,28 @@ impl AdeApp {
                     } else {
                         buffer.move_to(end);
                     }
+                    // The buffer's own real last line, 0-based - not
+                    // `line_col_for_offset(cursor_offset())`, whose documented boundary
+                    // convention rounds an offset sitting exactly on a line break up to the
+                    // *start of the next line*. For content ending in a trailing newline (the
+                    // ordinary case) `end` is exactly such a boundary, so that call would resolve
+                    // to one line past the buffer's real content - never a folded line, so the
+                    // reveal below would silently do nothing.
+                    let line = buffer.lines.len().saturating_sub(1);
                     this.code_cursor = Some(click_line_count.max(1));
+                    // GitHub issue #202: the caret can land on a line hidden inside a collapsed
+                    // fold whenever that region's closer sits on (or near) the buffer's own last
+                    // line - real, reachable content this app edits every day (`fn main() { ... }`
+                    // as the last block in a short file). A row that never paints never registers
+                    // `window.handle_input`, so without this the click would silently strand
+                    // typing - the same class of bug `Self::sync_cursor_and_scroll` exists to
+                    // prevent for every other caret-moving action.
+                    let absolute_path = this.file_tree_root.join(&click_path);
+                    this.scroll_file_view_to_line(
+                        &absolute_path,
+                        line,
+                        gpui::ScrollStrategy::Nearest,
+                    );
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -635,7 +857,7 @@ impl AdeApp {
             &self.file_view_diagnostics,
             &self.file_view_changed_lines,
             self.code_cursor,
-            line_count,
+            &fold_map,
         );
         let code_with_scrollbar = div()
             .relative()
@@ -670,6 +892,7 @@ impl AdeApp {
                 lines,
                 &self.file_view_changed_lines,
                 row_line_height.as_f32(),
+                &fold_map,
                 cx,
             ),
             None => None,
@@ -728,13 +951,20 @@ pub(in crate::code_surface) fn editor_scrollbar_marks(
     diagnostics: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
     changed_lines: &HashSet<usize>,
     cursor_line: Option<usize>,
-    line_count: usize,
+    fold_map: &fold::FoldMap,
 ) -> Vec<scrollbar::ScrollbarMark> {
-    if line_count == 0 {
+    // GitHub issue #202: fractions are of the *scrollable* extent, which is the visual row count,
+    // not the line count - the two diverge the moment a region is collapsed, and a mark placed at
+    // a line fraction would then point somewhere the scrollbar can't scroll to. With nothing
+    // folded `row_for_line` is the identity and `visible_row_count` is the line count, so this
+    // computes exactly what it always did.
+    let row_count = fold_map.visible_row_count();
+    if row_count == 0 {
         return Vec::new();
     }
-    let fraction_for_line =
-        |line_number: usize| -> f32 { line_number.saturating_sub(1) as f32 / line_count as f32 };
+    let fraction_for_line = |line_number: usize| -> f32 {
+        fold_map.row_for_line(line_number.saturating_sub(1)) as f32 / row_count as f32
+    };
 
     let mut marks = Vec::new();
     for (&line_number, line_diagnostics) in diagnostics {
@@ -781,7 +1011,12 @@ mod editor_scrollbar_mark_tests {
 
     #[test]
     fn an_empty_file_produces_no_marks_rather_than_a_divide_by_zero() {
-        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 0);
+        let marks = editor_scrollbar_marks(
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(1),
+            &fold::FoldMap::unfolded(0),
+        );
         assert!(marks.is_empty());
     }
 
@@ -795,7 +1030,12 @@ mod editor_scrollbar_mark_tests {
                 diagnostic(diagnostics_view::Severity::Information),
             ],
         );
-        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        let marks = editor_scrollbar_marks(
+            &diagnostics,
+            &HashSet::new(),
+            None,
+            &fold::FoldMap::unfolded(100),
+        );
         assert!(marks.is_empty());
     }
 
@@ -803,7 +1043,12 @@ mod editor_scrollbar_mark_tests {
     fn an_error_diagnostic_produces_a_real_mark_at_the_lines_fraction() {
         let mut diagnostics = HashMap::new();
         diagnostics.insert(51, vec![diagnostic(diagnostics_view::Severity::Error)]);
-        let marks = editor_scrollbar_marks(&diagnostics, &HashSet::new(), None, 100);
+        let marks = editor_scrollbar_marks(
+            &diagnostics,
+            &HashSet::new(),
+            None,
+            &fold::FoldMap::unfolded(100),
+        );
         assert_eq!(marks.len(), 1);
         // Line 51 of 100, 1-based -> fraction 0.50.
         assert!((marks[0].fraction - 0.50).abs() < 0.001);
@@ -811,7 +1056,12 @@ mod editor_scrollbar_mark_tests {
 
     #[test]
     fn the_cursor_line_produces_its_own_mark_independent_of_diagnostics_and_git_changes() {
-        let marks = editor_scrollbar_marks(&HashMap::new(), &HashSet::new(), Some(1), 100);
+        let marks = editor_scrollbar_marks(
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(1),
+            &fold::FoldMap::unfolded(100),
+        );
         assert_eq!(marks.len(), 1);
         assert!((marks[0].fraction - 0.0).abs() < 0.001);
     }
@@ -820,7 +1070,12 @@ mod editor_scrollbar_mark_tests {
     fn a_changed_line_produces_its_own_mark() {
         let mut changed = HashSet::new();
         changed.insert(100);
-        let marks = editor_scrollbar_marks(&HashMap::new(), &changed, None, 100);
+        let marks = editor_scrollbar_marks(
+            &HashMap::new(),
+            &changed,
+            None,
+            &fold::FoldMap::unfolded(100),
+        );
         assert_eq!(marks.len(), 1);
         // Line 100 of 100, 1-based -> fraction 0.99.
         assert!((marks[0].fraction - 0.99).abs() < 0.001);
@@ -832,7 +1087,12 @@ mod editor_scrollbar_mark_tests {
         diagnostics.insert(1, vec![diagnostic(diagnostics_view::Severity::Error)]);
         let mut changed = HashSet::new();
         changed.insert(2);
-        let marks = editor_scrollbar_marks(&diagnostics, &changed, Some(3), 100);
+        let marks = editor_scrollbar_marks(
+            &diagnostics,
+            &changed,
+            Some(3),
+            &fold::FoldMap::unfolded(100),
+        );
         assert_eq!(marks.len(), 3);
     }
 }
