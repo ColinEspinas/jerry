@@ -157,6 +157,7 @@ impl AdeApp {
         let filter_focus_handle = cx.focus_handle();
         let settings_keymap_filter_focus_handle = cx.focus_handle();
         let theme_seed_focus_handle = cx.focus_handle();
+        let shell_focus_handle = cx.focus_handle();
         let caret_blink_subscriptions = AdeApp::wire_caret_blink(
             &[
                 &code_focus_handle,
@@ -166,10 +167,18 @@ impl AdeApp {
                 &filter_focus_handle,
                 &settings_keymap_filter_focus_handle,
                 &theme_seed_focus_handle,
+                &shell_focus_handle,
             ],
             window,
             cx,
         );
+
+        // GitHub issue #213: the Settings field starts out holding whatever the real file says,
+        // so opening Settings shows the shell that is actually in force rather than a blank
+        // field next to a running `fish`. Built here, before `settings` is moved into the
+        // literal below.
+        let shell_input =
+            text_history::TextField::seeded(settings.terminal.shell_override().unwrap_or(""));
 
         // GitHub issue #5: real, additional themes loaded from disk, before `apply_theme_selection`
         // (below) needs to resolve `settings.theme.name` against them. Derived from
@@ -428,6 +437,12 @@ impl AdeApp {
             settings_keymap_filter_focus_handle,
             theme_seed_input: text_history::TextField::new(),
             theme_seed_focus_handle,
+            shell_input,
+            shell_focus_handle,
+            // Left un-probed at construction: resolving it walks `$PATH` (or stats a file), and
+            // nothing shows it until Settings is opened, which recomputes it - see
+            // `AdeApp::refresh_shell_status`.
+            shell_status: settings::ShellStatus::SystemDefault,
             _theme_generate_task: None,
             keymap_recording: None,
             _keymap_intercept: None,
@@ -555,6 +570,7 @@ impl AdeApp {
                     AgentKind::Shell,
                     path.clone(),
                     this.settings.appearance.terminal_font_size,
+                    this.settings.terminal.shell_override(),
                     window,
                     cx,
                 );

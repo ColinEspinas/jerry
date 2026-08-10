@@ -926,6 +926,12 @@ impl AdeApp {
              elsewhere. The same chip shown in the status bar and terminal footer.",
             render_env_chip(),
         );
+        let shell_row = self.render_settings_row(
+            "Shell",
+            "What a new Shell tab runs - a name on PATH (bash, fish, pwsh) or an absolute path. \
+             Leave it empty to use the system default. Agent tabs are unaffected.",
+            self.render_settings_shell_control(cx),
+        );
         let inline_blame_row = self.render_settings_row(
             "Inline git blame",
             "Show who last changed the current line, and when, dimmed at the end of it. Off \
@@ -954,6 +960,7 @@ impl AdeApp {
             )
             .child(window_controls_row)
             .child(environment_row)
+            .child(shell_row)
             .child(
                 div()
                     .pt(px(20.0))
@@ -966,6 +973,191 @@ impl AdeApp {
             )
             .child(inline_blame_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::General))
+    }
+
+    /// GitHub issue #213's "Shell" control: a real, focusable free-text field naming the program
+    /// a Shell tab launches, plus a live, advisory hint saying what that name really resolves to
+    /// right now ([`Self::shell_status`]).
+    ///
+    /// The field is the same minimal hand-rolled input shape as the Themes page's seed field
+    /// ([`Self::render_theme_seed_row`]) and the Keybindings filter - a real `FocusHandle`, a
+    /// real caret ([`Self::render_simple_input_caret`]), append/backspace/`Esc`-clears, real
+    /// per-widget undo - deliberately reusing that established pattern rather than introducing a
+    /// second, richer text-input mechanism this app doesn't otherwise have.
+    ///
+    /// The placeholder is the real answer to "what happens if I leave this blank": whichever
+    /// program the OS itself names, not a blank field with no consequence stated.
+    fn render_settings_shell_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let shell = self.shell_input.as_str().to_string();
+        let has_shell = !shell.is_empty();
+        // The real program an empty field means on *this* machine, read live rather than
+        // described as a generic "$SHELL" - see `TerminalSpec::default_shell_program_display`.
+        let placeholder = crate::terminal::pane::TerminalSpec::default_shell_program_display();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(if self.shell_status.is_not_found() {
+                        theme::status::FAIL
+                    } else {
+                        theme::text::FAINTER
+                    })
+                    .child(self.shell_status.hint())
+                    .debug_selector(|| "settings-shell-status".to_string()),
+            )
+            .child(
+                div()
+                    .id("settings-shell-input")
+                    .debug_selector(|| "settings-shell-input".to_string())
+                    .track_focus(&self.shell_focus_handle)
+                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
+                    // tag and the listeners both live on this exact node.
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_settings_shell_text_undo))
+                    .on_action(cx.listener(Self::handle_settings_shell_text_redo))
+                    .on_key_down(cx.listener(Self::handle_settings_shell_key_down))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                        window.focus(&this.shell_focus_handle, cx);
+                    }))
+                    .cursor_pointer()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .h(px(20.0))
+                    .w(px(168.0))
+                    .px(px(7.0))
+                    .rounded(theme::radius::BUTTON)
+                    .border_1()
+                    .border_color(theme::border::CARD_FIELD)
+                    .bg(theme::surface::CARD_SUNK)
+                    // The caret sits before the placeholder (real cursor position 0) while the
+                    // field is empty, never appended after it - same fix as every other simple
+                    // input in this app (GitHub issue #45).
+                    .when(!has_shell, |el| {
+                        el.child(self.render_simple_input_caret(
+                            "settings-shell-caret",
+                            &self.shell_focus_handle,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(10.5))
+                            .text_color(if has_shell {
+                                theme::text::BODY
+                            } else {
+                                theme::text::GHOST
+                            })
+                            .child(if has_shell { shell } else { placeholder })
+                            .debug_selector(|| "settings-shell-text".to_string()),
+                    )
+                    .when(has_shell, |el| {
+                        el.child(self.render_simple_input_caret(
+                            "settings-shell-caret",
+                            &self.shell_focus_handle,
+                        ))
+                    }),
+            )
+    }
+
+    /// Same minimal append/backspace/`Esc`-clears shape as
+    /// [`Self::handle_settings_keymap_filter_key_down`] - see that method's docs for the
+    /// deliberate scope cut (no cursor positioning, no selection, no IME). Every real change
+    /// goes straight to the persisted setting through [`Self::apply_shell_input`], so there is
+    /// no separate "save" step that could be forgotten.
+    pub(in crate::settings) fn handle_settings_shell_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        self.reset_caret_blink(cx);
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.shell_input.pop(Instant::now()),
+            // Clearing the field is itself a real, meaningful edit here (it means "go back to the
+            // system default"), so it persists like any other - and is undoable, like every other
+            // simple input's `Esc`.
+            "escape" => self.shell_input.clear(Instant::now()),
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => self.shell_input.push_str(text, Instant::now()),
+                _ => false,
+            },
+        };
+        if changed {
+            self.apply_shell_input(cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// `TextUndo`/`TextRedo` for the Shell field (GitHub issue #17's per-widget undo) - see
+    /// `crate::default_key_bindings`' own docs for the scoping. Both re-apply the resulting text
+    /// to the real setting, so an undo can't leave the field and the file disagreeing.
+    pub(in crate::settings) fn handle_settings_shell_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shell_input.undo() {
+            self.apply_shell_input(cx);
+        }
+    }
+
+    pub(in crate::settings) fn handle_settings_shell_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shell_input.redo() {
+            self.apply_shell_input(cx);
+        }
+    }
+
+    /// Copies the Shell field's current text into the real, persisted setting and saves it
+    /// (GitHub issue #213). An empty/whitespace-only field is stored as a real `None` - "use the
+    /// system default" - never as `Some("")`.
+    ///
+    /// Deliberately does **not** touch already-open tabs: which program a terminal runs is fixed
+    /// when its process is spawned, and this app has no way to swap a live pty's program out from
+    /// under a running shell. The next Shell tab picks it up (`Agents::spawn` reads live
+    /// settings on every spawn), which is the honest scope - unlike the terminal *font size*,
+    /// which really can be applied to a live pane and therefore is
+    /// ([`Self::adjust_terminal_font_size`]).
+    pub(in crate::settings) fn apply_shell_input(&mut self, cx: &mut Context<Self>) {
+        let typed = self.shell_input.as_str().trim();
+        self.settings.terminal.shell = (!typed.is_empty()).then(|| typed.to_string());
+        self.refresh_shell_status();
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Re-probes what the configured shell resolves to right now
+    /// ([`crate::settings::state::detect_shell_status`], with the real
+    /// `pty_core::resolve_on_path`). Called on every edit and when Settings opens - never from
+    /// `render`, which would put a real `$PATH` walk on the frame path.
+    ///
+    /// A single `$PATH` walk for one name, unlike [`Self::load_agent_rows`]'s walk *per agent
+    /// binary*, so this stays on the foreground thread rather than growing a background task and
+    /// a stale-result race for a keystroke-frequency operation.
+    pub(crate) fn refresh_shell_status(&mut self) {
+        self.shell_status = settings::detect_shell_status(
+            self.settings.terminal.shell_override(),
+            pty_core::resolve_on_path,
+        );
     }
 
     /// *Appearance & scaling* - every row here is persisted and round-trips through
@@ -3927,6 +4119,268 @@ mod settings_lsp_install_action_tests {
             cx.debug_bounds("settings-lsp-install-ready-binary")
                 .is_none(),
             "a ready row has already live-found its binary and should show no Install action"
+        );
+    }
+}
+
+/// GitHub issue #213 ("Allow to select shell") end-to-end: the persisted `terminal.shell` isn't
+/// just a string in a file, it decides which real program a real Shell tab's real child process
+/// is. Every test here drives the same path a user does - a real window, a real settings value or
+/// real keystrokes into the real field, a real spawned pty - rather than asserting on the pure
+/// helper alone (which `terminal::pane::shell_program_tests` already covers).
+///
+/// unix-only: these spawn `sh`, matching this project's own convention of only running the test
+/// suite on Linux (`pty-core`'s "Platform scope" docs).
+#[cfg(all(test, unix))]
+mod shell_setting_tests {
+    use super::*;
+    use crate::rail::status::Status;
+    use crate::root::focus::palette_focus_tests;
+    use crate::terminal::pane::TerminalSpec;
+    use gpui::TestAppContext;
+
+    /// Same shape as the sibling test modules' own helper (`keybinding_rebind_tests`,
+    /// `custom_theme_settings_tests`) - a real window with a real, isolated `settings.toml` path,
+    /// so `persist_settings` actually writes a file these tests can read back.
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings: settings_store::Settings,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn settings_with_shell(shell: Option<&str>) -> settings_store::Settings {
+        let mut settings = settings_store::Settings::default();
+        settings.terminal.shell = shell.map(str::to_string);
+        settings
+    }
+
+    /// The whole point of the issue: a configured shell is what a real Shell tab really runs.
+    /// `sh` rather than the machine's own `$SHELL` so the assertion means something on any host
+    /// (a developer already using `sh` as their login shell would make a `$SHELL` comparison
+    /// vacuous).
+    #[gpui::test]
+    fn a_configured_shell_is_what_a_real_shell_tab_really_spawns(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_with_shell(Some("sh")),
+            settings_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|a| a.pane.clone()))
+            .expect("a fresh window starts one real shell tab");
+
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.program_label(),
+                "sh",
+                "the configured shell - not $SHELL - must be the program this tab spawned"
+            );
+            assert_eq!(
+                pane.spawn_error(),
+                None,
+                "a real, installed shell must start cleanly"
+            );
+            assert!(
+                pane.is_running(),
+                "the configured shell must be a genuinely live child process, not just a spec"
+            );
+        });
+    }
+
+    /// The zero-config guarantee: an install that never touches this setting keeps spawning
+    /// exactly what it spawned before the setting existed.
+    #[gpui::test]
+    fn an_unconfigured_shell_still_spawns_the_real_os_default(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let expected = PathBuf::from(TerminalSpec::default_shell_program_display())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .expect("the OS default shell must have a real file name");
+
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|a| a.pane.clone()))
+            .expect("a fresh window starts one real shell tab");
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.program_label(), expected);
+            assert!(pane.is_running(), "the OS default shell must really run");
+        });
+    }
+
+    /// GitHub issue #213's honest-failure question: a typo'd shell name must fail the way any
+    /// other missing program already does - a real, typed spawn error, named on the tab itself
+    /// and reflected in the tab's real status - not a blank pane, and not a silently substituted
+    /// fallback that would hide the user's mistake.
+    #[gpui::test]
+    fn a_misconfigured_shell_fails_visibly_on_the_tab_itself(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_with_shell(Some("definitely-not-a-real-shell-xyz")),
+            settings_dir.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|a| a.pane.clone()))
+            .expect("the tab is still created - it is the *process* that failed");
+        let error = pane
+            .read_with(cx, |pane, _| pane.spawn_error().map(str::to_string))
+            .expect("a shell that doesn't exist must record a real spawn error");
+        assert!(
+            error.contains("definitely-not-a-real-shell-xyz"),
+            "the error must name the program the user actually configured, so the typo is \
+             diagnosable: {error}"
+        );
+
+        let status = app.read_with(cx, |app, cx| {
+            let agent = app.agents.active().expect("the failed tab");
+            app.agent_status(agent, cx)
+        });
+        assert_eq!(
+            status,
+            Status::Fail,
+            "a tab whose shell never started must read as a real failure everywhere the app \
+             shows status, not as idle"
+        );
+
+        // And the Settings row says so up front, before the user has to read a terminal.
+        app.update(cx, |app, _| app.refresh_shell_status());
+        assert!(
+            app.read_with(cx, |app, _| app.shell_status.is_not_found()),
+            "the Settings row must flag a shell that genuinely isn't there"
+        );
+    }
+
+    /// The real user journey, driven through the real UI: focus the real painted field, type a
+    /// real shell name, and it lands in the real `settings.toml` *and* in the next real tab's
+    /// real child process.
+    #[gpui::test]
+    fn typing_a_shell_into_the_settings_row_persists_it_and_the_next_tab_uses_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        cx.run_until_parked();
+
+        let field = cx
+            .debug_bounds("settings-shell-input")
+            .expect("the Shell field must really paint on the General page");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("s h");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.terminal.shell.clone()),
+            Some("sh".to_string()),
+            "real keystrokes in the real field must reach the real setting"
+        );
+        let written = std::fs::read_to_string(&settings_path).expect("the file must exist");
+        assert!(
+            written.contains("shell = \"sh\""),
+            "the edit must really be persisted to settings.toml, got: {written}"
+        );
+
+        // The next real Shell tab runs it - and really starts.
+        app.update_in(cx, |app, window, cx| {
+            app.close_settings(window, cx);
+            app.new_agent(AgentKind::Shell, window, cx);
+        });
+        cx.run_until_parked();
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|a| a.pane.clone()))
+            .expect("the newly spawned tab");
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.program_label(), "sh");
+            assert_eq!(pane.spawn_error(), None);
+            assert!(pane.is_running(), "the typed shell must really be running");
+        });
+
+        // Clearing the field again is a real edit back to the system default, not a stuck value.
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        cx.run_until_parked();
+        let field = cx
+            .debug_bounds("settings-shell-input")
+            .expect("the Shell field must paint again on reopening Settings");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.terminal.shell.clone()),
+            None,
+            "emptying the field must mean 'use the system default', not an empty program name"
+        );
+    }
+
+    /// A shell configured in the file shows up in the field the moment Settings is opened -
+    /// otherwise a user with a hand-edited `settings.toml` would see a blank field and assume
+    /// nothing was set.
+    #[gpui::test]
+    fn an_already_persisted_shell_is_shown_in_the_field_at_startup(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_with_shell(Some("sh")),
+            settings_dir.path().join("settings.toml"),
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            "sh",
+            "the field must start out holding the real persisted value"
+        );
+        assert!(
+            app.read_with(cx, |app, _| matches!(
+                app.shell_status,
+                settings::ShellStatus::Resolved(_)
+            )),
+            "opening Settings must re-probe the configured shell against the real PATH"
+        );
+        assert!(
+            cx.debug_bounds("settings-shell-status").is_some(),
+            "the row's live found/not-found hint must really paint"
         );
     }
 }

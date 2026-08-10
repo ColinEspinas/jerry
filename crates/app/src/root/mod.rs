@@ -1579,6 +1579,19 @@ pub struct AdeApp {
     /// #17). Its value is what `crate::theme::shift_from_seed` derives a whole theme from.
     pub(crate) theme_seed_input: text_history::TextField,
     pub(crate) theme_seed_focus_handle: FocusHandle,
+    /// GitHub issue #213: the General page's "Shell" field - the same minimal focusable
+    /// text-input shape as [`Self::theme_seed_input`] (real `FocusHandle`, real caret,
+    /// append/backspace/`Esc`-clears, real per-widget undo history). Seeded at startup from the
+    /// persisted `settings.terminal.shell` and written straight back to it on every edit, so the
+    /// field and the file never disagree.
+    pub(crate) shell_input: text_history::TextField,
+    pub(crate) shell_focus_handle: FocusHandle,
+    /// The advisory found/not-found state of whatever [`Self::shell_input`] currently holds
+    /// (`crate::settings::state::detect_shell_status`) - recomputed on each edit and when
+    /// Settings opens, never inside `render` (it does real filesystem work). Advisory only: a
+    /// `NotFound` never stops the app from trying to spawn the configured program - see
+    /// `crate::terminal::pane::configured_shell_program`'s docs.
+    pub(crate) shell_status: settings::ShellStatus,
     /// The real background-executor task behind "Generate from colour" - same one-at-a-time
     /// shape as [`Self::_custom_theme_import_task`].
     pub(crate) _theme_generate_task: Option<Task<()>>,
@@ -2216,6 +2229,7 @@ impl AdeApp {
                 AgentKind::Shell,
                 path.clone(),
                 self.settings.appearance.terminal_font_size,
+                self.settings.terminal.shell_override(),
                 window,
                 cx,
             );
@@ -3670,6 +3684,7 @@ mod repo_list_tests {
                 AgentKind::Claude,
                 repo_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );

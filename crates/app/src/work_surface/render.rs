@@ -81,6 +81,7 @@ impl AdeApp {
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
+            self.settings.terminal.shell_override(),
             window,
             cx,
         );
@@ -416,6 +417,7 @@ impl AdeApp {
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
+            self.settings.terminal.shell_override(),
             window,
             cx,
         );
@@ -447,6 +449,7 @@ impl AdeApp {
                     AgentKind::Shell,
                     cwd,
                     self.settings.appearance.terminal_font_size,
+                    self.settings.terminal.shell_override(),
                     window,
                     cx,
                 );
@@ -1392,6 +1395,7 @@ impl AdeApp {
                     kind,
                     cwd,
                     this.settings.appearance.terminal_font_size,
+                    this.settings.terminal.shell_override(),
                     window,
                     cx,
                 );
@@ -2646,6 +2650,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2653,6 +2658,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2733,6 +2739,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2741,6 +2748,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2793,6 +2801,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2800,6 +2809,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2854,6 +2864,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             )
@@ -2864,6 +2875,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2910,6 +2922,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2917,6 +2930,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3022,6 +3036,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3096,6 +3111,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3154,6 +3170,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3257,6 +3274,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3334,6 +3352,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3436,6 +3455,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3493,6 +3513,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3500,6 +3521,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3537,6 +3559,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3552,6 +3575,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3585,6 +3609,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             )
@@ -3777,6 +3802,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3784,6 +3810,7 @@ mod tab_scoping_tests {
                 AgentKind::Claude,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3858,6 +3885,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             )
@@ -3922,6 +3950,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -3974,6 +4003,7 @@ mod tab_scoping_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -4089,6 +4119,7 @@ mod terminal_clear_action_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -4096,6 +4127,7 @@ mod terminal_clear_action_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -4208,6 +4240,7 @@ mod tab_order_persistence_tests {
                 AgentKind::Claude,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -4247,6 +4280,7 @@ mod tab_order_persistence_tests {
                 AgentKind::Claude,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -4356,6 +4390,7 @@ mod terminal_clipboard_action_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );

@@ -658,11 +658,152 @@ pub fn filter_keybinding_rows<'a>(
         .collect()
 }
 
+/// What the General page's "Shell" row can honestly say about the configured shell program
+/// (GitHub issue #213) - see [`detect_shell_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellStatus {
+    /// Nothing configured: a shell tab launches the real OS default (`$SHELL`/`%COMSPEC%`).
+    SystemDefault,
+    /// A real program was found - the resolved absolute path, exactly as it would be run.
+    Resolved(PathBuf),
+    /// Nothing by that name exists. Advisory only: this never stops the app from trying to spawn
+    /// it (see `crate::terminal::pane::configured_shell_program`'s docs for why the real spawn
+    /// stays the authority), it just makes a typo visible before a tab fails.
+    NotFound,
+}
+
+impl ShellStatus {
+    /// The trailing hint text the row shows next to the field - a real resolved path, an honest
+    /// "not found", or the name of what will actually run when nothing is configured.
+    pub fn hint(&self) -> String {
+        match self {
+            ShellStatus::SystemDefault => "empty - using the system default".to_string(),
+            ShellStatus::Resolved(path) => path.display().to_string(),
+            ShellStatus::NotFound => "not found - this tab will fail to start".to_string(),
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ShellStatus::NotFound)
+    }
+}
+
+/// Resolves the configured shell the same two ways `pty_core::spawn` itself will (GitHub issue
+/// #213): a name with no path separator is searched for on `PATH` via `resolve`, anything that
+/// looks like a path is checked as a real file on disk. Whitespace-only (or absent) is
+/// [`ShellStatus::SystemDefault`], matching
+/// `crate::settings::store::TerminalSettings::shell_override`.
+///
+/// Takes `resolve` as a parameter - in production `pty_core::resolve_on_path` - for the same
+/// reason [`detect_agent_rows`] does: so this is unit-testable independently of which shells
+/// happen to be installed on the machine running the suite. The on-disk check for a path-shaped
+/// value is a real `Path::is_file` call rather than a second injected closure; a test can point
+/// it at a real temp file, which is a truer check than a fake.
+///
+/// This is deliberately *advisory*. It cannot be a guarantee - `resolve_on_path` is a second
+/// implementation of `portable-pty`'s own search (see its docs for the disclosed divergences) -
+/// so it is used to inform the settings row, never to gate the spawn.
+pub fn detect_shell_status(
+    configured: Option<&str>,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> ShellStatus {
+    let Some(program) = configured
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+    else {
+        return ShellStatus::SystemDefault;
+    };
+
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 {
+        // A path, not a name to search for - `CommandBuilder` runs it as given, so the only
+        // real question is whether that file exists.
+        return match path.is_file() {
+            true => ShellStatus::Resolved(path.to_path_buf()),
+            false => ShellStatus::NotFound,
+        };
+    }
+
+    match resolve(program) {
+        Some(resolved) => ShellStatus::Resolved(resolved),
+        None => ShellStatus::NotFound,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rail::state::WorktreeNote;
     use wt_core::diff::WorktreeMergeStatus;
+
+    /// GitHub issue #213's advisory found/not-found hint: both real forms a user can type, plus
+    /// the "nothing configured" case that must never be reported as an error.
+    #[test]
+    fn shell_status_reports_each_real_configured_form_honestly() {
+        let fake_path_search =
+            |program: &str| (program == "fish").then(|| PathBuf::from("/usr/bin/fish"));
+
+        assert_eq!(
+            detect_shell_status(None, fake_path_search),
+            ShellStatus::SystemDefault,
+            "no override at all is the normal, healthy state - never a 'not found'"
+        );
+        assert_eq!(
+            detect_shell_status(Some("   "), fake_path_search),
+            ShellStatus::SystemDefault,
+            "a blank field means the system default, exactly like an absent value"
+        );
+        assert_eq!(
+            detect_shell_status(Some("fish"), fake_path_search),
+            ShellStatus::Resolved(PathBuf::from("/usr/bin/fish")),
+            "a bare name must be reported as the real path PATH resolution finds"
+        );
+        assert_eq!(
+            detect_shell_status(Some("fsih"), fake_path_search),
+            ShellStatus::NotFound,
+            "a typo'd name must be called out, not silently accepted"
+        );
+    }
+
+    /// A path-shaped value is checked against the real filesystem, not searched for on `PATH` -
+    /// exercised against a genuinely existing temp file and a genuinely missing one.
+    #[test]
+    fn a_path_shaped_shell_is_checked_on_disk_not_on_path() {
+        let never_resolves = |_: &str| -> Option<PathBuf> {
+            panic!("a path-shaped value must never be searched for on PATH")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_file = dir.path().join("my-shell");
+        std::fs::write(&real_file, "#!/bin/sh\n").expect("write");
+
+        assert_eq!(
+            detect_shell_status(Some(real_file.to_str().expect("utf-8")), never_resolves),
+            ShellStatus::Resolved(real_file.clone())
+        );
+        assert_eq!(
+            detect_shell_status(
+                Some(dir.path().join("no-such-shell").to_str().expect("utf-8")),
+                never_resolves
+            ),
+            ShellStatus::NotFound
+        );
+    }
+
+    /// The real production resolver, on a real binary this test environment genuinely has -
+    /// proof the injected-resolver tests above aren't only true of the fake.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_path_resolver_finds_a_real_shell() {
+        let status = detect_shell_status(Some("sh"), pty_core::resolve_on_path);
+        match status {
+            ShellStatus::Resolved(path) => assert!(
+                path.is_file(),
+                "the reported path must be a real file on this machine, got {}",
+                path.display()
+            ),
+            other => panic!("expected a real resolved sh, got {other:?}"),
+        }
+    }
 
     #[test]
     fn all_eleven_pages_are_covered_by_the_four_nav_groups_exactly_once() {

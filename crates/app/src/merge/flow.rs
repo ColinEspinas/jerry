@@ -1017,6 +1017,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1095,6 +1096,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1119,6 +1121,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1178,6 +1181,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1289,6 +1293,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1392,6 +1397,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1459,6 +1465,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1544,6 +1551,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1662,6 +1670,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1794,6 +1803,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1898,6 +1908,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1997,6 +2008,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -2161,6 +2173,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -2214,6 +2227,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -2322,6 +2336,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -2418,6 +2433,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -2533,6 +2549,7 @@ mod merge_regression_tests {
                 AgentKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )

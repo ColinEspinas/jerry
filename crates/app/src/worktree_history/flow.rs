@@ -269,6 +269,7 @@ mod worktree_history_regression_tests {
                 AgentKind::Shell,
                 cwd,
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )

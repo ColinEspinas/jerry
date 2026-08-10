@@ -99,8 +99,55 @@ pub struct Settings {
     pub keymap: KeymapSettings,
     pub blame: BlameSettings,
     pub editor: EditorSettings,
+    pub terminal: TerminalSettings,
     pub icon_pack: IconPackSettings,
     pub lsp: BTreeMap<String, LspServerSettings>,
+}
+
+/// The integrated terminal's own behavioural settings (GitHub issue #213: "Allow to select
+/// shell") - deliberately its own section rather than another key under [`AppearanceSettings`],
+/// which is exclusively about text sizes and painted shapes (`terminal_font_size` lives there
+/// because it *is* a font size). What program a shell tab launches is a spawn-time behaviour,
+/// not an appearance.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSettings {
+    /// The program a plain Shell tab (`crate::work_surface::agents::AgentKind::Shell`) spawns,
+    /// or `None` for "whatever the OS says" - `$SHELL` on unix, `%COMSPEC%` on Windows, exactly
+    /// the behaviour every install had before this setting existed (see
+    /// `crate::terminal::pane::TerminalSpec::shell`). `None` is the zero-config default, so a
+    /// user who never touches this keeps their real login shell.
+    ///
+    /// Either a bare program name to resolve against `PATH` (`"bash"`, `"fish"`, `"pwsh"`) or an
+    /// absolute path (`"/usr/local/bin/fish"`) - the same two forms `TerminalSpec::command`
+    /// already documents, resolved by the same real mechanism (`portable_pty::CommandBuilder`
+    /// inside `pty_core::spawn`), never by a second path search of this app's own.
+    ///
+    /// Agent CLI tabs (`claude`, `codex`) are unaffected: those spawn their own binary directly
+    /// rather than through a shell.
+    pub shell: Option<String>,
+}
+
+impl TerminalSettings {
+    /// The configured shell as a real, usable program name, or `None` when the user hasn't
+    /// chosen one. Whitespace-only is `None`, not a program named `" "`: the settings row's own
+    /// field is a free-text input, and an accidental space must mean the same thing an empty
+    /// field means (use the OS default), never a guaranteed-to-fail spawn.
+    pub fn shell_override(&self) -> Option<&str> {
+        self.shell
+            .as_deref()
+            .map(str::trim)
+            .filter(|shell| !shell.is_empty())
+    }
+
+    /// Normalizes a hand-edited `shell = "  "` (or `shell = ""`) down to a real `None`, so the
+    /// in-memory value a freshly loaded file produces is the same one the UI would have written.
+    /// Same "a hand-edit gets normalized, not rejected" discipline as
+    /// [`AppearanceSettings::sanitize`]/[`EditorSettings::sanitize`]; called from the same place
+    /// (see [`Settings::load_or_init_at`]).
+    pub fn sanitize(&mut self) {
+        self.shell = self.shell_override().map(str::to_string);
+    }
 }
 
 /// Per-language-server overrides, keyed by the server's own name as this app knows it -
@@ -515,13 +562,15 @@ impl Settings {
     /// doesn't exist yet, writes a default file there (via [`Settings::save_at`]) so the config
     /// file exists on first run; a save failure there is also logged rather than propagated. A
     /// file that does parse still gets every section's own `sanitize` applied
-    /// ([`AppearanceSettings::sanitize`], [`EditorSettings::sanitize`]).
+    /// ([`AppearanceSettings::sanitize`], [`EditorSettings::sanitize`],
+    /// [`TerminalSettings::sanitize`]).
     pub fn load_or_init_at(path: &Path) -> Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Settings>(&contents) {
                 Ok(mut settings) => {
                     settings.appearance.sanitize();
                     settings.editor.sanitize();
+                    settings.terminal.sanitize();
                     settings
                 }
                 Err(err) => {
@@ -593,7 +642,7 @@ pub enum ConfigPage {
 /// fixture also names settings this app doesn't implement, e.g. `window.restore_sessions`).
 pub fn config_keys_line(page: ConfigPage) -> &'static str {
     match page {
-        ConfigPage::General => "window.controls",
+        ConfigPage::General => "window.controls \u{b7} terminal.shell",
         ConfigPage::Appearance => {
             "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
              appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
@@ -627,9 +676,16 @@ pub enum SnippetLineKind {
     Key,
 }
 
+/// Both sections the General page really owns rows for - `[window]` (window controls) and
+/// `[terminal]` (the shell override, GitHub issue #213). One doc rather than two so the snippet
+/// block keeps showing the whole of what that page writes, in the same order the real file has
+/// it. An unset `shell` renders as a bare `[terminal]` header with no key under it, which is
+/// exactly what the real `settings.toml` on disk contains in that state - `toml` omits a `None`
+/// value entirely rather than inventing a `shell = ""` the loader would then have to un-invent.
 #[derive(Serialize)]
-struct WindowSnippetDoc<'a> {
+struct GeneralSnippetDoc<'a> {
     window: &'a WindowSettings,
+    terminal: &'a TerminalSettings,
 }
 
 #[derive(Serialize)]
@@ -654,14 +710,18 @@ struct EditorSnippetDoc<'a> {
 /// in the output - a bare struct at the TOML document root has no name to put in brackets.
 pub fn snippet_lines(settings: &Settings, page: ConfigPage, format: CfgFormat) -> Vec<SnippetLine> {
     let text = match (page, format) {
-        (ConfigPage::General, CfgFormat::Toml) => toml::to_string_pretty(&WindowSnippetDoc {
+        (ConfigPage::General, CfgFormat::Toml) => toml::to_string_pretty(&GeneralSnippetDoc {
             window: &settings.window,
+            terminal: &settings.terminal,
         })
         .unwrap_or_default(),
-        (ConfigPage::General, CfgFormat::Json) => serde_json::to_string_pretty(&WindowSnippetDoc {
-            window: &settings.window,
-        })
-        .unwrap_or_default(),
+        (ConfigPage::General, CfgFormat::Json) => {
+            serde_json::to_string_pretty(&GeneralSnippetDoc {
+                window: &settings.window,
+                terminal: &settings.terminal,
+            })
+            .unwrap_or_default()
+        }
         (ConfigPage::Appearance, CfgFormat::Toml) => {
             toml::to_string_pretty(&AppearanceSnippetDoc {
                 appearance: &settings.appearance,
@@ -1213,9 +1273,90 @@ mod tests {
             .all(|line| line.kind == SnippetLineKind::Key));
     }
 
+    /// GitHub issue #213. The zero-config default must stay "whatever the OS says" - a `None`,
+    /// never a guessed `"bash"` - and a real hand-edited value must survive a full
+    /// write-then-load round trip through the same file the app itself writes.
+    #[test]
+    fn the_shell_override_defaults_to_none_and_round_trips_through_a_real_file() {
+        assert_eq!(
+            Settings::default().terminal.shell,
+            None,
+            "an install that has never touched this setting must keep using the real OS default"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        // The default file the app writes on first run must still be a real, complete file -
+        // `to_toml_string` swallows a serialization error into an empty string, so a `None`
+        // that `toml` refused to serialize would silently blank the whole config.
+        let defaults = Settings::default();
+        defaults.save_at(&path).expect("write defaults");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("[window]") && written.contains("[terminal]"),
+            "the written file must really contain every section, got: {written}"
+        );
+        assert!(
+            !written.contains("shell ="),
+            "an unset shell must be omitted from the file entirely, not written as an empty \
+             string: {written}"
+        );
+        assert_eq!(Settings::load_or_init_at(&path), defaults);
+
+        let mut configured = Settings::default();
+        configured.terminal.shell = Some("fish".to_string());
+        configured.save_at(&path).expect("write configured");
+        assert_eq!(
+            Settings::load_or_init_at(&path).terminal.shell.as_deref(),
+            Some("fish")
+        );
+    }
+
+    /// A hand-edited `[terminal] shell` is normalized the same way every other hand-edited value
+    /// is: a blank/whitespace-only entry means "system default", not a program named `" "`.
+    #[test]
+    fn a_hand_edited_blank_shell_loads_as_the_real_system_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        std::fs::write(&path, "[terminal]\nshell = \"  \"\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).terminal.shell,
+            None,
+            "a whitespace-only shell must load as no override at all"
+        );
+
+        std::fs::write(&path, "[terminal]\nshell = \"  /usr/bin/fish \"\n").expect("write");
+        assert_eq!(
+            Settings::load_or_init_at(&path).terminal.shell.as_deref(),
+            Some("/usr/bin/fish"),
+            "surrounding whitespace is trimmed, the real program name is kept verbatim"
+        );
+    }
+
+    /// The General page's snippet block is a live view of the real file - the shell override has
+    /// to actually appear in it once set, or the banner would name a key the panel never shows.
+    #[test]
+    fn the_general_snippet_shows_the_real_shell_override() {
+        let mut settings = Settings::default();
+        settings.terminal.shell = Some("pwsh".to_string());
+
+        let lines = snippet_lines(&settings, ConfigPage::General, CfgFormat::Toml);
+        let joined: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(joined.contains(&"[terminal]"));
+        assert!(
+            joined.iter().any(|line| line.contains("\"pwsh\"")),
+            "the snippet must show the real configured value, got {joined:?}"
+        );
+    }
+
     #[test]
     fn config_keys_line_only_names_real_persisted_fields() {
-        assert_eq!(config_keys_line(ConfigPage::General), "window.controls");
+        assert_eq!(
+            config_keys_line(ConfigPage::General),
+            "window.controls \u{b7} terminal.shell"
+        );
         assert!(
             config_keys_line(ConfigPage::Appearance).contains("appearance.interface_scale_percent")
         );

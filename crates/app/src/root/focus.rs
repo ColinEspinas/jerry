@@ -164,6 +164,10 @@ impl AdeApp {
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);
         self.load_lsp_rows(cx);
+        // GitHub issue #213: the General page's shell field shows a real found/not-found hint,
+        // and `$PATH` (or the file it names) can have changed since the last time Settings was
+        // open - re-probe once here, on open, rather than per render.
+        self.refresh_shell_status();
         cx.notify();
     }
 
@@ -589,6 +593,7 @@ mod tab_strip_keybinding_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -633,6 +638,7 @@ mod tab_strip_keybinding_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -835,6 +841,7 @@ mod tab_strip_keybinding_tests {
                     AgentKind::Shell,
                     repo.path().to_path_buf(),
                     app.settings.appearance.terminal_font_size,
+                    app.settings.terminal.shell_override(),
                     window,
                     cx,
                 )
