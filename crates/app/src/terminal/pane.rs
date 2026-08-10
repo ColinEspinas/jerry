@@ -43,6 +43,23 @@
 //! application cursor-key mode) - enough to type commands, use arrow keys, and send
 //! `Ctrl-C`, not a full VT100 keymap.
 //!
+//! ## Double-width characters (GitHub issue #211)
+//!
+//! CJK ideographs and most emoji occupy two grid columns. `crate::terminal::grid` labels those
+//! cells (`CellWidth`, from `alacritty_terminal`'s own `WIDE_CHAR`/`WIDE_CHAR_SPACER` flags); this
+//! module is what acts on the label, in [`row_runs`]/[`wide_run_width`]:
+//!
+//! - The spacer cell the emulator writes after a wide character paints nothing at all. Painting it
+//!   (which is what this module used to do, having no idea it existed) put a stray blank column
+//!   after every wide glyph.
+//! - A run of wide characters is pinned to an explicit `2 * cell_width` per character rather than
+//!   left to whatever advance the font gives that glyph, so the column grid stays exact even when
+//!   an emoji resolves through font fallback to a face with a different advance.
+//!
+//! Together those keep every grid column starting at exactly `column * cell_width`, which is what
+//! lets [`cell_position_in_grid`]'s mouse arithmetic stay a pure function of pixels - see its own
+//! docs.
+//!
 //! ## Windows: process-exit detection can't rely on pty EOF
 //!
 //! [`Self::spawn_process`]'s poll loop has exactly one unix-native trigger for "the process
@@ -72,7 +89,9 @@ use gpui::{
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
-use crate::terminal::grid::{CellPosition, CellSide, GridCell, TerminalGrid, TerminalPalette};
+use crate::terminal::grid::{
+    CellPosition, CellSide, CellWidth, GridCell, TerminalGrid, TerminalPalette,
+};
 use crate::terminal::links::{self as terminal_links, LinkMatch};
 use crate::theme;
 
@@ -895,6 +914,10 @@ impl TerminalPane {
             .iter()
             .map(|row| {
                 row.iter()
+                    // A wide character's trailing spacer holds a `' '` the *emulator* wrote, not
+                    // one the program printed (GitHub issue #211) - keeping it would put a stray
+                    // space after every CJK character/emoji in the rail's question preview.
+                    .filter(|cell| cell.width != CellWidth::Spacer)
                     .map(|cell| cell.c)
                     .collect::<String>()
                     .trim_end()
@@ -1273,6 +1296,25 @@ fn size_to_grid(size: Size<Pixels>, cell_size: Size<Pixels>) -> (u16, u16) {
 /// [`CellSide::Right`] specifically, so the final column is genuinely *included* in the
 /// selection - `Selection::to_range`'s own `range_simple` drops the last cell when the
 /// selection ends on a cell's left side (`selection.rs:333`).
+///
+/// ## Why one fixed `cell_width` is still correct with double-width characters (issue #211)
+///
+/// A row full of CJK looks like it should break `pixel_x / cell_width`, and it would under a
+/// renderer that painted a wide glyph across two columns *and* still painted the spacer cell after
+/// it. This one doesn't: [`row_runs`] drops spacer cells entirely and [`wide_run_width`] pins a
+/// wide run to exactly `2 * cell_width` per character, so every grid column - wide, spacer, or
+/// narrow - still starts at exactly `column * cell_width`. That invariant is the deliberate reason
+/// `CellWidth::Spacer::columns()` is zero rather than one, it is asserted directly by
+/// `wide_char_render_tests::painted_columns_always_sum_to_the_grid_column_count`, and it is
+/// checked at real painted pixel coordinates end to end by `mouse_selection_tests::
+/// a_drag_after_two_cjk_characters_still_hits_the_columns_it_looks_like_it_hits`. So this stays a
+/// pure function of pixels and cell size, with no need to know the row's contents.
+///
+/// Clicking the *right* half of a wide character resolves to its spacer column, which is what a
+/// real terminal does too - `alacritty_terminal`'s own selection handles that case
+/// (`Selection::contains_cell` includes a wide char whose trailing spacer is selected,
+/// `selection.rs:86`, and `Term::line_to_string` extends a selection that starts on a spacer back
+/// onto the character, `term/mod.rs:584`).
 fn cell_position_in_grid(
     position: gpui::Point<Pixels>,
     origin: gpui::Point<Pixels>,
@@ -1515,6 +1557,10 @@ fn same_run_style(a: &GridCell, b: &GridCell) -> bool {
         // background), so a run must break at the selection's own edges - merging across one
         // would paint unselected characters as selected.
         && a.selected == b.selected
+        // GitHub issue #211: a double-width run is painted at an explicit pixel width covering
+        // the two columns per character it owns, so it can never share a span with narrow text -
+        // that span would then be sized for the wrong number of columns.
+        && a.width == b.width
 }
 
 /// One segment of a grid row - either a span of the row's original style-per-cell text, or a
@@ -1567,8 +1613,17 @@ fn split_segments(row_char_count: usize, links: &[LinkMatch]) -> Vec<RowSegment>
     segments
 }
 
-fn plain_span(style: &GridCell, text: String, palette: &TerminalPalette) -> impl IntoElement {
+/// `fixed_width` is `Some` only for a double-width run - see [`wide_run_width`].
+fn plain_span(
+    style: &GridCell,
+    text: String,
+    palette: &TerminalPalette,
+    fixed_width: Option<Pixels>,
+) -> impl IntoElement {
     let mut span = div().text_color(rgb(pack_rgb(style.fg)));
+    if let Some(width) = fixed_width {
+        span = span.w(width).flex_none().whitespace_nowrap();
+    }
     // The selection fill wins over the cell's own ANSI background, so a selection is visible
     // across text a program has coloured - which is most of what an agent CLI prints.
     if style.selected {
@@ -1589,6 +1644,19 @@ fn plain_span(style: &GridCell, text: String, palette: &TerminalPalette) -> impl
         span = span.line_through();
     }
     span.child(text)
+}
+
+/// The two paint decisions a caller makes per link span, grouped into one parameter so
+/// [`render_link_span`] stays inside clippy's argument-count budget (its id, target and click
+/// wiring already account for the rest).
+#[derive(Debug, Clone, Copy, Default)]
+struct LinkSpanPaint {
+    /// The live theme's selection fill when this span falls inside the selection, and `None` when
+    /// it doesn't - the fill rather than a `selected: bool` plus the whole palette, since the fill
+    /// is the only thing this function ever wants out of it.
+    selection_fill: Option<(u8, u8, u8)>,
+    /// `Some` only for a double-width run - see [`wide_run_width`].
+    fixed_width: Option<Pixels>,
 }
 
 /// Renders one detected link as a clickable span - the design's link template:
@@ -1617,10 +1685,7 @@ fn render_link_span(
     cwd: &Path,
     row_index: usize,
     link_ordinal: usize,
-    // `selection_fill` is the live theme's selection fill when this span falls inside the
-    // selection and `None` when it doesn't - one parameter rather than a `selected: bool` plus
-    // the whole palette, since the fill is the only thing this function ever wants out of it.
-    selection_fill: Option<(u8, u8, u8)>,
+    paint: LinkSpanPaint,
     cx: &mut Context<TerminalPane>,
 ) -> impl IntoElement {
     let target = terminal_links::resolve(cwd, &link.path);
@@ -1633,8 +1698,11 @@ fn render_link_span(
         .border_b_1()
         .border_color(theme::term::LINK_UNDERLINE)
         .child(text);
-    if let Some(fill) = selection_fill {
+    if let Some(fill) = paint.selection_fill {
         span = span.bg(rgb(pack_rgb(fill)));
+    }
+    if let Some(width) = paint.fixed_width {
+        span = span.w(width).flex_none().whitespace_nowrap();
     }
     span.style().border_style = Some(BorderStyle::Dashed);
 
@@ -1673,6 +1741,104 @@ fn click_included_secondary_modifier(event: &ClickEvent) -> bool {
     }
 }
 
+/// One painted piece of a grid row: consecutive cells that share a style, already merged, with
+/// the wide characters' spacer cells dropped. The pure half of [`render_row`] - see [`row_runs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowRun {
+    /// Exactly the characters this run paints. Never contains a wide character's spacer `' '`
+    /// (see [`CellWidth::Spacer`]), so this is the row's real text, not the emulator's padding.
+    text: String,
+    /// How many *grid columns* this run covers: one per narrow character, two per wide one. Not
+    /// `text.chars().count()` - that is the whole point of this field.
+    columns: usize,
+    /// The style every cell in the run shares. Its own `GridCell::c` is meaningless here (the
+    /// run's characters are in [`Self::text`]); its `width` says whether this is a wide run.
+    style: GridCell,
+    /// The detected link this run is part of, if any - one run per style change *within* a link,
+    /// each keeping the same click target.
+    link: Option<LinkMatch>,
+}
+
+/// Splits one grid row into the runs [`render_row`] paints - pure, so the whole wide-character
+/// layout contract is unit-testable with no GPUI window (see this module's
+/// `wide_char_render_tests`).
+///
+/// Spacer cells are dropped up front (GitHub issue #211), which does two things at once:
+///
+/// - They contribute no glyph, so a double-width character is no longer followed by a stray blank
+///   column pushing the rest of the row right.
+/// - Everything downstream sees the row's *real* text. In particular `find_links` runs against
+///   `日本/x.rs` rather than `日 本 /x.rs`, and [`split_segments`]'s char offsets keep indexing
+///   one painted cell each - the contract `crate::terminal::links::LinkMatch` is built on.
+fn row_runs(row: &[GridCell]) -> Vec<RowRun> {
+    let cells: Vec<&GridCell> = row
+        .iter()
+        .filter(|cell| cell.width != CellWidth::Spacer)
+        .collect();
+    let text: String = cells.iter().map(|cell| cell.c).collect();
+    let links = terminal_links::find_links(&text);
+
+    let mut runs = Vec::new();
+    for segment in split_segments(cells.len(), &links) {
+        let (start, end, link) = match segment {
+            RowSegment::Plain { start, end } => (start, end, None),
+            RowSegment::Link { start, end, link } => (start, end, Some(link)),
+        };
+
+        let mut inner = start;
+        while inner < end {
+            let style = *cells[inner];
+            let mut run_end = inner + 1;
+            // A link's own colour replaces whatever ANSI colour the underlying cells carried, so
+            // a link run only has to break where something it *does* paint differs: the selection
+            // fill, and the column width. A plain run breaks on any style difference at all.
+            let continues_run = |cell: &GridCell| match link {
+                Some(_) => cell.selected == style.selected && cell.width == style.width,
+                None => same_run_style(cell, &style),
+            };
+            // A double-width character is deliberately never merged with the next one: each gets
+            // its own two-column box, so a glyph whose real advance overshoots two cells (Segoe UI
+            // Emoji's do, measurably) can only spill a pixel or two into its immediate neighbour
+            // instead of accumulating that overshoot across a whole run and shoving the rest of
+            // the row sideways.
+            if style.width != CellWidth::Wide {
+                while run_end < end && continues_run(cells[run_end]) {
+                    run_end += 1;
+                }
+            }
+
+            runs.push(RowRun {
+                text: cells[inner..run_end].iter().map(|cell| cell.c).collect(),
+                columns: cells[inner..run_end]
+                    .iter()
+                    .map(|cell| cell.width.columns())
+                    .sum(),
+                style,
+                link: link.clone(),
+            });
+            inner = run_end;
+        }
+    }
+
+    runs
+}
+
+/// The explicit pixel width a run must be pinned to, or `None` for an ordinary narrow run that
+/// can just take its glyphs' natural advance (GitHub issue #211).
+///
+/// A double-width character owns exactly two grid columns, but nothing guarantees the font
+/// actually advances by two monospace cells for it - a CJK ideograph in the bundled mono face
+/// usually does, an emoji resolved through font fallback does not (measured: Segoe UI Emoji
+/// overshoots, and before `whitespace_nowrap()` was added the overshoot made a fixed-width span
+/// *wrap*, dropping the last emoji of a run onto a line of its own). Pinning each wide character
+/// to `2 * cell_width` makes the row's column grid exact regardless of which face the glyph came
+/// from; `flex_none()` stops the row's flex layout from shrinking the box back, and
+/// `whitespace_nowrap()` stops an overshooting glyph from reflowing out of it (both applied at the
+/// span-building call sites).
+fn wide_run_width(run: &RowRun, cell_width: Pixels) -> Option<Pixels> {
+    (run.style.width == CellWidth::Wide).then(|| cell_width * run.columns as f32)
+}
+
 /// Renders one grid row as a horizontal run of styled spans - grouping consecutive cells that
 /// share the same style into a single span keeps the element count low (a typical row is
 /// mostly-uniform default-styled text, so this is usually 1-3 spans, not one per character)
@@ -1680,61 +1846,45 @@ fn click_included_secondary_modifier(event: &ClickEvent) -> bool {
 /// Additionally splits any run that contains a detected link
 /// (`crate::terminal::links::find_links`, via the pure [`split_segments`]) into its own
 /// clickable span - see [`render_link_span`]'s docs.
+///
+/// All of the row-splitting decisions live in the pure [`row_runs`]; this only turns each run
+/// into an element, applying [`wide_run_width`] to the double-width ones.
 fn render_row(
     row: &[GridCell],
     row_index: usize,
     cwd: &Path,
     palette: &TerminalPalette,
+    cell_width: Pixels,
     cx: &mut Context<TerminalPane>,
 ) -> impl IntoElement {
-    let row_text: String = row.iter().map(|cell| cell.c).collect();
-    let links = terminal_links::find_links(&row_text);
-    let segments = split_segments(row.len(), &links);
-
     let mut line = div().flex().flex_row();
     let mut link_ordinal = 0usize;
 
-    for segment in segments {
-        match segment {
-            RowSegment::Plain { start, end } => {
-                let mut inner = start;
-                while inner < end {
-                    let style = &row[inner];
-                    let mut run_end = inner + 1;
-                    while run_end < end && same_run_style(&row[run_end], style) {
-                        run_end += 1;
-                    }
-                    let text: String = row[inner..run_end].iter().map(|cell| cell.c).collect();
-                    line = line.child(plain_span(style, text, palette));
-                    inner = run_end;
-                }
+    for run in row_runs(row) {
+        let fixed_width = wide_run_width(&run, cell_width);
+        match &run.link {
+            // A selection can end part-way through a link, so the link is split into one span per
+            // selected/unselected run rather than highlighted as a unit - every sub-span keeps the
+            // same click target, so clicking any part of the link still opens the same file. In
+            // the overwhelmingly common (unselected, all-narrow) case this is one span, exactly as
+            // it always was.
+            Some(link) => {
+                line = line.child(render_link_span(
+                    run.text,
+                    link,
+                    cwd,
+                    row_index,
+                    link_ordinal,
+                    LinkSpanPaint {
+                        selection_fill: run.style.selected.then_some(palette.selection),
+                        fixed_width,
+                    },
+                    cx,
+                ));
+                link_ordinal += 1;
             }
-            RowSegment::Link { start, end, link } => {
-                // A selection can end part-way through a link, so the link is split into one
-                // span per selected/unselected run rather than highlighted as a unit - every
-                // sub-span keeps the same click target, so clicking any part of the link still
-                // opens the same file. In the overwhelmingly common (unselected) case this is
-                // one iteration producing exactly the single span it always did.
-                let mut inner = start;
-                while inner < end {
-                    let selected = row[inner].selected;
-                    let mut run_end = inner + 1;
-                    while run_end < end && row[run_end].selected == selected {
-                        run_end += 1;
-                    }
-                    let text: String = row[inner..run_end].iter().map(|cell| cell.c).collect();
-                    line = line.child(render_link_span(
-                        text,
-                        &link,
-                        cwd,
-                        row_index,
-                        link_ordinal,
-                        selected.then_some(palette.selection),
-                        cx,
-                    ));
-                    link_ordinal += 1;
-                    inner = run_end;
-                }
+            None => {
+                line = line.child(plain_span(&run.style, run.text, palette, fixed_width));
             }
         }
     }
@@ -1777,9 +1927,11 @@ fn render_plain_line_with_links(
                     // own `row_index` never reaches anywhere close to `usize::MAX`).
                     usize::MAX,
                     link_ordinal,
-                    // The spawn-error line is not part of the grid, so it is never part of a
-                    // grid selection.
-                    None,
+                    // Neither applies here: the spawn-error line is not part of the grid, so it
+                    // is never part of a grid selection, and it is plain `&str` rather than grid
+                    // cells, so it has no double-width *columns* to pin a width to - it just
+                    // takes its glyphs' natural advance.
+                    LinkSpanPaint::default(),
                     cx,
                 ));
                 link_ordinal += 1;
@@ -1793,6 +1945,11 @@ fn render_plain_line_with_links(
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize_pty(window);
+
+        // GitHub issue #211: the real measured monospace advance (`Self::cell_size`, cached), so
+        // `render_row` can pin a double-width run to exactly the two columns per character it
+        // owns instead of trusting whatever advance the font happens to give that glyph.
+        let cell_width = self.cell_size(window).width;
 
         // GitHub issue #208: resolved once per frame and threaded through every span this paints,
         // so the whole pane (its own fill, unstyled text, every ANSI colour a program asked for,
@@ -1885,7 +2042,7 @@ impl Render for TerminalPane {
         }
 
         for (row_index, row) in self.grid.visible_rows(&palette).into_iter().enumerate() {
-            pane = pane.child(render_row(&row, row_index, &cwd, &palette, cx));
+            pane = pane.child(render_row(&row, row_index, &cwd, &palette, cell_width, cx));
         }
 
         if self.grid.ended {
@@ -2865,6 +3022,20 @@ mod mouse_selection_tests {
         Bounds<Pixels>,
         Size<Pixels>,
     ) {
+        painted_pane_showing(cx, b"hello world")
+    }
+
+    /// [`painted_pane`] with caller-chosen row-0 content - used by the wide-character drag
+    /// coverage (GitHub issue #211), which needs real CJK on screen.
+    fn painted_pane_showing<'a>(
+        cx: &'a mut TestAppContext,
+        row_zero: &[u8],
+    ) -> (
+        Entity<TerminalPane>,
+        &'a mut VisualTestContext,
+        Bounds<Pixels>,
+        Size<Pixels>,
+    ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
             TerminalPane::new(
                 TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
@@ -2875,7 +3046,7 @@ mod mouse_selection_tests {
         cx.run_until_parked();
 
         pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"hello world", cx);
+            pane.inject_bytes_for_test(row_zero, cx);
         });
         cx.run_until_parked();
 
@@ -3007,6 +3178,411 @@ mod mouse_selection_tests {
                 .collect::<String>()
         });
         assert_eq!(flagged, "hello");
+    }
+
+    /// GitHub issue #211's mouse-math half, end to end through real GPUI event dispatch at real
+    /// painted pixel coordinates.
+    ///
+    /// `cell_position_in_grid` divides by a single fixed `cell_width`, which would be wrong for
+    /// any row where painted x offsets stopped matching `column * cell_width`. They don't: a wide
+    /// cell paints two columns and its spacer paints none (see `CellWidth::columns`), so the
+    /// offsets stay exact - and *this* is what proves it, by dragging over the `"world"` that
+    /// sits four grid columns (two CJK characters) into the row and getting exactly `"world"`
+    /// back. Under the pre-fix renderer those two characters painted six columns' worth of
+    /// glyphs, so the same pixel positions landed two columns early.
+    #[gpui::test]
+    fn a_drag_after_two_cjk_characters_still_hits_the_columns_it_looks_like_it_hits(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx, bounds, cell_size) = painted_pane_showing(cx, "你好world".as_bytes());
+
+        // `你好` occupies grid columns 0..=3, so `world` is columns 4..=8.
+        let start = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 4.1,
+            cell_centre(bounds, cell_size, 0, 4).y,
+        );
+        let end = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 8.9,
+            cell_centre(bounds, cell_size, 0, 8).y,
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test())
+                .as_deref(),
+            Some("world")
+        );
+    }
+
+    /// Dragging over the wide characters themselves - including across the second (spacer) column
+    /// of the last one - must copy them once each, with no emulator-written padding spaces.
+    #[gpui::test]
+    fn a_drag_over_cjk_characters_copies_them_once_each(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = painted_pane_showing(cx, "你好world".as_bytes());
+
+        let start = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 0.1,
+            cell_centre(bounds, cell_size, 0, 0).y,
+        );
+        let end = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 3.9,
+            cell_centre(bounds, cell_size, 0, 3).y,
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test())
+                .as_deref(),
+            Some("你好")
+        );
+    }
+}
+
+/// GitHub issue #211's *input* half - real UTF-8 going **into** the pty rather than coming out of
+/// it.
+///
+/// Reading the real path end to end turned up nothing broken to fix, and these exist to keep it
+/// that way rather than to fix anything: [`keystroke_to_bytes`] hands
+/// `gpui::Keystroke::key_char`'s own `String` straight to `str::as_bytes`, [`paste_payload`]'s
+/// `str::replace` calls are all char-oriented, and `pty_core::PtySession::write_input` copies the
+/// slice into a `Vec<u8>` that its writer thread `write_all`s. Nothing on that path is
+/// byte-indexed, length-capped, or `char`-typed, so a three-byte CJK character and a
+/// multi-codepoint ZWJ emoji sequence are as safe as ASCII. Regression coverage matters anyway,
+/// since any of those three could grow a `.chars().next()`-shaped shortcut later.
+///
+/// One real limitation, stated plainly rather than papered over: this covers keys that arrive as a
+/// finished `key_char`, which is what a direct (including AltGr/dead-key) keypress produces.
+/// Composing text through a platform IME - the normal way CJK is *typed* - goes through GPUI's
+/// `EntityInputHandler`/`Window::set_input_handler` machinery instead, which this pane does not
+/// implement at all. That is a separate, larger piece of work than this issue, and it is untouched
+/// here; pasting CJK works today, typing it through an IME does not.
+#[cfg(test)]
+mod utf8_input_tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext};
+
+    fn typed(text: &str) -> Keystroke {
+        Keystroke {
+            key: text.to_string(),
+            key_char: Some(text.to_string()),
+            modifiers: Modifiers::none(),
+        }
+    }
+
+    /// A three-byte character must reach the pty as all three of its bytes, in order - not as one
+    /// truncated byte, and not as a replacement character.
+    #[test]
+    fn a_multi_byte_character_is_forwarded_as_its_exact_utf8_bytes() {
+        assert_eq!(
+            keystroke_to_bytes(&typed("好")),
+            Some("好".as_bytes().to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&typed("好")),
+            Some(vec![0xe5, 0xa5, 0xbd]),
+            "spelled out, so a change that started re-encoding this fails visibly"
+        );
+    }
+
+    /// A grapheme cluster made of several codepoints (here a ZWJ family emoji: three emoji joined
+    /// by U+200D) arrives as one `key_char` string and must be forwarded whole. Truncating to the
+    /// first `char` would send a lone `👨`.
+    #[test]
+    fn a_multi_codepoint_grapheme_cluster_is_forwarded_whole() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        assert_eq!(family.chars().count(), 5, "sanity check on the fixture");
+        assert_eq!(
+            keystroke_to_bytes(&typed(family)),
+            Some(family.as_bytes().to_vec())
+        );
+    }
+
+    /// Paste framing is `str`-level throughout, so it must not disturb multi-byte text either -
+    /// in both bracketed and unbracketed mode.
+    #[test]
+    fn paste_framing_leaves_multi_byte_text_byte_for_byte_intact() {
+        let text = "日本語 🎉";
+        assert_eq!(paste_payload(text, false), text);
+        assert_eq!(
+            paste_payload(text, true),
+            format!("\x1b[200~{text}\x1b[201~")
+        );
+    }
+
+    /// The real round trip, through everything: a real `KeyDownEvent` into the pane's own
+    /// `handle_key_down`, out through `PtySession::write_input`'s writer thread to a real pty, and
+    /// back as a real `cat` process's echo - which the grid then parses as real UTF-8. What is
+    /// asserted is the character landing in the grid as a genuine wide cell, so nothing along that
+    /// path can have mangled the bytes.
+    #[gpui::test]
+    fn typing_a_cjk_character_round_trips_through_a_real_pty_as_a_wide_cell(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update_in(cx, |pane, window, cx| {
+            for text in ["日", "本", "🎉"] {
+                pane.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: typed(text),
+                        is_held: false,
+                        prefer_character_input: true,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+
+        let mut echoed = None;
+        for _ in 0..100 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            let row = pane.read_with(cx, |pane, _| pane.painted_rows_for_test().remove(0));
+            let text: String = row
+                .iter()
+                .filter(|cell| cell.width != CellWidth::Spacer)
+                .map(|cell| cell.c)
+                .collect();
+            if text.trim_end() == "日本🎉" {
+                echoed = Some(row);
+                break;
+            }
+        }
+
+        let row = echoed.expect("expected the real pty's echo of the typed UTF-8 in the grid");
+        assert_eq!(
+            row.iter()
+                .take(6)
+                .map(|cell| cell.width)
+                .collect::<Vec<_>>(),
+            vec![
+                CellWidth::Wide,
+                CellWidth::Spacer,
+                CellWidth::Wide,
+                CellWidth::Spacer,
+                CellWidth::Wide,
+                CellWidth::Spacer,
+            ]
+        );
+    }
+}
+
+/// GitHub issue #211's rendering half. Before this, `render_row` painted every grid cell as one
+/// glyph of ordinary monospace text, so a double-width character reached the screen as its own
+/// (roughly two-advance) glyph *plus* the blank spacer cell `alacritty_terminal` writes after it -
+/// three columns of paint for two columns of grid, and every character after it on the row shifted
+/// right.
+///
+/// These drive real UTF-8 through a real `TerminalGrid` (the same `alacritty_terminal` parser
+/// production uses) and assert on [`row_runs`], which is genuinely what `render_row` turns into
+/// elements - not a re-derivation of the layout a second way.
+#[cfg(test)]
+mod wide_char_render_tests {
+    use super::*;
+
+    /// Row 0 of a real grid after parsing `bytes`.
+    fn row_zero(bytes: &str, cols: u16) -> Vec<GridCell> {
+        let mut grid = TerminalGrid::new(2, cols);
+        grid.append_bytes(bytes.as_bytes());
+        grid.visible_rows(&TerminalPalette::default())
+            .into_iter()
+            .next()
+            .expect("a two-row grid always has a row 0")
+    }
+
+    /// The invariant the whole design rests on, and the reason `cell_position_in_grid`'s fixed
+    /// `pixel_x / cell_width` arithmetic needed no change: however many wide characters a row
+    /// contains, the painted columns still add up to exactly the grid's own column count, so the
+    /// x offset of grid column `k` is always `k * cell_width`.
+    #[test]
+    fn painted_columns_always_sum_to_the_grid_column_count() {
+        for bytes in [
+            "plain ascii",
+            "你好world",
+            "🎉🎉🎉",
+            "a你b好c",
+            "abcd好", // wraps: the last column holds a real blank, not a spacer
+        ] {
+            let row = row_zero(bytes, 20);
+            let painted: usize = row.iter().map(|cell| cell.width.columns()).sum();
+            assert_eq!(
+                painted,
+                row.len(),
+                "row {bytes:?} paints {painted} columns for {} grid columns",
+                row.len()
+            );
+        }
+    }
+
+    /// The bug itself: the spacer cell must contribute no glyph. Painting the whole row's runs
+    /// back to a string has to give the characters the program actually printed, once each.
+    #[test]
+    fn a_spacer_cell_contributes_no_glyph_of_its_own() {
+        let runs = row_runs(&row_zero("你好world", 20));
+        let painted: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(
+            painted.trim_end(),
+            "你好world",
+            "the emulator's own padding spaces must never reach the screen"
+        );
+    }
+
+    /// Every wide character is its own two-column run - never merged with the next one, so a glyph
+    /// whose real advance overshoots two cells can't accumulate that overshoot across a run.
+    /// Narrow text still merges into as few runs as possible.
+    #[test]
+    fn each_wide_character_is_its_own_two_column_run() {
+        let runs = row_runs(&row_zero("你好world", 20));
+
+        assert_eq!(runs[0].text, "你");
+        assert_eq!(runs[0].columns, 2);
+        assert_eq!(runs[0].style.width, CellWidth::Wide);
+        assert_eq!(runs[1].text, "好");
+        assert_eq!(runs[1].columns, 2);
+
+        assert_eq!(runs[2].text.trim_end(), "world");
+        assert_eq!(runs[2].style.width, CellWidth::Narrow);
+        assert_eq!(
+            runs[2].columns,
+            runs[2].text.chars().count(),
+            "a narrow run covers exactly one column per character"
+        );
+    }
+
+    /// The pixel width a wide run is pinned to, and the fact a narrow one is left unpinned (it can
+    /// use its glyphs' natural monospace advance, which is already correct).
+    #[test]
+    fn only_a_wide_run_gets_an_explicit_pixel_width() {
+        let runs = row_runs(&row_zero("你好world", 20));
+        assert_eq!(wide_run_width(&runs[0], px(8.0)), Some(px(16.0)));
+        assert_eq!(wide_run_width(&runs[2], px(8.0)), None);
+    }
+
+    /// A narrow run and a wide run can never be merged, whatever their colours - the merged span
+    /// would be sized for the wrong number of columns.
+    #[test]
+    fn a_wide_run_never_merges_into_the_narrow_text_around_it() {
+        let runs = row_runs(&row_zero("a好b", 20));
+        let shapes: Vec<(&str, usize)> = runs
+            .iter()
+            .map(|run| (run.text.trim_end(), run.columns))
+            .collect();
+        assert_eq!(shapes[0], ("a", 1));
+        assert_eq!(shapes[1], ("好", 2));
+        // The trailing run is `b` plus the row's blank remainder.
+        assert_eq!(&shapes[2].0[..1], "b");
+    }
+
+    /// Link detection has to see the row's real text, not the emulator's padding. With the spacer
+    /// cells still in the row text this reads `/tmp/日 本 /main.rs`, whose space breaks the path
+    /// apart; the link then either fails to match or matches the wrong span.
+    #[test]
+    fn a_link_containing_wide_characters_is_still_detected_as_one_link() {
+        let runs = row_runs(&row_zero("see /tmp/日本/main.rs:12 ok", 40));
+        let linked: Vec<&RowRun> = runs.iter().filter(|run| run.link.is_some()).collect();
+
+        let path = linked
+            .first()
+            .and_then(|run| run.link.as_ref())
+            .map(|link| link.path.clone());
+        assert_eq!(path.as_deref(), Some("/tmp/日本/main.rs"));
+        assert_eq!(
+            linked
+                .first()
+                .and_then(|run| run.link.as_ref())
+                .and_then(|link| link.line),
+            Some(12)
+        );
+
+        let link_text: String = linked.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(link_text, "/tmp/日本/main.rs:12");
+    }
+
+    /// A link sitting *after* a wide character still gets its own span, and the plain text around
+    /// it is preserved - i.e. `split_segments`'s char offsets and the painted cells stayed in
+    /// lockstep once the spacers were dropped.
+    #[test]
+    fn a_link_after_a_wide_character_still_lands_on_the_right_characters() {
+        let runs = row_runs(&row_zero("好 src/main.rs done", 40));
+        let linked: Vec<&RowRun> = runs.iter().filter(|run| run.link.is_some()).collect();
+        let link_text: String = linked.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(link_text, "src/main.rs");
+
+        let painted: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(painted.trim_end(), "好 src/main.rs done");
+    }
+
+    /// Selection is still carried per wide character - a run that lost the flag halfway would
+    /// paint the selection fill across characters that aren't selected.
+    #[test]
+    fn the_selection_flag_survives_onto_the_wide_characters_it_covers() {
+        let mut grid = TerminalGrid::new(2, 20);
+        grid.append_bytes("你好世界".as_bytes());
+        // Columns 0..=3 are `你好` (each a wide cell plus its spacer).
+        grid.start_selection(CellPosition {
+            row: 0,
+            column: 0,
+            side: CellSide::Left,
+        });
+        grid.update_selection(CellPosition {
+            row: 0,
+            column: 3,
+            side: CellSide::Right,
+        });
+        let row = grid
+            .visible_rows(&TerminalPalette::default())
+            .into_iter()
+            .next()
+            .expect("a two-row grid always has a row 0");
+
+        let runs = row_runs(&row);
+        let selected: String = runs
+            .iter()
+            .filter(|run| run.style.selected)
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(selected, "你好");
+        assert!(runs.iter().all(|run| run.style.width != CellWidth::Wide
+            || run.columns == 2 && run.text.chars().count() == 1));
+    }
+
+    /// `visible_text_lines` backs the rail's question preview, which is plain text a human reads -
+    /// it must not carry the emulator's padding spaces either.
+    #[gpui::test]
+    fn the_plain_text_view_of_the_grid_drops_the_padding_spaces(cx: &mut gpui::TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test("完了 🎉".as_bytes(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.visible_text_lines())[0],
+            "完了 🎉"
+        );
     }
 }
 

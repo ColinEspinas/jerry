@@ -64,6 +64,34 @@
 //! resolving the live theme is `crate::terminal::pane`'s job - it has the theme at paint time -
 //! and this module only consumes the already-resolved RGB it hands over.
 //!
+//! ## Double-width characters (GitHub issue #211)
+//!
+//! `alacritty_terminal` already tracks, per cell, whether a character is double-width - a CJK
+//! ideograph, most emoji, anything `unicode-width` reports as two columns. Verified against the
+//! pinned rev's real source (`term/mod.rs:1103-1130`, `Term::input`): a wide character is written
+//! into its own cell with `Flags::WIDE_CHAR` set, and the *next* cell is then written with a
+//! literal `' '` and `Flags::WIDE_CHAR_SPACER` set. That spacer is a placeholder holding the
+//! second column the glyph occupies, not a character of its own - `Term::line_to_string`
+//! (`term/mod.rs:605`) skips it when building selection/clipboard text, and no real terminal
+//! paints it.
+//!
+//! Neither flag used to be read here at all, so [`GridCell`] had no way to tell the renderer any
+//! of that apart: a row containing `你好` reached `crate::terminal::pane` as the four cells
+//! `['你', ' ', '好', ' ']`, which it painted as four glyph advances of ordinary monospace text -
+//! the two wide glyphs each taking roughly two advances of their own, plus two stray spaces, so
+//! everything after them on the row sat two columns too far right. [`CellWidth`] is what closes
+//! that: see its own docs, and `crate::terminal::pane::row_runs` for what the renderer does with
+//! it.
+//!
+//! Not covered: zero-width characters (combining marks, variation selectors, ZWJ) that
+//! `alacritty_terminal` stacks onto a cell's `Cell::zerowidth()` side-channel rather than into
+//! `Cell::c`. [`GridCell`] still carries exactly one `char` per cell, so those are dropped -
+//! `e` + U+0301 renders as a bare `e`, and `❤` + U+FE0F renders in its text presentation. That is
+//! unchanged from before this issue, and picking it up means letting one cell contribute more than
+//! one character to a row's text, which the link scanner's char-offset-per-cell contract
+//! (`crate::terminal::links::LinkMatch`) is currently built on - a real follow-up, not a one-line
+//! addition.
+//!
 //! ## Text selection (GitHub issue #158)
 //!
 //! Selection is not tracked here at all - it lives in `alacritty_terminal`'s own
@@ -162,6 +190,45 @@ pub struct GridCell {
     /// never stored - so it can't go stale against the real selection the way a separately
     /// tracked copy would.
     pub selected: bool,
+    /// How many columns this cell really occupies on screen (GitHub issue #211) - see
+    /// [`CellWidth`].
+    pub width: CellWidth,
+}
+
+/// How many grid columns one [`GridCell`] actually paints into, derived from
+/// `alacritty_terminal`'s own `Flags::WIDE_CHAR`/`Flags::WIDE_CHAR_SPACER` (GitHub issue #211 -
+/// see the module docs for the exact `Term::input` behaviour this mirrors).
+///
+/// The three variants' [`CellWidth::columns`] deliberately sum back to the grid's own column
+/// count: a `Wide` cell paints the two columns it owns and its following `Spacer` paints none, so
+/// the painted x offset of grid column `k` stays exactly `k * cell_width` no matter how many wide
+/// characters precede it. That is what keeps `crate::terminal::pane`'s pixel-to-column mouse
+/// arithmetic correct on a row full of CJK without it needing to know the row's contents at all -
+/// pinned by `crate::terminal::pane::wide_char_render_tests::
+/// painted_columns_always_sum_to_the_grid_column_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellWidth {
+    /// An ordinary single-column cell.
+    Narrow,
+    /// The leading cell of a double-width character (`Flags::WIDE_CHAR`): the glyph itself lives
+    /// here and covers this column *and* the next.
+    Wide,
+    /// The trailing placeholder cell `alacritty_terminal` writes after a wide character
+    /// (`Flags::WIDE_CHAR_SPACER`). Its own `c` is a literal `' '` the emulator put there; it is
+    /// not a character the program printed, and painting it is exactly the bug this issue fixes.
+    Spacer,
+}
+
+impl CellWidth {
+    /// How many columns' worth of pixels this cell is painted across - see the type's own docs
+    /// for why `Spacer` is genuinely zero rather than one.
+    pub fn columns(self) -> usize {
+        match self {
+            CellWidth::Narrow => 1,
+            CellWidth::Wide => 2,
+            CellWidth::Spacer => 0,
+        }
+    }
 }
 
 /// Which half of a character cell a pointer position fell in - the row/column-space counterpart
@@ -350,8 +417,22 @@ fn grid_cell_from_alacritty(
     if is_cursor {
         std::mem::swap(&mut fg, &mut bg);
     }
+    // GitHub issue #211. `LEADING_WIDE_CHAR_SPACER` is deliberately *not* mapped to
+    // [`CellWidth::Spacer`]: `alacritty_terminal` writes that one at the end of a row when a wide
+    // character wouldn't fit before the wrap (`term/mod.rs:1109-1114`), and the character itself
+    // then lands on the *next* row. So it is a genuine, real blank column standing on its own,
+    // not the second half of a glyph rendered elsewhere on the same row - it must keep painting
+    // its own single column, or every wrapped row would come out one column short.
+    let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+        CellWidth::Wide
+    } else if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        CellWidth::Spacer
+    } else {
+        CellWidth::Narrow
+    };
     GridCell {
         selected,
+        width,
         // An uninitialized-by-any-write cell holds `'\0'` (`Cell::default()` in
         // `term/cell.rs` uses `c: ' '` only as the *constructed* default) - render as a
         // space either way.
@@ -797,6 +878,150 @@ mod tests {
     }
 }
 
+/// GitHub issue #211: `Flags::WIDE_CHAR`/`WIDE_CHAR_SPACER` were never read here, so the renderer
+/// had no way to tell a double-width glyph from an ordinary one - see the module docs. These drive
+/// real UTF-8 bytes (CJK, an emoji, a wrapped-at-the-edge wide character) through the same real
+/// VT parser everything else goes through and assert on what [`GridCell::width`] genuinely reports.
+#[cfg(test)]
+mod wide_char_tests {
+    use super::*;
+
+    fn widths(row: &[GridCell]) -> Vec<CellWidth> {
+        row.iter().map(|cell| cell.width).collect()
+    }
+
+    /// The core fact this issue rests on, straight out of real parsed UTF-8: a CJK ideograph
+    /// occupies its own cell plus a following spacer cell, and both are now labelled as such.
+    #[test]
+    fn a_cjk_character_is_a_wide_cell_followed_by_a_spacer_cell() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes("你好X".as_bytes());
+        let rows = grid.visible_rows(&TerminalPalette::default());
+
+        assert_eq!(rows[0][0].c, '你');
+        assert_eq!(rows[0][2].c, '好');
+        assert_eq!(rows[0][4].c, 'X');
+        assert_eq!(
+            widths(&rows[0][..5]),
+            vec![
+                CellWidth::Wide,
+                CellWidth::Spacer,
+                CellWidth::Wide,
+                CellWidth::Spacer,
+                CellWidth::Narrow,
+            ],
+        );
+    }
+
+    /// The spacer's own `c` is a literal space `alacritty_terminal` wrote there
+    /// (`term/mod.rs:1127-1129`), not a copy of the character or a NUL - which is precisely why
+    /// painting it used to insert a stray blank column after every wide glyph. Pinned so a future
+    /// dependency bump that changed it can't silently invalidate the renderer's assumption.
+    #[test]
+    fn the_spacer_cell_really_holds_a_plain_space_of_its_own() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes("好".as_bytes());
+        let rows = grid.visible_rows(&TerminalPalette::default());
+        assert_eq!(rows[0][1].c, ' ');
+        assert_eq!(rows[0][1].width, CellWidth::Spacer);
+    }
+
+    /// Emoji, not just CJK - the other half of what issue #211 asks for. `🎉` (U+1F389) is a real
+    /// 4-byte UTF-8 sequence and `unicode-width` reports it as two columns.
+    #[test]
+    fn an_emoji_is_a_wide_cell_too() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes("🎉ok".as_bytes());
+        let rows = grid.visible_rows(&TerminalPalette::default());
+
+        assert_eq!(rows[0][0].c, '🎉');
+        assert_eq!(rows[0][0].width, CellWidth::Wide);
+        assert_eq!(rows[0][1].width, CellWidth::Spacer);
+        assert_eq!(rows[0][2].c, 'o');
+        assert_eq!(rows[0][2].width, CellWidth::Narrow);
+    }
+
+    /// A multi-byte UTF-8 character that is *not* double-width (`é`, two bytes, one column) must
+    /// stay [`CellWidth::Narrow`] - "multi-byte" and "double-width" are different properties, and
+    /// conflating them would push every accented Latin character a column to the right.
+    #[test]
+    fn a_multi_byte_but_single_width_character_stays_narrow() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes("éa".as_bytes());
+        let rows = grid.visible_rows(&TerminalPalette::default());
+        assert_eq!(rows[0][0].c, 'é');
+        assert_eq!(widths(&rows[0][..2]), vec![CellWidth::Narrow; 2]);
+    }
+
+    /// The end-of-row case: a wide character that doesn't fit in the last column wraps, and
+    /// `alacritty_terminal` leaves a `LEADING_WIDE_CHAR_SPACER` behind in that last column. That
+    /// one is a real, standalone blank column (the character itself is on the *next* row), so it
+    /// must stay [`CellWidth::Narrow`] - see [`grid_cell_from_alacritty`]'s comment.
+    #[test]
+    fn a_wide_character_wrapped_off_the_row_end_leaves_a_real_blank_column_not_a_spacer() {
+        let mut grid = TerminalGrid::new(3, 5);
+        // Four narrow characters fill columns 0..=3, leaving only column 4 - too narrow for `好`.
+        grid.append_bytes("abcd好".as_bytes());
+        let rows = grid.visible_rows(&TerminalPalette::default());
+
+        assert_eq!(rows[0][4].c, ' ');
+        assert_eq!(
+            rows[0][4].width,
+            CellWidth::Narrow,
+            "the wrap placeholder is its own real column, not the second half of a glyph painted \
+             on this row"
+        );
+        assert_eq!(rows[1][0].c, '好');
+        assert_eq!(rows[1][0].width, CellWidth::Wide);
+        assert_eq!(rows[1][1].width, CellWidth::Spacer);
+    }
+
+    /// End-to-end through a genuinely spawned process on a real pty, so the UTF-8 travels as real
+    /// bytes over a real file descriptor rather than being handed to the parser in one clean
+    /// slice - which is the case that would break if anything on the read path were byte- rather
+    /// than stream-oriented (a 3-byte character split across two `read(2)` calls).
+    #[test]
+    fn end_to_end_real_pty_utf8_output_lands_as_wide_cells() {
+        let session = pty_core::spawn(pty_core::SpawnOptions::new("printf").arg("日本語 🎉 ok"))
+            .expect("spawning `printf` should succeed - this environment must have printf on PATH");
+
+        let mut grid = TerminalGrid::new(5, 40);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Ok(chunk) = session
+            .output()
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            grid.append_bytes(&chunk);
+        }
+
+        let rows = grid.visible_rows(&TerminalPalette::default());
+        let painted: String = rows[0]
+            .iter()
+            .filter(|cell| cell.width != CellWidth::Spacer)
+            .map(|cell| cell.c)
+            .collect();
+        assert_eq!(
+            painted.trim_end(),
+            "日本語 🎉 ok",
+            "the real pty's UTF-8 must survive as the exact characters printed, once each; got \
+             rows: {rows:?}"
+        );
+        assert_eq!(
+            widths(&rows[0][..8]),
+            vec![
+                CellWidth::Wide, // 日
+                CellWidth::Spacer,
+                CellWidth::Wide, // 本
+                CellWidth::Spacer,
+                CellWidth::Wide, // 語
+                CellWidth::Spacer,
+                CellWidth::Narrow, // space
+                CellWidth::Wide,   // 🎉
+            ],
+        );
+    }
+}
+
 /// GitHub issue #158: before this, `TerminalGrid` exposed no selection surface at all -
 /// `Term::selection` was never written and `Term::selection_to_string` never called, so there
 /// was nothing for a Copy binding to copy even once one existed. These cover the real
@@ -951,6 +1176,23 @@ mod selection_tests {
         grid.append_bytes(b"hello world");
         let rows = grid.visible_rows(&TerminalPalette::default());
         assert!(rows.iter().flatten().all(|cell| !cell.selected));
+    }
+
+    /// A wide character's *trailing spacer* column is genuinely part of the selection as far as
+    /// `alacritty_terminal` is concerned, but the copied text must still contain the character
+    /// exactly once - `Term::line_to_string` skips spacer cells (`term/mod.rs:605`). Proves
+    /// [`GridCell::width`] didn't have to teach the clipboard anything: dragging over the second
+    /// half of `好` copies `好`, not `好 `.
+    #[test]
+    fn selecting_a_wide_character_copies_it_once_not_once_plus_its_spacer() {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes("你好".as_bytes());
+
+        // Columns 0..=3 are `[你][spacer][好][spacer]` - a drag across all four.
+        grid.start_selection(left(0, 0));
+        grid.update_selection(right(0, 3));
+
+        assert_eq!(grid.selected_text().as_deref(), Some("你好"));
     }
 
     /// Paste framing depends on this being read from the *live* `Term::mode()` - a program that
