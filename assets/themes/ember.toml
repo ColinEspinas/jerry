@@ -288,6 +288,30 @@ link_underline       = "#0a556e"
 link_hover           = "#6599ae"
 link_underline_hover = "#3f8099"
 
+# The integrated terminal's own rendered-content palette - the colours a program running inside
+# a terminal pane actually paints its characters with.
+[terminal]
+background = "#0e1112"  # The terminal pane's own fill
+foreground = "#777f84"  # Unstyled output
+cursor     = "#00789d"  # What NamedColor::Cursor resolves to
+selection  = "#16323e"  # The fill painted behind a selected cell
+"ansi.0"   = "#000000"
+"ansi.1"   = "#cd3131"
+"ansi.2"   = "#0dbc79"
+"ansi.3"   = "#e5e510"
+"ansi.4"   = "#2472c8"
+"ansi.5"   = "#bc3fbc"
+"ansi.6"   = "#11a8cd"
+"ansi.7"   = "#e5e5e5"
+"ansi.8"   = "#666666"
+"ansi.9"   = "#f14c4c"
+"ansi.10"  = "#23d18b"
+"ansi.11"  = "#f5f543"
+"ansi.12"  = "#3b8eea"
+"ansi.13"  = "#d670d6"
+"ansi.14"  = "#29b8db"
+"ansi.15"  = "#ffffff"
+
 # Exact colours for Surface C's real Completions popup item rows - read directly from
 # design_handoff_jerry_ade/revision/Jerry.dc.html's own completions/KBG/KFG data (the sel ? ...
 [completions_popup]

@@ -271,6 +271,7 @@ pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("syntax", syntax::TOKENS),
     ("editor", editor::TOKENS),
     ("term", term::TOKENS),
+    ("terminal", terminal::TOKENS),
     ("env", env::TOKENS),
     ("agent", agent::TOKENS),
     ("lang", lang::TOKENS),
@@ -715,55 +716,93 @@ fn enforce_syntax_contrast_floors(palette: &mut [(&'static str, Rgba)]) {
         let Some(floor) = syntax_contrast_floor(key) else {
             continue;
         };
-        let quantized_now = Rgba {
-            r: (color.r * 255.0).round() / 255.0,
-            g: (color.g * 255.0).round() / 255.0,
-            b: (color.b * 255.0).round() / 255.0,
-            a: color.a,
-        };
-        if contrast_ratio(quantized_now, background) >= floor * 1.005 {
-            continue;
+        *color = pushed_to_clear_floor(*color, background, floor, lighten);
+    }
+}
+
+/// The one real "move this colour away from that background until it clears `floor`" step both
+/// contrast guards share - [`enforce_syntax_contrast_floors`] and
+/// [`enforce_terminal_foreground_contrast`].
+///
+/// Holds hue and chroma and moves lightness only, so the colour keeps its identity; `lighten` is
+/// the direction its own guard already decided from the background (up on a dark theme, down on a
+/// light one). Returns `color` completely unchanged when it already clears, so this is strictly
+/// one-directional - it can only ever increase contrast.
+fn pushed_to_clear_floor(color: Rgba, background: Rgba, floor: f32, lighten: bool) -> Rgba {
+    // Measured on the **quantized** colour, not the float one. A theme file stores `#rrggbb`, so an
+    // 8-bit rounding step is applied to whatever this produces; searching in float space and
+    // ignoring that lands colours a hundredth of a ratio point under the floor, which is a real
+    // failure of a real assertion rather than a rounding nicety.
+    let quantize = |candidate: Rgba| -> Rgba {
+        Rgba {
+            r: (candidate.r * 255.0).round() / 255.0,
+            g: (candidate.g * 255.0).round() / 255.0,
+            b: (candidate.b * 255.0).round() / 255.0,
+            a: candidate.a,
         }
-        let (lightness, chroma, hue) = oklch::of(*color);
-        let limit = if lighten { 1.0 } else { 0.0 };
-        // Measured on the **quantized** colour, not the float one. A theme file stores `#rrggbb`,
-        // so an 8-bit rounding step is applied to whatever this produces; searching in float space
-        // and ignoring that lands colours a hundredth of a ratio point under the floor, which is a
-        // real failure of a real assertion rather than a rounding nicety.
-        let quantize = |candidate: Rgba| -> Rgba {
-            Rgba {
-                r: (candidate.r * 255.0).round() / 255.0,
-                g: (candidate.g * 255.0).round() / 255.0,
-                b: (candidate.b * 255.0).round() / 255.0,
-                a: candidate.a,
-            }
-        };
-        // A hair above the floor, not exactly on it. Landing a colour on 4.4999 is a real
-        // assertion failure, and the difference between an f32 ratio computed here and an f64 one
-        // computed by any external checker is comfortably inside that margin.
-        let target = floor * 1.005;
-        let clears = |candidate: Rgba| contrast_ratio(quantize(candidate), background) >= target;
-        // Binary-search the smallest move that clears the floor: contrast is monotonic in
-        // lightness once we are moving away from the background, so this converges.
-        let (mut low, mut high) = (lightness, limit);
-        let mut best = oklch::to_rgba(limit, chroma, hue, color.a);
-        if !clears(best) {
-            // Even pure white/black cannot clear it - take the extreme and let the theme's own
-            // validation report the palette as unreadable rather than silently pretending.
-            *color = best;
-            continue;
+    };
+    // A hair above the floor, not exactly on it. Landing a colour on 4.4999 is a real assertion
+    // failure, and the difference between an f32 ratio computed here and an f64 one computed by any
+    // external checker is comfortably inside that margin.
+    let target = floor * 1.005;
+    let clears = |candidate: Rgba| contrast_ratio(quantize(candidate), background) >= target;
+    if clears(color) {
+        return color;
+    }
+
+    let (lightness, chroma, hue) = oklch::of(color);
+    let limit = if lighten { 1.0 } else { 0.0 };
+    let mut best = oklch::to_rgba(limit, chroma, hue, color.a);
+    if !clears(best) {
+        // Even pure white/black cannot clear it - take the extreme and let the theme's own
+        // validation report the palette as unreadable rather than silently pretending.
+        return best;
+    }
+    // Binary-search the smallest move that clears the floor: contrast is monotonic in lightness
+    // once we are moving away from the background, so this converges.
+    let (mut low, mut high) = (lightness, limit);
+    for _ in 0..24 {
+        let mid = 0.5 * (low + high);
+        let candidate = oklch::to_rgba(mid, chroma, hue, color.a);
+        if clears(candidate) {
+            best = candidate;
+            high = mid;
+        } else {
+            low = mid;
         }
-        for _ in 0..24 {
-            let mid = 0.5 * (low + high);
-            let candidate = oklch::to_rgba(mid, chroma, hue, color.a);
-            if clears(candidate) {
-                best = candidate;
-                high = mid;
-            } else {
-                low = mid;
-            }
+    }
+    best
+}
+
+/// The same guard [`enforce_syntax_contrast_floors`] applies to code, applied to unstyled terminal
+/// output - `terminal.foreground` against `terminal.background` rather than against
+/// `surface.center`, because that is the surface it is actually painted on.
+///
+/// Needed for the same reason and measured the same way: [`derive_shift`]'s lightness fit is solved
+/// from a theme's two *background* swatches and carries no foreground-contrast guarantee at all. On
+/// this app's own bundled themes it lands `Slate`'s terminal foreground at a measured 4.27:1 -
+/// readable-ish, but under WCAG's 4.5:1 body-text bar for what is, by volume, most of what a
+/// terminal ever paints.
+///
+/// Deliberately only the foreground. The ANSI sixteen are pinned rather than derived (see
+/// [`pin_terminal_ansi_palette`]), and pinned values are authored to be legible; forcing a floor on
+/// them would also be wrong on its own terms, since ANSI black on a dark background is *supposed*
+/// to be near-invisible - that is what a program asking for colour 0 is asking for.
+fn enforce_terminal_foreground_contrast(palette: &mut [(&'static str, Rgba)]) {
+    let Some(background) = palette
+        .iter()
+        .find(|(key, _)| *key == terminal::BACKGROUND.key)
+        .map(|(_, color)| *color)
+    else {
+        return;
+    };
+    let (background_lightness, _, _) = oklch::of(background);
+    let lighten = background_lightness < 0.5;
+
+    for (key, color) in palette.iter_mut() {
+        if *key == terminal::FOREGROUND.key {
+            *color = pushed_to_clear_floor(*color, background, 4.5, lighten);
         }
-        *color = best;
     }
 }
 
@@ -780,7 +819,47 @@ pub fn derived_palette(shift: OklchShift) -> Vec<(&'static str, Rgba)> {
         .map(|token| (token.key, apply_shift(token.default, shift)))
         .collect();
     enforce_syntax_contrast_floors(&mut palette);
+    pin_terminal_ansi_palette(&mut palette);
+    enforce_terminal_foreground_contrast(&mut palette);
     palette
+}
+
+/// Replaces the sixteen derived `terminal.ansi.*` entries with a real, *authored* ANSI palette -
+/// [`terminal::ANSI`]'s own defaults for a dark derived theme, [`terminal::LIGHT_ANSI`] for a light
+/// one, decided from the palette's own derived `surface.window` via [`theme_is_light`].
+///
+/// See [`terminal::LIGHT_ANSI`]'s docs for the whole reasoning. The short version: every other
+/// colour in this app is a free design choice, so shifting it is right; the ANSI sixteen carry
+/// fixed conventional meanings that a systematic hue/lightness shift destroys - most sharply on
+/// `Paper`, whose genuinely negative lightness slope would derive ANSI *black* to near-white, i.e.
+/// invisible on Paper's own light terminal background.
+///
+/// Deliberately shaped like [`enforce_syntax_contrast_floors`] - a narrow, documented pass over the
+/// already-derived palette rather than a special case threaded through [`apply_shift`] - so
+/// everything that consumes a derived palette (the bundled theme generator, "generate from colour",
+/// and the VSCode importer's base layer) gets it identically and for free.
+fn pin_terminal_ansi_palette(palette: &mut [(&'static str, Rgba)]) {
+    let Some(window) = palette
+        .iter()
+        .find(|(key, _)| *key == "surface.window")
+        .map(|(_, color)| *color)
+    else {
+        return;
+    };
+    let light = theme_is_light(window);
+    for (key, color) in palette.iter_mut() {
+        let Some(index) = key
+            .strip_prefix("terminal.ansi.")
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        *color = if light {
+            hex_rgba(terminal::LIGHT_ANSI[index])
+        } else {
+            terminal::ANSI[index].default
+        };
+    }
 }
 /// Backgrounds - every solid fill in the app, from the window itself down to popovers,
 /// hover states and keycaps.
@@ -1745,6 +1824,146 @@ pub mod term {
         ("LINK_UNDERLINE", LINK_UNDERLINE),
         ("LINK_HOVER", LINK_HOVER),
         ("LINK_UNDERLINE_HOVER", LINK_UNDERLINE_HOVER),
+    ];
+}
+
+/// The integrated terminal's own rendered-content palette - the colours a program running inside a
+/// terminal pane actually paints its characters with.
+///
+/// GitHub issue #208, "the integrated terminal theme should follow the editor theme".
+///
+/// ## Why this is not `term`, despite the name
+///
+/// `theme::term` is chrome *around and over* terminal output - the caret this app paints in its
+/// own text fields (`term::CURSOR`), the command palette's prompt tint (`term::PROMPT`), the
+/// diagnostic warning tone (`term::WARN`), and the clickable `path:line` link styling the terminal
+/// pane overlays on rows it has scanned (`term::LINK` and friends). None of it is what a pty's own
+/// bytes resolve to. This module is: `crate::terminal::grid`'s `TerminalPalette` is built from
+/// exactly these tokens, and every character cell `crate::terminal::pane` paints takes its
+/// foreground, background and selection fill from it.
+///
+/// Before this existed the whole set was hardcoded in `crate::terminal::grid` - VS Code's own
+/// default terminal colours, identical in every one of this app's six themes, so the terminal
+/// stayed a `#1e1e1e` rectangle inside a `#0d0f11` app no matter which theme was selected.
+///
+/// ## What "follow the editor theme" means for each of these
+///
+/// [`BACKGROUND`], [`FOREGROUND`], [`CURSOR`] and [`SELECTION`] are ordinary chrome: they default
+/// to the values this palette already had for exactly these jobs (`surface::PTY` is literally
+/// documented as "agent CLI + terminal", `term::TEXT` as terminal output text), and they go
+/// through `super::derived_palette`'s real OKLCH shift like every other token, so switching themes
+/// visibly moves them.
+///
+/// [`ANSI`] is deliberately different - see [`LIGHT_ANSI`]'s docs for the whole reasoning.
+pub mod terminal {
+    use super::{token, ColorToken};
+
+    /// The terminal pane's own fill - and what `NamedColor::Background` resolves to. Defaults to
+    /// [`super::surface::PTY`]'s value, the token this palette already documents as "agent CLI +
+    /// terminal", and the exact colour of the surface this pane is painted *into*
+    /// (`crate::work_surface::render`'s `pty-surface`), so out of the box the terminal stops being
+    /// a lighter rectangle floating inside the app's own chrome.
+    pub const BACKGROUND: ColorToken = token("terminal.background", 0x0d0f11);
+    /// Unstyled output - and what `NamedColor::Foreground`/`BrightForeground` resolve to. Defaults
+    /// to [`super::term::TEXT`]'s value, this palette's own designed "terminal output text" tone,
+    /// which until this module existed no renderer had ever actually painted.
+    pub const FOREGROUND: ColorToken = token("terminal.foreground", 0xa7adb4);
+    /// What `NamedColor::Cursor` resolves to - the colour a program gets when it explicitly asks
+    /// for "the cursor colour" rather than a concrete one. Defaults to [`super::term::CURSOR`]'s
+    /// value, the caret colour this app already paints elsewhere.
+    ///
+    /// The block cursor itself is *not* painted from this: `crate::terminal::grid` renders it the
+    /// way a real terminal does, by swapping the cursor cell's own foreground and background, so
+    /// it tracks [`BACKGROUND`]/[`FOREGROUND`] (or whatever colours that cell already had) for
+    /// free.
+    pub const CURSOR: ColorToken = token("terminal.cursor", 0x5a9ad4);
+    /// The fill painted behind a selected cell - GitHub issue #158's real mouse selection.
+    ///
+    /// Its default is exactly what the *editor's* own selection composites to:
+    /// [`super::editor::SELECTION`] at [`super::editor::SELECTION_OPACITY`] over
+    /// [`super::surface::CENTER`], flattened to an opaque value because the terminal paints a span
+    /// background rather than a translucent overlay quad. Pinned by
+    /// `super::terminal_palette_tests::the_terminal_selection_default_is_the_editor_selection_flattened`,
+    /// so the two can't drift into looking like unrelated features.
+    pub const SELECTION: ColorToken = token("terminal.selection", 0x273a4d);
+
+    /// The standard ANSI 16-colour palette, indexed `0..=15` by `NamedColor`'s own discriminants
+    /// and by `Color::Indexed(0..=15)`, in the conventional order: black, red, green, yellow, blue,
+    /// magenta, cyan, white, then the eight bright variants in the same order.
+    ///
+    /// These values are VS Code's own default *dark* terminal palette, which is where
+    /// `crate::terminal::grid`'s hardcoded array took them from before they became real tokens.
+    pub const ANSI: [ColorToken; 16] = [
+        token("terminal.ansi.0", 0x000000),
+        token("terminal.ansi.1", 0xcd3131),
+        token("terminal.ansi.2", 0x0dbc79),
+        token("terminal.ansi.3", 0xe5e510),
+        token("terminal.ansi.4", 0x2472c8),
+        token("terminal.ansi.5", 0xbc3fbc),
+        token("terminal.ansi.6", 0x11a8cd),
+        token("terminal.ansi.7", 0xe5e5e5),
+        token("terminal.ansi.8", 0x666666),
+        token("terminal.ansi.9", 0xf14c4c),
+        token("terminal.ansi.10", 0x23d18b),
+        token("terminal.ansi.11", 0xf5f543),
+        token("terminal.ansi.12", 0x3b8eea),
+        token("terminal.ansi.13", 0xd670d6),
+        token("terminal.ansi.14", 0x29b8db),
+        token("terminal.ansi.15", 0xffffff),
+    ];
+
+    /// [`ANSI`]'s light-theme counterpart - VS Code's own default *light* terminal palette, same
+    /// provenance and same `0..=15` ordering.
+    ///
+    /// ## Why the ANSI sixteen are not run through the OKLCH derivation
+    ///
+    /// Every other colour in this app is a free design choice, so [`super::derived_palette`]'s
+    /// systematic hue/chroma/lightness shift is exactly the right way to carry it into another
+    /// theme. The ANSI sixteen are not free: their *meaning* is fixed by forty years of convention
+    /// (index 1 is red because programs print errors in it; index 0 is the darkest colour a
+    /// program can ask for), and a shifted palette stops answering to that name. Measured on this
+    /// app's own themes, the derivation would have rotated every one of them off-hue on `Ember`
+    /// and `Moss`, and - far worse - inverted them wholesale on `Paper`, whose fit has a genuinely
+    /// negative lightness slope: ANSI *black* would have come out near-white, i.e. invisible on
+    /// Paper's own light terminal background, for every program that prints black-on-default.
+    ///
+    /// So the sixteen are pinned rather than derived, and pinned in the two variants a real
+    /// terminal palette needs. [`super::derived_palette`] picks between them from the derived
+    /// theme's own [`super::theme_is_light`] verdict, which is exactly what VS Code itself does
+    /// (its Dark+ and Light+ themes ship two separately authored `terminal.ansi*` blocks; these
+    /// are those two blocks). Every one of them is still a real, registered, independently
+    /// themeable token, so a hand-written theme file or an imported VSCode theme that *does* author
+    /// its own sixteen gets them honoured verbatim - the pinning is only the default a theme that
+    /// says nothing inherits.
+    pub const LIGHT_ANSI: [u32; 16] = [
+        0x000000, 0xcd3131, 0x00bc00, 0x949800, 0x0451a5, 0xbc05bc, 0x0598bc, 0x555555, 0x666666,
+        0xcd3131, 0x14ce14, 0xb5ba00, 0x0451a5, 0xbc05bc, 0x0598bc, 0xa5a5a5,
+    ];
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
+    /// own docs for what walks this and why every token has to appear here.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("BACKGROUND", BACKGROUND),
+        ("FOREGROUND", FOREGROUND),
+        ("CURSOR", CURSOR),
+        ("SELECTION", SELECTION),
+        ("ANSI.0", ANSI[0]),
+        ("ANSI.1", ANSI[1]),
+        ("ANSI.2", ANSI[2]),
+        ("ANSI.3", ANSI[3]),
+        ("ANSI.4", ANSI[4]),
+        ("ANSI.5", ANSI[5]),
+        ("ANSI.6", ANSI[6]),
+        ("ANSI.7", ANSI[7]),
+        ("ANSI.8", ANSI[8]),
+        ("ANSI.9", ANSI[9]),
+        ("ANSI.10", ANSI[10]),
+        ("ANSI.11", ANSI[11]),
+        ("ANSI.12", ANSI[12]),
+        ("ANSI.13", ANSI[13]),
+        ("ANSI.14", ANSI[14]),
+        ("ANSI.15", ANSI[15]),
     ];
 }
 
@@ -2740,6 +2959,155 @@ mod token_registry_tests {
             all_tokens().count() >= 250,
             "only {} registered tokens - this app's palette is ~270",
             all_tokens().count()
+        );
+    }
+}
+
+/// GitHub issue #208's own coverage inside this module: the shape of the new [`terminal`] group,
+/// and the one real special case it adds to [`derived_palette`].
+///
+/// The end-to-end half - a real painted pane whose colours genuinely change with the selected
+/// theme - lives in `crate::terminal::pane::terminal_theme_tests`.
+#[cfg(test)]
+mod terminal_palette_tests {
+    use super::*;
+
+    /// [`terminal`] must be a genuinely separate group from [`term`], not a rename of it: the two
+    /// name completely different things (see [`terminal`]'s own docs) and a theme has to be able to
+    /// move one without touching the other.
+    #[test]
+    fn the_terminal_group_is_distinct_from_term_and_fully_registered() {
+        let terminal_keys: Vec<&str> = terminal::TOKENS.iter().map(|(_, t)| t.key).collect();
+        assert_eq!(
+            terminal_keys.len(),
+            20,
+            "background, foreground, cursor, selection and the ANSI sixteen"
+        );
+        for key in &terminal_keys {
+            assert!(
+                token_for_key(key).is_some(),
+                "{key} is declared but not reachable through the registry"
+            );
+        }
+        for (_, token) in term::TOKENS {
+            assert!(
+                !terminal_keys.contains(&token.key),
+                "{} is registered in both groups - one would shadow the other",
+                token.key
+            );
+        }
+        // The specific confusion this guards: `term.cursor` (the app's own caret colour, painted
+        // in the command palette and the File view) and `terminal.cursor` (what a pty's own
+        // `NamedColor::Cursor` resolves to) are two real, separately themeable colours.
+        assert_ne!(term::CURSOR.key, terminal::CURSOR.key);
+    }
+
+    /// [`terminal::SELECTION`]'s default is not a hand-picked blue: it is exactly what the
+    /// *editor's* own selection composites to over the code surface, flattened. Recomputed here
+    /// rather than restated, so retuning [`editor::SELECTION`] or [`editor::SELECTION_OPACITY`]
+    /// without retuning this fails loudly instead of quietly leaving two selections that no longer
+    /// look like the same feature.
+    #[test]
+    fn the_terminal_selection_default_is_the_editor_selection_flattened() {
+        let over = surface::CENTER.default;
+        let fill = editor::SELECTION.default;
+        let alpha = editor::SELECTION_OPACITY;
+        let flatten =
+            |top: f32, bottom: f32| ((alpha * top + (1.0 - alpha) * bottom) * 255.0).round();
+
+        let expected = (
+            flatten(fill.r, over.r) as u8,
+            flatten(fill.g, over.g) as u8,
+            flatten(fill.b, over.b) as u8,
+        );
+        let actual = terminal::SELECTION.default;
+        assert_eq!(
+            (
+                (actual.r * 255.0).round() as u8,
+                (actual.g * 255.0).round() as u8,
+                (actual.b * 255.0).round() as u8
+            ),
+            expected
+        );
+    }
+
+    /// The ANSI sixteen are pinned, not derived - see [`terminal::LIGHT_ANSI`]'s docs. A *dark*
+    /// derived theme gets [`terminal::ANSI`]'s own defaults back verbatim, no matter how far the
+    /// shift moves everything else.
+    #[test]
+    fn a_dark_derived_theme_keeps_the_standard_ansi_sixteen_exactly() {
+        let shift = derive_shift(
+            crate::settings::builtin_themes::jerry_dark_swatches(),
+            [0x12100e, 0x1e1a16, 0x8fae6b, 0xd98b3a, 0xc4713f], // Ember's own swatches
+        );
+        let derived: HashMap<&str, Rgba> = derived_palette(shift).into_iter().collect();
+
+        for index in 0..16 {
+            let key = terminal::ANSI[index].key;
+            assert_eq!(
+                crate::settings::custom_theme::rgba_to_hex(derived[key]),
+                crate::settings::custom_theme::rgba_to_hex(terminal::ANSI[index].default),
+                "{key} was shifted - the ANSI sixteen carry fixed conventional meanings and are \
+                 deliberately not derived"
+            );
+        }
+        // ...while the chrome around them genuinely *is* derived, or this test would pass just as
+        // well against a shift that did nothing at all.
+        assert_ne!(
+            crate::settings::custom_theme::rgba_to_hex(derived["terminal.background"]),
+            crate::settings::custom_theme::rgba_to_hex(terminal::BACKGROUND.default),
+        );
+    }
+
+    /// A *light* derived theme gets [`terminal::LIGHT_ANSI`] instead. The value that matters most:
+    /// ANSI black must still be black. Derived, it would have come out near-white - i.e. invisible
+    /// on a light terminal - for every program that prints black-on-default.
+    #[test]
+    fn a_light_derived_theme_gets_the_light_ansi_palette_with_black_still_black() {
+        let shift = derive_shift(
+            crate::settings::builtin_themes::jerry_dark_swatches(),
+            [0xf4f1ea, 0xe4e0d6, 0x3f7a52, 0xa8752a, 0x3d6c9c], // Paper's own swatches
+        );
+        let derived: HashMap<&str, Rgba> = derived_palette(shift).into_iter().collect();
+
+        assert!(
+            theme_is_light(derived["surface.window"]),
+            "sanity check: these swatches really do derive a light theme"
+        );
+        for index in 0..16 {
+            let key = terminal::ANSI[index].key;
+            assert_eq!(
+                crate::settings::custom_theme::rgba_to_hex(derived[key]),
+                terminal::LIGHT_ANSI[index],
+                "{key} must come from the light palette"
+            );
+        }
+        assert_eq!(
+            crate::settings::custom_theme::rgba_to_hex(derived["terminal.ansi.0"]),
+            0x000000,
+            "ANSI black must survive a light theme as black - deriving it would have inverted it \
+             to near-white, invisible on the light background this same theme derives"
+        );
+        assert!(
+            theme_is_light(derived["terminal.background"]),
+            "and the terminal itself must genuinely go light, or the palette above is being used \
+             against the wrong background"
+        );
+    }
+
+    /// The two pinned palettes are really two palettes - a guard against one of them being an
+    /// accidental copy of the other, which would make the light case above vacuous.
+    #[test]
+    fn the_dark_and_light_ansi_palettes_are_genuinely_different() {
+        let differing = (0..16)
+            .filter(|index| {
+                crate::settings::custom_theme::rgba_to_hex(terminal::ANSI[*index].default)
+                    != terminal::LIGHT_ANSI[*index]
+            })
+            .count();
+        assert!(
+            differing >= 8,
+            "only {differing} of the sixteen differ between the dark and light palettes"
         );
     }
 }

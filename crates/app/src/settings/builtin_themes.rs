@@ -384,6 +384,60 @@ mod tests {
         );
     }
 
+    /// GitHub issue #208, at the layer where a stale checked-in file (rather than a bad default)
+    /// would break it: every bundled theme's terminal must really be its *own* terminal, and must
+    /// really be readable.
+    ///
+    /// The readability floor is WCAG's own 4.5:1 "normal text" number, which is the right bar here
+    /// (unlike `crate::settings::custom_theme::MIN_CONTRAST_PER_HUNDRED`, a deliberately far lower
+    /// *validity* floor for arbitrary user-authored themes): these six files are this project's own
+    /// generated output, so anything below the real bar is a generator bug to fix, not a theme to
+    /// tolerate.
+    #[test]
+    fn every_bundled_theme_paints_its_own_readable_terminal() {
+        use crate::settings::custom_theme::compile_palette_by_name;
+
+        let mut backgrounds: Vec<u32> = Vec::new();
+        for source in BUILTIN_THEME_SOURCES.iter() {
+            let palette = compile_palette_by_name(source.name, &[])
+                .expect("a bundled theme must compile")
+                .unwrap_or_default();
+            let resolve =
+                |token: theme::ColorToken| palette.get(token.key).copied().unwrap_or(token.default);
+            let background = resolve(theme::terminal::BACKGROUND);
+            let foreground = resolve(theme::terminal::FOREGROUND);
+
+            let ratio = theme::contrast_ratio(foreground, background);
+            assert!(
+                ratio >= 4.5,
+                "{}: terminal.foreground is {ratio:.2}:1 against terminal.background - unstyled \
+                 terminal output would be hard to read",
+                source.name
+            );
+
+            // The pane is painted *into* `surface.pty`; a terminal fill that drifted away from it
+            // would put the exact lighter-rectangle-inside-the-app back that issue #208 is about.
+            assert_eq!(
+                crate::settings::custom_theme::rgba_to_hex(background),
+                crate::settings::custom_theme::rgba_to_hex(resolve(theme::surface::PTY)),
+                "{}: the terminal fill has drifted off the surface it is painted into",
+                source.name
+            );
+
+            backgrounds.push(crate::settings::custom_theme::rgba_to_hex(background));
+        }
+
+        let mut unique = backgrounds.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            backgrounds.len(),
+            "two bundled themes paint the terminal the same colour, so switching between them \
+             would not visibly change it: {backgrounds:06x?}"
+        );
+    }
+
     /// "Paper" is the one real light bundled theme - its generated `surface.window` must really be
     /// light, the same property the old derivation's lightness fit produced live.
     #[test]

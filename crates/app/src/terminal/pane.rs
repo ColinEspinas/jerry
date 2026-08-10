@@ -72,10 +72,7 @@ use gpui::{
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
-use crate::terminal::grid::{
-    CellPosition, CellSide, GridCell, TerminalGrid, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND,
-    SELECTION_BACKGROUND,
-};
+use crate::terminal::grid::{CellPosition, CellSide, GridCell, TerminalGrid, TerminalPalette};
 use crate::terminal::links::{self as terminal_links, LinkMatch};
 use crate::theme;
 
@@ -467,6 +464,15 @@ pub struct TerminalPane {
     /// selection *itself* lives in `alacritty_terminal`'s own `Term::selection` (see
     /// `crate::terminal::grid`'s selection docs), not here.
     selecting: bool,
+    /// Test-only seam: the exact [`TerminalPalette`] the most recent real `Render::render` call
+    /// painted with (GitHub issue #208). Written by `render` itself and by nothing else, so a test
+    /// asserting on it is asserting on what the pane genuinely painted rather than re-deriving the
+    /// palette a second way and hoping the two agree.
+    ///
+    /// `#[cfg(test)]` because production has no use for it - the palette is resolved fresh every
+    /// frame and consumed within that frame (see [`theme_terminal_palette`]).
+    #[cfg(test)]
+    last_painted_palette: Option<TerminalPalette>,
 }
 
 impl TerminalPane {
@@ -495,6 +501,8 @@ impl TerminalPane {
             _task: None,
             is_foreground: true,
             selecting: false,
+            #[cfg(test)]
+            last_painted_palette: None,
         };
         this.spawn_process(cx);
         this
@@ -858,12 +866,32 @@ impl TerminalPane {
         self.font_size_px
     }
 
+    /// Test-only seam: the palette the most recent real paint used - see
+    /// [`Self::last_painted_palette`].
+    #[cfg(test)]
+    pub(crate) fn last_painted_palette_for_test(&self) -> Option<TerminalPalette> {
+        self.last_painted_palette
+    }
+
+    /// Test-only seam: the visible grid resolved against the palette the most recent real paint
+    /// used, i.e. exactly the cells that paint turned into styled spans.
+    #[cfg(test)]
+    pub(crate) fn painted_rows_for_test(&self) -> Vec<Vec<GridCell>> {
+        let palette = self
+            .last_painted_palette
+            .expect("the pane must have painted at least once");
+        self.grid.visible_rows(&palette)
+    }
+
     /// The visible grid as trimmed-right text lines (leading whitespace, e.g. an agent CLI's
     /// indented menu, is preserved) - used by `crate::rail::state` to build the "question preview"
     /// (the design's "Jerry reading the tail of the agent's pty").
     pub fn visible_text_lines(&self) -> Vec<String> {
         self.grid
-            .visible_rows()
+            // Text only - this reads nothing but `GridCell::c`, so which palette the cells were
+            // resolved against genuinely cannot affect the result, and this caller (`crate::rail::
+            // state`'s question preview) has no live theme access of its own to offer.
+            .visible_rows(&TerminalPalette::default())
             .iter()
             .map(|row| {
                 row.iter()
@@ -1442,6 +1470,38 @@ fn pack_rgb((r, g, b): (u8, u8, u8)) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
+/// One [`theme::ColorToken`], resolved against whichever theme is really live right now and
+/// reduced to the 8-bit-per-channel RGB triple [`TerminalPalette`] carries.
+///
+/// 8-bit is the terminal's real precision on both ends - `alacritty_terminal` hands back `u8`
+/// channels for a program-specified colour, and a theme file stores `#rrggbb` - so nothing is lost
+/// here that the grid could have represented anyway.
+fn token_rgb(token: theme::ColorToken) -> (u8, u8, u8) {
+    let color = token.resolve();
+    let channel = |component: f32| (component.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (channel(color.r), channel(color.g), channel(color.b))
+}
+
+/// The live theme's real terminal palette (GitHub issue #208) - `crate::theme::terminal`'s twenty
+/// registered tokens resolved against whichever theme is installed right now.
+///
+/// This is the one place the terminal's colours cross from the theme system into
+/// `crate::terminal::grid`, which is deliberately theme-free (see that module's own docs). Called
+/// fresh inside [`Render::render`] rather than cached on the pane: `crate::theme`'s resolution is a
+/// single hash lookup per token, and `AdeApp::apply_theme_selection` already forces a repaint of
+/// every window when the selection changes (`App::refresh_windows`), so reading it at paint time
+/// means a theme switch lands on the very next frame with no invalidation hook of its own to
+/// forget.
+fn theme_terminal_palette() -> TerminalPalette {
+    TerminalPalette {
+        background: token_rgb(theme::terminal::BACKGROUND),
+        foreground: token_rgb(theme::terminal::FOREGROUND),
+        cursor: token_rgb(theme::terminal::CURSOR),
+        selection: token_rgb(theme::terminal::SELECTION),
+        ansi: std::array::from_fn(|index| token_rgb(theme::terminal::ANSI[index])),
+    }
+}
+
 /// Whether two cells share every attribute a rendered run cares about (everything but the
 /// character itself) - used to group a grid row into as few styled spans as possible.
 fn same_run_style(a: &GridCell, b: &GridCell) -> bool {
@@ -1507,13 +1567,13 @@ fn split_segments(row_char_count: usize, links: &[LinkMatch]) -> Vec<RowSegment>
     segments
 }
 
-fn plain_span(style: &GridCell, text: String) -> impl IntoElement {
+fn plain_span(style: &GridCell, text: String, palette: &TerminalPalette) -> impl IntoElement {
     let mut span = div().text_color(rgb(pack_rgb(style.fg)));
     // The selection fill wins over the cell's own ANSI background, so a selection is visible
     // across text a program has coloured - which is most of what an agent CLI prints.
     if style.selected {
-        span = span.bg(rgb(pack_rgb(SELECTION_BACKGROUND)));
-    } else if style.bg != DEFAULT_BACKGROUND {
+        span = span.bg(rgb(pack_rgb(palette.selection)));
+    } else if style.bg != palette.background {
         span = span.bg(rgb(pack_rgb(style.bg)));
     }
     if style.bold {
@@ -1557,7 +1617,10 @@ fn render_link_span(
     cwd: &Path,
     row_index: usize,
     link_ordinal: usize,
-    selected: bool,
+    // `selection_fill` is the live theme's selection fill when this span falls inside the
+    // selection and `None` when it doesn't - one parameter rather than a `selected: bool` plus
+    // the whole palette, since the fill is the only thing this function ever wants out of it.
+    selection_fill: Option<(u8, u8, u8)>,
     cx: &mut Context<TerminalPane>,
 ) -> impl IntoElement {
     let target = terminal_links::resolve(cwd, &link.path);
@@ -1570,8 +1633,8 @@ fn render_link_span(
         .border_b_1()
         .border_color(theme::term::LINK_UNDERLINE)
         .child(text);
-    if selected {
-        span = span.bg(rgb(pack_rgb(SELECTION_BACKGROUND)));
+    if let Some(fill) = selection_fill {
+        span = span.bg(rgb(pack_rgb(fill)));
     }
     span.style().border_style = Some(BorderStyle::Dashed);
 
@@ -1621,6 +1684,7 @@ fn render_row(
     row: &[GridCell],
     row_index: usize,
     cwd: &Path,
+    palette: &TerminalPalette,
     cx: &mut Context<TerminalPane>,
 ) -> impl IntoElement {
     let row_text: String = row.iter().map(|cell| cell.c).collect();
@@ -1641,7 +1705,7 @@ fn render_row(
                         run_end += 1;
                     }
                     let text: String = row[inner..run_end].iter().map(|cell| cell.c).collect();
-                    line = line.child(plain_span(style, text));
+                    line = line.child(plain_span(style, text, palette));
                     inner = run_end;
                 }
             }
@@ -1665,7 +1729,7 @@ fn render_row(
                         cwd,
                         row_index,
                         link_ordinal,
-                        selected,
+                        selected.then_some(palette.selection),
                         cx,
                     ));
                     link_ordinal += 1;
@@ -1715,7 +1779,7 @@ fn render_plain_line_with_links(
                     link_ordinal,
                     // The spawn-error line is not part of the grid, so it is never part of a
                     // grid selection.
-                    false,
+                    None,
                     cx,
                 ));
                 link_ordinal += 1;
@@ -1729,6 +1793,15 @@ fn render_plain_line_with_links(
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize_pty(window);
+
+        // GitHub issue #208: resolved once per frame and threaded through every span this paints,
+        // so the whole pane (its own fill, unstyled text, every ANSI colour a program asked for,
+        // and the selection fill) tracks whichever theme is live - see `theme_terminal_palette`.
+        let palette = theme_terminal_palette();
+        #[cfg(test)]
+        {
+            self.last_painted_palette = Some(palette);
+        }
 
         // Measures this pane's rendered content-area bounds every frame, so
         // `Self::maybe_resize_pty` can size the terminal grid from the pane's actual
@@ -1787,7 +1860,7 @@ impl Render for TerminalPane {
             .size_full()
             .min_w_0()
             .overflow_hidden()
-            .bg(rgb(pack_rgb(DEFAULT_BACKGROUND)))
+            .bg(rgb(pack_rgb(palette.background)))
             // Not the equivalent `.p_2()` shorthand - see `PANE_PADDING_PX`'s docs for why
             // this needs to be the same value `Self::maybe_resize_pty` subtracts.
             .p(px(PANE_PADDING_PX))
@@ -1796,7 +1869,7 @@ impl Render for TerminalPane {
             // for why leaving either implicit was a measured bug.
             .text_size(px(self.font_size_px))
             .line_height(px(self.line_height_px()))
-            .text_color(rgb(pack_rgb(DEFAULT_FOREGROUND)))
+            .text_color(rgb(pack_rgb(palette.foreground)))
             .child(measure_bounds);
 
         let cwd = self.spec.cwd.clone();
@@ -1811,8 +1884,8 @@ impl Render for TerminalPane {
             ));
         }
 
-        for (row_index, row) in self.grid.visible_rows().into_iter().enumerate() {
-            pane = pane.child(render_row(&row, row_index, &cwd, cx));
+        for (row_index, row) in self.grid.visible_rows(&palette).into_iter().enumerate() {
+            pane = pane.child(render_row(&row, row_index, &cwd, &palette, cx));
         }
 
         if self.grid.ended {
@@ -2927,12 +3000,222 @@ mod mouse_selection_tests {
         cx.run_until_parked();
 
         let flagged = pane.read_with(cx, |pane, _| {
-            pane.grid.visible_rows()[0]
+            pane.grid.visible_rows(&TerminalPalette::default())[0]
                 .iter()
                 .filter(|cell| cell.selected)
                 .map(|cell| cell.c)
                 .collect::<String>()
         });
         assert_eq!(flagged, "hello");
+    }
+}
+
+/// GitHub issue #208, end to end through a real painted GPUI window: the integrated terminal's own
+/// rendered colours must follow the selected theme.
+///
+/// Before this, `crate::terminal::grid` held them as module constants (VS Code's own default
+/// terminal palette), so every one of this app's six themes rendered the terminal identically - a
+/// `#1e1e1e` rectangle sitting inside a `#0d0f11` app, unchanged by switching to the light theme.
+///
+/// These assert on [`TerminalPane::last_painted_palette_for_test`], which `Render::render` itself
+/// writes - so what is checked is the palette a real paint genuinely used, not one this test
+/// re-derived a second way.
+#[cfg(test)]
+mod terminal_theme_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use std::rc::Rc;
+
+    /// Restores the Jerry Dark identity (no palette installed) on drop, so a test that installs a
+    /// theme - or panics half way through one - can't leak it into any other test on this thread.
+    struct ResetThemeOnDrop;
+
+    impl Drop for ResetThemeOnDrop {
+        fn drop(&mut self) {
+            theme::set_current_theme(None);
+        }
+    }
+
+    /// Installs a real bundled theme exactly the way selecting its card does: compiled from its own
+    /// checked-in `assets/themes/*.toml` file through the real `base` chain
+    /// (`crate::settings::custom_theme::compile_palette_by_name`, which is what
+    /// `AdeApp::apply_theme_selection` calls), not a palette synthesized for the test.
+    fn with_bundled_theme(name: &str) -> ResetThemeOnDrop {
+        let palette = crate::settings::custom_theme::compile_palette_by_name(name, &[])
+            .expect("a bundled theme must compile")
+            .expect("a bundled non-Jerry-Dark theme has real overrides");
+        theme::set_current_theme(Some(Rc::new(palette)));
+        ResetThemeOnDrop
+    }
+
+    /// That bundled theme's own value for one key, straight out of its compiled palette.
+    fn bundled_rgb(name: &str, key: &str) -> (u8, u8, u8) {
+        let palette = crate::settings::custom_theme::compile_palette_by_name(name, &[])
+            .expect("a bundled theme must compile")
+            .expect("a bundled non-Jerry-Dark theme has real overrides");
+        let color = *palette.get(key).expect("a real registered key");
+        let channel = |component: f32| (component.clamp(0.0, 1.0) * 255.0).round() as u8;
+        (channel(color.r), channel(color.g), channel(color.b))
+    }
+
+    /// Opens a real window on a `cat`-backed pane (`cat` writes nothing of its own, so the grid
+    /// holds exactly the injected bytes) and paints it at least once.
+    fn painted_pane<'a>(
+        cx: &'a mut TestAppContext,
+        bytes: &[u8],
+    ) -> (Entity<TerminalPane>, &'a mut VisualTestContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| pane.inject_bytes_for_test(bytes, cx));
+        cx.run_until_parked();
+        (pane, cx)
+    }
+
+    /// `crate::terminal::grid` stays theme-free, so it carries its own transcription of Jerry
+    /// Dark's terminal palette. This is what stops that copy from going stale: with no theme
+    /// installed (the real Jerry Dark identity case), resolving the real tokens must produce
+    /// exactly it.
+    #[test]
+    fn the_pure_grid_default_palette_is_exactly_jerry_darks_own() {
+        assert!(
+            theme::current_theme_palette().is_none(),
+            "the real Jerry Dark identity case - no palette installed"
+        );
+        assert_eq!(
+            theme_terminal_palette(),
+            TerminalPalette::default(),
+            "crate::terminal::grid's TerminalPalette::default() has drifted from \
+             crate::theme::terminal's own compiled defaults - retune one and you must retune both"
+        );
+    }
+
+    /// The headline behaviour. The *same* pane, painted twice, must genuinely change colour when
+    /// the theme changes - and land on the light theme's own real values, not merely on something
+    /// different.
+    #[gpui::test]
+    fn switching_to_the_light_theme_really_repaints_the_terminal_light(cx: &mut TestAppContext) {
+        let (pane, cx) = painted_pane(cx, b"hello world");
+
+        let dark = pane
+            .read_with(cx, |pane, _| pane.last_painted_palette_for_test())
+            .expect("the pane must have painted at least once");
+        assert_eq!(
+            dark,
+            TerminalPalette::default(),
+            "with no theme installed the pane must paint Jerry Dark's own palette"
+        );
+
+        let _theme = with_bundled_theme("Paper");
+        pane.update(cx, |_pane, cx| cx.notify());
+        cx.run_until_parked();
+
+        let light = pane
+            .read_with(cx, |pane, _| pane.last_painted_palette_for_test())
+            .expect("the repaint must have happened");
+
+        assert_eq!(
+            light.background,
+            bundled_rgb("Paper", "terminal.background")
+        );
+        assert_eq!(
+            light.foreground,
+            bundled_rgb("Paper", "terminal.foreground")
+        );
+        assert_ne!(
+            light.background, dark.background,
+            "the terminal background must genuinely change when the theme does - this is the \
+             whole of GitHub issue #208"
+        );
+        assert_ne!(light.foreground, dark.foreground);
+
+        let luminance =
+            |(r, g, b): (u8, u8, u8)| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        assert!(
+            luminance(light.background) > luminance(light.foreground),
+            "Paper is a light theme, so its terminal must be dark text on a light fill, not the \
+             other way round - got fg {:?} on bg {:?}",
+            light.foreground,
+            light.background
+        );
+    }
+
+    /// Two visually distinct *dark* themes must differ too - a guard against a fix that only
+    /// happened to work because one bundled theme inverts lightness.
+    #[gpui::test]
+    fn two_different_dark_themes_paint_two_different_terminals(cx: &mut TestAppContext) {
+        let (pane, cx) = painted_pane(cx, b"hello world");
+
+        let ember = {
+            let _theme = with_bundled_theme("Ember");
+            pane.update(cx, |_pane, cx| cx.notify());
+            cx.run_until_parked();
+            pane.read_with(cx, |pane, _| pane.last_painted_palette_for_test())
+                .expect("painted")
+        };
+        let moss = {
+            let _theme = with_bundled_theme("Moss");
+            pane.update(cx, |_pane, cx| cx.notify());
+            cx.run_until_parked();
+            pane.read_with(cx, |pane, _| pane.last_painted_palette_for_test())
+                .expect("painted")
+        };
+
+        assert_eq!(
+            ember.background,
+            bundled_rgb("Ember", "terminal.background")
+        );
+        assert_eq!(moss.background, bundled_rgb("Moss", "terminal.background"));
+        assert_ne!(
+            ember, moss,
+            "two bundled dark themes must not paint the terminal identically"
+        );
+    }
+
+    /// A colour the *running program* asked for by name (`SGR 32`, "green") has to come out of the
+    /// theme's own palette too, not only the pane's default fill and text - that is the half a fix
+    /// that only retinted the background would miss entirely.
+    #[gpui::test]
+    fn a_named_ansi_colour_is_painted_from_the_themes_own_palette(cx: &mut TestAppContext) {
+        let (pane, cx) = painted_pane(cx, b"\x1b[32mOK\x1b[0m");
+
+        let dark_green = pane.read_with(cx, |pane, _| pane.painted_rows_for_test()[0][0].fg);
+        assert_eq!(dark_green, TerminalPalette::default().ansi[2]);
+
+        let _theme = with_bundled_theme("Paper");
+        pane.update(cx, |_pane, cx| cx.notify());
+        cx.run_until_parked();
+
+        let light_green = pane.read_with(cx, |pane, _| pane.painted_rows_for_test()[0][0].fg);
+        assert_eq!(
+            light_green,
+            bundled_rgb("Paper", "terminal.ansi.2"),
+            "the cell the program printed in ANSI green must resolve against the live theme's own \
+             ansi.2, not a module constant"
+        );
+        assert_ne!(
+            light_green, dark_green,
+            "Paper ships the light ANSI palette, so its green is genuinely a different colour"
+        );
+    }
+
+    /// Unstyled text - the overwhelming majority of what a terminal paints - must take the theme's
+    /// foreground, and an unstyled cell's background must be the theme's terminal background.
+    #[gpui::test]
+    fn unstyled_output_takes_the_themes_own_foreground_and_background(cx: &mut TestAppContext) {
+        let (pane, cx) = painted_pane(cx, b"plain");
+        let _theme = with_bundled_theme("Slate");
+        pane.update(cx, |_pane, cx| cx.notify());
+        cx.run_until_parked();
+
+        let cell = pane.read_with(cx, |pane, _| pane.painted_rows_for_test()[0][0]);
+        assert_eq!(cell.c, 'p');
+        assert_eq!(cell.fg, bundled_rgb("Slate", "terminal.foreground"));
+        assert_eq!(cell.bg, bundled_rgb("Slate", "terminal.background"));
     }
 }

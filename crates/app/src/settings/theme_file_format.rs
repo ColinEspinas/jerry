@@ -53,7 +53,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "The code surface",
-        &["syntax", "editor", "term", "completions_popup"],
+        &["syntax", "editor", "term", "terminal", "completions_popup"],
     ),
     (
         "Chrome and widgets",
