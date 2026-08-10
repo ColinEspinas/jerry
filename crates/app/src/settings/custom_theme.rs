@@ -1436,6 +1436,55 @@ keyword = "#ff79c6"
         );
     }
 
+    /// GitHub issue #208's custom-theme half. A user's own theme file almost never mentions the
+    /// terminal at all, so what it renders the terminal with is entirely a question of inheritance
+    /// - and it must resolve to something real and coherent either way:
+    ///
+    /// - a theme based on a bundled one gets *that theme's* terminal, so a custom theme built on
+    ///   Paper gets Paper's light terminal rather than Jerry Dark's dark one;
+    /// - a theme based on nothing gets Jerry Dark's own compiled defaults, the same as every other
+    ///   key it doesn't name.
+    ///
+    /// Nothing terminal-specific makes this true - it is the same generic `base`-chain layering
+    /// every other token already gets - which is exactly the point of asserting it: these tokens
+    /// really are ordinary registry entries, not a second mechanism.
+    #[test]
+    fn a_custom_theme_that_names_no_terminal_colours_inherits_its_bases() {
+        let builtins: Vec<&CustomTheme> = THEME_DEFS.iter().map(|def| def.theme).collect();
+        let paper = *builtins
+            .iter()
+            .find(|def| def.name == "Paper")
+            .expect("Paper is a bundled theme");
+
+        let child = theme_named("Mine", Some("Paper"), &[("surface.window", 0x333333)]);
+        let mut known = builtins.clone();
+        known.push(&child);
+        let palette = compile_palette(&child, &known).expect("should compile");
+
+        for key in [
+            "terminal.background",
+            "terminal.foreground",
+            "terminal.ansi.2",
+        ] {
+            assert_eq!(
+                palette.get(key).copied(),
+                paper.overrides.get(key).copied(),
+                "{key} must be inherited from the named base, not silently dropped"
+            );
+        }
+        assert!(
+            theme::theme_is_light(palette["terminal.background"]),
+            "a custom theme based on the light bundled theme must get a light terminal"
+        );
+
+        // And a theme with no base at all falls through to the compiled defaults, the real Jerry
+        // Dark case - absent from the palette is exactly how this app expresses that.
+        let rootless = theme_named("Rootless", None, &[("surface.window", 0x333333)]);
+        let palette = compile_palette(&rootless, &[&rootless]).expect("should compile");
+        assert!(!palette.contains_key("terminal.background"));
+        assert!(!palette.contains_key("terminal.ansi.2"));
+    }
+
     #[test]
     fn a_multi_level_base_chain_layers_root_first() {
         let root = theme_named("Root", None, &[("text.body", 0x111111)]);

@@ -477,6 +477,51 @@ const COLOR_KEY_MAP: &[(&str, &[&str])] = &[
         "term.menu_sel_fg",
         &["terminal.ansiBrightYellow", "terminal.ansiYellow"],
     ),
+    // ---- the integrated terminal's own rendered palette (GitHub issue #208) ------------------
+    //
+    // The *other* genuinely one-to-one block, and a more literal one than the `term.*` rows above:
+    // `crate::theme::terminal`'s twenty tokens are modelled on exactly the keys VSCode's own
+    // terminal contributes, so each of these is the same colour under a different name rather than
+    // a mapping that had to pick a plausible stand-in. Worth having precisely because
+    // `crate::theme::terminal::LIGHT_ANSI`'s two pinned palettes are only the *default* a theme
+    // that says nothing inherits - an imported theme that really authors its own sixteen gets them
+    // rendered verbatim instead.
+    (
+        "terminal.background",
+        &[
+            "terminal.background",
+            "panel.background",
+            "editor.background",
+        ],
+    ),
+    (
+        "terminal.foreground",
+        &["terminal.foreground", "editor.foreground"],
+    ),
+    (
+        "terminal.cursor",
+        &["terminalCursor.foreground", "editorCursor.foreground"],
+    ),
+    (
+        "terminal.selection",
+        &["terminal.selectionBackground", "editor.selectionBackground"],
+    ),
+    ("terminal.ansi.0", &["terminal.ansiBlack"]),
+    ("terminal.ansi.1", &["terminal.ansiRed"]),
+    ("terminal.ansi.2", &["terminal.ansiGreen"]),
+    ("terminal.ansi.3", &["terminal.ansiYellow"]),
+    ("terminal.ansi.4", &["terminal.ansiBlue"]),
+    ("terminal.ansi.5", &["terminal.ansiMagenta"]),
+    ("terminal.ansi.6", &["terminal.ansiCyan"]),
+    ("terminal.ansi.7", &["terminal.ansiWhite"]),
+    ("terminal.ansi.8", &["terminal.ansiBrightBlack"]),
+    ("terminal.ansi.9", &["terminal.ansiBrightRed"]),
+    ("terminal.ansi.10", &["terminal.ansiBrightGreen"]),
+    ("terminal.ansi.11", &["terminal.ansiBrightYellow"]),
+    ("terminal.ansi.12", &["terminal.ansiBrightBlue"]),
+    ("terminal.ansi.13", &["terminal.ansiBrightMagenta"]),
+    ("terminal.ansi.14", &["terminal.ansiBrightCyan"]),
+    ("terminal.ansi.15", &["terminal.ansiBrightWhite"]),
     // ---- diff -------------------------------------------------------------------------------
     (
         "diff.add_bg",

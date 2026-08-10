@@ -42,14 +42,27 @@
 //! `Term::scroll_display` (mouse-wheel/PageUp scrolling into history) isn't wired up here. Not
 //! an oversight - a natural following step.
 //!
-//! ## Scope cut: fixed 16-color palette, no OSC 4/10/11 customization
+//! ## Scope cut: no OSC 4/10/11 customization
 //!
 //! `Term::colors` (a palette OSC 4/10/11 sequences can override) starts out entirely `None` and
-//! this module never populates or consults it; named/indexed colors resolve against a fixed,
-//! hardcoded ANSI-16 palette plus the standard xterm 256-color cube/grayscale formulas for
-//! `Color::Indexed` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
-//! `get_color_at_index`/`rgb_for_index`, a public xterm convention). A program that repalettes
-//! its own colors via OSC renders with the default palette instead.
+//! this module never populates or consults it. A program that repalettes its own colors via OSC
+//! renders with the theme's palette instead.
+//!
+//! ## The palette is the caller's, not this module's (GitHub issue #208)
+//!
+//! Named/indexed colors resolve against a [`TerminalPalette`] the caller passes into
+//! [`TerminalGrid::visible_rows`], plus the standard xterm 256-color cube/grayscale formulas for
+//! `Color::Indexed(16..=255)` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
+//! `get_color_at_index`/`rgb_for_index`, a public xterm convention).
+//!
+//! Those sixteen-plus-four colors used to be hardcoded module constants, which is why the terminal
+//! rendered as one fixed set of VS Code default values regardless of which of this app's six themes
+//! was selected. They are now real, registered `crate::theme::terminal` tokens - but this module
+//! deliberately does not read them itself. It stays entirely free of `gpui::Window`/theme access
+//! (the same pure-module discipline `crate::code_surface::fold` keeps, and for the same reason:
+//! grid state and color resolution have to stay unit-testable with no real GPUI window), so
+//! resolving the live theme is `crate::terminal::pane`'s job - it has the theme at paint time -
+//! and this module only consumes the already-resolved RGB it hands over.
 //!
 //! ## Text selection (GitHub issue #158)
 //!
@@ -190,40 +203,66 @@ impl CellPosition {
     }
 }
 
-/// Default foreground/background, used both for `NamedColor::Foreground`/`Background` and this
-/// pane's own rendering background - matches step 3's `TerminalPane` colors (`rgb(0xd4d4d4)` on
-/// `rgb(0x1e1e1e)`).
-pub const DEFAULT_FOREGROUND: (u8, u8, u8) = (0xd4, 0xd4, 0xd4);
-pub const DEFAULT_BACKGROUND: (u8, u8, u8) = (0x1e, 0x1e, 0x1e);
+/// Every real colour a terminal grid resolves against, already reduced to concrete RGB - the whole
+/// interface between the live theme and this pure module (GitHub issue #208).
+///
+/// Built from `crate::theme::terminal`'s real registered tokens by
+/// `crate::terminal::pane::theme_terminal_palette`, which runs at paint time where the live theme
+/// is actually reachable. This module never resolves a token itself; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPalette {
+    /// The pane's own fill, and what `NamedColor::Background` resolves to.
+    pub background: (u8, u8, u8),
+    /// Unstyled output, and what `NamedColor::Foreground`/`BrightForeground` resolve to.
+    pub foreground: (u8, u8, u8),
+    /// What `NamedColor::Cursor` resolves to. The block cursor itself is an inverse-video swap
+    /// (see [`grid_cell_from_alacritty`]), not a fill painted in this colour.
+    pub cursor: (u8, u8, u8),
+    /// The fill painted behind a selected cell (GitHub issue #158).
+    pub selection: (u8, u8, u8),
+    /// The ANSI 16, indexed `0..=15` by `NamedColor`'s own discriminants / `Color::Indexed(0..=15)`.
+    pub ansi: [(u8, u8, u8); 16],
+}
 
-/// The fill painted behind a selected cell (GitHub issue #158). `#264f78` - VS Code's own
-/// `terminal.selectionBackground`, the same source [`NAMED_COLOR_PALETTE`] below already takes
-/// its 16 ANSI values from, rather than `crate::theme::editor::SELECTION`: this module's colors
-/// are deliberately a fixed palette independent of the live theme (see the module docs' palette
-/// scope cut), and a selection fill that tracked the theme while the 16 colors behind it did not
-/// would be the only thing in the terminal that did.
-pub const SELECTION_BACKGROUND: (u8, u8, u8) = (0x26, 0x4f, 0x78);
-
-/// The standard ANSI 16-color palette (VS Code's default terminal theme values), indexed
-/// `0..=15` by `NamedColor`'s own discriminants / `Color::Indexed(0..=15)`.
-const NAMED_COLOR_PALETTE: [(u8, u8, u8); 16] = [
-    (0x00, 0x00, 0x00), // 0 black
-    (0xcd, 0x31, 0x31), // 1 red
-    (0x0d, 0xbc, 0x79), // 2 green
-    (0xe5, 0xe5, 0x10), // 3 yellow
-    (0x24, 0x72, 0xc8), // 4 blue
-    (0xbc, 0x3f, 0xbc), // 5 magenta
-    (0x11, 0xa8, 0xcd), // 6 cyan
-    (0xe5, 0xe5, 0xe5), // 7 white
-    (0x66, 0x66, 0x66), // 8 bright black
-    (0xf1, 0x4c, 0x4c), // 9 bright red
-    (0x23, 0xd1, 0x8b), // 10 bright green
-    (0xf5, 0xf5, 0x43), // 11 bright yellow
-    (0x3b, 0x8e, 0xea), // 12 bright blue
-    (0xd6, 0x70, 0xd6), // 13 bright magenta
-    (0x29, 0xb8, 0xdb), // 14 bright cyan
-    (0xff, 0xff, 0xff), // 15 bright white
-];
+/// Jerry Dark's own terminal palette, transcribed - the exact literal values
+/// `crate::theme::terminal`'s tokens carry as their compiled defaults.
+///
+/// Duplicated here rather than resolved from `crate::theme` so this module stays theme-free (see
+/// the module docs), and kept honest about it by
+/// `crate::terminal::pane::terminal_theme_tests::the_pure_grid_default_palette_is_exactly_jerry_darks_own`,
+/// which resolves the real tokens and asserts they equal this value - so a retuned token can't
+/// leave this stale.
+///
+/// This is what the module's own tests render against, and what a caller that has no theme to offer
+/// gets. The app itself always passes the live theme's palette.
+impl Default for TerminalPalette {
+    fn default() -> Self {
+        Self {
+            background: (0x0d, 0x0f, 0x11),
+            foreground: (0xa7, 0xad, 0xb4),
+            cursor: (0x5a, 0x9a, 0xd4),
+            selection: (0x27, 0x3a, 0x4d),
+            ansi: [
+                (0x00, 0x00, 0x00), // 0 black
+                (0xcd, 0x31, 0x31), // 1 red
+                (0x0d, 0xbc, 0x79), // 2 green
+                (0xe5, 0xe5, 0x10), // 3 yellow
+                (0x24, 0x72, 0xc8), // 4 blue
+                (0xbc, 0x3f, 0xbc), // 5 magenta
+                (0x11, 0xa8, 0xcd), // 6 cyan
+                (0xe5, 0xe5, 0xe5), // 7 white
+                (0x66, 0x66, 0x66), // 8 bright black
+                (0xf1, 0x4c, 0x4c), // 9 bright red
+                (0x23, 0xd1, 0x8b), // 10 bright green
+                (0xf5, 0xf5, 0x43), // 11 bright yellow
+                (0x3b, 0x8e, 0xea), // 12 bright blue
+                (0xd6, 0x70, 0xd6), // 13 bright magenta
+                (0x29, 0xb8, 0xdb), // 14 bright cyan
+                (0xff, 0xff, 0xff), // 15 bright white
+            ],
+        }
+    }
+}
 
 /// Halves each channel - used for `NamedColor`'s `Dim*` variants, which have no fixed standard
 /// RGB value the way the base 16 colors do.
@@ -231,45 +270,49 @@ fn dim(color: (u8, u8, u8)) -> (u8, u8, u8) {
     (color.0 / 2, color.1 / 2, color.2 / 2)
 }
 
-fn named_color_rgb(name: NamedColor) -> (u8, u8, u8) {
+fn named_color_rgb(name: NamedColor, palette: &TerminalPalette) -> (u8, u8, u8) {
     match name {
-        NamedColor::Black => NAMED_COLOR_PALETTE[0],
-        NamedColor::Red => NAMED_COLOR_PALETTE[1],
-        NamedColor::Green => NAMED_COLOR_PALETTE[2],
-        NamedColor::Yellow => NAMED_COLOR_PALETTE[3],
-        NamedColor::Blue => NAMED_COLOR_PALETTE[4],
-        NamedColor::Magenta => NAMED_COLOR_PALETTE[5],
-        NamedColor::Cyan => NAMED_COLOR_PALETTE[6],
-        NamedColor::White => NAMED_COLOR_PALETTE[7],
-        NamedColor::BrightBlack => NAMED_COLOR_PALETTE[8],
-        NamedColor::BrightRed => NAMED_COLOR_PALETTE[9],
-        NamedColor::BrightGreen => NAMED_COLOR_PALETTE[10],
-        NamedColor::BrightYellow => NAMED_COLOR_PALETTE[11],
-        NamedColor::BrightBlue => NAMED_COLOR_PALETTE[12],
-        NamedColor::BrightMagenta => NAMED_COLOR_PALETTE[13],
-        NamedColor::BrightCyan => NAMED_COLOR_PALETTE[14],
-        NamedColor::BrightWhite => NAMED_COLOR_PALETTE[15],
-        NamedColor::Foreground | NamedColor::BrightForeground => DEFAULT_FOREGROUND,
-        NamedColor::Background => DEFAULT_BACKGROUND,
-        NamedColor::Cursor => DEFAULT_FOREGROUND,
-        NamedColor::DimForeground => dim(DEFAULT_FOREGROUND),
-        NamedColor::DimBlack => dim(NAMED_COLOR_PALETTE[0]),
-        NamedColor::DimRed => dim(NAMED_COLOR_PALETTE[1]),
-        NamedColor::DimGreen => dim(NAMED_COLOR_PALETTE[2]),
-        NamedColor::DimYellow => dim(NAMED_COLOR_PALETTE[3]),
-        NamedColor::DimBlue => dim(NAMED_COLOR_PALETTE[4]),
-        NamedColor::DimMagenta => dim(NAMED_COLOR_PALETTE[5]),
-        NamedColor::DimCyan => dim(NAMED_COLOR_PALETTE[6]),
-        NamedColor::DimWhite => dim(NAMED_COLOR_PALETTE[7]),
+        NamedColor::Black => palette.ansi[0],
+        NamedColor::Red => palette.ansi[1],
+        NamedColor::Green => palette.ansi[2],
+        NamedColor::Yellow => palette.ansi[3],
+        NamedColor::Blue => palette.ansi[4],
+        NamedColor::Magenta => palette.ansi[5],
+        NamedColor::Cyan => palette.ansi[6],
+        NamedColor::White => palette.ansi[7],
+        NamedColor::BrightBlack => palette.ansi[8],
+        NamedColor::BrightRed => palette.ansi[9],
+        NamedColor::BrightGreen => palette.ansi[10],
+        NamedColor::BrightYellow => palette.ansi[11],
+        NamedColor::BrightBlue => palette.ansi[12],
+        NamedColor::BrightMagenta => palette.ansi[13],
+        NamedColor::BrightCyan => palette.ansi[14],
+        NamedColor::BrightWhite => palette.ansi[15],
+        NamedColor::Foreground | NamedColor::BrightForeground => palette.foreground,
+        NamedColor::Background => palette.background,
+        NamedColor::Cursor => palette.cursor,
+        NamedColor::DimForeground => dim(palette.foreground),
+        NamedColor::DimBlack => dim(palette.ansi[0]),
+        NamedColor::DimRed => dim(palette.ansi[1]),
+        NamedColor::DimGreen => dim(palette.ansi[2]),
+        NamedColor::DimYellow => dim(palette.ansi[3]),
+        NamedColor::DimBlue => dim(palette.ansi[4]),
+        NamedColor::DimMagenta => dim(palette.ansi[5]),
+        NamedColor::DimCyan => dim(palette.ansi[6]),
+        NamedColor::DimWhite => dim(palette.ansi[7]),
     }
 }
 
 /// The standard xterm 256-color cube (indices `16..=231`) and grayscale ramp (`232..=255`)
 /// formulas - matches `vendor/zed/crates/terminal/src/terminal.rs`'s `get_color_at_index`/
 /// `rgb_for_index` (a public xterm convention, cited from the same source there).
-fn indexed_color_rgb(index: u8) -> (u8, u8, u8) {
+///
+/// Only `0..=15` is themeable: the cube and the ramp are fixed arithmetic on the index itself, the
+/// same in every real terminal, and a program asking for `Color::Indexed(196)` is asking for that
+/// exact well-known RGB rather than for "the theme's red".
+fn indexed_color_rgb(index: u8, palette: &TerminalPalette) -> (u8, u8, u8) {
     match index {
-        0..=15 => NAMED_COLOR_PALETTE[index as usize],
+        0..=15 => palette.ansi[index as usize],
         16..=231 => {
             let i = index - 16;
             let r = i / 36;
@@ -285,17 +328,22 @@ fn indexed_color_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
-fn resolve_color(color: Color) -> (u8, u8, u8) {
+fn resolve_color(color: Color, palette: &TerminalPalette) -> (u8, u8, u8) {
     match color {
-        Color::Named(name) => named_color_rgb(name),
+        Color::Named(name) => named_color_rgb(name, palette),
         Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-        Color::Indexed(index) => indexed_color_rgb(index),
+        Color::Indexed(index) => indexed_color_rgb(index, palette),
     }
 }
 
-fn grid_cell_from_alacritty(cell: &AlacCell, is_cursor: bool, selected: bool) -> GridCell {
-    let mut fg = resolve_color(cell.fg);
-    let mut bg = resolve_color(cell.bg);
+fn grid_cell_from_alacritty(
+    cell: &AlacCell,
+    is_cursor: bool,
+    selected: bool,
+    palette: &TerminalPalette,
+) -> GridCell {
+    let mut fg = resolve_color(cell.fg, palette);
+    let mut bg = resolve_color(cell.bg, palette);
     if cell.flags.contains(Flags::INVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }
@@ -404,7 +452,11 @@ impl TerminalGrid {
     /// exactly `columns` cells). The cell at the cursor's current position (if visible) has its
     /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph, and
     /// every cell inside the live selection is flagged [`GridCell::selected`].
-    pub fn visible_rows(&self) -> Vec<Vec<GridCell>> {
+    ///
+    /// `palette` is what every `NamedColor`/`Color::Indexed(0..=15)` the running program asked for
+    /// resolves against (GitHub issue #208) - passed in per call rather than stored, so a theme
+    /// switch is picked up by the very next repaint with no invalidation step that could go stale.
+    pub fn visible_rows(&self, palette: &TerminalPalette) -> Vec<Vec<GridCell>> {
         let content = self.term.renderable_content();
         let cursor_point =
             (content.cursor.shape != CursorShape::Hidden).then_some(content.cursor.point);
@@ -425,7 +477,12 @@ impl TerminalGrid {
             };
             let is_cursor = cursor_point == Some(indexed.point);
             let selected = selection.is_some_and(|range| range.contains(indexed.point));
-            row.push(grid_cell_from_alacritty(indexed.cell, is_cursor, selected));
+            row.push(grid_cell_from_alacritty(
+                indexed.cell,
+                is_cursor,
+                selected,
+                palette,
+            ));
         }
 
         rows
@@ -491,7 +548,7 @@ mod tests {
     fn plain_text_lands_on_the_first_row() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"hello");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(rows.len(), 5);
         assert!(row_text(&rows[0]).starts_with("hello"));
     }
@@ -543,7 +600,7 @@ mod tests {
         let mut grid = TerminalGrid::new(5, 20);
         // Move to row 3, column 5 (1-indexed, per CSI CUP), then write "X".
         grid.append_bytes(b"\x1b[3;5HX");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         // Row index 2 (0-indexed), column index 4.
         assert_eq!(rows[2][4].c, 'X');
         // Everywhere else on that row is still blank.
@@ -558,7 +615,7 @@ mod tests {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"\x1b[1;1Hfirst");
         grid.append_bytes(b"\x1b[1;1HSECOND");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert!(row_text(&rows[0]).starts_with("SECOND"));
     }
 
@@ -566,16 +623,92 @@ mod tests {
     fn sgr_red_foreground_resolves_to_the_named_palette_color() {
         let mut grid = TerminalGrid::new(2, 10);
         grid.append_bytes(b"\x1b[31mR\x1b[0m");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(rows[0][0].c, 'R');
-        assert_eq!(rows[0][0].fg, NAMED_COLOR_PALETTE[1]);
+        assert_eq!(rows[0][0].fg, TerminalPalette::default().ansi[1]);
+    }
+
+    /// GitHub issue #208's pure half. Two renders of the *same* grid state under two different
+    /// palettes must produce two different sets of colours - which is only true because every
+    /// resolution path (unstyled default fg/bg, a named ANSI colour, and `Color::Indexed(0..=15)`)
+    /// reads the passed-in palette rather than a module constant.
+    #[test]
+    fn every_themeable_colour_comes_from_the_supplied_palette_not_a_hardcoded_one() {
+        let mut grid = TerminalGrid::new(2, 10);
+        // "P" unstyled, "R" in named red (SGR 31), "B" in indexed blue (SGR 38;5;4).
+        grid.append_bytes(b"P\x1b[31mR\x1b[0m\x1b[38;5;4mB\x1b[0m");
+
+        let mut ansi = TerminalPalette::default().ansi;
+        ansi[1] = (0x77, 0x88, 0x99);
+        ansi[4] = (0xaa, 0xbb, 0xcc);
+        let themed = TerminalPalette {
+            foreground: (0x11, 0x22, 0x33),
+            background: (0x44, 0x55, 0x66),
+            ansi,
+            ..Default::default()
+        };
+
+        let default_rows = grid.visible_rows(&TerminalPalette::default());
+        let themed_rows = grid.visible_rows(&themed);
+
+        assert_eq!(themed_rows[0][0].c, 'P');
+        assert_eq!(themed_rows[0][0].fg, (0x11, 0x22, 0x33));
+        assert_eq!(themed_rows[0][0].bg, (0x44, 0x55, 0x66));
+        assert_eq!(themed_rows[0][1].c, 'R');
+        assert_eq!(themed_rows[0][1].fg, (0x77, 0x88, 0x99));
+        assert_eq!(themed_rows[0][2].c, 'B');
+        assert_eq!(themed_rows[0][2].fg, (0xaa, 0xbb, 0xcc));
+
+        for column in 0..3 {
+            assert_ne!(
+                default_rows[0][column].fg, themed_rows[0][column].fg,
+                "column {column} rendered the same foreground under two different palettes - it \
+                 is still resolving against something hardcoded"
+            );
+        }
+    }
+
+    /// A cell the running program gave a real 24-bit colour (`SGR 38;2;r;g;b`) is *not* themeable -
+    /// the program asked for that exact colour, and a terminal that repainted it in a theme colour
+    /// would be corrupting output, not theming it.
+    #[test]
+    fn a_program_specified_truecolor_is_left_exactly_alone_by_the_palette() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes(b"\x1b[38;2;1;2;3mX");
+
+        let themed = TerminalPalette {
+            foreground: (0x11, 0x22, 0x33),
+            ansi: [(0x11, 0x22, 0x33); 16],
+            ..Default::default()
+        };
+
+        assert_eq!(grid.visible_rows(&themed)[0][0].fg, (1, 2, 3));
+    }
+
+    /// The xterm 256-colour cube and grayscale ramp (`16..=255`) are fixed arithmetic, not palette
+    /// entries - see [`indexed_color_rgb`]'s own docs.
+    #[test]
+    fn the_xterm_256_cube_stays_fixed_while_the_first_sixteen_follow_the_palette() {
+        let mut grid = TerminalGrid::new(2, 10);
+        grid.append_bytes(b"\x1b[38;5;196mC\x1b[0m");
+
+        let themed = TerminalPalette {
+            ansi: [(0x11, 0x22, 0x33); 16],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            grid.visible_rows(&themed)[0][0].fg,
+            (0xff, 0x00, 0x00),
+            "index 196 is the cube's own pure red, the same in every real terminal"
+        );
     }
 
     #[test]
     fn sgr_bold_sets_the_bold_flag() {
         let mut grid = TerminalGrid::new(2, 10);
         grid.append_bytes(b"\x1b[1mB");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert!(rows[0][0].bold);
     }
 
@@ -583,7 +716,7 @@ mod tests {
     fn resize_changes_the_visible_row_and_column_count() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.resize(10, 40);
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0].len(), 40);
     }
@@ -593,7 +726,7 @@ mod tests {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"hello");
         grid.append_bytes(b"\x1b[2J\x1b[1;1H");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(row_text(&rows[0]).trim(), "");
     }
 
@@ -609,10 +742,13 @@ mod tests {
     fn clear_erases_visible_text_and_homes_the_cursor() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"\x1b[3;5Hhello");
-        assert_eq!(row_text(&grid.visible_rows()[2]).trim(), "hello");
+        assert_eq!(
+            row_text(&grid.visible_rows(&TerminalPalette::default())[2]).trim(),
+            "hello"
+        );
 
         grid.clear();
-        for row in grid.visible_rows() {
+        for row in grid.visible_rows(&TerminalPalette::default()) {
             assert_eq!(
                 row_text(&row).trim(),
                 "",
@@ -623,7 +759,7 @@ mod tests {
         // The cursor is homed to (1,1) - writing right after `clear()` lands at the top-left,
         // not wherever the cursor happened to be before.
         grid.append_bytes(b"X");
-        assert_eq!(grid.visible_rows()[0][0].c, 'X');
+        assert_eq!(grid.visible_rows(&TerminalPalette::default())[0][0].c, 'X');
     }
 
     #[test]
@@ -652,7 +788,7 @@ mod tests {
             grid.append_bytes(&chunk);
         }
 
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(
             rows[1][2].c, 'O',
             "expected 'O' at row 2 col 3, got rows: {rows:?}"
@@ -796,7 +932,7 @@ mod selection_tests {
         grid.start_selection(left(0, 6));
         grid.update_selection(right(0, 10));
 
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         let flagged: String = rows[0]
             .iter()
             .filter(|cell| cell.selected)
@@ -813,7 +949,7 @@ mod selection_tests {
     fn no_selection_means_no_cell_is_flagged() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"hello world");
-        let rows = grid.visible_rows();
+        let rows = grid.visible_rows(&TerminalPalette::default());
         assert!(rows.iter().flatten().all(|cell| !cell.selected));
     }
 
