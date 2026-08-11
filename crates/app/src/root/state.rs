@@ -443,6 +443,12 @@ impl AdeApp {
             // nothing shows it until Settings is opened, which recomputes it - see
             // `AdeApp::refresh_shell_status`.
             shell_status: settings::ShellStatus::SystemDefault,
+            // Same reasoning, and more so: detecting the installed shells reads `/etc/shells` and
+            // walks `$PATH` several times over. Left genuinely empty until a real gesture asks
+            // for it (`AdeApp::refresh_shell_suggestions`), never guessed at startup.
+            shell_suggestions: Vec::new(),
+            shell_suggestions_open: false,
+            shell_field_bounds: gpui::Bounds::default(),
             _theme_generate_task: None,
             keymap_recording: None,
             _keymap_intercept: None,

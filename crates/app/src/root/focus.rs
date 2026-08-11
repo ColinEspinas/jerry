@@ -168,6 +168,11 @@ impl AdeApp {
         // and `$PATH` (or the file it names) can have changed since the last time Settings was
         // open - re-probe once here, on open, rather than per render.
         self.refresh_shell_status();
+        // Same reasoning for that field's suggestion list (issue #213's follow-up): detected here,
+        // on a real gesture, so the dropdown has real entries the instant it is opened rather than
+        // needing a frame of detection. Its own open flag is left alone - opening Settings does
+        // not open a dropdown.
+        self.refresh_shell_suggestions();
         cx.notify();
     }
 
@@ -175,6 +180,11 @@ impl AdeApp {
     /// [`Self::handle_settings_key_down`]) and restores focus via [`restore_focus`].
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // The Shell field's suggestion dropdown belongs to the page being left (GitHub issue
+        // #213's follow-up). `AdeApp::render` already gates it on `settings_open`, so this is not
+        // what keeps it off the workspace - it is what stops it from silently reappearing the next
+        // time Settings is opened, still holding the state a user walked away from.
+        self.shell_suggestions_open = false;
         // A live keybinding-recording intercept (`Self::_keymap_intercept`) is a real, global
         // `App::intercept_keystrokes` subscription - it must never survive leaving the Settings
         // surface, or every keystroke in the whole app would keep being silently swallowed.

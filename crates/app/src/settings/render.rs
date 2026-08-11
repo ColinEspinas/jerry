@@ -1,6 +1,27 @@
 use super::*;
-use crate::root::widgets::{hover_keycap_row, render_env_chip, render_keycap_row, KeycapSize};
+use crate::root::widgets::{
+    hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
+};
 use crate::settings::widgets::ChoiceOption;
+
+/// The Shell suggestion dropdown's width (GitHub issue #213's follow-up). Wider than the 168px
+/// field it hangs under, because a row carries a shell's name *and* its real absolute path
+/// (`/usr/local/bin/fish`) and truncating that away would defeat the point of showing the path at
+/// all. Sized between the git graph's own two menus (`theme::graph::PUSH_MENU_WIDTH` 268,
+/// `ROW_MENU_WIDTH` 330) rather than picked freehand.
+const SHELL_SUGGESTIONS_WIDTH: gpui::Pixels = px(288.0);
+
+/// How tall the row list may grow before it scrolls. Nine 29px rows plus the panel's own padding,
+/// which comfortably clears what a real machine lists (this one's `/etc/shells` yields seven after
+/// deduplication) while keeping the dropdown from ever covering the whole Settings page on a host
+/// with an unusually long list. Anything beyond it is genuinely reachable by scrolling, not
+/// silently dropped from the detection results.
+const SHELL_SUGGESTIONS_MAX_HEIGHT: gpui::Pixels = px(269.0);
+
+/// The smallest left offset the dropdown will accept, for a window narrow enough that
+/// right-aligning it against the field would push it off the left edge. Mirrors
+/// `crate::sidebar::context_menu::MENU_EDGE_MARGIN`, whose job is exactly this.
+const SHELL_SUGGESTIONS_EDGE_MARGIN: f32 = 4.0;
 
 impl AdeApp {
     pub(crate) fn handle_toggle_settings_action(
@@ -928,8 +949,9 @@ impl AdeApp {
         );
         let shell_row = self.render_settings_row(
             "Shell",
-            "What a new Shell tab runs - a name on PATH (bash, fish, pwsh) or an absolute path. \
-             Leave it empty to use the system default. Agent tabs are unaffected.",
+            "What a new Shell tab runs - click the field for the shells detected on this machine, \
+             or type any name on PATH or absolute path. Leave it empty to use the system default. \
+             Agent tabs are unaffected.",
             self.render_settings_shell_control(cx),
         );
         let inline_blame_row = self.render_settings_row(
@@ -1023,7 +1045,26 @@ impl AdeApp {
                     .on_key_down(cx.listener(Self::handle_settings_shell_key_down))
                     .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                         window.focus(&this.shell_focus_handle, cx);
+                        this.open_shell_suggestions(cx);
                     }))
+                    // The field's real, window-space painted bounds, for positioning the
+                    // suggestion dropdown - the same `gpui::canvas` idiom
+                    // `Self::plus_button_bounds` uses, and for the same reason: the dropdown is a
+                    // top-level sibling in `AdeApp::render`, so it needs the field's position in
+                    // window space, not in this row's own coordinate system.
+                    .child({
+                        let this = cx.entity();
+                        gpui::canvas(
+                            move |bounds, _window, cx| {
+                                this.update(cx, |this, _cx| {
+                                    this.shell_field_bounds = bounds;
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full()
+                    })
                     .cursor_pointer()
                     .flex_none()
                     .flex()
@@ -1074,6 +1115,14 @@ impl AdeApp {
     /// deliberate scope cut (no cursor positioning, no selection, no IME). Every real change
     /// goes straight to the persisted setting through [`Self::apply_shell_input`], so there is
     /// no separate "save" step that could be forgotten.
+    ///
+    /// The suggestion dropdown deliberately consumes **no** keystroke this handler needs. It has
+    /// no keyboard selection of its own (no up/down/enter capture), so every key still means
+    /// exactly what it meant before the dropdown existed - the field is the only thing typing can
+    /// reach. `Esc` in particular keeps its existing, tested meaning (clear the field, undoably),
+    /// rather than being stolen as a "close the dropdown" key; it just closes the dropdown as
+    /// well, since a cleared field is the user saying they want out of the way, and every other
+    /// edit re-opens it so the filtered list keeps up with what is being typed.
     pub(in crate::settings) fn handle_settings_shell_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1085,6 +1134,7 @@ impl AdeApp {
             return;
         }
         self.reset_caret_blink(cx);
+        let escaped = keystroke.key.as_str() == "escape";
         let changed = match keystroke.key.as_str() {
             "backspace" => self.shell_input.pop(Instant::now()),
             // Clearing the field is itself a real, meaningful edit here (it means "go back to the
@@ -1100,6 +1150,58 @@ impl AdeApp {
             self.apply_shell_input(cx);
             cx.stop_propagation();
         }
+        if escaped {
+            self.shell_suggestions_open = false;
+            cx.notify();
+        } else if changed {
+            self.open_shell_suggestions(cx);
+        }
+    }
+
+    /// Opens (or re-opens) the Shell field's suggestion dropdown, re-detecting the machine's real
+    /// shells first (GitHub issue #213's follow-up).
+    ///
+    /// The detection runs here, on a real user gesture - a click on the field, a keystroke that
+    /// changed it - and never from `render`: [`crate::settings::state::detect_installed_shells`]
+    /// reads `/etc/shells` and walks `$PATH`, which is exactly the class of work
+    /// [`Self::refresh_shell_status`] and [`Self::load_agent_rows`] already keep off the frame
+    /// path. Re-running it per gesture rather than once at startup is what makes a shell the user
+    /// installed *while* the app was running actually show up.
+    ///
+    /// Goes through [`Self::close_menu_surfaces_except`] like every other menu-opening path
+    /// (GitHub issue #176), so this dropdown and some other popover can never be painted at once.
+    pub(in crate::settings) fn open_shell_suggestions(&mut self, cx: &mut Context<Self>) {
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::ShellSuggestions));
+        self.refresh_shell_suggestions();
+        self.shell_suggestions_open = true;
+        cx.notify();
+    }
+
+    /// Re-detects the shells this machine genuinely has ([`Self::shell_suggestions`]). Separate
+    /// from [`Self::open_shell_suggestions`] so opening Settings can warm it without also opening
+    /// the dropdown.
+    pub(crate) fn refresh_shell_suggestions(&mut self) {
+        self.shell_suggestions = settings::detect_installed_shells();
+    }
+
+    /// Puts a clicked suggestion's real path into the field, exactly as if it had been typed:
+    /// same [`text_history::TextField`] (so it is a single undoable edit, and the field's existing
+    /// caret/undo behaviour is untouched), same [`Self::apply_shell_input`] persistence path, same
+    /// advisory status hint recomputed afterwards. Nothing about a suggested value is special once
+    /// it is in the field - which is the whole point of the field staying free text.
+    pub(in crate::settings) fn select_shell_suggestion(
+        &mut self,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shell_input.set(&value, Instant::now());
+        self.apply_shell_input(cx);
+        self.shell_suggestions_open = false;
+        // Focus goes back to the field, not the dropdown that just vanished, so the very next
+        // keystroke edits the value the user just picked.
+        window.focus(&self.shell_focus_handle, cx);
+        cx.notify();
     }
 
     /// `TextUndo`/`TextRedo` for the Shell field (GitHub issue #17's per-widget undo) - see
@@ -1158,6 +1260,169 @@ impl AdeApp {
             self.settings.terminal.shell_override(),
             pty_core::resolve_on_path,
         );
+    }
+
+    /// The Shell field's suggestion dropdown (GitHub issue #213's follow-up): one clickable row
+    /// per shell this machine genuinely has ([`Self::shell_suggestions`]), filtered by whatever is
+    /// currently typed, positioned directly under the field.
+    ///
+    /// **Why it is a top-level sibling in [`AdeApp::render`]** rather than a child of the settings
+    /// row: the row lives inside the settings page's own scrolling column, which clips its
+    /// children, so a popover nested there would be cut off at the column's edge. The established
+    /// answer in this app is the `+` menu's: capture the trigger's window-space bounds with a real
+    /// `gpui::canvas` ([`Self::shell_field_bounds`]) and position an `.absolute()` root-level
+    /// sibling off them.
+    ///
+    /// **Chrome is not invented here.** The panel is
+    /// [`crate::root::widgets::menu_popover_chrome`] with `theme::shadow::MENU` - the one real
+    /// dropdown/context-menu surface every other popover in the app is built from - and the rows
+    /// mirror `crate::work_surface::render::render_dropdown_menu_row`'s exact tokens (see
+    /// [`Self::render_shell_suggestion_row`] for the one reason they can't literally call it).
+    /// The click-away scrim is the file tree context menu's: full-window below the title bar
+    /// (never over it - a full-window occluding scrim swallows the caption buttons) and
+    /// `.occlude()`d, with the panel calling `cx.stop_propagation()` so a click on a row is not
+    /// also a click on the scrim.
+    ///
+    /// Dismissal is therefore the same as every other menu's, not a new rule: the scrim's click,
+    /// opening any other menu surface, the window losing focus
+    /// (`crate::root::menus::MenuSurface::ShellSuggestions`), leaving Settings, and picking a row.
+    pub(crate) fn render_shell_suggestions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = self.shell_field_bounds;
+        // Right-aligned with the field (which sits at the right edge of its settings row) so the
+        // panel, wider than the 168px field, grows inwards over the page rather than off it -
+        // the same right-alignment the git graph's row menu uses against its own trigger. Clamped
+        // to a small left margin for a genuinely narrow window, mirroring
+        // `crate::sidebar::context_menu::MENU_EDGE_MARGIN`'s own job.
+        let left = px(f32::max(
+            (bounds.origin.x + bounds.size.width - SHELL_SUGGESTIONS_WIDTH).as_f32(),
+            SHELL_SUGGESTIONS_EDGE_MARGIN,
+        ));
+        // The scrim starts below the title bar, so positions measured in window space have to be
+        // rebased into it - exactly what `render_tree_context_menu` does.
+        let top = bounds.origin.y + bounds.size.height + px(4.0) - theme::band::TITLE_BAR;
+        let matches =
+            settings::filter_shell_suggestions(&self.shell_suggestions, self.shell_input.as_str());
+
+        div()
+            .id("settings-shell-suggestions-scrim")
+            .absolute()
+            .top(theme::band::TITLE_BAR)
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .bg(work_surface::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.shell_suggestions_open = false;
+                cx.notify();
+            }))
+            .child(
+                menu_popover_chrome(
+                    div()
+                        .id("settings-shell-suggestions-popover")
+                        .debug_selector(|| "settings-shell-suggestions-popover".to_string())
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(SHELL_SUGGESTIONS_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .occlude()
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(3.0))
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(9.0))
+                        .text_color(theme::text::GHOST)
+                        .child("detected on this machine"),
+                )
+                .child(
+                    div()
+                        .id("settings-shell-suggestions-list")
+                        .flex()
+                        .flex_col()
+                        .max_h(SHELL_SUGGESTIONS_MAX_HEIGHT)
+                        .overflow_y_scroll()
+                        .children(matches.iter().enumerate().map(|(index, suggestion)| {
+                            self.render_shell_suggestion_row(index, suggestion, cx)
+                        })),
+                ),
+            )
+    }
+
+    /// One suggestion row - a `❯` chip (the same glyph the `+` menu's own "New terminal" row
+    /// uses), the shell's real name, and the real absolute path it was found at, so the user can
+    /// tell `/bin/bash` from `/usr/local/bin/bash` before clicking. Clicking types that path into
+    /// the field ([`Self::select_shell_suggestion`]).
+    ///
+    /// Visually this is `crate::work_surface::render::render_dropdown_menu_row` - same 29px band,
+    /// same 10px padding and 9px gap, same 14×14 chip, same label/sub type ramp, same
+    /// `theme::surface::MENU_ROW_HOVER` hover. It cannot literally call that function for one real
+    /// reason: that helper keys its GPUI element id off a `&'static str` label, and a shell's name
+    /// is neither `'static` nor guaranteed unique (a machine can genuinely have two different
+    /// `bash` binaries at two different paths), so the ids would collide. The row's identity is
+    /// its position in the filtered list instead.
+    fn render_shell_suggestion_row(
+        &self,
+        index: usize,
+        suggestion: &settings::ShellSuggestion,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let value = suggestion.value();
+        div()
+            .id(("settings-shell-suggestion", index))
+            .debug_selector(move || format!("settings-shell-suggestion-{index}"))
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .h(theme::band::PLUS_MENU_ROW)
+            .px(px(10.0))
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_shell_suggestion(value.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .rounded(theme::radius::CHIP)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::surface::CHIP_NEUTRAL)
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(8.0))
+                    .text_color(theme::text::DIM)
+                    .child("\u{276f}"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(11.5))
+                    .text_color(theme::text::HEADING)
+                    .child(suggestion.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(suggestion.value()),
+            )
     }
 
     /// *Appearance & scaling* - every row here is persisted and round-trips through
@@ -4381,6 +4646,384 @@ mod shell_setting_tests {
         assert!(
             cx.debug_bounds("settings-shell-status").is_some(),
             "the row's live found/not-found hint must really paint"
+        );
+    }
+}
+
+/// GitHub issue #213's follow-up ("would a select + auto-detect installed shells be better?" -
+/// answered as a hybrid): real detected shells offered as clickable suggestions under a field that
+/// stays unrestricted free text.
+///
+/// Every test here drives the real thing end to end - a real window, real painted bounds, a real
+/// mouse click on a real suggestion row, the real `/etc/shells`/`PATH` detection of the machine
+/// running the suite - rather than asserting on the pure detector alone (which
+/// `crate::settings::state`'s own tests already cover against real tempdir fixtures).
+///
+/// unix-only, like its sibling module: the final assertions spawn a real shell.
+#[cfg(all(test, unix))]
+mod shell_suggestion_dropdown_tests {
+    use super::*;
+    use crate::root::menus::MenuSurface;
+    use gpui::TestAppContext;
+
+    /// Opens Settings on the General page, with a real isolated `settings.toml`, and returns the
+    /// app plus that path.
+    fn open_general_settings(
+        cx: &mut TestAppContext,
+        settings_path: PathBuf,
+        repo_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    /// `VisualTestContext::debug_bounds` takes a `&'static str`, and a suggestion row's selector
+    /// is built from its runtime position in the filtered list - so a test that wants to click
+    /// row *n* has to hand out a genuinely `'static` selector for it. Leaking a per-lookup
+    /// `String` is the honest way to do that in a test binary: bounded (a handful of rows per
+    /// test), and it keeps the row selectors index-based, which is what makes them unique even on
+    /// a machine with two shells of the same name.
+    fn row_selector(index: usize) -> &'static str {
+        Box::leak(format!("settings-shell-suggestion-{index}").into_boxed_str())
+    }
+
+    /// Clicks the real painted Shell field, which is what opens the dropdown.
+    fn click_the_shell_field(cx: &mut gpui::VisualTestContext) {
+        let field = cx
+            .debug_bounds("settings-shell-input")
+            .expect("the Shell field must really paint on the General page");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// The core of the feature: clicking the field really paints a dropdown, and every row in it
+    /// is a shell that genuinely exists on this machine - detected, not hardcoded.
+    #[gpui::test]
+    fn clicking_the_field_opens_a_dropdown_of_genuinely_detected_shells(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_general_settings(
+            cx,
+            settings_dir.path().join("settings.toml"),
+            repo.path().to_path_buf(),
+        );
+
+        assert!(
+            cx.debug_bounds("settings-shell-suggestions-popover")
+                .is_none(),
+            "the dropdown must not be painted before anything has been clicked"
+        );
+
+        click_the_shell_field(cx);
+
+        assert!(
+            app.read_with(cx, |app, _| app.shell_suggestions_open),
+            "clicking the field must really open the suggestion surface"
+        );
+        assert!(
+            cx.debug_bounds("settings-shell-suggestions-popover")
+                .is_some(),
+            "the dropdown must really paint, with real bounds, under the field"
+        );
+
+        let suggestions = app.read_with(cx, |app, _| app.shell_suggestions.clone());
+        assert!(
+            !suggestions.is_empty(),
+            "detection must find real shells on a machine that genuinely has /etc/shells"
+        );
+        for (index, suggestion) in suggestions.iter().enumerate() {
+            assert!(
+                suggestion.path.is_file(),
+                "the dropdown offered {}, which is not a real file on this machine",
+                suggestion.path.display()
+            );
+            assert!(
+                cx.debug_bounds(row_selector(index)).is_some(),
+                "every detected shell must really paint as a clickable row: {}",
+                suggestion.name
+            );
+        }
+    }
+
+    /// The whole user journey the follow-up asked for, with no typing at all: click the field,
+    /// click a real detected shell, and that shell's real path is in the field, in the real
+    /// `settings.toml`, and running as the real child process of the next Shell tab.
+    #[gpui::test]
+    fn clicking_a_suggestion_configures_it_and_the_next_tab_really_runs_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_general_settings(cx, settings_path.clone(), repo.path().to_path_buf());
+        click_the_shell_field(cx);
+
+        // Pick a real detected shell this test can then really spawn. `sh` is the one every Unix
+        // host running this suite genuinely has.
+        let (index, chosen) = app
+            .read_with(cx, |app, _| {
+                app.shell_suggestions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, suggestion)| suggestion.name == "sh")
+                    .map(|(index, suggestion)| (index, suggestion.clone()))
+            })
+            .expect("every Unix host running this suite has a real sh in /etc/shells");
+
+        let row = cx
+            .debug_bounds(row_selector(index))
+            .expect("the chosen suggestion must really paint");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            chosen.value(),
+            "clicking a suggestion must put its real path in the field, exactly as typing would"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.terminal.shell.clone()),
+            Some(chosen.value()),
+            "and it must reach the real setting through the same path a typed value does"
+        );
+        let written = std::fs::read_to_string(&settings_path).expect("the file must exist");
+        assert!(
+            written.contains(&format!("shell = \"{}\"", chosen.value())),
+            "a clicked suggestion must really be persisted to settings.toml, got: {written}"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.shell_suggestions_open),
+            "picking a suggestion must close the dropdown, not leave it stuck open"
+        );
+        assert!(
+            cx.debug_bounds("settings-shell-suggestions-popover")
+                .is_none(),
+            "and it must really stop painting"
+        );
+
+        // The real proof it was a usable choice and not just a string: the next Shell tab spawns it.
+        app.update_in(cx, |app, window, cx| {
+            app.close_settings(window, cx);
+            app.new_agent(AgentKind::Shell, window, cx);
+        });
+        cx.run_until_parked();
+        let pane = app
+            .read_with(cx, |app, _| app.agents.active().map(|a| a.pane.clone()))
+            .expect("the newly spawned tab");
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(
+                pane.spawn_error(),
+                None,
+                "a shell picked from the detected list must always start - that is what makes \
+                 detection worth trusting"
+            );
+            assert_eq!(pane.program_label(), "sh");
+            assert!(pane.is_running(), "the picked shell must really be running");
+        });
+    }
+
+    /// The field must stay genuinely free text: a path this machine has never heard of is still
+    /// typeable and still persists, and the dropdown - which has nothing to suggest for it -
+    /// simply shows no rows rather than restricting or overriding anything.
+    #[gpui::test]
+    fn a_custom_value_the_machine_has_never_heard_of_still_works(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_general_settings(
+            cx,
+            settings_dir.path().join("settings.toml"),
+            repo.path().to_path_buf(),
+        );
+        click_the_shell_field(cx);
+        cx.simulate_keystrokes("q q q");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.terminal.shell.clone()),
+            Some("qqq".to_string()),
+            "typing must reach the setting exactly as it did before the dropdown existed"
+        );
+        assert!(
+            app.read_with(cx, |app, _| settings::filter_shell_suggestions(
+                &app.shell_suggestions,
+                app.shell_input.as_str()
+            )
+            .is_empty()),
+            "nothing detected matches a custom value, so nothing may be suggested for it"
+        );
+        assert!(
+            cx.debug_bounds("settings-shell-suggestion-0").is_none(),
+            "no suggestion row may paint when nothing matches - the dropdown never restricts what \
+             can be typed, it just has nothing to add"
+        );
+
+        // And typing something the machine *does* have narrows the list to it rather than
+        // replacing what was typed.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("z s h");
+        cx.run_until_parked();
+        let matched = app.read_with(cx, |app, _| {
+            settings::filter_shell_suggestions(&app.shell_suggestions, app.shell_input.as_str())
+                .into_iter()
+                .map(|suggestion| suggestion.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            "zsh",
+            "the field still holds exactly what was typed - a suggestion never rewrites it"
+        );
+        if app.read_with(cx, |app, _| {
+            app.shell_suggestions
+                .iter()
+                .any(|suggestion| suggestion.name == "zsh")
+        }) {
+            assert_eq!(
+                matched,
+                vec!["zsh".to_string()],
+                "typing a real shell's name must narrow the list to it"
+            );
+        }
+    }
+
+    /// A clicked suggestion is an ordinary edit of the same [`crate::text_history::TextField`] the
+    /// field already used, so the field's existing undo history really covers it - a real
+    /// regression guard against the dropdown growing a second, parallel way to change the value
+    /// that undo would not know about.
+    #[gpui::test]
+    fn a_clicked_suggestion_is_a_single_undoable_edit_of_the_real_field(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_general_settings(
+            cx,
+            settings_dir.path().join("settings.toml"),
+            repo.path().to_path_buf(),
+        );
+        click_the_shell_field(cx);
+        // A real typed value first, so undo has something distinct to come back to.
+        cx.simulate_keystrokes("s");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            "s"
+        );
+
+        let row = cx
+            .debug_bounds("settings-shell-suggestion-0")
+            .expect("'s' matches real detected shells, so a row must paint");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let picked = app.read_with(cx, |app, _| app.shell_input.as_str().to_string());
+        assert!(
+            picked.starts_with('/'),
+            "the click must have replaced the typed text with a real absolute path, got {picked}"
+        );
+
+        let undo = if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        };
+        cx.simulate_keystrokes(undo);
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            "s",
+            "the field's own existing undo must reverse a clicked suggestion in one step - the \
+             dropdown writes through the same TextField, not around it"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.terminal.shell.clone()),
+            Some("s".to_string()),
+            "and the undone value must be re-applied to the real setting, so the field and the \
+             file can never disagree"
+        );
+    }
+
+    /// The dropdown obeys the app's one shared dismissal rule
+    /// (`crate::root::menus::MenuSurface`), rather than owning a second one: a click away closes
+    /// it, the window losing focus closes it, and leaving Settings closes it.
+    #[gpui::test]
+    fn the_dropdown_dismisses_the_same_way_every_other_menu_does(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_general_settings(
+            cx,
+            settings_dir.path().join("settings.toml"),
+            repo.path().to_path_buf(),
+        );
+
+        // It is a real member of the shared menu-surface set, not a private bool.
+        click_the_shell_field(cx);
+        assert!(
+            app.read_with(cx, |app, _| app
+                .menu_surface_is_open(MenuSurface::ShellSuggestions)),
+            "the dropdown must answer the shared 'is a menu open' question"
+        );
+
+        // A click away from the panel hits the scrim and closes it.
+        let popover = cx
+            .debug_bounds("settings-shell-suggestions-popover")
+            .expect("the dropdown must be painted");
+        cx.simulate_click(
+            gpui::Point::new(popover.origin.x - px(80.0), popover.origin.y + px(200.0)),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.shell_suggestions_open),
+            "clicking away from the dropdown must close it"
+        );
+
+        // Leaving Settings entirely never leaves it armed for the next visit.
+        click_the_shell_field(cx);
+        assert!(app.read_with(cx, |app, _| app.shell_suggestions_open));
+        app.update_in(cx, |app, window, cx| app.close_settings(window, cx));
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.shell_suggestions_open),
+            "closing Settings must close the dropdown that belonged to it"
+        );
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.select_settings_page(SettingsPage::General, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-shell-suggestions-popover")
+                .is_none(),
+            "reopening Settings must not resurrect a dropdown nobody asked for"
+        );
+
+        // And the window losing OS focus closes it, exactly like every other menu surface - last,
+        // since `VisualTestContext` has no way to re-activate a window afterwards.
+        //
+        // `deactivate_window` is a no-op unless this window really is the platform's active one,
+        // and `TestWindow` does not start active - the same premise
+        // `crate::root::menus`'s own window-activation test sets up.
+        cx.update(|window, _cx| window.activate_window());
+        cx.run_until_parked();
+        click_the_shell_field(cx);
+        assert!(app.read_with(cx, |app, _| app.shell_suggestions_open));
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.shell_suggestions_open),
+            "a deactivated window must not leave a dropdown floating over the app"
         );
     }
 }
