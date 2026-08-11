@@ -1588,6 +1588,7 @@ impl AdeApp {
             .child(editor_font_row)
             .child(terminal_font_row)
             .child(follow_system_row)
+            .child(self.render_display_scale_override_rows(cx))
             .child(
                 div()
                     .pt(px(20.0))
@@ -1603,6 +1604,76 @@ impl AdeApp {
             .child(indent_guides_row)
             .child(bracket_pair_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Appearance))
+    }
+
+    /// GitHub issue #216's rows: a toggle that turns
+    /// [`settings_store::AppearanceSettings::display_scale_override`] from `None` (GPUI detects
+    /// the scale, as it always has) into a real forced factor, plus - only while it is on - a
+    /// stepper for that factor.
+    ///
+    /// Two rows rather than one control, because the setting is genuinely two states: "leave
+    /// detection alone" is not the same as "force 1.0", and a bare stepper could not express the
+    /// first. The stepper is hidden rather than disabled while the override is off, so the page
+    /// never shows a number that isn't being used.
+    ///
+    /// Built as a `#[cfg]` pair of same-named methods - the idiom
+    /// `crate::status_bar::render::AdeApp::render_status_agents_cluster` already established for a
+    /// platform-conditional *rendered* element - scoped to the two targets whose `gpui_platform`
+    /// dependency requests the `x11` feature (`crates/app/Cargo.toml`). Everywhere else the
+    /// variable this writes is never read by anything, so the row would be a control bound to
+    /// nothing.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn render_display_scale_override_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let override_factor = self.settings.appearance.display_scale_override;
+
+        let toggle_row = self.render_settings_row(
+            "Override display scale",
+            "Ignore the scale GPUI detects for this display. X11 sessions only, not Wayland - \
+             takes effect the next time Jerry starts.",
+            self.render_toggle_control(
+                "settings-display-scale-override",
+                override_factor.is_some(),
+                cx,
+                |this, cx| this.toggle_display_scale_override(cx),
+            ),
+        );
+        let factor_row = override_factor.map(|factor| {
+            self.render_settings_row(
+                "Forced scale factor",
+                "1.00\u{d7} is unscaled - what a display that reports no scaling should look like.",
+                self.render_stepper_control(
+                    "settings-display-scale-factor",
+                    format!("{factor:.2}\u{d7}"),
+                    cx,
+                    |this, cx| {
+                        this.adjust_display_scale_override(
+                            -settings_store::DISPLAY_SCALE_OVERRIDE_STEP,
+                            cx,
+                        )
+                    },
+                    |this, cx| {
+                        this.adjust_display_scale_override(
+                            settings_store::DISPLAY_SCALE_OVERRIDE_STEP,
+                            cx,
+                        )
+                    },
+                ),
+            )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .child(toggle_row)
+            .children(factor_row)
+    }
+
+    /// Non-X11 build: this setting's only real effect is `GPUI_X11_SCALE_FACTOR`, which nothing on
+    /// this platform reads (see the `#[cfg]` twin above), so the Appearance page shows no row at
+    /// all rather than a switch that would persist a value and change nothing.
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn render_display_scale_override_rows(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
     }
 
     /// One Appearance page preview card - a static approximation of `percent`'s scale on a fixed
@@ -3301,6 +3372,55 @@ impl AdeApp {
     fn toggle_follow_system_text_size(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.follow_system_text_size =
             !self.settings.appearance.follow_system_text_size;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// GitHub issue #216's toggle: flips
+    /// [`settings_store::AppearanceSettings::display_scale_override`] between `None` (GPUI's own
+    /// detection) and a real forced factor, starting at
+    /// [`settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT`] - `1.0`, the unscaled value the reported
+    /// bug is asking for, so turning the switch on is already the fix in the common case.
+    ///
+    /// Persist-and-notify only, with no live application, and that is the whole honest story:
+    /// GPUI reads `GPUI_X11_SCALE_FACTOR` once while its X11 client initialises, so the new value
+    /// is picked up by `crate::main` at the *next* launch. The row's hint says so.
+    ///
+    /// `#[cfg]`-scoped to match [`Self::render_display_scale_override_rows`], its only caller -
+    /// an ungated mutator would be dead code on every other platform.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(in crate::settings) fn toggle_display_scale_override(&mut self, cx: &mut Context<Self>) {
+        self.settings.appearance.display_scale_override =
+            match self.settings.appearance.display_scale_override {
+                Some(_) => None,
+                None => Some(settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT),
+            };
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// GitHub issue #216's stepper. A no-op while the override is off - there is no factor to
+    /// step, and inventing one would silently turn the override on from a button the page isn't
+    /// even showing then.
+    ///
+    /// Each result is snapped back to the two decimal places the row displays, rather than left as
+    /// whatever repeatedly adding [`settings_store::DISPLAY_SCALE_OVERRIDE_STEP`] to an `f32`
+    /// accumulates. Twenty clicks then land on a real `2.00`, not on a `1.9999998` that would look
+    /// like `2.00` in the row while being written to `settings.toml` - and exported to GPUI -
+    /// verbatim. Two decimals is exactly the step's own precision (`0.05`), so no reachable value
+    /// is lost to the snap.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(in crate::settings) fn adjust_display_scale_override(
+        &mut self,
+        delta: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.settings.appearance.display_scale_override else {
+            return;
+        };
+        let stepped = ((current + delta) * 100.0).round() / 100.0;
+        self.settings.appearance.display_scale_override =
+            Some(settings_store::sanitize_display_scale_override(stepped));
         self.persist_settings(cx);
         cx.notify();
     }
@@ -6870,6 +6990,18 @@ mod bracket_pair_colorization_settings_tests {
         });
         cx.run_until_parked();
 
+        // This row now sits past the bottom of the page's own scroll viewport (GitHub issue #216
+        // added a row above it), so it has to be scrolled to before it can be clicked - exactly
+        // what a real user does. Without this the click lands on a clipped position and silently
+        // hits nothing, which is a real hazard for a test that would otherwise still "pass" its
+        // `debug_bounds` lookup: painted bounds are recorded even for content scrolled out of
+        // view.
+        app.update(cx, |app, cx| {
+            app.settings_content_scroll_handle.scroll_to_bottom();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
         let bounds = cx
             .debug_bounds("settings-bracket-pair-colorization")
             .expect("the Bracket pair colors toggle must really paint on the Appearance page");
@@ -6900,6 +7032,193 @@ mod bracket_pair_colorization_settings_tests {
                 .appearance
                 .bracket_pair_colorization),
             "and clicking it again must flip it back"
+        );
+    }
+}
+
+/// GitHub issue #216's Appearance rows, driven through the same real mutators a click invokes.
+///
+/// Scoped to the platforms that render the rows at all - see
+/// [`AdeApp::render_display_scale_override_rows`]'s `#[cfg]` pair.
+///
+/// The honest limit of this coverage: it proves the setting is a real, persisted, correctly
+/// clamped tri-state that survives a reload, and `crate::x11_scale_factor_env_tests` proves which
+/// string that turns into for `GPUI_X11_SCALE_FACTOR`. Neither proves GPUI then paints at that
+/// scale - that happens inside a pinned dependency during X11 client init, against a real display
+/// this test harness does not have.
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod display_scale_override_settings_tests {
+    use crate::root::AdeApp;
+    use crate::settings::state::SettingsPage;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    /// Same real-load-before-construct helper the neighbouring settings tests use.
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let settings = settings_store::Settings::load_or_init_at(&settings_path);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn the_toggle_turns_detection_into_a_real_forced_factor_and_persists_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            None,
+            "sanity check: an install that never touched this keeps GPUI's own detection"
+        );
+
+        app.update(cx, |app, cx| app.toggle_display_scale_override(cx));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT),
+            "turning it on must produce a real unscaled 1.0, which is the reported bug's own fix"
+        );
+        cx.run_until_parked();
+
+        let (reloaded, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT),
+            "it must have really reached disk - `main` reads the file, not this process's memory"
+        );
+
+        app.update(cx, |app, cx| app.toggle_display_scale_override(cx));
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            None,
+            "turning it back off must restore detection, not leave a forced 1.0 behind"
+        );
+        cx.run_until_parked();
+
+        let (reloaded_off, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert_eq!(
+            reloaded_off.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn the_stepper_moves_in_whole_steps_and_stops_at_the_real_bounds(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let step = settings_store::DISPLAY_SCALE_OVERRIDE_STEP;
+
+        app.update(cx, |app, cx| {
+            // While the override is off there is nothing to step, and stepping must not switch it
+            // on behind a control the page isn't showing.
+            app.adjust_display_scale_override(step, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            None
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_display_scale_override(cx);
+            app.adjust_display_scale_override(step, cx);
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(1.05)
+        );
+
+        // Twenty more increments must land exactly on 2.05, not on an accumulated float drift -
+        // the value is written to `settings.toml` and exported to GPUI as-is.
+        app.update(cx, |app, cx| {
+            for _ in 0..20 {
+                app.adjust_display_scale_override(step, cx);
+            }
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(2.05)
+        );
+
+        app.update(cx, |app, cx| {
+            for _ in 0..200 {
+                app.adjust_display_scale_override(step, cx);
+            }
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(settings_store::DISPLAY_SCALE_OVERRIDE_MAX),
+            "the stepper must clamp to the same bound a hand-edited file is clamped to"
+        );
+
+        app.update(cx, |app, cx| {
+            for _ in 0..200 {
+                app.adjust_display_scale_override(-step, cx);
+            }
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(settings_store::DISPLAY_SCALE_OVERRIDE_MIN),
+            "and must never reach the zero or negative that would panic GPUI outright"
+        );
+    }
+
+    /// The real Appearance page row: it paints, and a real click on it flips the real persisted
+    /// value - what would catch a row wired to nothing or wired to the wrong handler.
+    #[gpui::test]
+    fn the_appearance_page_row_paints_and_clicking_it_flips_the_real_setting(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+
+        cx.dispatch_action(crate::settings::ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Appearance, window, cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("settings-display-scale-override")
+            .expect("the Override display scale toggle must really paint on the Appearance page");
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            Some(settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT),
+            "clicking the real row must set a real forced factor"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
+            None,
+            "and clicking it again must hand detection back to GPUI"
         );
     }
 }

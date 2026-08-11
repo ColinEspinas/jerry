@@ -203,6 +203,26 @@ pub struct WindowSettings {
 #[serde(default)]
 pub struct AppearanceSettings {
     pub interface_scale_percent: u16,
+    /// GitHub issue #216 ("Scaling issues on Linux"): a forced display scale factor for GPUI's
+    /// X11 backend, or `None` - the default - to leave GPUI's own detection alone.
+    ///
+    /// Not covered by [`Self::interface_scale_percent`], which is text-size-only by deliberate
+    /// design (see `crate::theme::ui_scale`'s own docs) and so cannot undo an over-detected
+    /// *window* scale: GPUI multiplies every painted pixel - padding, icons, fixed chrome - by
+    /// the factor its X11 client resolves once at startup, so when that number is wrong the whole
+    /// UI is oversized, not just its text.
+    ///
+    /// The reported case is the real one this exists for: a KDE/X11 session with
+    /// `ScreenScaleFactors=eDP-1=1;HDMI-1=1` (explicitly *no* scaling) still came up zoomed,
+    /// because GPUI's `get_scale_factor` never reads KScreen's config. Its real resolution order
+    /// is `GPUI_X11_SCALE_FACTOR`, then the `Xft.dpi` X resource, then a physical-millimetres-vs-
+    /// pixels RandR heuristic that over-scales on small laptop panels, then `1.0`.
+    ///
+    /// Applied by [`crate::x11_scale_factor_env_value`], read in `main` before GPUI starts: that
+    /// environment variable is the only override GPUI offers, and it is read once while the X11
+    /// client initialises, so a change here needs a restart and does nothing on Wayland or on a
+    /// non-X11 platform.
+    pub display_scale_override: Option<f32>,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub follow_system_text_size: bool,
@@ -249,6 +269,7 @@ impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             interface_scale_percent: 100,
+            display_scale_override: None,
             editor_font_size: 13.0,
             terminal_font_size: 12.5,
             follow_system_text_size: false,
@@ -305,6 +326,41 @@ pub const FONT_SIZE_MAX: f32 = 32.0;
 pub const INTERFACE_SCALE_PERCENT_MIN: u16 = 50;
 pub const INTERFACE_SCALE_PERCENT_MAX: u16 = 300;
 
+/// Bounds, step and "just switched on" starting value for
+/// [`AppearanceSettings::display_scale_override`]. A raw `f32` multiplier rather than a `u16`
+/// percentage like [`INTERFACE_SCALE_PERCENT_MIN`]/[`INTERFACE_SCALE_PERCENT_MAX`], because the
+/// value is handed to GPUI's `GPUI_X11_SCALE_FACTOR` verbatim and GPUI parses it as a bare
+/// `f32`; keeping the stored form identical to the transmitted form means there is no
+/// percentage-to-factor conversion to get wrong in either direction.
+///
+/// The range spans every real arrangement (0.5 for a panel GPUI detects at 2x that the user
+/// wants unscaled, 4.0 beyond any shipping display) and, more importantly, excludes the values
+/// GPUI refuses: its own `valid_scale_factor` requires a positive, normal float and *panics* the
+/// process on anything else, so a `0`, a negative, or a subnormal from a bad hand-edit must never
+/// reach it - see [`sanitize_display_scale_override`].
+///
+/// The default is `1.0` because that is precisely what issue #216's reporter is asking for: their
+/// KScreen config already says "no scaling", and this is the switch that makes GPUI agree.
+pub const DISPLAY_SCALE_OVERRIDE_MIN: f32 = 0.5;
+pub const DISPLAY_SCALE_OVERRIDE_MAX: f32 = 4.0;
+pub const DISPLAY_SCALE_OVERRIDE_STEP: f32 = 0.05;
+pub const DISPLAY_SCALE_OVERRIDE_DEFAULT: f32 = 1.0;
+
+/// The one real clamp for [`AppearanceSettings::display_scale_override`], shared by
+/// [`AppearanceSettings::sanitize`] (hand-edited file), `crate::settings::render`'s stepper (UI
+/// edit) and [`crate::x11_scale_factor_env_value`] (the value actually handed to GPUI), so those
+/// three can never disagree about what is in range.
+///
+/// NaN is handled explicitly rather than left to `f32::clamp`, which propagates it: `nan` is a
+/// real, spellable TOML float literal, and a NaN reaching `GPUI_X11_SCALE_FACTOR` would panic
+/// GPUI's X11 client at startup instead of merely looking wrong.
+pub fn sanitize_display_scale_override(factor: f32) -> f32 {
+    if factor.is_nan() {
+        return DISPLAY_SCALE_OVERRIDE_DEFAULT;
+    }
+    factor.clamp(DISPLAY_SCALE_OVERRIDE_MIN, DISPLAY_SCALE_OVERRIDE_MAX)
+}
+
 /// Editor-zoom range (70-200%, in steps of 10) and default (100%) - the single real source for
 /// these bounds. `crate::code_surface` re-exports these as `AdeApp::ZOOM_*` associated
 /// consts (unchanged names, so its own call sites and doc comments didn't need to move) rather
@@ -324,6 +380,11 @@ impl AppearanceSettings {
         self.interface_scale_percent = self
             .interface_scale_percent
             .clamp(INTERFACE_SCALE_PERCENT_MIN, INTERFACE_SCALE_PERCENT_MAX);
+        // `map`, not a blanket clamp: `None` is a real, distinct state ("leave GPUI's own
+        // detection alone"), not a zero to be pulled up into range.
+        self.display_scale_override = self
+            .display_scale_override
+            .map(sanitize_display_scale_override);
         self.editor_font_size = self.editor_font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
         self.terminal_font_size = self.terminal_font_size.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
         self.editor_zoom_percent = self
@@ -644,8 +705,9 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
     match page {
         ConfigPage::General => "window.controls \u{b7} terminal.shell",
         ConfigPage::Appearance => {
-            "appearance.interface_scale_percent \u{b7} appearance.editor_font_size \u{b7} \
-             appearance.terminal_font_size \u{b7} appearance.follow_system_text_size \u{b7} \
+            "appearance.interface_scale_percent \u{b7} appearance.display_scale_override \u{b7} \
+             appearance.editor_font_size \u{b7} appearance.terminal_font_size \u{b7} \
+             appearance.follow_system_text_size \u{b7} \
              appearance.editor_zoom_percent \u{b7} appearance.caret_style \u{b7} \
              appearance.caret_blink \u{b7} appearance.show_indent_guides \u{b7} \
              appearance.bracket_pair_colorization"
@@ -1153,6 +1215,71 @@ mod tests {
         );
     }
 
+    /// GitHub issue #216. The forced X11 scale factor is the one appearance value a bad hand-edit
+    /// can do more than misrender with: it is handed to `GPUI_X11_SCALE_FACTOR`, and GPUI's own
+    /// `valid_scale_factor` panics the process on anything that isn't a positive, normal float.
+    /// `nan` is checked alongside the out-of-range numbers because it is a real TOML float
+    /// literal, and it is the one value `f32::clamp` would have propagated straight through.
+    #[test]
+    fn a_hand_edited_out_of_range_display_scale_override_is_clamped_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        for (written, expected) in [
+            ("12.0", DISPLAY_SCALE_OVERRIDE_MAX),
+            ("-3.0", DISPLAY_SCALE_OVERRIDE_MIN),
+            ("0.0", DISPLAY_SCALE_OVERRIDE_MIN),
+            ("nan", DISPLAY_SCALE_OVERRIDE_DEFAULT),
+        ] {
+            std::fs::write(
+                &path,
+                format!("[appearance]\ndisplay_scale_override = {written}\n"),
+            )
+            .expect("write out-of-range file");
+
+            assert_eq!(
+                Settings::load_or_init_at(&path)
+                    .appearance
+                    .display_scale_override,
+                Some(expected),
+                "a hand-edited `display_scale_override = {written}` must be clamped into range, \
+                 not handed to GPUI verbatim"
+            );
+        }
+    }
+
+    /// The default has to stay a real `None` - "let GPUI detect the scale, as it always has" - and
+    /// must be omitted from the written file entirely rather than materializing as some number,
+    /// which would silently pin every existing install to a scale its user never chose.
+    #[test]
+    fn the_display_scale_override_defaults_to_none_and_round_trips_through_a_real_file() {
+        assert_eq!(
+            Settings::default().appearance.display_scale_override,
+            None,
+            "auto-detection is the default; an override is opt-in"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        Settings::default().save_at(&path).expect("write defaults");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !written.contains("display_scale_override"),
+            "an unset override must not appear in the file at all: {written}"
+        );
+
+        let mut configured = Settings::default();
+        configured.appearance.display_scale_override = Some(1.25);
+        configured.save_at(&path).expect("write configured");
+        assert_eq!(
+            Settings::load_or_init_at(&path)
+                .appearance
+                .display_scale_override,
+            Some(1.25)
+        );
+    }
+
     /// The real regression guard for removing `per_tab_zoom`/`AdeApp::file_zoom_percent`: an old
     /// `settings.toml` written before this consolidation has a real `per_tab_zoom` key under
     /// `[appearance]` that no longer maps to any field. `serde`'s default (non-`deny_unknown_
@@ -1189,6 +1316,7 @@ mod tests {
     fn appearance_settings_sanitize_leaves_in_range_values_untouched() {
         let mut appearance = AppearanceSettings {
             interface_scale_percent: 110,
+            display_scale_override: Some(1.25),
             editor_font_size: 15.0,
             terminal_font_size: 13.5,
             follow_system_text_size: true,
