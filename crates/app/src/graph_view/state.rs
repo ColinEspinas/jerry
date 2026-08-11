@@ -113,6 +113,32 @@ pub(crate) struct GraphTabState {
     /// `AdeApp::_worktree_history_task`'s identical one-slot-per-feature pattern. `None` when
     /// [`Self::remote_op_in_flight`] is `false`.
     pub _remote_op_task: Option<Task<()>>,
+    /// GitHub issue #221 ("Git graph only displays 500 commits"). The `max_commits` cap the
+    /// currently loaded [`Graph`] was really walked with - `wt_core::graph::DEFAULT_MAX_COMMITS`
+    /// after a fresh [`AdeApp::load_graph`], then one
+    /// `crate::graph_view::render::LOAD_MORE_BATCH` higher per completed "load more".
+    ///
+    /// The next cap is derived from *this*, not from `graph.rows.len()`, for two real reasons:
+    /// `rows` can carry a synthetic "Uncommitted changes" row that was never subject to the cap
+    /// at all (`wt_core::graph::build_graph`), and deriving it from the last *requested* cap makes
+    /// the sequence strictly monotonic, so even a history that shrinks under us (an amend, a
+    /// rebase, a `gc` between two walks) still terminates instead of ping-ponging between two
+    /// caps forever.
+    pub loaded_cap: usize,
+    /// `true` while a real "load more" walk is running on the background executor. Guards the row
+    /// builder - which runs several times per frame, on every frame the user is scrolled near the
+    /// bottom - against spawning a second, overlapping `build_graph` over the same history, the
+    /// same single-flight discipline [`Self::remote_op_in_flight`] applies to Fetch/Pull/Push.
+    pub load_more_in_flight: bool,
+    /// `true` once a "load more" walk has genuinely failed. Without it the trigger would re-fire
+    /// on the very next frame and spin a failing `gix` walk forever; the real error is reported
+    /// once through [`Self::status_message`] instead. Cleared by any fresh
+    /// [`AdeApp::load_graph`], which is also the only way to retry.
+    pub load_more_failed: bool,
+    /// The in-flight "load more" task - held so dropping it (and therefore cancelling the walk)
+    /// doesn't happen the instant the spawning function returns, exactly like
+    /// [`Self::_remote_op_task`]. `None` when [`Self::load_more_in_flight`] is `false`.
+    pub _load_more_task: Option<Task<()>>,
     /// GitHub issue #142: the commit row list's own scroll position, tracked so
     /// `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` has a real handle to draw
     /// against - every other scrollable region in the app has had one since GitHub issue #30;
@@ -149,6 +175,10 @@ impl GraphTabState {
             remote_op_in_flight: false,
             push_force_confirm_armed: None,
             _remote_op_task: None,
+            loaded_cap: wt_core::graph::DEFAULT_MAX_COMMITS,
+            load_more_in_flight: false,
+            load_more_failed: false,
+            _load_more_task: None,
             rows_scroll_handle: UniformListScrollHandle::new(),
             commit_panel_scroll_handle: ScrollHandle::new(),
             branches_scroll_handle: ScrollHandle::new(),

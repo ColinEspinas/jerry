@@ -1402,6 +1402,63 @@ mod tests {
         assert!(subjects.contains("Merge branch 'feature'"));
     }
 
+    /// The property the graph tab's "load more" (GitHub issue #221) is built on: because
+    /// `build_graph` has no resumable cursor, loading more is a *re-walk with a bigger cap*, and
+    /// the UI keeps the user's selection, open row menu and scroll offset across that swap by
+    /// index. That is only sound if a bigger cap yields a strict, element-identical prefix - not
+    /// merely the same commits in the same order, but the same lane, dot kind, lane segments and
+    /// elbows for each of them, since a re-laned prefix would visibly rewrite the graph above the
+    /// user's viewport while they scrolled.
+    ///
+    /// It holds because the walk is deterministic (same tips, same
+    /// `Sorting::ByCommitTime(NewestFirst)`) and `layout_lanes` is a single forward pass whose
+    /// output for row `i` is a function of commits `0..=i` alone. This test pins it against a
+    /// deliberately branchy history - a merge plus a still-extant side branch, so several lanes
+    /// are genuinely live at the cap boundary - rather than a linear one, where every cap trivially
+    /// agrees on lane 0.
+    #[test]
+    fn graph_walk_is_prefix_stable_across_caps() {
+        let repo = init_repo();
+        commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        commit_at(repo.path(), "b.txt", "1", "feature 1", 1_700_000_100);
+        commit_at(repo.path(), "b.txt", "2", "feature 2", 1_700_000_200);
+        git(repo.path(), &["checkout", "main"]);
+        commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_300);
+        merge_at(repo.path(), "feature", "Merge feature", 1_700_000_400);
+        git(repo.path(), &["checkout", "-b", "side"]);
+        commit_at(repo.path(), "c.txt", "1", "side 1", 1_700_000_500);
+        git(repo.path(), &["checkout", "main"]);
+        commit_at(repo.path(), "a.txt", "3", "main 2", 1_700_000_600);
+
+        let full = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
+        assert!(
+            !full.truncated && full.rows.len() == 7,
+            "precondition: the whole branchy history must fit uncapped, got {} rows",
+            full.rows.len()
+        );
+
+        for cap in 1..full.rows.len() {
+            let capped = build_graph(repo.path(), GraphScope::All, cap).expect("build_graph");
+            assert!(
+                capped.truncated,
+                "a cap below the real history length must report a truncated walk"
+            );
+            assert_eq!(
+                capped.rows.len(),
+                cap,
+                "a capped walk must load exactly `max_commits` rows"
+            );
+            assert_eq!(
+                capped.rows,
+                full.rows[..cap],
+                "cap {cap} must be an element-identical prefix of the uncapped walk - same \
+                 commits, same lanes, same segments and elbows - or the graph tab's index-keyed \
+                 selection/menu/scroll would land on a different commit after a load-more"
+            );
+        }
+    }
+
     #[test]
     fn commit_changed_files_reports_real_add_modify_delete() {
         let repo = init_repo();

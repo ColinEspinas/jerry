@@ -12,6 +12,28 @@ use std::ops::Range;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
+/// GitHub issue #221: how many further commits each "load more" adds to the walk cap.
+///
+/// One full `wt_core::graph::DEFAULT_MAX_COMMITS` batch, for a reason specific to how loading
+/// more actually works here: `build_graph` has no resumable cursor, so every batch re-walks the
+/// history *from the tips* with a bigger cap. Total work to reach `n` commits is therefore
+/// quadratic in the number of batches (`n²/2b` commits walked), so a small batch is not merely
+/// slower to fill the screen - it makes the whole feature progressively more expensive the
+/// further back the user goes. 500 is also the one batch size already known to be acceptable in
+/// practice: it is exactly the walk every single graph-tab open already pays for.
+///
+/// At `theme::graph::ROW`'s 26px, 500 rows is ~13000px of content - many viewports' worth, so
+/// combined with [`LOAD_MORE_PREFETCH_ROWS`] below the user should never actually watch it load.
+const LOAD_MORE_BATCH: usize = wt_core::graph::DEFAULT_MAX_COMMITS;
+
+/// How close to the last loaded row the visible range has to get before the next batch starts
+/// walking - roughly one 1080p viewport of `theme::graph::ROW` rows (~41 fit), so the walk starts
+/// about a screen before the user can actually reach the end of the loaded rows.
+///
+/// Must stay far below [`LOAD_MORE_BATCH`], or a completed batch would land the visible range
+/// still inside the trigger zone and immediately start another one.
+const LOAD_MORE_PREFETCH_ROWS: usize = 40;
+
 impl AdeApp {
     /// Opens the git graph tab (the tab strip's own entry, the `+` menu's "Git graph" row, the
     /// palette's "Open git graph", `mod+shift+G`, and the status bar's branch cluster all funnel
@@ -122,6 +144,13 @@ impl AdeApp {
         self.graph_state.row_menu_open = None;
         self.graph_state.push_menu_open = false;
         self.graph_state.commit_files_cache = None;
+        // GitHub issue #221: a reopened tab loads from scratch (see this function's own docs), so
+        // the incremental walk cap has to start over with it - and dropping the task cancels any
+        // "load more" still walking for a tab that no longer exists.
+        self.graph_state.loaded_cap = wt_core::graph::DEFAULT_MAX_COMMITS;
+        self.graph_state.load_more_in_flight = false;
+        self.graph_state.load_more_failed = false;
+        self.graph_state._load_more_task = None;
         // A reopened tab is a genuinely new widget instance, so the Branches filter's undo
         // history must not be reachable from it - `reset`, not `clear` (itself a real, undoable
         // step) - the same reasoning `crate::root::AdeApp::open_palette` documents for its own
@@ -200,6 +229,15 @@ impl AdeApp {
         // just outdated.
         self.graph_state.row_menu_open = None;
         self.graph_state.row_menu_bounds.clear();
+        // GitHub issue #221: a fresh load starts the incremental "load more" sequence over from
+        // the default cap. Dropping the in-flight task cancels any load-more still walking against
+        // the *previous* scope, whose result would be a graph for a scope the user has already
+        // left; `load_more_failed` is cleared here because a fresh load is also the only real
+        // retry path after a failed one.
+        self.graph_state.loaded_cap = wt_core::graph::DEFAULT_MAX_COMMITS;
+        self.graph_state.load_more_in_flight = false;
+        self.graph_state.load_more_failed = false;
+        self.graph_state._load_more_task = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
@@ -239,6 +277,101 @@ impl AdeApp {
             });
         });
         self._load_graph_task = Some(task);
+    }
+
+    /// GitHub issue #221 ("Git graph only displays 500 commits"): walks further back and replaces
+    /// the loaded graph with the longer walk, keeping the user exactly where they were.
+    ///
+    /// `wt_core::graph::build_graph` is a one-shot walk with no resumable cursor, so "load more"
+    /// is a *re-walk with a bigger cap*, not an append. That is sound because the walk is
+    /// deterministic - same tips, same `Sorting::ByCommitTime(NewestFirst)` - and
+    /// `wt_core::graph::layout_lanes` is a single forward pass whose output for row `i` depends
+    /// only on commits `0..=i`. A bigger cap therefore produces a strict prefix-identical
+    /// superset: every already-visible row keeps its index, its lane and its elbows, so the
+    /// scroll offset (owned by `uniform_list` itself, untouched here) still points at the same
+    /// commits after the swap. `wt_core::graph::graph_walk_is_prefix_stable_across_caps` is the
+    /// real test pinning that property.
+    ///
+    /// Unlike [`Self::load_graph`] this deliberately does *not* reset `selected_row`,
+    /// `row_menu_open` or `commit_files_cache`: nothing the user was looking at moved. The two
+    /// index-carrying fields are still re-resolved by commit id rather than simply left alone,
+    /// because the one row that genuinely *can* shift every index is the synthetic "Uncommitted
+    /// changes" row - it is not subject to `max_commits` at all and appears/disappears purely
+    /// from a live `is_dirty` check, so a save landing between the two walks would otherwise
+    /// silently slide the selection onto the neighbouring commit.
+    pub(crate) fn load_more_graph_rows(&mut self, cx: &mut Context<Self>) {
+        if self.graph_state.load_more_in_flight || self.graph_state.load_more_failed {
+            return;
+        }
+        // Only a genuinely truncated walk has anything left to load; at the true end of history
+        // there is nothing to fetch and nothing to say about it.
+        if !self.current_graph().is_some_and(|graph| graph.truncated) {
+            return;
+        }
+        let root = self.diff_root.clone();
+        let scope = self.graph_state.scope;
+        let next_cap = self.graph_state.loaded_cap.saturating_add(LOAD_MORE_BATCH);
+        self.graph_state.load_more_in_flight = true;
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { wt_core::graph::build_graph(&root, scope, next_cap) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // A fresh `load_graph` (a scope change, a fetch/pull/push) clears this flag while
+                // we were walking; its own, newer graph must win over this now-stale one.
+                if !this.graph_state.load_more_in_flight || this.graph_state.scope != scope {
+                    return;
+                }
+                this.graph_state.load_more_in_flight = false;
+                match result {
+                    Ok(graph) => {
+                        let selected_id = this
+                            .graph_state
+                            .selected_row
+                            .and_then(|index| this.current_graph_row(index))
+                            .map(|row| row.commit.id.clone());
+                        let menu_id = this
+                            .graph_state
+                            .row_menu_open
+                            .and_then(|menu| this.current_graph_row(menu.row_index))
+                            .map(|row| row.commit.id.clone());
+                        if let Some(id) = selected_id {
+                            this.graph_state.selected_row =
+                                graph.rows.iter().position(|row| row.commit.id == id);
+                        }
+                        match menu_id
+                            .and_then(|id| graph.rows.iter().position(|row| row.commit.id == id))
+                        {
+                            Some(index) => {
+                                if let Some(menu) = this.graph_state.row_menu_open.as_mut() {
+                                    menu.row_index = index;
+                                }
+                            }
+                            // The row it was opened against is genuinely gone from this walk;
+                            // leaving the menu pointing at whatever now sits at that index would
+                            // aim its Cherry-pick/Revert rows at the wrong commit.
+                            None => this.graph_state.row_menu_open = None,
+                        }
+                        this.graph_state.loaded_cap = next_cap;
+                        this.graph_state.load = GraphLoadState::Loaded(graph);
+                    }
+                    Err(err) => {
+                        // The already-loaded rows stay exactly as they are - a failed *extension*
+                        // of the walk is no reason to throw away the history already on screen -
+                        // but the trigger must stop re-firing, or every frame the user spends
+                        // near the bottom spawns another failing walk.
+                        this.graph_state.load_more_failed = true;
+                        this.graph_state.status_message =
+                            Some(format!("loading more commits failed: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.graph_state._load_more_task = Some(task);
     }
 
     pub(crate) fn set_graph_scope(&mut self, scope: GraphScope, cx: &mut Context<Self>) {
@@ -1053,8 +1186,17 @@ impl AdeApp {
     ///
     /// Its one real requirement - a fixed row height - is already satisfied: every commit row is
     /// exactly `theme::graph::ROW` tall (see [`Self::render_graph_row`]), and so is the trailing
-    /// truncation notice ([`render_graph_truncation_row`]), which is a genuine item of this list
-    /// rather than a sibling appended outside it.
+    /// "loading more commits" row ([`render_graph_load_more_row`]), which is a genuine item of
+    /// this list rather than a sibling appended outside it.
+    ///
+    /// **The visible range is also the "load more" trigger** (GitHub issue #221). The range
+    /// `uniform_list` hands the row builder every frame already *is* the scroll position, so
+    /// nothing extra needs measuring: once it reaches within [`LOAD_MORE_PREFETCH_ROWS`] of the
+    /// last loaded row, [`Self::load_more_graph_rows`] walks further back. That function is
+    /// single-flight guarded (`GraphTabState::load_more_in_flight`), which it has to be - this
+    /// closure runs several times per frame (`uniform_list` calls it once at `0..1` to measure the
+    /// row height, again during layout, then once more with the real visible range) and on every
+    /// frame the user lingers near the bottom.
     fn render_graph_rows(&self, graph: &Graph, cx: &mut Context<Self>) -> gpui::AnyElement {
         if graph.rows.is_empty() {
             return div()
@@ -1075,7 +1217,7 @@ impl AdeApp {
 
         let list = uniform_list(
             "graph-rows",
-            graph_item_count(graph),
+            graph_item_count(graph, self.graph_state.load_more_in_flight),
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 // Re-resolved from `this` rather than captured: the closure is `'static` and
                 // cannot borrow the `&Graph` this method was handed, and re-reading it means a
@@ -1086,21 +1228,32 @@ impl AdeApp {
                 let Some(graph) = this.current_graph() else {
                     return Vec::new();
                 };
+                // GitHub issue #221. Copied out now because the `&Graph` borrow above has to end
+                // before the `&mut self` "load more" call at the bottom of this closure.
+                let row_count = graph.rows.len();
+                let loading_more = this.graph_state.load_more_in_flight;
                 // Clamped rather than trusted, and `start` against `end` rather than only against
                 // the length, so a divergence degrades to "renders fewer rows" instead of
                 // panicking on an inverted range.
-                let end = range.end.min(graph_item_count(graph));
+                let end = range.end.min(graph_item_count(graph, loading_more));
                 let start = range.start.min(end);
-                (start..end)
+                let items = (start..end)
                     .map(|index| match graph.rows.get(index) {
                         Some(row) => this
                             .render_graph_row(index, row, graph.lane_count, now, cx)
                             .into_any_element(),
                         // The one index past the last row, which `graph_item_count` only hands
-                        // out when the walk was genuinely truncated.
-                        None => render_graph_truncation_row().into_any_element(),
+                        // out while a real "load more" walk is genuinely in flight.
+                        None => render_graph_load_more_row().into_any_element(),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                // Fired *after* this frame's rows are built, so the graph they were built from is
+                // the one that was actually measured. `load_more_graph_rows` is a no-op unless the
+                // walk really was truncated and nothing is already in flight.
+                if end + LOAD_MORE_PREFETCH_ROWS >= row_count {
+                    this.load_more_graph_rows(cx);
+                }
+                items
             }),
         )
         .flex_1()
@@ -1903,37 +2056,43 @@ fn unix_now() -> i64 {
 }
 
 /// How many items [`AdeApp::render_graph_rows`]' `uniform_list` has: one per loaded commit row,
-/// plus the trailing truncation notice when - and only when - the walk really was cut short by
-/// `wt_core::graph::DEFAULT_MAX_COMMITS`. Shared by the `item_count` argument and the row
-/// builder's own clamp so the two can never disagree about where the notice lives.
-fn graph_item_count(graph: &Graph) -> usize {
-    graph.rows.len() + usize::from(graph.truncated)
+/// plus a trailing row while - and only while - a real "load more" walk is in flight. Shared by
+/// the `item_count` argument and the row builder's own clamp so the two can never disagree about
+/// where that row lives.
+///
+/// Note what is *not* here any more (GitHub issue #221): the walk being truncated no longer adds
+/// an item of its own. A truncated walk is not a fact worth a permanent line of chrome - it is
+/// simply history that has not been walked yet, and scrolling to it loads it.
+fn graph_item_count(graph: &Graph, load_more_in_flight: bool) -> usize {
+    graph.rows.len() + usize::from(load_more_in_flight)
 }
 
-/// The "showing the first N commits" notice - a real, honest statement that
-/// `wt_core::graph::build_graph` stopped at its own cap, so the bottom of this list is not the
-/// bottom of the history.
+/// The trailing "loading more commits" row, shown only while a real
+/// [`AdeApp::load_more_graph_rows`] walk is genuinely running (GitHub issue #221) - it replaces
+/// the former "showing the first 500 commits" notice, which stated a limit that no longer exists.
+///
+/// Deliberately the same "loading …" wording, font and colour the whole-tab loading state uses
+/// (`AdeApp::render_graph_view`) rather than a new visual language, but left-aligned on the row
+/// grid like the notice it replaces instead of centred, so it reads as the next item in the list
+/// it is extending.
 ///
 /// The final *item* of the row list rather than a sibling below it, which is what keeps it
 /// scrolling with the rows it is talking about. That makes it subject to `uniform_list`'s fixed
 /// row height, which is sized from item 0 alone, so it carries the same `theme::graph::ROW`
-/// height every commit row does - a taller notice would simply be overlapped by nothing and
-/// clipped, with no panic and no warning.
-fn render_graph_truncation_row() -> impl IntoElement {
+/// height every commit row does - a taller row would simply be clipped, with no panic and no
+/// warning.
+fn render_graph_load_more_row() -> impl IntoElement {
     div()
-        .debug_selector(|| "graph-rows-truncated-notice".to_string())
+        .debug_selector(|| "graph-rows-load-more".to_string())
         .flex()
         .items_center()
         .w_full()
         .h(theme::graph::ROW)
         .px(px(12.0))
-        .font(font(theme::font::MONO))
-        .text_size(px(10.0))
-        .text_color(theme::text::GHOST)
-        .child(format!(
-            "showing the first {} commits",
-            wt_core::graph::DEFAULT_MAX_COMMITS
-        ))
+        .font(font(theme::font::SANS))
+        .text_size(px(11.5))
+        .text_color(theme::text::FAINT)
+        .child("loading more commits\u{2026}")
 }
 
 fn render_graph_meta_row(label: &'static str, value: String) -> impl IntoElement {
@@ -6056,18 +6215,20 @@ mod graph_virtualization_tests {
         );
     }
 
-    /// The truncation notice is now the final *item* of the virtualized list rather than a
-    /// sibling appended below it, so it has to (a) still exist, (b) sit below the last real row
-    /// rather than floating anywhere else, and (c) respect the fixed row height every other item
-    /// has - `uniform_list` sizes every slot from item 0 alone, so a notice that disagreed with
+    /// The trailing "loading more commits" row is the final *item* of the virtualized list rather
+    /// than a sibling appended below it, so it has to (a) sit directly below the last loaded row
+    /// rather than floating anywhere else, and (b) respect the fixed row height every other item
+    /// has - `uniform_list` sizes every slot from item 0 alone, so a row that disagreed with
     /// `theme::graph::ROW` would be laid out at the wrong height with no panic and no warning.
     ///
     /// The truncated graph here is real `wt_core::graph::build_graph` output, walked with an
     /// explicit small `max_commits` rather than a repository of 501 commits - the same real code
     /// path and the same real `Graph::truncated` flag `DEFAULT_MAX_COMMITS` sets, at a seed cost
-    /// this test suite can afford.
+    /// this test suite can afford. `load_more_in_flight` is set the same way the real trigger sets
+    /// it, and left set, so the frame under assertion is stable: the real walk is never allowed to
+    /// finish and take the row away mid-test.
     #[gpui::test]
-    fn the_truncation_notice_is_the_last_row_of_the_list_at_the_shared_row_height(
+    fn the_load_more_row_is_the_last_item_of_the_list_at_the_shared_row_height(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6084,50 +6245,306 @@ mod graph_virtualization_tests {
         );
         app.update(cx, |app, cx| {
             app.graph_state.load = GraphLoadState::Loaded(truncated);
+            app.graph_state.load_more_in_flight = true;
             cx.notify();
         });
         cx.run_until_parked();
 
         let last_row = cx
             .debug_bounds("graph-row-2")
-            .expect("the last real commit row must paint");
-        let notice = cx.debug_bounds("graph-rows-truncated-notice").expect(
-            "a truncated walk must still say so on screen - that notice is the only thing \
-             telling the user the bottom of this list is not the bottom of the history",
+            .expect("the last loaded commit row must paint");
+        let loading = cx.debug_bounds("graph-rows-load-more").expect(
+            "while more history is genuinely being walked the list must say so at its bottom",
         );
         assert_eq!(
-            notice.origin.y,
+            loading.origin.y,
             last_row.origin.y + last_row.size.height,
-            "the notice must be the item directly below the last commit row"
+            "the loading row must be the item directly below the last loaded commit row"
         );
         assert_eq!(
-            notice.size.height,
+            loading.size.height,
             theme::graph::ROW,
             "and it must be exactly as tall as every other item, which is the fixed height \
              `uniform_list` lays every slot out at"
         );
     }
 
-    /// The notice is not unconditional chrome: an untruncated walk must render no such row, and
-    /// the list must have exactly one item per commit.
+    /// GitHub issue #221 seeds: more commits than `wt_core::graph::DEFAULT_MAX_COMMITS`, so the
+    /// tab's own first load is genuinely capped and truncated exactly the way the reported bug is.
+    /// 520 keeps the whole remaining history inside a single [`LOAD_MORE_BATCH`], so one real
+    /// scroll to the bottom is enough to reach the true end.
+    const OVER_CAP_COMMITS: usize = 520;
+
+    /// The issue itself: the graph must not stop at 500. Scrolling the real `uniform_list` to the
+    /// bottom of the initially-capped walk has to load the rest, and rows that could not possibly
+    /// exist before (index >= 500) have to become genuinely paintable elements.
     #[gpui::test]
-    fn an_untruncated_graph_renders_no_notice_row(cx: &mut TestAppContext) {
+    fn scrolling_to_the_bottom_of_a_capped_walk_really_loads_more_commits(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), OVER_CAP_COMMITS);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        app.read_with(cx, |app, _| {
+            let graph = app.current_graph().expect("the graph must be loaded");
+            assert_eq!(
+                graph.rows.len(),
+                wt_core::graph::DEFAULT_MAX_COMMITS,
+                "precondition: the first load really is capped - this is the reported bug"
+            );
+            assert!(
+                graph.truncated,
+                "precondition: and it knows it stopped early"
+            );
+        });
+        assert!(
+            cx.debug_bounds("graph-row-519").is_none(),
+            "precondition: the 520th commit is not even loaded yet, let alone painted"
+        );
+
+        // A deliberately huge delta: `uniform_list` clamps to its own real maximum scroll offset,
+        // so this lands at the true bottom of what is loaded without modelling row heights.
+        let anchor = row_list_anchor(cx);
+        scroll_to_bottom(cx, anchor);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let graph = app.current_graph().expect("the graph must still be loaded");
+            assert_eq!(
+                graph.rows.len(),
+                OVER_CAP_COMMITS,
+                "reaching the bottom must walk the rest of the real history, not stop at 500"
+            );
+            assert!(
+                !graph.truncated,
+                "and with the whole history walked nothing is truncated any more"
+            );
+            assert_eq!(
+                app.graph_state.loaded_cap,
+                wt_core::graph::DEFAULT_MAX_COMMITS + LOAD_MORE_BATCH,
+                "exactly one batch must have been applied"
+            );
+        });
+
+        // Now that they exist, the newly loaded rows must really paint - scrolling again goes to
+        // the new bottom, which the previous scroll offset (unchanged by the swap, which is the
+        // point) is no longer at.
+        scroll_to_bottom(cx, anchor);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("graph-row-519").is_some(),
+            "the last commit of the real history must be a genuinely painted row once loaded"
+        );
+        assert!(
+            cx.debug_bounds("graph-rows-load-more").is_none(),
+            "and with nothing left to load there must be no loading row at the bottom"
+        );
+    }
+
+    /// A load-more replaces the whole `Graph`, so the user's selection has to survive it. It does
+    /// because a bigger cap is an element-identical prefix superset of the smaller walk
+    /// (`wt_core::graph::tests::graph_walk_is_prefix_stable_across_caps` pins that), and this
+    /// asserts the consequence end to end: the same row index still names the same real commit.
+    #[gpui::test]
+    fn loading_more_commits_keeps_the_selected_row_on_the_same_commit(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), OVER_CAP_COMMITS);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        let selected_sha = app.update(cx, |app, cx| {
+            app.select_graph_row(12, cx);
+            app.current_graph_row(12)
+                .expect("row 12 of a 500-row walk")
+                .commit
+                .id
+                .clone()
+        });
+        cx.run_until_parked();
+
+        let anchor = row_list_anchor(cx);
+        scroll_to_bottom(cx, anchor);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.current_graph().expect("loaded").rows.len()
+                    > wt_core::graph::DEFAULT_MAX_COMMITS,
+                "precondition: a load-more really did happen"
+            );
+            assert_eq!(
+                app.graph_state.selected_row,
+                Some(12),
+                "the selection must not move when more history is appended below it"
+            );
+            assert_eq!(
+                app.current_graph_row(12).map(|row| row.commit.id.clone()),
+                Some(selected_sha.clone()),
+                "and that index must still name the very same commit"
+            );
+        });
+    }
+
+    /// The single-flight guard. `AdeApp::load_more_graph_rows` is what every frame near the
+    /// bottom calls - and `uniform_list` runs the row builder several times per frame - so a
+    /// second call while a walk is already running must start nothing.
+    ///
+    /// This calls that real function directly rather than through a second simulated scroll,
+    /// because mid-flight is not reachable through one: `VisualTestContext::simulate_event` runs
+    /// the executor until parked itself, so by the time it returns the walk has already finished.
+    /// The observable is `_load_more_task`, which only `load_more_graph_rows` ever writes: it is
+    /// cleared between the two calls, so the slot being `None` afterwards means no second walk was
+    /// spawned. (Clearing it also cancels the first walk, which is what pins `load_more_in_flight`
+    /// true for the rest of the test - exactly the state the guard exists to handle.)
+    #[gpui::test]
+    fn a_second_call_while_a_walk_is_in_flight_starts_nothing(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), 6);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        let truncated = wt_core::graph::build_graph(repo.path(), GraphScope::All, 3)
+            .expect("a real, deliberately capped graph walk");
+        assert!(truncated.truncated, "precondition: a truncated walk");
+        app.update(cx, |app, cx| {
+            app.graph_state.load = GraphLoadState::Loaded(truncated);
+            app.graph_state.loaded_cap = 3;
+
+            app.load_more_graph_rows(cx);
+            assert!(
+                app.graph_state.load_more_in_flight,
+                "the first call must really start a walk"
+            );
+            assert!(
+                app.graph_state._load_more_task.is_some(),
+                "and really hold it as a task"
+            );
+
+            app.graph_state._load_more_task = None;
+            app.load_more_graph_rows(cx);
+            assert!(
+                app.graph_state._load_more_task.is_none(),
+                "a second call while one is already in flight must not spawn an overlapping walk"
+            );
+        });
+    }
+
+    /// The other half of the guard: a walk that genuinely failed must not be retried on every
+    /// frame the user spends near the bottom. The failure here is real - the repository is
+    /// deleted out from under the walk, which is exactly what `build_graph` errors on - and the
+    /// real error has to reach the user through the toolbar's own status line.
+    #[gpui::test]
+    fn a_failed_load_more_reports_the_real_error_and_stops_retrying(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), 6);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        let truncated = wt_core::graph::build_graph(repo.path(), GraphScope::All, 3)
+            .expect("a real, deliberately capped graph walk");
+        app.update(cx, |app, cx| {
+            app.graph_state.load = GraphLoadState::Loaded(truncated);
+            app.graph_state.loaded_cap = 3;
+            cx.notify();
+        });
+        std::fs::remove_dir_all(repo.path().join(".git")).expect("remove the real repository");
+
+        app.update(cx, |app, cx| app.load_more_graph_rows(cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.load_more_failed,
+                "a genuinely failed walk must be recorded, or the next frame retries it forever"
+            );
+            let status = app.graph_state.status_message.clone();
+            assert!(
+                status
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("loading more commits failed:")),
+                "the real error must reach the user rather than being swallowed - got {status:?}"
+            );
+            assert_eq!(
+                app.current_graph().expect("still loaded").rows.len(),
+                3,
+                "and the rows already on screen must survive a failed extension of the walk"
+            );
+        });
+
+        app.update(cx, |app, cx| {
+            app.graph_state._load_more_task = None;
+            app.load_more_graph_rows(cx);
+            assert!(
+                app.graph_state._load_more_task.is_none(),
+                "and no further frame near the bottom may retry the failed walk"
+            );
+        });
+    }
+
+    /// The true end of history is not noteworthy: a fully-scrolled small repository must show no
+    /// trailing row at all - no loading indicator, and above all none of the old "showing the
+    /// first N commits" notice the issue asked for the removal of - and must not spin on a
+    /// reload loop that never terminates.
+    #[gpui::test]
+    fn reaching_the_true_end_of_history_shows_nothing_and_loads_nothing(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_commits(repo.path(), 4);
         let (app, cx) = open_graph_on(cx, repo.path());
 
         app.read_with(cx, |app, _| {
             let graph = app.current_graph().expect("the graph must be loaded");
-            assert!(!graph.truncated, "precondition: an untruncated walk");
+            assert!(!graph.truncated, "precondition: the whole history fits");
             assert_eq!(
-                graph_item_count(graph),
+                graph_item_count(graph, app.graph_state.load_more_in_flight),
                 graph.rows.len(),
-                "with nothing truncated the list has exactly one item per commit row"
+                "with nothing to load the list has exactly one item per commit row"
             );
         });
+
+        // Every one of these parks, which is itself the "no infinite reload loop" assertion: a
+        // trigger that kept re-firing would keep the executor busy and never park.
+        let anchor = row_list_anchor(cx);
+        for _ in 0..3 {
+            scroll_to_bottom(cx, anchor);
+            cx.run_until_parked();
+        }
+
         assert!(
-            cx.debug_bounds("graph-rows-truncated-notice").is_none(),
-            "no truncation, no notice"
+            cx.debug_bounds("graph-rows-load-more").is_none(),
+            "there is nothing left to load, so nothing may claim to be loading"
         );
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.graph_state.load_more_in_flight,
+                "an untruncated walk must never start a load-more at all"
+            );
+            assert_eq!(
+                app.graph_state.loaded_cap,
+                wt_core::graph::DEFAULT_MAX_COMMITS,
+                "and the cap must not have been bumped for a walk that never ran"
+            );
+            assert_eq!(
+                app.current_graph().expect("loaded").rows.len(),
+                4,
+                "the loaded rows must be exactly the real history, unchanged"
+            );
+        });
+    }
+
+    /// A window position genuinely inside the row list, captured from the first row while it is
+    /// still on screen. The list occupies that screen area no matter how far it is scrolled, so
+    /// one capture is enough to keep aiming later scroll events at it.
+    fn row_list_anchor(cx: &mut gpui::VisualTestContext) -> gpui::Point<Pixels> {
+        cx.debug_bounds("graph-row-0")
+            .expect("the first commit row must paint before anything is scrolled")
+            .center()
+    }
+
+    /// Scrolls the real list past its own maximum offset; `uniform_list` clamps, so this lands at
+    /// the true bottom of whatever is currently loaded without modelling row heights or the
+    /// viewport.
+    fn scroll_to_bottom(cx: &mut gpui::VisualTestContext, anchor: gpui::Point<Pixels>) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: anchor,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
     }
 }
