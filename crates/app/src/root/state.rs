@@ -256,6 +256,7 @@ impl AdeApp {
             _tree_delete_tasks: Vec::new(),
             _tree_copy_task: None,
             staged_files: HashSet::new(),
+            dirty_files: None,
             staging_error: None,
             _stage_tasks: TaskPool::new(),
             commit_menu_open: false,

@@ -160,6 +160,29 @@ pub(crate) fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
         .child(style.label)
 }
 
+/// The Changes row's `committed` tag - a file that differs from the base branch only because a
+/// real commit on this branch already holds that difference (`crate::sidebar::changes::
+/// is_committed_clean`, GitHub issue #220).
+///
+/// Deliberately **not** a [`ChangeTag`] variant: `ChangeTag` is documented as derived from the
+/// file's `FileChangeStatus`, and this is orthogonal to it - a committed-clean file can perfectly
+/// well also be an addition, and would then need both this and the `new` pill. That is the same
+/// reason `crate::sidebar::render::render_moved_tag` is its own neutral chip rather than a
+/// `ChangeTag`, and this matches its look exactly so the row's two status-independent pills read
+/// as one family.
+pub(crate) fn render_committed_tag() -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(theme::radius::CHIP)
+        .bg(theme::surface::CHIP_NEUTRAL)
+        .font(font(theme::font::MONO))
+        .text_size(px(9.5))
+        .text_color(theme::text::GHOST)
+        .child("committed")
+}
+
 /// One always-neutral, single-literal keyboard-shortcut keycap. For a platform-resolved combo
 /// (anything that could contain a `mod`/`alt`/`ctrl`/`shift`/`enter`/`esc`/`tab`/`bksp` token),
 /// use [`render_keycap_row`] with `crate::keymap::resolve_combo`'s output instead - this helper

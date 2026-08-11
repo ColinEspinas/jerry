@@ -2,8 +2,8 @@ use super::*;
 use crate::keymap;
 use crate::root::scrollbar;
 use crate::root::widgets::{
-    hover_bg, menu_popover_chrome, render_keycap_row, render_menu_group_divider,
-    render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_committed_tag, render_keycap_row,
+    render_menu_group_divider, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -1553,19 +1553,35 @@ impl AdeApp {
     /// answers "how many of the worktree's changed files are staged", the composer's answers
     /// "how many of those staged files is the next commit about to include" (today the same set,
     /// but a distinct question).
+    ///
+    /// The `N file(s)` label counts every row the list really paints, but the progress bar's
+    /// denominator is the *stageable* subset (`changes::stageable_count`): a committed-clean file
+    /// (GitHub issue #220) is a real row with genuinely nothing left to stage, so counting it
+    /// against the bar would pin a fully-staged worktree short of full forever.
     pub(in crate::sidebar) fn render_changes_header(
         &self,
         diff: &WorktreeDiff,
     ) -> impl IntoElement {
         let total = diff.files.len();
+        let stageable = changes::stageable_count(&diff.files, self.dirty_files.as_ref());
         let staged = diff
             .files
             .iter()
             .filter(|file| self.staged_files.contains(&file.path))
             .count();
-        let progress = changes::StagedProgress { staged, total };
+        let progress = changes::StagedProgress {
+            staged,
+            total: stageable,
+        };
         let fraction = progress.fraction();
         const BAR_WIDTH: f32 = 56.0;
+
+        // Test-only outside `cfg(test)`/`test-support`, exactly like the commit composer's own
+        // `commit-composer-progress-{n}-of-{m}` selector: the real counts baked into the string so
+        // an interaction test can prove this header moved with real git state instead of a
+        // hardcoded number.
+        let files_selector = format!("changes-header-{total}-files");
+        let staged_selector = format!("changes-header-{staged}-of-{stageable}-staged");
 
         div()
             .flex_none()
@@ -1579,6 +1595,7 @@ impl AdeApp {
             .border_color(theme::border::INNER)
             .child(
                 div()
+                    .debug_selector(move || files_selector)
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
@@ -1605,6 +1622,7 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .debug_selector(move || staged_selector)
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
@@ -1729,6 +1747,19 @@ impl AdeApp {
     /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
     /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
     /// row body's.
+    ///
+    /// **A committed-clean file gets no checkbox at all** (GitHub issue #220). The Changes list is
+    /// a diff against the merge-base with the default branch, so it legitimately shows files whose
+    /// difference from that base is already inside a real commit on this branch - and until this
+    /// fix every one of them painted an unchecked, actionable "stage me" box, which is what made
+    /// committed work read as unstaged. Such a row keeps its place in the list (reviewing the
+    /// whole branch against main is the entire point of this panel) and stays clickable to open
+    /// its diff; what changes is that the checkbox is replaced by
+    /// [`Self::render_committed_marker`]'s inert check plus a `committed` pill
+    /// (`crate::root::widgets::render_committed_tag`). A checked-but-disabled checkbox was the
+    /// alternative and was rejected: in this panel a checked box means "staged, and the next
+    /// commit will include it", and reusing that exact mark for "this is already *in* a commit"
+    /// would trade one wrong reading for another.
     pub(in crate::sidebar) fn render_change_row(
         &self,
         file: &DiffFile,
@@ -1737,6 +1768,7 @@ impl AdeApp {
         let path = file.path.clone();
         let open_path = path.clone();
         let staged = self.staged_files.contains(&file.path);
+        let committed = changes::is_committed_clean(&file.path, self.dirty_files.as_ref());
         let selected = self.open_change.as_deref() == Some(file.path.as_path());
         let (add, del) = changes::diff_file_stats(file);
         let (dir, name) = changes::split_dir_name(&file.path);
@@ -1776,7 +1808,12 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.open_change_diff(open_path.clone(), window, cx);
             }))
-            .child(self.render_staging_checkbox(path, staged, cx))
+            .child(if committed {
+                self.render_committed_marker(&path).into_any_element()
+            } else {
+                self.render_staging_checkbox(path, staged, cx)
+                    .into_any_element()
+            })
             .when(!dir.is_empty(), |el| {
                 el.child(
                     div()
@@ -1797,7 +1834,11 @@ impl AdeApp {
                     .text_size(self.ui_text_size(11.5))
                     // Staged rows read at full strength; unstaged drop to `theme::text::DIM` -
                     // the exact inverse of the old "reviewed" dimming this replaces (Revision R12
-                    // §5), never both conventions at once.
+                    // §5), never both conventions at once. A committed-clean row lands on `DIM`
+                    // too, and correctly so under that same rule: this dimming means "not part of
+                    // the commit being composed", which is true of a file already sitting in an
+                    // earlier commit. Its `committed` pill and marker, not its text weight, are
+                    // what say *why*.
                     .text_color(if staged {
                         theme::text::STRONG
                     } else {
@@ -1807,6 +1848,9 @@ impl AdeApp {
             )
             .when_some(author_chips, |el, chips| el.child(chips))
             .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
+            // Alongside `tag`, never instead of it: a file added by a commit on this branch is
+            // genuinely both `new` (relative to the base) and `committed`.
+            .when(committed, |el| el.child(render_committed_tag()))
             // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
             // isn't `new`/`del`), so without this it looked identical to an unchanged file.
             // `changes::is_real_rename` only fires when `old_path` differs from the current path.
@@ -1898,14 +1942,20 @@ impl AdeApp {
     /// not "reviewed") - toggled via [`Self::toggle_staged`]. Stops propagation on click so
     /// checking a box never also opens the row's diff, mirroring `Self::render_agent_tab`'s
     /// nested-clickable-child pattern (its tab-close `×`).
+    ///
+    /// Only rendered for a file with a real, live uncommitted delta - see
+    /// [`Self::render_change_row`] for why a committed-clean file gets
+    /// [`Self::render_committed_marker`] instead.
     pub(in crate::sidebar) fn render_staging_checkbox(
         &self,
         path: PathBuf,
         checked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let selector = format!("stage-checkbox-{}", path.display());
         div()
             .id(format!("stage-checkbox-{}", path.display()))
+            .debug_selector(move || selector)
             .flex_none()
             .w(px(12.0))
             .h(px(12.0))
@@ -1931,6 +1981,38 @@ impl AdeApp {
             }))
     }
 
+    /// What sits in the checkbox slot for a committed-clean Changes row (GitHub issue #220): the
+    /// same 12×12 footprint so the list's text column stays aligned, holding an inert `✓` in
+    /// [`theme::text::GHOST`] - no border, no fill, no hover, no `cursor_pointer`, and above all
+    /// no click handler, because there is no real git operation for it to run. Staging an
+    /// already-committed, clean file is a `git add` that changes nothing, so a checkbox here would
+    /// be a control bound to a no-op - exactly the kind of thing that must not be drawn.
+    ///
+    /// The `✓` is deliberately grey rather than the checkbox's `theme::button::GREEN_FG`: green
+    /// means "staged for the next commit" everywhere else in this panel, and this state is the
+    /// different, quieter fact that the change is already in history. The row's `committed` pill
+    /// (`crate::root::widgets::render_committed_tag`) carries the word itself; a
+    /// [`text_tooltip`] spells it out on hover.
+    pub(in crate::sidebar) fn render_committed_marker(&self, path: &Path) -> impl IntoElement {
+        let selector = format!("committed-marker-{}", path.display());
+        div()
+            .id(format!("committed-marker-{}", path.display()))
+            .debug_selector(move || selector)
+            .flex_none()
+            .w(px(12.0))
+            .h(px(12.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(9.0))
+            .text_color(theme::text::GHOST)
+            .child("\u{2713}")
+            .tooltip(text_tooltip(
+                "Already committed on this branch - nothing to stage",
+            ))
+    }
+
     /// The commit composer at the foot of the Changes panel (Revision R12 §5): header row
     /// (`COMMIT` · `N of M staged` · staged diffstat), a pre-drafted message box, and the primary
     /// commit action with its `▾` split-button menu. The staged set is derived once, early
@@ -1946,7 +2028,11 @@ impl AdeApp {
     ) -> impl IntoElement {
         let staged = changes::staged_subset(&diff.files, &self.staged_files);
         let staged_count = staged.len();
-        let total = diff.files.len();
+        // The stageable count, not `diff.files.len()` - same reasoning as
+        // `Self::render_changes_header`'s own denominator (GitHub issue #220): a committed-clean
+        // file can never join this commit, so counting it here would make `N of M staged` claim
+        // outstanding work that doesn't exist.
+        let total = changes::stageable_count(&diff.files, self.dirty_files.as_ref());
         let (add, del) = changes::staged_diff_stats(&staged);
         let stat_text = if staged_count > 0 {
             format!("+{add} \u{2212}{del}")
@@ -4463,6 +4549,34 @@ mod commit_composer_tests {
         repo
     }
 
+    /// GitHub issue #220's exact shape: a feature branch carrying **one real commit** since its
+    /// merge-base with `main` (`committed.txt`, clean on disk - nothing left to stage) plus **one
+    /// genuinely uncommitted edit** (`dirty.txt`). `wt_core::diff::diff_against_base` diffs
+    /// against that merge-base, so it lists *both* files and `DiffFile` alone cannot tell them
+    /// apart - which is precisely what used to make the committed one render an actionable,
+    /// unchecked "stage me" checkbox.
+    fn repo_with_a_committed_and_a_dirty_file() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\n").expect("write dirty.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("committed.txt"), "committed\n")
+            .expect("write committed.txt");
+        git(repo.path(), &["add", "committed.txt"]);
+        git(
+            repo.path(),
+            &["commit", "-m", "a real commit on the feature branch"],
+        );
+        // ...and only now a real, still-uncommitted edit to the other file.
+        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\nthree\n")
+            .expect("modify dirty.txt");
+        repo
+    }
+
     fn open_changes_view<'a>(
         cx: &'a mut TestAppContext,
         repo: &TempDir,
@@ -5159,6 +5273,186 @@ mod commit_composer_tests {
             "switching into the second worktree must re-derive staged_files from *its* real \
              index (c.txt, staged before this switch ever happened), not carry over the first \
              worktree's empty set or silently stay empty"
+        );
+    }
+
+    /// GitHub issue #220, "Changes are displayed as unstaged but are commited". The Changes list
+    /// diffs against the merge-base with the default branch, so a file whose difference from that
+    /// base is already inside a real commit sits in the same list as a genuinely uncommitted one.
+    /// It must still be *visible* there (reviewing the whole branch is the point of the panel),
+    /// but it must not present an actionable staging checkbox - `git add` on an already-committed,
+    /// clean file does nothing at all.
+    #[gpui::test]
+    fn a_committed_clean_file_shows_no_staging_checkbox_but_a_really_edited_one_does(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.current_diff().map(|d| d.files.len())),
+            Some(2),
+            "sanity check: the merge-base diff really does list both files - if it listed only \
+             the dirty one, everything below would pass for the wrong reason"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dirty_files.clone()),
+            Some([PathBuf::from("dirty.txt")].into_iter().collect()),
+            "the real `git status --porcelain` read must name exactly the uncommitted file"
+        );
+
+        assert!(
+            cx.debug_bounds("change-row-committed.txt").is_some(),
+            "the committed file must stay in the Changes list - reviewing the branch against \
+             main is exactly what this panel is for, so it must not be filtered out"
+        );
+        assert!(
+            cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
+            "the committed-clean file must NOT paint a staging checkbox - that unchecked box is \
+             the whole bug: it claimed committed work was still unstaged"
+        );
+        assert!(
+            cx.debug_bounds("committed-marker-committed.txt").is_some(),
+            "it must paint the inert committed marker in the checkbox's place instead, so the \
+             row still says something true about its state rather than going blank"
+        );
+
+        assert!(
+            cx.debug_bounds("stage-checkbox-dirty.txt").is_some(),
+            "the genuinely uncommitted file must keep its real, actionable staging checkbox"
+        );
+        assert!(
+            cx.debug_bounds("committed-marker-dirty.txt").is_none(),
+            "and must never be marked committed"
+        );
+    }
+
+    /// The header's denominator is the *stageable* count, not the raw file count: with one of the
+    /// two listed files already committed there is exactly one thing left to stage, and staging it
+    /// must fill the bar rather than stalling at a permanent one-of-two.
+    #[gpui::test]
+    fn the_changes_header_counts_only_really_stageable_files_in_its_denominator(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("changes-header-2-files").is_some(),
+            "both files are really in the list, so the file count says 2"
+        );
+        assert!(
+            cx.debug_bounds("changes-header-0-of-1-staged").is_some(),
+            "but only one of them can be staged at all, so that is the real denominator"
+        );
+        assert!(
+            cx.debug_bounds("changes-header-0-of-2-staged").is_none(),
+            "counting the committed file as outstanding work is exactly the misleading fraction \
+             this fix removes"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-progress-0-of-1").is_some(),
+            "the composer's own `N of M staged` must agree - two counters in one panel may not \
+             disagree about how much is left to stage"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("dirty.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "dirty.txt"]),
+            "M  dirty.txt",
+            "sanity check: that really staged it in the real git index"
+        );
+        assert!(
+            cx.debug_bounds("changes-header-1-of-1-staged").is_some(),
+            "with the only stageable file staged, the header must read fully staged - not `1 of \
+             2`, which would imply a second file still needs attention when none does"
+        );
+    }
+
+    /// The committed row's marker is inert by construction (no click handler at all), so a click
+    /// at its exact painted position must reach the row underneath and open the file's diff -
+    /// never run a meaningless `git add` on an already-clean file.
+    #[gpui::test]
+    fn clicking_a_committed_files_marker_stages_nothing_in_real_git(cx: &mut TestAppContext) {
+        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let marker = cx
+            .debug_bounds("committed-marker-committed.txt")
+            .expect("the committed marker must really paint");
+        cx.simulate_click(marker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain"]),
+            "M dirty.txt",
+            "the real index must be untouched: only dirty.txt's own unstaged modification, no \
+             newly staged committed.txt"
+        );
+        assert!(
+            app.read_with(cx, |app, _| !app
+                .staged_files
+                .contains(Path::new("committed.txt"))),
+            "and nothing may claim it got staged in memory either"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(PathBuf::from("committed.txt")),
+            "with no click handler of its own the marker lets the click through to the row, \
+             which opens the file's diff - the committed file stays fully reviewable"
+        );
+    }
+
+    /// Before the fix, committing from the composer left the just-committed files in the Changes
+    /// list (correctly - they still differ from `main`) but *still* showing unchecked staging
+    /// checkboxes, which is the exact user-visible report in issue #220. After a real commit the
+    /// reloaded diff must reclassify them.
+    #[gpui::test]
+    fn committing_a_staged_file_flips_its_row_from_stageable_to_committed(cx: &mut TestAppContext) {
+        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("dirty.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("stage-checkbox-dirty.txt").is_some(),
+            "sanity check: it is stageable (and now staged) before the commit"
+        );
+
+        let commits_before = commit_count(repo.path());
+        app.update(cx, |app, cx| {
+            app.commit_staged_files(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before + 1,
+            "sanity check: a real commit must actually have happened"
+        );
+
+        assert!(
+            cx.debug_bounds("change-row-dirty.txt").is_some(),
+            "it still differs from `main`, so it stays in the list - `commit_staged_files`' own \
+             docs are explicit about that"
+        );
+        assert!(
+            cx.debug_bounds("stage-checkbox-dirty.txt").is_none(),
+            "but it must no longer offer to stage anything: this is the reported bug, a file the \
+             user just committed still rendering an unchecked staging checkbox"
+        );
+        assert!(
+            cx.debug_bounds("committed-marker-dirty.txt").is_some(),
+            "it must read as committed now"
+        );
+        assert!(
+            cx.debug_bounds("changes-header-0-of-0-staged").is_some(),
+            "with everything committed there is nothing stageable left at all"
         );
     }
 }

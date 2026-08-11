@@ -26,10 +26,20 @@ impl AdeApp {
     /// call per reload. This is also what makes a worktree with something already staged in real
     /// git *before* Jerry ever opened it read as staged the moment it's loaded, rather than
     /// starting at an empty, UI-only set the way it used to.
+    ///
+    /// The same background task also re-derives [`Self::dirty_files`]
+    /// (`wt_core::stage::dirty_paths`, a real `git status --porcelain` read) for exactly the same
+    /// reasons, plus one specific to it: `diff_against_base` diffs against the **merge-base with
+    /// the default branch**, so the file list it produces mixes already-committed changes with
+    /// live uncommitted ones, and only this second query can tell them apart (GitHub issue #220 -
+    /// see [`Self::dirty_files`]' own docs). It is reset to `None` ("not known yet") synchronously
+    /// here rather than left holding the outgoing diff's answer, so a stale set can never outlive
+    /// the diff it described.
     pub(crate) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
         self.diff_totals = None;
+        self.dirty_files = None;
         // A reloaded diff is a new worktree's (or the same worktree's freshly re-read) file
         // list - any authorship recorded against the *previous* one belongs to files that may
         // not even be in this diff anymore. See `changes::Authorship`'s own docs for why this is
@@ -37,7 +47,7 @@ impl AdeApp {
         self.file_authorship = changes::Authorship::default();
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let (diff_result, staged_result) = cx
+            let (diff_result, staged_result, dirty_result) = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
@@ -54,7 +64,8 @@ impl AdeApp {
                             (base, totals)
                         });
                         let staged_result = wt_core::stage::staged_paths(&root);
-                        (diff_result, staged_result)
+                        let dirty_result = wt_core::stage::dirty_paths(&root);
+                        (diff_result, staged_result, dirty_result)
                     }
                 })
                 .await;
@@ -76,6 +87,13 @@ impl AdeApp {
                 // problem honestly.
                 if let Ok(staged) = staged_result {
                     this.staged_files = staged;
+                }
+                // A failed `dirty_paths` query leaves `dirty_files` at the `None` this method
+                // already set synchronously - "not known", so every Changes row falls back to the
+                // ordinary stageable presentation rather than silently declaring every file
+                // committed-clean off the back of an answer git never actually gave.
+                if let Ok(dirty) = dirty_result {
+                    this.dirty_files = Some(dirty);
                 }
                 // The reloaded diff may have changed whether `open_change`'s path has a
                 // `DiffFile`, so refresh the cache immediately rather than leaving it stale.

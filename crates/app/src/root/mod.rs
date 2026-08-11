@@ -515,6 +515,27 @@ pub struct AdeApp {
     /// than a per-worktree cache, and why that means a worktree with something already staged in
     /// real git before Jerry ever opened it still reads as staged once loaded.
     pub(crate) staged_files: HashSet<PathBuf>,
+    /// Every path in the currently-loaded worktree with a *live* uncommitted delta - staged,
+    /// unstaged, or untracked (`wt_core::stage::dirty_paths`, a real `git status --porcelain`
+    /// read), or `None` while that answer isn't known yet.
+    ///
+    /// GitHub issue #220 ("Changes are displayed as unstaged but are commited"): the Changes list
+    /// is `wt_core::diff::diff_against_base`'s diff against the **merge-base with the default
+    /// branch**, so it deliberately lists files whose difference from that base is already latched
+    /// into a real commit on this branch alongside files with genuinely uncommitted edits, and
+    /// `wt_core::diff::DiffFile` carries nothing to tell the two apart. Without this set, every
+    /// file not in [`Self::staged_files`] rendered an actionable, unchecked "stage me" checkbox -
+    /// including already-committed files, for which `git add` would be a no-op, so the row falsely
+    /// implied the work wasn't committed yet. `crate::sidebar::changes::is_committed_clean` is the
+    /// read side.
+    ///
+    /// `None` means **unknown**, never "nothing is dirty": it is set synchronously at the top of
+    /// [`Self::load_diff`] (so it can never outlive the diff it describes, which is also why -
+    /// unlike [`Self::staged_files`] - nothing in `crate::sidebar::tree_ops` has to remap or prune
+    /// it across a rename or delete) and only filled in once the real query lands. Every consumer
+    /// falls back to the ordinary stageable presentation while it is `None`, rather than claiming
+    /// files are committed on the strength of an answer that hasn't arrived.
+    pub(crate) dirty_files: Option<HashSet<PathBuf>>,
     /// The most recent real staging/unstaging failure from [`Self::toggle_staged`] - `(path,
     /// message)`. Surfaced next to the commit composer (`Self::render_staging_error`) the same
     /// honest way [`Self::tree_op_error`] surfaces a failed tree operation, rather than silently
