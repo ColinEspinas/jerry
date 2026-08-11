@@ -73,6 +73,20 @@ impl AgentKind {
             AgentKind::Codex => Some("codex"),
         }
     }
+
+    /// Whether this kind is a real agent session (has turns, can be asked something, can
+    /// finish a unit of work worth reviewing) as opposed to [`AgentKind::Shell`], which is just
+    /// an interactive terminal that happens to live in the same rail/tab UI. The single place
+    /// that distinction lives - `crate::rail::status::derive_status` reads it instead of
+    /// re-deriving "is this Shell or not" per status, and any future per-session machinery
+    /// (structured hook/ACP signal, review-eligibility) should gate on this rather than adding
+    /// another ad-hoc kind match.
+    pub fn is_agent_session(self) -> bool {
+        match self {
+            AgentKind::Shell => false,
+            AgentKind::Claude | AgentKind::Codex => true,
+        }
+    }
 }
 
 /// A monotonically increasing agent id, stable across other agents closing - used

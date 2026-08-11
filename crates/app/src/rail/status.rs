@@ -12,7 +12,12 @@
 //! Exit-based statuses ([`Status::Fail`], [`Status::Review`]) are exact: a process either exited
 //! non-zero/was killed by a signal, or exited 0. Whether a "review ready" exit has anything to
 //! review is likewise exact - `wt_core::diff::diff_against_base` reporting at least one changed
-//! file.
+//! file. [`Status::Review`] is further gated on
+//! [`crate::work_surface::agents::AgentKind::is_agent_session`]: a plain
+//! [`crate::work_surface::agents::AgentKind::Shell`] exiting next to an unrelated worktree diff
+//! didn't do reviewable work - it's a terminal that closed, not a session that finished a turn -
+//! so it reports [`Status::Idle`] instead, same as an agent session's clean exit with nothing to
+//! review.
 //!
 //! The one fuzzy call is distinguishing [`Status::Run`] from [`Status::Ask`] for a still-alive
 //! process: there's no portable, reliable way to know from outside a process that it's blocked
@@ -23,15 +28,15 @@
 //! quiet longer than a threshold is treated as "probably waiting on input" - a heuristic, not a
 //! certainty.
 //!
-//! Two thresholds, because a plain shell and an interactive agent CLI mean something different
-//! by "gone quiet":
+//! Two thresholds, because a plain shell and a real agent session
+//! ([`crate::work_surface::agents::AgentKind::is_agent_session`]) mean something different by
+//! "gone quiet":
 //! - [`RUN_RECENT_OUTPUT_WINDOW`] (2s) is the boundary between "actively streaming" and "merely
 //!   paused" for any live process.
-//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is a second, longer threshold that only matters for
-//!   [`crate::work_surface::agents::AgentKind::Claude`]/[`crate::work_surface::agents::AgentKind::Codex`] agents:
-//!   an agent CLI commonly pauses for several seconds between a tool call and its result, so
-//!   treating every pause past 2s as "needs input" would flicker the rail on normal agent
-//!   latency. Only past the longer window is an agent flagged [`Status::Ask`].
+//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is a second, longer threshold that only matters for a
+//!   real agent session: an agent CLI commonly pauses for several seconds between a tool call
+//!   and its result, so treating every pause past 2s as "needs input" would flicker the rail on
+//!   normal agent latency. Only past the longer window is an agent flagged [`Status::Ask`].
 //!
 //! A plain [`crate::work_surface::agents::AgentKind::Shell`] has no such grace window: a shell sitting at
 //! its prompt isn't "asking a question", it's just idle - so it falls straight to
@@ -146,25 +151,26 @@ pub enum ProcessSignal {
 pub fn derive_status(kind: AgentKind, signal: ProcessSignal, has_reviewable_diff: bool) -> Status {
     match signal {
         ProcessSignal::NoProcess => Status::Idle,
-        ProcessSignal::Running { idle } => match kind {
-            AgentKind::Shell => {
-                if idle < RUN_RECENT_OUTPUT_WINDOW {
-                    Status::Run
-                } else {
-                    Status::Idle
-                }
-            }
-            AgentKind::Claude | AgentKind::Codex => {
+        ProcessSignal::Running { idle } => {
+            if kind.is_agent_session() {
                 if idle < AGENT_ASK_IDLE_THRESHOLD {
                     Status::Run
                 } else {
                     Status::Ask
                 }
+            } else if idle < RUN_RECENT_OUTPUT_WINDOW {
+                Status::Run
+            } else {
+                Status::Idle
             }
-        },
+        }
         ProcessSignal::Exited { success } => {
             if success {
-                if has_reviewable_diff {
+                // A worktree diff sitting around when a plain shell happens to exit isn't
+                // this shell's doing - it's not a session that did reviewable work, it's a
+                // terminal that closed. Only a real agent session's successful exit means
+                // "review ready" (see `AgentKind::is_agent_session`'s docs).
+                if kind.is_agent_session() && has_reviewable_diff {
                     Status::Review
                 } else {
                     Status::Idle
@@ -251,6 +257,19 @@ mod tests {
         assert_eq!(
             derive_status(AgentKind::Claude, signal, true),
             Status::Review
+        );
+    }
+
+    #[test]
+    fn a_shell_zero_exit_with_a_real_diff_is_idle_not_review() {
+        // A plain shell exiting next to an unrelated worktree diff isn't a session that
+        // finished reviewable work - it's a terminal that closed. Only a real agent session's
+        // clean exit means "review ready" (see `AgentKind::is_agent_session`'s docs).
+        let signal = ProcessSignal::Exited { success: true };
+        assert_eq!(
+            derive_status(AgentKind::Shell, signal, true),
+            Status::Idle,
+            "a shell isn't an agent session - its exit can't be \"review ready\""
         );
     }
 
