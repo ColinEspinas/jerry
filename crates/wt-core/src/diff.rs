@@ -78,7 +78,7 @@ use crate::{check_success, format_args, git_command, open_repo, run_git};
 /// (thousands of changed lines, or a huge generated file slipping past `.gitignore`) is
 /// truncated rather than buffered without bound or left to hang the read loop; see
 /// [`WorktreeDiff::truncated`].
-const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Cap on how many changed files are kept from a single diff. Mirrors the "cap the loaded
 /// data, independent of what's rendered" approach `file_tree::build_file_tree` uses.
@@ -217,6 +217,7 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         let uncommitted = compute_diff(
             worktree_path,
             &worktree_head_sha,
+            ShadowIndexContent::IntentToAdd,
             worktree_branch.unwrap_or_default(),
         )?;
         return Ok(DiffBase::NoBase {
@@ -226,7 +227,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     };
 
     if worktree_branch.as_deref() == Some(base_branch.as_str()) {
-        let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+        let uncommitted = compute_diff(
+            worktree_path,
+            &worktree_head_sha,
+            ShadowIndexContent::IntentToAdd,
+            base_branch.clone(),
+        )?;
         return Ok(DiffBase::NoBase {
             branch: Some(base_branch),
             uncommitted,
@@ -239,7 +245,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
             // A real default branch exists, but shares no common ancestor with this worktree's
             // history - still real uncommitted changes to show against `HEAD`, same as the
             // on-default-branch case just above.
-            let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+            let uncommitted = compute_diff(
+                worktree_path,
+                &worktree_head_sha,
+                ShadowIndexContent::IntentToAdd,
+                base_branch.clone(),
+            )?;
             return Ok(DiffBase::NoBase {
                 branch: Some(base_branch),
                 uncommitted,
@@ -248,31 +259,56 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
 
-    let diff = compute_diff(worktree_path, &merge_base_id.to_string(), base_branch)?;
+    let diff = compute_diff(
+        worktree_path,
+        &merge_base_id.to_string(),
+        ShadowIndexContent::IntentToAdd,
+        base_branch,
+    )?;
     Ok(DiffBase::Diff(diff))
 }
 
-/// Runs `git diff <commit_sha>` against the worktree's real working tree (see the module docs'
+/// Defensive validation for an object id about to be handed to a spawned `git` process as a
+/// bare argument: it must be a non-empty, all-ASCII-hex string, so it can never be misparsed as
+/// a flag or as revision syntax. Every in-crate caller produces these from a real `gix` object
+/// id (or from `git write-tree`'s own stdout), but re-checking costs nothing and means a future
+/// change to how one is derived can't silently turn into a git-argument injection.
+///
+/// Deliberately does **not** pin a length (40 for SHA-1, 64 for SHA-256): a repository's hash
+/// algorithm is the repository's business, and hardcoding today's two lengths here would be a
+/// latent failure for a future one without buying anything the hex-only check doesn't already.
+///
+/// `pub(crate)` so [`crate::review`]'s own tree-id arguments go through this exact check rather
+/// than a second, drifting copy of it.
+pub(crate) fn validate_object_id(id: &str, what: &str) -> Result<(), Error> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::WorktreeIo(std::io::Error::other(format!(
+            "{what} was not a hex object id"
+        ))));
+    }
+    Ok(())
+}
+
+/// Runs `git diff <object_id>` against the worktree's real working tree (see the module docs'
 /// "What the diff includes" section) and folds the result into a [`WorktreeDiff`]. `label_branch`
 /// is purely descriptive - the real base branch name for [`DiffBase::Diff`], or whatever branch
 /// name is available (possibly none) for the [`DiffBase::NoBase`] uncommitted-vs-`HEAD` fallback.
-fn compute_diff(
+///
+/// `object_id` is a commit id for every caller in this module, but `git diff <object>` resolves a
+/// **tree** id exactly the same way - it diffs that tree against the working tree either way - so
+/// [`crate::review::diff_against_tree`] reuses this function verbatim against a
+/// `git write-tree` snapshot rather than duplicating the invocation, the shadow index, the pinned
+/// config, and the parser. That is why this is `pub(crate)` rather than private.
+pub(crate) fn compute_diff(
     worktree_path: &Path,
-    commit_sha: &str,
+    object_id: &str,
+    shadow_content: ShadowIndexContent,
     label_branch: String,
 ) -> Result<WorktreeDiff, Error> {
-    // Defensive: this is about to be handed to a spawned `git` process as an argument. Every
-    // caller just produced it from a real `gix` object id, but double-checking it's actually a
-    // hex string (rather than something that could be misparsed as a flag) costs nothing and
-    // means a future change to how it's derived can't silently turn into a git-argument
-    // injection.
-    if commit_sha.is_empty() || !commit_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::WorktreeIo(std::io::Error::other(
-            "commit id was not a hex object id",
-        )));
-    }
+    let commit_sha = object_id;
+    validate_object_id(commit_sha, "commit id")?;
 
-    let shadow_index = prepare_shadow_index(worktree_path)?;
+    let shadow_index = prepare_shadow_index(worktree_path, shadow_content)?;
 
     let args: Vec<OsString> = vec![
         // Global config overrides (`-c key=value`) must precede the subcommand for `git` to
@@ -551,7 +587,7 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 /// `max_bytes`, the child is killed (rather than waited on to completion) and the second
 /// element of the returned tuple is `true` - mirrors [`super::is_dirty`]'s reasoning for not
 /// risking a blocked read against a pipe the child may still be filling.
-fn capture_git_stdout(
+pub(crate) fn capture_git_stdout(
     dir: &Path,
     args: &[OsString],
     max_bytes: usize,
@@ -677,29 +713,74 @@ fn read_streams_concurrently(
     Ok((buf, truncated, stderr_text))
 }
 
-/// Builds a temporary, throwaway copy of the worktree's index with untracked files added as
-/// "intent to add" stubs (`git add --intent-to-add`), so `git diff <merge-base>` - which
-/// only ever considers paths already present in the index or in `<merge-base>`'s tree (see
-/// the module docs' "What the diff includes" section) - picks up new, unstaged files as
-/// additions instead of silently omitting them.
+/// Which flavour of `git add` [`prepare_shadow_index`] runs into the throwaway index copy.
+///
+/// `pub(crate)` because [`crate::review::snapshot_worktree_tree`] needs the second flavour: a
+/// `git write-tree` snapshot has to name real blobs, and an intent-to-add stub has no blob to
+/// name (`write-tree` refuses outright with `fatal: ... has intent-to-add entries`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShadowIndexContent {
+    /// `git add --intent-to-add -A` - records just enough for `git diff <object>` to treat an
+    /// untracked path as present, without writing any blob into the object database. The
+    /// long-standing default for [`compute_diff`]; see this function's own docs for why that is
+    /// sufficient there.
+    IntentToAdd,
+    /// `git add -A` - stages real content, so every untracked/modified file's blob genuinely
+    /// lands in the object database and `git write-tree` can name it. Writes real objects (the
+    /// only way to snapshot a working tree at all), but still only ever into the object database:
+    /// the real index, working tree, `HEAD` and stash are as untouched as with `IntentToAdd`,
+    /// because every mutation still goes through the same `GIT_INDEX_FILE` override.
+    ///
+    /// **Unbounded in the size of the untracked set**, which is why
+    /// [`crate::review::snapshot_worktree_tree`] measures that set before ever asking for this -
+    /// see [`crate::review::MAX_UNTRACKED_SNAPSHOT_BYTES`] and the real 19 GB worktree that
+    /// motivated the cap.
+    FullContent,
+    /// `git add -u` - stages real content for **tracked** paths only (including deletions), and
+    /// never touches untracked files at all.
+    ///
+    /// The bounded fallback for a worktree whose untracked set is too large to hash into the
+    /// object database. Bounded by construction: every path it can write a blob for is already
+    /// in git's history, so the work is proportional to what the user has actually committed
+    /// rather than to whatever build output happens to be sitting in the directory.
+    ///
+    /// Known limitation: `git write-tree` refuses an index containing intent-to-add entries, and
+    /// unlike [`Self::FullContent`]'s `add -A` this flavour does not materialize them. A worktree
+    /// where the user has run a real `git add -N` therefore fails to snapshot through this path.
+    /// That surfaces as an ordinary error (the caller logs it and leaves the review surface
+    /// unavailable), not as a wrong answer.
+    TrackedOnly,
+}
+
+/// Builds a temporary, throwaway copy of the worktree's index with untracked files added,
+/// either as "intent to add" stubs or with their real content ([`ShadowIndexContent`]), so
+/// `git diff <merge-base>` - which only ever considers paths already present in the index or in
+/// `<merge-base>`'s tree (see the module docs' "What the diff includes" section) - picks up new,
+/// unstaged files as additions instead of silently omitting them, and so
+/// [`crate::review::snapshot_worktree_tree`] can `git write-tree` a complete snapshot.
 ///
 /// The real index is only ever *read* (to seed the copy); every mutation happens on the temp
 /// file via a `GIT_INDEX_FILE` override in the caller, so this can never perturb the real
 /// repository state - verified by checking that `git status` still reports the untracked
 /// file as untracked (`??`), never staged, immediately after diffing through a shadow index.
 ///
-/// `--intent-to-add` (rather than a full `git add -A`) is deliberate: it records just enough
-/// (an empty-blob stub entry) for `git diff` to treat the path as present, without staging
-/// actual file content into the temp index - unnecessary, since `git diff <commit>` (no
-/// `--cached`) always compares against the real working-tree file content directly
-/// regardless of what's staged.
+/// [`ShadowIndexContent::IntentToAdd`] (rather than a full `git add -A`) is deliberate for
+/// [`compute_diff`]: it records just enough (an empty-blob stub entry) for `git diff` to treat
+/// the path as present, without staging actual file content into the temp index - unnecessary,
+/// since `git diff <commit>` (no `--cached`) always compares against the real working-tree file
+/// content directly regardless of what's staged. [`crate::review::snapshot_worktree_tree`] is the
+/// one caller that genuinely does need the content, and asks for
+/// [`ShadowIndexContent::FullContent`] instead - see that variant's own docs.
 ///
 /// The copy also inherits the real index's **mtime**, not just its bytes - an index's cached
 /// stat data only means anything relative to that index file's own timestamp (git's
 /// racy-index rule). See the inline comment at the copy itself, and the
 /// `a_same_length_edit_racy_against_the_index_timestamp_is_still_reported` test, for the real
 /// bug (GitHub issue #163) that came of not doing this.
-fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
+pub(crate) fn prepare_shadow_index(
+    worktree_path: &Path,
+    content: ShadowIndexContent,
+) -> Result<tempfile::NamedTempFile, Error> {
     let index_path_args: Vec<OsString> =
         vec!["rev-parse".into(), "--git-path".into(), "index".into()];
     let output = run_git(worktree_path, &index_path_args)?;
@@ -767,13 +848,18 @@ fn prepare_shadow_index(worktree_path: &Path) -> Result<tempfile::NamedTempFile,
         }
     }
 
-    let add_args: Vec<OsString> = vec![
-        "add".into(),
-        "--intent-to-add".into(),
-        "-A".into(),
-        "--".into(),
-        ".".into(),
-    ];
+    let mut add_args: Vec<OsString> = vec!["add".into()];
+    match content {
+        ShadowIndexContent::IntentToAdd => {
+            add_args.push("--intent-to-add".into());
+            add_args.push("-A".into());
+        }
+        ShadowIndexContent::FullContent => add_args.push("-A".into()),
+        // `-u` restricts the update to paths git already tracks, so no untracked file's content
+        // can reach the object database through this flavour - see its own docs.
+        ShadowIndexContent::TrackedOnly => add_args.push("-u".into()),
+    }
+    add_args.extend([OsString::from("--"), ".".into()]);
     let output = git_command(worktree_path, &add_args)
         .env("GIT_INDEX_FILE", shadow.path())
         .output()

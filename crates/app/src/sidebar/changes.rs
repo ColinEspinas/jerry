@@ -6,89 +6,13 @@
 //! shows lives here; `gpui::Div` construction happens in `crate::root`, which owns the
 //! `Context<AdeApp>` the click handlers (review-toggle, open-in-centre) need.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
 
 use crate::theme;
-use crate::work_surface::agents::AgentId;
 use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
-
-/// Which agent(s) wrote each changed file in one worktree's diff -
-/// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4 ("Where numbers live")'s
-/// `by: 's1'`, or `by: ['s1', 's9']` when more than one agent touched the same file. Keyed by a
-/// [`DiffFile::path`] (or `old_path`, before a rename - callers decide which path they're asking
-/// about; this type doesn't special-case renames itself).
-///
-/// **Not wired to any real tracking yet.** A separate, parallel piece of work watches an agent's
-/// edit tool calls and is meant to call [`Self::record`] as it observes them; this phase only
-/// defines the shape so that work has somewhere real to write into, and so every current consumer
-/// (`crate::code_surface::tabs::AdeApp::load_diff`, which resets this to
-/// [`Authorship::default`] on every worktree/diff reload - see that method's own docs) has a real,
-/// empty value to thread through rather than a stub. An empty `Authorship` means exactly what an
-/// empty [`Self::authors_for`] result says: "nobody's authorship has been recorded for this file
-/// yet", never fabricated as "no agent touched it".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Authorship {
-    by_path: HashMap<PathBuf, Vec<AgentId>>,
-}
-
-impl Authorship {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Every agent id recorded as having written `path`, in the order [`Self::record`] saw
-    /// them - empty (never fabricated) when nothing has recorded authorship for it yet, which
-    /// today is every path (see this type's own docs).
-    pub fn authors_for(&self, path: &Path) -> &[AgentId] {
-        self.by_path.get(path).map(Vec::as_slice).unwrap_or(&[])
-    }
-
-    /// Records `agent` as (one of) `path`'s authors. Idempotent: recording the same agent
-    /// against the same path twice does not duplicate the entry, so [`Self::authors_for`]'s
-    /// length is always the real distinct-author count, not an edit-tool-call count.
-    pub fn record(&mut self, path: PathBuf, agent: AgentId) {
-        let authors = self.by_path.entry(path).or_default();
-        if !authors.contains(&agent) {
-            authors.push(agent);
-        }
-    }
-
-    /// `true` when more than one distinct agent has written `path` - the design's amber
-    /// shared-file warning: the rail's worktree-row `⚠ N` and the Changes panel's amber
-    /// author-chip ring both key off this per-file check.
-    pub fn has_multiple_authors(&self, path: &Path) -> bool {
-        self.authors_for(path).len() > 1
-    }
-
-    /// How many of `paths` have more than one recorded author - the worktree row's `⚠ N` count
-    /// itself (§4: "files two agents both wrote").
-    pub fn shared_file_count<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> usize {
-        paths
-            .into_iter()
-            .filter(|path| self.has_multiple_authors(path))
-            .count()
-    }
-
-    /// How many of `paths` `agent` is a recorded author of - the rail agent row's
-    /// `review ready` trailing text (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §2.3: "`12 files` ... here the count **is** the ask - the size of
-    /// the review handed to you"). Deliberately per-agent, unlike [`Self::shared_file_count`]
-    /// (which is worktree-wide) - the whole point of this number is "how much of *this* review
-    /// is mine".
-    pub fn file_count_for<'a>(
-        &self,
-        agent: AgentId,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> usize {
-        paths
-            .into_iter()
-            .filter(|path| self.authors_for(path).contains(&agent))
-            .count()
-    }
-}
 
 /// Added/removed line counts for one file, counted directly from its hunks.
 /// `wt_core::diff::DiffFile` has no separate stored counter for this, so it's recomputed here
@@ -365,8 +289,7 @@ pub fn commit_button_label(staged_count: usize) -> String {
 
 /// A placeholder commit message, standing in for real agent-drafted commit-message generation -
 /// **out of scope for this task**: no such system exists anywhere in this codebase yet (this
-/// phase only wires the Changes panel's real staging/composer UI against real data, per this
-/// module's own `Authorship` precedent for "real API, honestly incomplete data"). Deterministic
+/// phase only wires the Changes panel's real staging/composer UI against real data). Deterministic
 /// and derived straight from the staged file list rather than fabricated prose, and empty when
 /// nothing is staged - the composer only ever shows this with something real to say.
 pub fn draft_commit_message(staged: &[&DiffFile]) -> String {
@@ -814,97 +737,6 @@ mod tests {
         assert_eq!(
             empty_hunks_message(FileChangeStatus::Deleted),
             "no line changes"
-        );
-    }
-
-    #[test]
-    fn a_fresh_authorship_has_no_authors_for_any_path() {
-        let authorship = Authorship::new();
-        assert_eq!(
-            authorship.authors_for(Path::new("src/main.rs")),
-            &[] as &[AgentId]
-        );
-        assert!(!authorship.has_multiple_authors(Path::new("src/main.rs")));
-    }
-
-    #[test]
-    fn recording_one_agent_makes_it_the_sole_author() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1]);
-        assert!(!authorship.has_multiple_authors(Path::new("src/main.rs")));
-    }
-
-    #[test]
-    fn recording_the_same_agent_twice_does_not_duplicate_it() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1]);
-    }
-
-    #[test]
-    fn two_distinct_agents_writing_the_same_file_is_a_shared_file() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        authorship.record(PathBuf::from("src/main.rs"), 9);
-        assert_eq!(authorship.authors_for(Path::new("src/main.rs")), &[1, 9]);
-        assert!(authorship.has_multiple_authors(Path::new("src/main.rs")));
-    }
-
-    #[test]
-    fn shared_file_count_only_counts_paths_with_more_than_one_author() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        authorship.record(PathBuf::from("src/main.rs"), 9);
-        authorship.record(PathBuf::from("src/lib.rs"), 1);
-
-        let paths = [
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/lib.rs"),
-            PathBuf::from("src/untouched.rs"),
-        ];
-        assert_eq!(
-            authorship.shared_file_count(paths.iter().map(PathBuf::as_path)),
-            1
-        );
-    }
-
-    #[test]
-    fn different_paths_never_share_recorded_authors() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        assert!(authorship.authors_for(Path::new("src/other.rs")).is_empty());
-    }
-
-    #[test]
-    fn file_count_for_only_counts_paths_this_agent_authored() {
-        let mut authorship = Authorship::new();
-        authorship.record(PathBuf::from("src/main.rs"), 1);
-        authorship.record(PathBuf::from("src/main.rs"), 9);
-        authorship.record(PathBuf::from("src/lib.rs"), 1);
-        authorship.record(PathBuf::from("src/other.rs"), 9);
-
-        let paths = [
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/lib.rs"),
-            PathBuf::from("src/other.rs"),
-            PathBuf::from("src/untouched.rs"),
-        ];
-        assert_eq!(
-            authorship.file_count_for(1, paths.iter().map(PathBuf::as_path)),
-            2,
-            "agent 1 wrote main.rs and lib.rs, not other.rs or untouched.rs"
-        );
-        assert_eq!(
-            authorship.file_count_for(9, paths.iter().map(PathBuf::as_path)),
-            2,
-            "agent 9 wrote main.rs and other.rs, not lib.rs or untouched.rs"
-        );
-        assert_eq!(
-            authorship.file_count_for(42, paths.iter().map(PathBuf::as_path)),
-            0,
-            "an agent with no recorded authorship anywhere gets a real 0, not a stray match"
         );
     }
 

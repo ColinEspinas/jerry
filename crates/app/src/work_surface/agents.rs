@@ -17,7 +17,7 @@
 //! docs for why it must also move real keyboard focus in the same step.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 
@@ -154,6 +154,20 @@ pub struct Agent {
     /// pause/resume-with-a-fresh-clock concept (see `crate::work_surface::state::pty_state_label`'s
     /// docs), so "elapsed" is simply wall-clock time since this real process was spawned.
     pub spawned_at: Instant,
+    /// The same spawn moment as [`Self::spawned_at`], but as real wall-clock seconds since the
+    /// Unix epoch - set from the identical call site, at the identical instant.
+    ///
+    /// Both exist because they answer genuinely different questions and neither can answer the
+    /// other's. [`Instant`] is monotonic, which is exactly right for "how long has this been
+    /// running" (the rail's elapsed text) and exactly wrong for identity: it has no meaning
+    /// outside this process, and cannot be converted to a wall-clock time at all. This field is
+    /// the durable half - part of the key a persisted review baseline is filed under
+    /// (`crate::review::state::baseline_key`), since [`AgentId`] is a per-window counter that
+    /// restarts at zero on every launch and so cannot key anything expected to outlive one.
+    ///
+    /// See `crate::review::baseline_state`'s own module docs for what that persistence can and
+    /// cannot do today.
+    pub spawned_at_unix: i64,
     /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
     /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
     _link_subscription: Subscription,
@@ -197,6 +211,42 @@ impl Agents {
     /// as long as `self` - it owns its own copy instead, closed over by the filter closure.
     pub fn iter_for_cwd(&self, cwd: PathBuf) -> impl Iterator<Item = &Agent> {
         self.agents.iter().filter(move |agent| agent.cwd == cwd)
+    }
+
+    /// How many agents are currently open in `cwd` - the real signal behind GitHub issue #225's
+    /// **single-agent gate**.
+    ///
+    /// The whole review surface (the Review tab, the footer's `Review diff` door, and the rail's
+    /// review-ready status) is held back for any worktree with more than one open agent, because
+    /// real per-agent attribution does not exist yet: with two agents sharing a worktree, an
+    /// agent's review diff would honestly include changes the *other* one made, and this app
+    /// would have no way to tell them apart. Presenting that as "this agent's review" would be a
+    /// fabrication, so it shows nothing at all until the worktree is back down to one agent.
+    ///
+    /// Deliberately a **decision-time** check, not a capture-time one: a baseline is still
+    /// captured for every agent regardless of how many share its worktree (it's cheap, and it
+    /// means the surface simply starts working - correctly, against a real baseline taken at the
+    /// right moment - the instant the others close). Only *display* is gated.
+    ///
+    /// Reads through [`Self::iter_for_cwd`] rather than open-coding the filter, so the tab
+    /// strip's own per-worktree scoping and this gate can never disagree about which agents
+    /// belong to a worktree.
+    pub fn count_for_cwd(&self, cwd: &Path) -> usize {
+        self.iter_for_cwd(cwd.to_path_buf()).count()
+    }
+
+    /// `true` if `id` names an agent that is the **only** one currently open in its own
+    /// worktree: the review surface's real gate, in the one form every call site wants. `false`
+    /// for an
+    /// unknown id (e.g. a just-closed agent), so a stale click handler can never re-open a review
+    /// surface for an agent that no longer exists.
+    ///
+    /// See [`Self::count_for_cwd`] for why this gate exists at all.
+    pub fn is_sole_agent_in_worktree(&self, id: AgentId) -> bool {
+        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
+            return false;
+        };
+        self.count_for_cwd(&agent.cwd) == 1
     }
 
     pub fn active_id(&self) -> Option<AgentId> {
@@ -255,12 +305,27 @@ impl Agents {
             cwd: cwd.clone(),
             pane,
             spawned_at: Instant::now(),
+            spawned_at_unix: unix_now(),
             _link_subscription: link_subscription,
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
         self.sync_pane_cadence(cx);
         id
+    }
+
+    /// Test-only: overrides an already-spawned agent's recorded [`ProcessKind`] without
+    /// touching its real process. Exists for tests that need to exercise kind-gated logic (e.g.
+    /// `crate::review::flow::AdeApp::capture_review_baseline`'s real-agent-only gate) without
+    /// paying for an actual `claude`/`codex` CLI spawn - `ProcessKind::spec` only affects which
+    /// binary [`Self::spawn`] execs, so retagging after the fact is honest: everything
+    /// downstream of the recorded `kind` field behaves exactly as if a real agent CLI had been
+    /// spawned, without the process weight of one.
+    #[cfg(test)]
+    pub(crate) fn set_kind_for_test(&mut self, id: AgentId, kind: ProcessKind) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.kind = kind;
+        }
     }
 
     /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
@@ -417,6 +482,16 @@ impl Agents {
         }
         self.sync_pane_cadence(cx);
     }
+}
+
+/// Real wall-clock seconds since the Unix epoch, for [`Agent::spawned_at_unix`]. Mirrors
+/// `crate::graph_view::render::unix_now` exactly, including its `unwrap_or(0)` for a system clock
+/// somehow set before 1970 - a nonsense clock shouldn't stop an agent from spawning.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl Default for Agents {

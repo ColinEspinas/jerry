@@ -31,6 +31,11 @@ pub enum TabRef {
     Agent(AgentId),
     File(PathBuf),
     Graph,
+    /// The agent review tab (GitHub issue #225), for the agent it reviews. Unlike `Graph` this
+    /// carries a payload, because a review is inherently *per agent* - that is the entire point
+    /// of the feature - even though, like `Graph`, at most one is open per window at a time
+    /// (`crate::root::AdeApp::review_tab_open`).
+    Review(AgentId),
 }
 
 /// Reconciles a worktree's stored tab order (`crate::root::AdeApp::tab_order`) against what's
@@ -55,13 +60,21 @@ pub fn reconcile_tab_order(
     agents_for_cwd: &[AgentId],
     open_files: &[PathBuf],
     graph_open: bool,
+    review_open: Option<AgentId>,
 ) -> Vec<TabRef> {
+    // GitHub issue #225: a review tab is live only when it's really open *and* the agent it
+    // reviews is one of this worktree's own agents. Both halves matter: the first drops a closed
+    // review tab exactly like every other kind, and the second keeps another worktree's review
+    // tab out of this worktree's strip - `review_open` is a single window-wide slot (like
+    // `graph_open`), but unlike the graph tab a review genuinely belongs to one worktree.
+    let review_live = |id: &AgentId| review_open == Some(*id) && agents_for_cwd.contains(id);
     let mut order: Vec<TabRef> = stored
         .iter()
         .filter(|tab_ref| match tab_ref {
             TabRef::Agent(id) => agents_for_cwd.contains(id),
             TabRef::File(path) => open_files.contains(path),
             TabRef::Graph => graph_open,
+            TabRef::Review(id) => review_live(id),
         })
         .cloned()
         .collect();
@@ -83,6 +96,11 @@ pub fn reconcile_tab_order(
     }
     if graph_open && !order.contains(&TabRef::Graph) {
         order.push(TabRef::Graph);
+    }
+    if let Some(id) = review_open {
+        if review_live(&id) && !order.contains(&TabRef::Review(id)) {
+            order.push(TabRef::Review(id));
+        }
     }
     order
 }
@@ -389,8 +407,20 @@ pub enum ActionKind {
     /// action that force-removes a worktree, preserving uncommitted/untracked content in a real
     /// git stash first).
     DiscardWorktree,
-    /// No backing logic exists yet (git-level review/editor-surface workflows) - always rendered
-    /// disabled regardless of [`FooterAction::implemented`] (always `false` for these).
+    /// GitHub issue #225: opens this agent's **review** tab
+    /// (`crate::review::render::AdeApp::open_review_tab`) - what has changed since this agent
+    /// started, or since the user last marked it reviewed. Deliberately not a second door: this
+    /// row has existed as [`ActionKind::Unimplemented`] since the original design, waiting for
+    /// exactly this feature, and was wired up rather than replaced.
+    ///
+    /// Real, but *conditionally* so: the render call site disables it whenever
+    /// `crate::review::flow::AdeApp::review_available_for` is false (no baseline captured yet, or
+    /// more than one agent open in this worktree - see that method's docs), the same
+    /// state-dependent enablement layered on top of [`FooterAction::implemented`] that
+    /// [`ActionKind::Respawn`] already uses.
+    OpenReview,
+    /// No backing logic exists yet (the editor-surface workflow) - always rendered disabled
+    /// regardless of [`FooterAction::implemented`] (always `false` for these).
     Unimplemented,
 }
 
@@ -441,11 +471,14 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: true,
             },
             FooterAction {
-                kind: ActionKind::Unimplemented,
-                label: "Review diff",
+                kind: ActionKind::OpenReview,
+                // "Review", not "Review diff" (GitHub issue #225): this door leads to the
+                // agent-review surface, and "diff" is the git side's word - see
+                // `crate::review`'s own module docs on the enforced vocabulary split.
+                label: "Review",
                 keycap: None,
                 style: ActionStyle::Outline,
-                implemented: false,
+                implemented: true,
             },
             FooterAction {
                 kind: ActionKind::Unimplemented,
@@ -644,21 +677,45 @@ mod tests {
         );
     }
 
+    /// GitHub issue #225 promoted the review row from a permanently-disabled placeholder to a
+    /// real door into the agent review surface. `Open in editor` is the only row in this strip
+    /// with no backing logic left.
     #[test]
-    fn review_actions_keep_all_and_discard_are_real_review_diff_and_open_in_editor_are_not() {
+    fn every_review_footer_action_except_open_in_editor_now_has_real_backing() {
         let actions = footer_actions(Status::Review);
         for action in &actions {
-            let should_be_implemented = matches!(
-                action.kind,
-                ActionKind::KeepAllChanges | ActionKind::DiscardWorktree
-            );
+            let should_be_implemented = !matches!(action.kind, ActionKind::Unimplemented);
             assert_eq!(
                 action.implemented, should_be_implemented,
-                "{} implemented={} - Revision R10 gave Keep all/Discard worktree real backing, \
-                 Review diff/Open in editor still have none",
+                "{} implemented={} - only `Open in editor` should still be unimplemented",
                 action.label, action.implemented
             );
         }
+        let unimplemented: Vec<&str> = actions
+            .iter()
+            .filter(|action| !action.implemented)
+            .map(|action| action.label)
+            .collect();
+        assert_eq!(unimplemented, vec!["Open in editor"]);
+    }
+
+    /// The review door must be a real [`ActionKind::OpenReview`], not the old placeholder - and
+    /// it must not say "diff", which is the git side's word (see `crate::review`'s module docs on
+    /// the enforced vocabulary split).
+    #[test]
+    fn the_review_footer_door_is_real_and_never_says_diff() {
+        let actions = footer_actions(Status::Review);
+        let review = actions
+            .iter()
+            .find(|action| action.kind == ActionKind::OpenReview)
+            .expect("the Review status footer must offer a real review door");
+        assert!(review.implemented);
+        assert_eq!(review.label, "Review");
+        assert!(
+            !review.label.to_lowercase().contains("diff"),
+            "the review door must not use the git side's own word - got {:?}",
+            review.label
+        );
     }
 
     #[test]
@@ -792,6 +849,7 @@ mod tests {
             &[1, 2],
             &[PathBuf::from("a.rs"), PathBuf::from("b.rs")],
             false,
+            None,
         );
         assert_eq!(
             order,
@@ -814,7 +872,7 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false);
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false, None);
         assert_eq!(order, stored);
     }
 
@@ -828,7 +886,7 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[2], &[], false);
+        let order = reconcile_tab_order(&stored, &[2], &[], false, None);
         assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
@@ -837,7 +895,7 @@ mod tests {
     #[test]
     fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
         let stored = vec![TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false);
+        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false, None);
         assert_eq!(
             order,
             vec![
@@ -853,7 +911,7 @@ mod tests {
     /// gets, not silently dropped or given a hardcoded fixed position.
     #[test]
     fn reconcile_appends_a_freshly_opened_graph_tab() {
-        let order = reconcile_tab_order(&[], &[1], &[], true);
+        let order = reconcile_tab_order(&[], &[1], &[], true, None);
         assert_eq!(order, vec![TabRef::Agent(1), TabRef::Graph]);
     }
 
@@ -863,7 +921,7 @@ mod tests {
     #[test]
     fn reconcile_preserves_a_stored_graph_tab_position() {
         let stored = vec![TabRef::Graph, TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1], &[], true);
+        let order = reconcile_tab_order(&stored, &[1], &[], true, None);
         assert_eq!(order, stored);
     }
 
@@ -873,8 +931,49 @@ mod tests {
     #[test]
     fn reconcile_drops_a_closed_graph_tab() {
         let stored = vec![TabRef::Agent(1), TabRef::Graph];
-        let order = reconcile_tab_order(&stored, &[1], &[], false);
+        let order = reconcile_tab_order(&stored, &[1], &[], false, None);
         assert_eq!(order, vec![TabRef::Agent(1)]);
+    }
+
+    /// GitHub issue #225: a freshly opened review tab is appended like every other kind.
+    #[test]
+    fn reconcile_appends_a_freshly_opened_review_tab() {
+        let order = reconcile_tab_order(&[], &[1], &[], false, Some(1));
+        assert_eq!(order, vec![TabRef::Agent(1), TabRef::Review(1)]);
+    }
+
+    #[test]
+    fn reconcile_preserves_a_stored_review_tab_position() {
+        let stored = vec![TabRef::Review(1), TabRef::Agent(1)];
+        assert_eq!(
+            reconcile_tab_order(&stored, &[1], &[], false, Some(1)),
+            stored
+        );
+    }
+
+    #[test]
+    fn reconcile_drops_a_closed_review_tab() {
+        let stored = vec![TabRef::Agent(1), TabRef::Review(1)];
+        let order = reconcile_tab_order(&stored, &[1], &[], false, None);
+        assert_eq!(order, vec![TabRef::Agent(1)]);
+    }
+
+    /// A review tab whose agent has closed must be dropped even while `review_open` still names
+    /// it - otherwise the strip would keep rendering a tab for an agent that no longer exists,
+    /// exactly the dangling-entry class `reconcile_tab_order` exists to prevent.
+    #[test]
+    fn reconcile_drops_a_review_tab_whose_agent_is_gone() {
+        let stored = vec![TabRef::Review(7)];
+        assert!(reconcile_tab_order(&stored, &[], &[], false, Some(7)).is_empty());
+    }
+
+    /// The review tab belongs to *one* worktree's strip - the worktree its agent runs in. Another
+    /// worktree's strip must not show it, even though `review_open` is a single window-wide slot.
+    #[test]
+    fn a_review_tab_never_leaks_into_another_worktrees_strip() {
+        // Worktree B's strip: its own agent 2 is open, but the review is for agent 1 (worktree A).
+        let order = reconcile_tab_order(&[], &[2], &[], false, Some(1));
+        assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
     /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands

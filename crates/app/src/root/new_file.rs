@@ -388,6 +388,14 @@ impl AdeApp {
         // `graph_tab_active` (so `Self::render_center_pane` kept showing the graph, not this new
         // file) with `Window::focus` on `code_focus_handle`, which isn't in that frame either.
         self.leave_graph_tab(window, cx);
+        // GitHub issue #225: the review tab occupies the centre pane exactly as the graph tab
+        // does, so it needs the identical teardown here. Without this, `review_tab_active` stayed
+        // set, `render_center_pane` kept returning the review body, and the tab this call is
+        // switching *to* never mounted at all - while real focus had already moved onto it. Found
+        // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
+        // discipline and, in exactly this way, did not.
+        self.leave_review_tab(window, cx);
+
         self.focus_code_surface(window, cx);
         self.pending_cursor_line = None;
         if !self

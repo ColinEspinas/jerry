@@ -104,6 +104,18 @@ impl AdeApp {
             .map(crate::work_surface::tab_order_state::TabOrderState::load_at)
             .unwrap_or_default();
 
+        // GitHub issue #225's review baselines resolve the same way, for the same reasons - see
+        // `crate::review::baseline_state`'s module docs, including the honest note that nothing
+        // can reconnect a loaded baseline to a live agent yet (agent ids don't survive a restart).
+        // Loaded anyway so the file is merged into rather than clobbered on the first save.
+        let review_baseline_path = settings_path
+            .as_deref()
+            .map(crate::review::baseline_state::review_baseline_path_for);
+        let review_baseline_state = review_baseline_path
+            .as_deref()
+            .map(crate::review::baseline_state::ReviewBaselineState::load_at)
+            .unwrap_or_default();
+
         // The repo-list file mirrors the fold-state file's own resolution one line up (see
         // `rail::repo`'s module docs for why it's the identical pattern): a sibling of whatever
         // settings path this instance was given, `None` (and so no persistence at all) for a test
@@ -227,7 +239,22 @@ impl AdeApp {
             changes_rows_scroll_handle: UniformListScrollHandle::new(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
-            file_authorship: changes::Authorship::default(),
+            agent_reviews: HashMap::new(),
+            review_baseline_state,
+            review_baseline_path,
+            review_baselines_owned: std::collections::BTreeSet::new(),
+            review_mark_in_flight: None,
+            review_tab_open: None,
+            review_tab_active: false,
+            review_focus_handle: cx.focus_handle(),
+            review_focus: OverlayFocus::default(),
+            review_scroll_handle: UniformListScrollHandle::new(),
+            review_highlight_cache: None,
+            _review_baseline_tasks: HashMap::new(),
+            _review_load_task: None,
+            _review_mark_task: None,
+            _review_release_tasks: HashMap::new(),
+            _review_persist_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
@@ -573,7 +600,7 @@ impl AdeApp {
                 // other. `focus_active` below moves real keyboard focus onto it - see
                 // `Agents::focus_active`'s docs and this crate's `OverlayFocus`/`restore_focus`
                 // docs for why a *focused* window must never start with `Window::focus == None`.
-                this.agents.spawn(
+                let startup_agent = this.agents.spawn(
                     ProcessKind::Shell,
                     path.clone(),
                     this.settings.appearance.terminal_font_size,
@@ -581,6 +608,14 @@ impl AdeApp {
                     window,
                     cx,
                 );
+                // GitHub issue #225: the startup shell is a real agent like any other and needs a
+                // real review baseline too. This is the *second* `Agents::spawn` call site in the
+                // app (`Self::new_agent` is the other), and it is deliberately hooked separately
+                // rather than folded into `Agents::spawn` itself - see
+                // `crate::review::flow::AdeApp::capture_review_baseline`'s docs for why `Agents`
+                // stays out of the git-snapshot business. Missing this would have left exactly one
+                // agent - the one every window starts with - permanently without a review.
+                this.capture_review_baseline(startup_agent, cx);
                 this.agents.focus_active(window, cx);
                 this.load_worktrees(cx);
                 this.load_file_tree(path.clone(), cx);

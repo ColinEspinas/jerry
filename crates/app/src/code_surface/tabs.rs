@@ -40,11 +40,6 @@ impl AdeApp {
         self.diff_state = DiffLoadState::Loading;
         self.diff_totals = None;
         self.dirty_files = None;
-        // A reloaded diff is a new worktree's (or the same worktree's freshly re-read) file
-        // list - any authorship recorded against the *previous* one belongs to files that may
-        // not even be in this diff anymore. See `changes::Authorship`'s own docs for why this is
-        // always empty today regardless (no real tracking wired up yet).
-        self.file_authorship = changes::Authorship::default();
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let (diff_result, staged_result, dirty_result) = cx
@@ -185,6 +180,14 @@ impl AdeApp {
         // its own `code_focus.capture()` never captures a handle that's about to stop being
         // rendered. See `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs.
         self.leave_graph_tab(window, cx);
+        // GitHub issue #225: the review tab occupies the centre pane exactly as the graph tab
+        // does, so it needs the identical teardown here. Without this, `review_tab_active` stayed
+        // set, `render_center_pane` kept returning the review body, and the tab this call is
+        // switching *to* never mounted at all - while real focus had already moved onto it. Found
+        // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
+        // discipline and, in exactly this way, did not.
+        self.leave_review_tab(window, cx);
+
         if focus_editor {
             self.focus_code_surface(window, cx);
         }
@@ -343,6 +346,14 @@ impl AdeApp {
         // See `Self::open_and_focus_file`'s identical call for why this must run before
         // `focus_code_surface` below.
         self.leave_graph_tab(window, cx);
+        // GitHub issue #225: the review tab occupies the centre pane exactly as the graph tab
+        // does, so it needs the identical teardown here. Without this, `review_tab_active` stayed
+        // set, `render_center_pane` kept returning the review body, and the tab this call is
+        // switching *to* never mounted at all - while real focus had already moved onto it. Found
+        // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
+        // discipline and, in exactly this way, did not.
+        self.leave_review_tab(window, cx);
+
         self.focus_code_surface(window, cx);
         let has_diff = self
             .current_diff()

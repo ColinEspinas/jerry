@@ -25,6 +25,7 @@ pub mod palette;
 // to close. Nothing outside this crate has any business calling it directly.
 pub(crate) mod persisted_state_lock;
 pub mod rail;
+pub mod review;
 pub mod root;
 pub mod settings;
 pub mod sidebar;

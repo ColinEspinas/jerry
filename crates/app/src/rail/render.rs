@@ -1,6 +1,5 @@
 use super::*;
 use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -136,26 +135,17 @@ impl AdeApp {
                     None => agent.cwd.display().to_string(),
                 };
 
-                // See `AgentRow::review_file_count`'s own docs: a review-ready agent outside
-                // the one worktree currently loaded in Zone 3 (`Self::diff_root`) has no diff data
-                // to report and stays `None` rather than a fabricated count. Within that worktree,
-                // the count is only unambiguous when this agent is the sole agent there - with
-                // more than one agent sharing the worktree, attributing which files are "this
-                // agent's" needs real per-agent authorship tracking, which doesn't exist yet (see
-                // `crate::sidebar::changes::Authorship`'s own docs), so that case also stays `None`
-                // rather than reporting every agent's row as authoring zero files.
-                let review_file_count =
-                    if status_value == Status::Review && agent.cwd == self.diff_root {
-                        let agents_in_worktree =
-                            self.agents.iter().filter(|s| s.cwd == agent.cwd).count();
-                        if agents_in_worktree <= 1 {
-                            self.current_diff().map(|diff| diff.files.len())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                // GitHub issue #225: a real per-agent count, read from this agent's *own* review
+                // against its *own* baseline (`Self::agent_review_file_count`) - no longer the
+                // whole worktree's git diff, which was never this agent's answer and was only
+                // ever available for the one worktree currently loaded in Zone 3. It is now real
+                // for every single-agent worktree, loaded or not. See that method's own docs for
+                // exactly when it stays `None`.
+                let review_file_count = if status_value == Status::Review {
+                    self.agent_review_file_count(agent.id)
+                } else {
+                    None
+                };
 
                 AgentRow {
                     id: agent.id,
@@ -255,36 +245,68 @@ impl AdeApp {
             loop {
                 cx.background_executor().timer(STATUS_POLL_INTERVAL).await;
 
-                let Ok((worktrees, diff_paths, pids)) = this.update(cx, |this, cx| {
-                    let worktrees: Vec<rail::WorktreeQuery> = this
-                        .worktrees
-                        .iter()
-                        .filter(|item| item.error.is_none())
-                        .map(|item| rail::WorktreeQuery {
-                            path: item.path.clone(),
-                            is_main: item.is_main,
-                            is_locked: item.is_locked,
-                        })
-                        .collect();
-                    let diff_paths: Vec<PathBuf> =
-                        this.agents.iter().map(|agent| agent.cwd.clone()).collect();
-                    let pids: Vec<u32> = this
-                        .agents
-                        .iter()
-                        .filter_map(|agent| agent.pane.read(cx).pid())
-                        .collect();
-                    (worktrees, diff_paths, pids)
-                }) else {
+                let Ok((worktrees, diff_paths, pids, review_targets)) =
+                    this.update(cx, |this, cx| {
+                        let worktrees: Vec<rail::WorktreeQuery> = this
+                            .worktrees
+                            .iter()
+                            .filter(|item| item.error.is_none())
+                            .map(|item| rail::WorktreeQuery {
+                                path: item.path.clone(),
+                                is_main: item.is_main,
+                                is_locked: item.is_locked,
+                            })
+                            .collect();
+                        let diff_paths: Vec<PathBuf> =
+                            this.agents.iter().map(|agent| agent.cwd.clone()).collect();
+                        let pids: Vec<u32> = this
+                            .agents
+                            .iter()
+                            .filter_map(|agent| agent.pane.read(cx).pid())
+                            .collect();
+                        // GitHub issue #225: every agent with a captured baseline, to be measured
+                        // against it below.
+                        let review_targets = this.review_measure_targets();
+                        (worktrees, diff_paths, pids, review_targets)
+                    })
+                else {
                     break;
                 };
 
-                let (snapshot, process_samples, next_prev) = cx
+                let (snapshot, process_samples, next_prev, review_measurements) = cx
                     .background_executor()
                     .spawn(async move {
                         let snapshot = rail::compute_status_snapshot(&worktrees, &diff_paths);
                         let (process_samples, next_prev) =
                             process_stats::sample_processes(&pids, prev_process_samples);
-                        (snapshot, process_samples, next_prev)
+                        // GitHub issue #225: each agent's own unreviewed set, measured against
+                        // its own baseline. `changed_paths_against_tree` is one
+                        // `git diff --name-only` process per agent with no hunk parsing - the
+                        // cheap counterpart to the full review the tab itself loads.
+                        //
+                        // This runs on the *poll*, not only when the Review tab is open, and that
+                        // is load-bearing rather than eager: `Status::Review` is what surfaces the
+                        // footer's `Review` door, the door is what opens the tab, and the tab is
+                        // what loads the full diff - so measuring only inside the tab would be
+                        // circular and nothing would ever become reviewable at all.
+                        //
+                        // A failed measurement is dropped rather than recorded as an empty set;
+                        // see `AdeApp::apply_review_measurements`.
+                        let review_measurements: Vec<(
+                            crate::work_surface::agents::AgentId,
+                            String,
+                            Vec<PathBuf>,
+                        )> = review_targets
+                            .into_iter()
+                            .filter_map(|(id, worktree, tree_id, untracked)| {
+                                let paths = wt_core::review::changed_paths_against_tree(
+                                    &worktree, &tree_id, untracked,
+                                )
+                                .ok()?;
+                                Some((id, tree_id, paths))
+                            })
+                            .collect();
+                        (snapshot, process_samples, next_prev, review_measurements)
                     })
                     .await;
                 prev_process_samples = next_prev;
@@ -294,6 +316,7 @@ impl AdeApp {
                     this.worktree_notes = snapshot.worktree_notes;
                     this.ahead_behind_cache = snapshot.ahead_behind;
                     this.process_stats = process_samples;
+                    this.apply_review_measurements(review_measurements);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -1046,23 +1069,6 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The worktree row's `⚠ N` shared-file flag (§2.2's trailing slot, §4's "files two agents
-    /// both wrote") - real, but only for whichever worktree's diff is currently loaded in
-    /// Zone 3 ([`Self::diff_root`]): [`Self::file_authorship`] is scoped to that one diff (see
-    /// its own docs), not tracked per-worktree yet, so every other row has no data to report and
-    /// gets a real `0` (hidden by the render side's own "only when ≥1" gate) rather than a
-    /// fabricated count.
-    pub(in crate::rail) fn worktree_shared_file_count(&self, worktree_path: &Path) -> usize {
-        if worktree_path != self.diff_root {
-            return 0;
-        }
-        let Some(diff) = self.current_diff() else {
-            return 0;
-        };
-        self.file_authorship
-            .shared_file_count(diff.files.iter().map(|f| f.path.as_path()))
-    }
-
     /// One worktree row (§2.2: 27 high, padding `0 10 0 6`, gap 6) plus, when expanded, its
     /// agent rows (§2.3) - the rail's real "worktree owns N agents" structure. `index` (unique
     /// within its repo group) disambiguates element ids for the real degenerate case
@@ -1133,8 +1139,6 @@ impl AdeApp {
         } else {
             theme::text::DIM.into()
         };
-
-        let shared_count = self.worktree_shared_file_count(&row.path);
 
         let caret = if has_agents {
             let worktree_path = row.path.clone();
@@ -1235,17 +1239,6 @@ impl AdeApp {
                 )
             })
             .child(div().flex_1().min_w(px(2.0)))
-            .when(shared_count > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .font(font(theme::font::MONO))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(self.ui_text_size(9.0))
-                        .text_color(theme::status::ASK_CARD_FG)
-                        .child(format!("\u{26a0} {shared_count}")),
-                )
-            })
             .child(trailing);
 
         let mut container = div()
@@ -1548,6 +1541,7 @@ mod prune_regression_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
 

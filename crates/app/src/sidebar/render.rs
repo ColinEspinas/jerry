@@ -1740,9 +1740,8 @@ impl AdeApp {
         column.into_any_element()
     }
 
-    /// One Changes row: a staging checkbox, `dir`/`name`, a `flex:none` per-author chip group
-    /// (Revision R12 §5, multi-agent worktrees only - see [`Self::render_change_author_chips`]),
-    /// an optional tag pill, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the
+    /// One Changes row: a staging checkbox, `dir`/`name`, an optional tag pill, `+n`/`−n`, and
+    /// the five-segment stat bar. Clicking anywhere on the
     /// row other than the checkbox itself (see [`Self::render_staging_checkbox`]'s
     /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
     /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
@@ -1774,7 +1773,6 @@ impl AdeApp {
         let (dir, name) = changes::split_dir_name(&file.path);
         let tag = changes::change_tag(file.status);
         let segments = changes::stat_bar_segments(add, del);
-        let author_chips = self.render_change_author_chips(&file.path);
 
         // See `Self::render_file_tree_row`'s own `debug_selector` for why this exists, and why
         // the closure borrows `file` instead of capturing an owned `String`.
@@ -1846,7 +1844,6 @@ impl AdeApp {
                     })
                     .child(name),
             )
-            .when_some(author_chips, |el, chips| el.child(chips))
             .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
             // Alongside `tag`, never instead of it: a file added by a commit on this branch is
             // genuinely both `new` (relative to the base) and `committed`.
@@ -1874,68 +1871,6 @@ impl AdeApp {
                     .child(format!("\u{2212}{del}")),
             )
             .child(render_stat_bar(segments))
-    }
-
-    /// The Changes row's `flex:none` per-file author chip group (Revision R12 §5): one
-    /// [`render_change_author_chip`] per agent [`AdeApp::file_authorship`] records as having
-    /// written this file, with a 1px amber ring (`theme::status::ASK_CARD_EDGE`) once it has more
-    /// than one. `None` (never an empty-but-present group) unless the currently selected
-    /// worktree has more than one agent - [`Self::current_worktree_agent_count`] is this
-    /// gate, per the design's own reasoning: with a single agent every chip would be identical
-    /// and carry no information.
-    ///
-    /// `file_authorship` is real, wired data (`crate::sidebar::changes::Authorship::authors_for`)
-    /// that today is always empty - the heuristic that records edits into it lives on a separate,
-    /// not-yet-merged branch (see [`crate::root::AdeApp::file_authorship`]'s own docs) - so a
-    /// multi-agent worktree renders a real, ringless, chip-less group until that heuristic lands,
-    /// rather than fabricating a chip for an agent nobody recorded.
-    pub(in crate::sidebar) fn render_change_author_chips(
-        &self,
-        path: &Path,
-    ) -> Option<impl IntoElement> {
-        if self.current_worktree_agent_count() <= 1 {
-            return None;
-        }
-        let ring: gpui::Rgba = if self.file_authorship.has_multiple_authors(path) {
-            theme::status::ASK_CARD_EDGE.into()
-        } else {
-            work_surface::TRANSPARENT
-        };
-        let mut group = div()
-            .flex_none()
-            .flex()
-            .gap(px(2.0))
-            .p(px(1.0))
-            .rounded(theme::radius::BUTTON)
-            .border_1()
-            .border_color(ring);
-        for &id in self.file_authorship.authors_for(path) {
-            if let Some(kind) = self.agent_kind_for(id) {
-                group = group.child(render_change_author_chip(kind));
-            }
-        }
-        Some(group)
-    }
-
-    /// Resolves a recorded author's [`ProcessKind`] for chip tinting - `None` if that agent has
-    /// since closed (its process exited, its tab closed), in which case
-    /// [`Self::render_change_author_chips`] simply omits the chip rather than guessing a kind for
-    /// an agent that no longer exists.
-    fn agent_kind_for(&self, id: AgentId) -> Option<ProcessKind> {
-        self.agents
-            .iter()
-            .find(|agent| agent.id == id)
-            .map(|agent| agent.kind)
-    }
-
-    /// How many distinct agent (non-`Shell`) processes are running in the currently selected
-    /// worktree - Revision R12 §5's gate for the Changes row author chip group. Reuses
-    /// [`Self::current_worktree_agents`] (`crate::work_surface::render`) so this and the tab
-    /// strip can never disagree about which agents belong to the selected worktree.
-    pub(in crate::sidebar) fn current_worktree_agent_count(&self) -> usize {
-        self.current_worktree_agents()
-            .filter(|agent| agent.kind.is_agent_session())
-            .count()
     }
 
     /// The Changes row's 12×12 staging checkbox (Revision R12 §5: the checkbox **is** staging,
@@ -2551,31 +2486,6 @@ fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement 
                 .text_color(theme::text::FAINTER)
                 .child(sub),
         )
-}
-
-/// One author chip in a Changes row's chip group (Revision R12 §5) - the same 13×13 visual
-/// template `Self::render_lang_chip` uses for the file tree's language chip
-/// (`crate::sidebar::file_tree::LangChip`), tinted per-agent via
-/// `work_surface::agent_tint`/`work_surface::agent_initial` (`work_surface::state`'s existing
-/// per-agent colour convention, already the tab strip's own source of truth) rather than a
-/// second, independently-tinted chip style.
-pub(in crate::sidebar) fn render_change_author_chip(kind: ProcessKind) -> impl IntoElement {
-    let (fg, bg) = work_surface::agent_tint(kind);
-    let initial = work_surface::agent_initial(kind);
-    div()
-        .flex_none()
-        .w(px(13.0))
-        .h(px(13.0))
-        .rounded(theme::radius::CHIP)
-        .bg(bg)
-        .flex()
-        .items_center()
-        .justify_center()
-        .font(font(theme::font::MONO))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_size(px(7.5))
-        .text_color(fg)
-        .child(initial)
 }
 
 /// Which data source the right sidebar currently shows for the selected worktree - Zone 3's

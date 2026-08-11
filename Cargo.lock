@@ -9500,6 +9500,7 @@ name = "wt-core"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
 ]
