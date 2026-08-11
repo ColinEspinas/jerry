@@ -3,7 +3,7 @@
 use crate::root::AdeApp;
 use crate::text_history::TextField;
 use crate::theme;
-use gpui::{Bounds, Context, FocusHandle, Pixels, ScrollHandle, Task};
+use gpui::{Bounds, Context, FocusHandle, Pixels, ScrollHandle, Task, UniformListScrollHandle};
 use std::collections::HashMap;
 use wt_core::graph::{Graph, GraphScope};
 use wt_core::remote::PushForce;
@@ -117,7 +117,13 @@ pub(crate) struct GraphTabState {
     /// `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` has a real handle to draw
     /// against - every other scrollable region in the app has had one since GitHub issue #30;
     /// the graph tab shipped after that audit and was never retrofitted.
-    pub rows_scroll_handle: ScrollHandle,
+    ///
+    /// A `UniformListScrollHandle` rather than a plain `ScrollHandle` since GitHub issue #218:
+    /// the row list is a real `gpui::uniform_list` now, which owns its own scroll offset and
+    /// tracks it through this type (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`).
+    /// `crate::root::scrollbar::ScrollableHandle` is implemented for both kinds, so the
+    /// scrollbar call site is unchanged - see that trait's own docs.
+    pub rows_scroll_handle: UniformListScrollHandle,
     /// The Commit panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
     pub commit_panel_scroll_handle: ScrollHandle,
     /// The Branches panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
@@ -143,7 +149,7 @@ impl GraphTabState {
             remote_op_in_flight: false,
             push_force_confirm_armed: None,
             _remote_op_task: None,
-            rows_scroll_handle: ScrollHandle::new(),
+            rows_scroll_handle: UniformListScrollHandle::new(),
             commit_panel_scroll_handle: ScrollHandle::new(),
             branches_scroll_handle: ScrollHandle::new(),
         }
