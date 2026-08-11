@@ -7,7 +7,8 @@ use crate::root::widgets::{menu_popover_chrome, render_sidebar_message, render_t
 use crate::settings::widgets;
 use crate::sidebar::changes;
 use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
-use gpui::{KeyDownEvent, Pixels};
+use gpui::{uniform_list, KeyDownEvent, Pixels};
+use std::ops::Range;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
@@ -1024,10 +1025,36 @@ impl AdeApp {
             )
     }
 
-    /// The row list - not virtualized (a reasonable, honest simplification for phase (a) given
-    /// `wt_core::graph::DEFAULT_MAX_COMMITS` already caps loaded data at 500 rows; a
-    /// `uniform_list` upgrade is real future work if that turns out to matter for perf, not a
-    /// correctness gap).
+    /// The row list - a real `gpui::uniform_list` (GitHub issue #218: "when displaying a big git
+    /// history the git graph is laggy").
+    ///
+    /// **Scrolling lives in the list itself, not in a wrapper.** Until this fix every one of the
+    /// up to `wt_core::graph::DEFAULT_MAX_COMMITS` (500) loaded rows was built, laid out and
+    /// painted on *every single frame*, inside a plain `div().overflow_y_scroll()` - including
+    /// all the ones scrolled off screen (at `theme::graph::ROW`'s 26px, a 1080p window shows on
+    /// the order of 30 of them), each carrying a `gpui::canvas` lane painter, its ref chips and
+    /// a `⋯` trigger button. That is structurally the same per-frame cost
+    /// `crate::sidebar::render::AdeApp::render_file_tree` was carrying before it was virtualized,
+    /// where it measured as ~72% of a whole `Window::draw` - that number is the file tree's, on
+    /// its own row shape, not a measurement of this list; what is measured here is
+    /// `super::render::graph_virtualization_tests`' own before/after, i.e. that a row far below
+    /// the viewport stopped being built at all. This method deliberately follows that one's
+    /// structure rather than inventing a second pattern.
+    ///
+    /// Two things about `uniform_list` are load-bearing:
+    /// - its default `ListSizingBehavior::Auto` gives it zero intrinsic height, so every pixel
+    ///   of its height comes from the `.flex_1().min_h_0()` below - drop either and the list
+    ///   renders zero rows, with no panic and no warning;
+    /// - it sets its own `overflow.y = Scroll` and owns the scroll offset, so it needs no
+    ///   `overflow_y_scroll()` wrapper and must not be given one. (Re-adding one here was tried
+    ///   directly and did *not* defeat the virtualization the way `render_file_tree`'s docs warn
+    ///   it can - the `.flex_1().min_h_0()` still resolved against the wrapper's definite height
+    ///   - so this is redundancy to avoid, not a live trap on this particular call site.)
+    ///
+    /// Its one real requirement - a fixed row height - is already satisfied: every commit row is
+    /// exactly `theme::graph::ROW` tall (see [`Self::render_graph_row`]), and so is the trailing
+    /// truncation notice ([`render_graph_truncation_row`]), which is a genuine item of this list
+    /// rather than a sibling appended outside it.
     fn render_graph_rows(&self, graph: &Graph, cx: &mut Context<Self>) -> gpui::AnyElement {
         if graph.rows.is_empty() {
             return div()
@@ -1041,37 +1068,49 @@ impl AdeApp {
                 .child("no commits reachable from this scope")
                 .into_any_element();
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let mut list = div()
-            .id("graph-rows")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.graph_state.rows_scroll_handle);
-        for (index, row) in graph.rows.iter().enumerate() {
-            list = list.child(self.render_graph_row(index, row, graph.lane_count, now, cx));
-        }
-        if graph.truncated {
-            list = list.child(
-                div()
-                    .flex_none()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!(
-                        "showing the first {} commits",
-                        wt_core::graph::DEFAULT_MAX_COMMITS
-                    )),
-            );
-        }
-        // GitHub issue #142.
+        // Resolved once per frame rather than inside the row builder: `uniform_list` invokes that
+        // closure several times per frame (measure, prepaint, then the real visible range), and
+        // a wall-clock read per call could hand two rows of the same frame different "now"s.
+        let now = unix_now();
+
+        let list = uniform_list(
+            "graph-rows",
+            graph_item_count(graph),
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
+                // Re-resolved from `this` rather than captured: the closure is `'static` and
+                // cannot borrow the `&Graph` this method was handed, and re-reading it means a
+                // reload that replaced the whole graph between this frame's `item_count` read and
+                // this call renders fewer rows instead of indexing a stale snapshot. Mirrors
+                // `crate::sidebar::render::AdeApp::render_changes_rows`'s identical re-resolve -
+                // and it costs no `GraphRow` clones at all, which capturing would have.
+                let Some(graph) = this.current_graph() else {
+                    return Vec::new();
+                };
+                // Clamped rather than trusted, and `start` against `end` rather than only against
+                // the length, so a divergence degrades to "renders fewer rows" instead of
+                // panicking on an inverted range.
+                let end = range.end.min(graph_item_count(graph));
+                let start = range.start.min(end);
+                (start..end)
+                    .map(|index| match graph.rows.get(index) {
+                        Some(row) => this
+                            .render_graph_row(index, row, graph.lane_count, now, cx)
+                            .into_any_element(),
+                        // The one index past the last row, which `graph_item_count` only hands
+                        // out when the walk was genuinely truncated.
+                        None => render_graph_truncation_row().into_any_element(),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .track_scroll(&self.graph_state.rows_scroll_handle);
+
+        // GitHub issue #142. The scrollbar is a *sibling* of the list inside this non-scrolling
+        // `.relative()` wrapper, never a child of it - see
+        // `crate::sidebar::render::AdeApp::render_file_tree`'s own docs for why a scrollbar
+        // painted as a scrolling element's own child scrolls away with the content.
         div()
             .relative()
             .flex()
@@ -1861,6 +1900,40 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// How many items [`AdeApp::render_graph_rows`]' `uniform_list` has: one per loaded commit row,
+/// plus the trailing truncation notice when - and only when - the walk really was cut short by
+/// `wt_core::graph::DEFAULT_MAX_COMMITS`. Shared by the `item_count` argument and the row
+/// builder's own clamp so the two can never disagree about where the notice lives.
+fn graph_item_count(graph: &Graph) -> usize {
+    graph.rows.len() + usize::from(graph.truncated)
+}
+
+/// The "showing the first N commits" notice - a real, honest statement that
+/// `wt_core::graph::build_graph` stopped at its own cap, so the bottom of this list is not the
+/// bottom of the history.
+///
+/// The final *item* of the row list rather than a sibling below it, which is what keeps it
+/// scrolling with the rows it is talking about. That makes it subject to `uniform_list`'s fixed
+/// row height, which is sized from item 0 alone, so it carries the same `theme::graph::ROW`
+/// height every commit row does - a taller notice would simply be overlapped by nothing and
+/// clipped, with no panic and no warning.
+fn render_graph_truncation_row() -> impl IntoElement {
+    div()
+        .debug_selector(|| "graph-rows-truncated-notice".to_string())
+        .flex()
+        .items_center()
+        .w_full()
+        .h(theme::graph::ROW)
+        .px(px(12.0))
+        .font(font(theme::font::MONO))
+        .text_size(px(10.0))
+        .text_color(theme::text::GHOST)
+        .child(format!(
+            "showing the first {} commits",
+            wt_core::graph::DEFAULT_MAX_COMMITS
+        ))
 }
 
 fn render_graph_meta_row(label: &'static str, value: String) -> impl IntoElement {
@@ -5828,6 +5901,233 @@ mod graph_remote_action_tests {
                 .is_some_and(|text| text.starts_with("Rebase failed:")),
             "a real conflicting rebase must surface as a real, visible failure message, not a \
              silent success or a panic - got {status:?}"
+        );
+    }
+}
+
+/// Real, live-rendered proof that the commit row list is genuinely virtualized (GitHub issue
+/// #218) - that a row scrolled far below the viewport is not merely *invisible* but never becomes
+/// a painted element at all.
+///
+/// This is the property the whole fix rests on, and none of it is observable from the pure
+/// `wt_core::graph` logic: `build_graph` returns exactly the same rows either way. Only a real
+/// render can tell "built 200 rows and clipped 170 of them" apart from "built 30". These tests
+/// therefore also assert the *positive* half - that the rows which should paint really do, and
+/// that the ones which don't are still reachable by really scrolling - so a future change that
+/// "virtualizes" by rendering nothing fails here rather than passing.
+///
+/// Both of the first two tests were run against the pre-fix eager `flex_col` before being
+/// committed, and both genuinely failed against it (row 199 was painted); they pass against the
+/// `uniform_list`. That is what they measure and all they measure.
+///
+/// **What they do not catch, honestly:** re-wrapping the list in an outer `overflow_y_scroll()`
+/// container - the trap `crate::sidebar::render::AdeApp::render_file_tree`'s docs warn about -
+/// was tried here directly, and this list kept virtualizing anyway, because the `uniform_list`'s
+/// own `.flex_1().min_h_0()` still resolves against the outer scroller's definite height rather
+/// than growing to the full virtual one. So no assertion below claims to guard that; the only
+/// thing keeping the wrapper away is [`AdeApp::render_graph_rows`]' own structure and docs.
+///
+/// Mirrors `crate::sidebar::render::virtualization_tests`, the same proof for the file tree and
+/// the Changes list.
+#[cfg(test)]
+mod graph_virtualization_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Entity, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test User"]);
+    }
+
+    /// `count` real commits, and a clean working tree at the end so `build_graph` adds no
+    /// "Uncommitted changes" row to shift the indices these tests name by literal selector.
+    ///
+    /// `--allow-empty` keeps the seed cheap: what is being measured here is how many *rows* get
+    /// painted, and an empty commit is as real a `GraphRow` as any other.
+    fn seed_commits(dir: &std::path::Path, count: usize) {
+        init_repo(dir);
+        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "first"]);
+        for index in 1..count {
+            git(
+                dir,
+                &["commit", "--allow-empty", "-m", &format!("c{index}")],
+            );
+        }
+    }
+
+    fn open_graph_on<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &std::path::Path,
+    ) -> (Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    /// The test viewport is 1920x1080 (`gpui`'s own test display), so at `theme::graph::ROW`'s
+    /// 26px a little over 30 commit rows can possibly be on screen at once. 200 rows is far past
+    /// that in every direction, and still well under `wt_core::graph::DEFAULT_MAX_COMMITS`, so
+    /// this measures virtualization alone rather than the load cap.
+    const SEEDED_COMMITS: usize = 200;
+
+    #[gpui::test]
+    fn a_graph_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), SEEDED_COMMITS);
+        let (_app, cx) = open_graph_on(cx, repo.path());
+
+        assert!(
+            cx.debug_bounds("graph-row-0").is_some(),
+            "the first commit row must really paint - if it doesn't, this test proves nothing \
+             about virtualization, only that the graph is empty"
+        );
+        assert!(
+            cx.debug_bounds("graph-row-199").is_none(),
+            "the 200th commit row is far below any plausible viewport, so a virtualized list \
+             must never build it as an element at all - this is exactly what the pre-fix eager \
+             `flex_col` did, and what this assertion was checked to genuinely fail against"
+        );
+    }
+
+    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
+    /// must still be reachable. This scrolls the real list with a real `gpui::ScrollWheelEvent`
+    /// and asserts the row that was absent genuinely materializes - which simultaneously proves
+    /// the list still scrolls at all now that the former `div().overflow_y_scroll()` wrapper is
+    /// gone, the one behaviour this change could plausibly have broken outright.
+    #[gpui::test]
+    fn scrolling_the_virtualized_graph_materializes_a_row_that_was_not_painted(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), SEEDED_COMMITS);
+        let (_app, cx) = open_graph_on(cx, repo.path());
+
+        let first_row = cx
+            .debug_bounds("graph-row-0")
+            .expect("the first commit row must really paint");
+        assert!(
+            cx.debug_bounds("graph-row-199").is_none(),
+            "precondition: the last row must not be painted before scrolling"
+        );
+
+        // A deliberately huge delta: `uniform_list` clamps to its own real maximum scroll offset,
+        // so this lands at the true bottom without this test having to model row heights or the
+        // viewport itself.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first_row.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("graph-row-199").is_some(),
+            "scrolling to the bottom must really materialize the last row - if this fails the \
+             list is not scrollable any more, which is a far worse regression than the per-frame \
+             render cost this change set out to fix"
+        );
+        assert!(
+            cx.debug_bounds("graph-row-0").is_none(),
+            "and the rows scrolled off the top must stop being built, not merely move - a list \
+             that keeps painting them is not virtualizing, it is just translating"
+        );
+    }
+
+    /// The truncation notice is now the final *item* of the virtualized list rather than a
+    /// sibling appended below it, so it has to (a) still exist, (b) sit below the last real row
+    /// rather than floating anywhere else, and (c) respect the fixed row height every other item
+    /// has - `uniform_list` sizes every slot from item 0 alone, so a notice that disagreed with
+    /// `theme::graph::ROW` would be laid out at the wrong height with no panic and no warning.
+    ///
+    /// The truncated graph here is real `wt_core::graph::build_graph` output, walked with an
+    /// explicit small `max_commits` rather than a repository of 501 commits - the same real code
+    /// path and the same real `Graph::truncated` flag `DEFAULT_MAX_COMMITS` sets, at a seed cost
+    /// this test suite can afford.
+    #[gpui::test]
+    fn the_truncation_notice_is_the_last_row_of_the_list_at_the_shared_row_height(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), 6);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        let truncated = wt_core::graph::build_graph(repo.path(), GraphScope::All, 3)
+            .expect("a real, deliberately capped graph walk");
+        assert!(
+            truncated.truncated && truncated.rows.len() == 3,
+            "precondition: this must be a genuinely truncated walk, got {} rows, truncated={}",
+            truncated.rows.len(),
+            truncated.truncated
+        );
+        app.update(cx, |app, cx| {
+            app.graph_state.load = GraphLoadState::Loaded(truncated);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let last_row = cx
+            .debug_bounds("graph-row-2")
+            .expect("the last real commit row must paint");
+        let notice = cx.debug_bounds("graph-rows-truncated-notice").expect(
+            "a truncated walk must still say so on screen - that notice is the only thing \
+             telling the user the bottom of this list is not the bottom of the history",
+        );
+        assert_eq!(
+            notice.origin.y,
+            last_row.origin.y + last_row.size.height,
+            "the notice must be the item directly below the last commit row"
+        );
+        assert_eq!(
+            notice.size.height,
+            theme::graph::ROW,
+            "and it must be exactly as tall as every other item, which is the fixed height \
+             `uniform_list` lays every slot out at"
+        );
+    }
+
+    /// The notice is not unconditional chrome: an untruncated walk must render no such row, and
+    /// the list must have exactly one item per commit.
+    #[gpui::test]
+    fn an_untruncated_graph_renders_no_notice_row(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_commits(repo.path(), 4);
+        let (app, cx) = open_graph_on(cx, repo.path());
+
+        app.read_with(cx, |app, _| {
+            let graph = app.current_graph().expect("the graph must be loaded");
+            assert!(!graph.truncated, "precondition: an untruncated walk");
+            assert_eq!(
+                graph_item_count(graph),
+                graph.rows.len(),
+                "with nothing truncated the list has exactly one item per commit row"
+            );
+        });
+        assert!(
+            cx.debug_bounds("graph-rows-truncated-notice").is_none(),
+            "no truncation, no notice"
         );
     }
 }
