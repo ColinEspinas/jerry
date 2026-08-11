@@ -1764,8 +1764,14 @@ mod rail_row_tests {
             // real not-currently-selected case, or the new selected-worktree exemption would
             // make this test vacuous.
             app.select_worktree(1, window, cx);
-            app.agents
-                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
         });
         // The pty spawn itself is async (`TerminalPane::spawn_process`), so the process isn't
         // observably running yet the instant `spawn` returns - let it actually start before
@@ -1824,8 +1830,14 @@ mod rail_row_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.agents
-                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -1877,8 +1889,14 @@ mod rail_row_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.agents
-                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
         });
         // See the identical `run_until_parked` call/comment in
         // `worktree_is_expanded_defaults_to_the_real_idle_rooted_rule` just above.
@@ -1938,6 +1956,7 @@ mod rail_row_tests {
                 AgentKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -1946,6 +1965,7 @@ mod rail_row_tests {
                 AgentKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             )
@@ -2000,6 +2020,7 @@ mod rail_row_tests {
                 AgentKind::Claude,
                 busy_wt.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2007,6 +2028,7 @@ mod rail_row_tests {
                 AgentKind::Codex,
                 busy_wt.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );
@@ -2472,8 +2494,14 @@ mod agent_chip_icon_pack_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
-            app.agents
-                .spawn(AgentKind::Shell, wt.path().to_path_buf(), 12.0, window, cx);
+            app.agents.spawn(
+                AgentKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         (repo, wt, app, cx)

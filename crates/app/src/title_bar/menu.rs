@@ -1295,6 +1295,7 @@ mod title_menu_tests {
                 AgentKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1395,6 +1396,7 @@ mod title_menu_tests {
                 AgentKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             )
@@ -1526,6 +1528,7 @@ mod title_menu_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             );
@@ -1533,6 +1536,7 @@ mod title_menu_tests {
                 AgentKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             );
@@ -1544,6 +1548,7 @@ mod title_menu_tests {
                 AgentKind::Shell,
                 other_wt.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
                 window,
                 cx,
             );

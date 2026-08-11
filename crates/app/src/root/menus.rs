@@ -23,7 +23,7 @@
 
 use super::*;
 
-/// Every real floating menu/dropdown surface in the app - the six built on
+/// Every real floating menu/dropdown surface in the app - the seven built on
 /// [`crate::root::widgets::menu_popover_chrome`].
 ///
 /// Deliberately *not* including the command palette, the "New file" prompt, or the Settings
@@ -50,6 +50,12 @@ pub(crate) enum MenuSurface {
     GraphPush,
     /// A git graph row's `⋯`/right-click menu - `graph_state.row_menu_open`.
     GraphRow,
+    /// Settings › General's "Shell" field suggestion dropdown (GitHub issue #213's follow-up) -
+    /// [`AdeApp::shell_suggestions_open`]. The seventh surface, and the first one that lives on
+    /// the Settings page rather than the workspace; it is a click-away dropdown built on
+    /// [`crate::root::widgets::menu_popover_chrome`] like the other six, so it belongs to the
+    /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
+    ShellSuggestions,
 }
 
 impl MenuSurface {
@@ -57,13 +63,14 @@ impl MenuSurface {
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
     /// until it is really wired to real state - that pairing is what stops a seventh menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 6] = [
+    pub(crate) const ALL: [MenuSurface; 7] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
         MenuSurface::Commit,
         MenuSurface::GraphPush,
         MenuSurface::GraphRow,
+        MenuSurface::ShellSuggestions,
     ];
 }
 
@@ -78,6 +85,7 @@ impl AdeApp {
             MenuSurface::Commit => self.commit_menu_open,
             MenuSurface::GraphPush => self.graph_state.push_menu_open,
             MenuSurface::GraphRow => self.graph_state.row_menu_open.is_some(),
+            MenuSurface::ShellSuggestions => self.shell_suggestions_open,
         }
     }
 
@@ -98,6 +106,7 @@ impl AdeApp {
             MenuSurface::Commit => self.commit_menu_open = false,
             MenuSurface::GraphPush => self.graph_state.push_menu_open = false,
             MenuSurface::GraphRow => self.graph_state.row_menu_open = None,
+            MenuSurface::ShellSuggestions => self.shell_suggestions_open = false,
         }
     }
 
@@ -106,7 +115,7 @@ impl AdeApp {
     /// `cx.notify()`.
     ///
     /// This is the whole "opening a second menu closes the first" rule. Every real path that
-    /// *opens* one of the six calls it with its own surface as `keep` immediately before setting
+    /// *opens* one of them calls it with its own surface as `keep` immediately before setting
     /// its own state - so the invariant holds no matter which of the (many) entry points was used:
     /// a click on the tab strip `+`, a click on a rail repo header's `+`, a title bar label, a
     /// right-click in the file tree, the commit composer's `▾`, the graph's `Push ▾`, a graph
@@ -148,7 +157,7 @@ mod menu_surface_tests {
     use crate::root::focus::palette_focus_tests::open_test_app;
     use gpui::TestAppContext;
 
-    /// Opens every one of the six at once by writing their real state fields directly - the state
+    /// Opens every one of them at once by writing their real state fields directly - the state
     /// this test then proves cannot survive a single `close_menu_surfaces_except`.
     fn open_every_menu(app: &mut AdeApp) {
         app.plus_menu_open = true;
@@ -165,10 +174,11 @@ mod menu_surface_tests {
             origin_x: px(4.0),
             origin_y: px(4.0),
         });
+        app.shell_suggestions_open = true;
     }
 
     #[gpui::test]
-    fn closing_all_menu_surfaces_really_closes_every_one_of_the_six(cx: &mut TestAppContext) {
+    fn closing_all_menu_surfaces_really_closes_every_one_of_them(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
@@ -203,7 +213,7 @@ mod menu_surface_tests {
     /// The exact "2 context menus open at the same time" shape from GitHub issue #176, at the
     /// level of the shared primitive: whichever surface is being opened is the only survivor.
     #[gpui::test]
-    fn opening_any_one_surface_closes_all_five_others(cx: &mut TestAppContext) {
+    fn opening_any_one_surface_closes_all_the_others(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 

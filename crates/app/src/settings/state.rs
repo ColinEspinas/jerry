@@ -658,11 +658,661 @@ pub fn filter_keybinding_rows<'a>(
         .collect()
 }
 
+/// What the General page's "Shell" row can honestly say about the configured shell program
+/// (GitHub issue #213) - see [`detect_shell_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellStatus {
+    /// Nothing configured: a shell tab launches the real OS default (`$SHELL`/`%COMSPEC%`).
+    SystemDefault,
+    /// A real program was found - the resolved absolute path, exactly as it would be run.
+    Resolved(PathBuf),
+    /// Nothing by that name exists. Advisory only: this never stops the app from trying to spawn
+    /// it (see `crate::terminal::pane::configured_shell_program`'s docs for why the real spawn
+    /// stays the authority), it just makes a typo visible before a tab fails.
+    NotFound,
+}
+
+impl ShellStatus {
+    /// The trailing hint text the row shows next to the field - a real resolved path, an honest
+    /// "not found", or the name of what will actually run when nothing is configured.
+    pub fn hint(&self) -> String {
+        match self {
+            ShellStatus::SystemDefault => "empty - using the system default".to_string(),
+            ShellStatus::Resolved(path) => path.display().to_string(),
+            ShellStatus::NotFound => "not found - this tab will fail to start".to_string(),
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ShellStatus::NotFound)
+    }
+}
+
+/// Resolves the configured shell the same two ways `pty_core::spawn` itself will (GitHub issue
+/// #213): a name with no path separator is searched for on `PATH` via `resolve`, anything that
+/// looks like a path is checked as a real file on disk. Whitespace-only (or absent) is
+/// [`ShellStatus::SystemDefault`], matching
+/// `crate::settings::store::TerminalSettings::shell_override`.
+///
+/// Takes `resolve` as a parameter - in production `pty_core::resolve_on_path` - for the same
+/// reason [`detect_agent_rows`] does: so this is unit-testable independently of which shells
+/// happen to be installed on the machine running the suite. The on-disk check for a path-shaped
+/// value is a real `Path::is_file` call rather than a second injected closure; a test can point
+/// it at a real temp file, which is a truer check than a fake.
+///
+/// This is deliberately *advisory*. It cannot be a guarantee - `resolve_on_path` is a second
+/// implementation of `portable-pty`'s own search (see its docs for the disclosed divergences) -
+/// so it is used to inform the settings row, never to gate the spawn.
+pub fn detect_shell_status(
+    configured: Option<&str>,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> ShellStatus {
+    let Some(program) = configured
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+    else {
+        return ShellStatus::SystemDefault;
+    };
+
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 {
+        // A path, not a name to search for - `CommandBuilder` runs it as given, so the only
+        // real question is whether that file exists.
+        return match path.is_file() {
+            true => ShellStatus::Resolved(path.to_path_buf()),
+            false => ShellStatus::NotFound,
+        };
+    }
+
+    match resolve(program) {
+        Some(resolved) => ShellStatus::Resolved(resolved),
+        None => ShellStatus::NotFound,
+    }
+}
+
+/// One genuinely-present shell offered under the General page's free-text "Shell" field (GitHub
+/// issue #213's follow-up: "would a select + auto-detect installed shells be better?" - a hybrid,
+/// so the common case needs no typing while the field itself stays unrestricted).
+///
+/// Every one of these was found by real I/O - a line of `/etc/shells` whose file is on disk right
+/// now, or a real `$PATH`/`%PATH%` hit - never a hardcoded "shells people usually have". A name
+/// that isn't genuinely resolvable is never offered, because clicking it would configure a shell
+/// that cannot spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSuggestion {
+    /// The program's own file name (`bash`, `pwsh.exe`) - what a user recognizes at a glance.
+    pub name: String,
+    /// The real, absolute path it was found at, which is also the value clicking the row types
+    /// into the field ([`Self::value`]). Absolute rather than the bare name so the suggestion
+    /// means exactly one program: `pty_core::spawn` runs an absolute path verbatim, with no
+    /// second `PATH` search that could resolve to a different `bash` than the one listed here.
+    pub path: PathBuf,
+}
+
+impl ShellSuggestion {
+    /// The text this suggestion puts in the field when clicked - identical to what the user could
+    /// have typed by hand, so it flows through the exact same
+    /// `crate::settings::store::TerminalSettings::shell` path with nothing special about it.
+    pub fn value(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
+/// The real, standard file listing a Unix system's valid login shells - one absolute path per
+/// line, `#` comments and blank lines allowed. Read (never written) by [`detect_installed_shells`].
+#[cfg(unix)]
+pub const ETC_SHELLS: &str = "/etc/shells";
+
+/// Well-known shells that are genuinely, routinely *absent* from `/etc/shells` even when
+/// installed, so [`unix_shell_suggestions`] probes `PATH` for them as a supplement - not as the
+/// primary mechanism, and never as an answer of its own: a name here is only ever offered when a
+/// real `PATH` search actually finds it.
+///
+/// The list is short and evidence-driven rather than a general "common shells" guess. Registering
+/// a shell in `/etc/shells` is the *distribution packager's* job, and each of these is
+/// predominantly installed by a route that has no packager: fish's and PowerShell's own install
+/// instructions tell the user to append the path to `/etc/shells` by hand afterwards (which is
+/// only necessary because the install genuinely doesn't), Nushell ships mainly through
+/// `cargo install` and release tarballs, Xonsh through `pip`, and Elvish through `go install` and
+/// tarballs. None of those routes touch `/etc/shells` at all.
+#[cfg(unix)]
+const UNIX_SUPPLEMENTARY_SHELLS: [&str; 5] = ["fish", "nu", "pwsh", "elvish", "xonsh"];
+
+/// Shell programs a Windows install may genuinely have on `%PATH%`, probed one by one - see
+/// [`windows_shell_suggestions`], which only offers the ones a real search actually finds.
+///
+/// There is no `/etc/shells` equivalent on Windows, so this is a probe list rather than a source
+/// of truth, and it is deliberately confined to names that are real, well-known program names -
+/// not a catalogue of everything that might be a shell. `bash.exe` is a real example of why the
+/// *probe* matters more than the name: on a given machine it could be WSL's bash shim, Git Bash,
+/// or Cygwin's, and this makes no claim about which - only that the file the search found really
+/// exists and would really run.
+const WINDOWS_PROBED_SHELLS: [&str; 3] = ["powershell.exe", "pwsh.exe", "bash.exe"];
+
+/// Every shell this machine genuinely has, for the field's suggestion list - the production
+/// entry point, wired to the real `/etc/shells`, the real `%COMSPEC%`, and the real
+/// `pty_core::resolve_on_path`.
+///
+/// Does real filesystem and `PATH` I/O, so like [`detect_agent_rows`] and [`detect_shell_status`]
+/// it is called when Settings opens (`AdeApp::refresh_shell_suggestions`) and the result is held
+/// in state - never from `render`, which would put a directory walk on the frame path.
+pub fn detect_installed_shells() -> Vec<ShellSuggestion> {
+    #[cfg(unix)]
+    {
+        unix_shell_suggestions(std::path::Path::new(ETC_SHELLS), pty_core::resolve_on_path)
+    }
+    #[cfg(windows)]
+    {
+        windows_shell_suggestions(std::env::var_os("COMSPEC"), pty_core::resolve_on_path)
+    }
+}
+
+/// The Unix half of [`detect_installed_shells`]: parse `shells_file` (the real `/etc/shells`
+/// format - one absolute path per line, `#` comments and blank lines skipped) and keep the
+/// entries that are *actually a file on disk right now*. A listed shell can have been
+/// uninstalled without the line being removed, and offering a path that isn't there would be
+/// offering a shell that cannot spawn.
+///
+/// Then, and only then, [`UNIX_SUPPLEMENTARY_SHELLS`] are looked for on `PATH` via `resolve` and
+/// appended if genuinely found - see that constant's docs for why a supplement is warranted and
+/// why it is not the primary source.
+///
+/// `shells_file`/`resolve` are parameters, not constants read inside, for the same reason
+/// [`detect_agent_rows`] takes its resolver: a test can point this at a real, hand-written
+/// `/etc/shells` in a real tempdir and get a deterministic answer, instead of asserting on
+/// whatever the machine running the suite happens to have installed.
+#[cfg(unix)]
+pub fn unix_shell_suggestions(
+    shells_file: &std::path::Path,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Vec<ShellSuggestion> {
+    let mut found = Vec::new();
+    let mut seen = Vec::new();
+
+    if let Ok(contents) = std::fs::read_to_string(shells_file) {
+        for line in contents.lines() {
+            let entry = line.trim();
+            if entry.is_empty() || entry.starts_with('#') {
+                continue;
+            }
+            let path = PathBuf::from(entry);
+            if path.is_file() {
+                push_unique_shell(&mut found, &mut seen, path);
+            }
+        }
+    }
+
+    for name in UNIX_SUPPLEMENTARY_SHELLS {
+        if let Some(path) = resolve(name) {
+            push_unique_shell(&mut found, &mut seen, path);
+        }
+    }
+
+    found
+}
+
+/// The Windows half of [`detect_installed_shells`]. Windows has no `/etc/shells`, so there are
+/// exactly two real sources and this uses both: `%COMSPEC%` - already this app's own default-shell
+/// mechanism (`crate::terminal::pane::TerminalSpec::default_shell_program`), so the first
+/// suggestion is literally the program an empty field already runs - and a real `PATH` search for
+/// each of [`WINDOWS_PROBED_SHELLS`].
+///
+/// Both sources are verified before anything is offered: `%COMSPEC%` must name a file that
+/// genuinely exists, and a probed name must be genuinely found by `resolve`. A name that is
+/// merely plausible on Windows is never listed.
+///
+/// Takes `comspec`/`resolve` as parameters rather than reading the environment itself so this is
+/// exercisable as a real unit test (with a real temp file standing in for a real `%COMSPEC%`
+/// target) on any host, including the Linux machines this project's suite runs on - the
+/// alternative being a Windows code path with no test coverage whatsoever. It is compiled on
+/// every platform for exactly that reason (it is only *called* under `#[cfg(windows)]`), so the
+/// Linux suite really runs it rather than only type-checking it.
+pub fn windows_shell_suggestions(
+    comspec: Option<std::ffi::OsString>,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+) -> Vec<ShellSuggestion> {
+    let mut found = Vec::new();
+    let mut seen = Vec::new();
+
+    if let Some(comspec) = comspec {
+        let path = PathBuf::from(comspec);
+        if path.is_file() {
+            push_unique_shell(&mut found, &mut seen, path);
+        }
+    }
+
+    for name in WINDOWS_PROBED_SHELLS {
+        if let Some(path) = resolve(name) {
+            push_unique_shell(&mut found, &mut seen, path);
+        }
+    }
+
+    found
+}
+
+/// Appends `path` as a suggestion unless an equivalent one is already listed, keyed on
+/// `(file name, real canonicalized target)`.
+///
+/// Both halves of that key are load-bearing against real, live `/etc/shells` content. On any
+/// usr-merged distribution the file lists `/bin/bash` *and* `/usr/bin/bash`, which are the same
+/// binary reached through a symlinked directory - two rows that would offer a user the same
+/// choice twice, so the canonical target dedupes them. But `/bin/sh` and `/bin/dash` also
+/// canonicalize to the same target on Debian, and those are genuinely different choices a user
+/// means differently (POSIX `sh` semantics vs. dash by name), so the file name keeps them apart.
+///
+/// Symlink resolution failure falls back to the path itself rather than dropping the entry: the
+/// entry has already been proven to be a real file, and a failure to canonicalize is a reason to
+/// keep it, not to hide it.
+fn push_unique_shell(
+    found: &mut Vec<ShellSuggestion>,
+    seen: &mut Vec<(String, PathBuf)>,
+    path: PathBuf,
+) {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let key = (name.clone(), target);
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    found.push(ShellSuggestion { name, path });
+}
+
+/// The suggestions worth showing under a field currently holding `query` - a case-insensitive
+/// substring match against both the shell's name and its full path, mirroring
+/// [`filter_keybinding_rows`]'s own established "one lowercase substring test per searchable
+/// field" shape rather than inventing a second matching rule.
+///
+/// An empty (or whitespace-only) field matches everything: with nothing typed yet, every real
+/// shell on the machine is a legitimate suggestion. A query nothing matches yields nothing, which
+/// is exactly what should happen when a user is typing a custom path the machine has never heard
+/// of - the field stays entirely usable, the dropdown simply has nothing to add.
+pub fn filter_shell_suggestions<'a>(
+    suggestions: &'a [ShellSuggestion],
+    query: &str,
+) -> Vec<&'a ShellSuggestion> {
+    let query = query.trim().to_lowercase();
+    suggestions
+        .iter()
+        .filter(|suggestion| {
+            query.is_empty()
+                || suggestion.name.to_lowercase().contains(&query)
+                || suggestion
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rail::state::WorktreeNote;
     use wt_core::diff::WorktreeMergeStatus;
+
+    /// Writes a real, executable file and returns its path - the suggestion detector's entire
+    /// contract is "only offer things that genuinely exist on disk", so its tests need real files,
+    /// not paths that merely look plausible.
+    #[cfg(unix)]
+    fn write_real_program(dir: &std::path::Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// The heart of the Unix detection (GitHub issue #213's follow-up): a real `/etc/shells`-format
+    /// file is parsed for real, and a line whose program is genuinely not on disk is never
+    /// offered, because a listed shell can have been uninstalled and suggesting it would be
+    /// suggesting a tab that cannot start.
+    #[cfg(unix)]
+    #[test]
+    fn only_shells_that_really_exist_on_disk_are_suggested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_bash = write_real_program(dir.path(), "bash");
+        let real_zsh = write_real_program(dir.path(), "zsh");
+        let uninstalled = dir.path().join("ksh");
+
+        let shells_file = dir.path().join("shells");
+        std::fs::write(
+            &shells_file,
+            format!(
+                "# /etc/shells: valid login shells\n\
+                 \n\
+                 {}\n\
+                 {}\n\
+                    {}   \n\
+                 #{}\n",
+                real_bash.display(),
+                uninstalled.display(),
+                real_zsh.display(),
+                real_bash.display(),
+            ),
+        )
+        .expect("write");
+
+        let found = unix_shell_suggestions(&shells_file, |_| None);
+        let paths: Vec<PathBuf> = found.iter().map(|s| s.path.clone()).collect();
+
+        assert_eq!(
+            paths,
+            vec![real_bash.clone(), real_zsh.clone()],
+            "only the two lines naming files that genuinely exist may be offered, in file order, \
+             with the blank line, the comment header, and the commented-out duplicate all skipped"
+        );
+        assert!(
+            !paths.contains(&uninstalled),
+            "a shell listed in /etc/shells but not actually installed must never be offered"
+        );
+        assert_eq!(
+            found[0].name, "bash",
+            "the row's label is the program's own real file name"
+        );
+        assert_eq!(
+            found[1].value(),
+            real_zsh.display().to_string(),
+            "clicking a row types the real absolute path it was found at, nothing invented"
+        );
+    }
+
+    /// A missing `/etc/shells` (a system that genuinely has none) is not an error and not a
+    /// fabricated fallback list - it just means the supplementary `PATH` probe is all there is.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_shells_file_yields_only_what_path_really_has() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_fish = write_real_program(dir.path(), "fish");
+        let resolve = |program: &str| (program == "fish").then(|| real_fish.clone());
+
+        let found = unix_shell_suggestions(&dir.path().join("no-such-shells-file"), resolve);
+
+        assert_eq!(
+            found,
+            vec![ShellSuggestion {
+                name: "fish".to_string(),
+                path: real_fish
+            }],
+            "with no /etc/shells at all, the only honest answer is what a real PATH search found"
+        );
+    }
+
+    /// The supplementary probe's whole reason to exist: fish/nu/pwsh & co. are routinely installed
+    /// by routes that never register them in `/etc/shells`, so they must still be offered - and a
+    /// probed name that `PATH` genuinely doesn't have must not be.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_missing_from_etc_shells_is_still_found_on_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_bash = write_real_program(dir.path(), "bash");
+        let real_nu = write_real_program(dir.path(), "nu");
+        let shells_file = dir.path().join("shells");
+        std::fs::write(&shells_file, format!("{}\n", real_bash.display())).expect("write");
+
+        let found = unix_shell_suggestions(&shells_file, |program| {
+            (program == "nu").then(|| real_nu.clone())
+        });
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["bash", "nu"],
+            "the /etc/shells entries come first, then the genuinely-resolvable supplements"
+        );
+        assert!(
+            !names.contains(&"xonsh"),
+            "a probed name PATH does not have must never be offered - the probe list is a list of \
+             things to *look for*, never a list of things to claim"
+        );
+    }
+
+    /// Real usr-merge duplication (`/bin/bash` and `/usr/bin/bash` are one binary on every modern
+    /// distribution, and this machine's own `/etc/shells` lists both) collapses to one row, while
+    /// two genuinely different *names* for the same binary - `sh` and `dash` on Debian - stay two
+    /// rows, because a user choosing "sh" means something different by it.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_binary_listed_twice_is_offered_once_but_two_names_are_not_merged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let usr_bin = dir.path().join("usr").join("bin");
+        std::fs::create_dir_all(&usr_bin).expect("mkdir");
+        let real_dash = write_real_program(&usr_bin, "dash");
+        // The real usr-merge shape: /bin is a symlink to /usr/bin, so /bin/dash and /usr/bin/dash
+        // are the same file reached two ways.
+        std::os::unix::fs::symlink("usr/bin", dir.path().join("bin")).expect("symlink");
+        // And the real Debian shape for `sh`: a differently-named symlink to that same binary.
+        std::os::unix::fs::symlink("dash", usr_bin.join("sh")).expect("symlink");
+
+        let shells_file = dir.path().join("shells");
+        std::fs::write(
+            &shells_file,
+            format!(
+                "{}\n{}\n{}\n",
+                dir.path().join("bin").join("dash").display(),
+                real_dash.display(),
+                usr_bin.join("sh").display(),
+            ),
+        )
+        .expect("write");
+
+        let found = unix_shell_suggestions(&shells_file, |_| None);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["dash", "sh"],
+            "one row for the one dash binary listed under two directories, and a separate row for \
+             the sh name that resolves to it"
+        );
+        assert_eq!(
+            found[0].path,
+            dir.path().join("bin").join("dash"),
+            "the first-listed spelling is the one kept, not the canonicalized target"
+        );
+    }
+
+    /// Windows has no `/etc/shells`, so the two real sources are `%COMSPEC%` (this app's own
+    /// existing default-shell mechanism) and a real `PATH` search - both verified before anything
+    /// is offered. Runs on every platform, deliberately: the alternative is a Windows-only code
+    /// path this project's Linux-only suite could never execute.
+    #[test]
+    fn windows_offers_comspec_and_real_path_hits_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_cmd = dir.path().join("cmd.exe");
+        std::fs::write(&real_cmd, "").expect("write");
+        let real_pwsh = dir.path().join("pwsh.exe");
+        std::fs::write(&real_pwsh, "").expect("write");
+        let resolve = |program: &str| (program == "pwsh.exe").then(|| real_pwsh.clone());
+
+        let found = windows_shell_suggestions(Some(real_cmd.clone().into_os_string()), resolve);
+
+        assert_eq!(
+            found,
+            vec![
+                ShellSuggestion {
+                    name: "cmd.exe".to_string(),
+                    path: real_cmd
+                },
+                ShellSuggestion {
+                    name: "pwsh.exe".to_string(),
+                    path: real_pwsh
+                },
+            ],
+            "%COMSPEC% first (it is what an empty field already runs), then only the probed names \
+             a real PATH search actually found - never powershell.exe or bash.exe on faith"
+        );
+
+        assert!(
+            windows_shell_suggestions(Some(dir.path().join("gone.exe").into_os_string()), |_| None)
+                .is_empty(),
+            "a %COMSPEC% pointing at a file that isn't there must produce no suggestion at all"
+        );
+        assert!(
+            windows_shell_suggestions(None, |_| None).is_empty(),
+            "no %COMSPEC% and nothing on PATH is an honest empty list, not a guessed one"
+        );
+    }
+
+    /// The filter is a convenience over real data, never a gate: it narrows on both the name and
+    /// the path, and a query matching nothing yields nothing rather than falling back to
+    /// everything (which would offer suggestions for a custom path the machine has never heard of).
+    #[test]
+    fn the_suggestion_filter_matches_name_and_path_case_insensitively() {
+        let suggestions = vec![
+            ShellSuggestion {
+                name: "bash".to_string(),
+                path: PathBuf::from("/bin/bash"),
+            },
+            ShellSuggestion {
+                name: "fish".to_string(),
+                path: PathBuf::from("/usr/local/bin/fish"),
+            },
+        ];
+        let names = |query: &str| -> Vec<String> {
+            filter_shell_suggestions(&suggestions, query)
+                .into_iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+
+        assert_eq!(names(""), vec!["bash", "fish"], "an empty field offers all");
+        assert_eq!(names("   "), vec!["bash", "fish"]);
+        assert_eq!(names("FI"), vec!["fish"], "matching is case-insensitive");
+        assert_eq!(
+            names("/usr/local"),
+            vec!["fish"],
+            "a partial path must match too - a user typing an absolute path is exactly who the \
+             suggestions can still help"
+        );
+        assert!(
+            names("/opt/my-own-shell").is_empty(),
+            "a custom path nothing matches must produce an empty list, never the whole list back"
+        );
+    }
+
+    /// The real production detector on the real machine running this suite: whatever it returns,
+    /// every single entry must be a file that genuinely exists right now. This is the honesty
+    /// claim the whole feature rests on, checked against reality rather than a fixture.
+    #[test]
+    fn every_really_detected_shell_is_a_file_that_really_exists() {
+        for suggestion in detect_installed_shells() {
+            assert!(
+                suggestion.path.is_file(),
+                "detection offered {}, which is not a real file - a suggestion that cannot spawn \
+                 must never be shown",
+                suggestion.path.display()
+            );
+            assert!(
+                suggestion.path.is_absolute(),
+                "a suggestion's value is used verbatim as the program to spawn, so it must be an \
+                 absolute path: {}",
+                suggestion.path.display()
+            );
+            assert_eq!(
+                suggestion.value(),
+                suggestion.path.display().to_string(),
+                "the value typed into the field is the real detected path, nothing else"
+            );
+        }
+    }
+
+    /// This project's own CI hosts really do have `/etc/shells` with real shells in it, so the
+    /// production detector must genuinely find some - a detector that always returned an empty
+    /// list would pass every test above without doing anything at all.
+    #[cfg(unix)]
+    #[test]
+    fn real_detection_finds_at_least_one_real_shell_on_this_machine() {
+        if !std::path::Path::new(ETC_SHELLS).exists() {
+            // Honest skip rather than a false pass: a Unix host genuinely without /etc/shells has
+            // nothing for this assertion to be about. The sibling test above still holds there.
+            return;
+        }
+        let found = detect_installed_shells();
+        assert!(
+            !found.is_empty(),
+            "a machine with a real /etc/shells must yield real suggestions"
+        );
+        assert!(
+            found.iter().any(|s| s.name == "sh" || s.name == "bash"),
+            "every Unix host running this suite has a real sh or bash; got {found:?}"
+        );
+    }
+
+    /// GitHub issue #213's advisory found/not-found hint: both real forms a user can type, plus
+    /// the "nothing configured" case that must never be reported as an error.
+    #[test]
+    fn shell_status_reports_each_real_configured_form_honestly() {
+        let fake_path_search =
+            |program: &str| (program == "fish").then(|| PathBuf::from("/usr/bin/fish"));
+
+        assert_eq!(
+            detect_shell_status(None, fake_path_search),
+            ShellStatus::SystemDefault,
+            "no override at all is the normal, healthy state - never a 'not found'"
+        );
+        assert_eq!(
+            detect_shell_status(Some("   "), fake_path_search),
+            ShellStatus::SystemDefault,
+            "a blank field means the system default, exactly like an absent value"
+        );
+        assert_eq!(
+            detect_shell_status(Some("fish"), fake_path_search),
+            ShellStatus::Resolved(PathBuf::from("/usr/bin/fish")),
+            "a bare name must be reported as the real path PATH resolution finds"
+        );
+        assert_eq!(
+            detect_shell_status(Some("fsih"), fake_path_search),
+            ShellStatus::NotFound,
+            "a typo'd name must be called out, not silently accepted"
+        );
+    }
+
+    /// A path-shaped value is checked against the real filesystem, not searched for on `PATH` -
+    /// exercised against a genuinely existing temp file and a genuinely missing one.
+    #[test]
+    fn a_path_shaped_shell_is_checked_on_disk_not_on_path() {
+        let never_resolves = |_: &str| -> Option<PathBuf> {
+            panic!("a path-shaped value must never be searched for on PATH")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_file = dir.path().join("my-shell");
+        std::fs::write(&real_file, "#!/bin/sh\n").expect("write");
+
+        assert_eq!(
+            detect_shell_status(Some(real_file.to_str().expect("utf-8")), never_resolves),
+            ShellStatus::Resolved(real_file.clone())
+        );
+        assert_eq!(
+            detect_shell_status(
+                Some(dir.path().join("no-such-shell").to_str().expect("utf-8")),
+                never_resolves
+            ),
+            ShellStatus::NotFound
+        );
+    }
+
+    /// The real production resolver, on a real binary this test environment genuinely has -
+    /// proof the injected-resolver tests above aren't only true of the fake.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_path_resolver_finds_a_real_shell() {
+        let status = detect_shell_status(Some("sh"), pty_core::resolve_on_path);
+        match status {
+            ShellStatus::Resolved(path) => assert!(
+                path.is_file(),
+                "the reported path must be a real file on this machine, got {}",
+                path.display()
+            ),
+            other => panic!("expected a real resolved sh, got {other:?}"),
+        }
+    }
 
     #[test]
     fn all_eleven_pages_are_covered_by_the_four_nav_groups_exactly_once() {

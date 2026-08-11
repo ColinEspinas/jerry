@@ -282,9 +282,20 @@ impl TerminalSpec {
     /// itself never sets, so the fallback needs its own real Windows equivalent rather than the
     /// same Unix path unconditionally, which is a real path (`/bin/bash`) that doesn't exist on
     /// Windows at all - every default-shell spawn there was trying, and failing, to launch it.
-    pub fn shell(cwd: PathBuf) -> Self {
+    ///
+    /// `configured` is the user's own chosen shell (GitHub issue #213 -
+    /// `crate::settings::store::TerminalSettings::shell_override`, threaded here from live
+    /// settings by `crate::work_surface::agents::Agents::spawn`, exactly like the terminal font
+    /// size already is). `None` - the zero-config default - keeps the real OS behaviour above,
+    /// byte for byte. A configured value is handed straight through as the program to spawn: a
+    /// bare name (`"fish"`) is resolved against `PATH` by `pty_core::spawn`'s own
+    /// `CommandBuilder`, the same already-relied-on mechanism [`Self::command`] documents, and an
+    /// absolute path is used as-is. Nothing here checks whether it exists - see
+    /// [`configured_shell_program`]'s docs for why that is deliberate.
+    pub fn shell(cwd: PathBuf, configured: Option<&str>) -> Self {
         Self {
-            program: Self::default_shell_program(),
+            program: configured_shell_program(configured)
+                .unwrap_or_else(Self::default_shell_program),
             args: Vec::new(),
             cwd,
         }
@@ -310,6 +321,15 @@ impl TerminalSpec {
         shell_program_from_env(std::env::var_os("COMSPEC"), "cmd.exe")
     }
 
+    /// The real program a shell tab launches when the user has configured nothing (GitHub issue
+    /// #213) - `$SHELL`'s value on this machine right now, `%COMSPEC%`'s on Windows, resolved by
+    /// exactly the same code [`Self::shell`] falls back to. Exposed so the Settings row's
+    /// placeholder can name the *actual* program an empty field means, rather than a generic
+    /// `"$SHELL"` string that would be a second, drift-prone description of this decision.
+    pub fn default_shell_program_display() -> String {
+        Self::default_shell_program().display().to_string()
+    }
+
     /// An arbitrary command. `program` may be a bare name (e.g. `"claude"`, no path
     /// separator): `pty-core`'s `spawn` resolves it via `PATH` through
     /// `portable_pty::CommandBuilder` the same way a shell would, so this doesn't need the
@@ -331,6 +351,33 @@ fn shell_program_from_env(env_value: Option<std::ffi::OsString>, fallback: &str)
     env_value
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+/// The user's configured shell (GitHub issue #213) as a real program to spawn, or `None` when
+/// there genuinely isn't one - the pure half of [`TerminalSpec::shell`]'s decision, so both
+/// branches are testable on any host without touching the process environment.
+///
+/// Whitespace-only counts as "unset": the settings row backing this is a free-text field, and an
+/// accidental space must fall back to the OS default rather than becoming a program named `" "`
+/// that could never spawn. (`crate::settings::store::TerminalSettings::sanitize` already
+/// normalizes this on load; doing it here too means a value reaching this function by any other
+/// route can't reintroduce the case.)
+///
+/// Deliberately does **not** check that the program exists. `pty_core::spawn` is the only thing
+/// that can answer that question authoritatively - it is the code that actually resolves and
+/// execs it - and it already reports a real, typed `PtyError::Spawn` for a program that isn't
+/// there, which `TerminalPane` surfaces as a real `spawn_error` on the failed tab
+/// (`pty_core`'s own `spawn_reports_typed_error_for_nonexistent_program`). Second-guessing that
+/// here could only produce a *different* answer than the real spawn (a `PATH` search of this
+/// app's own is not the one `CommandBuilder` runs), which would mean silently refusing to launch
+/// a shell that would in fact have worked. The Settings row shows a live, advisory
+/// found/not-found hint instead (`crate::settings::state::detect_shell_status`), which informs
+/// without overriding.
+fn configured_shell_program(configured: Option<&str>) -> Option<PathBuf> {
+    configured
+        .map(str::trim)
+        .filter(|program| !program.is_empty())
+        .map(PathBuf::from)
 }
 
 /// GitHub issue #50's real regression guard: the Windows fallback must be a real Windows path
@@ -362,6 +409,104 @@ mod shell_program_tests {
     /// The real regression: the Windows fallback must be `cmd.exe`, a real path that exists on
     /// Windows - never the Unix `/bin/bash` this crate used to fall back to unconditionally,
     /// which does not exist there at all.
+    /// GitHub issue #213: a configured shell wins over whatever the OS environment says, in both
+    /// of the two documented forms - a bare name (`pty_core::spawn` resolves it on `PATH`) and an
+    /// absolute path (used verbatim).
+    #[test]
+    fn a_configured_shell_replaces_the_environment_default() {
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(
+            TerminalSpec::shell(cwd.clone(), Some("fish")).program,
+            PathBuf::from("fish"),
+            "a bare name must reach the spawn as-is, for pty-core's own PATH resolution"
+        );
+        assert_eq!(
+            TerminalSpec::shell(cwd.clone(), Some("/usr/local/bin/fish")).program,
+            PathBuf::from("/usr/local/bin/fish"),
+            "an absolute path must be used verbatim, not searched for on PATH"
+        );
+        assert!(
+            TerminalSpec::shell(cwd.clone(), Some("fish"))
+                .args
+                .is_empty(),
+            "a configured shell is launched exactly like the default one: no extra arguments"
+        );
+        assert_eq!(
+            TerminalSpec::shell(cwd.clone(), Some("fish")).cwd,
+            cwd,
+            "choosing a shell must not change which directory it starts in"
+        );
+    }
+
+    /// The zero-config path this setting must never disturb: no override (or a blank one, which
+    /// the settings field can genuinely produce) spawns *exactly* what this app spawned before
+    /// the setting existed.
+    #[test]
+    fn no_configured_shell_is_byte_for_byte_the_previous_os_default() {
+        let cwd = std::env::temp_dir();
+        let os_default = TerminalSpec::default_shell_program();
+
+        assert_eq!(TerminalSpec::shell(cwd.clone(), None).program, os_default);
+        assert_eq!(
+            TerminalSpec::shell(cwd.clone(), Some("")).program,
+            os_default,
+            "an empty setting means 'use the system default', not a program with no name"
+        );
+        assert_eq!(
+            TerminalSpec::shell(cwd, Some("   ")).program,
+            os_default,
+            "a whitespace-only setting must fall back too, never spawn a program named ' '"
+        );
+    }
+
+    /// The end-to-end half of the two tests above: the exact `program` a configured bare name
+    /// produces really starts a live process through the same `pty_core::spawn` a shell tab uses,
+    /// and a typo'd one really fails with the typed error `TerminalPane` turns into a visible
+    /// `spawn_error` on the tab - no silent blank pane either way.
+    ///
+    /// unix-only, like `pty-core`'s own suite: it spawns `sh`, a real binary this project's CI
+    /// only runs tests on (see that crate's "Platform scope" docs).
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_shell_really_spawns_and_a_typo_really_fails() {
+        let good = TerminalSpec::shell(std::env::temp_dir(), Some("sh"));
+        let mut session = pty_core::spawn(
+            pty_core::SpawnOptions::new(good.program.clone()).cwd(good.cwd.clone()),
+        )
+        .expect("a configured shell that really exists must spawn a real process");
+        assert!(
+            session.process_id().is_some(),
+            "the configured shell must be a real, running child with a real pid"
+        );
+        session.shutdown().expect("reap the child");
+
+        let bad = TerminalSpec::shell(
+            std::env::temp_dir(),
+            Some("definitely-not-a-real-shell-xyz"),
+        );
+        match pty_core::spawn(pty_core::SpawnOptions::new(bad.program).cwd(bad.cwd)) {
+            Err(err) => assert!(
+                matches!(err, pty_core::PtyError::Spawn(_)),
+                "a misconfigured shell must fail with the same real, typed, reportable error \
+                 any other missing program does, got {err:?}"
+            ),
+            Ok(_) => panic!("a shell that doesn't exist must not spawn"),
+        }
+    }
+
+    /// Trimming happens at the edge, so `" fish "` (a real, plausible copy-paste) spawns `fish`
+    /// rather than a name with spaces in it that no `PATH` entry could ever match.
+    #[test]
+    fn a_configured_shell_is_trimmed_before_it_becomes_a_program() {
+        assert_eq!(
+            configured_shell_program(Some("  zsh  ")),
+            Some(PathBuf::from("zsh"))
+        );
+        assert_eq!(configured_shell_program(None), None);
+        assert_eq!(configured_shell_program(Some(" ")), None);
+    }
+
     #[test]
     fn the_windows_fallback_is_a_real_windows_path_not_the_unix_one() {
         let windows_fallback = shell_program_from_env(None, "cmd.exe");

@@ -1579,6 +1579,39 @@ pub struct AdeApp {
     /// #17). Its value is what `crate::theme::shift_from_seed` derives a whole theme from.
     pub(crate) theme_seed_input: text_history::TextField,
     pub(crate) theme_seed_focus_handle: FocusHandle,
+    /// GitHub issue #213: the General page's "Shell" field - the same minimal focusable
+    /// text-input shape as [`Self::theme_seed_input`] (real `FocusHandle`, real caret,
+    /// append/backspace/`Esc`-clears, real per-widget undo history). Seeded at startup from the
+    /// persisted `settings.terminal.shell` and written straight back to it on every edit, so the
+    /// field and the file never disagree.
+    pub(crate) shell_input: text_history::TextField,
+    pub(crate) shell_focus_handle: FocusHandle,
+    /// The advisory found/not-found state of whatever [`Self::shell_input`] currently holds
+    /// (`crate::settings::state::detect_shell_status`) - recomputed on each edit and when
+    /// Settings opens, never inside `render` (it does real filesystem work). Advisory only: a
+    /// `NotFound` never stops the app from trying to spawn the configured program - see
+    /// `crate::terminal::pane::configured_shell_program`'s docs.
+    pub(crate) shell_status: settings::ShellStatus,
+    /// Every shell this machine genuinely has, offered as clickable suggestions under the Shell
+    /// field (GitHub issue #213's follow-up - "a select + auto-detect installed shells", built as
+    /// a hybrid so the field itself stays unrestricted free text).
+    ///
+    /// Detected by real I/O - `/etc/shells` plus a real `PATH` search, `%COMSPEC%` plus a real
+    /// `PATH` search on Windows (`crate::settings::state::detect_installed_shells`) - so like
+    /// [`Self::shell_status`] it is refreshed on a real user gesture (opening Settings, opening
+    /// the dropdown) and held here, never recomputed from `render`.
+    pub(crate) shell_suggestions: Vec<settings::ShellSuggestion>,
+    /// Whether that suggestion dropdown is currently painted. A real
+    /// [`crate::root::menus::MenuSurface`] like every other floating dropdown in the app, so the
+    /// one-at-a-time/close-on-window-deactivation invariant covers it too and it cannot get stuck
+    /// open behind another surface.
+    pub(crate) shell_suggestions_open: bool,
+    /// The Shell field's real painted, window-space bounds, captured through the same
+    /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses, so the dropdown can be positioned
+    /// directly under the field while still being a top-level sibling in [`Self::render`] - a
+    /// child of the settings row itself would be clipped by the settings page's own scroll
+    /// column. `Bounds::default()` until the field has really painted once.
+    pub(crate) shell_field_bounds: gpui::Bounds<Pixels>,
     /// The real background-executor task behind "Generate from colour" - same one-at-a-time
     /// shape as [`Self::_custom_theme_import_task`].
     pub(crate) _theme_generate_task: Option<Task<()>>,
@@ -2216,6 +2249,7 @@ impl AdeApp {
                 AgentKind::Shell,
                 path.clone(),
                 self.settings.appearance.terminal_font_size,
+                self.settings.terminal.shell_override(),
                 window,
                 cx,
             );
@@ -2582,6 +2616,19 @@ impl Render for AdeApp {
                     && self.right_sidebar_view == RightSidebarView::Files
                     && self.tree_context_menu.is_some(),
                 |el| el.child(self.render_tree_context_menu(cx)),
+            )
+            // Settings › General's Shell field suggestion dropdown (GitHub issue #213's
+            // follow-up) - a window-positioned overlay for the same reason the `+` menu is one,
+            // and more sharply so: the settings page is a scrolling column that clips its own
+            // children, so this popover can only paint in full as a top-level sibling positioned
+            // off `Self::shell_field_bounds`. Gated on Settings really being open on the page that
+            // paints the field, so a stale anchor from an earlier frame can never float a dropdown
+            // over the workspace.
+            .when(
+                self.settings_open
+                    && self.settings_page == settings::SettingsPage::General
+                    && self.shell_suggestions_open,
+                |el| el.child(self.render_shell_suggestions(cx)),
             )
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }
@@ -3670,6 +3717,7 @@ mod repo_list_tests {
                 AgentKind::Claude,
                 repo_a.path().to_path_buf(),
                 12.0,
+                None,
                 window,
                 cx,
             );

@@ -47,17 +47,21 @@ impl AgentKind {
         }
     }
 
-    fn spec(self, cwd: PathBuf) -> TerminalSpec {
+    /// `shell_override` is the user's configured shell
+    /// (`crate::settings::store::TerminalSettings::shell_override`, GitHub issue #213) and only
+    /// reaches [`AgentKind::Shell`]: an agent CLI spawns its own fixed binary directly, never
+    /// through a shell, so which shell the user prefers genuinely cannot affect it.
+    fn spec(self, cwd: PathBuf, shell_override: Option<&str>) -> TerminalSpec {
         // Reads through `agent_binary_name` rather than matching `Claude`/`Codex` again here,
         // so it stays the single source of truth for "what binary does this kind spawn".
         match self.agent_binary_name() {
             Some(binary) => TerminalSpec::command(binary, Vec::new(), cwd),
-            None => TerminalSpec::shell(cwd),
+            None => TerminalSpec::shell(cwd, shell_override),
         }
     }
 
     /// The literal command name this kind spawns as - `None` for [`AgentKind::Shell`],
-    /// which resolves `$SHELL` rather than a fixed binary name.
+    /// which resolves the configured shell (or `$SHELL`) rather than a fixed binary name.
     ///
     /// Public so `crate::settings::state`'s Agents page can look up the same `$PATH` name this
     /// method hands `TerminalSpec::command` at spawn time, instead of a second hardcoded
@@ -157,21 +161,26 @@ impl Agents {
     ///
     /// Subscribes to the new pane's [`TerminalPaneEvent`]s so a click on a detected
     /// path/`path:line` link in this agent's terminal output opens it as a file tab
-    /// (`crate::root::AdeApp::open_terminal_link`). `terminal_font_size_px` is read fresh
-    /// from live settings by every call site, so a freshly spawned pane never starts out
-    /// mismatched from what Settings › Appearance shows.
+    /// (`crate::root::AdeApp::open_terminal_link`). `terminal_font_size_px` and
+    /// `shell_override` are both read fresh from live settings by every call site (the same
+    /// threading pattern, for the same reason): a freshly spawned pane never starts out
+    /// mismatched from what Settings shows. `shell_override` is GitHub issue #213's configured
+    /// shell (`crate::settings::store::TerminalSettings::shell_override`) - `None` means "the
+    /// real OS default", and it only affects [`AgentKind::Shell`] tabs (see
+    /// [`AgentKind::spec`]).
     pub fn spawn(
         &mut self,
         kind: AgentKind,
         cwd: PathBuf,
         terminal_font_size_px: f32,
+        shell_override: Option<&str>,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
 
-        let spec = kind.spec(cwd.clone());
+        let spec = kind.spec(cwd.clone(), shell_override);
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
         let link_subscription =
             cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {

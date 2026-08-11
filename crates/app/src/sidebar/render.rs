@@ -4889,7 +4889,7 @@ mod commit_composer_tests {
     /// `close_menu_surfaces_except`. What this pins is the *outcome* - one menu open, never two -
     /// through a real interaction; the sweep itself is what makes that outcome structural rather
     /// than a coincidence of which scrim happens to be painted where, and
-    /// `crate::root::menus::menu_surface_tests::opening_any_one_surface_closes_all_five_others`
+    /// `crate::root::menus::menu_surface_tests::opening_any_one_surface_closes_all_the_others`
     /// is the test that fails the moment the sweep stops covering a surface.
     #[gpui::test]
     fn opening_the_commit_menu_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
