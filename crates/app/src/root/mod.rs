@@ -707,12 +707,15 @@ pub struct AdeApp {
     /// never on an ordinary click or fresh file open (no reason to fight the user's own scroll
     /// position).
     pub(crate) file_view_scroll_handle: UniformListScrollHandle,
-    /// The read-only Diff view's own real overlay scrollbar handle (GitHub issue #30) - a plain
-    /// `gpui::ScrollHandle`: `crate::code_surface::diff_view::AdeApp::render_diff_file_detail`
-    /// renders every hunk line eagerly into a plain `overflow_y_scroll()` div, not a
-    /// `uniform_list`, so it needs the base handle type directly rather than the `uniform_list`
-    /// wrapper [`Self::file_view_scroll_handle`] uses.
-    pub(crate) diff_view_scroll_handle: gpui::ScrollHandle,
+    /// The read-only Diff view's own scroll handle, and the source its real overlay scrollbar
+    /// (GitHub issue #30) reads its geometry from. A `gpui::UniformListScrollHandle`, the same
+    /// type [`Self::file_view_scroll_handle`] uses, since GitHub issue #224 turned
+    /// `crate::code_surface::diff_view::AdeApp::render_diff_file_detail`'s eager
+    /// `overflow_y_scroll()` div into a real `gpui::uniform_list`, which owns its own scroll
+    /// offset through this handle type rather than a plain `gpui::ScrollHandle`. The scrollbar
+    /// itself needed no change: `crate::root::scrollbar::ScrollableHandle` already treats both
+    /// handle kinds interchangeably.
+    pub(crate) diff_view_scroll_handle: UniformListScrollHandle,
     /// Cached parse/highlight of whichever file [`Self::render_file_view`] last loaded
     /// (`code_view::load_file`/`highlight_rust`) - reused unless `code_view::cache_is_fresh`
     /// says otherwise, always written from [`Self::spawn_file_load`]'s background task, never

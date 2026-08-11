@@ -289,7 +289,7 @@ impl AdeApp {
             _load_graph_task: None,
             _load_commit_files_task: None,
             file_view_scroll_handle: UniformListScrollHandle::new(),
-            diff_view_scroll_handle: gpui::ScrollHandle::new(),
+            diff_view_scroll_handle: UniformListScrollHandle::new(),
             file_view_cache: None,
             diff_highlight_cache: None,
             file_view_last_freshness_check: None,
