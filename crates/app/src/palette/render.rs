@@ -1030,7 +1030,7 @@ impl AdeApp {
         let chip = match &entry.target {
             palette::EntryTarget::Command(_) => render_palette_command_chip().into_any_element(),
             palette::EntryTarget::Agent(_) => {
-                let kind = entry.agent_kind.unwrap_or(ProcessKind::Shell);
+                let kind = entry.process_kind.unwrap_or(ProcessKind::Shell);
                 render_palette_agent_chip(kind).into_any_element()
             }
             palette::EntryTarget::File(path) => {

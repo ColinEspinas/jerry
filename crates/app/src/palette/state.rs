@@ -390,7 +390,7 @@ pub struct PaletteEntry {
     /// Only set for an [`EntryTarget::File`] row that is an add/delete in the loaded diff.
     pub file_change: Option<FileChangeKind>,
     /// Only set for an [`EntryTarget::Agent`] row - which agent badge/tint to draw.
-    pub agent_kind: Option<ProcessKind>,
+    pub process_kind: Option<ProcessKind>,
     pub target: EntryTarget,
 }
 
@@ -494,7 +494,7 @@ fn filter_agents(agents: &[AgentCandidate], query: &str) -> Vec<PaletteEntry> {
                 shortcut: None,
                 status: Some(candidate.status),
                 file_change: None,
-                agent_kind: Some(candidate.kind),
+                process_kind: Some(candidate.kind),
                 target: EntryTarget::Agent(candidate.id),
             },
         ));
@@ -518,7 +518,7 @@ fn filter_commands(commands: &[CommandCandidate], query: &str) -> Vec<PaletteEnt
                 shortcut: candidate.command.shortcut(),
                 status: None,
                 file_change: None,
-                agent_kind: None,
+                process_kind: None,
                 target: EntryTarget::Command(candidate.command),
             },
         ));
@@ -559,7 +559,7 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
                 shortcut: None,
                 status: None,
                 file_change: candidate.changed,
-                agent_kind: None,
+                process_kind: None,
                 target: EntryTarget::File(candidate.path.clone()),
             },
         ));
@@ -592,7 +592,7 @@ pub fn build_language_server_groups(
                 shortcut: None,
                 status: Some(candidate.status),
                 file_change: None,
-                agent_kind: None,
+                process_kind: None,
                 target: EntryTarget::LanguageServer(candidate.client_key),
             },
         ));
@@ -1125,7 +1125,7 @@ mod tests {
                     shortcut: None,
                     status: None,
                     file_change: None,
-                    agent_kind: None,
+                    process_kind: None,
                     target: EntryTarget::Agent(1),
                 }],
             },
@@ -1137,7 +1137,7 @@ mod tests {
                     shortcut: None,
                     status: None,
                     file_change: None,
-                    agent_kind: None,
+                    process_kind: None,
                     target: EntryTarget::Command(PaletteCommand::NewShell),
                 }],
             },
