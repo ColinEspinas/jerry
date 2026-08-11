@@ -222,10 +222,47 @@ pub fn stat_bar_segments(add: u32, del: u32) -> [StatSegment; STAT_BAR_LEN] {
     segments
 }
 
+/// Whether `path` is a change that is **already committed and clean** - it differs from the base
+/// branch (that is why `wt_core::diff::diff_against_base` listed it at all), but a real commit on
+/// this branch already holds that difference and nothing about it is uncommitted right now.
+///
+/// GitHub issue #220: `diff_against_base` diffs the working tree against the *merge-base with the
+/// default branch*, so its file list deliberately mixes committed and uncommitted changes and
+/// `DiffFile` itself carries no signal to tell them apart. `dirty` is that signal -
+/// `wt_core::stage::dirty_paths`' real `git status --porcelain` result, as cached in
+/// [`crate::root::AdeApp::dirty_files`].
+///
+/// `dirty` is an `Option` and `None` means **not known yet** (the query hasn't landed, or it
+/// failed), never "nothing is dirty": with no evidence this returns `false`, so a row falls back
+/// to the ordinary stageable presentation rather than claiming a file is committed on the strength
+/// of an absent answer.
+pub fn is_committed_clean(path: &Path, dirty: Option<&HashSet<PathBuf>>) -> bool {
+    match dirty {
+        Some(dirty) => !dirty.contains(path),
+        None => false,
+    }
+}
+
+/// How many of `files` actually have something to stage - i.e. everything
+/// [`is_committed_clean`] doesn't rule out. The real denominator for the Changes header's staged
+/// progress: counting a committed-clean file in it would make `1 staged` out of a 3-file list read
+/// as two-thirds of the work outstanding when in truth there is nothing left to stage.
+pub fn stageable_count(files: &[DiffFile], dirty: Option<&HashSet<PathBuf>>) -> usize {
+    files
+        .iter()
+        .filter(|file| !is_committed_clean(&file.path, dirty))
+        .count()
+}
+
 /// Staged progress for the Changes header's `N of M staged` label and progress bar (Revision R12
 /// §5: the checkbox **is** staging, not "reviewed") - `staged`/`total` are counted by the caller
-/// from real state (how many files are in [`crate::root::AdeApp::staged_files`]), never tracked
-/// as an independent counter that could drift.
+/// from real state (how many files are in [`crate::root::AdeApp::staged_files`], out of
+/// [`stageable_count`]'s genuinely stageable files), never tracked as an independent counter that
+/// could drift.
+///
+/// `total` is the *stageable* count, not the diff's whole file list: a committed-clean file
+/// (GitHub issue #220) has nothing to stage, so including it would permanently pin the fraction
+/// below 1.0 for a worktree where everything stageable really is staged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StagedProgress {
     pub staged: usize,
@@ -536,6 +573,65 @@ mod tests {
         // to 1" rule this function documents - confirm the bump actually applies.
         let segments = stat_bar_segments(1, 399);
         assert!(segments.contains(&StatSegment::Add));
+    }
+
+    #[test]
+    fn a_path_missing_from_a_known_dirty_set_is_committed_clean() {
+        let dirty: HashSet<PathBuf> = [PathBuf::from("src/edited.rs")].into_iter().collect();
+        assert!(is_committed_clean(
+            Path::new("src/committed.rs"),
+            Some(&dirty)
+        ));
+        assert!(!is_committed_clean(
+            Path::new("src/edited.rs"),
+            Some(&dirty)
+        ));
+    }
+
+    #[test]
+    fn nothing_is_committed_clean_while_the_dirty_set_is_still_unknown() {
+        // `None` is "the `git status` answer hasn't landed", not "nothing is dirty" - claiming a
+        // file is committed on the strength of an absent answer is exactly the mislabelling
+        // GitHub issue #220 is about, in the other direction.
+        assert!(!is_committed_clean(Path::new("src/anything.rs"), None));
+    }
+
+    #[test]
+    fn stageable_count_excludes_committed_clean_files() {
+        let files = vec![
+            changed_file("src/committed.rs", 4, 0),
+            changed_file("src/edited.rs", 1, 1),
+        ];
+        let dirty: HashSet<PathBuf> = [PathBuf::from("src/edited.rs")].into_iter().collect();
+        assert_eq!(stageable_count(&files, Some(&dirty)), 1);
+    }
+
+    #[test]
+    fn stageable_count_falls_back_to_every_file_when_the_dirty_set_is_unknown() {
+        let files = vec![
+            changed_file("src/a.rs", 1, 0),
+            changed_file("src/b.rs", 0, 1),
+        ];
+        assert_eq!(stageable_count(&files, None), 2);
+    }
+
+    #[test]
+    fn a_fully_committed_branch_has_nothing_stageable_and_so_a_zero_fraction_not_a_partial_one() {
+        let files = vec![
+            changed_file("src/one.rs", 3, 0),
+            changed_file("src/two.rs", 2, 0),
+        ];
+        let stageable = stageable_count(&files, Some(&HashSet::new()));
+        assert_eq!(stageable, 0);
+        let progress = StagedProgress {
+            staged: 0,
+            total: stageable,
+        };
+        assert_eq!(
+            progress.fraction(),
+            0.0,
+            "with nothing left to stage the bar must not read as `0 of 2` outstanding work"
+        );
     }
 
     #[test]
