@@ -2,7 +2,7 @@
 //! CLI/terminal pane header/footer.
 //!
 //! Deliberately GPUI-free, mirroring `crate::rail::status`'s own split: this module only maps
-//! already-known facts (a [`AgentKind`], a [`Status`], a `bool`) onto *which*
+//! already-known facts (a [`ProcessKind`], a [`Status`], a `bool`) onto *which*
 //! colours/labels/actions a Zone 2 element should show, so that mapping is directly
 //! unit-testable without a live GPUI window. Turning these into actual `gpui::Div` trees (and
 //! wiring click handlers) happens one layer up, in `crate::root`, which has the
@@ -15,7 +15,7 @@ use gpui::Rgba;
 use crate::rail::status::Status;
 use crate::sidebar::file_tree::LangChip;
 use crate::theme;
-use crate::work_surface::agents::{AgentId, AgentKind};
+use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
 
 /// One entry in a worktree's combined tab-strip order (GitHub issue #16, extended by issue #93
 /// to also cover the git graph tab) - an agent tab, a file tab, or the one real git graph tab.
@@ -148,22 +148,26 @@ pub const TRANSPARENT: Rgba = Rgba {
     a: 0.0,
 };
 
-/// The agent tint `(fg, bg)` for an agent's badge/chip. [`AgentKind::Shell`] isn't an agent,
+/// The agent tint `(fg, bg)` for an agent's badge/chip. [`ProcessKind::Shell`] isn't an agent,
 /// so it gets a neutral chip instead of an invented tint.
-pub fn agent_tint(kind: AgentKind) -> (Rgba, Rgba) {
+pub fn agent_tint(kind: ProcessKind) -> (Rgba, Rgba) {
     match kind {
-        AgentKind::Claude => (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into()),
-        AgentKind::Codex => (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into()),
-        AgentKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
+        ProcessKind::Agent(AgentKind::Claude) => {
+            (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into())
+        }
+        ProcessKind::Agent(AgentKind::Codex) => {
+            (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into())
+        }
+        ProcessKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
     }
 }
 
 /// The agent badge's single-character initial.
-pub fn agent_initial(kind: AgentKind) -> &'static str {
+pub fn agent_initial(kind: ProcessKind) -> &'static str {
     match kind {
-        AgentKind::Claude => "C",
-        AgentKind::Codex => "X",
-        AgentKind::Shell => "$",
+        ProcessKind::Agent(AgentKind::Claude) => "C",
+        ProcessKind::Agent(AgentKind::Codex) => "X",
+        ProcessKind::Shell => "$",
     }
 }
 
@@ -172,11 +176,11 @@ pub fn agent_initial(kind: AgentKind) -> &'static str {
 /// single-letter glyph rather than reusing that string directly: a pack author names files by
 /// what the icon *depicts* (`"claude.svg"`), not by this app's own internal one-letter fallback
 /// convention.
-pub fn agent_icon_name(kind: AgentKind) -> &'static str {
+pub fn agent_icon_name(kind: ProcessKind) -> &'static str {
     match kind {
-        AgentKind::Claude => "claude",
-        AgentKind::Codex => "codex",
-        AgentKind::Shell => "shell",
+        ProcessKind::Agent(AgentKind::Claude) => "claude",
+        ProcessKind::Agent(AgentKind::Codex) => "codex",
+        ProcessKind::Shell => "shell",
     }
 }
 
@@ -188,10 +192,10 @@ pub enum TabChipKind {
     Term,
 }
 
-pub fn tab_chip_kind(kind: AgentKind) -> TabChipKind {
+pub fn tab_chip_kind(kind: ProcessKind) -> TabChipKind {
     match kind {
-        AgentKind::Claude | AgentKind::Codex => TabChipKind::Cli,
-        AgentKind::Shell => TabChipKind::Term,
+        ProcessKind::Agent(_) => TabChipKind::Cli,
+        ProcessKind::Shell => TabChipKind::Term,
     }
 }
 
@@ -203,7 +207,7 @@ pub struct ChipColors {
     pub fg: Rgba,
 }
 
-pub fn tab_chip_colors(kind: AgentKind, active: bool) -> ChipColors {
+pub fn tab_chip_colors(kind: ProcessKind, active: bool) -> ChipColors {
     if active {
         let (fg, bg) = agent_tint(kind);
         ChipColors { bg, fg }
@@ -562,9 +566,9 @@ mod tests {
 
     #[test]
     fn agent_kinds_get_the_cli_chip_and_shell_gets_the_terminal_chip() {
-        assert_eq!(tab_chip_kind(AgentKind::Claude), TabChipKind::Cli);
-        assert_eq!(tab_chip_kind(AgentKind::Codex), TabChipKind::Cli);
-        assert_eq!(tab_chip_kind(AgentKind::Shell), TabChipKind::Term);
+        assert_eq!(tab_chip_kind(ProcessKind::claude()), TabChipKind::Cli);
+        assert_eq!(tab_chip_kind(ProcessKind::codex()), TabChipKind::Cli);
+        assert_eq!(tab_chip_kind(ProcessKind::Shell), TabChipKind::Term);
     }
 
     fn same(a: Rgba, b: Rgba) -> bool {
@@ -573,8 +577,8 @@ mod tests {
 
     #[test]
     fn an_active_cli_chip_is_tinted_with_its_own_agent_colour_not_a_shared_default() {
-        let claude = tab_chip_colors(AgentKind::Claude, true);
-        let codex = tab_chip_colors(AgentKind::Codex, true);
+        let claude = tab_chip_colors(ProcessKind::claude(), true);
+        let codex = tab_chip_colors(ProcessKind::codex(), true);
         assert!(
             !same(claude.bg, codex.bg),
             "two different agents must not share a tab chip colour"
@@ -604,15 +608,15 @@ mod tests {
             bg: theme::lang::RS.1.into(),
         };
         let file_colors = file_tab_chip_colors(rs, false);
-        let agent_colors = tab_chip_colors(AgentKind::Shell, false);
+        let agent_colors = tab_chip_colors(ProcessKind::Shell, false);
         assert!(same(file_colors.bg, agent_colors.bg));
         assert!(same(file_colors.fg, agent_colors.fg));
     }
 
     #[test]
     fn an_inactive_chip_is_always_dimmed_to_the_same_neutral_regardless_of_kind() {
-        let claude = tab_chip_colors(AgentKind::Claude, false);
-        let shell = tab_chip_colors(AgentKind::Shell, false);
+        let claude = tab_chip_colors(ProcessKind::claude(), false);
+        let shell = tab_chip_colors(ProcessKind::Shell, false);
         assert!(same(claude.bg, shell.bg));
         assert!(same(claude.fg, shell.fg));
         assert!(same(claude.bg, theme::border::ZONE.into()));

@@ -652,7 +652,7 @@ impl AdeApp {
                 KeycapSize::Standard,
             ))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.new_agent(AgentKind::Shell, window, cx);
+                this.new_agent(ProcessKind::Shell, window, cx);
             }))
     }
 
@@ -1759,7 +1759,7 @@ mod rail_row_tests {
             // make this test vacuous.
             app.select_worktree(1, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -1825,7 +1825,7 @@ mod rail_row_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -1884,7 +1884,7 @@ mod rail_row_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -1947,7 +1947,7 @@ mod rail_row_tests {
         let agent_in_b = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -1956,7 +1956,7 @@ mod rail_row_tests {
             );
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 None,
@@ -2011,7 +2011,7 @@ mod rail_row_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 busy_wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -2019,7 +2019,7 @@ mod rail_row_tests {
                 cx,
             );
             app.agents.spawn(
-                AgentKind::Codex,
+                ProcessKind::codex(),
                 busy_wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -2447,7 +2447,7 @@ mod rail_filter_caret_tests {
 mod agent_chip_icon_pack_tests {
     use crate::rail::worktrees::WorktreeItem;
     use crate::root::focus::palette_focus_tests;
-    use crate::work_surface::agents::AgentKind;
+    use crate::work_surface::agents::ProcessKind;
     use gpui::TestAppContext;
 
     fn worktree_item(path: std::path::PathBuf, label: &str) -> WorktreeItem {
@@ -2489,7 +2489,7 @@ mod agent_chip_icon_pack_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -2520,7 +2520,7 @@ mod agent_chip_icon_pack_tests {
         cx: &mut TestAppContext,
     ) {
         let pack_dir = tempfile::tempdir().expect("tempdir");
-        // The seeded agent is a real `AgentKind::Shell` (`work_surface::agent_icon_name`'s own
+        // The seeded agent is a real `ProcessKind::Shell` (`work_surface::agent_icon_name`'s own
         // mapping), so `shell.svg` is the real file this specific row's chip looks for.
         std::fs::write(pack_dir.path().join("shell.svg"), "<svg></svg>").expect("write");
 

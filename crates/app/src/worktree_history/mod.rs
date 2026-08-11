@@ -9,7 +9,7 @@
 use crate::root::*;
 use crate::work_surface::agents::AgentId;
 #[cfg(test)]
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use gpui::{Context, Window};
 use std::path::Path;
 #[cfg(test)]

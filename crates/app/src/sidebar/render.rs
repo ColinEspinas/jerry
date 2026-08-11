@@ -1985,18 +1985,18 @@ impl AdeApp {
         // The agent whose tint/initial the message box's chip shows - the current worktree's
         // first real agent, if any. There is no per-message "which agent drafted this"
         // fact to read (`changes::draft_commit_message`'s own docs cover why the message itself
-        // is a deterministic placeholder, not real agent output) - `AgentKind::Shell`'s
+        // is a deterministic placeholder, not real agent output) - `ProcessKind::Shell`'s
         // existing neutral chip (`work_surface::agent_tint`'s own docs: "isn't an agent, so it
         // gets a neutral chip instead of an invented tint") is the honest fallback with none.
         let drafting_kind = self
             .current_worktree_agents()
-            .find(|agent| agent.kind != AgentKind::Shell)
+            .find(|agent| agent.kind.is_agent_session())
             .map(|agent| agent.kind);
         let drafted_by = match drafting_kind {
             Some(kind) => format!("drafted by {}", kind.label()),
             None => "drafted by no agent".to_string(),
         };
-        let chip_kind = drafting_kind.unwrap_or(AgentKind::Shell);
+        let chip_kind = drafting_kind.unwrap_or(ProcessKind::Shell);
         let (chip_fg, chip_bg) = work_surface::agent_tint(chip_kind);
         let chip_initial = work_surface::agent_initial(chip_kind);
 

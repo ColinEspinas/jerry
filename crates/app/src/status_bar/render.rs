@@ -206,9 +206,10 @@ impl AdeApp {
     }
 
     /// `N agents · X% cpu · Y GB` - agent count is a real count of currently open
-    /// [`AgentKind::Claude`]/[`AgentKind::Codex`] agents; cpu/mem are the real,
-    /// periodically-sampled [`Self::process_stats`] aggregated across those agents' real pids
-    /// via [`process_stats::aggregate_process_stats`]. A field with no real sample known yet for
+    /// [`crate::work_surface::agents::ProcessKind::Agent`] agents - never a plain
+    /// `ProcessKind::Shell`, which has no agent work to attribute cpu/memory to. cpu/mem are the
+    /// real, periodically-sampled [`Self::process_stats`] aggregated across those agents' real
+    /// pids via [`process_stats::aggregate_process_stats`]. A field with no real sample yet for
     /// *any* agent shows `...` for that one piece rather than a fabricated `0%`/`0 B` - see that
     /// function's own docs for exactly when that is: a single un-sampleable pid (e.g. a real
     /// zombie mid-EOF-poll) no longer blanks every other agent's genuinely known value.
@@ -237,7 +238,7 @@ impl AdeApp {
         let agents: Vec<&Agent> = self
             .agents
             .iter()
-            .filter(|agent| matches!(agent.kind, AgentKind::Claude | AgentKind::Codex))
+            .filter(|agent| agent.kind.is_agent_session())
             .collect();
         let agent_count = agents.len();
         let agent_pids: Vec<u32> = agents
@@ -276,7 +277,7 @@ impl AdeApp {
         let agent_count = self
             .agents
             .iter()
-            .filter(|agent| matches!(agent.kind, AgentKind::Claude | AgentKind::Codex))
+            .filter(|agent| agent.kind.is_agent_session())
             .count();
         self.render_status_text(format!("{agent_count} agents"))
     }

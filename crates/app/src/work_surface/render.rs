@@ -69,7 +69,7 @@ impl AdeApp {
     /// this app can offer to spawn an agent into until a real repo is opened.
     pub(crate) fn new_agent(
         &mut self,
-        kind: AgentKind,
+        kind: ProcessKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -129,7 +129,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_agent(AgentKind::Shell, window, cx);
+        self.new_agent(ProcessKind::Shell, window, cx);
     }
 
     /// `Ctrl+W` (GitHub issue #26) - closes whichever tab the centre pane is genuinely showing
@@ -476,13 +476,13 @@ impl AdeApp {
         let existing = self
             .agents
             .iter()
-            .find(|agent| agent.kind == AgentKind::Shell && agent.cwd == cwd)
+            .find(|agent| agent.kind == ProcessKind::Shell && agent.cwd == cwd)
             .map(|agent| agent.id);
         match existing {
             Some(id) => self.select_agent(id, window, cx),
             None => {
                 self.agents.spawn(
-                    AgentKind::Shell,
+                    ProcessKind::Shell,
                     cwd,
                     self.settings.appearance.terminal_font_size,
                     self.settings.terminal.shell_override(),
@@ -729,7 +729,7 @@ impl AdeApp {
     pub(crate) fn current_worktree_is_bare(&self) -> bool {
         !self
             .current_worktree_agents()
-            .any(|agent| agent.kind != AgentKind::Shell)
+            .any(|agent| agent.kind.is_agent_session())
     }
 
     /// The branch label for the currently selected worktree, if any is recorded for it - shared
@@ -1228,7 +1228,7 @@ impl AdeApp {
     /// [`Self::plus_button_bounds`].
     ///
     /// Five rows, in the exact order and wording Revision R12 §3 specifies: *New terminal*
-    /// ([`Self::new_agent`] with [`AgentKind::Shell`]), *New agent* (`runs in <branch>` -
+    /// ([`Self::new_agent`] with [`ProcessKind::Shell`]), *New agent* (`runs in <branch>` -
     /// [`Self::new_agent_pane`]), *Git graph* ([`Self::open_git_graph`]), *Open file…*
     /// ([`Self::open_palette`], scoped to [`palette::PaletteScope::Files`]), and *Next changed
     /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent*, *Git graph*, and *Next
@@ -1259,7 +1259,7 @@ impl AdeApp {
             None => self.plus_button_bounds,
         };
 
-        let resolved_kind = self.resolved_new_agent_kind();
+        let resolved_kind = ProcessKind::from(self.resolved_new_agent_kind());
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
         let agent_initial = work_surface::agent_initial(resolved_kind);
         let branch = self.current_worktree_branch();
@@ -1307,7 +1307,7 @@ impl AdeApp {
                     )
                     .on_click(cx.listener(
                         |this, _event: &ClickEvent, window, cx| {
-                            this.new_agent(AgentKind::Shell, window, cx);
+                            this.new_agent(ProcessKind::Shell, window, cx);
                             this.plus_menu_open = false;
                             cx.notify();
                         },
@@ -1397,6 +1397,10 @@ impl AdeApp {
     /// installed, or `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet).
     /// Display-only - [`Self::new_agent_pane`] runs its own detection independently, off the
     /// foreground thread, at the moment it actually spawns.
+    ///
+    /// Returns the narrow [`AgentKind`], not [`ProcessKind`]: the "New agent" row can only ever
+    /// resolve to a real agent CLI, so "could this be a shell?" isn't a question a caller has to
+    /// answer - the type says it can't be.
     pub(crate) fn resolved_new_agent_kind(&self) -> AgentKind {
         settings::AGENT_KINDS
             .into_iter()
@@ -1428,11 +1432,9 @@ impl AdeApp {
             let installed = cx
                 .background_executor()
                 .spawn(async move {
-                    settings::AGENT_KINDS.into_iter().find(|kind| {
-                        kind.agent_binary_name()
-                            .and_then(pty_core::resolve_on_path)
-                            .is_some()
-                    })
+                    settings::AGENT_KINDS
+                        .into_iter()
+                        .find(|kind| pty_core::resolve_on_path(kind.binary_name()).is_some())
                 })
                 .await;
             // Needs `Window` access to move focus onto the newly spawned agent's pane
@@ -1440,7 +1442,7 @@ impl AdeApp {
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
                 this.agents.spawn(
-                    kind,
+                    ProcessKind::Agent(kind),
                     cwd,
                     this.settings.appearance.terminal_font_size,
                     this.settings.terminal.shell_override(),
@@ -1544,14 +1546,14 @@ impl AdeApp {
     }
 
     /// [`NewTerminal`]'s `ctrl-shift-T` action handler - the `+` menu's "New terminal" row's own
-    /// keybinding, spawning a [`AgentKind::Shell`] agent like the row's click handler does.
+    /// keybinding, spawning a [`ProcessKind::Shell`] agent like the row's click handler does.
     pub(crate) fn handle_new_terminal_action(
         &mut self,
         _action: &NewTerminal,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_agent(AgentKind::Shell, window, cx);
+        self.new_agent(ProcessKind::Shell, window, cx);
     }
 
     /// [`NewAgentPane`]'s `secondary-shift-n` action handler - see [`Self::new_agent_pane`].
@@ -1689,7 +1691,7 @@ impl AdeApp {
         let (agent_fg, agent_bg) = work_surface::agent_tint(agent.kind);
         let agent_initial = work_surface::agent_initial(agent.kind);
         let is_bare = self.current_worktree_is_bare();
-        // `AgentKind` only tracks which CLI binary is running, not which model it's
+        // `ProcessKind` only tracks which CLI binary is running, not which model it's
         // configured to use, so `agent.kind.label()` ("Claude"/"Codex"/"Shell") is the
         // closest honest substitute for a model name this app never actually observes. A bare
         // worktree (no real agent at all - `is_bare` is only ever true while `agent.kind`
@@ -1933,7 +1935,7 @@ impl AdeApp {
         let exit_code = pane.exit_status().map(|status| status.exit_code());
         let status_value = self.agent_status(agent, cx);
         let state_label = work_surface::pty_state_label(is_running, status_value, exit_code);
-        let is_wsl_shell = agent.kind == AgentKind::Shell && env_info::is_wsl();
+        let is_wsl_shell = agent.kind == ProcessKind::Shell && env_info::is_wsl();
         let label_text = if is_wsl_shell {
             format!("{program_label} \u{b7} wsl")
         } else {
@@ -1961,7 +1963,7 @@ impl AdeApp {
             );
 
         let header = match agent.kind {
-            AgentKind::Shell => header.child(
+            ProcessKind::Shell => header.child(
                 div()
                     .flex_none()
                     .max_w(px(280.0))
@@ -1974,7 +1976,7 @@ impl AdeApp {
             ),
             // No per-kind header content for an agent - pid is shown once, in the info
             // footer below.
-            AgentKind::Claude | AgentKind::Codex => header,
+            ProcessKind::Agent(_) => header,
         };
 
         let macos = self.window_controls_style().is_macos();
@@ -2483,7 +2485,10 @@ pub(crate) fn render_dropdown_menu_row(
 /// agent CLI tabs, or a pane glyph (a bar plus a prompt mark) for terminal tabs. Turns
 /// `work_surface::tab_chip_kind`/`tab_chip_colors`'s mapping into GPUI elements; no
 /// chip-selection logic lives here.
-pub(in crate::work_surface) fn render_tab_chip(kind: AgentKind, active: bool) -> gpui::AnyElement {
+pub(in crate::work_surface) fn render_tab_chip(
+    kind: ProcessKind,
+    active: bool,
+) -> gpui::AnyElement {
     let colors = work_surface::tab_chip_colors(kind, active);
     let base = div()
         .flex_none()
@@ -2725,7 +2730,7 @@ mod tab_scoping_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2733,7 +2738,7 @@ mod tab_scoping_tests {
                 cx,
             );
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2814,7 +2819,7 @@ mod tab_scoping_tests {
         let (id_a, id_b) = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             let id_a = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2823,7 +2828,7 @@ mod tab_scoping_tests {
             );
             app.select_worktree(1, window, cx);
             let id_b = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 None,
@@ -2876,7 +2881,7 @@ mod tab_scoping_tests {
         let (id1, id2) = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             let id1 = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2884,7 +2889,7 @@ mod tab_scoping_tests {
                 cx,
             );
             let id2 = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2939,7 +2944,7 @@ mod tab_scoping_tests {
         let id_a = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -2950,7 +2955,7 @@ mod tab_scoping_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 None,
@@ -2997,7 +3002,7 @@ mod tab_scoping_tests {
         let (initial_id, id2, id3) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let id2 = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3005,7 +3010,7 @@ mod tab_scoping_tests {
                 cx,
             );
             let id3 = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3111,7 +3116,7 @@ mod tab_scoping_tests {
         let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
             let first_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3186,7 +3191,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3245,7 +3250,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3349,7 +3354,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3427,7 +3432,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3530,7 +3535,7 @@ mod tab_scoping_tests {
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
             let second_id = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -3588,7 +3593,7 @@ mod tab_scoping_tests {
         let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             let first_id = app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3596,7 +3601,7 @@ mod tab_scoping_tests {
                 cx,
             );
             let second_id = app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3619,7 +3624,7 @@ mod tab_scoping_tests {
     /// Revision R12 §3: a worktree with only its default `Shell` agent is "bare" -
     /// `current_worktree_is_bare` must say so - and stops being bare the moment a real agent
     /// spawns into it, proven through the same live `Agents`/`AdeApp` plumbing every other test
-    /// in this module uses (not just the pure `AgentKind` match this reads off of).
+    /// in this module uses (not just the pure `ProcessKind` match this reads off of).
     #[gpui::test]
     fn a_worktree_with_only_its_default_shell_is_bare_until_a_real_agent_spawns(
         cx: &mut TestAppContext,
@@ -3634,7 +3639,7 @@ mod tab_scoping_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3650,7 +3655,7 @@ mod tab_scoping_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3684,7 +3689,7 @@ mod tab_scoping_tests {
         let shell_id = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3877,7 +3882,7 @@ mod tab_scoping_tests {
         let claude_id = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             let shell_id = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3885,7 +3890,7 @@ mod tab_scoping_tests {
                 cx,
             );
             let claude_id = app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3960,7 +3965,7 @@ mod tab_scoping_tests {
         });
         let second_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -4025,7 +4030,7 @@ mod tab_scoping_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -4078,7 +4083,7 @@ mod tab_scoping_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -4194,7 +4199,7 @@ mod terminal_clear_action_tests {
 
         let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
             let first = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -4202,7 +4207,7 @@ mod terminal_clear_action_tests {
                 cx,
             );
             let second = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -4315,7 +4320,7 @@ mod tab_order_persistence_tests {
         );
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -4355,7 +4360,7 @@ mod tab_order_persistence_tests {
             open_test_app_with_real_persistence(cx, repo.path().to_path_buf(), settings_path);
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
                 None,
@@ -4465,7 +4470,7 @@ mod terminal_clipboard_action_tests {
         seed_active_pane(&app, cx, "background-agent-text");
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
                 None,

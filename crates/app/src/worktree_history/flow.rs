@@ -266,7 +266,7 @@ mod worktree_history_regression_tests {
     ) -> AgentId {
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 cwd,
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),

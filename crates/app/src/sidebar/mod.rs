@@ -31,7 +31,7 @@
 use crate::root::*;
 use crate::sidebar::file_tree::{FileTreeEntry, LangChip};
 use crate::theme;
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use crate::work_surface::state as work_surface;
 use gpui::{div, font, prelude::*, px, uniform_list, ClickEvent, Context, Pixels, Window};
 use std::collections::{HashMap, HashSet};

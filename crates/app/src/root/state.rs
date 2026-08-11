@@ -601,7 +601,7 @@ impl AdeApp {
                 // `Agents::focus_active`'s docs and this crate's `OverlayFocus`/`restore_focus`
                 // docs for why a *focused* window must never start with `Window::focus == None`.
                 let startup_agent = this.agents.spawn(
-                    AgentKind::Shell,
+                    ProcessKind::Shell,
                     path.clone(),
                     this.settings.appearance.terminal_font_size,
                     this.settings.terminal.shell_override(),

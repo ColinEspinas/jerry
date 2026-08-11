@@ -87,7 +87,7 @@ use crate::text_history;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
 use crate::updater;
-use crate::work_surface::agents::{AgentId, AgentKind, Agents};
+use crate::work_surface::agents::{AgentId, Agents, ProcessKind};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 
@@ -2358,7 +2358,7 @@ impl AdeApp {
 
         if self.agents.iter_for_cwd(path.clone()).next().is_none() {
             self.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 path.clone(),
                 self.settings.appearance.terminal_font_size,
                 self.settings.terminal.shell_override(),
@@ -3826,7 +3826,7 @@ mod repo_list_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Claude,
+                ProcessKind::claude(),
                 repo_a.path().to_path_buf(),
                 12.0,
                 None,
@@ -3972,7 +3972,7 @@ mod repo_list_tests {
         });
 
         app.update_in(cx, |app, window, cx| {
-            app.new_agent(AgentKind::Shell, window, cx);
+            app.new_agent(ProcessKind::Shell, window, cx);
         });
         app.update_in(cx, |app, window, cx| {
             app.handle_new_agent_pane_action(&NewAgentPane, window, cx);

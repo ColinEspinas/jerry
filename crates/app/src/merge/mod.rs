@@ -23,7 +23,7 @@ use crate::merge::state as merge;
 use crate::root::*;
 use crate::theme;
 #[cfg(test)]
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use crate::work_surface::agents::{Agent, AgentId};
 use crate::work_surface::state as work_surface;
 use gpui::{

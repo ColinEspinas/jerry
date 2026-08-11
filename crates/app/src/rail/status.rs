@@ -2,17 +2,22 @@
 //! calls the whole point of the agent rail.
 //!
 //! GPUI-free and pty/process-free: takes small, already-read signals ([`ProcessSignal`], a
-//! `has_reviewable_diff` bool, a [`crate::work_surface::agents::AgentKind`]) and returns a [`Status`], so
-//! the decision logic is unit testable without a window or a child process. Gathering those
-//! signals from a live [`crate::terminal::pane::TerminalPane`] and `wt_core::diff::diff_against_base`
-//! lives in `crate::rail::state`/`crate::root`.
+//! `has_reviewable_diff` bool, a [`crate::work_surface::agents::ProcessKind`]) and returns a
+//! [`Status`], so the decision logic is unit testable without a window or a child process.
+//! Gathering those signals from a live [`crate::terminal::pane::TerminalPane`] and
+//! `wt_core::diff::diff_against_base` lives in `crate::rail::state`/`crate::root`.
 //!
 //! ## The heuristic, precisely
 //!
 //! Exit-based statuses ([`Status::Fail`], [`Status::Review`]) are exact: a process either exited
 //! non-zero/was killed by a signal, or exited 0. Whether a "review ready" exit has anything to
 //! review is likewise exact - `wt_core::diff::diff_against_base` reporting at least one changed
-//! file.
+//! file. [`Status::Review`] is further gated on
+//! [`crate::work_surface::agents::ProcessKind::is_agent_session`]: a plain
+//! [`crate::work_surface::agents::ProcessKind::Shell`] exiting next to an unrelated worktree
+//! diff didn't do reviewable work - it's a terminal that closed, not a session that finished a turn -
+//! so it reports [`Status::Idle`] instead, same as an agent session's clean exit with nothing to
+//! review.
 //!
 //! The one fuzzy call is distinguishing [`Status::Run`] from [`Status::Ask`] for a still-alive
 //! process: there's no portable, reliable way to know from outside a process that it's blocked
@@ -23,31 +28,32 @@
 //! quiet longer than a threshold is treated as "probably waiting on input" - a heuristic, not a
 //! certainty.
 //!
-//! Two thresholds, because a plain shell and an interactive agent CLI mean something different
-//! by "gone quiet":
+//! Two thresholds, because a plain shell and a real agent session
+//! ([`crate::work_surface::agents::ProcessKind::is_agent_session`]) mean something different by
+//! "gone quiet":
 //! - [`RUN_RECENT_OUTPUT_WINDOW`] (2s) is the boundary between "actively streaming" and "merely
 //!   paused" for any live process.
-//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is a second, longer threshold that only matters for
-//!   [`crate::work_surface::agents::AgentKind::Claude`]/[`crate::work_surface::agents::AgentKind::Codex`] agents:
-//!   an agent CLI commonly pauses for several seconds between a tool call and its result, so
-//!   treating every pause past 2s as "needs input" would flicker the rail on normal agent
-//!   latency. Only past the longer window is an agent flagged [`Status::Ask`].
+//! - [`AGENT_ASK_IDLE_THRESHOLD`] (15s) is a second, longer threshold that only matters for a
+//!   real agent session: an agent CLI commonly pauses for several seconds between a tool call
+//!   and its result, so treating every pause past 2s as "needs input" would flicker the rail on
+//!   normal agent latency. Only past the longer window is an agent flagged [`Status::Ask`].
 //!
-//! A plain [`crate::work_surface::agents::AgentKind::Shell`] has no such grace window: a shell sitting at
-//! its prompt isn't "asking a question", it's just idle - so it falls straight to
+//! A plain [`crate::work_surface::agents::ProcessKind::Shell`] has no such grace window: a shell
+//! sitting at its prompt isn't "asking a question", it's just idle - so it falls straight to
 //! [`Status::Idle`] once [`RUN_RECENT_OUTPUT_WINDOW`] elapses, never [`Status::Ask`].
 
 use std::time::Duration;
 
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 
 /// How long a live process must have produced output within to count as "recently active" - the
 /// short end of the Run/Ask heuristic (see the module docs).
 pub const RUN_RECENT_OUTPUT_WINDOW: Duration = Duration::from_secs(2);
 
-/// How long an agent-CLI agent ([`AgentKind::Claude`]/[`AgentKind::Codex`]) must have
-/// been quiet before it's flagged [`Status::Ask`] - see the module docs for why this is longer
-/// than [`RUN_RECENT_OUTPUT_WINDOW`].
+/// How long a real agent session ([`ProcessKind::Agent`] - i.e. any
+/// [`crate::work_surface::agents::AgentKind`] CLI, never a shell) must have been quiet before
+/// it's flagged [`Status::Ask`] - see the module docs for why this is longer than
+/// [`RUN_RECENT_OUTPUT_WINDOW`].
 pub const AGENT_ASK_IDLE_THRESHOLD: Duration = Duration::from_secs(15);
 
 /// The status vocabulary from `design_handoff_jerry_ade/README.md`'s "Status vocabulary" table,
@@ -143,28 +149,33 @@ pub enum ProcessSignal {
 
 /// Derives the [`Status`] for one agent from its process signal and whether it has a
 /// non-empty diff against its worktree's base - see the module docs for the Run/Ask split.
-pub fn derive_status(kind: AgentKind, signal: ProcessSignal, has_reviewable_diff: bool) -> Status {
+pub fn derive_status(
+    kind: ProcessKind,
+    signal: ProcessSignal,
+    has_reviewable_diff: bool,
+) -> Status {
     match signal {
         ProcessSignal::NoProcess => Status::Idle,
-        ProcessSignal::Running { idle } => match kind {
-            AgentKind::Shell => {
-                if idle < RUN_RECENT_OUTPUT_WINDOW {
-                    Status::Run
-                } else {
-                    Status::Idle
-                }
-            }
-            AgentKind::Claude | AgentKind::Codex => {
+        ProcessSignal::Running { idle } => {
+            if kind.is_agent_session() {
                 if idle < AGENT_ASK_IDLE_THRESHOLD {
                     Status::Run
                 } else {
                     Status::Ask
                 }
+            } else if idle < RUN_RECENT_OUTPUT_WINDOW {
+                Status::Run
+            } else {
+                Status::Idle
             }
-        },
+        }
         ProcessSignal::Exited { success } => {
             if success {
-                if has_reviewable_diff {
+                // A worktree diff sitting around when a plain shell happens to exit isn't
+                // this shell's doing - it's not a session that did reviewable work, it's a
+                // terminal that closed. Only a real agent session's successful exit means
+                // "review ready" (see `ProcessKind::is_agent_session`'s docs).
+                if kind.is_agent_session() && has_reviewable_diff {
                     Status::Review
                 } else {
                     Status::Idle
@@ -183,11 +194,11 @@ mod tests {
     #[test]
     fn no_process_is_idle_regardless_of_kind_or_diff() {
         assert_eq!(
-            derive_status(AgentKind::Shell, ProcessSignal::NoProcess, true),
+            derive_status(ProcessKind::Shell, ProcessSignal::NoProcess, true),
             Status::Idle
         );
         assert_eq!(
-            derive_status(AgentKind::Claude, ProcessSignal::NoProcess, true),
+            derive_status(ProcessKind::claude(), ProcessSignal::NoProcess, true),
             Status::Idle
         );
     }
@@ -197,9 +208,18 @@ mod tests {
         let signal = ProcessSignal::Running {
             idle: Duration::from_millis(500),
         };
-        assert_eq!(derive_status(AgentKind::Shell, signal, false), Status::Run);
-        assert_eq!(derive_status(AgentKind::Claude, signal, false), Status::Run);
-        assert_eq!(derive_status(AgentKind::Codex, signal, false), Status::Run);
+        assert_eq!(
+            derive_status(ProcessKind::Shell, signal, false),
+            Status::Run
+        );
+        assert_eq!(
+            derive_status(ProcessKind::claude(), signal, false),
+            Status::Run
+        );
+        assert_eq!(
+            derive_status(ProcessKind::codex(), signal, false),
+            Status::Run
+        );
     }
 
     #[test]
@@ -208,7 +228,7 @@ mod tests {
             idle: RUN_RECENT_OUTPUT_WINDOW + Duration::from_secs(1),
         };
         assert_eq!(
-            derive_status(AgentKind::Shell, signal, false),
+            derive_status(ProcessKind::Shell, signal, false),
             Status::Idle,
             "a shell sitting at its prompt is idle, not \"needs input\" - it isn't asking anything"
         );
@@ -222,8 +242,14 @@ mod tests {
         let signal = ProcessSignal::Running {
             idle: RUN_RECENT_OUTPUT_WINDOW + Duration::from_secs(1),
         };
-        assert_eq!(derive_status(AgentKind::Claude, signal, false), Status::Run);
-        assert_eq!(derive_status(AgentKind::Codex, signal, false), Status::Run);
+        assert_eq!(
+            derive_status(ProcessKind::claude(), signal, false),
+            Status::Run
+        );
+        assert_eq!(
+            derive_status(ProcessKind::codex(), signal, false),
+            Status::Run
+        );
     }
 
     #[test]
@@ -231,16 +257,25 @@ mod tests {
         let signal = ProcessSignal::Running {
             idle: AGENT_ASK_IDLE_THRESHOLD + Duration::from_secs(1),
         };
-        assert_eq!(derive_status(AgentKind::Claude, signal, false), Status::Ask);
-        assert_eq!(derive_status(AgentKind::Codex, signal, false), Status::Ask);
+        assert_eq!(
+            derive_status(ProcessKind::claude(), signal, false),
+            Status::Ask
+        );
+        assert_eq!(
+            derive_status(ProcessKind::codex(), signal, false),
+            Status::Ask
+        );
     }
 
     #[test]
     fn nonzero_exit_is_fail_regardless_of_diff() {
         let signal = ProcessSignal::Exited { success: false };
-        assert_eq!(derive_status(AgentKind::Shell, signal, true), Status::Fail);
         assert_eq!(
-            derive_status(AgentKind::Claude, signal, false),
+            derive_status(ProcessKind::Shell, signal, true),
+            Status::Fail
+        );
+        assert_eq!(
+            derive_status(ProcessKind::claude(), signal, false),
             Status::Fail
         );
     }
@@ -249,8 +284,21 @@ mod tests {
     fn zero_exit_with_a_real_diff_is_review() {
         let signal = ProcessSignal::Exited { success: true };
         assert_eq!(
-            derive_status(AgentKind::Claude, signal, true),
+            derive_status(ProcessKind::claude(), signal, true),
             Status::Review
+        );
+    }
+
+    #[test]
+    fn a_shell_zero_exit_with_a_real_diff_is_idle_not_review() {
+        // A plain shell exiting next to an unrelated worktree diff isn't a session that
+        // finished reviewable work - it's a terminal that closed. Only a real agent session's
+        // clean exit means "review ready" (see `ProcessKind::is_agent_session`'s docs).
+        let signal = ProcessSignal::Exited { success: true };
+        assert_eq!(
+            derive_status(ProcessKind::Shell, signal, true),
+            Status::Idle,
+            "a shell isn't an agent session - its exit can't be \"review ready\""
         );
     }
 
@@ -258,7 +306,7 @@ mod tests {
     fn zero_exit_with_no_diff_is_idle_not_review() {
         let signal = ProcessSignal::Exited { success: true };
         assert_eq!(
-            derive_status(AgentKind::Claude, signal, false),
+            derive_status(ProcessKind::claude(), signal, false),
             Status::Idle
         );
     }

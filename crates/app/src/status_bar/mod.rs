@@ -22,11 +22,11 @@ use crate::rail::state as rail;
 use crate::root::*;
 use crate::theme;
 // `Agent` itself is only named inside `render::render_status_agents_cluster`'s real
-// `#[cfg(target_os = "linux")]` variant (`Vec<&Agent>`) - the non-Linux twin only needs
-// `AgentKind`, so a Windows/macOS build genuinely never references `Agent` here.
+// `#[cfg(target_os = "linux")]` variant (`Vec<&Agent>`); the non-Linux twin reaches the same
+// agents through `AdeApp` and only calls `ProcessKind::is_agent_session` on them, so a
+// Windows/macOS build genuinely never references `Agent` here.
 #[cfg(target_os = "linux")]
 use crate::work_surface::agents::Agent;
-use crate::work_surface::agents::AgentKind;
 use gpui::{div, font, prelude::*, px, ClickEvent, Context};
 #[cfg(test)]
 use std::path::PathBuf;

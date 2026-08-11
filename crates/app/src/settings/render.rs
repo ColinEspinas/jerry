@@ -527,7 +527,11 @@ impl AdeApp {
         is_last: bool,
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (badge_fg, badge_bg) = work_surface::agent_tint(row.kind);
+        // `row.kind` is an `AgentKind` (this card only ever lists real agent CLIs); the badge
+        // helpers are shared with the tab strip/rail, which also have to draw shells, so they
+        // take the wider `ProcessKind`.
+        let badge_kind = ProcessKind::from(row.kind);
+        let (badge_fg, badge_bg) = work_surface::agent_tint(badge_kind);
         let path_text = match &row.resolved_path {
             Some(path) => path.display().to_string(),
             // The exact reason a "ready" dot isn't shown, not just "unknown"/blank.
@@ -564,7 +568,7 @@ impl AdeApp {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(px(9.5))
                     .text_color(badge_fg)
-                    .child(work_surface::agent_initial(row.kind)),
+                    .child(work_surface::agent_initial(badge_kind)),
             )
             .child(
                 div()
@@ -608,8 +612,8 @@ impl AdeApp {
 
     /// The Installed card's footer - `design_handoff_jerry_ade/README.md`: "Card footer ...
     /// '+ Add an agent — any binary that speaks a resumable agent on stdin'." Rendered dimmed
-    /// and inert (no `on_click`) - `crate::work_surface::agents::AgentKind` is a fixed Rust enum, so there
-    /// is no runtime "register a new agent binary" flow to wire this to yet.
+    /// and inert (no `on_click`) - `crate::work_surface::agents::AgentKind` is a fixed Rust enum,
+    /// so there is no runtime "register a new agent binary" flow to wire this to yet.
     pub(in crate::settings) fn render_settings_agents_footer(&self) -> impl IntoElement {
         div()
             .flex_none()
@@ -4431,7 +4435,7 @@ mod terminal_font_size_tests {
 
         // A second real agent, spawned at whatever the default font size already was.
         app.update_in(cx, |app, window, cx| {
-            app.new_agent(AgentKind::Shell, window, cx);
+            app.new_agent(ProcessKind::Shell, window, cx);
         });
         cx.run_until_parked();
 
@@ -4701,7 +4705,7 @@ mod shell_setting_tests {
         // The next real Shell tab runs it - and really starts.
         app.update_in(cx, |app, window, cx| {
             app.close_settings(window, cx);
-            app.new_agent(AgentKind::Shell, window, cx);
+            app.new_agent(ProcessKind::Shell, window, cx);
         });
         cx.run_until_parked();
         let pane = app
@@ -4938,7 +4942,7 @@ mod shell_suggestion_dropdown_tests {
         // The real proof it was a usable choice and not just a string: the next Shell tab spawns it.
         app.update_in(cx, |app, window, cx| {
             app.close_settings(window, cx);
-            app.new_agent(AgentKind::Shell, window, cx);
+            app.new_agent(ProcessKind::Shell, window, cx);
         });
         cx.run_until_parked();
         let pane = app
