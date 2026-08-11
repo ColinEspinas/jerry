@@ -77,7 +77,7 @@ impl AdeApp {
             return;
         }
         let cwd = self.active_agent_cwd();
-        self.agents.spawn(
+        let id = self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
@@ -85,6 +85,19 @@ impl AdeApp {
             window,
             cx,
         );
+        // GitHub issue #225: capture this agent's review baseline - a real snapshot of the
+        // worktree exactly as it stands right now, so "what has this agent changed" has a real
+        // base point to be measured against. Hooked here, at `Agents::spawn`'s caller rather than
+        // inside `Agents` itself, for the same reason `load_diff` is triggered by its caller:
+        // `Agents` owns processes and tabs, not git snapshots. See
+        // `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race
+        // between the process starting and the snapshot landing.
+        self.capture_review_baseline(id, cx);
+        // A second agent in this worktree closes the single-agent gate on every agent already
+        // there, so a review tab open for one of them must really close now - see
+        // `crate::review::render::AdeApp::close_gated_review_tab` for why this is a real close
+        // rather than just dropping the tab from the strip.
+        self.close_gated_review_tab(window, cx);
         self.focus_newly_spawned_agent(window, cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -311,12 +324,19 @@ impl AdeApp {
         } else {
             status::ProcessSignal::NoProcess
         };
-        let has_diff = self
-            .diff_cache
-            .get(&agent.cwd)
-            .map(|summary| summary.has_changes)
-            .unwrap_or(false);
-        status::derive_status(agent.kind, signal, has_diff)
+        // GitHub issue #225: what makes an exited agent "review ready" is now whether *it* has a
+        // real, unreviewed diff against *its own* baseline - not whether its worktree's branch
+        // differs from the default branch, which is a different question and was producing a
+        // genuinely wrong answer: an agent that changed nothing, in a worktree whose branch had
+        // already diverged from `main`, was reported `Review ready` off the back of the branch's
+        // diff. `derive_status` itself is unchanged - only the fact fed into it is.
+        //
+        // Also carries the single-agent gate (see `Self::review_available_for`): in a worktree
+        // with more than one open agent this is always `false`, so no agent there claims review
+        // readiness it can't honestly substantiate. Such an agent lands on `Idle` instead, which
+        // is the same state it would show with an empty review.
+        let has_unreviewed_changes = self.agent_has_unreviewed_changes(agent.id);
+        status::derive_status(agent.kind, signal, has_unreviewed_changes)
     }
 
     /// The context bar's and idle-status footer's `Archive` action - closes the tab via
@@ -368,6 +388,14 @@ impl AdeApp {
         // one was not.
         let skip_focus_move =
             self.open_change.is_some() || self.settings_open || self.graph_tab_active;
+        // GitHub issue #225: close this agent's review tab (if it's the one open) and release its
+        // baseline ref, *before* `Agents::close` removes the agent - `release_review_baseline`
+        // needs to still be able to look up which worktree to run `git update-ref -d` in. The
+        // persisted metadata entry deliberately survives; see that method's own docs.
+        if self.review_tab_open == Some(id) {
+            self.close_review_tab(window, cx);
+        }
+        self.release_review_baseline(id, cx);
         self.agents.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow
@@ -509,6 +537,7 @@ impl AdeApp {
             &agent_ids,
             self.open_files(),
             self.graph_tab_open,
+            self.review_tab_open,
         )
     }
 
@@ -540,7 +569,9 @@ impl AdeApp {
             .iter()
             .filter_map(|tab_ref| match tab_ref {
                 work_surface::TabRef::File(path) => Some(cwd.join(path)),
-                work_surface::TabRef::Agent(_) | work_surface::TabRef::Graph => None,
+                work_surface::TabRef::Agent(_)
+                | work_surface::TabRef::Graph
+                | work_surface::TabRef::Review(_) => None,
             })
             .collect();
         self.tab_order_state.set_file_order(&cwd, &files);
@@ -673,7 +704,9 @@ impl AdeApp {
         let order = self.combined_tab_order();
         order.into_iter().filter_map(move |tab_ref| match tab_ref {
             work_surface::TabRef::Agent(id) => self.agents.iter().find(|agent| agent.id == id),
-            work_surface::TabRef::File(_) | work_surface::TabRef::Graph => None,
+            work_surface::TabRef::File(_)
+            | work_surface::TabRef::Graph
+            | work_surface::TabRef::Review(_) => None,
         })
     }
 
@@ -767,7 +800,9 @@ impl AdeApp {
             .iter()
             .filter_map(|tab_ref| match tab_ref {
                 work_surface::TabRef::Agent(id) => Some(*id),
-                work_surface::TabRef::File(_) | work_surface::TabRef::Graph => None,
+                work_surface::TabRef::File(_)
+                | work_surface::TabRef::Graph
+                | work_surface::TabRef::Review(_) => None,
             })
             .collect();
         let labels = self.current_worktree_agent_tab_labels(&agent_ids, cx);
@@ -792,6 +827,11 @@ impl AdeApp {
                 // render_graph_tab`'s own docs for the drag wiring this required.
                 work_surface::TabRef::Graph => {
                     bar = bar.child(crate::graph_view::render::render_graph_tab(self, cx));
+                }
+                // GitHub issue #225: the agent review tab, a full member of the same combined,
+                // draggable order every other kind already goes through.
+                work_surface::TabRef::Review(id) => {
+                    bar = bar.child(crate::review::render::render_review_tab(self, id, cx));
                 }
             }
         }
@@ -2072,6 +2112,16 @@ impl AdeApp {
             {
                 enabled = false;
             }
+            // GitHub issue #225's single-agent gate, applied to the footer door: `Review` is real
+            // backing logic (`implemented: true`), but it is only *offerable* when this agent
+            // really has a baseline and is the sole agent in its worktree. Disabled rather than
+            // hidden, so the row doesn't shift around as agents come and go - and disabled here
+            // means genuinely inert (`Self::render_footer_action_button` drops
+            // `cursor_pointer`/hover/`on_click` entirely), never a clickable-looking no-op.
+            if action.kind == work_surface::ActionKind::OpenReview && !self.review_available_for(id)
+            {
+                enabled = false;
+            }
             // `Keep all`/`Discard worktree` (Revision R10) share one in-flight guard
             // (`Self::worktree_history_op_in_flight`) - see `crate::worktree_history::flow`'s own
             // module docs for why one flag is enough discipline here. Disabled, not just
@@ -2206,6 +2256,9 @@ impl AdeApp {
                         work_surface::ActionKind::DiscardWorktree => {
                             this.request_discard_worktree(id, window, cx)
                         }
+                        work_surface::ActionKind::OpenReview => {
+                            this.open_review_tab(id, window, cx)
+                        }
                         work_surface::ActionKind::Unimplemented => {}
                     }),
                 );
@@ -2242,6 +2295,15 @@ impl AdeApp {
             .h_full()
             .bg(theme::surface::CENTER)
             .child(self.render_tab_strip(cx));
+
+        // GitHub issue #225: the review tab occupies the centre pane exactly as the graph tab
+        // does. Checked first because `open_review_tab` always leaves the graph tab on its way in,
+        // so the two flags are never both set - the order only matters as a defence against a
+        // future path that forgets that.
+        if self.review_tab_active {
+            let body = self.render_review_view(cx);
+            return surface.child(body).into_any_element();
+        }
 
         if self.graph_tab_active {
             let body = self.render_graph_view(cx);
@@ -2487,6 +2549,12 @@ pub(crate) enum DraggedTab {
     Graph {
         label: String,
     },
+    /// GitHub issue #225 - the agent review tab. Carries the agent id it reviews, since (unlike
+    /// the graph tab) a review is always *of* a specific agent.
+    Review {
+        id: AgentId,
+        label: String,
+    },
 }
 
 impl DraggedTab {
@@ -2495,6 +2563,7 @@ impl DraggedTab {
             DraggedTab::Agent { label, .. } => label,
             DraggedTab::File { label, .. } => label,
             DraggedTab::Graph { label } => label,
+            DraggedTab::Review { label, .. } => label,
         }
     }
 
@@ -2505,6 +2574,7 @@ impl DraggedTab {
             DraggedTab::Agent { id, .. } => work_surface::TabRef::Agent(*id),
             DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
             DraggedTab::Graph { .. } => work_surface::TabRef::Graph,
+            DraggedTab::Review { id, .. } => work_surface::TabRef::Review(*id),
         }
     }
 }

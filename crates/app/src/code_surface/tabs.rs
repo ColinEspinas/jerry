@@ -40,11 +40,6 @@ impl AdeApp {
         self.diff_state = DiffLoadState::Loading;
         self.diff_totals = None;
         self.dirty_files = None;
-        // A reloaded diff is a new worktree's (or the same worktree's freshly re-read) file
-        // list - any authorship recorded against the *previous* one belongs to files that may
-        // not even be in this diff anymore. See `changes::Authorship`'s own docs for why this is
-        // always empty today regardless (no real tracking wired up yet).
-        self.file_authorship = changes::Authorship::default();
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let (diff_result, staged_result, dirty_result) = cx

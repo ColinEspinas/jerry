@@ -46,7 +46,6 @@ use crate::code_surface::state::{
     BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverAnchor,
     HoverEntry, HoverStatus,
 };
-use crate::keymap::{self};
 use crate::language;
 use crate::lsp::client::LspClientState;
 use crate::lsp::diagnostics as diagnostics_view;

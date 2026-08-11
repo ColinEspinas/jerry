@@ -72,6 +72,7 @@ use crate::palette::state as palette;
 use crate::rail::repo::{self as repo, Repo, RepoId};
 use crate::rail::state as rail;
 use crate::rail::worktrees::{self, WorktreeItem};
+use crate::review;
 use crate::settings::custom_theme;
 use crate::settings::state as settings;
 #[cfg(test)]
@@ -371,13 +372,39 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
-    /// Which agent(s) wrote each file in [`Self::diff_state`]'s currently loaded diff
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's `by: 's1'`/`by:
-    /// ['s1','s9']` record) - see [`changes::Authorship`]'s own docs for why this is always empty
-    /// today (no real authorship tracking exists yet; this phase only defines the shape a later
-    /// one populates). Reset alongside [`Self::diff_state`] on every reload
-    /// (`crate::code_surface::tabs::AdeApp::load_diff`), never carried across one.
-    pub(crate) file_authorship: changes::Authorship,
+    /// Every open agent's own **review** state (GitHub issue #225) - its captured baseline, the
+    /// diff loaded against that baseline, and which file it has open. Keyed by
+    /// [`crate::work_surface::agents::AgentId`].
+    ///
+    /// This is deliberately *not* the same thing as [`Self::diff_state`], and the difference is
+    /// the whole point of issue #225: `diff_state` holds the one **git** diff for the selected
+    /// worktree (against the merge-base with the default branch), while this holds a per-agent
+    /// **review** (against a snapshot taken when that agent started, or when the user last marked
+    /// it reviewed). One worktree with one agent has both, they answer different questions, and
+    /// they frequently disagree - correctly. See `crate::review`'s own module docs.
+    ///
+    /// An entry appears when a baseline is really captured
+    /// (`crate::review::flow::AdeApp::capture_review_baseline`, a background task, so slightly
+    /// after the agent itself appears) and is removed when the agent closes. An agent with no
+    /// entry has no review surface at all, which is honest: there is nothing to measure against.
+    pub(crate) agent_reviews: HashMap<AgentId, review::state::AgentReview>,
+    /// The on-disk mirror of [`Self::agent_reviews`]' baselines - see
+    /// `crate::review::baseline_state`'s module docs, including the honest note that nothing can
+    /// read these back into a live review yet.
+    pub(crate) review_baseline_state: review::baseline_state::ReviewBaselineState,
+    /// Where [`Self::review_baseline_state`] is persisted - a sibling of the real `settings.toml`,
+    /// or `None` for a test that hasn't opted into real persistence (in which case saving is a
+    /// genuine no-op, exactly like [`Self::tab_order_path`]).
+    pub(crate) review_baseline_path: Option<PathBuf>,
+    /// Which persisted baseline keys *this* instance owns, for the merge-not-clobber write path -
+    /// mirrors [`Self::tab_order_owned`]. See
+    /// `crate::review::baseline_state::ReviewBaselineState::save_merged_at` for the one way this
+    /// file's merge deliberately differs from its siblings'.
+    pub(crate) review_baselines_owned: std::collections::BTreeSet<String>,
+    /// `Some(id)` while a real `Mark reviewed` snapshot is running for that agent - guards against
+    /// a double-click starting two overlapping `git write-tree` runs against the same worktree,
+    /// mirroring [`Self::worktree_history_op_in_flight`]'s own single-flight discipline.
+    pub(crate) review_mark_in_flight: Option<AgentId>,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
@@ -692,6 +719,49 @@ pub struct AdeApp {
     /// The git graph tab's own state (loaded rows, scope, selection, right panel) - see
     /// `crate::graph_view::state::GraphTabState`.
     pub(crate) graph_state: graph_view::state::GraphTabState,
+    /// `Some(id)` when the review tab (GitHub issue #225) is open, for that agent. At most one
+    /// review tab exists per window - opening a review for a different agent retargets this one
+    /// rather than accumulating tabs, the same "one per window" shape [`Self::graph_tab_open`]
+    /// uses - but unlike the graph tab it carries which agent it's *for*, since a review is
+    /// inherently per-agent (that is the entire point of the feature).
+    pub(crate) review_tab_open: Option<AgentId>,
+    /// Whether the review tab is the tab strip's currently *active* entry - exactly mirrors
+    /// [`Self::graph_tab_active`], including that switching to another tab clears this without
+    /// closing the review tab.
+    pub(crate) review_tab_active: bool,
+    /// The review tab's own keyboard-focus target, `track_focus`'d by
+    /// `crate::review::render::AdeApp::render_review_view`'s container - and swept exactly like
+    /// [`Self::graph_focus_handle`] whenever the tab stops being rendered (see
+    /// `crate::review::render::AdeApp::leave_review_tab`).
+    pub(crate) review_focus_handle: FocusHandle,
+    /// Pre-open focus target for [`Self::review_focus_handle`] - see [`OverlayFocus`], and
+    /// [`Self::graph_focus`] for the identical role on the graph tab.
+    pub(crate) review_focus: OverlayFocus,
+    /// The review tab's own overlay-scrollbar handle - its own, not
+    /// [`Self::diff_view_scroll_handle`]: the two surfaces are separate places in the app, and
+    /// sharing one handle would carry the git Diff view's scroll position into the review (and
+    /// back) every time the user switched between them.
+    ///
+    /// A `gpui::UniformListScrollHandle`, matching [`Self::diff_view_scroll_handle`]'s own type -
+    /// both surfaces are driven by the same `render_diff_file_detail` `uniform_list` (GitHub
+    /// issue #224), which owns its scroll offset through this handle type rather than a plain
+    /// `gpui::ScrollHandle`.
+    pub(crate) review_scroll_handle: UniformListScrollHandle,
+    /// [`Self::diff_highlight_cache`]'s counterpart for the review tab's own open file - a
+    /// separate cache for the same reason the scroll handle is separate: the review tab and the
+    /// git Diff view can each have a *different* file open, and one shared cache would thrash
+    /// (its identity guard rejecting every read) every time the user moved between them. Kept
+    /// fresh by `crate::review::render::AdeApp::refresh_review_highlight_cache`.
+    pub(crate) review_highlight_cache: Option<DiffHighlightCache>,
+    /// The in-flight `wt_core::review::snapshot_worktree_tree` behind a fresh agent's baseline
+    /// capture - one slot, same shape as [`Self::_load_graph_task`].
+    pub(crate) _review_baseline_task: Option<Task<()>>,
+    /// The in-flight `wt_core::review::diff_against_tree` load behind the review tab.
+    pub(crate) _review_load_task: Option<Task<()>>,
+    /// The in-flight `Mark reviewed` re-snapshot - guarded by [`Self::review_mark_in_flight`].
+    pub(crate) _review_mark_task: Option<Task<()>>,
+    /// The in-flight `wt_core::review::delete_ref` releasing a closed agent's baseline ref.
+    pub(crate) _review_release_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,

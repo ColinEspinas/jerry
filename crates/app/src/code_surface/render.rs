@@ -2,7 +2,6 @@
 //! the key context that decides which keybindings are live over it, and the segmented
 //! File/Diff toggle that switches between them.
 
-use super::diff_view::render_accept_file_button;
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
@@ -38,7 +37,7 @@ impl AdeApp {
 
     /// The centre's single-file Surface C, opened by a Changes-row click (`diff_file` always
     /// `Some`) or a Files-tree row click (`diff_file` may be `None`): a toolbar (dir/name, tag
-    /// pill, +n/-n stats, the `File | Diff` toggle, the zoom group, `Accept file`, close) over
+    /// pill, +n/-n stats, the `File | Diff` toggle, the zoom group, close) over
     /// either [`Self::render_diff_file_detail`]'s folded hunk content or [`Self::render_file_view`]'s
     /// syntax-highlighted content, both zoom-scoped through [`zoom_scoped`].
     ///
@@ -137,9 +136,6 @@ impl AdeApp {
                     .h(px(16.0))
                     .bg(theme::border::DIVIDER),
             )
-            .child(render_accept_file_button(
-                self.window_controls_style().is_macos(),
-            ))
             .child(
                 div()
                     .id("close-diff-surface")
@@ -155,7 +151,9 @@ impl AdeApp {
             );
 
         let body = match (effective_view, diff_file) {
-            (code_view::CodeView::Diff, Some(file)) => self.render_diff_file_detail(file, cx),
+            (code_view::CodeView::Diff, Some(file)) => {
+                self.render_diff_file_detail(file, diff_view::DiffDetailSurface::Changes, cx)
+            }
             _ if is_markdown_file
                 && self.markdown_view == markdown_preview::MarkdownView::Preview =>
             {

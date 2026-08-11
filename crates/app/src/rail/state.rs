@@ -62,19 +62,28 @@ pub struct AgentRow {
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
     /// how this becomes the rendered `4m`/`1h` text.
     pub elapsed: Duration,
-    /// How many files are in the loaded diff, for a [`Status::Review`] row only - §2.3's "review
-    /// ready" trailing text (`12 files`). `None` for every other status (§2.3: "Do not put a
-    /// per-agent file count here" - review-ready is the one documented exception).
+    /// How many files **this agent** has changed since its own review baseline, for a
+    /// [`Status::Review`] row only - §2.3's "review ready" trailing text (`12 files`). `None` for
+    /// every other status (§2.3: "Do not put a per-agent file count here" - review-ready is the
+    /// one documented exception).
     ///
-    /// Also `None` when either the count would be a guess rather than a fact: a review-ready row
-    /// whose worktree diff isn't the one currently loaded in Zone 3 (`crate::root::AdeApp::
-    /// diff_root` only tracks one diff at a time, so a row outside it has no diff data at all),
-    /// or a worktree with more than one agent sharing it - attributing which of the diff's files
-    /// are "this agent's" needs real per-agent authorship tracking, which doesn't exist yet
-    /// (see `crate::sidebar::changes::Authorship`'s own docs), so every agent sharing that
-    /// worktree would otherwise report the same full count, or - if sourced from `Authorship`
-    /// instead - a uniformly fabricated zero. With exactly one agent in the worktree there's no
-    /// such ambiguity: every file in the diff is unambiguously that agent's.
+    /// GitHub issue #225 made this a genuinely per-agent number: it comes from
+    /// `crate::review::flow::AdeApp::agent_review_file_count`, a real
+    /// `wt_core::review::diff_against_tree` against the snapshot taken when this agent started
+    /// (or when the user last marked it reviewed). It used to be the *worktree's* whole git diff
+    /// against the merge-base with the default branch, which is a different question entirely -
+    /// an agent that changed nothing in a worktree whose branch had already diverged reported
+    /// every one of the branch's files as its own.
+    ///
+    /// Still `None` whenever the count would be a guess rather than a fact:
+    /// - No baseline has been captured yet (capture is a background task, so there is a real
+    ///   moment after spawn where there is genuinely nothing to measure against).
+    /// - The review hasn't loaded yet, or failed to load.
+    /// - **More than one agent is open in this worktree.** This is a deliberate design gate, not
+    ///   a missing feature: real per-agent attribution doesn't exist yet, so with two agents
+    ///   sharing a worktree this agent's review would honestly include the other's changes. The
+    ///   whole review surface is held back for such worktrees until they're back down to one
+    ///   agent - see `crate::work_surface::agents::Agents::count_for_cwd`.
     pub review_file_count: Option<usize>,
 }
 
@@ -223,7 +232,10 @@ impl WorktreeNote {
 /// deliberate: `std` has no timezone database, and pulling one in (`chrono-tz`, or the
 /// `time` crate's `local-offset` feature, unsound-by-default on unix) wasn't worth it for a
 /// single label.
-fn format_utc_hhmm(unix_seconds: i64) -> String {
+///
+/// `pub(crate)` so `crate::review::state`'s own "captured at HH:MM" header reuses this exact
+/// formatting (and its exact UTC caveat) rather than growing a second, subtly different copy.
+pub(crate) fn format_utc_hhmm(unix_seconds: i64) -> String {
     let seconds_in_day = unix_seconds.rem_euclid(86_400);
     let hours = seconds_in_day / 3600;
     let minutes = (seconds_in_day % 3600) / 60;

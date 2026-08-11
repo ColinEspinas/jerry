@@ -5,7 +5,6 @@ use super::zoom::zoom_scoped;
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
-use crate::root::widgets::render_action_keycap_row;
 use crate::root::widgets::render_sidebar_message;
 use std::rc::Rc;
 
@@ -99,6 +98,76 @@ fn diff_rows(file: &DiffFile) -> Vec<DiffRow> {
         rows.push(DiffRow::Truncated);
     }
     rows
+}
+
+/// Which surface [`AdeApp::render_diff_file_detail`] is drawing into.
+///
+/// GitHub issue #225 introduced a second place that shows a file's hunks - the agent Review tab -
+/// and the decision was explicitly **not** to write a second diff renderer for it. There is one
+/// hunk renderer in this app, and this parameter is the whole of what differs between its two
+/// callers: which highlight cache to read, which scroll handle to drive, and which element-id/
+/// `debug_selector` prefix to use so the two surfaces' elements stay distinguishable.
+///
+/// The three resources are genuinely per-surface, not shared, because both surfaces can hold a
+/// *different* open file at the same time: one shared highlight cache would have its identity
+/// guard reject every read as the user moved between them (recomputing both files' highlighting
+/// on every switch), and one shared scroll handle would drag each surface's scroll position onto
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffDetailSurface {
+    /// The git-side Diff view, opened from the Changes sidebar or the File/Diff toggle.
+    Changes,
+    /// The agent Review tab (`crate::review::render`).
+    Review,
+}
+
+impl DiffDetailSurface {
+    /// This surface's element-id and `debug_selector` prefix - `diff-line-3` vs. `review-line-3`.
+    /// Two surfaces rendering rows under one id prefix would produce duplicate GPUI element ids
+    /// whenever both were mounted, and would make a render test unable to say which surface it
+    /// actually measured.
+    pub(crate) fn id_prefix(self) -> &'static str {
+        match self {
+            DiffDetailSurface::Changes => "diff",
+            DiffDetailSurface::Review => "review",
+        }
+    }
+
+    fn scrollbar_id(self) -> &'static str {
+        match self {
+            DiffDetailSurface::Changes => "diff-view-scrollbar",
+            DiffDetailSurface::Review => "review-view-scrollbar",
+        }
+    }
+
+    fn scroll_handle(self, app: &AdeApp) -> &gpui::UniformListScrollHandle {
+        match self {
+            DiffDetailSurface::Changes => &app.diff_view_scroll_handle,
+            DiffDetailSurface::Review => &app.review_scroll_handle,
+        }
+    }
+
+    fn highlight_cache(self, app: &AdeApp) -> &Option<DiffHighlightCache> {
+        match self {
+            DiffDetailSurface::Changes => &app.diff_highlight_cache,
+            DiffDetailSurface::Review => &app.review_highlight_cache,
+        }
+    }
+
+    /// The `DiffFile` this surface currently has open, if any.
+    ///
+    /// The row builder inside [`AdeApp::render_diff_file_detail`]'s `uniform_list` is `'static`
+    /// (GitHub issue #224) and so cannot hold a borrow of the `&DiffFile` the method itself was
+    /// handed - it re-resolves through this instead, the same way the pre-#225 Changes-only
+    /// closure re-resolved `self.open_diff_file_cache` directly. Reading through `surface` rather
+    /// than hardcoding that field is what lets one virtualized list implementation serve both
+    /// surfaces correctly.
+    fn open_file(self, app: &AdeApp) -> Option<&DiffFile> {
+        match self {
+            DiffDetailSurface::Changes => app.open_diff_file_cache.as_ref(),
+            DiffDetailSurface::Review => app.open_review_file_detail(),
+        }
+    }
 }
 
 impl AdeApp {
@@ -196,17 +265,18 @@ impl AdeApp {
     ///
     /// The guard is consulted *inside* the row builder, once per invocation of it, rather than
     /// once per frame in this method: the builder is `'static` and re-resolves the open
-    /// `DiffFile` from `self` (below), so the cache has to be filtered against that same
-    /// re-resolved file for the check to mean anything. Nothing about the check itself changed -
-    /// same function, same `None`-means-fall-back-to-plain-text contract, and the per-row
-    /// `per_hunk.get(hunk)`/`lines.get(line)` reads are still reachable only through it.
+    /// `DiffFile` through `surface.open_file(self)` (below), so the cache has to be filtered
+    /// against that same re-resolved file for the check to mean anything. Nothing about the check
+    /// itself changed - same function, same `None`-means-fall-back-to-plain-text contract, and
+    /// the per-row `per_hunk.get(hunk)`/`lines.get(line)` reads are still reachable only through
+    /// it.
     ///
-    /// ## Virtualization (GitHub issue #224)
+    /// ## Virtualization (GitHub issue #224), generalized to two surfaces (GitHub issue #225)
     ///
     /// A real `gpui::uniform_list`, following
     /// `crate::code_surface::file_view::AdeApp::render_file_view`'s established pattern for this
     /// same content shape (see `vendor/zed/crates/gpui/examples/uniform_list.rs` for the API
-    /// itself). Until this fix every row of the whole capped diff - up to
+    /// itself). Until issue #224 every row of the whole capped diff - up to
     /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] lines plus every hunk header and fold marker - was
     /// built, laid out and painted on *every single frame*, inside a plain
     /// `div().overflow_y_scroll()`, including the great majority scrolled off screen. That is
@@ -217,12 +287,20 @@ impl AdeApp {
     /// view. What is measured here is `diff_virtualization_tests`' own before/after: a row far
     /// below the viewport stopped being built at all.
     ///
+    /// `surface` is what makes one `uniform_list` implementation correct for both the git Diff
+    /// view and the agent Review tab (issue #225): every place this method would otherwise reach
+    /// for `self.open_diff_file_cache`/`self.diff_highlight_cache`/`self.diff_view_scroll_handle`
+    /// directly instead goes through `surface.open_file`/`surface.highlight_cache`/
+    /// `surface.scroll_handle`, so the two surfaces can each hold a different open file without
+    /// either one's render pass reading the other's state.
+    ///
     /// Two things `uniform_list` requires, both real:
     /// - **Definite height.** Its default `ListSizingBehavior::Auto` gives it zero intrinsic
     ///   height, so every pixel comes from the `.flex_1().min_h_0()` below - drop either and it
-    ///   renders zero rows, silently. It also owns its own scroll offset (hence
-    ///   [`Self::diff_view_scroll_handle`] becoming a `gpui::UniformListScrollHandle`), so it
-    ///   needs no `overflow_y_scroll()` wrapper and must not be given one.
+    ///   renders zero rows, silently. It also owns its own scroll offset (hence both
+    ///   [`Self::diff_view_scroll_handle`] and [`Self::review_scroll_handle`] being a
+    ///   `gpui::UniformListScrollHandle`), so it needs no `overflow_y_scroll()` wrapper and must
+    ///   not be given one.
     /// - **One uniform row height,** measured from item 0 alone and then used for every slot
     ///   (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`'s `measure_item`/`prepaint`).
     ///   This list interleaves four differently-purposed rows, so each is pinned to the same
@@ -231,9 +309,10 @@ impl AdeApp {
     ///   were given it here. `rems`, not `px`, so they all still scale together under
     ///   [`zoom_scoped`] - which wraps the list exactly the way `render_file_view` wraps its own.
     ///   A row that disagreed would simply be clipped, with no panic and no warning.
-    pub(in crate::code_surface) fn render_diff_file_detail(
+    pub(crate) fn render_diff_file_detail(
         &self,
         file: &DiffFile,
+        surface: DiffDetailSurface,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // Read the effective zoom once and pass it to `zoom_scoped` at every return point below.
@@ -243,7 +322,7 @@ impl AdeApp {
             return zoom_scoped(
                 rem_px,
                 render_diff_message_pane(
-                    "diff-detail-binary",
+                    format!("{}-detail-binary", surface.id_prefix()),
                     "binary file (contents not diffed)".to_string(),
                 ),
             );
@@ -257,7 +336,7 @@ impl AdeApp {
             return zoom_scoped(
                 rem_px,
                 render_diff_message_pane(
-                    "diff-detail-empty",
+                    format!("{}-detail-empty", surface.id_prefix()),
                     changes::empty_hunks_message(file.status).to_string(),
                 ),
             );
@@ -275,26 +354,28 @@ impl AdeApp {
         let row_count = rows.len();
 
         let list = uniform_list(
-            // Per-path, matching the element id the pre-virtualization container carried: a
-            // different open diff is a different list, not the same one showing new content.
-            format!("diff-detail-{}", file.path.display()),
+            // Per-surface and per-path (see `DiffDetailSurface::id_prefix`'s own docs): a
+            // different open diff, or the other surface entirely, is a different list, not the
+            // same one showing new content.
+            format!("{}-detail-{}", surface.id_prefix(), file.path.display()),
             row_count,
             cx.processor(move |this: &mut Self, range: Range<usize>, _window, _cx| {
-                // Re-resolved from `this` rather than captured, mirroring
-                // `crate::graph_view::render::AdeApp::render_graph_rows`' identical re-resolve:
-                // the closure is `'static` and cannot borrow the `&DiffFile` this method was
-                // handed, and cloning one (up to `wt_core::diff`'s own per-file line cap) per
-                // frame would be a real cost of its own. `Self::render_center_pane` takes this
-                // field out only for the duration of its own `render()` call and puts it straight
-                // back, so it is genuinely populated by the time this closure runs (layout), the
-                // same lifecycle `render_graph_rows` relies on.
-                let Some(file) = this.open_diff_file_cache.as_ref() else {
+                // Re-resolved from `this` through `surface` rather than a hardcoded field,
+                // mirroring `crate::graph_view::render::AdeApp::render_graph_rows`' identical
+                // re-resolve: the closure is `'static` and cannot borrow the `&DiffFile` this
+                // method was handed, and cloning one (up to `wt_core::diff`'s own per-file line
+                // cap) per frame would be a real cost of its own. `Self::render_center_pane`/
+                // `crate::review::render::AdeApp::render_review_view` each take their own surface's
+                // open-file field out only for the duration of their own `render()` call and put
+                // it straight back, so it is genuinely populated by the time this closure runs
+                // (layout), the same lifecycle `render_graph_rows` relies on.
+                let Some(file) = surface.open_file(this) else {
                     return Vec::new();
                 };
                 // The real identity guard - a cache entry only counts as usable for these rows if
                 // it was built from this exact file (see this method's own "Cache identity guard"
                 // docs, and `diff_highlight_cache_for`'s own docs/tests for the pure logic).
-                let cache = diff_highlight_cache_for(&this.diff_highlight_cache, file);
+                let cache = diff_highlight_cache_for(surface.highlight_cache(this), file);
                 // Clamped rather than trusted, and `start` against `end` rather than only against
                 // the length, so a divergence degrades to "renders fewer rows" instead of
                 // panicking on an inverted range.
@@ -328,8 +409,14 @@ impl AdeApp {
                                         .and_then(|nums| nums.get(line))
                                         .copied()
                                         .unwrap_or((None, None));
-                                    render_diff_line(diff_line, rendered, numbers, row)
-                                        .into_any_element()
+                                    render_diff_line(
+                                        diff_line,
+                                        rendered,
+                                        numbers,
+                                        surface.id_prefix(),
+                                        row,
+                                    )
+                                    .into_any_element()
                                 }
                                 None => render_blank_diff_row().into_any_element(),
                             }
@@ -345,9 +432,9 @@ impl AdeApp {
         .bg(theme::surface::PTY)
         // GitHub issue #30's real overlay scrollbar reads its geometry straight off this same
         // handle (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`).
-        .track_scroll(&self.diff_view_scroll_handle);
+        .track_scroll(surface.scroll_handle(self));
 
-        zoom_scoped(rem_px, self.wrap_with_scrollbar(list, cx))
+        zoom_scoped(rem_px, self.wrap_with_scrollbar(surface, list, cx))
     }
 
     /// Wraps the Diff view's `uniform_list` in the real, non-scrolling `.relative()` sibling
@@ -363,6 +450,7 @@ impl AdeApp {
     /// screen.
     fn wrap_with_scrollbar(
         &self,
+        surface: DiffDetailSurface,
         content: impl IntoElement,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -374,8 +462,8 @@ impl AdeApp {
             .min_h_0()
             .child(content)
             .children(self.render_vertical_scrollbar(
-                "diff-view-scrollbar",
-                &self.diff_view_scroll_handle,
+                surface.scrollbar_id(),
+                surface.scroll_handle(self),
                 &[],
                 cx,
             ))
@@ -387,7 +475,7 @@ impl AdeApp {
 /// all) as a real pane: the same `theme::surface::PTY` background and top padding the row list
 /// sits on, with one [`render_sidebar_message`] on it. Deliberately not scrollable - see
 /// [`AdeApp::wrap_with_scrollbar`]'s own docs.
-fn render_diff_message_pane(id: &'static str, message: String) -> impl IntoElement {
+fn render_diff_message_pane(id: String, message: String) -> impl IntoElement {
     div()
         .id(id)
         .flex()
@@ -575,6 +663,7 @@ pub(in crate::code_surface) fn render_diff_line(
     line: &wt_core::diff::DiffLine,
     rendered: Option<&code_view::RenderedLine>,
     numbers: (Option<usize>, Option<usize>),
+    selector_prefix: &'static str,
     row_index: usize,
 ) -> impl IntoElement {
     // `accent` (`Some` only for Added/Removed) drives both the left-edge bar below and the sign
@@ -611,7 +700,7 @@ pub(in crate::code_surface) fn render_diff_line(
         // row's painted bounds and confirm the diff view's own rows are genuinely reachable, the
         // same pattern `render_file_view_line`'s `file-view-text-row-{n}` selector already
         // establishes for the File view.
-        .debug_selector(move || format!("diff-line-{row_index}"));
+        .debug_selector(move || format!("{selector_prefix}-line-{row_index}"));
     if let Some(bg) = bg {
         row = row.bg(bg);
     }
@@ -661,39 +750,6 @@ pub(in crate::code_surface) fn render_diff_line(
                 .child(sign),
         )
         .child(text_row)
-}
-
-/// The File view toolbar's always-rendered `Accept file` button, always in its dimmed
-/// non-interactive state: this app has no per-file review-apply logic yet, so it's deliberately
-/// given no `cursor_pointer()`/`on_click` at all rather than a handler that would silently no-op.
-///
-/// The trailing keycap is resolved through `crate::keymap::resolve_combo("enter", macos)` rather
-/// than a baked-in `⏎` glyph, so it reads `Enter` on Windows/Linux.
-pub(in crate::code_surface) fn render_accept_file_button(macos: bool) -> impl IntoElement {
-    let parts = keymap::resolve_combo("enter", macos);
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .px(px(8.0))
-        .py(px(3.0))
-        .rounded(theme::radius::BUTTON)
-        .border_1()
-        .border_color(theme::border::BUTTON_DISABLED)
-        .child(
-            div()
-                .font(font(theme::font::SANS))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(10.5))
-                .text_color(theme::text::GHOSTER)
-                .child("Accept file"),
-        )
-        .child(render_action_keycap_row(
-            &parts,
-            theme::text::GHOSTER.into(),
-            theme::border::BUTTON_DISABLED.into(),
-        ))
 }
 
 /// Real, render-level coverage for the Diff view's per-token syntax highlighting and its
