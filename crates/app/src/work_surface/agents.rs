@@ -314,6 +314,20 @@ impl Agents {
         id
     }
 
+    /// Test-only: overrides an already-spawned agent's recorded [`ProcessKind`] without
+    /// touching its real process. Exists for tests that need to exercise kind-gated logic (e.g.
+    /// `crate::review::flow::AdeApp::capture_review_baseline`'s real-agent-only gate) without
+    /// paying for an actual `claude`/`codex` CLI spawn - `ProcessKind::spec` only affects which
+    /// binary [`Self::spawn`] execs, so retagging after the fact is honest: everything
+    /// downstream of the recorded `kind` field behaves exactly as if a real agent CLI had been
+    /// spawned, without the process weight of one.
+    #[cfg(test)]
+    pub(crate) fn set_kind_for_test(&mut self, id: AgentId, kind: ProcessKind) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.kind = kind;
+        }
+    }
+
     /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
     /// agent's pane is foreground (`TerminalPane::set_foreground`), every other pane is
     /// background. Called at the end of **every** mutator that can change which agent is

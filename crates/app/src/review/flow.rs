@@ -50,7 +50,9 @@ impl AdeApp {
     /// Called from `crate::work_surface::render::AdeApp::new_agent` - the caller of
     /// `Agents::spawn`, not `Agents::spawn` itself, mirroring how `load_diff` is triggered by a
     /// caller rather than baked into a lower-level type. `Agents` has no business knowing about
-    /// git snapshots.
+    /// git snapshots. Called unconditionally after every spawn, [`ProcessKind::Shell`] included -
+    /// the kind check below is what makes that safe rather than something every caller has to
+    /// remember.
     ///
     /// ## The accepted race
     ///
@@ -61,16 +63,23 @@ impl AdeApp {
     /// [`ReviewBaseline::taken_at_unix`] records when the snapshot really happened, so the tab
     /// header can say "09:31" honestly instead of implying it is the process's own start instant.
     ///
-    /// Captured for **every** agent, including agents in worktrees that already have others open:
-    /// the gate is a display-time decision ([`Self::review_available_for`]), so a worktree that
-    /// later drops back to one agent finds a real baseline already waiting, taken at the right
-    /// moment rather than retroactively invented.
+    /// Captured for **every real agent session**, including agents in worktrees that already have
+    /// others open: the multi-agent gate is a display-time decision
+    /// ([`Self::review_available_for`]), so a worktree that later drops back to one agent finds a
+    /// real baseline already waiting, taken at the right moment rather than retroactively
+    /// invented. A plain [`ProcessKind::Shell`] is a different exclusion entirely - not gated at
+    /// display time at all, because there is nothing for it to eventually reveal: a shell has no
+    /// turns, so a baseline captured for one would only ever be able to show "whatever changed in
+    /// this worktree while the shell happened to be open", attributed to a shell that did not
+    /// necessarily do it. No baseline is ever captured for one, full stop.
     pub(crate) fn capture_review_baseline(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
+        let ProcessKind::Agent(kind) = agent.kind else {
+            return;
+        };
         let worktree = agent.cwd.clone();
-        let kind = agent.kind;
         let spawned_at_unix = agent.spawned_at_unix;
         let key = baseline_key(&worktree, kind, spawned_at_unix);
         let ref_name = wt_core::review::baseline_ref_name(&key);
@@ -283,8 +292,14 @@ impl AdeApp {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
+        // Unreachable in practice - `review_available_for`'s already-checked
+        // `agent_reviews.contains_key` implies a baseline exists, which `capture_review_baseline`
+        // only ever creates for a real agent session - but a destructure here rather than
+        // trusting that invariant keeps this function correct even if that changes.
+        let ProcessKind::Agent(kind) = agent.kind else {
+            return;
+        };
         let worktree = agent.cwd.clone();
-        let kind = agent.kind;
         let spawned_at_unix = agent.spawned_at_unix;
         let key = baseline_key(&worktree, kind, spawned_at_unix);
         let ref_name = wt_core::review::baseline_ref_name(&key);

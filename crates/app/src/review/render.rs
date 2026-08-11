@@ -643,7 +643,7 @@ mod review_flow_tests {
     use super::*;
     use crate::review::state::BaselineReason;
     use crate::root::focus::palette_focus_tests;
-    use crate::work_surface::agents::AgentKind;
+    use crate::work_surface::agents::{AgentKind, ProcessKind};
     use gpui::TestAppContext;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -697,17 +697,36 @@ mod review_flow_tests {
         repo
     }
 
-    /// Every window starts with exactly one real agent - the startup shell `AdeApp::new` spawns
-    /// into the repo root (see `root::state`). That agent is what these tests review, precisely
-    /// because it is the *sole* agent in its worktree, which is what the single-agent gate
-    /// requires. Its baseline is captured at startup, so callers must `run_until_parked` first.
+    /// Every window starts with exactly one agent - a plain shell `AdeApp::new` spawns into the
+    /// repo root (see `root::state`). A shell is never review-eligible (see [`ProcessKind`]'s
+    /// docs: it has no turns, so `capture_review_baseline` never captures one for it), so it
+    /// can't be what these tests review. This closes it and spawns a real `Claude` agent into
+    /// the same worktree in its place - still the *sole* agent there (what the single-agent gate
+    /// requires), and still rooted at the same `repo.path()` every caller already writes test
+    /// files into. Waits for the replacement's baseline capture to land, so callers don't need
+    /// their own `run_until_parked` just to get a usable id.
     fn sole_agent(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext) -> AgentId {
-        app.read_with(cx, |app, _| {
+        let startup = app.read_with(cx, |app, _| {
             let ids: Vec<AgentId> = app.agents.iter().map(|agent| agent.id).collect();
             assert_eq!(
                 ids.len(),
                 1,
                 "a fresh test window must start with exactly one agent"
+            );
+            ids[0]
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.close_agent(startup, window, cx);
+            app.new_agent(ProcessKind::claude(), window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let ids: Vec<AgentId> = app.agents.iter().map(|agent| agent.id).collect();
+            assert_eq!(
+                ids.len(),
+                1,
+                "closing the startup shell and spawning its replacement must still leave exactly \
+                 one agent"
             );
             ids[0]
         })
@@ -716,18 +735,21 @@ mod review_flow_tests {
     /// Spawns an *additional* agent through the real `new_agent` entry point (the same door the
     /// `+` menu uses) and waits for its baseline capture to land.
     ///
-    /// Callers that need a second agent **in the startup agent's own worktree** must pass a kind
-    /// other than [`AgentKind::Shell`]: a baseline key is `(worktree, kind, spawn second)`, so a
-    /// second shell spawned into the same worktree within the same second would share the startup
-    /// agent's key and therefore its baseline ref (this crate's documented, accepted collision -
-    /// see `super::state::baseline_key`). Sharing it would make one agent's close delete the
-    /// other's ref, which is not what any of these tests mean to exercise.
+    /// Callers that need a second agent **in the sole agent's own worktree** must pass a kind
+    /// other than [`AgentKind::Claude`] (what [`sole_agent`] itself now spawns): a baseline key
+    /// is `(worktree, kind, spawn second)`, so a second `Claude` agent spawned into the same
+    /// worktree within the same second would share the sole agent's key and therefore its
+    /// baseline ref (this crate's documented, accepted collision - see
+    /// `super::state::baseline_key`). Sharing it would make one agent's close delete the other's
+    /// ref, which is not what any of these tests mean to exercise.
     fn spawn_extra_agent(
         app: &gpui::Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
         kind: AgentKind,
     ) -> AgentId {
-        app.update_in(cx, |app, window, cx| app.new_agent(kind, window, cx));
+        app.update_in(cx, |app, window, cx| {
+            app.new_agent(ProcessKind::Agent(kind), window, cx)
+        });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             app.agents.iter().last().expect("a spawned agent").id
@@ -971,10 +993,11 @@ mod review_flow_tests {
         });
 
         // A second agent starts in the same worktree.
-        // `Codex`, not `Claude`: the kind only has to *differ* from the startup shell's (see
-        // `spawn_extra_agent`), and spawning the real `claude` CLI starts a heavy Node process
-        // whose load was measurably breaking this crate's timing-sensitive inotify tests running
-        // in parallel. Nothing this test asserts depends on which binary runs.
+        // `Codex`, not `Claude`: the kind only has to *differ* from the sole agent's own (see
+        // `spawn_extra_agent`) to get a distinct baseline key, and using the same kind twice
+        // would additionally spawn a second real `claude` CLI - a heavy Node process whose load
+        // was measurably breaking this crate's timing-sensitive inotify tests running in
+        // parallel. Nothing this test asserts depends on which binary runs.
         let second = spawn_extra_agent(&app, cx, AgentKind::Codex);
 
         app.read_with(cx, |app, _| {
@@ -1201,11 +1224,13 @@ mod review_flow_tests {
 
         // And that measurement is exactly the fact `derive_status` needs to reach
         // `Status::Review` - the status whose footer carries the real `Review` door. (The agent
-        // here is a live shell, so its *current* status is `Run`/`Idle`; what this pins is that
-        // the input is now genuinely true, which is the half the poll is responsible for.)
+        // here is a live `claude` process, so its *current* status is `Run`/`Ask`; what this pins
+        // is that the input is now genuinely true, which is the half the poll is responsible
+        // for. `Status::Review` is real-agent-only - see `AgentKind::is_agent_session`'s docs -
+        // so this must use the sole agent's own real kind, not a placeholder.)
         let has_unreviewed = app.read_with(cx, |app, _| app.agent_has_unreviewed_changes(id));
         let status_on_exit = crate::rail::status::derive_status(
-            AgentKind::Shell,
+            ProcessKind::claude(),
             crate::rail::status::ProcessSignal::Exited { success: true },
             has_unreviewed,
         );
@@ -1295,13 +1320,16 @@ mod review_flow_tests {
     /// Spawns two extra agents back to back, with no `run_until_parked` in between, so both
     /// captures are genuinely in flight simultaneously.
     ///
-    /// Both are cheap [`AgentKind::Shell`] agents in **separate real repositories**, rather than
-    /// one `Claude` and one `Codex`. Two reasons, both real: distinct worktrees is what makes
-    /// their baseline keys (and so their refs) genuinely distinct without relying on agent kind,
-    /// and spawning the actual `claude`/`codex` CLIs starts heavy Node processes whose load was
-    /// measurably breaking this crate's timing-sensitive inotify tests running in parallel. What
-    /// this test is about - two captures in flight at once - is entirely independent of which
-    /// binary the agent runs.
+    /// Spawned as cheap [`ProcessKind::Shell`] processes in **separate real repositories**,
+    /// rather than real `Claude`/`Codex` CLIs - spawning the actual `claude`/`codex` binaries
+    /// starts heavy Node processes whose load was measurably breaking this crate's
+    /// timing-sensitive inotify tests running in parallel. Immediately retagged to
+    /// `ProcessKind::claude()` via `Agents::set_kind_for_test` before `capture_review_baseline`
+    /// runs, since (unlike before this app drew a real type-level line between a shell and an
+    /// agent session) a plain shell is never baseline-eligible at all - what this test is about,
+    /// two captures genuinely in flight at once, only needs the recorded `kind`, not the real
+    /// binary. Distinct worktrees, not distinct kinds, is what makes their baseline keys (and so
+    /// their refs) genuinely distinct.
     #[gpui::test]
     fn concurrent_per_agent_captures_and_releases_are_never_cancelled_by_each_other(
         cx: &mut TestAppContext,
@@ -1311,36 +1339,38 @@ mod review_flow_tests {
         let other_b = diverged_repo();
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
-        let startup = sole_agent(&app, cx);
+        let sole = sole_agent(&app, cx);
 
         // `Agents::spawn` + `capture_review_baseline` is exactly what `new_agent` does, minus the
         // focus/menu bookkeeping - the same pair, driven with an explicit cwd.
         let (first, second) = app.update_in(cx, |app, window, cx| {
             let first = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 other_a.path().to_path_buf(),
                 12.0,
                 None,
                 window,
                 cx,
             );
+            app.agents.set_kind_for_test(first, ProcessKind::claude());
             app.capture_review_baseline(first, cx);
             // No parking in between: the first capture is still running right now.
             let second = app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 other_b.path().to_path_buf(),
                 12.0,
                 None,
                 window,
                 cx,
             );
+            app.agents.set_kind_for_test(second, ProcessKind::claude());
             app.capture_review_baseline(second, cx);
             (first, second)
         });
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            for (label, id) in [("startup", startup), ("first", first), ("second", second)] {
+            for (label, id) in [("sole", sole), ("first", first), ("second", second)] {
                 assert!(
                     app.agent_reviews.contains_key(&id),
                     "the {label} agent's baseline capture must not have been cancelled by a \
@@ -1356,7 +1386,7 @@ mod review_flow_tests {
 
         // Every agent's ref is real, in its own repository, and distinct from the others'.
         let refs: Vec<(PathBuf, String)> = app.read_with(cx, |app, _| {
-            [startup, first, second]
+            [sole, first, second]
                 .iter()
                 .map(|id| {
                     let agent = app.agents.iter().find(|a| a.id == *id).expect("agent");
@@ -1389,7 +1419,7 @@ mod review_flow_tests {
         cx.run_until_parked();
 
         for (cwd, ref_name) in refs.iter().filter(|(_, name)| {
-            // The startup agent is still open, so its own ref must survive; only the two just
+            // The sole agent is still open, so its own ref must survive; only the two just
             // closed should be gone.
             name != &refs[0].1
         }) {
@@ -1404,7 +1434,7 @@ mod review_flow_tests {
             !git_stdout(&refs[0].0, &["rev-parse", "--verify", &refs[0].1])
                 .trim()
                 .is_empty(),
-            "the still-open startup agent's own baseline ref must be untouched"
+            "the still-open sole agent's own baseline ref must be untouched"
         );
         app.read_with(cx, |app, _| {
             assert!(app._review_release_tasks.is_empty());
@@ -1444,6 +1474,10 @@ mod review_flow_tests {
         });
 
         cx.run_until_parked();
+        // The window's own startup shell (see `sole_agent`'s docs) is never baseline-eligible,
+        // so it never persists anything - this replaces it with a real agent before checking
+        // that a baseline was written at all.
+        let id = sole_agent(&app, cx);
 
         assert!(
             baselines_path.exists(),
@@ -1460,7 +1494,7 @@ mod review_flow_tests {
         assert_eq!(
             state.baselines.len(),
             1,
-            "exactly the startup agent's baseline"
+            "exactly the sole agent's baseline"
         );
         let entry = state.baselines.values().next().expect("an entry");
         assert_eq!(
@@ -1469,9 +1503,11 @@ mod review_flow_tests {
             "recorded against the real worktree, decodably"
         );
         app.read_with(cx, |app, _| {
-            let agent = app.agents.iter().next().expect("the startup agent");
-            let key =
-                crate::review::state::baseline_key(&agent.cwd, agent.kind, agent.spawned_at_unix);
+            let agent = app.agents.iter().find(|a| a.id == id).expect("the sole agent");
+            let ProcessKind::Agent(kind) = agent.kind else {
+                unreachable!("sole_agent always spawns a real agent, never a shell");
+            };
+            let key = crate::review::state::baseline_key(&agent.cwd, kind, agent.spawned_at_unix);
             assert_eq!(
                 state.get(&key),
                 Some(app.agent_reviews[&agent.id].baseline.clone()),

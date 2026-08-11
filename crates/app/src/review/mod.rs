@@ -61,7 +61,7 @@ use crate::code_surface::code_view;
 use crate::root::*;
 use crate::sidebar::changes;
 use crate::theme;
-use crate::work_surface::agents::{AgentId, AgentKind};
+use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
 use crate::work_surface::state as work_surface;
 use gpui::{div, font, prelude::*, px, App, ClickEvent, Context, Window};
 use std::path::{Path, PathBuf};
