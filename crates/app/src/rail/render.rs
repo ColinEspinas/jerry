@@ -107,9 +107,18 @@ impl AdeApp {
     /// summary from [`Self::diff_cache`] (refreshed by the periodic task started in
     /// `Self::new`). An agent with no diff data yet simply shows `0`/`0` until the next
     /// status-poll tick fills it in.
+    ///
+    /// A plain [`crate::work_surface::agents::ProcessKind::Shell`] never gets a row here - the
+    /// rail answers "who needs me", and a shell has no turn to finish and nothing to ask. It
+    /// still shows up in the tab strip (`crate::work_surface::render`, which lists everything
+    /// open in the selected worktree, agents and shells alike) - this is specifically the rail's
+    /// own, narrower list. A worktree whose only open pane is a shell therefore renders as an
+    /// empty/idle row here, identically to a worktree with nothing open at all
+    /// (`rail::build_worktree_rows` already handles that case).
     pub(crate) fn build_agent_rows(&self, cx: &App) -> Vec<AgentRow> {
         self.agents
             .iter()
+            .filter(|agent| agent.kind.is_agent_session())
             .map(|agent| {
                 let status_value = self.agent_status(agent, cx);
                 let pane = agent.pane.read(cx);
@@ -1732,8 +1741,15 @@ mod rail_row_tests {
     }
 
     /// §2.2: "Worktrees whose most urgent agent is idle start collapsed" - proven here against
-    /// a real running agent (never collapsed by default) and a real idle one (collapsed by
-    /// default), through `Self::worktree_is_expanded`, the single real place that default lives.
+    /// a running agent (never collapsed by default) and a real idle one (collapsed by default),
+    /// through `Self::worktree_is_expanded`, the single real place that default lives.
+    ///
+    /// The running case is a synthetic `AgentRow` rather than a real spawned agent: a plain
+    /// shell no longer produces any rail row at all (see `Self::build_agent_rows`'s own docs),
+    /// so it can't stand in for "a running agent" here any more, and reaching for a real
+    /// `claude`/`codex` spawn just to get one `Status::Run` row would trade a fast, deterministic
+    /// test for a slow one that also depends on those CLIs being installed - this test is about
+    /// `worktree_is_expanded`'s idle-rooted default, not about spawning.
     ///
     /// Selects a *second*, unrelated worktree rather than `wt` itself (GitHub issue #112 live
     /// follow-up: the currently selected worktree is now exempt from this default - see
@@ -1758,30 +1774,37 @@ mod rail_row_tests {
             // real not-currently-selected case, or the new selected-worktree exemption would
             // make this test vacuous.
             app.select_worktree(1, window, cx);
-            app.agents.spawn(
-                ProcessKind::Shell,
-                wt.path().to_path_buf(),
-                12.0,
-                None,
-                window,
-                cx,
-            );
         });
-        // The pty spawn itself is async (`TerminalPane::spawn_process`), so the process isn't
-        // observably running yet the instant `spawn` returns - let it actually start before
-        // reading a live `Status` off it.
-        cx.run_until_parked();
 
-        let running_row = app.read_with(cx, |app, cx| {
+        let empty_row = app.read_with(cx, |app, cx| {
             app.build_worktree_rows(cx)
                 .into_iter()
                 .find(|row| row.path == wt.path())
                 .expect("the seeded worktree must produce a row")
         });
+        let running_agent = rail::AgentRow {
+            id: 1,
+            kind: ProcessKind::claude(),
+            title: "wt".to_string(),
+            cwd: wt.path().to_path_buf(),
+            status: Status::Run,
+            branch: Some("wt".to_string()),
+            add: 0,
+            del: 0,
+            question_preview: None,
+            exit_code: None,
+            activity: None,
+            elapsed: std::time::Duration::from_secs(1),
+            review_file_count: None,
+        };
+        let running_row = rail::WorktreeRow {
+            agents: vec![running_agent],
+            ..empty_row
+        };
         assert_eq!(
             running_row.aggregate_status(),
             Status::Run,
-            "sanity check: a just-spawned shell is Run, not Idle, within the recent-output window"
+            "sanity check: a running agent's row aggregates to Run"
         );
         assert!(
             app.read_with(cx, |app, _| app.worktree_is_expanded(&running_row)),
@@ -1800,6 +1823,71 @@ mod rail_row_tests {
         assert!(
             !app.read_with(cx, |app, _| app.worktree_is_expanded(&idle_row)),
             "an idle-rooted worktree must default to collapsed"
+        );
+    }
+
+    /// **The regression test for this fix.** The rail answers "who needs me", and a plain shell
+    /// never needs anyone - so a worktree whose only open pane is a shell must produce zero rail
+    /// rows, the same as a worktree with nothing open at all. The tab strip
+    /// (`crate::work_surface::render`) is the real place a shell tab shows up; this test proves
+    /// the rail and the tab strip are allowed to disagree about that on purpose.
+    #[gpui::test]
+    fn a_worktree_with_only_a_shell_open_produces_no_agent_row(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(repo.path().to_path_buf(), "repo")];
+        });
+        cx.run_until_parked();
+
+        // The startup shell (`root::state`) already occupies this worktree - assert the
+        // precondition rather than assuming it, then add a second shell explicitly so this test
+        // doesn't depend on exactly how many the app happens to start with.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents
+                    .iter()
+                    .all(|agent| !agent.kind.is_agent_session()),
+                "precondition: every open agent in this test is a shell"
+            );
+            assert!(
+                app.agents.iter().count() >= 2,
+                "precondition: at least two shells are genuinely open"
+            );
+        });
+
+        let rows = app.read_with(cx, |app, cx| app.build_agent_rows(cx));
+        assert!(
+            rows.is_empty(),
+            "a worktree with only shells open must produce zero agent rows - got {rows:?}"
+        );
+
+        let worktree_row = app.read_with(cx, |app, cx| {
+            app.build_worktree_rows(cx)
+                .into_iter()
+                .find(|row| row.path == repo.path())
+                .expect("the repo's own worktree must still produce a row")
+        });
+        assert!(
+            worktree_row.agents.is_empty(),
+            "and the worktree row itself must fold in none of them"
+        );
+        assert_eq!(
+            worktree_row.aggregate_status(),
+            Status::Idle,
+            "a shell-only worktree aggregates exactly like an empty one"
         );
     }
 
@@ -2467,11 +2555,17 @@ mod agent_chip_icon_pack_tests {
         }
     }
 
-    /// A real, running shell agent in a real seeded worktree - a just-spawned shell is `Status::
-    /// Run`, which defaults its worktree row to expanded (`AdeApp::worktree_is_expanded`'s own
+    /// A real, running agent in a real seeded worktree - a just-spawned agent is `Status::Run`,
+    /// which defaults its worktree row to expanded (`AdeApp::worktree_is_expanded`'s own
     /// "idle-rooted" rule), so the agent row (and this chip) actually renders without needing a
     /// separate collapse-override hack.
-    fn open_with_a_running_shell_agent(
+    ///
+    /// Real `AgentKind::Claude`, not `ProcessKind::Shell`: the rail never renders a row for a
+    /// plain shell at all (`AdeApp::build_agent_rows`'s own docs - a shell has nothing for the
+    /// rail to triage), so it can no longer stand in for "an agent row" here. The icon-chip
+    /// logic under test (`AdeApp::render_agent_chip_icon`) doesn't care which real kind it's
+    /// given - it's exercised identically either way.
+    fn open_with_a_running_agent(
         cx: &mut TestAppContext,
     ) -> (
         tempfile::TempDir,
@@ -2489,7 +2583,7 @@ mod agent_chip_icon_pack_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                ProcessKind::Shell,
+                ProcessKind::claude(),
                 wt.path().to_path_buf(),
                 12.0,
                 None,
@@ -2503,7 +2597,7 @@ mod agent_chip_icon_pack_tests {
 
     #[gpui::test]
     fn the_rail_agent_row_shows_the_default_chip_with_no_pack_configured(cx: &mut TestAppContext) {
-        let (_repo, _wt, _app, cx) = open_with_a_running_shell_agent(cx);
+        let (_repo, _wt, _app, cx) = open_with_a_running_agent(cx);
 
         assert!(
             cx.debug_bounds("agent-chip-icon-default").is_some(),
@@ -2520,11 +2614,11 @@ mod agent_chip_icon_pack_tests {
         cx: &mut TestAppContext,
     ) {
         let pack_dir = tempfile::tempdir().expect("tempdir");
-        // The seeded agent is a real `ProcessKind::Shell` (`work_surface::agent_icon_name`'s own
-        // mapping), so `shell.svg` is the real file this specific row's chip looks for.
-        std::fs::write(pack_dir.path().join("shell.svg"), "<svg></svg>").expect("write");
+        // The seeded agent is a real `AgentKind::Claude` (`work_surface::agent_icon_name`'s own
+        // mapping), so `claude.svg` is the real file this specific row's chip looks for.
+        std::fs::write(pack_dir.path().join("claude.svg"), "<svg></svg>").expect("write");
 
-        let (_repo, _wt, app, cx) = open_with_a_running_shell_agent(cx);
+        let (_repo, _wt, app, cx) = open_with_a_running_agent(cx);
         app.update(cx, |app, cx| {
             app.settings.icon_pack.directory = Some(pack_dir.path().to_path_buf());
             cx.notify();

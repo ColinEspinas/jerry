@@ -817,6 +817,13 @@ mod agent_state_chip_live_tests {
     /// the title bar's chip row really disappears in response - not just that it starts out
     /// `None` before anything has run. `Self::render_title_bar` itself is also exercised at
     /// both ends, unmodified, to prove the real production method doesn't panic either way.
+    ///
+    /// The startup shell is retagged to a real `AgentKind` via `Agents::set_kind_for_test`
+    /// immediately after spawn: the rail (and so the title bar chip it drives) never produces a
+    /// row for a plain shell at all (`AdeApp::build_agent_rows`'s own docs), so this test's real
+    /// subject - "the chip row disappears once the one open real agent closes" - needs a real
+    /// agent kind to have anything to observe in the first place. The retag doesn't touch the
+    /// real spawned process, only the bookkeeping `kind` the rail/chip logic reads.
     #[gpui::test]
     fn closing_the_only_real_agent_makes_the_chip_row_disappear(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -826,12 +833,16 @@ mod agent_state_chip_live_tests {
         let startup_agent_id = app
             .read_with(cx, |app, _| app.agents.active_id())
             .expect("the real startup shell must be the active agent");
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(startup_agent_id, ProcessKind::claude());
+        });
 
         let chips_at_startup = app.update(cx, |app, cx| app.render_title_bar_agent_state_chips(cx));
         assert!(
             chips_at_startup.is_some(),
-            "the real, freshly spawned startup shell is a genuine Status::Run agent and must \
-             produce a real, visible chip"
+            "the retagged startup process is a genuine Status::Run agent and must produce a \
+             real, visible chip"
         );
         app.update(cx, |app, cx| {
             let _ = app.render_title_bar(cx);
@@ -864,6 +875,14 @@ mod agent_state_chip_live_tests {
     /// Spawning a real second agent on top of the real startup shell is a genuine state change
     /// over live process data - not a hand-built row - and the chip text must track it,
     /// including the exact singular → plural flip at 1 → 2.
+    ///
+    /// Both the startup shell and the second spawned process are retagged to a real `AgentKind`
+    /// via `Agents::set_kind_for_test` (see the sibling test's own docs for why): the rail no
+    /// longer produces any row at all for a plain shell, but this test is specifically about the
+    /// chip's real PTY-activity/idle-duration tracking, which is genuinely cheaper and more
+    /// deterministic to exercise against real shell processes than against real `claude`/`codex`
+    /// CLI spawns - the retag keeps that real PTY behavior while making the two agents count as
+    /// real agents for the chip logic under test.
     #[gpui::test]
     fn a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural(
         cx: &mut TestAppContext,
@@ -872,6 +891,14 @@ mod agent_state_chip_live_tests {
         let wt_b = tempfile::tempdir().expect("tempdir wt-b");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
+
+        let startup_agent_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup shell must be the active agent");
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(startup_agent_id, ProcessKind::claude());
+        });
 
         let rows_at_startup = app.update(cx, |app, cx| app.build_agent_rows(cx));
         assert_eq!(
@@ -888,14 +915,12 @@ mod agent_state_chip_live_tests {
             vec![(Status::Run, "1 agent running".to_string())],
             "one real running agent must read as the singular form"
         );
-        let first_agent_id = app
-            .read_with(cx, |app, _| app.agents.active_id())
-            .expect("the real startup shell is the sole, active agent");
+        let first_agent_id = startup_agent_id;
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_b.path().to_path_buf(), "wt-b")];
         });
-        app.update_in(cx, |app, window, cx| {
+        let second_agent_id = app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
                 ProcessKind::Shell,
@@ -904,7 +929,11 @@ mod agent_state_chip_live_tests {
                 None,
                 window,
                 cx,
-            );
+            )
+        });
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(second_agent_id, ProcessKind::codex());
         });
         // The pty spawn is async (`TerminalPane::spawn_process`) - let it actually start
         // before reading a live `Status` off it, the same real seam
