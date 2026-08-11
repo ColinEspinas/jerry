@@ -277,8 +277,44 @@ of the two now works either way, which is the entire point of this revision — 
 `BUILD-LOG.md`'s Revision R12 entry and `ASSESSMENT.md` for exactly what was and wasn't
 confirmed visually under each backend in this project's own (WSLg) sandbox.
 
-macOS and Windows are only build-tested in CI (see below) — nobody has run this app on
-those platforms yet.
+Windows is still only build-tested in CI (see below) — nobody has run this app there yet.
+macOS has now been run for real, once, locally (Apple Silicon, Xcode 26.2).
+
+### System dependencies (macOS)
+
+No Homebrew packages needed — GPUI's macOS backend links Xcode's own system frameworks
+(AppKit, Metal, CoreText, …), not separate `-dev` packages. Two things to have in place first:
+
+**Xcode Command Line Tools**
+
+```sh
+xcode-select -p   # should print a path, not an error
+```
+
+**A Metal Toolchain.** GPUI compiles its shaders at build time, and a stock Xcode install
+doesn't always have the toolchain that needs. If `cargo build` fails with:
+
+```
+metal shader compilation failed: ... cannot execute tool 'metal' due to missing Metal Toolchain
+```
+
+fetch it directly:
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+If that itself fails with a plug-in/framework-loading error (a stale Xcode install, unrelated
+to this project), repair Xcode first, then retry the download:
+
+```sh
+xcodebuild -runFirstLaunch
+```
+
+**Text rendering.** `gpui_macos` ships real system-font matching behind its own `font-kit`
+feature, off by default. Without it, the app builds and runs with no error but paints a
+blank window — no text, no crash. This repo's `crates/app/Cargo.toml` already requests it
+for macOS, so a plain `cargo build`/`cargo run` renders text out of the box.
 
 ### Build and test
 
