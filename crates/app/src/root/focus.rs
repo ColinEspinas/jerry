@@ -460,7 +460,7 @@ mod tab_strip_keybinding_tests {
         );
         assert_eq!(
             active_kind,
-            Some(AgentKind::Shell),
+            Some(ProcessKind::Shell),
             "New terminal always spawns a real Shell agent"
         );
     }
@@ -600,7 +600,7 @@ mod tab_strip_keybinding_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -645,7 +645,7 @@ mod tab_strip_keybinding_tests {
         });
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -802,7 +802,7 @@ mod tab_strip_keybinding_tests {
 
         for _ in 0..4 {
             app.update_in(cx, |app, window, cx| {
-                app.new_agent(AgentKind::Shell, window, cx);
+                app.new_agent(ProcessKind::Shell, window, cx);
             });
         }
         let third_id = app.read_with(cx, |app, _| {
@@ -848,7 +848,7 @@ mod tab_strip_keybinding_tests {
         for _ in 0..3 {
             let id = app.update_in(cx, |app, window, cx| {
                 app.agents.spawn(
-                    AgentKind::Shell,
+                    ProcessKind::Shell,
                     repo.path().to_path_buf(),
                     app.settings.appearance.terminal_font_size,
                     app.settings.terminal.shell_override(),

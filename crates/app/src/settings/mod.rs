@@ -35,8 +35,7 @@ use crate::settings::state::{self as settings, SettingsPage};
 use crate::settings::store as settings_store;
 use crate::sidebar::file_tree;
 use crate::theme;
-#[cfg(test)]
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use crate::work_surface::state as work_surface;
 
 pub mod builtin_themes;

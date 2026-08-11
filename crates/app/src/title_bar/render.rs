@@ -629,7 +629,7 @@ mod agent_state_chip_text_tests {
     fn row(id: u64, status: Status) -> AgentRow {
         AgentRow {
             id,
-            kind: AgentKind::Claude,
+            kind: ProcessKind::claude(),
             title: format!("agent-{id}"),
             cwd: PathBuf::from(format!("/wt-{id}")),
             status,
@@ -769,7 +769,7 @@ mod agent_state_chip_text_tests {
     }
 }
 
-/// Genuinely-live coverage: real spawned [`AgentKind::Shell`] agents in a real
+/// Genuinely-live coverage: real spawned [`ProcessKind::Shell`] agents in a real
 /// [`gpui::TestAppContext`] window, read back through the real
 /// [`crate::rail::render::AdeApp::build_agent_rows`]/[`Self::render_title_bar_agent_state_chips`]/
 /// [`Self::render_title_bar`] path - proves the wiring itself, not just the pure formatting
@@ -782,7 +782,7 @@ mod agent_state_chip_text_tests {
 /// environment state (`$SHELL`/`$PATH`, which this workspace's own established discipline
 /// forbids in a test - see `pty_core::resolve_in_path_var`'s and `lsp_core::client::
 /// resolve_server_binary_with`'s docs for the exact same call) isn't practical through
-/// [`crate::work_surface::agents::Agents::spawn`]'s real `AgentKind`-only spec. Those two states'
+/// [`crate::work_surface::agents::Agents::spawn`]'s real `ProcessKind`-only spec. Those two states'
 /// text/visibility rules are instead covered - just as really, over the identical `Status`/
 /// `AgentRow` types - by the pure tests above.
 #[cfg(test)]
@@ -810,7 +810,7 @@ mod agent_state_chip_live_tests {
 
     /// `AdeApp::new_with_settings` (`crate::root::state`, see its own "a fresh window starts
     /// with one shell in the repo root" comment) always auto-spawns exactly one real
-    /// `AgentKind::Shell` agent at startup, so `open_test_app` never actually starts at zero
+    /// `ProcessKind::Shell` agent at startup, so `open_test_app` never actually starts at zero
     /// agents - there is no real "empty app" state to observe live. This closes that one real
     /// startup agent via the real `Self::close_agent` path (the same one the tab strip's `×`
     /// and `Self::archive_agent` use) to reach a genuine, live zero-agents state, and proves
@@ -898,7 +898,7 @@ mod agent_state_chip_live_tests {
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
                 None,

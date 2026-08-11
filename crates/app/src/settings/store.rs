@@ -112,7 +112,7 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
-    /// The program a plain Shell tab (`crate::work_surface::agents::AgentKind::Shell`) spawns,
+    /// The program a plain Shell tab (`crate::work_surface::agents::ProcessKind::Shell`) spawns,
     /// or `None` for "whatever the OS says" - `$SHELL` on unix, `%COMSPEC%` on Windows, exactly
     /// the behaviour every install had before this setting existed (see
     /// `crate::terminal::pane::TerminalSpec::shell`). `None` is the zero-config default, so a

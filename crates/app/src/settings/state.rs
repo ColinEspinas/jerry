@@ -192,15 +192,17 @@ pub fn nav_groups() -> Vec<NavGroup> {
     ]
 }
 
-/// Agent kinds this app can spawn as an "agent" - `AgentKind::Shell` is deliberately excluded,
-/// since the Settings › Agents card lists agent CLIs, not shells.
+/// Every agent CLI this app can spawn. A shell isn't spawnable *as an agent* here at all, and
+/// that's now structural rather than a documented exclusion: [`AgentKind`] has no `Shell`
+/// variant, so nothing can put one in this array (a shell is a
+/// `crate::work_surface::agents::ProcessKind::Shell`, a different type).
 pub const AGENT_KINDS: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Codex];
 
 /// One row for the Agents page's Installed card - see [`detect_agent_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRow {
     pub kind: AgentKind,
-    /// The exact command name `AgentKind::agent_binary_name` hands to `TerminalSpec::command`
+    /// The exact command name `AgentKind::binary_name` hands to `TerminalSpec::command`
     /// at spawn time - the same name [`Self::resolved_path`] was searched for.
     pub binary_name: &'static str,
     /// `Some(path)` if a real `$PATH` search found the binary, `None` if it genuinely isn't
@@ -234,12 +236,13 @@ impl AgentRow {
 pub fn detect_agent_rows(resolve: impl Fn(&str) -> Option<PathBuf>) -> Vec<AgentRow> {
     AGENT_KINDS
         .into_iter()
-        .filter_map(|kind| {
-            kind.agent_binary_name().map(|binary_name| AgentRow {
+        .map(|kind| {
+            let binary_name = kind.binary_name();
+            AgentRow {
                 kind,
                 binary_name,
                 resolved_path: resolve(binary_name),
-            })
+            }
         })
         .collect()
 }

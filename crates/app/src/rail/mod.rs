@@ -34,7 +34,7 @@ use crate::rail::worktrees::WorktreeItem;
 use crate::root::*;
 use crate::status_bar::process_stats;
 use crate::theme;
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use gpui::{div, font, prelude::*, px, App, ClickEvent, Context, KeyDownEvent, Window};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

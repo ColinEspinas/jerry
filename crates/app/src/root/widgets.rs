@@ -1,6 +1,6 @@
 use super::*;
 use crate::icon_pack;
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 
 /// The two keycap sizes: `Standard` (primary shortcuts - the rail's `+`/⌘N, the status bar's
 /// `⌘P`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
@@ -432,7 +432,7 @@ impl AdeApp {
     /// of this helper's real call sites, rather than needing per-call-site size plumbing.
     pub(crate) fn render_agent_chip_icon(
         &self,
-        kind: AgentKind,
+        kind: ProcessKind,
         size: Pixels,
         font_size: Pixels,
     ) -> gpui::AnyElement {

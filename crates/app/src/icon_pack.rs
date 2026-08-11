@@ -6,7 +6,7 @@
 //!
 //! ## Scope
 //!
-//! Only `crate::work_surface::state::agent_tint`/`agent_initial`'s three agent-kind chips
+//! Only `crate::work_surface::state::agent_tint`/`agent_initial`'s three process-kind chips
 //! (Claude/Codex/Shell - `crate::work_surface::render::render_agent_icon`'s own real call
 //! sites) are wired to check a pack today. The other ~25 distinct icon concepts cataloged across
 //! this app (file-type chips, folder icons, chevrons, status dots, ...) are a real, stated

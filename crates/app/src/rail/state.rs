@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::rail::repo::RepoId;
 use crate::rail::status::Status;
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use wt_core::diff::{AheadBehind, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
 
 /// One agent, reduced to exactly what the rail row needs to render - built in `crate::root`
@@ -25,7 +25,7 @@ use wt_core::diff::{AheadBehind, DiffLineKind, WorktreeDiff, WorktreeMergeStatus
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRow {
     pub id: crate::work_surface::agents::AgentId,
-    pub kind: AgentKind,
+    pub kind: ProcessKind,
     pub title: String,
     pub cwd: PathBuf,
     pub status: Status,
@@ -740,7 +740,7 @@ mod tests {
     fn row(id: u64, status: Status, title: &str, cwd: &str) -> AgentRow {
         AgentRow {
             id,
-            kind: AgentKind::Claude,
+            kind: ProcessKind::claude(),
             title: title.to_string(),
             cwd: PathBuf::from(cwd),
             status,

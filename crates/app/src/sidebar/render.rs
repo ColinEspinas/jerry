@@ -1917,11 +1917,11 @@ impl AdeApp {
         Some(group)
     }
 
-    /// Resolves a recorded author's [`AgentKind`] for chip tinting - `None` if that agent has
+    /// Resolves a recorded author's [`ProcessKind`] for chip tinting - `None` if that agent has
     /// since closed (its process exited, its tab closed), in which case
     /// [`Self::render_change_author_chips`] simply omits the chip rather than guessing a kind for
     /// an agent that no longer exists.
-    fn agent_kind_for(&self, id: AgentId) -> Option<AgentKind> {
+    fn agent_kind_for(&self, id: AgentId) -> Option<ProcessKind> {
         self.agents
             .iter()
             .find(|agent| agent.id == id)
@@ -1934,7 +1934,7 @@ impl AdeApp {
     /// strip can never disagree about which agents belong to the selected worktree.
     pub(in crate::sidebar) fn current_worktree_agent_count(&self) -> usize {
         self.current_worktree_agents()
-            .filter(|agent| agent.kind != AgentKind::Shell)
+            .filter(|agent| agent.kind.is_agent_session())
             .count()
     }
 
@@ -2050,18 +2050,18 @@ impl AdeApp {
         // The agent whose tint/initial the message box's chip shows - the current worktree's
         // first real agent, if any. There is no per-message "which agent drafted this"
         // fact to read (`changes::draft_commit_message`'s own docs cover why the message itself
-        // is a deterministic placeholder, not real agent output) - `AgentKind::Shell`'s
+        // is a deterministic placeholder, not real agent output) - `ProcessKind::Shell`'s
         // existing neutral chip (`work_surface::agent_tint`'s own docs: "isn't an agent, so it
         // gets a neutral chip instead of an invented tint") is the honest fallback with none.
         let drafting_kind = self
             .current_worktree_agents()
-            .find(|agent| agent.kind != AgentKind::Shell)
+            .find(|agent| agent.kind.is_agent_session())
             .map(|agent| agent.kind);
         let drafted_by = match drafting_kind {
             Some(kind) => format!("drafted by {}", kind.label()),
             None => "drafted by no agent".to_string(),
         };
-        let chip_kind = drafting_kind.unwrap_or(AgentKind::Shell);
+        let chip_kind = drafting_kind.unwrap_or(ProcessKind::Shell);
         let (chip_fg, chip_bg) = work_surface::agent_tint(chip_kind);
         let chip_initial = work_surface::agent_initial(chip_kind);
 
@@ -2559,7 +2559,7 @@ fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement 
 /// `work_surface::agent_tint`/`work_surface::agent_initial` (`work_surface::state`'s existing
 /// per-agent colour convention, already the tab strip's own source of truth) rather than a
 /// second, independently-tinted chip style.
-pub(in crate::sidebar) fn render_change_author_chip(kind: AgentKind) -> impl IntoElement {
+pub(in crate::sidebar) fn render_change_author_chip(kind: ProcessKind) -> impl IntoElement {
     let (fg, bg) = work_surface::agent_tint(kind);
     let initial = work_surface::agent_initial(kind);
     div()

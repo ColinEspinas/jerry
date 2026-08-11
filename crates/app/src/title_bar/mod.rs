@@ -29,7 +29,8 @@ use crate::settings::state as settings;
 use crate::theme;
 use crate::title_bar::menu::TitleMenu;
 #[cfg(test)]
-use crate::work_surface::agents::{AgentId, AgentKind};
+use crate::work_surface::agents::AgentId;
+use crate::work_surface::agents::ProcessKind;
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 #[cfg(test)]

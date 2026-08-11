@@ -26,7 +26,7 @@ use crate::root::*;
 use crate::sidebar::changes;
 use crate::sidebar::file_tree::{self, LangChip};
 use crate::theme;
-use crate::work_surface::agents::AgentKind;
+use crate::work_surface::agents::ProcessKind;
 use crate::work_surface::state as work_surface;
 
 pub mod state;
