@@ -13,6 +13,19 @@
 use super::state::{baseline_key, AgentReview, BaselineReason, ReviewBaseline, ReviewLoadState};
 use super::*;
 
+/// The durable identity a captured baseline is filed under, bundled into one value so
+/// [`AdeApp::record_review_baseline`] stays under clippy's argument limit - the same reason
+/// `crate::work_surface::render::TabChromeArgs` and
+/// `crate::code_surface::file_view::HoverRenderContext` exist.
+struct BaselineIdentity {
+    id: AgentId,
+    /// `super::state::baseline_key`'s output for the three fields below.
+    key: String,
+    worktree: PathBuf,
+    kind: AgentKind,
+    spawned_at_unix: i64,
+}
+
 impl AdeApp {
     /// Whether agent `id`'s review surface should be shown at all right now - GitHub issue
     /// #225's single-agent gate, in the one place every caller reads it from.
@@ -69,44 +82,57 @@ impl AdeApp {
                 .spawn({
                     let worktree = worktree.clone();
                     async move {
-                        let tree_id = wt_core::review::snapshot_worktree_tree(&worktree)?;
+                        let snapshot = wt_core::review::snapshot_worktree_tree(&worktree)?;
                         // Anchor before reporting success: an unanchored tree is collectable, so
                         // a baseline that skipped this could silently stop resolving later.
-                        wt_core::review::anchor_tree(&worktree, &snapshot_ref_name, &tree_id)?;
-                        Ok::<String, wt_core::Error>(tree_id)
+                        wt_core::review::anchor_tree(
+                            &worktree,
+                            &snapshot_ref_name,
+                            &snapshot.tree_id,
+                        )?;
+                        Ok::<wt_core::review::WorktreeSnapshot, wt_core::Error>(snapshot)
                     }
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(tree_id) => {
-                    let baseline = ReviewBaseline {
-                        tree_id,
-                        ref_name,
-                        taken_at_unix: unix_now(),
-                        reason: BaselineReason::Spawn,
-                    };
-                    this.record_review_baseline(
-                        id,
-                        key,
-                        &worktree,
-                        kind,
-                        spawned_at_unix,
-                        baseline,
-                    );
-                    cx.notify();
-                }
-                Err(err) => {
-                    // No baseline means no review surface for this agent at all
-                    // ([`Self::review_available_for`]) - honest, and strictly better than
-                    // inventing a base point. Everything else about the agent still works.
-                    log::warn!(
-                        "failed to capture a review baseline for {}: {err}",
-                        worktree.display()
-                    );
+            let _ = this.update(cx, |this, cx| {
+                // This capture is finished either way; drop its own slot so the map only ever
+                // holds genuinely in-flight work.
+                this._review_baseline_tasks.remove(&id);
+                match result {
+                    Ok(snapshot) => {
+                        let baseline = ReviewBaseline {
+                            tree_id: snapshot.tree_id,
+                            ref_name,
+                            taken_at_unix: unix_now(),
+                            reason: BaselineReason::Spawn,
+                            untracked: snapshot.untracked,
+                        };
+                        this.record_review_baseline(
+                            BaselineIdentity {
+                                id,
+                                key,
+                                worktree: worktree.clone(),
+                                kind,
+                                spawned_at_unix,
+                            },
+                            baseline,
+                            cx,
+                        );
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        // No baseline means no review surface for this agent at all
+                        // ([`Self::review_available_for`]) - honest, and strictly better than
+                        // inventing a base point. Everything else about the agent still works.
+                        log::warn!(
+                            "failed to capture a review baseline for {}: {err}",
+                            worktree.display()
+                        );
+                    }
                 }
             });
         });
-        self._review_baseline_task = Some(task);
+        self._review_baseline_tasks.insert(id, task);
     }
 
     /// Stores a freshly captured baseline in memory and queues its persistence. Shared by
@@ -114,16 +140,20 @@ impl AdeApp {
     /// halves can never be updated by one and forgotten by the other.
     fn record_review_baseline(
         &mut self,
-        id: AgentId,
-        key: String,
-        worktree: &Path,
-        kind: AgentKind,
-        spawned_at_unix: i64,
+        identity: BaselineIdentity,
         baseline: ReviewBaseline,
+        cx: &mut Context<Self>,
     ) {
+        let BaselineIdentity {
+            id,
+            key,
+            worktree,
+            kind,
+            spawned_at_unix,
+        } = identity;
         self.review_baseline_state.set(
             key.clone(),
-            worktree,
+            &worktree,
             kind.label(),
             spawned_at_unix,
             &baseline,
@@ -135,27 +165,36 @@ impl AdeApp {
                 self.agent_reviews.insert(id, AgentReview::new(baseline));
             }
         }
-        self.persist_review_baselines();
+        self.persist_review_baselines(cx);
     }
 
     /// Queues a background-executor save of [`Self::review_baseline_state`] - the exact shape
     /// `crate::work_surface::render::AdeApp::persist_tab_order` uses, including the merge against
     /// [`Self::review_baselines_owned`] so a second window can't erase baselines it never saw. A
     /// genuine no-op with a `None` path (every GPUI test that hasn't opted into a real one).
-    fn persist_review_baselines(&mut self) {
+    ///
+    /// Really on the background executor, not merely documented as such. An earlier version ran
+    /// `save_merged_at` inline here, which meant the main thread performed two `fsync`s (the temp
+    /// file and its parent directory) while holding `crate::persisted_state_lock`'s process-wide
+    /// mutex - a lock that background writers of `repos.toml`/`tab-order.toml` also hold across
+    /// *their* fsyncs, so the UI thread could block on an entirely unrelated save.
+    fn persist_review_baselines(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.review_baseline_path.clone() else {
             return;
         };
         let state = self.review_baseline_state.clone();
         let owned = self.review_baselines_owned.clone();
-        // Deliberately `std::thread::spawn`-free and `cx`-free: this is called from inside an
-        // existing `this.update` closure, where no `Context` is available to spawn a task from
-        // without re-entering. A blocking write of a small TOML file is bounded work, and the
-        // sibling persisted-state files' own save paths are the same size; the cost of getting a
-        // background task's lifetime wrong here would be a dropped (silently unwritten) save.
-        if let Err(err) = state.save_merged_at(&path, &owned) {
-            log::warn!("failed to save {}: {err}", path.display());
-        }
+        let task = cx.spawn(async move |_this, cx| {
+            let save_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { state.save_merged_at(&save_path, &owned) })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        self._review_persist_task = Some(task);
     }
 
     /// Loads (or reloads) agent `id`'s review diff against its own baseline, off the UI thread.
@@ -173,6 +212,9 @@ impl AdeApp {
         };
         let worktree = agent.cwd.clone();
         let tree_id = review.baseline.tree_id.clone();
+        // Must match the coverage the snapshot was taken with, or a tracked-only baseline would
+        // report every pre-existing untracked file as a brand-new addition.
+        let untracked = review.baseline.untracked;
         // The `WorktreeDiff::base_branch` slot carries a *label*, and a review has no base branch
         // at all - so it carries the honest "since ..." phrase instead of a branch name that
         // would be a lie. See `wt_core::review::diff_against_tree`'s own docs.
@@ -183,9 +225,9 @@ impl AdeApp {
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(
-                    async move { wt_core::review::diff_against_tree(&worktree, &tree_id, label) },
-                )
+                .spawn(async move {
+                    wt_core::review::diff_against_tree(&worktree, &tree_id, untracked, label)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let Some(review) = this.agent_reviews.get_mut(&id) else {
@@ -256,29 +298,37 @@ impl AdeApp {
                 .spawn({
                     let worktree = worktree.clone();
                     async move {
-                        let tree_id = wt_core::review::snapshot_worktree_tree(&worktree)?;
-                        wt_core::review::anchor_tree(&worktree, &snapshot_ref_name, &tree_id)?;
-                        Ok::<String, wt_core::Error>(tree_id)
+                        let snapshot = wt_core::review::snapshot_worktree_tree(&worktree)?;
+                        wt_core::review::anchor_tree(
+                            &worktree,
+                            &snapshot_ref_name,
+                            &snapshot.tree_id,
+                        )?;
+                        Ok::<wt_core::review::WorktreeSnapshot, wt_core::Error>(snapshot)
                     }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.review_mark_in_flight = None;
                 match result {
-                    Ok(tree_id) => {
+                    Ok(snapshot) => {
                         let baseline = ReviewBaseline {
-                            tree_id,
+                            tree_id: snapshot.tree_id,
                             ref_name,
                             taken_at_unix: unix_now(),
                             reason: BaselineReason::MarkedReviewed,
+                            untracked: snapshot.untracked,
                         };
                         this.record_review_baseline(
-                            id,
-                            key,
-                            &worktree,
-                            kind,
-                            spawned_at_unix,
+                            BaselineIdentity {
+                                id,
+                                key,
+                                worktree: worktree.clone(),
+                                kind,
+                                spawned_at_unix,
+                            },
                             baseline,
+                            cx,
                         );
                         this.refresh_review_highlight_cache();
                         this.load_agent_review(id, cx);
@@ -318,7 +368,7 @@ impl AdeApp {
         };
         let worktree = agent.cwd.clone();
         let ref_name = review.baseline.ref_name.clone();
-        let task = cx.spawn(async move |_this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { wt_core::review::delete_ref(&worktree, &ref_name) })
@@ -326,8 +376,11 @@ impl AdeApp {
             if let Err(err) = result {
                 log::warn!("failed to release a review baseline ref: {err}");
             }
+            let _ = this.update(cx, |this, _cx| {
+                this._review_release_tasks.remove(&id);
+            });
         });
-        self._review_release_task = Some(task);
+        self._review_release_tasks.insert(id, task);
     }
 
     /// The rail's real per-agent `N files` count for a [`crate::rail::status::Status::Review`]
@@ -353,12 +406,20 @@ impl AdeApp {
     /// is genuinely correct per-agent-baseline regardless of how many agents share a worktree.
     /// Only *presenting* it is gated (`Self::review_available_for`), so a worktree dropping back
     /// to one agent has a fresh measurement already in hand rather than waiting a tick for one.
-    pub(crate) fn review_measure_targets(&self) -> Vec<(AgentId, PathBuf, String)> {
+    pub(crate) fn review_measure_targets(
+        &self,
+    ) -> Vec<(AgentId, PathBuf, String, wt_core::review::UntrackedCoverage)> {
         self.agents
             .iter()
             .filter_map(|agent| {
                 let review = self.agent_reviews.get(&agent.id)?;
-                Some((agent.id, agent.cwd.clone(), review.baseline.tree_id.clone()))
+                Some((
+                    agent.id,
+                    agent.cwd.clone(),
+                    review.baseline.tree_id.clone(),
+                    // Same coverage the baseline was captured with - see `load_agent_review`.
+                    review.baseline.untracked,
+                ))
             })
             .collect()
     }

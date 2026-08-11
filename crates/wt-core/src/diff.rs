@@ -217,6 +217,7 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         let uncommitted = compute_diff(
             worktree_path,
             &worktree_head_sha,
+            ShadowIndexContent::IntentToAdd,
             worktree_branch.unwrap_or_default(),
         )?;
         return Ok(DiffBase::NoBase {
@@ -226,7 +227,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     };
 
     if worktree_branch.as_deref() == Some(base_branch.as_str()) {
-        let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+        let uncommitted = compute_diff(
+            worktree_path,
+            &worktree_head_sha,
+            ShadowIndexContent::IntentToAdd,
+            base_branch.clone(),
+        )?;
         return Ok(DiffBase::NoBase {
             branch: Some(base_branch),
             uncommitted,
@@ -239,7 +245,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
             // A real default branch exists, but shares no common ancestor with this worktree's
             // history - still real uncommitted changes to show against `HEAD`, same as the
             // on-default-branch case just above.
-            let uncommitted = compute_diff(worktree_path, &worktree_head_sha, base_branch.clone())?;
+            let uncommitted = compute_diff(
+                worktree_path,
+                &worktree_head_sha,
+                ShadowIndexContent::IntentToAdd,
+                base_branch.clone(),
+            )?;
             return Ok(DiffBase::NoBase {
                 branch: Some(base_branch),
                 uncommitted,
@@ -248,7 +259,12 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
 
-    let diff = compute_diff(worktree_path, &merge_base_id.to_string(), base_branch)?;
+    let diff = compute_diff(
+        worktree_path,
+        &merge_base_id.to_string(),
+        ShadowIndexContent::IntentToAdd,
+        base_branch,
+    )?;
     Ok(DiffBase::Diff(diff))
 }
 
@@ -286,12 +302,13 @@ pub(crate) fn validate_object_id(id: &str, what: &str) -> Result<(), Error> {
 pub(crate) fn compute_diff(
     worktree_path: &Path,
     object_id: &str,
+    shadow_content: ShadowIndexContent,
     label_branch: String,
 ) -> Result<WorktreeDiff, Error> {
     let commit_sha = object_id;
     validate_object_id(commit_sha, "commit id")?;
 
-    let shadow_index = prepare_shadow_index(worktree_path, ShadowIndexContent::IntentToAdd)?;
+    let shadow_index = prepare_shadow_index(worktree_path, shadow_content)?;
 
     let args: Vec<OsString> = vec![
         // Global config overrides (`-c key=value`) must precede the subcommand for `git` to
@@ -713,7 +730,26 @@ pub(crate) enum ShadowIndexContent {
     /// only way to snapshot a working tree at all), but still only ever into the object database:
     /// the real index, working tree, `HEAD` and stash are as untouched as with `IntentToAdd`,
     /// because every mutation still goes through the same `GIT_INDEX_FILE` override.
+    ///
+    /// **Unbounded in the size of the untracked set**, which is why
+    /// [`crate::review::snapshot_worktree_tree`] measures that set before ever asking for this -
+    /// see [`crate::review::MAX_UNTRACKED_SNAPSHOT_BYTES`] and the real 19 GB worktree that
+    /// motivated the cap.
     FullContent,
+    /// `git add -u` - stages real content for **tracked** paths only (including deletions), and
+    /// never touches untracked files at all.
+    ///
+    /// The bounded fallback for a worktree whose untracked set is too large to hash into the
+    /// object database. Bounded by construction: every path it can write a blob for is already
+    /// in git's history, so the work is proportional to what the user has actually committed
+    /// rather than to whatever build output happens to be sitting in the directory.
+    ///
+    /// Known limitation: `git write-tree` refuses an index containing intent-to-add entries, and
+    /// unlike [`Self::FullContent`]'s `add -A` this flavour does not materialize them. A worktree
+    /// where the user has run a real `git add -N` therefore fails to snapshot through this path.
+    /// That surfaces as an ordinary error (the caller logs it and leaves the review surface
+    /// unavailable), not as a wrong answer.
+    TrackedOnly,
 }
 
 /// Builds a temporary, throwaway copy of the worktree's index with untracked files added,
@@ -813,10 +849,17 @@ pub(crate) fn prepare_shadow_index(
     }
 
     let mut add_args: Vec<OsString> = vec!["add".into()];
-    if content == ShadowIndexContent::IntentToAdd {
-        add_args.push("--intent-to-add".into());
+    match content {
+        ShadowIndexContent::IntentToAdd => {
+            add_args.push("--intent-to-add".into());
+            add_args.push("-A".into());
+        }
+        ShadowIndexContent::FullContent => add_args.push("-A".into()),
+        // `-u` restricts the update to paths git already tracks, so no untracked file's content
+        // can reach the object database through this flavour - see its own docs.
+        ShadowIndexContent::TrackedOnly => add_args.push("-u".into()),
     }
-    add_args.extend([OsString::from("-A"), "--".into(), ".".into()]);
+    add_args.extend([OsString::from("--"), ".".into()]);
     let output = git_command(worktree_path, &add_args)
         .env("GIT_INDEX_FILE", shadow.path())
         .output()

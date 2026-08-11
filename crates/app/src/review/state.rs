@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use wt_core::diff::WorktreeDiff;
+use wt_core::review::UntrackedCoverage;
 
 use crate::work_surface::agents::AgentKind;
 
@@ -83,6 +84,16 @@ pub struct ReviewBaseline {
     /// phase 1, not an oversight.
     pub taken_at_unix: i64,
     pub reason: BaselineReason,
+    /// Whether this snapshot actually captured the worktree's untracked files, or fell back to
+    /// tracked paths only because the untracked set was too large to hash
+    /// (`wt_core::review::MAX_UNTRACKED_SNAPSHOT_BYTES`).
+    ///
+    /// Carried on the baseline rather than recomputed, for two reasons: every later
+    /// `diff_against_tree`/`changed_paths_against_tree` call **must** be made with the same
+    /// coverage the snapshot used (otherwise a tracked-only baseline reports every pre-existing
+    /// untracked file as a brand-new addition), and the user is told about it in the tab header -
+    /// a narrower review is honest only if it says it is narrower.
+    pub untracked: UntrackedCoverage,
 }
 
 /// The Review tab's background diff load - mirrors `crate::graph_view::state::GraphLoadState`'s
@@ -199,7 +210,61 @@ impl AgentReview {
 /// rare in a path; it doesn't need to be escape-proof, since the whole key is hex-encoded into a
 /// ref name downstream (`wt_core::review::baseline_ref_name`) and stored as an opaque string here.
 pub fn baseline_key(worktree: &Path, kind: AgentKind, spawned_at_unix: i64) -> String {
-    format!("{}|{}|{spawned_at_unix}", worktree.display(), kind.label())
+    format!(
+        "{}|{}|{spawned_at_unix}",
+        encode_worktree(worktree),
+        kind.label()
+    )
+}
+
+/// A lossless, always-UTF-8 encoding of a worktree path, for use inside a [`baseline_key`] and in
+/// the persisted state file.
+///
+/// `Path::display()` - what this used to use - is *lossy*: it replaces invalid UTF-8 with U+FFFD.
+/// Two genuinely different worktree paths differing only in invalid bytes would therefore collapse
+/// to one key, and so onto one baseline ref, silently sharing a "since" point between unrelated
+/// agents. It also cannot round-trip back to a real `PathBuf`, which the persisted record needs to
+/// be worth anything to GitHub issue #227.
+///
+/// Both arms carry an explicit tag, so a real path that happens to look like the other encoding
+/// can't be mistaken for it - the encoding is injective by construction, not by luck.
+pub fn encode_worktree(worktree: &Path) -> String {
+    match worktree.to_str() {
+        Some(text) => format!("utf8:{text}"),
+        None => {
+            let bytes = worktree.as_os_str().as_encoded_bytes();
+            let mut encoded = String::with_capacity(6 + bytes.len() * 2);
+            encoded.push_str("bytes:");
+            for byte in bytes {
+                encoded.push_str(&format!("{byte:02x}"));
+            }
+            encoded
+        }
+    }
+}
+
+/// The inverse of [`encode_worktree`] - `None` for anything this app didn't write (a hand-edited
+/// or truncated state file), which callers treat as "this record isn't usable" rather than
+/// guessing at a path.
+///
+/// Non-UTF-8 paths decode only where their bytes are also valid UTF-8 once reassembled; the
+/// checked `String::from_utf8` path is deliberate, rather than reaching for
+/// `OsString::from_encoded_bytes_unchecked`'s `unsafe` in a read path whose only consumers are
+/// diagnostics and future issue #227 work.
+pub fn decode_worktree(encoded: &str) -> Option<PathBuf> {
+    if let Some(text) = encoded.strip_prefix("utf8:") {
+        return Some(PathBuf::from(text));
+    }
+    let hex = encoded.strip_prefix("bytes:")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks(2) {
+        let text = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(text, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 /// The Review tab's header text: what this review is measured against, and when that measurement
@@ -215,11 +280,18 @@ pub fn baseline_key(worktree: &Path, kind: AgentKind, spawned_at_unix: i64) -> S
 /// The time is UTC - see `crate::rail::state::format_utc_hhmm` for why this crate has no local
 /// timezone conversion anywhere.
 pub fn review_tab_header(agent_label: &str, baseline: &ReviewBaseline) -> String {
-    format!(
+    let mut header = format!(
         "{agent_label} \u{b7} {} \u{b7} {}",
         baseline.reason.since_phrase(),
         crate::rail::state::format_utc_hhmm(baseline.taken_at_unix),
-    )
+    );
+    // A tracked-only baseline answers a genuinely narrower question, so the header says so rather
+    // than presenting it as the full answer. Same honesty rule as the rest of this header: state
+    // what is really being measured, never imply more.
+    if baseline.untracked == UntrackedCoverage::Excluded {
+        header.push_str(" \u{b7} tracked files only");
+    }
+    header
 }
 
 /// The Review tab's own empty state, worded as the genuinely good outcome it is.
@@ -259,6 +331,7 @@ mod tests {
             ref_name: "refs/jerry/review/6b6579".to_string(),
             taken_at_unix,
             reason,
+            untracked: UntrackedCoverage::Included,
         }
     }
 
@@ -431,6 +504,84 @@ mod tests {
             baseline_key(Path::new("/repo/wt-a"), AgentKind::Claude, 1_700_000_000),
             "the same agent must resolve to the same key every time - that's what makes a \
              persisted baseline findable at all"
+        );
+    }
+
+    /// A worktree path must survive the key encoding exactly - `Path::display()`, which this used
+    /// to use, is lossy for non-UTF-8 and would collapse genuinely different worktrees onto one
+    /// key (and so onto one baseline ref, silently sharing a "since" point).
+    #[test]
+    fn a_worktree_path_round_trips_through_its_key_encoding() {
+        for path in [
+            "/repo/wt-a",
+            "/home/u/My Repo/.worktrees/feature-x",
+            "/tmp/utf8:looks-like-a-tag",
+            "/tmp/bytes:6162",
+        ] {
+            let encoded = encode_worktree(Path::new(path));
+            assert_eq!(
+                decode_worktree(&encoded),
+                Some(PathBuf::from(path)),
+                "{path} must round-trip exactly - including paths that look like the encoding's \
+                 own tags, which is why both arms carry an explicit prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_encoding_this_app_did_not_write_is_refused_rather_than_guessed() {
+        assert_eq!(decode_worktree("/repo/wt-a"), None, "no tag at all");
+        assert_eq!(decode_worktree("bytes:abc"), None, "odd-length hex");
+        assert_eq!(decode_worktree("bytes:zz"), None, "not hex");
+    }
+
+    /// Two worktree paths differing only in bytes `display()` would have flattened must produce
+    /// genuinely different keys. Built from real `OsStr` bytes on unix, where invalid UTF-8 in a
+    /// path is actually representable.
+    #[cfg(unix)]
+    #[test]
+    fn worktrees_differing_only_in_invalid_utf8_get_distinct_keys() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let a = PathBuf::from(OsStr::from_bytes(b"/repo/\xff"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/repo/\xfe"));
+        assert_ne!(
+            a, b,
+            "precondition: these really are different paths on this platform"
+        );
+        assert_eq!(
+            a.display().to_string(),
+            b.display().to_string(),
+            "precondition: and `display()` really does flatten them to the same string - which is \
+             exactly the bug this encoding replaces"
+        );
+
+        assert_ne!(
+            baseline_key(&a, AgentKind::Claude, 1),
+            baseline_key(&b, AgentKind::Claude, 1),
+            "two genuinely different worktrees must never share one baseline key"
+        );
+    }
+
+    /// A tracked-only baseline must say so in the header - a narrower answer presented as a
+    /// complete one is exactly the kind of quiet lie this feature exists to remove.
+    #[test]
+    fn a_tracked_only_baseline_says_so_in_the_header() {
+        let mut tracked_only = baseline(BaselineReason::Spawn, 9 * 3600 + 31 * 60);
+        tracked_only.untracked = UntrackedCoverage::Excluded;
+        assert_eq!(
+            review_tab_header("claude", &tracked_only),
+            "claude \u{b7} since it started \u{b7} 09:31 \u{b7} tracked files only"
+        );
+
+        // And the ordinary case must not grow a spurious caveat.
+        assert_eq!(
+            review_tab_header(
+                "claude",
+                &baseline(BaselineReason::Spawn, 9 * 3600 + 31 * 60)
+            ),
+            "claude \u{b7} since it started \u{b7} 09:31"
         );
     }
 

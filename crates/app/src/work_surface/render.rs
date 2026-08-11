@@ -250,6 +250,14 @@ impl AdeApp {
         // *after* `set_active` above: its `restore_focus` fallback resolves to
         // `Self::agents.active()`, which by this point is already the agent just selected.
         self.leave_graph_tab(window, cx);
+        // GitHub issue #225: the review tab occupies the centre pane exactly as the graph tab
+        // does, so it needs the identical teardown here. Without this, `review_tab_active` stayed
+        // set, `render_center_pane` kept returning the review body, and the tab this call is
+        // switching *to* never mounted at all - while real focus had already moved onto it. Found
+        // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
+        // discipline and, in exactly this way, did not.
+        self.leave_review_tab(window, cx);
+
         let had_open_file_tab = self.open_change.is_some();
         if had_open_file_tab {
             self.open_change = None;

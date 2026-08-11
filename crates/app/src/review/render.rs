@@ -715,6 +715,13 @@ mod review_flow_tests {
 
     /// Spawns an *additional* agent through the real `new_agent` entry point (the same door the
     /// `+` menu uses) and waits for its baseline capture to land.
+    ///
+    /// Callers that need a second agent **in the startup agent's own worktree** must pass a kind
+    /// other than [`AgentKind::Shell`]: a baseline key is `(worktree, kind, spawn second)`, so a
+    /// second shell spawned into the same worktree within the same second would share the startup
+    /// agent's key and therefore its baseline ref (this crate's documented, accepted collision -
+    /// see `super::state::baseline_key`). Sharing it would make one agent's close delete the
+    /// other's ref, which is not what any of these tests mean to exercise.
     fn spawn_extra_agent(
         app: &gpui::Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
@@ -727,14 +734,42 @@ mod review_flow_tests {
         })
     }
 
-    /// Spawning an agent must capture a genuinely real baseline: a hex tree id that git can
-    /// resolve, anchored under a real ref so `git gc` can't take it.
+    /// Spawning an agent must capture a genuinely real baseline - a hex tree id git can resolve,
+    /// anchored under a real ref so `git gc` can't take it - **without disturbing one byte** of
+    /// the worktree the agent is about to work in.
+    ///
+    /// Both halves in one test deliberately: they need the same real, mixed staged/unstaged/
+    /// untracked fixture, and every GPUI test app on a real git repo arms two OS-level `notify`
+    /// watchers (`start_file_tree_watch`/`start_worktree_watch`), which are a genuinely scarce
+    /// per-user resource under a fully parallel `cargo test` - see
+    /// `crate::sidebar::file_tree_watch::spawn_file_tree_watcher`'s own docs on the inotify
+    /// instance budget and the real regression that already exhausted it once.
     #[gpui::test]
-    fn spawning_an_agent_captures_a_real_anchored_baseline(cx: &mut TestAppContext) {
+    fn spawning_an_agent_captures_a_real_anchored_baseline_without_disturbing_git(
+        cx: &mut TestAppContext,
+    ) {
         let repo = diverged_repo();
+        // A genuinely mixed state, present *before* the app (and so before the snapshot) opens.
+        std::fs::write(repo.path().join("staged.txt"), "staged\n").expect("write");
+        git(repo.path(), &["add", "staged.txt"]);
+        std::fs::write(repo.path().join("base.txt"), "base\nedited\n").expect("write");
+        std::fs::write(repo.path().join("untracked.txt"), "untracked\n").expect("write");
+        let status_before = git_stdout(repo.path(), &["status", "--porcelain"]);
+        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = sole_agent(&app, cx);
+
+        assert_eq!(
+            git_stdout(repo.path(), &["status", "--porcelain"]),
+            status_before,
+            "capturing a baseline must not change one byte of the worktree's real git state"
+        );
+        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
+        assert!(git_stdout(repo.path(), &["stash", "list"])
+            .trim()
+            .is_empty());
 
         let (tree_id, ref_name, reason) = app.read_with(cx, |app, _| {
             let review = app
@@ -936,7 +971,11 @@ mod review_flow_tests {
         });
 
         // A second agent starts in the same worktree.
-        let second = spawn_extra_agent(&app, cx, AgentKind::Claude);
+        // `Codex`, not `Claude`: the kind only has to *differ* from the startup shell's (see
+        // `spawn_extra_agent`), and spawning the real `claude` CLI starts a heavy Node process
+        // whose load was measurably breaking this crate's timing-sensitive inotify tests running
+        // in parallel. Nothing this test asserts depends on which binary runs.
+        let second = spawn_extra_agent(&app, cx, AgentKind::Codex);
 
         app.read_with(cx, |app, _| {
             assert!(
@@ -965,6 +1004,18 @@ mod review_flow_tests {
             assert!(app.agent_reviews.contains_key(&second));
         });
 
+        // And trying to open it while gated is a real no-op, not a tab that opens and then
+        // renders an apology.
+        app.update_in(cx, |app, window, cx| app.open_review_tab(first, window, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.review_tab_open, None,
+                "gated: opening must refuse outright"
+            );
+            assert!(!app.review_tab_active);
+        });
+
         // Close the second agent - back down to one.
         app.update_in(cx, |app, window, cx| app.close_agent(second, window, cx));
         cx.run_until_parked();
@@ -990,25 +1041,6 @@ mod review_flow_tests {
             assert!(app
                 .combined_tab_order()
                 .contains(&work_surface::TabRef::Review(first)));
-        });
-    }
-
-    /// Opening the review tab while the gate is closed must be a real no-op, not a tab that opens
-    /// and then renders an apology.
-    #[gpui::test]
-    fn the_review_tab_refuses_to_open_for_a_multi_agent_worktree(cx: &mut TestAppContext) {
-        let repo = diverged_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-        let first = sole_agent(&app, cx);
-        let _second = spawn_extra_agent(&app, cx, AgentKind::Claude);
-
-        app.update_in(cx, |app, window, cx| app.open_review_tab(first, window, cx));
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.review_tab_open, None);
-            assert!(!app.review_tab_active);
         });
     }
 
@@ -1191,33 +1223,261 @@ mod review_flow_tests {
         );
     }
 
-    /// A snapshot must not disturb the worktree an agent is actively working in - the guarantee
-    /// the whole approach rests on, checked here through the real app flow (not just `wt_core`'s
-    /// own unit test) with a real mixed staged/unstaged/untracked state.
+    /// **The regression test for the wedged centre pane.** `leave_review_tab` had exactly one
+    /// non-test caller (`close_review_tab`), so every *other* way of taking over the centre pane -
+    /// clicking an agent tab, opening a file, opening the graph tab - left `review_tab_active`
+    /// set. `render_center_pane` checks that flag first and returns the review body
+    /// unconditionally, so the tab being switched to never mounted at all, while real focus had
+    /// already moved onto it: typed input went nowhere.
+    ///
+    /// Deliberately drives the real entry points rather than calling `leave_review_tab` - the bug
+    /// was precisely that those entry points didn't call it, so a test that calls it directly
+    /// (like `leaving_the_review_tab_moves_focus_off_its_handle` below) cannot catch this.
     #[gpui::test]
-    fn spawning_an_agent_does_not_perturb_real_git_state(cx: &mut TestAppContext) {
+    fn every_way_of_leaving_the_review_tab_really_releases_the_centre_pane(
+        cx: &mut TestAppContext,
+    ) {
         let repo = diverged_repo();
-        std::fs::write(repo.path().join("staged.txt"), "staged\n").expect("write");
-        git(repo.path(), &["add", "staged.txt"]);
-        std::fs::write(repo.path().join("base.txt"), "base\nedited\n").expect("write");
-        std::fs::write(repo.path().join("untracked.txt"), "untracked\n").expect("write");
-
-        let status_before = git_stdout(repo.path(), &["status", "--porcelain"]);
-        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
-
+        std::fs::write(repo.path().join("agent_work.rs"), "fn main() {}\n").expect("write");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
-        let _id = sole_agent(&app, cx);
+        let id = sole_agent(&app, cx);
 
-        assert_eq!(
-            git_stdout(repo.path(), &["status", "--porcelain"]),
-            status_before,
-            "capturing a baseline must not change one byte of the worktree's real git state"
+        // (a) Selecting an agent tab.
+        app.update_in(cx, |app, window, cx| app.open_review_tab(id, window, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(app.review_tab_active, "precondition"));
+
+        app.update_in(cx, |app, window, cx| app.select_agent(id, window, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.review_tab_active,
+                "clicking an agent tab must release the centre pane - otherwise the terminal \
+                 never mounts and focus dangles on an unrendered handle"
+            );
+            assert!(!app.review_focus_handle.is_focused(window));
+        });
+
+        // (b) Opening a file tab.
+        app.update_in(cx, |app, window, cx| app.open_review_tab(id, window, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(PathBuf::from("agent_work.rs"), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(!app.review_tab_active, "opening a file must release it too");
+            assert!(!app.review_focus_handle.is_focused(window));
+        });
+
+        // (c) Opening the git graph tab.
+        app.update_in(cx, |app, window, cx| app.open_review_tab(id, window, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| app.open_git_graph(window, cx));
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.review_tab_active,
+                "opening the graph tab must release it too - two centre-pane occupants must \
+                 never both consider themselves active"
+            );
+            assert!(app.graph_tab_active, "and the graph tab really took over");
+            assert!(!app.review_focus_handle.is_focused(window));
+        });
+    }
+
+    /// **The regression test for the cancelled-capture bug.** Baseline captures used to share one
+    /// `Option<Task<()>>` slot, and GPUI cancels a `Task` on drop - so spawning a second agent
+    /// while the first's snapshot was still running silently destroyed the first capture, leaving
+    /// that agent permanently without a review and its ref orphaned.
+    ///
+    /// Spawns two extra agents back to back, with no `run_until_parked` in between, so both
+    /// captures are genuinely in flight simultaneously.
+    ///
+    /// Both are cheap [`AgentKind::Shell`] agents in **separate real repositories**, rather than
+    /// one `Claude` and one `Codex`. Two reasons, both real: distinct worktrees is what makes
+    /// their baseline keys (and so their refs) genuinely distinct without relying on agent kind,
+    /// and spawning the actual `claude`/`codex` CLIs starts heavy Node processes whose load was
+    /// measurably breaking this crate's timing-sensitive inotify tests running in parallel. What
+    /// this test is about - two captures in flight at once - is entirely independent of which
+    /// binary the agent runs.
+    #[gpui::test]
+    fn concurrent_per_agent_captures_and_releases_are_never_cancelled_by_each_other(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = diverged_repo();
+        let other_a = diverged_repo();
+        let other_b = diverged_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let startup = sole_agent(&app, cx);
+
+        // `Agents::spawn` + `capture_review_baseline` is exactly what `new_agent` does, minus the
+        // focus/menu bookkeeping - the same pair, driven with an explicit cwd.
+        let (first, second) = app.update_in(cx, |app, window, cx| {
+            let first = app.agents.spawn(
+                AgentKind::Shell,
+                other_a.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            app.capture_review_baseline(first, cx);
+            // No parking in between: the first capture is still running right now.
+            let second = app.agents.spawn(
+                AgentKind::Shell,
+                other_b.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            app.capture_review_baseline(second, cx);
+            (first, second)
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            for (label, id) in [("startup", startup), ("first", first), ("second", second)] {
+                assert!(
+                    app.agent_reviews.contains_key(&id),
+                    "the {label} agent's baseline capture must not have been cancelled by a \
+                     later agent's - a cancelled capture is never retried, so that agent would \
+                     have no review for its entire lifetime"
+                );
+            }
+            assert!(
+                app._review_baseline_tasks.is_empty(),
+                "and every completed capture must drop its own task slot"
+            );
+        });
+
+        // Every agent's ref is real, in its own repository, and distinct from the others'.
+        let refs: Vec<(PathBuf, String)> = app.read_with(cx, |app, _| {
+            [startup, first, second]
+                .iter()
+                .map(|id| {
+                    let agent = app.agents.iter().find(|a| a.id == *id).expect("agent");
+                    (
+                        agent.cwd.clone(),
+                        app.agent_reviews[id].baseline.ref_name.clone(),
+                    )
+                })
+                .collect()
+        });
+        for (cwd, ref_name) in &refs {
+            assert!(
+                !git_stdout(cwd, &["rev-parse", ref_name]).trim().is_empty(),
+                "{ref_name} must really exist in {}",
+                cwd.display()
+            );
+        }
+        let unique: std::collections::HashSet<&String> =
+            refs.iter().map(|(_, name)| name).collect();
+        assert_eq!(unique.len(), 3, "each agent gets its own baseline ref");
+
+        // The mirror image, on the same two agents: closing them back to back must release
+        // *both* refs. With one shared task slot the first `delete_ref` was cancelled by the
+        // second and that ref leaked forever, since nothing ever retries it.
+        app.update_in(cx, |app, window, cx| {
+            app.close_agent(first, window, cx);
+            // Again, no parking in between - the first deletion is still in flight.
+            app.close_agent(second, window, cx);
+        });
+        cx.run_until_parked();
+
+        for (cwd, ref_name) in refs.iter().filter(|(_, name)| {
+            // The startup agent is still open, so its own ref must survive; only the two just
+            // closed should be gone.
+            name != &refs[0].1
+        }) {
+            assert!(
+                git_stdout(cwd, &["rev-parse", "--verify", ref_name])
+                    .trim()
+                    .is_empty(),
+                "{ref_name} must really have been deleted"
+            );
+        }
+        assert!(
+            !git_stdout(&refs[0].0, &["rev-parse", "--verify", &refs[0].1])
+                .trim()
+                .is_empty(),
+            "the still-open startup agent's own baseline ref must be untouched"
         );
-        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
-        assert!(git_stdout(repo.path(), &["stash", "list"])
-            .trim()
-            .is_empty());
+        app.read_with(cx, |app, _| {
+            assert!(app._review_release_tasks.is_empty());
+        });
+    }
+
+    /// The mirror image for ref *release*: closing two agents in quick succession used to cancel
+    /// the first one's `delete_ref`, leaking that ref forever.
+    /// Baseline persistence must be a real, on-disk write with real content - and must go through
+    /// the background executor rather than blocking the UI thread on two `fsync`s under
+    /// `persisted_state_lock`'s process-wide mutex (which background writers of the sibling state
+    /// files hold across their own fsyncs).
+    ///
+    /// Honest about what this proves: the real, checked assertion is the on-disk *result* - the
+    /// file exists, holds exactly the live baseline, and decodes back to the real worktree.
+    /// "Runs off the UI thread" is asserted structurally, via the `_review_persist_task` slot
+    /// only a `cx.spawn` ever fills, rather than by timing - `add_window_view` already runs the
+    /// test executor, so a "not written yet" check would be measuring GPUI's scheduling rather
+    /// than this code.
+    #[gpui::test]
+    fn baseline_persistence_really_writes_to_disk_off_the_ui_thread(cx: &mut TestAppContext) {
+        let repo = diverged_repo();
+        let config = tempfile::tempdir().expect("config dir");
+        let settings_path = config.path().join("settings.toml");
+        let baselines_path =
+            crate::review::baseline_state::review_baseline_path_for(&settings_path);
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo.path().to_path_buf()),
+                true,
+                crate::settings::store::Settings::default(),
+                Some(settings_path.clone()),
+                window,
+                cx,
+            )
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            baselines_path.exists(),
+            "the baseline must really be persisted to disk"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app._review_persist_task.is_some(),
+                "and the save must have gone through a real `cx.spawn` task - an inline \
+                 `save_merged_at` would leave this slot empty while fsync'ing on the UI thread"
+            );
+        });
+        let state = crate::review::baseline_state::ReviewBaselineState::load_at(&baselines_path);
+        assert_eq!(
+            state.baselines.len(),
+            1,
+            "exactly the startup agent's baseline"
+        );
+        let entry = state.baselines.values().next().expect("an entry");
+        assert_eq!(
+            entry.worktree_path(),
+            Some(repo.path().to_path_buf()),
+            "recorded against the real worktree, decodably"
+        );
+        app.read_with(cx, |app, _| {
+            let agent = app.agents.iter().next().expect("the startup agent");
+            let key =
+                crate::review::state::baseline_key(&agent.cwd, agent.kind, agent.spawned_at_unix);
+            assert_eq!(
+                state.get(&key),
+                Some(app.agent_reviews[&agent.id].baseline.clone()),
+                "and the persisted baseline must match the live one exactly"
+            );
+        });
     }
 
     /// Leaving the review tab must move real keyboard focus off a handle that is about to stop

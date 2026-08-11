@@ -12,3 +12,9 @@ thiserror = { workspace = true }
 # Used at runtime (not just in tests) by `diff::prepare_shadow_index` to build a throwaway
 # copy of the real index for `git diff`'s untracked-file handling - see that function's docs.
 tempfile = "3"
+# Fixed-length, collision-free ref-name components for `review::baseline_ref_name`. Raw hex
+# encoding of the key doubled its length and pushed real, ordinary worktree paths past the
+# filesystem's 255-byte `NAME_MAX` for a loose ref's filename, which failed baseline capture
+# outright. Already present in this workspace's lockfile via other dependencies, so this adds no
+# new crate to the build graph.
+sha2 = "0.10"

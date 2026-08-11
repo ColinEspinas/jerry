@@ -250,10 +250,11 @@ impl AdeApp {
             review_focus: OverlayFocus::default(),
             review_scroll_handle: UniformListScrollHandle::new(),
             review_highlight_cache: None,
-            _review_baseline_task: None,
+            _review_baseline_tasks: HashMap::new(),
             _review_load_task: None,
             _review_mark_task: None,
-            _review_release_task: None,
+            _review_release_tasks: HashMap::new(),
+            _review_persist_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that

@@ -46,7 +46,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{BaselineReason, ReviewBaseline};
+use wt_core::review::UntrackedCoverage;
+
+use super::state::{decode_worktree, encode_worktree, BaselineReason, ReviewBaseline};
 
 /// The baseline file's name, resolved next to the real `settings.toml` - mirrors
 /// `crate::work_surface::tab_order_state::TAB_ORDER_FILE_NAME`.
@@ -68,8 +70,11 @@ pub fn review_baseline_path_for(settings_path: &Path) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedBaseline {
-    /// The worktree this agent was running in, as an absolute path string. Recorded separately
-    /// from the map key (which also encodes it) so a reader never has to parse the key apart.
+    /// The worktree this agent was running in, in `super::state::encode_worktree`'s lossless
+    /// `utf8:`/`bytes:` form - recorded separately from the map key (which also encodes it) so a
+    /// reader never has to parse the key apart, and losslessly so it can be turned back into a
+    /// real `PathBuf` (`Self::worktree_path`) rather than a `Path::display()` string that cannot
+    /// round-trip.
     pub worktree: String,
     /// `AgentKind::label`'s output, e.g. `"Claude"`.
     pub kind: String,
@@ -84,6 +89,19 @@ pub struct PersistedBaseline {
     pub taken_at_unix: i64,
     /// [`BaselineReason::as_key`]'s stable string.
     pub reason: String,
+    /// `true` when this baseline covers tracked files only, because the worktree's untracked set
+    /// was too large to hash (`wt_core::review::MAX_UNTRACKED_SNAPSHOT_BYTES`). Persisted because
+    /// every later diff against this tree must use the *same* coverage to produce a correct
+    /// answer - a reader that assumed the default would report every untracked file as new.
+    pub tracked_only: bool,
+}
+
+impl PersistedBaseline {
+    /// This record's worktree as a real path - `None` for an entry this app didn't write (see
+    /// `super::state::decode_worktree`).
+    pub fn worktree_path(&self) -> Option<PathBuf> {
+        decode_worktree(&self.worktree)
+    }
 }
 
 impl Default for PersistedBaseline {
@@ -100,6 +118,9 @@ impl Default for PersistedBaseline {
             // the whole otherwise-valid entry away. `Spawn` is the honest default - it's what a
             // baseline is until someone marks it reviewed.
             reason: BaselineReason::Spawn.as_key().to_string(),
+            // The overwhelmingly common case, and the one a pre-`tracked_only` entry was written
+            // under - so an older file's entries keep meaning what they meant when written.
+            tracked_only: false,
         }
     }
 }
@@ -209,13 +230,14 @@ impl ReviewBaselineState {
         self.baselines.insert(
             key,
             PersistedBaseline {
-                worktree: worktree.display().to_string(),
+                worktree: encode_worktree(worktree),
                 kind: kind.to_string(),
                 spawned_at_unix,
                 tree_id: baseline.tree_id.clone(),
                 ref_name: baseline.ref_name.clone(),
                 taken_at_unix: baseline.taken_at_unix,
                 reason: baseline.reason.as_key().to_string(),
+                tracked_only: baseline.untracked == UntrackedCoverage::Excluded,
             },
         );
     }
@@ -242,6 +264,11 @@ impl ReviewBaselineState {
             ref_name: entry.ref_name.clone(),
             taken_at_unix: entry.taken_at_unix,
             reason: BaselineReason::from_key(&entry.reason)?,
+            untracked: if entry.tracked_only {
+                UntrackedCoverage::Excluded
+            } else {
+                UntrackedCoverage::Included
+            },
         })
     }
 }
@@ -256,6 +283,7 @@ mod tests {
             ref_name: "refs/jerry/review/6b6579".to_string(),
             taken_at_unix: 1_700_000_042,
             reason,
+            untracked: UntrackedCoverage::Included,
         }
     }
 
@@ -423,6 +451,78 @@ mod tests {
              live agent for it - that is exactly the data GitHub issue #227 needs to find"
         );
         assert!(on_disk.get("new-key").is_some());
+    }
+
+    /// The persisted worktree must be a real, decodable path rather than a `Path::display()`
+    /// string - it is the one field GitHub issue #227 will actually need to act on.
+    #[test]
+    fn a_persisted_worktree_round_trips_back_to_a_real_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("review-baselines.toml");
+        let worktree = Path::new("/repo/my worktree/feature-x");
+        let mut state = ReviewBaselineState::default();
+        state.set(
+            "key-a".to_string(),
+            worktree,
+            "Claude",
+            1,
+            &sample(BaselineReason::Spawn),
+        );
+        state.save_at(&path).expect("save");
+
+        let entry = ReviewBaselineState::load_at(&path).baselines["key-a"].clone();
+        assert_eq!(
+            entry.worktree_path(),
+            Some(worktree.to_path_buf()),
+            "the recorded worktree must decode back to the real path it was captured for"
+        );
+    }
+
+    /// Coverage must persist: a later diff made with the wrong coverage against a tracked-only
+    /// baseline would report every untracked file as a brand-new addition.
+    #[test]
+    fn a_tracked_only_baseline_persists_its_narrower_coverage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("review-baselines.toml");
+        let tracked_only = ReviewBaseline {
+            untracked: UntrackedCoverage::Excluded,
+            ..sample(BaselineReason::Spawn)
+        };
+        let mut state = ReviewBaselineState::default();
+        state.set(
+            "key-a".to_string(),
+            Path::new("/repo/wt-a"),
+            "Claude",
+            1,
+            &tracked_only,
+        );
+        state.save_at(&path).expect("save");
+
+        assert_eq!(
+            ReviewBaselineState::load_at(&path).get("key-a"),
+            Some(tracked_only),
+            "a tracked-only baseline must not silently come back as a full one"
+        );
+    }
+
+    /// An entry written before `tracked_only` existed must keep meaning what it meant - the
+    /// ordinary, full-coverage case - rather than failing to parse or flipping to the narrow one.
+    #[test]
+    fn an_entry_without_the_coverage_field_defaults_to_full_coverage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("review-baselines.toml");
+        std::fs::write(
+            &path,
+            "[baselines.\"key-a\"]\nworktree = \"utf8:/repo/wt-a\"\nkind = \"Claude\"\n\
+             spawned_at_unix = 1\ntree_id = \"aaaa\"\nref_name = \"refs/jerry/review/6b\"\n\
+             taken_at_unix = 2\nreason = \"spawn\"\n",
+        )
+        .expect("write");
+
+        let baseline = ReviewBaselineState::load_at(&path)
+            .get("key-a")
+            .expect("an entry missing only the new field must still be usable");
+        assert_eq!(baseline.untracked, UntrackedCoverage::Included);
     }
 
     #[test]

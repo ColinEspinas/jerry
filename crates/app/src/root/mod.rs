@@ -753,15 +753,33 @@ pub struct AdeApp {
     /// (its identity guard rejecting every read) every time the user moved between them. Kept
     /// fresh by `crate::review::render::AdeApp::refresh_review_highlight_cache`.
     pub(crate) review_highlight_cache: Option<DiffHighlightCache>,
-    /// The in-flight `wt_core::review::snapshot_worktree_tree` behind a fresh agent's baseline
-    /// capture - one slot, same shape as [`Self::_load_graph_task`].
-    pub(crate) _review_baseline_task: Option<Task<()>>,
+    /// The in-flight `wt_core::review::snapshot_worktree_tree` behind each fresh agent's
+    /// baseline capture, keyed by agent.
+    ///
+    /// Deliberately **not** the single `Option<Task<()>>` slot [`Self::_load_graph_task`] uses:
+    /// GPUI cancels a `Task` when it is dropped, so one shared slot meant spawning agent B while
+    /// agent A's snapshot was still running silently cancelled A's capture - permanently, since
+    /// nothing retries it, leaving A with no review for its entire lifetime and an orphaned
+    /// baseline ref that `release_review_baseline` would never clean up (it early-returns when
+    /// there is no entry). A single slot is right for a *replaceable* load like the graph's; a
+    /// baseline capture is per-agent and must not be superseded by an unrelated agent's.
+    ///
+    /// Entries are removed when their capture completes, so this never grows past the number of
+    /// captures genuinely in flight.
+    pub(crate) _review_baseline_tasks: HashMap<AgentId, Task<()>>,
     /// The in-flight `wt_core::review::diff_against_tree` load behind the review tab.
     pub(crate) _review_load_task: Option<Task<()>>,
     /// The in-flight `Mark reviewed` re-snapshot - guarded by [`Self::review_mark_in_flight`].
     pub(crate) _review_mark_task: Option<Task<()>>,
-    /// The in-flight `wt_core::review::delete_ref` releasing a closed agent's baseline ref.
-    pub(crate) _review_release_task: Option<Task<()>>,
+    /// In-flight `wt_core::review::delete_ref` calls releasing closed agents' baseline refs,
+    /// keyed by the agent that was closed - same reasoning as [`Self::_review_baseline_tasks`]:
+    /// with one shared slot, closing two agents in quick succession cancelled the first one's
+    /// deletion and leaked that ref forever.
+    pub(crate) _review_release_tasks: HashMap<AgentId, Task<()>>,
+    /// The in-flight background save of [`Self::review_baseline_state`] - one slot is correct
+    /// here (unlike the two above), because every save writes the *whole* merged state, so a
+    /// newer one genuinely supersedes an older one. Mirrors `AdeApp::_tab_order_save_task`.
+    pub(crate) _review_persist_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,

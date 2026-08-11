@@ -42,12 +42,39 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::diff::{
     capture_git_stdout, compute_diff, prepare_shadow_index, validate_object_id, ShadowIndexContent,
     WorktreeDiff, MAX_DIFF_OUTPUT_BYTES,
 };
 use crate::error::Error;
 use crate::{check_success, format_args, git_command, run_git};
+
+/// Cap on the total bytes of **untracked** content a single snapshot will hash into the object
+/// database before falling back to a tracked-only baseline ([`UntrackedCoverage::Excluded`]).
+///
+/// This cap is not hypothetical. `snapshot_worktree_tree` originally ran an unconditional
+/// `git add -A`, and this project's own checkout at the time carried a 19 GB, 21,471-file
+/// untracked build directory that was *not* gitignored. Every agent spawn - including the one
+/// every window performs at startup - would have hashed and written all of it into the user's
+/// real `.git/objects`, taking minutes and leaving the objects behind as loose files until a
+/// `git gc --prune` (a two-week default grace period).
+///
+/// 128 MiB is chosen as comfortably above any plausible *legitimate* untracked set (scratch
+/// files, a few generated artifacts) while bounding the pathological case to a few seconds of
+/// hashing. Large build outputs are normally gitignored, and a gitignored file is never counted
+/// here at all - a worktree tripping this cap has genuinely put hundreds of megabytes of
+/// un-ignored content in front of git.
+pub const MAX_UNTRACKED_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Companion cap to [`MAX_UNTRACKED_SNAPSHOT_BYTES`] on the *number* of untracked files.
+///
+/// Needed separately because per-file cost is not only bytes: each path costs a `stat`, an index
+/// entry, and a loose object. 21,471 tiny files would slip under a pure byte cap while still
+/// being exactly the case that motivated this. Also lets [`measure_untracked`] stop counting
+/// early rather than stat-ing an unbounded list just to discover it is unbounded.
+pub const MAX_UNTRACKED_SNAPSHOT_FILES: usize = 5_000;
 
 /// The ref namespace every review baseline is anchored under. Deliberately **not** under
 /// `refs/heads/` or `refs/tags/`: a baseline is not a branch and not a tag, and putting it in
@@ -60,9 +87,117 @@ use crate::{check_success, format_args, git_command, run_git};
 /// namespaces are ignored by essentially everything while still being real, gc-protecting refs.
 pub const REVIEW_REF_PREFIX: &str = "refs/jerry/review/";
 
+/// Whether a baseline's snapshot actually captured the worktree's untracked files.
+///
+/// Not a detail: it changes what a review *means*, so it travels with the baseline and is shown
+/// to the user rather than being silently assumed. It must also be passed back to
+/// [`diff_against_tree`]/[`changed_paths_against_tree`], because measuring against a baseline
+/// with one coverage using the other's rules produces a systematically wrong answer - a
+/// tracked-only baseline compared with untracked files included would report every pre-existing
+/// untracked file as something the agent had just added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrackedCoverage {
+    /// The normal case: untracked, non-ignored files were captured with their real content, so a
+    /// file the agent creates afterwards shows up as a real addition.
+    Included,
+    /// The worktree's untracked set exceeded [`MAX_UNTRACKED_SNAPSHOT_BYTES`] or
+    /// [`MAX_UNTRACKED_SNAPSHOT_FILES`], so the baseline covers tracked files only.
+    ///
+    /// Reviews against such a baseline are honest but narrower: they report changes to files git
+    /// already tracks, and say nothing about untracked ones in either direction. Callers are
+    /// expected to surface this to the user (this app's Review tab header appends `tracked files
+    /// only`) rather than presenting it as a complete answer.
+    Excluded,
+}
+
+impl UntrackedCoverage {
+    /// The shadow-index flavour that matches this coverage - the single place the mapping lives,
+    /// so a snapshot and every later diff against it can never disagree about whether untracked
+    /// files are in scope.
+    fn shadow_index_content(self, for_snapshot: bool) -> ShadowIndexContent {
+        match (self, for_snapshot) {
+            (UntrackedCoverage::Included, true) => ShadowIndexContent::FullContent,
+            // A diff never needs real untracked *content* - `git diff <object>` reads the working
+            // tree directly - so the cheap intent-to-add stub is enough to make the path visible.
+            (UntrackedCoverage::Included, false) => ShadowIndexContent::IntentToAdd,
+            (UntrackedCoverage::Excluded, _) => ShadowIndexContent::TrackedOnly,
+        }
+    }
+}
+
+/// A real captured baseline: the tree, and what it actually covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSnapshot {
+    /// The tree's hex object id.
+    pub tree_id: String,
+    pub untracked: UntrackedCoverage,
+    /// How many untracked, non-ignored files were found at capture time - real and measured, and
+    /// kept even when they were included, so a caller can explain *why* a baseline is
+    /// tracked-only. Saturates at [`MAX_UNTRACKED_SNAPSHOT_FILES`] + 1 when counting stopped
+    /// early (see [`measure_untracked`]).
+    pub untracked_files: usize,
+    /// Their total size in bytes, measured the same way. `0` when counting stopped on the file
+    /// cap before sizes were summed.
+    pub untracked_bytes: u64,
+}
+
+/// Measures the worktree's untracked, non-ignored set: how many files, and how many bytes.
+///
+/// `git ls-files -o --exclude-standard -z` is the real list git itself would stage under
+/// `add -A`, so this measures exactly what a [`ShadowIndexContent::FullContent`] snapshot would
+/// be asked to hash - gitignored content is excluded here for the same reason it is excluded
+/// there.
+///
+/// Stops early once the file count passes [`MAX_UNTRACKED_SNAPSHOT_FILES`], returning
+/// `(cap + 1, 0)`: past that point the answer is already "too many", and stat-ing the rest would
+/// be doing the very unbounded work this exists to avoid. A truncated path list is treated the
+/// same way, since a list too large to even read is by definition past the cap.
+fn measure_untracked(worktree_path: &Path) -> Result<(usize, u64), Error> {
+    let args: Vec<OsString> = vec![
+        "ls-files".into(),
+        "-o".into(),
+        "--exclude-standard".into(),
+        "-z".into(),
+    ];
+    let (output, truncated) =
+        capture_git_stdout(worktree_path, &args, MAX_DIFF_OUTPUT_BYTES, None)?;
+    if truncated {
+        return Ok((MAX_UNTRACKED_SNAPSHOT_FILES + 1, 0));
+    }
+
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for record in output.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        files += 1;
+        if files > MAX_UNTRACKED_SNAPSHOT_FILES {
+            return Ok((MAX_UNTRACKED_SNAPSHOT_FILES + 1, 0));
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(record).into_owned());
+        // `symlink_metadata`, not `metadata`: a symlink is staged as the link itself, so its own
+        // (tiny) size is what a snapshot would write - following it could both over-count wildly
+        // and wander outside the worktree entirely.
+        if let Ok(meta) = std::fs::symlink_metadata(worktree_path.join(&relative)) {
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    Ok((files, bytes))
+}
+
 /// Snapshots the worktree at `worktree_path` exactly as it stands right now - tracked
-/// modifications, staged changes, and untracked files alike - as a real git tree object, and
-/// returns its hex object id.
+/// modifications, staged changes, and (subject to the caps below) untracked files - as a real
+/// git tree object.
+///
+/// ## Bounded, not unconditional
+///
+/// The untracked set is **measured first** ([`measure_untracked`]). Only if it fits within
+/// [`MAX_UNTRACKED_SNAPSHOT_BYTES`] and [`MAX_UNTRACKED_SNAPSHOT_FILES`] is it staged with real
+/// content; otherwise the snapshot falls back to tracked paths only and says so via
+/// [`WorktreeSnapshot::untracked`]. See [`MAX_UNTRACKED_SNAPSHOT_BYTES`]'s own docs for the real
+/// 19 GB worktree this exists for - an unconditional `git add -A` here writes every untracked,
+/// non-ignored byte into the user's real object database, on every single agent spawn.
 ///
 /// This is a *review baseline*: the "since" point a later [`diff_against_tree`] compares
 /// against. It captures the working tree, not `HEAD`, because that is what a reviewer actually
@@ -89,8 +224,17 @@ pub const REVIEW_REF_PREFIX: &str = "refs/jerry/review/";
 /// entry, and refuses outright (`fatal: ... has intent-to-add entries`) on a stub.
 ///
 /// Performs blocking I/O (spawns real `git` child processes).
-pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<String, Error> {
-    let shadow_index = prepare_shadow_index(worktree_path, ShadowIndexContent::FullContent)?;
+pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<WorktreeSnapshot, Error> {
+    let (untracked_files, untracked_bytes) = measure_untracked(worktree_path)?;
+    let untracked = if untracked_files > MAX_UNTRACKED_SNAPSHOT_FILES
+        || untracked_bytes > MAX_UNTRACKED_SNAPSHOT_BYTES
+    {
+        UntrackedCoverage::Excluded
+    } else {
+        UntrackedCoverage::Included
+    };
+
+    let shadow_index = prepare_shadow_index(worktree_path, untracked.shadow_index_content(true))?;
 
     let args: Vec<OsString> = vec!["write-tree".into()];
     let output = git_command(worktree_path, &args)
@@ -107,7 +251,12 @@ pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<String, Error> {
     // very wrong; refusing it here (rather than storing it as a baseline that every later
     // `diff_against_tree` would reject one at a time) keeps the failure at the point it happened.
     validate_object_id(&tree_id, "written tree id")?;
-    Ok(tree_id)
+    Ok(WorktreeSnapshot {
+        tree_id,
+        untracked,
+        untracked_files,
+        untracked_bytes,
+    })
 }
 
 /// The real review diff: how the worktree at `worktree_path` differs *right now* from the
@@ -132,10 +281,16 @@ pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<String, Error> {
 pub fn diff_against_tree(
     worktree_path: &Path,
     tree_id: &str,
+    untracked: UntrackedCoverage,
     label: String,
 ) -> Result<WorktreeDiff, Error> {
     validate_object_id(tree_id, "baseline tree id")?;
-    compute_diff(worktree_path, tree_id, label)
+    compute_diff(
+        worktree_path,
+        tree_id,
+        untracked.shadow_index_content(false),
+        label,
+    )
 }
 
 /// Just the paths that differ from the `tree_id` snapshot - one `git diff --name-only` process,
@@ -159,10 +314,11 @@ pub fn diff_against_tree(
 pub fn changed_paths_against_tree(
     worktree_path: &Path,
     tree_id: &str,
+    untracked: UntrackedCoverage,
 ) -> Result<Vec<PathBuf>, Error> {
     validate_object_id(tree_id, "baseline tree id")?;
 
-    let shadow_index = prepare_shadow_index(worktree_path, ShadowIndexContent::IntentToAdd)?;
+    let shadow_index = prepare_shadow_index(worktree_path, untracked.shadow_index_content(false))?;
 
     let args: Vec<OsString> = vec![
         "diff".into(),
@@ -201,17 +357,31 @@ pub fn changed_paths_against_tree(
 /// control characters, a `.lock` suffix, and more). Rather than trying to sanitize each of those
 /// rules individually - a list that is easy to get subtly wrong, and where a *collision* between
 /// two different keys sanitizing to the same string would silently mean two agents sharing one
-/// baseline - this lowercase-hex-encodes the whole key. Hex is injective (distinct keys always
-/// produce distinct refs) and is trivially a valid ref-name component, with no rule left to get
-/// wrong.
+/// baseline - this hashes the whole key.
+///
+/// ## Why a digest rather than raw hex
+///
+/// The first version hex-encoded the key directly. Hex is injective and always ref-name-legal,
+/// but it **doubles the length**, and a loose ref is a real file whose name must fit in
+/// `NAME_MAX` (255 bytes on Linux, and less once git appends its own `.lock` suffix). That capped
+/// the worktree-path portion of a key at roughly 107 bytes - well inside the range of an ordinary
+/// `~/Developer/<org>/<repo>/.worktrees/<branch>` layout - and past it `git update-ref` failed
+/// with "File name too long", which surfaced only as a logged warning and a silently, permanently
+/// disabled Review door.
+///
+/// A SHA-256 digest is a fixed 64 characters regardless of key length, so the full ref is always
+/// 82 bytes. Collisions remain a non-issue - and these keys are local filesystem paths under the
+/// user's own control, never attacker-chosen input, so collision *resistance* is not the property
+/// being relied on here; injectivity in practice is.
 ///
 /// The cost is an unreadable ref name. That is an acceptable trade for internal bookkeeping refs
 /// no user is expected to read; the human-readable form of the same fact lives in this app's own
 /// persisted review state, next to the tree id.
 pub fn baseline_ref_name(key: &str) -> String {
-    let mut encoded = String::with_capacity(REVIEW_REF_PREFIX.len() + key.len() * 2);
+    let digest = Sha256::digest(key.as_bytes());
+    let mut encoded = String::with_capacity(REVIEW_REF_PREFIX.len() + digest.len() * 2);
     encoded.push_str(REVIEW_REF_PREFIX);
-    for byte in key.as_bytes() {
+    for byte in digest {
         encoded.push_str(&format!("{byte:02x}"));
     }
     encoded
@@ -314,6 +484,19 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// `snapshot_worktree_tree`, asserting the ordinary case (untracked content really captured)
+    /// and handing back just the tree id - the shape most tests here want.
+    fn snapshot_tree(path: &Path) -> String {
+        let snapshot = snapshot_worktree_tree(path).expect("snapshot");
+        assert_eq!(
+            snapshot.untracked,
+            UntrackedCoverage::Included,
+            "these fixtures are far under the untracked caps, so a tracked-only fallback here \
+             would mean the cap logic is misfiring"
+        );
+        snapshot.tree_id
+    }
+
     fn init_repo() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
         git(dir.path(), &["init", "-b", "main"]);
@@ -335,9 +518,14 @@ mod tests {
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
         fs::write(repo.path().join("untracked.txt"), "brand new\n").expect("write");
 
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
-        let review = diff_against_tree(repo.path(), &tree, "since it started".to_string())
-            .expect("diff_against_tree");
+        let tree = snapshot_tree(repo.path());
+        let review = diff_against_tree(
+            repo.path(),
+            &tree,
+            UntrackedCoverage::Included,
+            "since it started".to_string(),
+        )
+        .expect("diff_against_tree");
 
         assert!(
             review.files.is_empty(),
@@ -366,12 +554,17 @@ mod tests {
     #[test]
     fn changes_made_after_a_snapshot_show_up_in_the_review_diff_with_real_hunks() {
         let repo = init_repo();
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("file.txt"), "hello\nafter the snapshot\n").expect("write");
 
-        let review = diff_against_tree(repo.path(), &tree, "since it started".to_string())
-            .expect("diff_against_tree");
+        let review = diff_against_tree(
+            repo.path(),
+            &tree,
+            UntrackedCoverage::Included,
+            "since it started".to_string(),
+        )
+        .expect("diff_against_tree");
         assert_eq!(review.files.len(), 1, "exactly one file changed");
         let file = &review.files[0];
         assert_eq!(file.path, PathBuf::from("file.txt"));
@@ -394,12 +587,17 @@ mod tests {
     #[test]
     fn an_untracked_file_created_after_a_snapshot_is_reported_as_an_addition() {
         let repo = init_repo();
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("brand_new.txt"), "written by an agent\n").expect("write");
 
-        let review =
-            diff_against_tree(repo.path(), &tree, "since".to_string()).expect("diff_against_tree");
+        let review = diff_against_tree(
+            repo.path(),
+            &tree,
+            UntrackedCoverage::Included,
+            "since".to_string(),
+        )
+        .expect("diff_against_tree");
         let paths: Vec<PathBuf> = review.files.iter().map(|file| file.path.clone()).collect();
         assert_eq!(paths, vec![PathBuf::from("brand_new.txt")]);
         assert_eq!(review.files[0].status, crate::diff::FileChangeStatus::Added);
@@ -413,11 +611,16 @@ mod tests {
         let repo = init_repo();
         fs::write(repo.path().join("notes.txt"), "line one\n").expect("write");
 
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
         fs::write(repo.path().join("notes.txt"), "line one\nline two\n").expect("write");
 
-        let review =
-            diff_against_tree(repo.path(), &tree, "since".to_string()).expect("diff_against_tree");
+        let review = diff_against_tree(
+            repo.path(),
+            &tree,
+            UntrackedCoverage::Included,
+            "since".to_string(),
+        )
+        .expect("diff_against_tree");
         assert_eq!(review.files.len(), 1);
         assert_eq!(
             review.files[0].status,
@@ -482,15 +685,15 @@ mod tests {
     #[test]
     fn a_snapshot_id_tracks_real_content_not_the_time_it_was_taken() {
         let repo = init_repo();
-        let first = snapshot_worktree_tree(repo.path()).expect("snapshot");
-        let unchanged = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let first = snapshot_tree(repo.path());
+        let unchanged = snapshot_tree(repo.path());
         assert_eq!(
             first, unchanged,
             "an unchanged worktree must snapshot to the same tree"
         );
 
         fs::write(repo.path().join("file.txt"), "hello\nchanged\n").expect("write");
-        let after = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let after = snapshot_tree(repo.path());
         assert_ne!(
             first, after,
             "a real change must produce a genuinely different baseline"
@@ -502,24 +705,30 @@ mod tests {
     #[test]
     fn changed_paths_agrees_with_the_full_review_diffs_file_list() {
         let repo = init_repo();
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
         fs::write(repo.path().join("added.txt"), "new\n").expect("write");
 
-        let mut paths = changed_paths_against_tree(repo.path(), &tree).expect("changed_paths");
+        let mut paths = changed_paths_against_tree(repo.path(), &tree, UntrackedCoverage::Included)
+            .expect("changed_paths");
         paths.sort();
         assert_eq!(
             paths,
             vec![PathBuf::from("added.txt"), PathBuf::from("file.txt")]
         );
 
-        let mut full: Vec<PathBuf> = diff_against_tree(repo.path(), &tree, "since".to_string())
-            .expect("diff_against_tree")
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect();
+        let mut full: Vec<PathBuf> = diff_against_tree(
+            repo.path(),
+            &tree,
+            UntrackedCoverage::Included,
+            "since".to_string(),
+        )
+        .expect("diff_against_tree")
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
         full.sort();
         assert_eq!(paths, full, "the cheap path list must match the full diff");
     }
@@ -528,10 +737,127 @@ mod tests {
     fn changed_paths_is_empty_immediately_after_a_snapshot() {
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
-        assert!(changed_paths_against_tree(repo.path(), &tree)
-            .expect("changed_paths")
-            .is_empty());
+        let tree = snapshot_tree(repo.path());
+        assert!(
+            changed_paths_against_tree(repo.path(), &tree, UntrackedCoverage::Included)
+                .expect("changed_paths")
+                .is_empty()
+        );
+    }
+
+    /// Counts the loose objects under `.git/objects` - what a snapshot writes, and the thing an
+    /// unbounded `git add -A` would blow up.
+    fn loose_object_count(repo: &Path) -> usize {
+        let objects = repo.join(".git").join("objects");
+        let Ok(shards) = std::fs::read_dir(&objects) else {
+            return 0;
+        };
+        shards
+            .flatten()
+            .filter(|shard| {
+                let name = shard.file_name();
+                let name = name.to_string_lossy();
+                // The two-hex-char fan-out directories; `info`/`pack` are not loose objects.
+                name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .map(|shard| {
+                std::fs::read_dir(shard.path())
+                    .map(|entries| entries.flatten().count())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// **The regression test for the 19 GB bug.** A worktree with an untracked set past
+    /// [`MAX_UNTRACKED_SNAPSHOT_FILES`] must not hash that content into the object database at
+    /// all - it must fall back to a tracked-only baseline and say so.
+    ///
+    /// Checks the real consequence (loose objects actually written), not just the returned flag:
+    /// the flag being right while the content still landed in `.git/objects` would be exactly the
+    /// bug, still present, with a label on it.
+    #[test]
+    fn an_oversized_untracked_set_is_never_hashed_into_the_object_database() {
+        let repo = init_repo();
+        // Comfortably past the file cap, deliberately tiny so the test stays fast - the file cap
+        // exists precisely because many small files are as expensive as a few large ones.
+        let junk = repo.path().join("build-output");
+        std::fs::create_dir_all(&junk).expect("mkdir");
+        for index in 0..(MAX_UNTRACKED_SNAPSHOT_FILES + 10) {
+            fs::write(junk.join(format!("{index}.o")), b"x").expect("write");
+        }
+
+        let before = loose_object_count(repo.path());
+        let snapshot = snapshot_worktree_tree(repo.path()).expect("snapshot");
+
+        assert_eq!(
+            snapshot.untracked,
+            UntrackedCoverage::Excluded,
+            "an untracked set past the cap must produce a tracked-only baseline"
+        );
+        let written = loose_object_count(repo.path()).saturating_sub(before);
+        assert!(
+            written < 100,
+            "a tracked-only snapshot must not write the untracked set into the object database - \
+             it wrote {written} new loose objects for {} untracked files",
+            MAX_UNTRACKED_SNAPSHOT_FILES + 10
+        );
+
+        // And the baseline is still genuinely usable for what it does cover.
+        let paths = changed_paths_against_tree(repo.path(), &snapshot.tree_id, snapshot.untracked)
+            .expect("changed_paths");
+        assert!(
+            paths.is_empty(),
+            "nothing tracked has changed since the snapshot, and the untracked set must not leak \
+             in as spurious additions either - got {paths:?}"
+        );
+
+        // A real edit to a *tracked* file is still caught, which is what makes the fallback worth
+        // having rather than refusing outright.
+        fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
+        let paths = changed_paths_against_tree(repo.path(), &snapshot.tree_id, snapshot.untracked)
+            .expect("changed_paths");
+        assert_eq!(paths, vec![PathBuf::from("file.txt")]);
+    }
+
+    /// The cap must not fire for an ordinary worktree - a fallback that triggered constantly
+    /// would quietly degrade every review.
+    #[test]
+    fn an_ordinary_untracked_set_is_still_captured_in_full() {
+        let repo = init_repo();
+        fs::write(repo.path().join("scratch.txt"), "a normal untracked file\n").expect("write");
+
+        let snapshot = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        assert_eq!(snapshot.untracked, UntrackedCoverage::Included);
+        assert_eq!(snapshot.untracked_files, 1);
+    }
+
+    /// Gitignored content must not count toward the cap at all - `git add -A` would never have
+    /// staged it, so counting it would push ordinary worktrees onto the fallback for content git
+    /// was never going to touch.
+    #[test]
+    fn gitignored_content_does_not_count_toward_the_untracked_cap() {
+        let repo = init_repo();
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").expect("write");
+        let ignored = repo.path().join("ignored");
+        std::fs::create_dir_all(&ignored).expect("mkdir");
+        // A handful is enough: what this pins is that ignored files are counted as *zero*, not
+        // that some threshold isn't reached - so it deliberately doesn't recreate the sibling
+        // test's several-thousand-file fixture, which is real filesystem work this crate's own
+        // parallel test suite has to share a machine with.
+        for index in 0..25 {
+            fs::write(ignored.join(format!("{index}.o")), b"x").expect("write");
+        }
+
+        let snapshot = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        assert_eq!(
+            snapshot.untracked,
+            UntrackedCoverage::Included,
+            "ignored files must never count toward the cap"
+        );
+        assert_eq!(
+            snapshot.untracked_files, 1,
+            "only the real untracked, non-ignored file (.gitignore itself) should be counted"
+        );
     }
 
     /// A real, anchored baseline must survive an aggressive `git gc` - the whole reason
@@ -540,7 +866,7 @@ mod tests {
     fn an_anchored_baseline_survives_a_real_aggressive_gc() {
         let repo = init_repo();
         fs::write(repo.path().join("only_here.txt"), "unreferenced content\n").expect("write");
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
 
         let ref_name = baseline_ref_name("worktree-a|Claude|1700000000");
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
@@ -559,12 +885,12 @@ mod tests {
     #[test]
     fn anchoring_again_moves_an_existing_baseline_ref_rather_than_failing() {
         let repo = init_repo();
-        let first = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let first = snapshot_tree(repo.path());
         let ref_name = baseline_ref_name("key");
         anchor_tree(repo.path(), &ref_name, &first).expect("anchor");
 
         fs::write(repo.path().join("file.txt"), "hello\nmarked reviewed\n").expect("write");
-        let second = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let second = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &second).expect("re-anchor");
 
         assert_eq!(
@@ -577,7 +903,7 @@ mod tests {
     #[test]
     fn deleting_a_baseline_ref_removes_it_and_is_idempotent() {
         let repo = init_repo();
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
         let ref_name = baseline_ref_name("key");
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
 
@@ -632,6 +958,58 @@ mod tests {
         }
     }
 
+    /// **The regression test for the `NAME_MAX` bug.** A realistically deep worktree path used to
+    /// hex-encode into a ref filename longer than the 255-byte limit, so `git update-ref` failed
+    /// with "File name too long" and the review surface was silently, permanently disabled.
+    ///
+    /// Drives a real `anchor_tree` against a real repository with a long key, rather than only
+    /// asserting a length - the failure was in git, not in this crate's arithmetic.
+    #[test]
+    fn a_long_worktree_path_still_produces_a_usable_ref_name() {
+        let repo = init_repo();
+        // A perfectly ordinary deep layout, well past the ~107-byte ceiling raw hex imposed.
+        let long_key = format!(
+            "/home/developer/Developer/some-organisation/{}/.worktrees/{}|Claude|1700000000",
+            "a-reasonably-long-repository-name", "feature/a-descriptive-branch-name-here"
+        );
+        assert!(
+            long_key.len() > 107,
+            "the fixture must exceed the old ceiling, or it proves nothing"
+        );
+
+        let ref_name = baseline_ref_name(&long_key);
+        assert_eq!(
+            ref_name.len(),
+            REVIEW_REF_PREFIX.len() + 64,
+            "a digest-based ref name is a fixed length regardless of key length"
+        );
+        // The real limit is on the final path *component*, which is what git turns into a file.
+        let component = ref_name.rsplit('/').next().expect("a final ref component");
+        assert!(
+            component.len() + ".lock".len() <= 255,
+            "the ref's own filename, plus git's `.lock` suffix, must fit in NAME_MAX"
+        );
+
+        // And it really works against real git, which is where the original bug actually showed.
+        let tree = snapshot_tree(repo.path());
+        anchor_tree(repo.path(), &ref_name, &tree).expect("a long key must still anchor");
+        assert_eq!(
+            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
+            tree
+        );
+        delete_ref(repo.path(), &ref_name).expect("and must still be deletable");
+    }
+
+    /// Key length must not affect ref length at all - the property that makes the `NAME_MAX`
+    /// failure structurally impossible rather than merely unlikely.
+    #[test]
+    fn ref_name_length_is_independent_of_key_length() {
+        let short = baseline_ref_name("a");
+        let long = baseline_ref_name(&"x".repeat(4096));
+        assert_eq!(short.len(), long.len());
+        assert_ne!(short, long, "but distinct keys still produce distinct refs");
+    }
+
     /// A real `git check-ref-format` run over a key stuffed with every character class git's own
     /// ref rules reject - the encoding must produce something git genuinely accepts.
     #[test]
@@ -652,7 +1030,7 @@ mod tests {
         );
 
         // And it really works as a ref, end to end.
-        let tree = snapshot_worktree_tree(repo.path()).expect("snapshot");
+        let tree = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
         assert_eq!(
             git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
@@ -663,9 +1041,21 @@ mod tests {
     #[test]
     fn a_tree_id_that_is_not_a_hex_object_id_is_refused_before_git_ever_runs() {
         let repo = init_repo();
-        assert!(diff_against_tree(repo.path(), "--upload-pack=evil", "x".to_string()).is_err());
-        assert!(changed_paths_against_tree(repo.path(), "").is_err());
-        assert!(diff_against_tree(repo.path(), "HEAD", "x".to_string()).is_err());
+        assert!(diff_against_tree(
+            repo.path(),
+            "--upload-pack=evil",
+            UntrackedCoverage::Included,
+            "x".to_string()
+        )
+        .is_err());
+        assert!(changed_paths_against_tree(repo.path(), "", UntrackedCoverage::Included).is_err());
+        assert!(diff_against_tree(
+            repo.path(),
+            "HEAD",
+            UntrackedCoverage::Included,
+            "x".to_string()
+        )
+        .is_err());
     }
 
     /// A snapshot really is per-worktree: two worktrees of the same repository snapshot their own
@@ -687,9 +1077,10 @@ mod tests {
 
         fs::write(other.join("feature_only.txt"), "in the linked worktree\n").expect("write");
 
-        let main_tree = snapshot_worktree_tree(repo.path()).expect("snapshot main");
+        let main_tree = snapshot_tree(repo.path());
         let linked_paths =
-            changed_paths_against_tree(&other, &main_tree).expect("changed_paths in linked");
+            changed_paths_against_tree(&other, &main_tree, UntrackedCoverage::Included)
+                .expect("changed_paths in linked");
         assert_eq!(
             linked_paths,
             vec![PathBuf::from("feature_only.txt")],

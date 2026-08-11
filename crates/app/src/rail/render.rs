@@ -298,9 +298,9 @@ impl AdeApp {
                             Vec<PathBuf>,
                         )> = review_targets
                             .into_iter()
-                            .filter_map(|(id, worktree, tree_id)| {
+                            .filter_map(|(id, worktree, tree_id, untracked)| {
                                 let paths = wt_core::review::changed_paths_against_tree(
-                                    &worktree, &tree_id,
+                                    &worktree, &tree_id, untracked,
                                 )
                                 .ok()?;
                                 Some((id, tree_id, paths))

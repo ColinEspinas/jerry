@@ -64,6 +64,12 @@ impl AdeApp {
         if self.palette_open {
             self.close_palette(window, cx);
         }
+        // GitHub issue #225: the review tab is the other centre-pane occupant, and it needs the
+        // same real teardown here that this function's own `leave_graph_tab` counterparts perform
+        // in the opposite direction - see `crate::review::render::AdeApp::leave_review_tab`.
+        self.leave_review_tab(window, cx);
+        self.review_tab_open = None;
+
         self.graph_tab_open = true;
         let was_active = self.graph_tab_active;
         self.graph_tab_active = true;
