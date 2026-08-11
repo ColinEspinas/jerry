@@ -625,6 +625,50 @@ pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
     }
 }
 
+/// The environment variable GPUI's X11 client reads a forced scale factor from - the literal
+/// name from its own `get_scale_factor`
+/// (`gpui_linux/src/linux/x11/client.rs`, this workspace's pinned `zed` rev). Named here rather
+/// than spelled out at the one call site in `crate::main` so the string and the code that
+/// explains it stay together.
+pub const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
+
+/// GitHub issue #216. Decides what, if anything, `crate::main` should put in
+/// [`GPUI_X11_SCALE_FACTOR_ENV`] before GPUI starts - the whole decision, factored out of `main`
+/// so it can be tested without a process to mutate. `existing_env` is whatever that variable
+/// already holds in the real process environment (`std::env::var` at the call site).
+///
+/// Why an environment variable at all: GPUI resolves the X11 scale factor exactly once, while its
+/// X11 client initialises inside `gpui_platform::application()`, and this variable is the only
+/// override it offers - there is no runtime API, and `gpui` is a pinned git dependency with no
+/// `[patch]` section, so it cannot be changed from here. That is also why the Appearance page's
+/// hint says a restart is required.
+///
+/// Two decisions worth stating, both visible in the tests below:
+///
+/// - An override already present in the environment wins. A user who exported
+///   `GPUI_X11_SCALE_FACTOR` in their shell profile or launcher meant it for this launch
+///   specifically; silently overwriting it from a persisted setting would make that export
+///   look broken. An empty or whitespace-only value is not an override - GPUI itself treats the
+///   empty string as "not set" (`DpiMode::NotSet`) - so it is passed over.
+/// - The value is re-clamped through
+///   [`settings::store::sanitize_display_scale_override`] rather than trusted. Loading normally
+///   sanitizes it already, but GPUI *panics* (not falls back) on a non-positive or non-normal
+///   float, so the last step before handing it over does not assume anything about how the
+///   `Settings` value was obtained.
+pub fn x11_scale_factor_env_value(
+    settings: &settings::store::Settings,
+    existing_env: Option<&str>,
+) -> Option<String> {
+    if existing_env.is_some_and(|value| !value.trim().is_empty()) {
+        return None;
+    }
+    settings
+        .appearance
+        .display_scale_override
+        .map(settings::store::sanitize_display_scale_override)
+        .map(|factor| factor.to_string())
+}
+
 /// Opens the ADE window against `repo_path` and runs the GPUI event loop until the window is
 /// closed. Blocks the calling thread for the application's lifetime, mirroring
 /// `gpui::Application::run`'s own contract (`vendor/zed/crates/gpui/examples/hello_world.rs`).
@@ -679,6 +723,91 @@ pub fn run(repo_path: Option<PathBuf>) {
                 }
             }
         });
+}
+
+/// GitHub issue #216's real decision, tested without a process environment to mutate - see
+/// [`x11_scale_factor_env_value`]'s own docs.
+///
+/// What these tests deliberately do **not** claim: that GPUI then renders at the forced scale.
+/// That happens inside a pinned dependency, at X11-client init, against a real display - there is
+/// no headless way to assert it from here. What is proven is the whole of this app's side of the
+/// contract: which string, if any, reaches the variable GPUI reads.
+#[cfg(test)]
+mod x11_scale_factor_env_tests {
+    use super::x11_scale_factor_env_value;
+    use crate::settings::store::{
+        Settings, DISPLAY_SCALE_OVERRIDE_MAX, DISPLAY_SCALE_OVERRIDE_MIN,
+    };
+
+    #[test]
+    fn no_override_configured_leaves_the_environment_untouched() {
+        assert_eq!(x11_scale_factor_env_value(&Settings::default(), None), None);
+    }
+
+    #[test]
+    fn a_configured_override_becomes_the_bare_float_gpui_parses() {
+        let mut settings = Settings::default();
+
+        settings.appearance.display_scale_override = Some(1.25);
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, None).as_deref(),
+            Some("1.25")
+        );
+
+        // A whole number must not pick up any decoration GPUI's `var.parse::<f32>()` would
+        // choke on (no `%`, no `x`) - "1" is what the reporter's own case needs to produce.
+        settings.appearance.display_scale_override = Some(1.0);
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, None).as_deref(),
+            Some("1")
+        );
+    }
+
+    /// GPUI panics rather than falling back on a value outside its `valid_scale_factor`, so this
+    /// last step re-clamps instead of trusting that the `Settings` came from a sanitizing load.
+    #[test]
+    fn an_unsanitized_settings_value_is_still_clamped_before_it_reaches_gpui() {
+        let mut settings = Settings::default();
+
+        settings.appearance.display_scale_override = Some(90.0);
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, None).as_deref(),
+            Some(DISPLAY_SCALE_OVERRIDE_MAX.to_string().as_str())
+        );
+
+        settings.appearance.display_scale_override = Some(0.0);
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, None).as_deref(),
+            Some(DISPLAY_SCALE_OVERRIDE_MIN.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn a_real_override_already_in_the_environment_is_never_overwritten() {
+        let mut settings = Settings::default();
+        settings.appearance.display_scale_override = Some(1.25);
+
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, Some("2")),
+            None,
+            "an exported GPUI_X11_SCALE_FACTOR is this launch's explicit choice and wins"
+        );
+        assert_eq!(
+            x11_scale_factor_env_value(&settings, Some("randr")),
+            None,
+            "including GPUI's own literal `randr` mode, which is not a number"
+        );
+
+        // GPUI itself reads an empty value as `DpiMode::NotSet`, so neither of these is a real
+        // override to defer to.
+        for empty in ["", "   "] {
+            assert_eq!(
+                x11_scale_factor_env_value(&settings, Some(empty)).as_deref(),
+                Some("1.25"),
+                "an empty GPUI_X11_SCALE_FACTOR={empty:?} is not an override"
+            );
+        }
+    }
 }
 
 /// GitHub issue #17's scoping matrix, proven as predicate logic against every real key-context
