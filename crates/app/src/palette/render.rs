@@ -420,11 +420,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         match command {
-            palette::PaletteCommand::NewShell => self.new_agent(AgentKind::Shell, window, cx),
+            palette::PaletteCommand::NewShell => self.new_agent(ProcessKind::Shell, window, cx),
             palette::PaletteCommand::NewClaudeAgent => {
-                self.new_agent(AgentKind::Claude, window, cx)
+                self.new_agent(ProcessKind::claude(), window, cx)
             }
-            palette::PaletteCommand::NewCodexAgent => self.new_agent(AgentKind::Codex, window, cx),
+            palette::PaletteCommand::NewCodexAgent => {
+                self.new_agent(ProcessKind::codex(), window, cx)
+            }
             palette::PaletteCommand::ToggleFilesChanges => {
                 // Any palette gesture must disarm a pending prune confirmation (see
                 // `Self::open_palette`'s docs); the other branches already do this via the
@@ -1028,7 +1030,7 @@ impl AdeApp {
         let chip = match &entry.target {
             palette::EntryTarget::Command(_) => render_palette_command_chip().into_any_element(),
             palette::EntryTarget::Agent(_) => {
-                let kind = entry.agent_kind.unwrap_or(AgentKind::Shell);
+                let kind = entry.agent_kind.unwrap_or(ProcessKind::Shell);
                 render_palette_agent_chip(kind).into_any_element()
             }
             palette::EntryTarget::File(path) => {
@@ -1193,7 +1195,7 @@ pub(in crate::palette) fn render_palette_command_chip() -> impl IntoElement {
 /// The palette row's 15×15 agent chip - the same agent badge/tint
 /// (`crate::work_surface::state::agent_tint`/`agent_initial`) the rail's agent rows use, reused
 /// verbatim rather than a second, independently-drifting colour mapping.
-pub(in crate::palette) fn render_palette_agent_chip(kind: AgentKind) -> impl IntoElement {
+pub(in crate::palette) fn render_palette_agent_chip(kind: ProcessKind) -> impl IntoElement {
     let (fg, bg) = work_surface::agent_tint(kind);
     div()
         .flex_none()

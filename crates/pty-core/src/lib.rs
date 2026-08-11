@@ -330,7 +330,7 @@ impl SpawnOptions {
 ///   uid/gid. Judged an acceptable simplification for a status dot over adding a dependency.
 /// - This never checks a cwd-relative candidate (`portable-pty`'s `is_cwd_relative_path`
 ///   branch, e.g. `./claude`) - every caller here passes a bare name
-///   (`SessionKind::agent_binary_name` in the `app` crate only returns plain names like
+///   (`AgentKind::binary_name` in the `app` crate only returns plain names like
 ///   `"claude"`/`"codex"`), so that branch is dead code for this crate's actual callers.
 ///
 /// Because this is a second, independent implementation of the same algorithm rather than a

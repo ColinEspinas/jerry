@@ -1014,7 +1014,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1093,7 +1093,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1118,7 +1118,7 @@ mod merge_regression_tests {
 
         let second_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1178,7 +1178,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1290,7 +1290,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1394,7 +1394,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1462,7 +1462,7 @@ mod merge_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1548,7 +1548,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1667,7 +1667,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1800,7 +1800,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1905,7 +1905,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2005,7 +2005,7 @@ mod merge_regression_tests {
         let notes_path = repo.path().join("notes.txt");
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2170,7 +2170,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2224,7 +2224,7 @@ mod merge_regression_tests {
         );
         let second_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2333,7 +2333,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2430,7 +2430,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -2546,7 +2546,7 @@ mod merge_regression_tests {
         bind_real_keys(cx);
         let feature_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),

@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use crate::rail::status::Status;
-use crate::work_surface::agents::{AgentId, AgentKind};
+use crate::work_surface::agents::{AgentId, ProcessKind};
 
 /// Cap on how many rows a single group ([`PaletteGroup`]) contributes, independent of how many
 /// candidates matched - a palette meant to answer "which of these am I looking for" at a glance
@@ -109,7 +109,7 @@ pub enum PaletteStep {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentCandidate {
     pub id: AgentId,
-    pub kind: AgentKind,
+    pub kind: ProcessKind,
     pub title: String,
     pub branch: Option<String>,
     pub status: Status,
@@ -120,11 +120,11 @@ pub struct AgentCandidate {
 /// never a stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteCommand {
-    /// `crate::root::AdeApp::new_agent(AgentKind::Shell, ..)`, same as the rail's `+`/⌘N.
+    /// `crate::root::AdeApp::new_agent(ProcessKind::Shell, ..)`, same as the rail's `+`/⌘N.
     NewShell,
-    /// `crate::root::AdeApp::new_agent(AgentKind::Claude, ..)`.
+    /// `crate::root::AdeApp::new_agent(ProcessKind::claude(), ..)`.
     NewClaudeAgent,
-    /// `crate::root::AdeApp::new_agent(AgentKind::Codex, ..)`.
+    /// `crate::root::AdeApp::new_agent(ProcessKind::codex(), ..)`.
     NewCodexAgent,
     /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files | Changes` control.
     ToggleFilesChanges,
@@ -390,7 +390,7 @@ pub struct PaletteEntry {
     /// Only set for an [`EntryTarget::File`] row that is an add/delete in the loaded diff.
     pub file_change: Option<FileChangeKind>,
     /// Only set for an [`EntryTarget::Agent`] row - which agent badge/tint to draw.
-    pub agent_kind: Option<AgentKind>,
+    pub agent_kind: Option<ProcessKind>,
     pub target: EntryTarget,
 }
 
@@ -806,7 +806,7 @@ mod tests {
     fn agent(id: AgentId, title: &str, branch: Option<&str>, status: Status) -> AgentCandidate {
         AgentCandidate {
             id,
-            kind: AgentKind::Claude,
+            kind: ProcessKind::claude(),
             title: title.to_string(),
             branch: branch.map(str::to_string),
             status,

@@ -504,10 +504,11 @@ impl AdeApp {
     /// swap to "confirm discard?" for a real second click); every other row closes the menu on
     /// click, matching the `+` menu's own convention.
     fn agent_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let resolved_kind = self.resolved_new_agent_kind();
+        let resolved_agent = self.resolved_new_agent_kind();
+        let resolved_kind = ProcessKind::from(resolved_agent);
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
         let agent_initial = work_surface::agent_initial(resolved_kind);
-        let agent_label = resolved_kind.label();
+        let agent_label = resolved_agent.label();
         // Scoped to the *currently selected worktree*'s own agents, matching
         // `AdeApp::select_relative_agent`'s own real cycling scope (see that method's docs) -
         // otherwise this row could show "enabled" while the real cycle it drives is a genuine
@@ -1292,7 +1293,7 @@ mod title_menu_tests {
         });
         let id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1393,7 +1394,7 @@ mod title_menu_tests {
         });
         let id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1525,7 +1526,7 @@ mod title_menu_tests {
         // more real agents there so there are three to cycle through.
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1533,7 +1534,7 @@ mod title_menu_tests {
                 cx,
             );
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
@@ -1545,7 +1546,7 @@ mod title_menu_tests {
         // selected worktree rather than this flat list.
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
-                AgentKind::Shell,
+                ProcessKind::Shell,
                 other_wt.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),

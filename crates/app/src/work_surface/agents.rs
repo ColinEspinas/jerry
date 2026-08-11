@@ -24,12 +24,18 @@ use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, 
 use crate::root::AdeApp;
 use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
 
-/// What kind of process an agent runs. Purely descriptive - drives the tab label and which
-/// "New ... Agent" button created it; `TerminalPane` itself has no branching for
-/// "shell" vs. "agent CLI".
+/// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
+/// also covers a plain interactive terminal.
+///
+/// This type existing *without* a `Shell` variant is the point: anything that only makes sense
+/// for a real agent (the Settings › Agents "installed on `$PATH`?" card, the `$PATH` name to
+/// search for, which tint/initial an agent badge wears) can take an `AgentKind` and be
+/// structurally impossible to call with a shell, rather than having to remember a runtime
+/// "is this Shell?" check it could silently forget - which is exactly the bug class this shape
+/// replaced (`crate::rail::status::derive_status`'s [`crate::rail::status::Status::Review`] arm
+/// genuinely forgot it, back when one flat enum held all three cases as equal peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
-    Shell,
     /// The `claude` CLI (Claude Code), spawned with no arguments in the chosen worktree.
     /// Resolved via `PATH`; if not installed, spawning fails and the pane shows
     /// `TerminalPane::spawn_error`.
@@ -41,51 +47,92 @@ pub enum AgentKind {
 impl AgentKind {
     pub fn label(self) -> &'static str {
         match self {
-            AgentKind::Shell => "Shell",
             AgentKind::Claude => "Claude",
             AgentKind::Codex => "Codex",
         }
     }
 
-    /// `shell_override` is the user's configured shell
-    /// (`crate::settings::store::TerminalSettings::shell_override`, GitHub issue #213) and only
-    /// reaches [`AgentKind::Shell`]: an agent CLI spawns its own fixed binary directly, never
-    /// through a shell, so which shell the user prefers genuinely cannot affect it.
-    fn spec(self, cwd: PathBuf, shell_override: Option<&str>) -> TerminalSpec {
-        // Reads through `agent_binary_name` rather than matching `Claude`/`Codex` again here,
-        // so it stays the single source of truth for "what binary does this kind spawn".
-        match self.agent_binary_name() {
-            Some(binary) => TerminalSpec::command(binary, Vec::new(), cwd),
-            None => TerminalSpec::shell(cwd, shell_override),
-        }
-    }
-
-    /// The literal command name this kind spawns as - `None` for [`AgentKind::Shell`],
-    /// which resolves the configured shell (or `$SHELL`) rather than a fixed binary name.
+    /// The literal command name this agent's CLI spawns as. Infallible - there is no
+    /// "this kind has no fixed binary" case to model, precisely because an `AgentKind` is never
+    /// a shell (before the shell/agent split this was an `Option<&'static str>` every caller had
+    /// to unwrap or `filter_map` away).
     ///
     /// Public so `crate::settings::state`'s Agents page can look up the same `$PATH` name this
-    /// method hands `TerminalSpec::command` at spawn time, instead of a second hardcoded
-    /// list that could drift from what's actually spawned.
-    pub fn agent_binary_name(self) -> Option<&'static str> {
+    /// eventually hands `TerminalSpec::command` at spawn time (see [`ProcessKind::spec`]),
+    /// instead of a second hardcoded list that could drift from what's actually spawned.
+    pub fn binary_name(self) -> &'static str {
         match self {
-            AgentKind::Shell => None,
-            AgentKind::Claude => Some("claude"),
-            AgentKind::Codex => Some("codex"),
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
+}
+
+/// What's actually running in an agent slot/tab: a bare interactive terminal, or a real agent
+/// session. Purely descriptive - drives the tab label and which "New ..." button created it;
+/// `TerminalPane` itself has no branching for "shell" vs. "agent CLI", and the PTY/tab/spawn/
+/// close/focus machinery below is deliberately identical for both.
+///
+/// The shell/agent split is a *type-level* distinction, not a convention: a [`Self::Shell`] is a
+/// bare terminal with no turns and nothing to review, so every `match` on this enum is forced by
+/// the compiler to say what it does about that case. Cases that only ever cared about "is this a
+/// shell or not" collapse to two arms (`Shell` / `Agent(_)`); the rarer cases that genuinely
+/// differ per CLI destructure the inner [`AgentKind`]. And code that can only ever mean a real
+/// agent doesn't take this type at all - it takes [`AgentKind`], which has no shell to handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessKind {
+    Shell,
+    Agent(AgentKind),
+}
+
+impl ProcessKind {
+    /// Construction-only shorthand for `ProcessKind::Agent(AgentKind::Claude)`. Deliberately
+    /// *not* usable to dodge exhaustiveness: it's a constructor, so a `match` still has to name
+    /// the real variants and still breaks if a fourth distinguishing case is ever added.
+    pub const fn claude() -> Self {
+        ProcessKind::Agent(AgentKind::Claude)
+    }
+
+    /// Construction-only shorthand for `ProcessKind::Agent(AgentKind::Codex)` - see
+    /// [`Self::claude`].
+    pub const fn codex() -> Self {
+        ProcessKind::Agent(AgentKind::Codex)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProcessKind::Shell => "Shell",
+            ProcessKind::Agent(agent) => agent.label(),
         }
     }
 
-    /// Whether this kind is a real agent session (has turns, can be asked something, can
-    /// finish a unit of work worth reviewing) as opposed to [`AgentKind::Shell`], which is just
-    /// an interactive terminal that happens to live in the same rail/tab UI. The single place
-    /// that distinction lives - `crate::rail::status::derive_status` reads it instead of
-    /// re-deriving "is this Shell or not" per status, and any future per-session machinery
-    /// (structured hook/ACP signal, review-eligibility) should gate on this rather than adding
-    /// another ad-hoc kind match.
-    pub fn is_agent_session(self) -> bool {
+    /// `shell_override` is the user's configured shell
+    /// (`crate::settings::store::TerminalSettings::shell_override`, GitHub issue #213) and only
+    /// reaches [`ProcessKind::Shell`]: an agent CLI spawns its own fixed binary directly, never
+    /// through a shell, so which shell the user prefers genuinely cannot affect it.
+    fn spec(self, cwd: PathBuf, shell_override: Option<&str>) -> TerminalSpec {
         match self {
-            AgentKind::Shell => false,
-            AgentKind::Claude | AgentKind::Codex => true,
+            ProcessKind::Shell => TerminalSpec::shell(cwd, shell_override),
+            ProcessKind::Agent(agent) => {
+                TerminalSpec::command(agent.binary_name(), Vec::new(), cwd)
+            }
         }
+    }
+
+    /// Whether this slot holds a real agent session ([`ProcessKind::Agent`]) as opposed to
+    /// [`ProcessKind::Shell`], which is just an interactive terminal that happens to live in the
+    /// same rail/tab UI. The boolean form of that distinction, for filter/predicate call sites
+    /// that don't need the inner [`AgentKind`]; anything that *does* need it should
+    /// `if let ProcessKind::Agent(agent) = kind` (or match) rather than calling this and then
+    /// re-deriving the CLI.
+    pub fn is_agent_session(self) -> bool {
+        matches!(self, ProcessKind::Agent(_))
+    }
+}
+
+impl From<AgentKind> for ProcessKind {
+    fn from(agent: AgentKind) -> Self {
+        ProcessKind::Agent(agent)
     }
 }
 
@@ -96,7 +143,7 @@ pub type AgentId = u64;
 
 pub struct Agent {
     pub id: AgentId,
-    pub kind: AgentKind,
+    pub kind: ProcessKind,
     /// The worktree (or repo root) this agent's process was started in. Kept for the tab
     /// label/title; `TerminalPane` doesn't expose its own `cwd` back out.
     pub cwd: PathBuf,
@@ -180,11 +227,11 @@ impl Agents {
     /// threading pattern, for the same reason): a freshly spawned pane never starts out
     /// mismatched from what Settings shows. `shell_override` is GitHub issue #213's configured
     /// shell (`crate::settings::store::TerminalSettings::shell_override`) - `None` means "the
-    /// real OS default", and it only affects [`AgentKind::Shell`] tabs (see
-    /// [`AgentKind::spec`]).
+    /// real OS default", and it only affects [`ProcessKind::Shell`] tabs (see
+    /// [`ProcessKind::spec`]).
     pub fn spawn(
         &mut self,
-        kind: AgentKind,
+        kind: ProcessKind,
         cwd: PathBuf,
         terminal_font_size_px: f32,
         shell_override: Option<&str>,
@@ -395,5 +442,87 @@ mod tests {
         let agents = Agents::new();
         assert_eq!(agents.active_id(), None);
         assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn every_agent_kind_is_a_session_and_a_shell_never_is() {
+        // The whole point of the two-type split: `is_agent_session` can only ever be `false`
+        // for the one variant that isn't an agent, and there is no `AgentKind` value at all
+        // that could make it `false` - `ProcessKind::from` can't produce a shell.
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            assert!(
+                ProcessKind::from(agent).is_agent_session(),
+                "{agent:?} wrapped as a ProcessKind must be a real agent session"
+            );
+        }
+        assert!(
+            !ProcessKind::Shell.is_agent_session(),
+            "a bare shell has no turns and nothing to review - it is never a session"
+        );
+    }
+
+    #[test]
+    fn the_construction_shorthands_are_exactly_their_long_forms() {
+        // `claude()`/`codex()` exist only to keep call sites short; if they ever drifted from
+        // the explicit construction, spawn sites would quietly disagree with match arms.
+        assert_eq!(ProcessKind::claude(), ProcessKind::Agent(AgentKind::Claude));
+        assert_eq!(ProcessKind::codex(), ProcessKind::Agent(AgentKind::Codex));
+        assert_eq!(ProcessKind::claude(), AgentKind::Claude.into());
+        assert_eq!(ProcessKind::codex(), AgentKind::Codex.into());
+    }
+
+    #[test]
+    fn a_process_kinds_label_delegates_to_its_agents_own_label() {
+        assert_eq!(ProcessKind::Shell.label(), "Shell");
+        assert_eq!(ProcessKind::claude().label(), AgentKind::Claude.label());
+        assert_eq!(ProcessKind::codex().label(), AgentKind::Codex.label());
+        assert_eq!(AgentKind::Claude.label(), "Claude");
+        assert_eq!(AgentKind::Codex.label(), "Codex");
+    }
+
+    #[test]
+    fn each_agent_kind_spawns_its_own_distinct_path_binary() {
+        assert_eq!(AgentKind::Claude.binary_name(), "claude");
+        assert_eq!(AgentKind::Codex.binary_name(), "codex");
+        assert_ne!(
+            AgentKind::Claude.binary_name(),
+            AgentKind::Codex.binary_name(),
+            "a copy-pasted arm sharing one binary name would spawn the wrong CLI silently"
+        );
+    }
+
+    /// `spec` is private, but the fact it reads through `AgentKind::binary_name` (rather than a
+    /// second hardcoded list) is what keeps the Settings › Agents `$PATH` search honest: the name
+    /// that card searches for must be the name actually spawned. This asserts the shared source,
+    /// which is the part that could drift.
+    #[test]
+    fn the_settings_path_search_and_the_real_spawn_read_the_same_binary_name() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let spec = ProcessKind::Agent(agent).spec(PathBuf::from("/tmp"), None);
+            assert_eq!(
+                spec.program,
+                PathBuf::from(agent.binary_name()),
+                "{agent:?} must spawn exactly the binary the Agents page searches $PATH for"
+            );
+            assert!(
+                spec.args.is_empty(),
+                "{agent:?} is spawned bare, with no arguments"
+            );
+        }
+        // `shell_override` reaches only the shell arm - an agent CLI is spawned directly, never
+        // through a shell, so the user's preferred shell genuinely cannot affect it.
+        let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), Some("/bin/dash"));
+        assert_eq!(
+            shell.program,
+            PathBuf::from("/bin/dash"),
+            "a shell resolves the user's configured shell, not a fixed agent binary"
+        );
+        let agent_ignoring_override =
+            ProcessKind::claude().spec(PathBuf::from("/tmp"), Some("/bin/dash"));
+        assert_eq!(
+            agent_ignoring_override.program,
+            PathBuf::from("claude"),
+            "a configured shell must not be substituted for an agent CLI's own binary"
+        );
     }
 }

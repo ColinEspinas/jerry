@@ -3,7 +3,7 @@
 //! Split the way every feature folder in this crate is split - pure, GPUI-window-free
 //! logic separate from the `gpui::Div`-building code that draws it:
 //!
-//! - [`state`] - the pure mapping from already-known facts (an `AgentKind`, a `Status`, a
+//! - [`state`] - the pure mapping from already-known facts (a `ProcessKind`, a `Status`, a
 //!   bool) onto which colours/labels/actions a Zone 2 element shows. No `gpui::Window`.
 //! - [`agents`] - agent/tab bookkeeping: which agents are open, which worktree each
 //!   belongs to, and which one is active for the centre pane.
@@ -24,7 +24,7 @@ use crate::root::*;
 use crate::settings::state as settings;
 use crate::sidebar::file_tree::{self};
 use crate::theme;
-use crate::work_surface::agents::{Agent, AgentId, AgentKind};
+use crate::work_surface::agents::{Agent, AgentId, AgentKind, ProcessKind};
 use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 use gpui::{div, font, prelude::*, px, App, ClickEvent, Context, Window};
