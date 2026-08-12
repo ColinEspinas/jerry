@@ -229,7 +229,28 @@ impl AdeApp {
     /// by the same periodic task as [`Self::diff_cache`]), defaulting to "unknown yet"
     /// (`clean: None, merge: None`) for one the background snapshot hasn't reached yet.
     pub(in crate::rail) fn build_worktree_entries(&self) -> Vec<WorktreeEntry> {
-        self.worktrees
+        self.build_worktree_entries_from(&self.worktrees)
+    }
+
+    /// [`Self::build_worktree_entries`]'s own logic, generalized to any [`WorktreeItem`] list -
+    /// [`Self::build_repo_groups`]'s non-focused-repo rows reuse this against each repo's own
+    /// [`crate::rail::repo::Repo::worktrees`] rather than [`Self::worktrees`].
+    ///
+    /// [`Self::worktree_notes`] is only ever populated for the *focused* repo's own paths
+    /// (`Self::start_status_polling` computes it from `Self::worktrees`, not
+    /// `Self::repos`) - a real, deliberate scope decision, not an oversight: a clean/merged note
+    /// costs a real `git status` walk plus a merge-base computation *per worktree*, and running
+    /// that for every worktree of every added repo on every status-poll tick (see
+    /// [`crate::root::STATUS_POLL_INTERVAL`]) would multiply this app's real background `git`
+    /// subprocess cost by however many repos are added, for status text that's only ever shown on
+    /// an agent-less row in the first place. A non-focused repo's rows fall through to the
+    /// identical "unknown yet" default this function already gives a *focused*-repo worktree the
+    /// status snapshot hasn't reached yet - never a fabricated clean/merged guess.
+    pub(in crate::rail) fn build_worktree_entries_from(
+        &self,
+        items: &[WorktreeItem],
+    ) -> Vec<WorktreeEntry> {
+        items
             .iter()
             .map(|item| {
                 if let Some(error) = &item.error {
@@ -801,13 +822,18 @@ impl AdeApp {
     /// something in it wants a human" - typing into the filter box is the same promise, just
     /// scrolled-past-in-time rather than in-space).
     ///
-    /// See [`rail::group_worktrees_by_repo`]'s own docs for why every repo but
-    /// [`Self::focused_repo`] still has no live data (`all_rows` empty too) today - that half is
-    /// a real, separate, already-tracked data-model limitation (no per-repo worktree loading
-    /// yet), not something this function papers over. Every non-focused repo gets
-    /// `rows_loaded: false` (see [`rail::RepoWorktrees::rows_loaded`]'s own docs) so the render
-    /// side can tell that real gap apart from a repo that was actually loaded and really has zero
-    /// worktrees, rather than rendering both identically.
+    /// Every repo in [`Self::repos`] gets its own real `all_rows`/`rows` here, not just
+    /// [`Self::focused_repo`] - the focused repo's come from [`Self::build_worktree_rows`] (which
+    /// also folds in every open agent and its GitHub issue #227 history, both still genuinely
+    /// scoped to the focused repo only - see that method's own docs), while every other repo's
+    /// come straight from its own [`crate::rail::repo::Repo::worktrees`] (kept live by
+    /// `crate::root::AdeApp::load_repo_worktrees`/`crate::root::AdeApp::
+    /// start_repo_worktrees_polling`) with no agents folded in, since this app closes every open
+    /// agent on a repo switch (`crate::root::AdeApp::open_repo_in_current_window`'s own docs) -
+    /// by construction, no agent can belong to a repo that isn't focused. [`rail::RepoWorktrees::
+    /// rows_loaded`] mirrors [`crate::rail::repo::Repo::worktrees_loaded`] for a non-focused repo
+    /// (always `true` for the focused one - its own data path is unchanged) so the render side
+    /// can still tell "never fetched yet" apart from "fetched, and really has zero worktrees".
     pub(in crate::rail) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
@@ -821,16 +847,29 @@ impl AdeApp {
             .iter()
             .map(|repo| {
                 let is_focused = Some(repo.id) == self.focused_repo;
+                let (all_rows, rows_loaded) = if is_focused {
+                    (rows.clone(), true)
+                } else {
+                    let entries = self.build_worktree_entries_from(&repo.worktrees);
+                    (
+                        rail::build_worktree_rows(&entries, &[]),
+                        repo.worktrees_loaded,
+                    )
+                };
+                let rows = if is_focused {
+                    filtered.clone()
+                } else {
+                    rail::filter_worktree_rows(&all_rows, self.filter_query.as_str())
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                };
                 RepoWorktrees {
                     repo_id: repo.id,
                     repo_name: repo.name.clone(),
-                    all_rows: if is_focused { rows.clone() } else { Vec::new() },
-                    rows: if is_focused {
-                        filtered.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    rows_loaded: is_focused,
+                    all_rows,
+                    rows,
+                    rows_loaded,
                 }
             })
             .collect();
@@ -897,10 +936,11 @@ impl AdeApp {
     /// click target or the `+`, is affected by an empty vs. filtered-away distinction (see the
     /// inline message below, which does distinguish the two for its own wording).
     ///
-    /// `group.rows_loaded` gates the `N wt` count itself: `false` (every non-focused repo today -
-    /// see [`rail::RepoWorktrees::rows_loaded`]'s docs) renders an honest em dash instead of `0
-    /// wt`, since this repo's real worktree count was never fetched and may well be nonzero - a
-    /// literal `0 wt` would be a false claim about state this app hasn't actually loaded.
+    /// `group.rows_loaded` gates the `N wt` count itself: `false` (a repo whose own first real
+    /// fetch hasn't resolved yet - see [`rail::RepoWorktrees::rows_loaded`]'s docs) renders an
+    /// honest em dash instead of `0 wt`, since this repo's real worktree count was never fetched
+    /// and may well be nonzero - a literal `0 wt` would be a false claim about state this app
+    /// hasn't actually loaded.
     pub(in crate::rail) fn render_repo_group(
         &self,
         group: &RepoGroup,
@@ -980,10 +1020,11 @@ impl AdeApp {
             // dropped from the rail entirely whenever it had no rows to show - see
             // `Self::render_rail_list`'s own updated docs. A real, worded inline message now
             // takes that empty row-list's place instead, distinguishing three real cases: this
-            // repo's data was never loaded (`!group.rows_loaded` - every non-focused repo today),
-            // it genuinely has no open worktrees, or the filter box is hiding them - never
-            // claiming "no worktrees open yet" for a repo whose data this app hasn't actually
-            // fetched, which may well have several worktrees on disk.
+            // repo's own first real fetch hasn't resolved yet (`!group.rows_loaded` - normally
+            // just a brief window right after `Self::add_repo`, not a standing limitation), it
+            // genuinely has no open worktrees, or the filter box is hiding them - never claiming
+            // "no worktrees open yet" for a repo whose data this app hasn't actually fetched,
+            // which may well have several worktrees on disk.
             group_div = group_div.child(
                 div()
                     .px(px(12.0))
@@ -2638,6 +2679,39 @@ mod rail_row_tests {
 mod repo_checkout_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// A minimal, real `git init`-ed repo - mirrors `crate::root::state::
+    /// load_worktrees_integration_tests`'s identical own helper, duplicated locally per this
+    /// crate's own established per-test-module convention rather than shared.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
 
     /// Repo B is added (`Self::add_repo`) but never focused - the exact "known to the rail, zero
     /// open worktrees/agents" state the issue describes: `Self::build_repo_groups` only
@@ -2669,7 +2743,8 @@ mod repo_checkout_tests {
             .expect("repo B's group must render despite having zero rows - GitHub issue #113");
         assert!(
             repo_b_group.rows.is_empty() && repo_b_group.all_rows.is_empty(),
-            "sanity check: repo B genuinely has no live worktree data loaded yet"
+            "sanity check: repo B isn't a real git repository, so its real fetch resolves to a \
+             real (not fabricated) empty list"
         );
         assert_ne!(
             app.read_with(cx, |app, _| app.focused_repo_path()),
@@ -2701,20 +2776,22 @@ mod repo_checkout_tests {
         });
     }
 
-    /// A checker audit of the fix above (GitHub issue #113) found a real "no fake functionality"
-    /// violation: repo B's group renders with empty `rows`/`all_rows` not because it really has
-    /// zero worktrees, but because its data was simply never loaded (single-repo-scoped rail -
-    /// see `rail::group_worktrees_by_repo`'s own docs). Before `RepoGroup::rows_loaded` existed,
-    /// the render side had no way to tell that apart from a real zero-worktree repo, so it showed
-    /// a literal "0 wt" and "no worktrees open yet" for repo B - both false claims about state
-    /// this app hasn't actually fetched. This proves the fix: the focused repo (real data) must
-    /// report `rows_loaded: true`, and every other repo (unfetched) must report `false`.
+    /// A checker audit of the original GitHub issue #113 fix found a real "no fake functionality"
+    /// violation: repo B's group used to render with empty `rows`/`all_rows` not because it
+    /// really had zero worktrees, but because *no repo but the focused one* had its worktree data
+    /// loaded at all - a real, then-standing data-model limitation. `RepoGroup::rows_loaded` was
+    /// added to tell that gap apart from a genuine zero-worktree repo. That data-model limitation
+    /// is exactly what this test now proves is gone: repo B (a real git repo, never focused)
+    /// still reads `rows_loaded: false` for the brief window before its own real background fetch
+    /// resolves (never a premature `true`, and never a fabricated non-empty count in that
+    /// window), then becomes `rows_loaded: true` with its real worktree count once that fetch
+    /// completes - proving the count is real data, not a race with "not loaded yet".
     #[gpui::test]
-    fn build_repo_groups_marks_only_the_focused_repos_data_as_really_loaded(
+    fn build_repo_groups_marks_a_non_focused_repos_data_as_loaded_once_its_real_fetch_resolves(
         cx: &mut TestAppContext,
     ) {
         let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = tempfile::tempdir().expect("tempdir b");
+        let repo_b = init_repo();
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
@@ -2724,7 +2801,31 @@ mod repo_checkout_tests {
                 .expect("sanity check: repo A is focused")
                 .id
         });
-        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+
+        // `add_repo` and `build_repo_groups` run inside the same synchronous `update` call, with
+        // no `run_until_parked` in between - the real background fetch `add_repo` kicks off has
+        // had no chance to run at all yet, so this genuinely observes the pre-fetch state rather
+        // than racing it.
+        let (repo_b_id, groups_before_fetch) = app.update(cx, |app, cx| {
+            let id = app.add_repo(repo_b.path().to_path_buf(), cx);
+            let groups = app.build_repo_groups(cx);
+            (id, groups)
+        });
+
+        let group_b_before = groups_before_fetch
+            .iter()
+            .find(|g| g.repo_id == repo_b_id)
+            .expect("repo B's group must exist immediately, even before its fetch resolves");
+        assert!(
+            !group_b_before.rows_loaded,
+            "repo B's real fetch hasn't resolved yet - rows_loaded must still be false"
+        );
+        assert!(
+            group_b_before.all_rows.is_empty(),
+            "and its rows must genuinely be empty until that fetch resolves, never a fabricated \
+             non-empty guess in the meantime"
+        );
+
         cx.run_until_parked();
 
         let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
@@ -2735,7 +2836,7 @@ mod repo_checkout_tests {
             .expect("repo A's group must exist");
         assert!(
             group_a.rows_loaded,
-            "the focused repo's own data really was loaded - rows_loaded must be true"
+            "the focused repo's own data path is unchanged by this feature - always loaded"
         );
 
         let group_b = groups
@@ -2743,14 +2844,15 @@ mod repo_checkout_tests {
             .find(|g| g.repo_id == repo_b_id)
             .expect("repo B's group must exist");
         assert!(
-            !group_b.rows_loaded,
-            "repo B's data was never fetched (it isn't the focused repo) - rows_loaded must be \
-             false, not indistinguishable from a repo that was loaded and really has zero \
-             worktrees"
+            group_b.rows_loaded,
+            "repo B's real background fetch has resolved by now (`run_until_parked`) - \
+             rows_loaded must become true even though repo B was never focused"
         );
-        assert!(
-            group_b.all_rows.is_empty() && group_b.rows.is_empty(),
-            "sanity check: repo B's rows are empty only because nothing was ever loaded for it"
+        assert_eq!(
+            group_b.all_rows.len(),
+            1,
+            "a real git repo always has at least its own main checkout as a worktree - this \
+             must read as a real 1, never a false 0 masquerading as \"confirmed empty\""
         );
     }
 

@@ -156,6 +156,7 @@ impl AdeApp {
                 path: PathBuf::from(key),
                 name: record.name.clone(),
                 worktrees: Vec::new(),
+                worktrees_loaded: false,
             });
             next_repo_id += 1;
         }
@@ -431,6 +432,8 @@ impl AdeApp {
             _load_diff_task: None,
             _file_load_task: None,
             _status_poll_task: None,
+            _repo_worktrees_tasks: TaskPool::new(),
+            _repo_worktrees_poll_task: None,
             _disk_usage_task: None,
             _prune_task: None,
             _worktree_history_task: None,
@@ -667,6 +670,25 @@ impl AdeApp {
                 window.focus(&this.empty_state_focus_handle, cx);
             }
         }
+        // Every repo restored from `repos.toml` (`loaded_repo_state`, above) besides whichever
+        // one just became focused (already covered by `load_worktrees` in the `Some` branch
+        // above) needs its own real first `Self::load_repo_worktrees` fetch too - unlike a repo
+        // added later via `Self::add_repo` (which triggers this itself), these were pushed
+        // straight into `repos` during construction, before `self` existed to call it against.
+        // Run unconditionally (not only inside the `Some(path)` branch above): a genuinely empty-
+        // focus startup can still have real, previously-added repos sitting in `Self::repos` from
+        // a past session, and they deserve real rail data too, not just the one that happens to
+        // be focused this time.
+        let non_focused_repo_ids: Vec<RepoId> = this
+            .repos
+            .iter()
+            .filter(|repo| Some(repo.id) != this.focused_repo)
+            .map(|repo| repo.id)
+            .collect();
+        for repo_id in non_focused_repo_ids {
+            this.load_repo_worktrees(repo_id, cx);
+        }
+        this.start_repo_worktrees_polling(cx);
         // GitHub issue #87: a real startup check, plus the periodic loop that keeps re-checking
         // for as long as the app runs - see `crate::updater::flow::AdeApp::
         // start_update_check_loop`'s own docs. Unconditional for the same reason the keybindings/
@@ -690,6 +712,10 @@ impl AdeApp {
     /// [`Self::worktree_selection_notice`]. See that function's docs for the full state machine.
     pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
         let repo_path = self.focused_repo_path();
+        // Captured now, not re-read via `this.focused_repo` once the fetch below completes: a
+        // rapid double repo-switch could otherwise land this fetch's *old* result on whatever
+        // repo happens to be focused *later*, rather than the one it was actually a fetch for.
+        let focused_id = self.focused_repo;
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -711,6 +737,19 @@ impl AdeApp {
                     Err(err) => {
                         this.worktrees = Vec::new();
                         this.worktrees_error = Some(err.to_string());
+                    }
+                }
+
+                // Mirrors this same real fetch into the focused repo's own `Repo::worktrees` -
+                // the rail's per-repo group listing (`crate::rail::render::AdeApp::
+                // build_repo_groups`) reads that, not `Self::worktrees` directly, so the focused
+                // repo's own rail group must never fall behind what this method just loaded. A
+                // mirror, not a second independent fetch: `Self::start_repo_worktrees_polling`
+                // deliberately skips the focused repo for exactly this reason - see its own docs.
+                if let Some(id) = focused_id {
+                    if let Some(repo) = this.repos.iter_mut().find(|repo| repo.id == id) {
+                        repo.worktrees = this.worktrees.clone();
+                        repo.worktrees_loaded = true;
                     }
                 }
 
@@ -748,6 +787,153 @@ impl AdeApp {
             });
         });
         self._load_worktrees_task = Some(task);
+    }
+
+    /// A real, one-shot `wt_core::list_worktrees_porcelain` fetch for a single repo, writing the
+    /// result straight into that repo's own [`Repo::worktrees`]/[`Repo::worktrees_loaded`] - the
+    /// rail-display counterpart to [`Self::load_worktrees`], which stays scoped to [`Self::
+    /// focused_repo`] and the single-slot [`Self::worktrees`] field the file tree/diff/agent-
+    /// spawn machinery reads (see that field's own docs for why the two are deliberately kept
+    /// separate rather than merged into one).
+    ///
+    /// Called once per newly [`Self::add_repo`]-ed repo (so a freshly added repo shows a real
+    /// count within moments, rather than waiting for [`Self::start_repo_worktrees_polling`]'s own
+    /// [`REPO_WORKTREES_POLL_INTERVAL`] tick) and once per repo restored from `repos.toml` at
+    /// startup (`Self::new_with_settings`) - both real, one-time "get this repo a first real
+    /// answer promptly" calls, not part of the steady-state keep-fresh cadence itself.
+    ///
+    /// A no-op if `repo_id` isn't (or is no longer) a known repo - defensive, matching every
+    /// other `RepoId`-keyed lookup in this crate. On a genuine fetch failure (an inaccessible or
+    /// since-deleted path - `wt_core::list_worktrees_porcelain` itself already reports that as a
+    /// real `Err`, never a panic), this still marks the repo [`Repo::worktrees_loaded`] `true`
+    /// with an empty list: the identical "attempted, got a definitive (if disappointing) answer"
+    /// contract [`Self::load_worktrees`] already applies to the focused repo's own [`Self::
+    /// worktrees_error`] case, so a broken repo shows a real, honest "no worktrees" rather than
+    /// spinning on "not loaded yet" forever.
+    pub(crate) fn load_repo_worktrees(&mut self, repo_id: RepoId, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .map(|repo| repo.path.clone())
+        else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { wt_core::list_worktrees_porcelain(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(repo) = this.repos.iter_mut().find(|repo| repo.id == repo_id) {
+                    repo.worktrees = match result {
+                        Ok(results) => worktrees::build_worktree_items(results),
+                        Err(_) => Vec::new(),
+                    };
+                    repo.worktrees_loaded = true;
+                }
+                cx.notify();
+            });
+        });
+        self._repo_worktrees_tasks.push(task);
+    }
+
+    /// The steady-state keep-fresh sweep for every *non-focused* [`Self::repos`] entry's own
+    /// [`Repo::worktrees`] - the currently focused repo is deliberately excluded here, since it
+    /// already gets kept fresh at a faster cadence by [`Self::load_worktrees`]'s own mirror
+    /// (see that method's docs) plus the real filesystem watcher/poll fallback ([`Self::
+    /// start_worktree_watch`]); fetching it a second time here would be genuine duplicate `git`
+    /// subprocess work for data this app already has.
+    ///
+    /// Started once, at startup (`Self::new_with_settings`) - unlike [`Self::
+    /// start_worktree_watch`]/[`Self::start_status_polling`], this loop is never restarted on a
+    /// repo switch, since it reads [`Self::repos`]/[`Self::focused_repo`] fresh on every tick
+    /// rather than closing over one repo's path at spawn time; one instance already serves
+    /// however many repos are added, for the whole life of the window.
+    ///
+    /// ## Cadence
+    ///
+    /// Ticks every [`REPO_WORKTREES_POLL_INTERVAL`] - see that constant's own docs for why it is
+    /// deliberately slower than [`STATUS_POLL_INTERVAL`].
+    ///
+    /// ## Concurrency cap
+    ///
+    /// Firing one real `git worktree list` subprocess per non-focused repo *simultaneously* on
+    /// every tick would be unbounded process-spawn cost for a user with many repos added. Each
+    /// tick instead splits the due repos into fixed-size batches of [`REPO_WORKTREES_FETCH_CONCURRENCY`]
+    /// (`crate::rail::repo::batch_repos_for_refresh` - see its own docs/tests for the exact
+    /// chunking), spawning one batch's real subprocesses concurrently on the background executor
+    /// and fully awaiting all of them before starting the next batch - so no more than
+    /// [`REPO_WORKTREES_FETCH_CONCURRENCY`] of this sweep's own `git` processes are ever in
+    /// flight at once, regardless of how many repos are due.
+    pub(crate) fn start_repo_worktrees_polling(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            'outer: loop {
+                cx.background_executor()
+                    .timer(REPO_WORKTREES_POLL_INTERVAL)
+                    .await;
+
+                let Ok(due_ids) = this.update(cx, |this, _cx| {
+                    let focused = this.focused_repo;
+                    this.repos
+                        .iter()
+                        .filter(|repo| Some(repo.id) != focused)
+                        .map(|repo| repo.id)
+                        .collect::<Vec<_>>()
+                }) else {
+                    break;
+                };
+
+                for batch in
+                    repo::batch_repos_for_refresh(&due_ids, REPO_WORKTREES_FETCH_CONCURRENCY)
+                {
+                    let Ok(paths) = this.update(cx, |this, _cx| {
+                        batch
+                            .iter()
+                            .filter_map(|id| {
+                                this.repos
+                                    .iter()
+                                    .find(|repo| repo.id == *id)
+                                    .map(|repo| (*id, repo.path.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    }) else {
+                        break 'outer;
+                    };
+
+                    // Spawned up front (not one at a time inside the loop below) so every
+                    // subprocess in this batch genuinely starts running concurrently on the
+                    // background executor - awaiting them afterward just collects results, it
+                    // doesn't gate when each one's real `git` call begins.
+                    let fetches: Vec<_> = paths
+                        .into_iter()
+                        .map(|(id, path)| {
+                            cx.background_executor().spawn(async move {
+                                (id, wt_core::list_worktrees_porcelain(&path))
+                            })
+                        })
+                        .collect();
+
+                    for fetch in fetches {
+                        let (id, result) = fetch.await;
+                        let updated = this.update(cx, |this, cx| {
+                            if let Some(repo) = this.repos.iter_mut().find(|repo| repo.id == id) {
+                                repo.worktrees = match result {
+                                    Ok(results) => worktrees::build_worktree_items(results),
+                                    Err(_) => Vec::new(),
+                                };
+                                repo.worktrees_loaded = true;
+                            }
+                            cx.notify();
+                        });
+                        if updated.is_err() {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        });
+        self._repo_worktrees_poll_task = Some(task);
     }
 
     /// Recomputes [`Self::disk_usage`] and [`Self::worktree_disk_usage`] from the current
@@ -1887,6 +2073,305 @@ mod load_worktrees_integration_tests {
             None,
             "a real user re-selection must clear the stale fallback notice"
         );
+    }
+}
+
+/// Real, end-to-end proof that every added repo's own worktree list loads and stays live in the
+/// rail, not just the currently focused repo's - the fix for a real live-user report: the rail
+/// grouped worktrees under a repo header for every added repo, but only the *focused* one ever
+/// showed a real count or its rows; every other one showed an honest but permanent "not loaded
+/// yet" placeholder even though nothing stopped it from being fetched too. `AdeApp::
+/// load_repo_worktrees` (a one-shot fetch on `AdeApp::add_repo`/at startup) and `AdeApp::
+/// start_repo_worktrees_polling` (the periodic keep-fresh sweep for every non-focused repo) are
+/// what closes that gap - see both methods' own docs. Real repos, real `git` subprocesses, no
+/// mocks, mirroring `load_worktrees_integration_tests`'s own established discipline just above.
+#[cfg(test)]
+mod multi_repo_worktree_loading_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+    }
+
+    /// The core ask: repo B is added but never focused, yet its own real worktree list still
+    /// loads in the background and lands in `AdeApp::repos` once the fetch resolves - not just
+    /// the currently focused repo A's.
+    #[gpui::test]
+    fn a_non_focused_repos_worktrees_load_in_the_background(cx: &mut TestAppContext) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+
+        // Immediately after `add_repo`, in this same synchronous step, the real background fetch
+        // it just kicked off has had no chance to run yet - proving the count that appears later
+        // is real data, not a race that was always going to read `1` regardless.
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_b_id)
+                .expect("repo B is a known repo");
+            assert!(
+                !entry.worktrees_loaded,
+                "repo B's real fetch hasn't resolved yet - worktrees_loaded must still be false"
+            );
+        });
+
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let repo_a_id = app.focused_repo().expect("repo A is focused").id;
+            let repo_a_entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_a_id)
+                .expect("repo A is a known repo");
+            assert!(
+                repo_a_entry.worktrees_loaded,
+                "the focused repo's own data path must remain loaded exactly as before"
+            );
+            assert_eq!(repo_a_entry.worktrees.len(), 1);
+
+            let repo_b_entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_b_id)
+                .expect("repo B is a known repo");
+            assert!(
+                repo_b_entry.worktrees_loaded,
+                "repo B's real background fetch must have resolved by now"
+            );
+            assert_eq!(
+                repo_b_entry.worktrees.len(),
+                1,
+                "a real git repo always has at least its own main checkout as a worktree - this \
+                 must read as a real 1, never a 0 that's actually just a race with \"not loaded \
+                 yet\""
+            );
+        });
+    }
+
+    /// A repo whose path becomes inaccessible before its first real fetch resolves must not
+    /// panic, and must still land on a real, definitive answer (`worktrees_loaded: true`, an
+    /// empty list) rather than spinning on "not loaded yet" forever - the identical honest
+    /// "attempted, got a disappointing but real answer" contract `AdeApp::load_worktrees` already
+    /// gives the focused repo's own `AdeApp::worktrees_error` case on a real fetch failure.
+    #[gpui::test]
+    fn a_repo_whose_path_disappears_before_its_first_load_does_not_panic(cx: &mut TestAppContext) {
+        let repo_a = init_repo();
+        let doomed = TempDir::new().expect("tempdir");
+        let doomed_path = doomed.path().to_path_buf();
+        git(&doomed_path, &["init", "-b", "main"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let doomed_id = app.update(cx, |app, cx| app.add_repo(doomed_path.clone(), cx));
+
+        // Deleted before the real background fetch this same `add_repo` call kicked off ever
+        // gets a chance to run.
+        std::fs::remove_dir_all(&doomed_path).expect("remove doomed repo directory");
+
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == doomed_id)
+                .expect("still a known repo - a failed fetch must never remove it");
+            assert!(
+                entry.worktrees_loaded,
+                "a failed fetch is still a real, definitive answer, not a forever-pending one"
+            );
+            assert!(
+                entry.worktrees.is_empty(),
+                "an inaccessible path must report a real empty list, never stale/fabricated data"
+            );
+        });
+    }
+
+    /// The cadence contract: a non-focused repo's worktree list must not be refetched before it
+    /// has genuinely gone stale (`REPO_WORKTREES_POLL_INTERVAL`), and must be refetched once that
+    /// interval elapses - proven with a real `git worktree add` landing between the two checks,
+    /// so "unchanged" and "changed" both mean something real rather than an unobservable no-op.
+    #[gpui::test]
+    fn a_non_focused_repos_worktrees_are_not_refetched_before_the_poll_interval_elapses(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_b_id)
+                .expect("repo B is a known repo");
+            assert_eq!(
+                entry.worktrees.len(),
+                1,
+                "sanity check: repo B starts out with just its own main checkout"
+            );
+        });
+
+        // A real new worktree lands in repo B's real git metadata...
+        add_worktree(repo_b.path(), "feature", "added-wt");
+
+        // ...but less than a full poll interval has elapsed since repo B's last real fetch, so
+        // the periodic sweep must not have refetched it yet.
+        cx.background_executor
+            .advance_clock(REPO_WORKTREES_POLL_INTERVAL - Duration::from_secs(1));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_b_id)
+                .expect("repo B is a known repo");
+            assert_eq!(
+                entry.worktrees.len(),
+                1,
+                "repo B's data hasn't gone stale yet (less than REPO_WORKTREES_POLL_INTERVAL has \
+                 elapsed since its last real fetch) - the periodic sweep must not have refetched \
+                 it, so the real new worktree must not be visible yet"
+            );
+        });
+
+        // Now a full interval has elapsed since repo B's last real fetch - the periodic sweep
+        // must pick up the real change.
+        cx.background_executor
+            .advance_clock(Duration::from_secs(1) + Duration::from_millis(500));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let entry = app
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_b_id)
+                .expect("repo B is a known repo");
+            assert_eq!(
+                entry.worktrees.len(),
+                2,
+                "once the poll interval has elapsed, the periodic sweep must refetch repo B and \
+                 pick up the real new worktree"
+            );
+        });
+    }
+
+    /// The real concurrency cap end to end, with more due repos than
+    /// `REPO_WORKTREES_FETCH_CONCURRENCY`: one real sweep still drains every batch to completion
+    /// - not just the first cap-sized chunk - proven with a real change landing in *every* extra
+    /// repo, which only the periodic sweep (not each repo's own already-completed, one-shot
+    /// `add_repo`-time fetch) can ever observe. `crate::rail::repo::batch_repos_for_refresh`'s own
+    /// unit tests prove the exact chunk sizes the cap produces; this proves the sweep built on
+    /// top of it actually processes every one of those chunks, not just the first.
+    #[gpui::test]
+    fn the_periodic_sweep_refreshes_every_repo_even_with_more_than_the_concurrency_cap(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_focused = init_repo();
+        let extra_count = REPO_WORKTREES_FETCH_CONCURRENCY * 2 + 1;
+        let extra_repos: Vec<TempDir> = (0..extra_count).map(|_| init_repo()).collect();
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_focused.path().to_path_buf());
+        cx.run_until_parked();
+
+        let extra_ids: Vec<RepoId> = extra_repos
+            .iter()
+            .map(|repo| app.update(cx, |app, cx| app.add_repo(repo.path().to_path_buf(), cx)))
+            .collect();
+        cx.run_until_parked();
+
+        // Sanity check: every repo's own one-shot `add_repo`-time fetch (not the periodic sweep
+        // under test below) has already given it a real baseline of exactly one worktree.
+        app.read_with(cx, |app, _| {
+            for id in &extra_ids {
+                let entry = app
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == *id)
+                    .expect("repo is known");
+                assert_eq!(entry.worktrees.len(), 1);
+            }
+        });
+
+        // A real new worktree lands in *every* extra repo - only a real periodic sweep tick can
+        // ever observe this, since each repo's own one-shot add-time fetch already ran above.
+        for repo in &extra_repos {
+            add_worktree(repo.path(), "feature", "added-wt");
+        }
+
+        cx.background_executor
+            .advance_clock(REPO_WORKTREES_POLL_INTERVAL + Duration::from_millis(500));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            for id in &extra_ids {
+                let entry = app
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == *id)
+                    .expect("repo is known");
+                assert_eq!(
+                    entry.worktrees.len(),
+                    2,
+                    "every non-focused repo must be refreshed within one real sweep, not just \
+                     the first REPO_WORKTREES_FETCH_CONCURRENCY of them - the batching loop must \
+                     drain every batch, not stop after the first"
+                );
+            }
+        });
     }
 }
 

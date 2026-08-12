@@ -436,9 +436,10 @@ pub fn filter_worktree_rows<'a>(rows: &'a [WorktreeRow], query: &str) -> Vec<&'a
 }
 
 /// One repo, with its already-built [`WorktreeRow`]s - `crate::root`'s reduction of one
-/// [`crate::rail::repo::Repo`] plus (for the currently focused repo only) live worktree rows,
-/// as input to [`group_worktrees_by_repo`]. See that function's own docs for why every other
-/// repo currently supplies an empty `all_rows`/`rows`.
+/// [`crate::rail::repo::Repo`] plus its own live worktree rows (the focused repo's come from
+/// [`crate::rail::render::AdeApp::build_worktree_rows`], every other repo's from its own
+/// [`crate::rail::repo::Repo::worktrees`] - see [`crate::rail::render::AdeApp::
+/// build_repo_groups`]'s own docs), as input to [`group_worktrees_by_repo`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoWorktrees {
     pub repo_id: RepoId,
@@ -456,13 +457,17 @@ pub struct RepoWorktrees {
     /// currently visible on screen is a real, separate UI concern from what the header reports
     /// about the repo's real state.
     pub rows: Vec<WorktreeRow>,
-    /// Whether `all_rows`/`rows` reflect this repo's real, live worktree data - `true` only for
-    /// the currently focused repo (see [`group_worktrees_by_repo`]'s own docs for why every other
-    /// repo's worktree/agent data simply hasn't been loaded into memory yet, a real pre-existing
-    /// data-model limitation, not something this field papers over). An empty `all_rows` with
-    /// `rows_loaded: false` means "unpopulated" - a repo that may genuinely have several
-    /// worktrees on disk that just haven't been fetched - and must never be rendered the same way
-    /// as an empty `all_rows` with `rows_loaded: true`, which really does mean zero worktrees.
+    /// Whether `all_rows`/`rows` reflect this repo's real, live worktree data - always `true` for
+    /// the focused repo (its own data path predates and is unaffected by per-repo loading), and
+    /// for any other repo mirrors [`crate::rail::repo::Repo::worktrees_loaded`]: `true` once a
+    /// real `wt_core::list_worktrees_porcelain` fetch for it has completed at least once
+    /// (`crate::root::AdeApp::load_repo_worktrees`/`crate::root::AdeApp::
+    /// start_repo_worktrees_polling`), `false` only in the brief window before that first fetch
+    /// resolves (e.g. immediately after `crate::root::AdeApp::add_repo`). An empty `all_rows`
+    /// with `rows_loaded: false` means "unpopulated" - a repo that may genuinely have several
+    /// worktrees on disk that just haven't been fetched yet - and must never be rendered the same
+    /// way as an empty `all_rows` with `rows_loaded: true`, which really does mean zero
+    /// worktrees.
     pub rows_loaded: bool,
 }
 
@@ -546,13 +551,13 @@ pub fn waiting_count_label(count: usize) -> Option<String> {
 /// explicit warning. Both sorts are stable (`slice::sort_by_key`), so two rows/groups tied on
 /// rank keep their caller-supplied relative order rather than reshuffling on every render.
 ///
-/// A repo currently supplies an empty `rows` unless it's the focused one:
-/// `crate::rail::repo::Repo::worktrees` isn't wired to live `wt_core::list_worktrees` data yet
-/// for any *other* repo (see that field's own docs) - there is no UI to add a second repo yet
-/// either (this revision deliberately doesn't build one), so in practice `repos` holds exactly
-/// one entry and this is a no-op in every real agent; the general mechanism is still built
-/// correctly so a later phase that wires up multi-repo data has a real, tested place to plug
-/// into rather than a single-repo special case to unwind.
+/// Every repo supplies real `rows`/`all_rows` here, not just the focused one -
+/// `crate::rail::repo::Repo::worktrees` is kept live for every added repo by
+/// `crate::root::AdeApp::load_repo_worktrees`/`crate::root::AdeApp::
+/// start_repo_worktrees_polling` (see [`RepoWorktrees::rows_loaded`]'s own docs for exactly when
+/// a given repo's data has actually arrived). This function itself stays a plain, repo-count-
+/// agnostic reduction either way - it only ever sorts and re-shapes whatever [`RepoWorktrees`]
+/// list it's handed, never reads [`crate::root::AdeApp`] fields directly.
 pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
     let mut groups: Vec<RepoGroup> = repos
         .into_iter()
