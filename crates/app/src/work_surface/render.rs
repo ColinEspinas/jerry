@@ -3833,6 +3833,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3840,6 +3841,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4002,6 +4004,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -4009,6 +4012,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,

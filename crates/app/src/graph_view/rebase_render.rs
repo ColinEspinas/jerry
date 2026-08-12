@@ -1379,6 +1379,7 @@ mod rebase_flow_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             )
@@ -1486,6 +1487,7 @@ mod rebase_flow_tests {
                 ProcessKind::Shell,
                 repo_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -1679,6 +1681,7 @@ mod rebase_flow_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
