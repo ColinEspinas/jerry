@@ -3,9 +3,12 @@
 //! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
 
 use super::*;
-use crate::root::widgets::{menu_popover_chrome, render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{
+    menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_tag_pill,
+};
 use crate::settings::widgets;
 use crate::sidebar::changes;
+use crate::text_history::TextField;
 use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
 use gpui::{uniform_list, KeyDownEvent, Pixels};
 use std::ops::Range;
@@ -222,6 +225,12 @@ impl AdeApp {
         // for an outright close, closes the gap for the "switch tabs and back" path too.
         self.graph_state.row_menu_open = None;
         self.graph_state.push_menu_open = false;
+        // GitHub issue #241: the same "switch tabs and back reveals a stale overlay with no
+        // click at all" gap the comment above fixes for the row/push menus applies identically
+        // to the "Create branch here" prompt (also gated on `graph_tab_active` in
+        // `crate::root::AdeApp::render`) and to a stale armed Hard-reset confirmation.
+        self.graph_state.create_branch_prompt = None;
+        self.graph_state.hard_reset_confirm_armed = None;
     }
 
     /// Loads (or reloads) the graph and its upstream ahead/behind counts, off the UI thread -
@@ -460,6 +469,10 @@ impl AdeApp {
         );
         if already_open_here {
             self.graph_state.row_menu_open = None;
+            // GitHub issue #241: closing the menu (rather than acting on one of its rows) is
+            // itself "some other action" - see `GraphTabState::hard_reset_confirm_armed`'s own
+            // docs.
+            self.graph_state.hard_reset_confirm_armed = None;
             cx.notify();
             return;
         }
@@ -522,6 +535,10 @@ impl AdeApp {
         // call replaces the single `push_menu_open = false` that used to live here, and runs
         // *before* the assignment below so the sweep can't clear what it just set.
         let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphRow));
+        // GitHub issue #241: a freshly (re)opened menu instance never inherits an armed Hard
+        // reset confirmation from a previous one - see
+        // `GraphTabState::hard_reset_confirm_armed`'s own docs.
+        self.graph_state.hard_reset_confirm_armed = None;
         self.graph_state.row_menu_open = Some(GraphRowMenu {
             row_index: index,
             origin_x: px(clamped_x),
@@ -547,6 +564,8 @@ impl AdeApp {
     pub(crate) fn copy_graph_text(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.graph_state.row_menu_open = None;
+        // GitHub issue #241: see `GraphTabState::hard_reset_confirm_armed`'s own docs.
+        self.graph_state.hard_reset_confirm_armed = None;
         cx.notify();
     }
 
@@ -611,6 +630,9 @@ impl AdeApp {
     /// [`Self::request_graph_pull`] does: the worktree is left in the real conflicted state for
     /// the user to resolve, not silently rolled back.
     pub(crate) fn request_graph_cherry_pick(&mut self, sha: String, cx: &mut Context<Self>) {
+        // GitHub issue #241: any other row-menu action disarms a previously-armed Hard reset
+        // confirmation - see [`GraphTabState::hard_reset_confirm_armed`]'s own docs.
+        self.graph_state.hard_reset_confirm_armed = None;
         self.run_graph_remote_op("Cherry-pick", cx, move |root| {
             wt_core::rewrite::cherry_pick(&root, &sha)
         });
@@ -621,6 +643,8 @@ impl AdeApp {
     /// [`Self::request_graph_cherry_pick`]'s own docs on real-conflict handling, which applies
     /// identically here.
     pub(crate) fn request_graph_revert(&mut self, sha: String, cx: &mut Context<Self>) {
+        // GitHub issue #241: see [`Self::request_graph_cherry_pick`]'s own comment above.
+        self.graph_state.hard_reset_confirm_armed = None;
         self.run_graph_remote_op("Revert", cx, move |root| {
             wt_core::rewrite::revert(&root, &sha)
         });
@@ -633,8 +657,154 @@ impl AdeApp {
     /// identically here. Interactive rebase (commit reordering/squash/edit) is a real, stated
     /// follow-up - it needs its own commit-selection UI, not just a single click.
     pub(crate) fn request_graph_rebase_onto(&mut self, sha: String, cx: &mut Context<Self>) {
+        // GitHub issue #241: see [`Self::request_graph_cherry_pick`]'s own comment above.
+        self.graph_state.hard_reset_confirm_armed = None;
         self.run_graph_remote_op("Rebase", cx, move |root| {
             wt_core::rewrite::rebase_onto(&root, &sha)
+        });
+    }
+
+    /// The row menu's "Check out" action (GitHub issue #241). Moves `HEAD` (detached) onto `sha`
+    /// in the focused worktree (`wt_core::checkout::checkout`) - never the repository's main
+    /// checkout, the same "current worktree" resolution [`Self::request_graph_cherry_pick`] and
+    /// friends already use via `Self::diff_root`. A genuinely conflicting checkout (uncommitted
+    /// changes that would be overwritten) surfaces through [`Self::run_graph_remote_op`]'s own
+    /// status-message path with git's own real refusal text - this makes no attempt to pre-check
+    /// or second-guess a dirty worktree itself; see `wt_core::checkout::checkout`'s own docs.
+    pub(crate) fn request_graph_checkout(&mut self, sha: String, cx: &mut Context<Self>) {
+        self.graph_state.hard_reset_confirm_armed = None;
+        self.run_graph_remote_op("Check out", cx, move |root| {
+            wt_core::checkout::checkout(&root, &sha)
+        });
+    }
+
+    /// Opens the row menu's "Create branch here" prompt (GitHub issue #241) - a small, hand-
+    /// rolled inline text input (mirrors `crate::root::new_file::AdeApp::start_new_file`'s own
+    /// shape; see [`state::GraphCreateBranchPrompt`]'s own docs for why there's no separate
+    /// modal-dialog subsystem behind it). Closes the row `⋯` menu it was clicked from - the
+    /// prompt replaces it as a focus-owning overlay, the same relationship the "New file" prompt
+    /// has with whatever it was opened from.
+    pub(crate) fn start_graph_create_branch(
+        &mut self,
+        sha: String,
+        short_sha: String,
+        subject: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.hard_reset_confirm_armed = None;
+        self.graph_state.row_menu_open = None;
+        self.graph_state.create_branch_prompt = Some(state::GraphCreateBranchPrompt {
+            sha,
+            short_sha,
+            subject,
+            error: None,
+        });
+        self.graph_state.create_branch_name = TextField::new();
+        window.focus(&self.graph_state.create_branch_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Closes the "Create branch here" prompt without creating anything - Escape, or a click on
+    /// its own scrim. Mirrors `crate::root::new_file::AdeApp::cancel_new_file`'s own shape,
+    /// simpler here since the prompt only ever opens while the graph tab is focused: focus always
+    /// returns to [`AdeApp::graph_focus_handle`].
+    pub(crate) fn cancel_graph_create_branch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph_state.create_branch_prompt.take().is_some() {
+            window.focus(&self.graph_focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Enter on the "Create branch here" prompt. The only hand-rolled validation here is "not
+    /// empty" - just enough to avoid a clearly-broken `git checkout -b '' <sha>` invocation; a
+    /// name colliding with an existing branch is deliberately *not* pre-checked here and instead
+    /// surfaces as git's own real error through [`Self::run_graph_remote_op`]'s status-message
+    /// path, exactly like every other row-menu mutation's real-conflict handling.
+    pub(crate) fn commit_graph_create_branch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt) = self.graph_state.create_branch_prompt.clone() else {
+            return;
+        };
+        let name = self
+            .graph_state
+            .create_branch_name
+            .as_str()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                open.error = Some("branch name can't be empty".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        self.graph_state.create_branch_prompt = None;
+        window.focus(&self.graph_focus_handle, cx);
+        self.request_graph_create_branch(prompt.sha, name, cx);
+    }
+
+    /// The real `wt_core::checkout::create_branch_at` call behind
+    /// [`Self::commit_graph_create_branch`] - split out so tests can drive it directly without
+    /// going through the prompt's own focus/window plumbing, matching
+    /// [`Self::request_graph_cherry_pick`] and friends.
+    pub(crate) fn request_graph_create_branch(
+        &mut self,
+        sha: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.hard_reset_confirm_armed = None;
+        self.run_graph_remote_op("Create branch", cx, move |root| {
+            wt_core::checkout::create_branch_at(&root, &name, &sha)
+        });
+    }
+
+    /// The row menu's "Soft"/"Mixed"/"Hard" reset actions (GitHub issue #241) - real `git reset`
+    /// against the focused worktree's current branch (`wt_core::checkout::reset`).
+    ///
+    /// `Soft`/`Mixed` run immediately on a single click - neither ever discards uncommitted work
+    /// (see `wt_core::checkout::ResetMode`'s own docs on what each really does), so like the Push
+    /// menu's plain "Push" row they need no confirmation. `Hard` genuinely discards uncommitted
+    /// changes and detaches whatever commits sat after `sha`, so it follows the exact two-click
+    /// discipline [`Self::request_graph_push`] already established for its own Force rows: the
+    /// first click on a given commit's "Hard" row only arms
+    /// [`GraphTabState::hard_reset_confirm_armed`] and re-labels the row, without resetting
+    /// anything; a second click on that *same* commit's "Hard" row is what actually runs the
+    /// reset. Any other mode, or "Hard" on a *different* commit, disarms rather than carrying a
+    /// stale confirmation over onto a reset the user never confirmed for that commit.
+    pub(crate) fn request_graph_reset(
+        &mut self,
+        mode: wt_core::checkout::ResetMode,
+        sha: String,
+        cx: &mut Context<Self>,
+    ) {
+        use wt_core::checkout::ResetMode;
+
+        if mode == ResetMode::Hard
+            && self.graph_state.hard_reset_confirm_armed.as_deref() != Some(sha.as_str())
+        {
+            self.graph_state.hard_reset_confirm_armed = Some(sha);
+            self.graph_state.status_message = Some("click Hard again to really reset".to_string());
+            cx.notify();
+            return;
+        }
+        self.graph_state.hard_reset_confirm_armed = None;
+
+        let action = match mode {
+            ResetMode::Soft => "Soft reset",
+            ResetMode::Mixed => "Mixed reset",
+            ResetMode::Hard => "Hard reset",
+        };
+        self.run_graph_remote_op(action, cx, move |root| {
+            wt_core::checkout::reset(&root, mode, &sha)
         });
     }
 
@@ -729,6 +899,211 @@ impl AdeApp {
         if self.graph_state.branches_filter.redo() {
             cx.notify();
         }
+    }
+
+    /// The "Create branch here" prompt's key handler - append/backspace/Enter (create)/Escape
+    /// (cancel), mirroring `crate::root::new_file::AdeApp::handle_new_file_key_down`'s own
+    /// minimal shape (GitHub issue #241).
+    pub(in crate::graph_view) fn handle_graph_create_branch_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.cancel_graph_create_branch(window, cx);
+                cx.stop_propagation();
+            }
+            "enter" => {
+                self.commit_graph_create_branch(window, cx);
+                cx.stop_propagation();
+            }
+            "backspace" => {
+                if self.graph_state.create_branch_prompt.is_some() {
+                    self.graph_state.create_branch_name.pop(Instant::now());
+                    if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                        open.error = None;
+                    }
+                    self.reset_caret_blink(cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            _ => {
+                if let Some(text) = keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    if self.graph_state.create_branch_prompt.is_some() {
+                        self.graph_state
+                            .create_branch_name
+                            .push_str(text, Instant::now());
+                        if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                            open.error = None;
+                        }
+                        self.reset_caret_blink(cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Ctrl/Cmd+Z` inside the "Create branch here" prompt (GitHub issue #17's per-widget text
+    /// undo, GitHub issue #241).
+    pub(in crate::graph_view) fn handle_graph_create_branch_text_undo(
+        &mut self,
+        _: &crate::root::TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph_state.create_branch_name.undo() {
+            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                open.error = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// `Ctrl/Cmd+Shift+Z` / `Ctrl+Y` inside the "Create branch here" prompt - the mirror of
+    /// [`Self::handle_graph_create_branch_text_undo`].
+    pub(in crate::graph_view) fn handle_graph_create_branch_text_redo(
+        &mut self,
+        _: &crate::root::TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph_state.create_branch_name.redo() {
+            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                open.error = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// The "Create branch here" prompt: a scrim + small centered panel (GitHub issue #241),
+    /// exactly the shape `crate::root::new_file::AdeApp::render_new_file_prompt` already
+    /// established for this app's one other hand-rolled "prompt for a name" - transparent-to-
+    /// nothing modal scrim, `.occlude()`d panel that stops its own click from bubbling up and
+    /// dismissing it. Assumes `Self::graph_state.create_branch_prompt` is `Some` - the caller
+    /// (`crate::root::AdeApp::render`) only renders this when it is.
+    pub(crate) fn render_graph_create_branch_prompt(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let prompt = self.graph_state.create_branch_prompt.clone();
+        let name = self.graph_state.create_branch_name.as_str().to_string();
+        let has_name = !name.is_empty();
+
+        div()
+            .id("graph-create-branch-scrim")
+            .absolute()
+            .top(theme::band::TITLE_BAR)
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .bg(modal_scrim_bg())
+            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                this.cancel_graph_create_branch(window, cx);
+            }))
+            .child(
+                div()
+                    .id("graph-create-branch-panel")
+                    .track_focus(&self.graph_state.create_branch_focus_handle)
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_graph_create_branch_text_undo))
+                    .on_action(cx.listener(Self::handle_graph_create_branch_text_redo))
+                    .on_key_down(cx.listener(Self::handle_graph_create_branch_key_down))
+                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .w(px(320.0))
+                    .p(px(12.0))
+                    .bg(theme::surface::PALETTE)
+                    .border_1()
+                    .border_color(theme::border::POPOVER)
+                    .rounded(theme::radius::CARD)
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(11.5))
+                            .text_color(theme::text::HEADING)
+                            .child("Create branch here"),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(9.5))
+                            .text_color(theme::text::FAINTER)
+                            .child(match &prompt {
+                                Some(prompt) => {
+                                    format!("{} \u{b7} {}", prompt.short_sha, prompt.subject)
+                                }
+                                None => String::new(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(theme::radius::CHIP)
+                            .bg(theme::surface::SEGMENT_TRACK)
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .font(font(theme::font::MONO))
+                            .text_size(px(11.5))
+                            .text_color(theme::text::BODY)
+                            .when(!has_name, |el| {
+                                el.child(self.render_simple_input_caret(
+                                    "graph-create-branch-caret",
+                                    &self.graph_state.create_branch_focus_handle,
+                                ))
+                            })
+                            .child(if has_name {
+                                name
+                            } else {
+                                "branch-name".to_string()
+                            })
+                            .when(has_name, |el| {
+                                el.child(self.render_simple_input_caret(
+                                    "graph-create-branch-caret",
+                                    &self.graph_state.create_branch_focus_handle,
+                                ))
+                            }),
+                    )
+                    .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
+                        el.child(
+                            div()
+                                .font(font(theme::font::SANS))
+                                .text_size(px(10.5))
+                                .text_color(theme::status::FAIL)
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::GHOST)
+                            .child("enter to create \u{b7} esc to cancel"),
+                    ),
+            )
     }
 }
 
@@ -1498,6 +1873,8 @@ impl AdeApp {
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
                 this.graph_state.row_menu_open = None;
+                // GitHub issue #241: see `GraphTabState::hard_reset_confirm_armed`'s own docs.
+                this.graph_state.hard_reset_confirm_armed = None;
                 cx.notify();
             }))
             // A right-click elsewhere must dismiss too (mirrors `crate::sidebar::render::AdeApp::
@@ -1513,6 +1890,11 @@ impl AdeApp {
                 gpui::MouseButton::Right,
                 cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
                     this.graph_state.row_menu_open = None;
+                    // GitHub issue #241: see `GraphTabState::hard_reset_confirm_armed`'s own
+                    // docs - `Self::open_graph_row_menu_at` would disarm too if this lands on
+                    // another row and reopens fresh right after, but a right-click on empty
+                    // space only ever reaches this dismiss.
+                    this.graph_state.hard_reset_confirm_armed = None;
                     cx.notify();
                 }),
             )
@@ -1543,24 +1925,48 @@ impl AdeApp {
                     cx.stop_propagation();
                 }))
                 .child(render_graph_row_menu_header("Branch"))
-                .child(render_dropdown_menu_row(
-                    "\u{2713}",
-                    theme::text::GHOST.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Check out",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
-                .child(render_dropdown_menu_row(
-                    "+",
-                    theme::text::GHOST.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Create branch here",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2713}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Check out",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_checkout(sha.clone(), cx);
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "+",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Create branch here",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let sha = sha.clone();
+                        let short_sha = short_sha.clone();
+                        let subject = subject.clone();
+                        move |this, _event: &ClickEvent, window, cx| {
+                            this.start_graph_create_branch(
+                                sha.clone(),
+                                short_sha.clone(),
+                                subject.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    })),
+                )
                 .child(render_dropdown_menu_row(
                     "\u{25b8}",
                     theme::button::BLUE_FG.into(),
@@ -1632,33 +2038,75 @@ impl AdeApp {
                     false,
                 ))
                 .child(render_graph_row_menu_header("Reset"))
-                .child(render_dropdown_menu_row(
-                    "\u{21ba}",
-                    theme::text::GHOST.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Soft",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
-                .child(render_dropdown_menu_row(
-                    "\u{21ba}",
-                    theme::text::GHOST.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Mixed",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
-                .child(render_dropdown_menu_row(
-                    "\u{21ba}",
-                    theme::button::DANGER_FG.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Hard",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{21ba}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Soft",
+                        "keeps changes staged".to_string(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_reset(
+                                wt_core::checkout::ResetMode::Soft,
+                                sha.clone(),
+                                cx,
+                            );
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{21ba}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Mixed",
+                        "keeps changes unstaged".to_string(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_reset(
+                                wt_core::checkout::ResetMode::Mixed,
+                                sha.clone(),
+                                cx,
+                            );
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{21ba}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Hard",
+                        if self.graph_state.hard_reset_confirm_armed.as_deref()
+                            == Some(sha.as_str())
+                        {
+                            "click again to really reset".to_string()
+                        } else {
+                            "discards uncommitted changes".to_string()
+                        },
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let sha = sha.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_reset(
+                                wt_core::checkout::ResetMode::Hard,
+                                sha.clone(),
+                                cx,
+                            );
+                        }
+                    })),
+                )
                 .child(render_graph_row_menu_header("Copy"))
                 .child(
                     render_dropdown_menu_row(
@@ -1700,7 +2148,8 @@ impl AdeApp {
                         .text_size(px(9.5))
                         .text_color(theme::text::GHOSTER)
                         .child(
-                            "rebase and reset run in the focused worktree, never the main checkout",
+                            "check out, branch, rebase, and reset all run in the focused \
+                             worktree, never the main checkout",
                         ),
                 ),
             )
@@ -6066,6 +6515,358 @@ mod graph_remote_action_tests {
                 .is_some_and(|text| text.starts_with("Rebase failed:")),
             "a real conflicting rebase must surface as a real, visible failure message, not a \
              silent success or a panic - got {status:?}"
+        );
+    }
+
+    // GitHub issue #241: "Check out" / "Create branch here" / Soft-Mixed-Hard reset.
+
+    #[gpui::test]
+    async fn checkout_really_moves_head_and_reports_success(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "b.txt", "second", "second commit");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_checkout(base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "HEAD"]),
+            base_sha,
+            "the real click must have run a real git checkout onto the target commit"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Check out".to_string()),
+            "a successful checkout must report real success, not the old 'not implemented yet' \
+             stub text"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "the in-flight guard must clear once the real checkout completes"
+        );
+    }
+
+    #[gpui::test]
+    async fn checkout_on_a_dirty_worktree_with_a_real_conflict_surfaces_gits_own_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "other"]);
+        commit(
+            local.path(),
+            "a.txt",
+            "other branch content",
+            "other change",
+        );
+        git(local.path(), &["checkout", "main"]);
+        // An uncommitted change that genuinely conflicts with what "other" holds - real git
+        // refuses to silently clobber it, and this makes no attempt to pre-check that itself.
+        std::fs::write(local.path().join("a.txt"), "uncommitted dirty content")
+            .expect("write a.txt");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_checkout("other".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Check out failed:")),
+            "a real conflicting checkout must surface as a real, visible failure message, not a \
+             silent success or a panic - got {status:?}"
+        );
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "a refused checkout must leave the worktree exactly where it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+            "uncommitted dirty content",
+            "the refused checkout must not have touched the dirty file"
+        );
+    }
+
+    #[gpui::test]
+    async fn create_branch_here_really_creates_and_switches_and_reports_success(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "b.txt", "second", "second commit");
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_graph_create_branch(
+                base_sha.clone(),
+                base_sha[..7].to_string(),
+                "base".to_string(),
+                window,
+                cx,
+            );
+            app.graph_state.create_branch_name =
+                crate::text_history::TextField::seeded("feature-x");
+            app.commit_graph_create_branch(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feature-x",
+            "must really switch onto the newly created branch"
+        );
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "HEAD"]),
+            base_sha,
+            "the new branch must really be rooted at the commit the prompt was opened on"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Create branch".to_string()),
+            "a successful create-branch must report real success, not the old 'not implemented \
+             yet' stub text"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.create_branch_prompt.is_none()),
+            "the prompt must close once the branch has really been created"
+        );
+    }
+
+    #[gpui::test]
+    async fn create_branch_prompt_rejects_an_empty_name_without_touching_git(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_graph_create_branch(
+                base_sha.clone(),
+                base_sha[..7].to_string(),
+                "base".to_string(),
+                window,
+                cx,
+            );
+            // The field starts genuinely empty - commit without typing anything, the same real
+            // "just hit enter" case a hand-rolled empty-name guard exists for.
+            app.commit_graph_create_branch(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .create_branch_prompt
+                .as_ref()
+                .and_then(|prompt| prompt.error.clone())),
+            Some("branch name can't be empty".to_string()),
+            "an empty name must leave the prompt open with a real, visible rejection, not \
+             silently close it or invoke git at all"
+        );
+        assert_eq!(
+            git_output(local.path(), &["branch", "--list"]),
+            "* main",
+            "no branch must have been created for an empty name - this is exactly the \
+             'clearly-broken invocation' the empty-name guard exists to avoid, not a real git \
+             error"
+        );
+    }
+
+    #[gpui::test]
+    async fn create_branch_with_a_colliding_name_surfaces_gits_own_real_error(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["branch", "existing-branch"]);
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_graph_create_branch(
+                base_sha.clone(),
+                base_sha[..7].to_string(),
+                "base".to_string(),
+                window,
+                cx,
+            );
+            app.graph_state.create_branch_name =
+                crate::text_history::TextField::seeded("existing-branch");
+            app.commit_graph_create_branch(window, cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Create branch failed:")
+                    && text.contains("already exists")),
+            "a real branch-name collision must surface git's own real error, not hand-rolled \
+             validation - got {status:?}"
+        );
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "a failed create-branch must not have switched anything"
+        );
+    }
+
+    #[gpui::test]
+    async fn soft_reset_moves_the_branch_tip_and_keeps_the_change_staged(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "a.txt", "changed", "second commit");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Soft, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(git_output(local.path(), &["rev-parse", "HEAD"]), base_sha);
+        assert_eq!(
+            git_output(local.path(), &["diff", "--cached", "--name-only"]),
+            "a.txt",
+            "a soft reset must leave the undone commit's own change staged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+            "changed",
+            "the working tree content must be untouched by a soft reset"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Soft reset".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn mixed_reset_moves_the_branch_tip_and_unstages_the_change(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "a.txt", "changed", "second commit");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Mixed, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(git_output(local.path(), &["rev-parse", "HEAD"]), base_sha);
+        assert!(
+            git_output(local.path(), &["diff", "--cached", "--name-only"]).is_empty(),
+            "a mixed reset must leave nothing staged"
+        );
+        assert_eq!(
+            git_output(local.path(), &["diff", "--name-only"]),
+            "a.txt",
+            "the undone commit's own change must land unstaged instead"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Mixed reset".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn hard_reset_requires_a_real_second_click_before_it_runs(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "a.txt", "changed", "second commit");
+        let tip_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Hard, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "HEAD"]),
+            tip_sha,
+            "the first click on Hard must only arm the confirmation, never touch real git state"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .hard_reset_confirm_armed
+                .clone()),
+            Some(base_sha.clone()),
+            "the first click must arm exactly the commit that was clicked"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Hard, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "HEAD"]),
+            base_sha,
+            "the second click on the same armed commit must really run the hard reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+            "base",
+            "a hard reset must really restore the working tree to the target commit's content"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .hard_reset_confirm_armed
+                .clone()),
+            None,
+            "the confirmation must disarm once the real reset has actually run"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_different_row_action_disarms_a_previously_armed_hard_reset(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        commit(local.path(), "a.txt", "changed", "second commit");
+        let tip_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Hard, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .hard_reset_confirm_armed
+                .clone()),
+            Some(base_sha.clone()),
+            "premise: Hard is armed by its own first click"
+        );
+
+        // A click on a *different* row-menu action (here, a harmless clipboard copy - no git
+        // mutation at all) must disarm rather than let a later, unrelated second click on Hard
+        // silently ride on this stale confirmation. Mirrors
+        // `clicking_a_different_row_disarms_the_previous_confirmation`'s identical premise for
+        // the Push menu's own force-confirmation.
+        app.update_in(cx, |app, _window, cx| {
+            app.copy_graph_text("unrelated".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .hard_reset_confirm_armed
+                .clone()),
+            None,
+            "a different action must disarm the previous Hard confirmation"
+        );
+
+        // With the arm cleared, a further click on Hard must arm again from scratch rather than
+        // execute immediately.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_reset(wt_core::checkout::ResetMode::Hard, base_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "HEAD"]),
+            tip_sha,
+            "the disarmed confirmation must require a fresh first click before Hard can run again"
         );
     }
 }
