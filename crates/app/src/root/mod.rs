@@ -113,6 +113,7 @@ use crate::status_bar::process_stats;
 use crate::text_history;
 use crate::theme;
 use crate::title_bar::menu as title_bar;
+use crate::title_bar::menu_model::MenuCommand;
 use crate::updater;
 use crate::work_surface::agents::{AgentId, Agents, ProcessKind};
 use crate::work_surface::state as work_surface;
@@ -225,6 +226,36 @@ actions!(
         TerminalClear,
         TerminalCopy,
         TerminalPaste,
+        // GitHub issue #235: a real macOS `NSApp.mainMenu`/`gpui::App::set_menus` menu, and the
+        // matching macOS application menu (Hide/Hide Others/Show All/Quit) that only a real
+        // `NSApp.mainMenu` can host. `crate::title_bar::menu_model::MenuCommand` is the shared
+        // source of truth that maps every one of these (plus the already-existing actions it
+        // reuses as-is - `EditorSave`, `ToggleSettings`, `TextUndo`, `TextRedo`, `EditorCut`,
+        // `EditorCopy`, `EditorPaste`, `EditorSelectAll`, `TogglePalette`, `NewTerminal`,
+        // `NewAgentPane`) onto a label, an optional keystroke spec, and a row position - so the
+        // Windows/Linux in-window popover (`crate::title_bar::menu`) and the real macOS menu
+        // (`crate::title_bar::native_menu`, a later revision) can never drift onto two different
+        // command sets. No `KeyBinding` is added alongside any of these here; the one real
+        // `cmd-q` binding this issue needs is added separately once `Quit` has a real handler.
+        OpenFile,
+        OpenFolder,
+        NewWindow,
+        CloseWindow,
+        Quit,
+        Hide,
+        HideOthers,
+        ShowAll,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
+        NextAgent,
+        PreviousAgent,
+        ArchiveAgent,
+        KeepAllChanges,
+        DiscardWorktree,
+        OpenDocumentation,
+        ReportIssue,
+        About,
     ]
 );
 
@@ -2765,8 +2796,21 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_toggle_palette_action))
             .on_action(cx.listener(Self::handle_toggle_settings_action))
             .on_action(cx.listener(Self::handle_goto_definition_action))
-            .on_action(cx.listener(Self::handle_new_terminal_action))
-            .on_action(cx.listener(Self::handle_new_agent_pane_action))
+            // GitHub issue #235: wrapped in `.when(...)` (rather than the unconditional
+            // registration every other `on_action` on this element uses) so
+            // `gpui::App::is_action_available` genuinely reports `false` for `NewTerminal`/
+            // `NewAgentPane` while `menu_command_enabled` says there's no focused repo to spawn
+            // into - the real macOS menu (`crate::title_bar::native_menu`) greys its own "New
+            // Terminal"/"New Agent Pane" rows off exactly that signal, with no separate
+            // `disabled:` bookkeeping of its own. `new_agent`/`new_agent_pane` already no-op
+            // internally on the same condition (see their own docs), so this changes what
+            // `is_action_available` reports, not what a keystroke or click actually does.
+            .when(self.menu_command_enabled(MenuCommand::NewTerminal), |el| {
+                el.on_action(cx.listener(Self::handle_new_terminal_action))
+            })
+            .when(self.menu_command_enabled(MenuCommand::NewAgentPane), |el| {
+                el.on_action(cx.listener(Self::handle_new_agent_pane_action))
+            })
             .on_action(cx.listener(Self::handle_new_git_graph_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
@@ -2781,6 +2825,47 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_terminal_clear_action))
             .on_action(cx.listener(Self::handle_terminal_copy_action))
             .on_action(cx.listener(Self::handle_terminal_paste_action))
+            // GitHub issue #235: the `MenuCommand` variants with no existing handler anywhere
+            // else in the tree - see `crate::root::menu_commands`'s own "Not every command gets
+            // a `handle_*_menu_command` here" docs for the ones deliberately absent from this
+            // list (they keep whatever pre-existing registration already covers their reused
+            // action). Unconditional for a command `menu_command_enabled` always reports `true`
+            // for; `.when(...)` for one that can genuinely be disabled, so
+            // `gpui::App::is_action_available` reflects real state for the native macOS menu.
+            .on_action(cx.listener(Self::handle_open_file_menu_command))
+            .on_action(cx.listener(Self::handle_open_folder_menu_command))
+            .on_action(cx.listener(Self::handle_new_window_menu_command))
+            .on_action(cx.listener(Self::handle_close_window_menu_command))
+            .on_action(cx.listener(Self::handle_open_documentation_menu_command))
+            .on_action(cx.listener(Self::handle_report_issue_menu_command))
+            .on_action(cx.listener(Self::handle_about_menu_command))
+            .when(self.menu_command_enabled(MenuCommand::ZoomIn), |el| {
+                el.on_action(cx.listener(Self::handle_zoom_in_menu_command))
+            })
+            .when(self.menu_command_enabled(MenuCommand::ZoomOut), |el| {
+                el.on_action(cx.listener(Self::handle_zoom_out_menu_command))
+            })
+            .when(self.menu_command_enabled(MenuCommand::ResetZoom), |el| {
+                el.on_action(cx.listener(Self::handle_reset_zoom_menu_command))
+            })
+            .when(self.menu_command_enabled(MenuCommand::NextAgent), |el| {
+                el.on_action(cx.listener(Self::handle_next_agent_menu_command))
+            })
+            .when(
+                self.menu_command_enabled(MenuCommand::PreviousAgent),
+                |el| el.on_action(cx.listener(Self::handle_previous_agent_menu_command)),
+            )
+            .when(self.menu_command_enabled(MenuCommand::ArchiveAgent), |el| {
+                el.on_action(cx.listener(Self::handle_archive_agent_menu_command))
+            })
+            .when(
+                self.menu_command_enabled(MenuCommand::KeepAllChanges),
+                |el| el.on_action(cx.listener(Self::handle_keep_all_changes_menu_command)),
+            )
+            .when(
+                self.menu_command_enabled(MenuCommand::DiscardWorktree),
+                |el| el.on_action(cx.listener(Self::handle_discard_worktree_menu_command)),
+            )
             .child(self.render_title_bar(cx))
             // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
             // not a modal: it replaces the three zones while the title bar and status bar
@@ -4518,6 +4603,7 @@ mod repo_list_tests {
 pub(crate) mod caret_blink;
 pub(crate) mod focus;
 pub mod layout;
+pub(crate) mod menu_commands;
 pub(crate) mod menus;
 pub(crate) mod new_file;
 pub(crate) mod rem_scope;

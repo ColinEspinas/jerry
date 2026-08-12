@@ -194,7 +194,16 @@ use gpui::{
 ///   five non-editor text-input surfaces (a filter row, a query field, a rename prompt) that
 ///   would need claiming there.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
-    vec![
+    // GitHub issue #235: `cmd-q` (macOS only - appended below, not part of this literal list) is
+    // the one real exception to this function's own "no new global keybinding" discipline every
+    // entry above documents. macOS convention makes Quit's keyboard shortcut a near-mandatory
+    // affordance (unlike any of the other new menu commands issue #235 added, none of which have
+    // a keystroke of their own), and there is zero collision risk with a focused terminal/agent:
+    // `keystroke_to_bytes` (`crate::terminal::pane`) returns `None` for *any* keystroke with
+    // `modifiers.platform` set, so a real Cmd-modified key never reaches a pty in the first
+    // place - the same real fact `"cmd-k"`/`"cmd-c"`/`"cmd-v"` below already rely on for
+    // `TerminalClear`/`TerminalCopy`/`TerminalPaste`.
+    let mut bindings = vec![
         gpui::KeyBinding::new("secondary-n", root::NewAgent, None),
         // The palette's real shortcut, matching the VS Code/Sublime "command palette" convention
         // directly rather than reusing "secondary-k". "secondary-k" was the original binding, but
@@ -595,7 +604,10 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::TerminalPaste,
             Some("terminal"),
         ),
-    ]
+    ];
+    #[cfg(target_os = "macos")]
+    bindings.push(gpui::KeyBinding::new("cmd-q", root::Quit, None));
+    bindings
 }
 
 /// The [`WindowOptions`] every ADE window opens with - both the one real window [`run`] itself
@@ -699,6 +711,27 @@ pub fn run(repo_path: Option<PathBuf>) {
             }
 
             cx.bind_keys(default_key_bindings());
+
+            // GitHub issue #235: the four macOS application-menu commands with no `AdeApp`/
+            // `Window` to run against (Quit must work even with no window focused, e.g. invoked
+            // from the Dock; Hide/Hide Others/Show All are pure `gpui::App`-level window-manager
+            // calls) - registered as real global `App`-level action listeners rather than on any
+            // one window's root, so they still fire with nothing focused at all. Every other real
+            // `MenuCommand` this issue added dispatches through a window-scoped `on_action` on
+            // `AdeApp`'s own root instead - see `crate::root::menu_commands`'s own docs for why
+            // these four are the one deliberate exception.
+            cx.on_action(|_: &root::Quit, cx| cx.quit());
+            cx.on_action(|_: &root::Hide, cx| cx.hide());
+            cx.on_action(|_: &root::HideOthers, cx| cx.hide_other_apps());
+            cx.on_action(|_: &root::ShowAll, cx| cx.unhide_other_apps());
+
+            // Must run after `bind_keys` above: `gpui::App::set_menus` reads the current
+            // `Keymap` right now to resolve each real item's own displayed key equivalent
+            // (`gpui_macos`'s menu-item construction reads `keymap.bindings_for_action`), so
+            // calling it first would install a menu with no keycap shown for anything
+            // `default_key_bindings` bound.
+            #[cfg(target_os = "macos")]
+            cx.set_menus(title_bar::native_menu::native_menus());
 
             let options = default_window_options(cx);
             let opened = cx.open_window(options, {

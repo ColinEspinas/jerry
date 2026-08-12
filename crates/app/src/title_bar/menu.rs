@@ -1,13 +1,15 @@
-//! The Windows/Linux title bar's five real `File Edit View Agent Help` dropdowns -
-//! which rows each one offers, and which already-existing real `AdeApp` method every row
-//! calls. Split out of [`super::render`] (the band's own chrome) because the two answer
-//! genuinely different questions: "what does the title bar look like" versus "what can I
-//! actually do from it".
+//! The Windows/Linux title bar's five real `File Edit View Agent Help` dropdowns - which rows
+//! each one offers, in the canonical order [`crate::title_bar::menu_model::MenuCommand::rows`]
+//! defines (GitHub issue #235's shared source of truth, also read by the real macOS menu,
+//! `crate::title_bar::native_menu`). Split out of [`super::render`] (the band's own chrome)
+//! because the two answer genuinely different questions: "what does the title bar look like"
+//! versus "what can I actually do from it".
 
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::widgets::{menu_popover_chrome, render_menu_group_divider};
+use crate::title_bar::menu_model::{MenuCommand, MenuRow};
 use crate::work_surface::render::render_dropdown_menu_row;
 
 /// The Windows/Linux title bar's five real menu dropdowns (`File Edit View Agent Help`) - see
@@ -84,9 +86,9 @@ impl AdeApp {
     /// scrim closes the menu on any click outside it, and the popover itself is absolutely
     /// positioned directly off the open label's own painted bounds
     /// ([`AdeApp::title_menu_button_bounds`]) rather than a second, independently-computed
-    /// offset. Every row is a real [`render_dropdown_menu_row`] wired to a real, already-existing
-    /// `AdeApp` method via the matching `*_menu_rows` builder below - see each one's own docs for
-    /// which real method backs which row, and why.
+    /// offset. Every row is a real [`render_dropdown_menu_row`] built by [`Self::title_menu_rows`]
+    /// from [`crate::title_bar::menu_model::MenuCommand`] - the same shared model the real macOS
+    /// menu (`crate::title_bar::native_menu`, a later revision) reads too (GitHub issue #235).
     ///
     /// ## No new keybinding opens or drives this menu
     ///
@@ -108,13 +110,7 @@ impl AdeApp {
     ) -> gpui::AnyElement {
         let bounds = self.title_menu_button_bounds[menu.index()];
         let macos = self.window_controls_style().is_macos();
-        let rows = match menu {
-            TitleMenu::File => self.file_menu_rows(macos, cx),
-            TitleMenu::Edit => self.edit_menu_rows(macos, cx),
-            TitleMenu::View => self.view_menu_rows(cx),
-            TitleMenu::Agent => self.agent_menu_rows(macos, cx),
-            TitleMenu::Help => self.help_menu_rows(cx),
-        };
+        let rows = self.title_menu_rows(menu, macos, cx);
 
         div()
             .id("title-menu-scrim")
@@ -157,581 +153,301 @@ impl AdeApp {
         render_menu_group_divider()
     }
 
-    /// The File menu: open a file (the same real, files-scoped command palette the `+` menu's
-    /// own "Open file…" row opens), open a folder or a brand-new empty window (GitHub issue #90,
-    /// see [`Self::render_title_menu`]'s own row-by-row docs below), save the active file (real,
-    /// same handler `secondary-s` dispatches - a safe no-op with nothing dirty to save, per
-    /// [`crate::code_surface::editing::AdeApp::save_active_file`]'s own guard), open Settings, and quit
-    /// (the same real [`Window::remove_window`] the title bar's own close control uses).
-    fn file_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let can_save = self.active_edit_buffer().is_some();
-        let mut save_row = render_dropdown_menu_row(
-            "S",
-            theme::text::DIM.into(),
-            theme::surface::CHIP_NEUTRAL.into(),
-            "Save",
-            "active file".to_string(),
-            keymap::resolve_combo("mod+s", macos),
-            can_save,
-        );
-        if can_save {
-            save_row = save_row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.handle_editor_save_action(&EditorSave, window, cx);
-                cx.notify();
+    /// The real row order for one of the five `File Edit View Agent Help` popovers -
+    /// [`MenuCommand::rows`]'s own canonical order (GitHub issue #235's shared source of truth,
+    /// see `crate::title_bar::menu_model`'s own docs), each turned into a real row by
+    /// [`Self::menu_command_row`]. Replaces what used to be five separately hand-written
+    /// `file_menu_rows`/`edit_menu_rows`/`view_menu_rows`/`agent_menu_rows`/`help_menu_rows`
+    /// builders, each of which duplicated this exact chip/label/sub-label/keystroke/enabled/
+    /// on_click shape by hand for every one of its own rows.
+    fn title_menu_rows(
+        &self,
+        menu: TitleMenu,
+        macos: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        MenuCommand::rows(menu)
+            .iter()
+            .map(|row| match row {
+                MenuRow::Separator => Self::render_title_menu_divider(),
+                MenuRow::Command(cmd) => self.menu_command_row(*cmd, macos, cx),
+            })
+            .collect()
+    }
+
+    /// One real row for `cmd`, in whichever popover [`Self::title_menu_rows`] is currently
+    /// building. Chip glyph/colors and sub-label come from [`Self::menu_command_chip`]/
+    /// [`Self::menu_command_sub_label`], except [`MenuCommand::NewAgentPane`]: its real chip/
+    /// sub-label depend on [`Self::resolved_new_agent_kind`] (which agent a fresh pane would
+    /// actually spawn right now, per `crate::work_surface::agent_tint`/`agent_initial`) rather
+    /// than anything the window-free `crate::title_bar::menu_model` could know statically, so
+    /// that one case is resolved here instead.
+    ///
+    /// Enablement and the row's real effect both come from `crate::root::menu_commands`
+    /// ([`AdeApp::menu_command_enabled`]/[`AdeApp::perform_menu_command`]) - the same two
+    /// functions the real macOS menu (`crate::title_bar::native_menu`, a later revision) uses, so
+    /// a row here can never show as enabled/disabled or do something different from what its
+    /// native-menu counterpart would. A disabled row gets no `on_click` at all (rather than one
+    /// that silently no-ops), matching [`render_dropdown_menu_row`]'s own enabled/disabled
+    /// contract every pre-issue-#235 row already followed.
+    fn menu_command_row(
+        &self,
+        cmd: MenuCommand,
+        macos: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (chip_glyph, chip_fg, chip_bg, sub) = if cmd == MenuCommand::NewAgentPane {
+            let resolved_agent = self.resolved_new_agent_kind();
+            let resolved_kind = ProcessKind::from(resolved_agent);
+            let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
+            let agent_initial = work_surface::agent_initial(resolved_kind);
+            (
+                agent_initial,
+                agent_fg,
+                agent_bg,
+                resolved_agent.label().to_string(),
+            )
+        } else {
+            let (glyph, fg, bg) = Self::menu_command_chip(cmd);
+            (glyph, fg, bg, self.menu_command_sub_label(cmd))
+        };
+        let label = self.menu_command_label(cmd);
+        let keys = cmd
+            .keystroke_spec()
+            .map(|spec| keymap::resolve_combo(spec, macos))
+            .unwrap_or_default();
+        let enabled = self.menu_command_enabled(cmd);
+
+        let mut row =
+            render_dropdown_menu_row(chip_glyph, chip_fg, chip_bg, label, sub, keys, enabled);
+        if enabled {
+            row = row.on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.perform_menu_command(cmd, window, cx);
             }));
         }
+        row.into_any_element()
+    }
 
-        vec![
-            render_dropdown_menu_row(
+    /// This command's real chip glyph/colors in the popover - the same literal glyph and
+    /// `theme::text::DIM`/`theme::surface::CHIP_NEUTRAL` (or, for the two command-style rows and
+    /// the one destructive row, their own distinct colors) every pre-issue-#235 `*_menu_rows`
+    /// builder already used for this exact row. [`MenuCommand::NewAgentPane`]'s real chip is
+    /// dynamic ([`Self::menu_command_row`] resolves it directly instead) - this arm, and the four
+    /// macOS-application-menu-only commands (the popover never renders a row for them at all, see
+    /// [`crate::title_bar::menu_model::MenuCommand::app_menu_rows`]'s own docs), are never
+    /// actually shown; kept only so this match stays total rather than reaching for a wildcard
+    /// that could silently start covering a real future command too.
+    fn menu_command_chip(cmd: MenuCommand) -> (&'static str, gpui::Rgba, gpui::Rgba) {
+        match cmd {
+            MenuCommand::OpenFile => (
                 "@",
                 theme::palette::COMMAND_CHIP.0.into(),
                 theme::palette::COMMAND_CHIP.1.into(),
-                "Open File\u{2026}",
-                "search this worktree".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.open_palette(window, cx);
-                // `open_palette` always resets `palette_scope` to `PaletteScope::default()`, so
-                // this must be set after it returns, not before - the same ordering
-                // `crate::work_surface::render::AdeApp::render_plus_menu`'s identical "Open
-                // file…" row already established.
-                this.palette_scope = palette::PaletteScope::Files;
-                cx.notify();
-            }))
-            .into_any_element(),
-            // GitHub issue #90's "Open Folder…" - a real native OS directory picker
-            // ([`AdeApp::start_choose_repo_folder`], the same `gpui::App::prompt_for_paths`
-            // shape `crate::settings::render::AdeApp::start_choose_icon_pack_folder` already
-            // uses), opening the chosen folder as a real, focused repo in *this* window - unlike
-            // the "New Window" row just below, which deliberately opens a brand-new, empty one.
-            // No keybinding (`Vec::new()` combo), matching this menu's own "Open File…" row just
-            // above: this app never binds a keystroke that could also be a plain character a
-            // focused terminal/agent needs, and this row isn't part of `crate::default_key_bindings`
-            // for that same reason.
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::OpenFolder => (
                 "F",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Open Folder\u{2026}",
-                "open a repository".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                this.start_choose_repo_folder(cx);
-                cx.notify();
-            }))
-            .into_any_element(),
-            // GitHub issue #90's "New Window" - a brand-new ADE window in a genuinely empty
-            // state (`AdeApp::new_with_settings`'s own `use_remembered_repo` docs), not this
-            // window's repo and deliberately not whatever folder was last remembered either - the
-            // issue's own wording is explicit that a new window starts empty. Shares
-            // `crate::default_window_options` with [`crate::run`]'s own real startup window, so
-            // the two can never silently drift apart on bounds/titlebar/decorations.
-            //
-            // Deliberately calls `AdeApp::new_with_settings` with *this* window's own already-
-            // loaded `self.settings`/`self.settings_path` - not `AdeApp::new`, which would re-run
-            // `settings_store::Settings::load_or_init()` from scratch. Two real reasons, not just
-            // one: the new window should show the exact settings/keymap/theme this one already
-            // has loaded rather than risk a second, independent disk read racing a concurrent
-            // edit; and `Settings::load_or_init` really does write a fresh default file to disk
-            // the first time it's ever called (`Settings::load_or_init_at`'s own docs) - firing
-            // that unconditionally from a menu click (including from a test that clicks this real
-            // row, per this codebase's own test rule that a test must never touch the real
-            // settings file - `crate::root::focus::palette_focus_tests::open_test_app`'s own
-            // docs) would be a real, surprising side effect a plain "open another window" click
-            // has no business causing.
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::NewWindow => (
                 "N",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "New Window",
-                "empty window".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                let options = crate::default_window_options(cx);
-                let settings = this.settings.clone();
-                let settings_path = this.settings_path.clone();
-                let opened = cx.open_window(options, move |window, cx| {
-                    cx.new(|cx| {
-                        AdeApp::new_with_settings(None, false, settings, settings_path, window, cx)
-                    })
-                });
-                if let Err(err) = opened {
-                    log::error!("failed to open a new ADE window: {err}");
-                }
-                cx.notify();
-            }))
-            .into_any_element(),
-            Self::render_title_menu_divider(),
-            save_row.into_any_element(),
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::Save => (
+                "S",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Settings => (
                 "P",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Settings\u{2026}",
-                "preferences".to_string(),
-                keymap::resolve_combo("mod+,", macos),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.open_settings(window, cx);
-            }))
-            .into_any_element(),
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::CloseWindow => (
                 "\u{d7}",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Quit",
-                "close window".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|_this, _event: &ClickEvent, window, _cx| {
-                // The same real `Window::remove_window` the title bar's own close control (both
-                // the macOS dot and the Windows/Linux caption button) already calls - see
-                // `Self::render_window_controls`'s own docs.
-                window.remove_window();
-            }))
-            .into_any_element(),
-        ]
-    }
-
-    /// The Edit menu: real **text** `Undo`/`Redo` for whichever edit buffer is currently active
-    /// (GitHub issue #17, `crate::text_history`), then Cut/Copy/Paste/Select All against the real
-    /// active edit buffer (File view or merge hand-edit -
-    /// [`crate::code_surface::editing::AdeApp::active_edit_buffer`]), dimmed when there's no real
-    /// edit target right now.
-    ///
-    /// The text rows are dimmed, per [`crate::work_surface::render::render_dropdown_menu_row`]'s
-    /// own enabled/disabled convention, whenever there is genuinely nothing to undo or redo -
-    /// rather than looking exactly as actionable as a working row and silently doing nothing.
-    ///
-    /// Their sub-line says `"editor"`, not `"text"`, and that word is load-bearing: enablement
-    /// comes from [`crate::code_surface::editing::AdeApp::active_edit_buffer`], which only ever
-    /// resolves to an `EditBuffer` (the File view or the merge hand-edit surface). The app's five
-    /// single-line `crate::text_history::TextField` inputs - palette query, rail filter, Settings
-    /// keybindings filter, New file prompt, and the file tree's inline name editor - have real,
-    /// working undo histories of their own that
-    /// this menu genuinely cannot reach, so a row labelled `"text"` would sit permanently dimmed
-    /// while `mod+z` worked perfectly well inside them. Found by an independent adversarial audit.
-    /// Narrowing the label is the honest fix rather than routing the menu through whatever widget
-    /// happens to be focused: a menu click moves focus to the menu, so "the focused text widget"
-    /// is not a thing this row could resolve at click time anyway.
-    fn edit_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let editing = self.active_edit_buffer().is_some();
-        let can_text_undo = self
-            .active_edit_buffer()
-            .is_some_and(|buffer| buffer.can_undo());
-        let can_text_redo = self
-            .active_edit_buffer()
-            .is_some_and(|buffer| buffer.can_redo());
-
-        let mut rows = vec![
-            {
-                let mut row = render_dropdown_menu_row(
-                    "U",
-                    theme::text::DIM.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Undo",
-                    "editor".to_string(),
-                    keymap::resolve_combo("mod+z", macos),
-                    can_text_undo,
-                );
-                if can_text_undo {
-                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.title_menu_open = None;
-                        this.perform_text_undo(cx);
-                    }));
-                }
-                row.into_any_element()
-            },
-            {
-                let mut row = render_dropdown_menu_row(
-                    "R",
-                    theme::text::DIM.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Redo",
-                    "editor".to_string(),
-                    keymap::resolve_combo("mod+shift+z", macos),
-                    can_text_redo,
-                );
-                if can_text_redo {
-                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.title_menu_open = None;
-                        this.perform_text_redo(cx);
-                    }));
-                }
-                row.into_any_element()
-            },
-            Self::render_title_menu_divider(),
-        ];
-
-        macro_rules! edit_action_row {
-            ($chip:expr, $label:expr, $sub:expr, $spec:expr, $handler:ident, $action:expr) => {{
-                let mut row = render_dropdown_menu_row(
-                    $chip,
-                    theme::text::DIM.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    $label,
-                    $sub.to_string(),
-                    keymap::resolve_combo($spec, macos),
-                    editing,
-                );
-                if editing {
-                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        this.title_menu_open = None;
-                        this.$handler($action, window, cx);
-                    }));
-                }
-                rows.push(row.into_any_element());
-            }};
-        }
-        edit_action_row!(
-            "X",
-            "Cut",
-            "selection",
-            "mod+x",
-            handle_editor_cut_action,
-            &EditorCut
-        );
-        edit_action_row!(
-            "C",
-            "Copy",
-            "selection",
-            "mod+c",
-            handle_editor_copy_action,
-            &EditorCopy
-        );
-        edit_action_row!(
-            "V",
-            "Paste",
-            "clipboard",
-            "mod+v",
-            handle_editor_paste_action,
-            &EditorPaste
-        );
-        edit_action_row!(
-            "A",
-            "Select All",
-            "active buffer",
-            "mod+a",
-            handle_editor_select_all_action,
-            &EditorSelectAll
-        );
-
-        rows
-    }
-
-    /// The View menu: the command palette, and the real code-surface zoom controls
-    /// ([`crate::code_surface::zoom::AdeApp::zoom_in`]/`zoom_out`/`reset_zoom` - the same ones
-    /// the Diff/File toolbar's own zoom group calls), dimmed while no file/diff view is actually
-    /// showing to zoom (the exact predicate
-    /// [`crate::code_surface::editing::AdeApp::active_edit_target`]'s own docs give for "Surface C is
-    /// genuinely on screen").
-    fn view_menu_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let code_surface_showing = self.open_change.is_some()
-            && (self.open_diff_file_cache.is_some() || self.code_view == code_view::CodeView::File);
-
-        let mut rows = vec![
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::Undo => (
+                "U",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Redo => (
+                "R",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Cut => (
+                "X",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Copy => (
+                "C",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Paste => (
+                "V",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::SelectAll => (
+                "A",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::CommandPalette => (
                 "P",
                 theme::palette::COMMAND_CHIP.0.into(),
                 theme::palette::COMMAND_CHIP.1.into(),
-                "Command Palette",
-                "search everything".to_string(),
-                keymap::resolve_combo("mod+P", self.window_controls_style().is_macos()),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.open_palette(window, cx);
-            }))
-            .into_any_element(),
-            Self::render_title_menu_divider(),
-        ];
-
-        macro_rules! zoom_row {
-            ($chip:expr, $label:expr, $sub:expr, $method:ident) => {{
-                let mut row = render_dropdown_menu_row(
-                    $chip,
-                    theme::text::DIM.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    $label,
-                    $sub,
-                    Vec::new(),
-                    code_surface_showing,
-                );
-                if code_surface_showing {
-                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.$method(cx);
-                    }));
-                }
-                rows.push(row.into_any_element());
-            }};
-        }
-        zoom_row!("+", "Zoom In", "code view".to_string(), zoom_in);
-        zoom_row!("\u{2212}", "Zoom Out", "code view".to_string(), zoom_out);
-        zoom_row!(
-            "0",
-            "Reset Zoom",
-            format!("{}%", self.settings.appearance.editor_zoom_percent),
-            reset_zoom
-        );
-
-        rows
-    }
-
-    /// The Agent menu: spawn a terminal or agent pane (the same two real actions the `+`
-    /// menu's own top two rows call), cycle the active agent tab
-    /// ([`crate::work_surface::render::AdeApp::select_relative_agent`]), and the real,
-    /// per-active-agent worktree-history actions - archive, "Keep all changes", and "Discard
-    /// worktree". The last two reuse the exact same real methods
-    /// ([`crate::worktree_history::flow::AdeApp::keep_all_changes`]/`request_discard_worktree`)
-    /// and the same busy/two-click-confirm state
-    /// ([`AdeApp::worktree_history_op_in_flight`]/[`AdeApp::discard_confirm_armed`]) the agent
-    /// footer's own buttons already use - a first click on "Discard worktree" only arms
-    /// confirmation and deliberately does **not** close the menu (so the row's own label can
-    /// swap to "confirm discard?" for a real second click); every other row closes the menu on
-    /// click, matching the `+` menu's own convention.
-    fn agent_menu_rows(&self, macos: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let resolved_agent = self.resolved_new_agent_kind();
-        let resolved_kind = ProcessKind::from(resolved_agent);
-        let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);
-        let agent_initial = work_surface::agent_initial(resolved_kind);
-        let agent_label = resolved_agent.label();
-        // Scoped to the *currently selected worktree*'s own agents, matching
-        // `AdeApp::select_relative_agent`'s own real cycling scope (see that method's docs) -
-        // otherwise this row could show "enabled" while the real cycle it drives is a genuine
-        // no-op (or worse, silently jumps to a different worktree) whenever other worktrees have
-        // agents open but this one doesn't have a second one of its own.
-        let can_cycle = self.current_worktree_agents().count() > 1;
-        let active_id = self.agents.active_id();
-        // GitHub issue #90: a genuinely empty window has no real repo root to spawn a new agent
-        // into - see `crate::work_surface::render::AdeApp::new_agent`'s own docs for the real
-        // guard these two rows must agree with, and the concrete bug (a PTY silently spawned
-        // against a different, unopened repo) an independent audit found here.
-        let has_focused_repo = self.focused_repo().is_some();
-
-        let mut new_terminal_row = render_dropdown_menu_row(
-            "\u{276f}",
-            theme::text::DIM.into(),
-            theme::surface::CHIP_NEUTRAL.into(),
-            "New Terminal",
-            "in this worktree".to_string(),
-            keymap::resolve_combo("ctrl+shift+T", macos),
-            has_focused_repo,
-        );
-        if has_focused_repo {
-            new_terminal_row =
-                new_terminal_row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    this.title_menu_open = None;
-                    this.handle_new_terminal_action(&NewTerminal, window, cx);
-                }));
-        }
-        let mut new_agent_pane_row = render_dropdown_menu_row(
-            agent_initial,
-            agent_fg,
-            agent_bg,
-            "New Agent Pane",
-            agent_label.to_string(),
-            keymap::resolve_combo("mod+shift+N", macos),
-            has_focused_repo,
-        );
-        if has_focused_repo {
-            new_agent_pane_row = new_agent_pane_row.on_click(cx.listener(
-                |this, _event: &ClickEvent, window, cx| {
-                    this.title_menu_open = None;
-                    this.handle_new_agent_pane_action(&NewAgentPane, window, cx);
-                },
-            ));
-        }
-
-        let mut rows = vec![
-            new_terminal_row.into_any_element(),
-            new_agent_pane_row.into_any_element(),
-            Self::render_title_menu_divider(),
-        ];
-
-        macro_rules! cyclic_row {
-            ($chip:expr, $label:expr, $delta:expr) => {{
-                let mut row = render_dropdown_menu_row(
-                    $chip,
-                    theme::text::DIM.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    $label,
-                    "cycle tabs".to_string(),
-                    Vec::new(),
-                    can_cycle,
-                );
-                if can_cycle {
-                    row = row.on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        this.title_menu_open = None;
-                        this.select_relative_agent($delta, window, cx);
-                    }));
-                }
-                rows.push(row.into_any_element());
-            }};
-        }
-        cyclic_row!("\u{203a}", "Next Agent", 1isize);
-        cyclic_row!("\u{2039}", "Previous Agent", -1isize);
-        rows.push(Self::render_title_menu_divider());
-
-        let mut archive_row = render_dropdown_menu_row(
-            "A",
-            theme::text::DIM.into(),
-            theme::surface::CHIP_NEUTRAL.into(),
-            "Archive Agent",
-            "close the active tab".to_string(),
-            Vec::new(),
-            active_id.is_some(),
-        );
-        if let Some(id) = active_id {
-            archive_row =
-                archive_row.on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.title_menu_open = None;
-                    this.archive_agent(id, window, cx);
-                }));
-        }
-        rows.push(archive_row.into_any_element());
-
-        let keep_busy = self.worktree_history_op_in_flight
-            == Some(worktree_history::WorktreeHistoryOpKind::Keep);
-        let keep_label: &'static str = if keep_busy {
-            "keeping\u{2026}"
-        } else {
-            "Keep All Changes"
-        };
-        let mut keep_row = render_dropdown_menu_row(
-            "K",
-            theme::text::DIM.into(),
-            theme::surface::CHIP_NEUTRAL.into(),
-            keep_label,
-            "commit the active worktree".to_string(),
-            Vec::new(),
-            active_id.is_some() && !keep_busy,
-        );
-        if let Some(id) = active_id {
-            if !keep_busy {
-                keep_row = keep_row.on_click(cx.listener(
-                    move |this, _event: &ClickEvent, _window, cx| {
-                        this.title_menu_open = None;
-                        this.keep_all_changes(id, cx);
-                    },
-                ));
-            }
-        }
-        rows.push(keep_row.into_any_element());
-
-        let discard_busy = self.worktree_history_op_in_flight
-            == Some(worktree_history::WorktreeHistoryOpKind::Discard);
-        let discard_armed = active_id.is_some() && self.discard_confirm_armed == active_id;
-        let discard_label: &'static str = if discard_busy {
-            "discarding\u{2026}"
-        } else if discard_armed {
-            "confirm discard?"
-        } else {
-            "Discard Worktree"
-        };
-        let mut discard_row = render_dropdown_menu_row(
-            "D",
-            theme::diff::STAT_DEL.into(),
-            theme::surface::CHIP_NEUTRAL.into(),
-            discard_label,
-            "force-remove uncommitted content".to_string(),
-            Vec::new(),
-            active_id.is_some() && !discard_busy,
-        );
-        if let Some(id) = active_id {
-            if !discard_busy {
-                discard_row = discard_row.on_click(cx.listener(
-                    move |this, _event: &ClickEvent, window, cx| {
-                        this.request_discard_worktree(id, window, cx);
-                        // The first click only arms confirmation
-                        // (`AdeApp::discard_confirm_armed`) - keep the menu open so this row's
-                        // own label can swap to "confirm discard?" for a real second click,
-                        // mirroring the agent footer's identical two-step button
-                        // (`crate::work_surface::render::AdeApp::render_footer_action_button`).
-                        // Only the second click - which actually executes and clears the arm
-                        // flag - closes the menu.
-                        if this.discard_confirm_armed != Some(id) {
-                            this.title_menu_open = None;
-                        }
-                        cx.notify();
-                    },
-                ));
-            }
-        }
-        rows.push(discard_row.into_any_element());
-
-        rows
-    }
-
-    /// The Help menu: real links to this project's own GitHub repository (README and issue
-    /// tracker, opened via the real platform `Window`-manager call
-    /// `vendor/zed/crates/gpui/src/app.rs:1408`'s `App::open_url`), and About (the same real,
-    /// already-shipped Settings page - `crate::settings::state::SettingsPage::About` - the palette and
-    /// Settings' own nav already reach; still an honest nav-only placeholder page, per
-    /// `crate::settings::state`'s own module docs, but navigating there is exactly what the Settings
-    /// nav sidebar's own "About" row already does, not a new fabricated affordance).
-    fn help_menu_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        vec![
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::ZoomIn => (
+                "+",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::ZoomOut => (
+                "\u{2212}",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::ResetZoom => (
+                "0",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::NewTerminal => (
+                "\u{276f}",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::NextAgent => (
+                "\u{203a}",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::PreviousAgent => (
+                "\u{2039}",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::ArchiveAgent => (
+                "A",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::KeepAllChanges => (
+                "K",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::DiscardWorktree => (
+                "D",
+                theme::diff::STAT_DEL.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+            MenuCommand::Documentation => (
                 "?",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Documentation",
-                "README on GitHub".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                cx.open_url("https://github.com/ColinEspinas/jerry#readme");
-                cx.notify();
-            }))
-            .into_any_element(),
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::ReportIssue => (
                 "!",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "Report an Issue",
-                "GitHub issues".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.title_menu_open = None;
-                cx.open_url("https://github.com/ColinEspinas/jerry/issues");
-                cx.notify();
-            }))
-            .into_any_element(),
-            Self::render_title_menu_divider(),
-            render_dropdown_menu_row(
+            ),
+            MenuCommand::About => (
                 "i",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
-                "About",
-                "Jerry".to_string(),
-                Vec::new(),
-                true,
-            )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.title_menu_open = None;
-                this.open_settings(window, cx);
-                this.select_settings_page(settings::SettingsPage::About, window, cx);
-            }))
-            .into_any_element(),
-        ]
+            ),
+            MenuCommand::NewAgentPane
+            | MenuCommand::Hide
+            | MenuCommand::HideOthers
+            | MenuCommand::ShowAll
+            | MenuCommand::Quit => (
+                "?",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
+        }
+    }
+
+    /// This command's real sub-label in the popover - reused verbatim from the pre-issue-#235
+    /// `*_menu_rows` builders. [`MenuCommand::ResetZoom`]'s is the one dynamic case that isn't
+    /// [`MenuCommand::NewAgentPane`] (resolved by [`Self::menu_command_row`] instead): the real
+    /// current zoom percentage. The four macOS-application-menu-only commands have no popover row
+    /// to show a sub-label in at all - same "never actually reached" note as
+    /// [`Self::menu_command_chip`].
+    fn menu_command_sub_label(&self, cmd: MenuCommand) -> String {
+        match cmd {
+            MenuCommand::OpenFile => "search this worktree".to_string(),
+            MenuCommand::OpenFolder => "open a repository".to_string(),
+            MenuCommand::NewWindow => "empty window".to_string(),
+            MenuCommand::Save => "active file".to_string(),
+            MenuCommand::Settings => "preferences".to_string(),
+            MenuCommand::CloseWindow => "close window".to_string(),
+            MenuCommand::Undo | MenuCommand::Redo => "editor".to_string(),
+            MenuCommand::Cut | MenuCommand::Copy => "selection".to_string(),
+            MenuCommand::Paste => "clipboard".to_string(),
+            MenuCommand::SelectAll => "active buffer".to_string(),
+            MenuCommand::CommandPalette => "search everything".to_string(),
+            MenuCommand::ZoomIn | MenuCommand::ZoomOut => "code view".to_string(),
+            MenuCommand::ResetZoom => {
+                format!("{}%", self.settings.appearance.editor_zoom_percent)
+            }
+            MenuCommand::NewTerminal => "in this worktree".to_string(),
+            MenuCommand::NextAgent | MenuCommand::PreviousAgent => "cycle tabs".to_string(),
+            MenuCommand::ArchiveAgent => "close the active tab".to_string(),
+            MenuCommand::KeepAllChanges => "commit the active worktree".to_string(),
+            MenuCommand::DiscardWorktree => "force-remove uncommitted content".to_string(),
+            MenuCommand::Documentation => "README on GitHub".to_string(),
+            MenuCommand::ReportIssue => "GitHub issues".to_string(),
+            MenuCommand::About => "Jerry".to_string(),
+            MenuCommand::NewAgentPane
+            | MenuCommand::Hide
+            | MenuCommand::HideOthers
+            | MenuCommand::ShowAll
+            | MenuCommand::Quit => String::new(),
+        }
+    }
+
+    /// This command's real display label - [`MenuCommand::label`] for every command except the
+    /// two whose real label is a live status string (GitHub issue #235 preserves both dynamic
+    /// labels exactly as the pre-issue popover had them): [`MenuCommand::KeepAllChanges`] swaps
+    /// to `"keeping…"` mid-flight, and [`MenuCommand::DiscardWorktree`] swaps to `"discarding…"`
+    /// mid-flight or `"confirm discard?"` once armed by a first click - see
+    /// [`AdeApp::perform_menu_command`]'s own `DiscardWorktree` arm for the real arm/confirm
+    /// state machine this label mirrors.
+    fn menu_command_label(&self, cmd: MenuCommand) -> &'static str {
+        match cmd {
+            MenuCommand::KeepAllChanges => {
+                if self.worktree_history_op_in_flight
+                    == Some(worktree_history::WorktreeHistoryOpKind::Keep)
+                {
+                    "keeping\u{2026}"
+                } else {
+                    cmd.label()
+                }
+            }
+            MenuCommand::DiscardWorktree => {
+                let active_id = self.agents.active_id();
+                let discard_busy = self.worktree_history_op_in_flight
+                    == Some(worktree_history::WorktreeHistoryOpKind::Discard);
+                let discard_armed = active_id.is_some() && self.discard_confirm_armed == active_id;
+                if discard_busy {
+                    "discarding\u{2026}"
+                } else if discard_armed {
+                    "confirm discard?"
+                } else {
+                    cmd.label()
+                }
+            }
+            _ => cmd.label(),
+        }
     }
 }
 
