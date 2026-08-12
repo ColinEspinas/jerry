@@ -62,6 +62,12 @@ tree-sitter-python = "0.25.0"
 serde = { workspace = true }
 toml = { workspace = true }
 serde_json = { workspace = true }
+# GitHub issue #239 phase 2: the agent-hook listener's per-launch auth token. A CSPRNG is the
+# point - this codebase's usual `std::process::id()` + `AtomicU64` uniqueness convention exists
+# for temp *filenames*, where predictability is free; for a token it is the whole vulnerability.
+# Already in the lock file transitively (via `self_update`'s stack), so this is a direct
+# dependency on a crate that was being compiled anyway rather than new build surface.
+rand = "0.9"
 # Real path/`path:line[:col]` link detection inside terminal output (`crate::terminal_links`) -
 # pinned to the same `"1.5"` requirement `vendor/zed/Cargo.toml` itself pins, matching this
 # project's established shared-dependency convention (this is a generic text-scanning utility
@@ -240,6 +246,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
 # pulled in automatically by `gpui_platform`'s own Windows target section.
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
+
+# Unix only, and used for exactly one thing: `kill(pid, 0)` as the portable POSIX check for
+# whether a process still exists, so `crate::hooks::settings_file` can sweep launch directories
+# left behind by a Jerry that was SIGKILLed (where `Drop` never runs) without ever deleting a
+# live instance's working directory - an age-based sweep would eventually do exactly that to a
+# long-running window. Already in the lock file transitively, so no new build surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

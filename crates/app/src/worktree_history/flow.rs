@@ -270,6 +270,7 @@ mod worktree_history_regression_tests {
                 cwd,
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )

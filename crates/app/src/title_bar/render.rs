@@ -927,6 +927,7 @@ mod agent_state_chip_live_tests {
                 wt_b.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             )

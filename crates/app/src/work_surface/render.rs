@@ -77,11 +77,17 @@ impl AdeApp {
             return;
         }
         let cwd = self.active_agent_cwd();
+        // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
+        // `--settings` file and told, through its environment, where to report its hooks. Taken as
+        // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
+        // `crate::hooks::HookRuntime::injection`.
+        let hook_injection = self.hook_injection_for(kind);
         let id = self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
             self.settings.terminal.shell_override(),
+            hook_injection.as_ref(),
             window,
             cx,
         );
@@ -332,6 +338,16 @@ impl AdeApp {
         } else {
             status::ProcessSignal::NoProcess
         };
+        // GitHub issue #239: the second, structural signal - what the process said about itself
+        // through its own terminal (title glyph, OSC 9/777 notification, OSC 9;4 progress),
+        // rather than what its silence implies. Gathered for every kind and gated inside
+        // `derive_status`, which consults it only for a real agent session: a shell's title can
+        // say anything and must never be able to fake agent-ness (see that module's docs).
+        let terminal = status::TerminalSignal {
+            title: pane.title().map(title_signal::classify_title),
+            attention_pinged: pane.has_pending_attention_ping(),
+            progress: pane.progress(),
+        };
         // GitHub issue #225: what makes an exited agent "review ready" is now whether *it* has a
         // real, unreviewed diff against *its own* baseline - not whether its worktree's branch
         // differs from the default branch, which is a different question and was producing a
@@ -343,8 +359,17 @@ impl AdeApp {
         // with more than one open agent this is always `false`, so no agent there claims review
         // readiness it can't honestly substantiate. Such an agent lands on `Idle` instead, which
         // is the same state it would show with an empty review.
+        // GitHub issue #239 phase 2: the third and strongest signal - what the agent reported
+        // about itself through Claude Code's hook side-channel. `Default` (no fact) for every
+        // agent that has never fired one, which is every Codex agent, every shell, and every
+        // Claude agent whose first hook hasn't arrived yet - all of which therefore land on
+        // exactly the Phase 1 behaviour above.
+        let hooks = match &self.hook_runtime {
+            Some(runtime) => runtime.signal_for(agent.id),
+            None => status::HookSignal::default(),
+        };
         let has_unreviewed_changes = self.agent_has_unreviewed_changes(agent.id);
-        status::derive_status(agent.kind, signal, has_unreviewed_changes)
+        status::derive_status(agent.kind, signal, terminal, hooks, has_unreviewed_changes)
     }
 
     /// The context bar's and idle-status footer's `Archive` action - closes the tab via
@@ -404,6 +429,15 @@ impl AdeApp {
             self.close_review_tab(window, cx);
         }
         self.release_review_baseline(id, cx);
+        // GitHub issue #239 phase 2: drop this agent's live hook facts. Agent ids are handed out
+        // by a monotonic counter so they are not reused today, but a stale entry keeping a dead
+        // agent's status alive in the inbox would be a real bug the moment that ever changed -
+        // and there is no reason to keep facts about a pane that no longer exists. The *persisted*
+        // record deliberately survives, exactly like the review baseline immediately above:
+        // that closed agent is what GitHub issue #227 exists to show.
+        if let Some(runtime) = &self.hook_runtime {
+            runtime.forget(id);
+        }
         self.agents.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow
@@ -449,11 +483,16 @@ impl AdeApp {
         let kind = agent.kind;
         let cwd = agent.cwd.clone();
         self.close_agent(id, window, cx);
+        // A respawned agent is a freshly spawned one in every other respect, so it gets the same
+        // real hook injection - otherwise "Retry" would silently produce an agent whose status
+        // fell back to the quiescence heuristic.
+        let hook_injection = self.hook_injection_for(kind);
         self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
             self.settings.terminal.shell_override(),
+            hook_injection.as_ref(),
             window,
             cx,
         );
@@ -486,6 +525,7 @@ impl AdeApp {
                     cwd,
                     self.settings.appearance.terminal_font_size,
                     self.settings.terminal.shell_override(),
+                    None,
                     window,
                     cx,
                 );
@@ -1551,11 +1591,13 @@ impl AdeApp {
             // (`Self::focus_newly_spawned_agent`) - `Entity::update_in` provides it.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind));
                 this.agents.spawn(
                     ProcessKind::Agent(kind),
                     cwd,
                     this.settings.appearance.terminal_font_size,
                     this.settings.terminal.shell_override(),
+                    hook_injection.as_ref(),
                     window,
                     cx,
                 );
@@ -2853,6 +2895,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2860,6 +2903,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2874,6 +2918,66 @@ mod tab_scoping_tests {
             2,
             "both agents spawned into wt-a must show as tabs under it - not just the first \
              one found (the exact bug the old ProjectChild model had)"
+        );
+    }
+
+    /// GitHub issue #227's resume flow: `Agents::spawn_resume` must really produce a
+    /// `claude --resume <session_id> --settings <path>` spawn - `--resume` prepended ahead of the
+    /// real hook injection's own `--settings`, not dropped in favour of it, and the hook
+    /// injection's `JERRY_*` environment still riding along so a resumed conversation keeps
+    /// reporting its status exactly like a fresh one. Uses a real [`crate::hooks::HookRuntime`]
+    /// (a real bound loopback listener, real generated files) rather than a hand-built
+    /// injection, so this exercises the exact object `crate::hooks::flow::AdeApp::
+    /// hook_injection_for` would hand a real spawn.
+    #[gpui::test]
+    fn spawn_resume_prepends_resume_ahead_of_the_real_hook_injection(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let hook_temp = tempfile::tempdir().expect("hook temp dir");
+        let runtime = crate::hooks::HookRuntime::start(hook_temp.path())
+            .expect("the hook runtime must start in a test sandbox");
+        let injection = runtime.injection();
+        let session_id = "5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned();
+
+        let pane = app.update_in(cx, |app, window, cx| {
+            let id = app.agents.spawn_resume(
+                AgentKind::Claude,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                Some(&injection),
+                session_id.clone(),
+                window,
+                cx,
+            );
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the agent this call just spawned")
+                .pane
+                .clone()
+        });
+
+        let spec = pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
+        assert_eq!(
+            spec.program,
+            PathBuf::from("claude"),
+            "a resumed agent must still spawn the real claude binary"
+        );
+        assert_eq!(
+            spec.args[0..2],
+            ["--resume".to_owned(), session_id],
+            "--resume <session_id> must lead the argument list"
+        );
+        assert_eq!(
+            spec.args[2], "--settings",
+            "the real hook injection's own --settings must still follow, not be dropped"
+        );
+        assert!(
+            !spec.env.is_empty(),
+            "the hook injection's JERRY_* environment must still ride along on a resume spawn, \
+             so a resumed conversation keeps reporting its status like a fresh one"
         );
     }
 
@@ -2942,6 +3046,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2950,6 +3055,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3004,6 +3110,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3011,6 +3118,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3067,6 +3175,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             )
@@ -3077,6 +3186,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3125,6 +3235,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3132,6 +3243,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3239,6 +3351,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3314,6 +3427,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3372,6 +3486,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3477,6 +3592,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3554,6 +3670,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3657,6 +3774,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3835,6 +3953,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3842,6 +3961,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3932,6 +4052,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -3947,6 +4068,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -3981,6 +4103,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4175,6 +4298,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -4182,6 +4306,7 @@ mod tab_scoping_tests {
                 ProcessKind::claude(),
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4258,6 +4383,7 @@ mod tab_scoping_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             )
@@ -4323,6 +4449,7 @@ mod tab_scoping_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -4375,6 +4502,7 @@ mod tab_scoping_tests {
                 ProcessKind::Shell,
                 wt_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4492,6 +4620,7 @@ mod terminal_clear_action_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -4499,6 +4628,7 @@ mod terminal_clear_action_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4613,6 +4743,7 @@ mod tab_order_persistence_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -4652,6 +4783,7 @@ mod tab_order_persistence_tests {
                 ProcessKind::claude(),
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -4762,6 +4894,7 @@ mod terminal_clipboard_action_tests {
                 ProcessKind::Shell,
                 repo.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,

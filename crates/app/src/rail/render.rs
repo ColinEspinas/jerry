@@ -130,14 +130,34 @@ impl AdeApp {
                     .find(|item| item.path == agent.cwd)
                     .and_then(|item| item.branch.clone());
 
-                let question_preview = if status_value == Status::Ask {
-                    pane.visible_text_lines()
-                        .into_iter()
-                        .rev()
-                        .find(|line| !line.trim().is_empty())
-                } else {
-                    None
+                // GitHub issue #239 phase 2: real, structured text straight from this agent's own
+                // hook payloads, when it has fired any recently enough to still be describing the
+                // present (`crate::hooks::event::HOOK_SIGNAL_TTL`).
+                let (hook_activity, hook_question) = match &self.hook_runtime {
+                    Some(runtime) => runtime.text_for(agent.id),
+                    None => (None, None),
                 };
+
+                // The grid scrape stays, as the fallback it now is. It is a genuinely worse
+                // signal - the last non-blank line of whatever the CLI happened to have rendered,
+                // which for a permission prompt is as likely to be a box-drawing border or a
+                // truncated menu item as the actual question - but it is the *only* signal for
+                // a Codex agent, a shell, or a Claude agent whose hooks haven't fired yet, so
+                // removing it would be a real regression for every one of those.
+                let question_preview = hook_question.or_else(|| {
+                    if status_value == Status::Ask {
+                        pane.visible_text_lines()
+                            .into_iter()
+                            .rev()
+                            .find(|line| !line.trim().is_empty())
+                    } else {
+                        None
+                    }
+                });
+
+                // Only shown while the agent is actually running: a stale "Bash: cargo test" next
+                // to an idle or review-ready row would describe something that already finished.
+                let activity = hook_activity.filter(|_| status_value == Status::Run);
 
                 let title = match agent.cwd.file_name() {
                     Some(name) => name.to_string_lossy().into_owned(),
@@ -167,9 +187,7 @@ impl AdeApp {
                     del: diff.map(|summary| summary.del).unwrap_or(0),
                     question_preview,
                     exit_code: pane.exit_status().map(|status| status.exit_code()),
-                    // See `AgentRow::activity`'s own docs: no real PTY-activity heuristic is
-                    // wired up yet, so every row threads `None` through for now.
-                    activity: None,
+                    activity,
                     elapsed: agent.spawned_at.elapsed(),
                     review_file_count,
                 }
@@ -177,11 +195,29 @@ impl AdeApp {
             .collect()
     }
 
-    /// Builds one [`WorktreeRow`] per worktree, folding in every currently open agent
-    /// (`crate::rail::state::build_worktree_rows`) - the single real per-render source both rail modes
-    /// now build their list from (see [`Self::render_rail_list`]).
+    /// Builds one [`WorktreeRow`] per worktree, folding in every currently open agent and (GitHub
+    /// issue #227) every real persisted-but-not-currently-running agent
+    /// (`crate::rail::state::build_worktree_rows_with_history`) - the single real per-render
+    /// source both rail modes now build their list from (see [`Self::render_rail_list`]).
     pub(in crate::rail) fn build_worktree_rows(&self, cx: &App) -> Vec<WorktreeRow> {
-        rail::build_worktree_rows(&self.build_worktree_entries(), &self.build_agent_rows(cx))
+        let live_keys = self.live_agent_status_keys();
+        let history: Vec<crate::hooks::history::PastAgent> = self
+            .worktrees
+            .iter()
+            .filter(|item| item.error.is_none())
+            .flat_map(|item| {
+                crate::hooks::history::past_agents_for_worktree(
+                    &self.agent_status_state,
+                    &item.path,
+                    &live_keys,
+                )
+            })
+            .collect();
+        rail::build_worktree_rows_with_history(
+            &self.build_worktree_entries(),
+            &self.build_agent_rows(cx),
+            &history,
+        )
     }
 
     /// Builds the worktree list: every worktree `wt_core::list_worktrees` reported, including
@@ -326,6 +362,11 @@ impl AdeApp {
                     this.ahead_behind_cache = snapshot.ahead_behind;
                     this.process_stats = process_samples;
                     this.apply_review_measurements(review_measurements);
+                    // GitHub issue #239 phase 2: fold each agent's real, hook-derived state into
+                    // the persisted record for issue #227 to build on. Rides this existing timer
+                    // rather than adding one, and only touches the disk when something actually
+                    // changed - see `AdeApp::record_agent_statuses`.
+                    this.record_agent_statuses(cx);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -1127,7 +1168,12 @@ impl AdeApp {
 
         let is_selected = self.active_agent_cwd() == row.path;
         let has_agents = !row.agents.is_empty();
-        let is_expanded = has_agents && self.worktree_is_expanded(row);
+        let has_history = !row.history.is_empty();
+        // GitHub issue #227: a worktree with no live agent but real persisted history must still
+        // be expandable - the caret/expand state used to be gated on `has_agents` alone, which
+        // would hide a bare worktree's history behind a caret that never rendered at all.
+        let has_children = has_agents || has_history;
+        let is_expanded = has_children && self.worktree_is_expanded(row);
         let status = row.aggregate_status();
 
         // 2px left edge = the colour of the worktree's most urgent agent - bare/prunable get
@@ -1149,7 +1195,7 @@ impl AdeApp {
             theme::text::DIM.into()
         };
 
-        let caret = if has_agents {
+        let caret = if has_children {
             let worktree_path = row.path.clone();
             Some(
                 div()
@@ -1258,6 +1304,9 @@ impl AdeApp {
         if is_expanded {
             for agent in &row.agents {
                 container = container.child(self.render_agent_row(agent, cx));
+            }
+            if has_history {
+                container = container.child(self.render_history_section(&row.history, cx));
             }
         }
 
@@ -1430,6 +1479,159 @@ impl AdeApp {
                             .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::PATH)
                             .child(agent.kind.label()),
+                    ),
+            )
+    }
+
+    /// A worktree row's "History" section (GitHub issue #227): a small label, then one
+    /// [`Self::render_past_agent_row`] per real persisted-but-not-running agent. Only ever called
+    /// when `past` is non-empty - see [`Self::render_worktree_row`]'s own `has_history` gate,
+    /// which is also this app's answer to "a worktree with no persisted history shows nothing":
+    /// no empty state renders here at all, because this whole section is never reached for one.
+    fn render_history_section(
+        &self,
+        past: &[crate::hooks::history::PastAgent],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Real wall-clock seconds since the Unix epoch, mirroring
+        // `crate::work_surface::agents::unix_now`'s own `unwrap_or(0)` for a nonsense clock.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pl(px(13.0))
+                    .pt(px(4.0))
+                    .pb(px(2.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(8.5))
+                    .text_color(theme::text::GHOSTER)
+                    .child("HISTORY"),
+            )
+            .children(
+                past.iter()
+                    .map(|past_agent| self.render_past_agent_row(past_agent, now_unix, cx)),
+            )
+    }
+
+    /// One row under a worktree's "History" section: a real, persisted-but-not-currently-running
+    /// agent (`crate::hooks::history::PastAgent`). Deliberately not selectable/highlightable the
+    /// way [`Self::render_agent_row`] is - there is no live pane behind it to switch to - so its
+    /// only real interaction is the trailing resume button.
+    ///
+    /// The button reads "Resume" when [`crate::hooks::history::PastAgent::session_id`] is real -
+    /// a literal `claude --resume <session_id>`, verified against a real binary (see
+    /// `crate::hooks::event::HookReport::session_id`'s own docs) - and "Reopen" otherwise, the
+    /// honest label for the fallback (`crate::hooks::flow::AdeApp::resume_past_agent`) of simply
+    /// spawning a fresh agent back into this worktree. Never claims to continue a conversation it
+    /// cannot.
+    fn render_past_agent_row(
+        &self,
+        past: &crate::hooks::history::PastAgent,
+        now_unix: i64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let status = past.status;
+        let chip_icon = self.render_agent_chip_icon(
+            ProcessKind::Agent(past.kind),
+            px(15.0),
+            self.ui_text_size(9.0),
+        );
+        let last_active = crate::graph_view::state::relative_time(past.updated_at_unix, now_unix);
+        let summary = past
+            .question
+            .clone()
+            .or_else(|| past.activity.clone())
+            .unwrap_or_else(|| format!("{} session", past.kind.label()));
+        let resume_label = if past.session_id.is_some() {
+            "Resume"
+        } else {
+            "Reopen"
+        };
+        let key = past.key.clone();
+        let resume_key = key.clone();
+
+        div()
+            .id(format!("history-row-{key}"))
+            .flex()
+            .flex_col()
+            .pl(px(13.0))
+            .pr(px(10.0))
+            .py(px(4.0))
+            .gap(px(2.0))
+            .border_l(px(1.0))
+            .border_color(theme::border::ZONE)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(chip_icon)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(11.5))
+                            .text_color(theme::text::DIM)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::GHOST)
+                            .child(last_active),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(21.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(status.color()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::FAINT)
+                            .child(format!("was {}", agent_state_word(status))),
+                    )
+                    .child(
+                        div()
+                            .id(format!("history-resume-{resume_key}"))
+                            .flex_none()
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(theme::radius::CHIP)
+                            .bg(theme::button::BLUE_BG)
+                            .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::button::BLUE_FG)
+                            .child(resume_label)
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.resume_past_agent(&resume_key, window, cx);
+                            })),
                     ),
             )
     }
@@ -1849,6 +2051,7 @@ mod rail_row_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -1917,6 +2120,7 @@ mod rail_row_tests {
                 wt.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -1975,6 +2179,7 @@ mod rail_row_tests {
                 ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2039,6 +2244,7 @@ mod rail_row_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2047,6 +2253,7 @@ mod rail_row_tests {
                 ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2103,6 +2310,7 @@ mod rail_row_tests {
                 busy_wt.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2110,6 +2318,7 @@ mod rail_row_tests {
                 ProcessKind::codex(),
                 busy_wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2175,6 +2384,246 @@ mod rail_row_tests {
             1,
             "sanity check: the *displayed* rows really did narrow to the one matching worktree \
              - proving the filter query took effect at all, just not on the header count"
+        );
+    }
+
+    /// GitHub issue #227's read side, exercised through the real `AdeApp`/rail pipeline rather
+    /// than the pure `crate::rail::state` function directly: a worktree with no persisted history
+    /// shows none, a real closed agent's record shows up under `.history`, and a record that
+    /// *also* still has a live agent open (the same real key `record_agent_statuses` would
+    /// persist for a still-running one) is excluded rather than duplicated.
+    #[gpui::test]
+    fn build_worktree_rows_shows_real_persisted_history_and_excludes_a_currently_live_agent(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::work_surface::agents::AgentKind;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+
+        let no_history_row = app.update(cx, |app, cx| {
+            app.build_worktree_rows(cx)
+                .into_iter()
+                .find(|row| row.path == wt.path())
+                .expect("the seeded worktree must produce a row")
+        });
+        assert!(
+            no_history_row.history.is_empty(),
+            "premise: a worktree with no persisted history shows none"
+        );
+
+        let live_id = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                ProcessKind::claude(),
+                wt.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        let live_spawned_at = app.read_with(cx, |app, _| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == live_id)
+                .expect("the just-spawned agent")
+                .spawned_at_unix
+        });
+        let live_key =
+            crate::review::state::baseline_key(wt.path(), AgentKind::Claude, live_spawned_at);
+        let closed_key =
+            crate::review::state::baseline_key(wt.path(), AgentKind::Claude, 1_700_000_000);
+
+        app.update(cx, |app, _cx| {
+            // A real closed agent's persisted record, written through the real `set` the app's
+            // own hook-status poll uses (`crate::hooks::flow::AdeApp::record_agent_statuses`).
+            app.agent_status_state.set(
+                closed_key.clone(),
+                wt.path(),
+                "Claude",
+                1_700_000_000,
+                Status::Review,
+                Some("Edit: src/auth.rs".to_owned()),
+                None,
+                Some("session-closed".to_owned()),
+                1_700_000_500,
+            );
+            // A record for an agent that is *also* still open right now - the real case
+            // `record_agent_statuses` produces for a live agent (it records every agent with a
+            // fresh hook fact, not just closed ones). It must not show up twice.
+            app.agent_status_state.set(
+                live_key.clone(),
+                wt.path(),
+                "Claude",
+                live_spawned_at,
+                Status::Run,
+                None,
+                None,
+                None,
+                1_700_000_600,
+            );
+        });
+
+        let rows = app.update(cx, |app, cx| app.build_worktree_rows(cx));
+        let wt_row = rows
+            .iter()
+            .find(|row| row.path == wt.path())
+            .expect("the seeded worktree must still produce a row");
+        assert_eq!(
+            wt_row.history.len(),
+            1,
+            "exactly the closed agent's record must show, not the live agent's own"
+        );
+        assert_eq!(wt_row.history[0].key, closed_key);
+        assert_eq!(
+            wt_row.history[0].session_id.as_deref(),
+            Some("session-closed")
+        );
+    }
+
+    /// The literal resume path (GitHub issue #227): a real persisted record carrying a real
+    /// `session_id` must spawn a genuine `claude --resume <session_id>`, not just a fresh agent
+    /// in the same worktree.
+    #[gpui::test]
+    fn resume_past_agent_with_a_real_session_id_spawns_a_real_claude_resume(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::work_surface::agents::AgentKind;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+
+        let key = crate::review::state::baseline_key(wt.path(), AgentKind::Claude, 1);
+        app.update(cx, |app, _cx| {
+            app.agent_status_state.set(
+                key.clone(),
+                wt.path(),
+                "Claude",
+                1,
+                Status::Idle,
+                None,
+                None,
+                Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+                2,
+            );
+        });
+
+        let resumed = app.update_in(cx, |app, window, cx| {
+            app.resume_past_agent(&key, window, cx)
+        });
+        assert!(
+            resumed,
+            "a real, decodable record naming a real, known worktree must resume"
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.selected),
+            Some(0),
+            "resuming must select the record's own worktree"
+        );
+
+        let new_pane = app.read_with(cx, |app, _cx| {
+            app.agents
+                .iter_for_cwd(wt.path().to_path_buf())
+                .last()
+                .expect("a new agent must have been spawned into wt")
+                .pane
+                .clone()
+        });
+        let spec = new_pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
+        assert_eq!(spec.program, PathBuf::from("claude"));
+        assert_eq!(
+            spec.args[0..2],
+            [
+                "--resume".to_owned(),
+                "5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()
+            ],
+            "the real session id must lead the resumed spawn's arguments"
+        );
+    }
+
+    /// The honest fallback (GitHub issue #227): a record with no real session id - a Codex
+    /// record, since Codex has no hooks and so never captures one, or a Claude record that
+    /// predates this field - must spawn a *fresh* agent of the recorded kind into the same
+    /// worktree, and must never fabricate a `--resume` flag with no real id behind it.
+    #[gpui::test]
+    fn resume_past_agent_without_a_session_id_reopens_a_fresh_agent_instead(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::work_surface::agents::AgentKind;
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+
+        let key = crate::review::state::baseline_key(wt.path(), AgentKind::Codex, 1);
+        app.update(cx, |app, _cx| {
+            app.agent_status_state.set(
+                key.clone(),
+                wt.path(),
+                "Codex",
+                1,
+                Status::Idle,
+                None,
+                None,
+                None,
+                2,
+            );
+        });
+
+        let resumed = app.update_in(cx, |app, window, cx| {
+            app.resume_past_agent(&key, window, cx)
+        });
+        assert!(resumed);
+
+        let new_pane = app.read_with(cx, |app, _cx| {
+            app.agents
+                .iter_for_cwd(wt.path().to_path_buf())
+                .last()
+                .expect("a new agent must have been spawned into wt")
+                .pane
+                .clone()
+        });
+        let spec = new_pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
+        assert_eq!(spec.program, PathBuf::from("codex"));
+        assert!(
+            spec.args.is_empty(),
+            "with no real session id, the fallback must not fabricate a --resume flag - got \
+             {:?}",
+            spec.args
+        );
+    }
+
+    /// A stale/unknown key (the record was pruned, or never existed) must be a genuine no-op -
+    /// nothing is spawned, and nothing else about the app's state changes.
+    #[gpui::test]
+    fn resume_past_agent_is_a_no_op_for_an_unknown_key(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let count_before = app.read_with(cx, |app, _| app.agents.iter().count());
+
+        let resumed = app.update_in(cx, |app, window, cx| {
+            app.resume_past_agent("no-such-key", window, cx)
+        });
+        assert!(!resumed);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.iter().count()),
+            count_before,
+            "a no-op resume must not spawn anything"
         );
     }
 }
@@ -2586,6 +3035,7 @@ mod agent_chip_icon_pack_tests {
                 ProcessKind::claude(),
                 wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
