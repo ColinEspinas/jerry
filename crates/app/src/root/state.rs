@@ -169,8 +169,17 @@ impl AdeApp {
         // directory - `RepoState::last_focused_existing_path` is the one place that "still
         // exists" check happens, so a deleted/moved remembered folder can never surface as a
         // broken/error startup state here, only as a genuinely empty one.
+        //
+        // The CLI argument is normalized here (`repo::canonical_repo_path`), before anything in
+        // this constructor uses it - it becomes `Self::file_tree_root`, the startup shell's real
+        // cwd, and (via `Self::add_repo`) `Repo::path`, and every one of those is compared by
+        // exact path against git's own fully-resolved worktree paths later. `jerry .` and
+        // `jerry ~/link-to-repo` are the ordinary ways to launch this app, and both used to
+        // produce a repo whose agents matched no worktree row at all; see that function's own
+        // docs. The remembered-repo branch needs no such call: `RepoState`'s keys are already
+        // `repo::repo_key` output, which is canonical by construction.
         let resolved_repo_path: Option<PathBuf> = match repo_path {
-            Some(path) => Some(path),
+            Some(path) => Some(repo::canonical_repo_path(&path)),
             None if use_remembered_repo => loaded_repo_state.last_focused_existing_path(),
             None => None,
         };
@@ -531,8 +540,6 @@ impl AdeApp {
             ),
             plus_menu_open: false,
             plus_button_bounds: gpui::Bounds::default(),
-            plus_menu_repo_anchor: None,
-            rail_plus_button_bounds: HashMap::new(),
             title_menu_open: None,
             title_menu_button_bounds: [gpui::Bounds::default(); title_bar::TitleMenu::ALL.len()],
             _new_agent_pane_task: TaskPool::new(),
@@ -1561,16 +1568,71 @@ impl AdeApp {
         self.edit_buffers.insert((cwd, path), buffer)
     }
 
-    /// Selects a worktree by its real path (rather than an index into
-    /// [`Self::worktrees`], which project-mode rows don't carry) - used by a plain worktree
-    /// row's click handler in "by project" mode. Falls back to doing nothing if the path
-    /// isn't currently in the loaded worktree list (e.g. a stale click racing a reload).
+    /// Selects a worktree by its real path (rather than an index into [`Self::worktrees`], which
+    /// the rail's rows don't carry) - the click handler behind every worktree row in the rail
+    /// (`crate::rail::render::AdeApp::render_worktree_row`).
+    ///
+    /// ## Cross-repo
+    ///
+    /// [`Self::worktrees`] only ever holds the **focused** repo's own live list, so the plain
+    /// index lookup below can only ever find a worktree of the repo already showing. That used to
+    /// be this method's whole body, and it was fine right up until the multi-repo rail landed: a
+    /// non-focused repo's worktrees had no rendered rows to click (its group showed "not loaded
+    /// yet" instead), so the "path isn't in the list" branch was genuinely only ever a stale click
+    /// racing a reload. Now every added repo renders its own real, clickable worktree rows from
+    /// its own [`crate::rail::repo::Repo::worktrees`], and clicking one belonging to a *different*
+    /// repo silently did nothing at all - the reported "I can't switch from a worktree to another
+    /// repo's worktree".
+    ///
+    /// So a path not in [`Self::worktrees`] is now searched for across every added repo's own
+    /// worktree list, and finding it means this is a real cross-repo switch:
+    /// [`Self::checkout_repo_from_rail`] does the entire repo switch (cross-repo agent
+    /// persistence, [`Self::reset_repo_scoped_state`], the watchers, `Agents::activate_for_
+    /// worktree`) - nothing of it is reimplemented here - and then the specific worktree is
+    /// selected within it.
+    ///
+    /// That second step needs [`Self::worktrees`] to already contain the target, and it does not:
+    /// `checkout_repo_from_rail`'s own [`Self::load_worktrees`] call is a real *background* `git
+    /// worktree list --porcelain` fetch, so [`Self::worktrees`] still holds the repo just **left**
+    /// when it returns. Rather than chaining onto that fetch's completion, this seeds
+    /// [`Self::worktrees`] synchronously from the target repo's own already-fetched
+    /// [`crate::rail::repo::Repo::worktrees`] - the exact same data, from the exact same
+    /// `list_worktrees_porcelain` call, kept fresh in the background by
+    /// [`Self::load_repo_worktrees`]/[`Self::start_repo_worktrees_polling`], and the very list the
+    /// row that was just clicked was rendered from in the first place. Selecting against it is
+    /// therefore selecting against precisely what the user saw and clicked, which a continuation
+    /// racing a fresh fetch would not guarantee. The in-flight fetch is not wasted or cancelled:
+    /// it lands moments later and overwrites this seed with an equally real, slightly newer list,
+    /// and because the selection below is recorded *before* it does,
+    /// `crate::rail::worktrees::recover_selection` re-anchors it by path - so a worktree that
+    /// really did vanish between the seed and the fetch falls back to main with a real notice,
+    /// exactly as it would for any other refresh, instead of leaving a dangling index.
+    ///
+    /// Still does nothing at all when `path` isn't found in *any* repo - a stale click racing a
+    /// reload, or a worktree removed on disk since the last render - which is the same documented
+    /// fallback the focused-repo-only version already had.
     pub(crate) fn select_worktree_by_path(
         &mut self,
         path: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(index) = self.worktrees.iter().position(|item| item.path == path) {
+            self.select_worktree(index, window, cx);
+            return;
+        }
+
+        let Some((repo_id, items)) = self.repos.iter().find_map(|repo| {
+            repo.worktrees
+                .iter()
+                .any(|item| item.path == path)
+                .then(|| (repo.id, repo.worktrees.clone()))
+        }) else {
+            return;
+        };
+
+        self.checkout_repo_from_rail(repo_id, window, cx);
+        self.worktrees = items;
         if let Some(index) = self.worktrees.iter().position(|item| item.path == path) {
             self.select_worktree(index, window, cx);
         }

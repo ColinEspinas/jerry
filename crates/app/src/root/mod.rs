@@ -1832,26 +1832,14 @@ pub struct AdeApp {
     /// pattern as [`Self::body_bounds`]). [`Self::render_plus_menu`] positions the popover
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
-    /// Only the real anchor when [`Self::plus_menu_repo_anchor`] is `None` - see that field's own
-    /// docs for the rail's per-repo `+` case.
+    ///
+    /// The *only* anchor this popover has. A per-repo `plus_menu_repo_anchor`/
+    /// `rail_plus_button_bounds` pair used to exist alongside it, for the rail repo header's own
+    /// `+` opening this same popover; that button is inert now (see
+    /// `crate::rail::render::AdeApp::render_repo_group_new_button`'s own docs for why), so
+    /// nothing outside the tab strip can open the plus menu and both fields went with it rather
+    /// than being left capturing bounds for an anchor no click can ever select.
     pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
-    /// Which control opened [`Self::plus_menu_open`]'s popover: `None` for the tab strip's own
-    /// `+` ([`Self::plus_button_bounds`]), `Some(repo_id)` for that repo's own header `+`
-    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`],
-    /// [`Self::rail_plus_button_bounds`]). GitHub issue #113's per-repo `+` used to always
-    /// position the popover off [`Self::plus_button_bounds`] regardless of which button actually
-    /// opened it - visually anchored to the tab strip even when a rail row's own `+` was clicked.
-    /// Set on every real click of either button (see both render sites), read only by
-    /// [`Self::render_plus_menu`].
-    pub(crate) plus_menu_repo_anchor: Option<RepoId>,
-    /// Each rail repo header's own `+` button's painted bounds, captured every render the same
-    /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses - keyed by [`RepoId`] since, unlike
-    /// the tab strip's single `+`, one such button paints per repo group every frame regardless
-    /// of which one (if any) was actually clicked; a single shared field would silently hold
-    /// whichever repo happened to render last. [`Self::render_plus_menu`] looks up the entry for
-    /// [`Self::plus_menu_repo_anchor`] when it is `Some`. No entry until that repo's header has
-    /// painted at least once.
-    pub(crate) rail_plus_button_bounds: std::collections::HashMap<RepoId, gpui::Bounds<Pixels>>,
     /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
     /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
     /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
@@ -1942,13 +1930,13 @@ pub struct AdeApp {
     pub(crate) next_tab_settle_id: u64,
     /// Each currently-rendered tab's own real painted bounds, captured every render by a
     /// `gpui::canvas` overlay in [`work_surface::render::AdeApp::render_tab_chrome`] - the same
-    /// idiom [`Self::plus_button_bounds`]/[`Self::rail_plus_button_bounds`] already use, keyed by
+    /// idiom [`Self::plus_button_bounds`] already uses, keyed by
     /// [`work_surface::TabRef`] since every tab paints its own each frame. This is the *only*
     /// real source of a tab's on-screen width (GPUI's flex layout means no two tabs are the same
     /// size), which [`Self::drop_dragged_tab`] needs to compute how far a drop's neighbouring
     /// tabs must visually slide (see [`Self::tab_slide`]'s own docs). Never pruned when a tab
-    /// closes - a harmless, bounded leak, the same tradeoff [`Self::rail_plus_button_bounds`]
-    /// already makes.
+    /// closes - a harmless, bounded leak, since a `TabRef` is small and the set of tabs a session
+    /// ever opens is bounded by real user action.
     pub(crate) tab_bounds: std::collections::HashMap<work_surface::TabRef, gpui::Bounds<Pixels>>,
     /// The unified tab strip's real neighbour-slide animation - the "every tab other than the
     /// one actually dropped just teleports to its new slot" gap GitHub issue #16 left open
@@ -2345,6 +2333,14 @@ impl AdeApp {
     /// keystroke path, unlike [`repo::repo_key`]'s hot-path sibling
     /// `crate::sidebar::fold_state::worktree_key`.
     pub(crate) fn add_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) -> RepoId {
+        // The single point a repo path enters [`Self::repos`], and so the single place it gets
+        // normalized - see [`repo::canonical_repo_path`]'s own docs for the real, reproduced bug
+        // an unresolved path here causes (an agent spawned into the repo root vanishing from the
+        // rail entirely, because its `cwd` never equals git's own answer for the same directory).
+        // Callers that also *use* the path they passed for real work of their own
+        // ([`Self::open_repo_in_current_window`], startup) normalize it themselves before calling
+        // here rather than relying on this; both are the same idempotent call.
+        let path = repo::canonical_repo_path(&path);
         let key = repo::repo_key(&path);
         if let Some(key) = key.as_deref() {
             if let Some(existing) = self
@@ -2453,6 +2449,10 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Normalized *before* anything else uses it: `path` is not only stored on the `Repo`
+        // below, it is also this method's own spawn cwd, `Agents::activate_for_worktree` key and
+        // `Self::reset_repo_scoped_state` root. See `repo::canonical_repo_path`'s own docs.
+        let path = repo::canonical_repo_path(&path);
         let id = self.add_repo(path.clone(), cx);
         self.focus_repo(id, cx);
 
@@ -2494,9 +2494,7 @@ impl AdeApp {
     /// terminal is running so a freshly opened folder is never inert - this gesture's whole point
     /// is to make a genuinely empty repo (zero open worktrees/agents) reachable as a real
     /// "focused, nothing open yet" state, so the user can choose what to open next themselves
-    /// (the tab strip's own `+` menu, or the rail's own per-repo `+` -
-    /// [`crate::rail::render::AdeApp::render_repo_group`]) instead of always landing in an
-    /// unwanted shell.
+    /// (the tab strip's own `+` menu) instead of always landing in an unwanted shell.
     ///
     /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
     /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
@@ -2506,8 +2504,9 @@ impl AdeApp {
     /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
     /// that `id` has never had a real agent open in comes up genuinely empty, exactly the
     /// "focused, nothing open yet" state this method's own module docs above describe - the user
-    /// opens something next via the tab strip's own `+` or the rail's per-repo `+`
-    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
+    /// opens something next via the tab strip's own `+` (the rail repo header's own `+` is inert
+    /// until a real "add worktree" design lands - see
+    /// [`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
     /// *before*, though, may already have real agents left running from that earlier visit (see
     /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
     /// closed or respawned here, and [`Self::agents`]' `activate_for_worktree` call below makes

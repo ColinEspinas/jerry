@@ -37,7 +37,10 @@ use super::*;
 /// answers "is it open" and "close it", which is all the shared invariant needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuSurface {
-    /// The tab strip's (and rail repo header's) `+` menu - [`AdeApp::plus_menu_open`].
+    /// The tab strip's `+` menu - [`AdeApp::plus_menu_open`]. The rail repo header's own `+` used
+    /// to open this same popover too; it is inert now (see
+    /// `crate::rail::render::AdeApp::render_repo_group_new_button`), so the tab strip is the
+    /// only opener left.
     Plus,
     /// The Windows/Linux title bar's File/Edit/View/Agent/Help dropdowns -
     /// [`AdeApp::title_menu_open`].
@@ -97,10 +100,7 @@ impl AdeApp {
     /// method does is exactly the notify this one deliberately defers.
     pub(crate) fn close_menu_surface(&mut self, surface: MenuSurface) {
         match surface {
-            MenuSurface::Plus => {
-                self.plus_menu_open = false;
-                self.plus_menu_repo_anchor = None;
-            }
+            MenuSurface::Plus => self.plus_menu_open = false,
             MenuSurface::Title => self.title_menu_open = None,
             MenuSurface::TreeContext => self.tree_context_menu = None,
             MenuSurface::Commit => self.commit_menu_open = false,
@@ -117,9 +117,8 @@ impl AdeApp {
     /// This is the whole "opening a second menu closes the first" rule. Every real path that
     /// *opens* one of them calls it with its own surface as `keep` immediately before setting
     /// its own state - so the invariant holds no matter which of the (many) entry points was used:
-    /// a click on the tab strip `+`, a click on a rail repo header's `+`, a title bar label, a
-    /// right-click in the file tree, the commit composer's `▾`, the graph's `Push ▾`, a graph
-    /// row's `⋯`, or a right-click on a graph row.
+    /// a click on the tab strip `+`, a title bar label, a right-click in the file tree, the commit
+    /// composer's `▾`, the graph's `Push ▾`, a graph row's `⋯`, or a right-click on a graph row.
     #[must_use]
     pub(crate) fn close_menu_surfaces_except(&mut self, keep: Option<MenuSurface>) -> bool {
         let mut closed_any = false;
@@ -280,27 +279,6 @@ mod menu_surface_tests {
                      a still-open popover positioned off possibly-moved bounds is the bug"
                 );
             }
-        });
-    }
-
-    /// The `+` menu's repo anchor is part of "which `+` menu is open", not a separate fact: a
-    /// stale anchor left behind by a rail repo header's `+` would position the *next* tab-strip
-    /// `+` menu off that repo row instead of off the `+` button.
-    #[gpui::test]
-    fn closing_the_plus_menu_also_clears_its_repo_anchor(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, cx| {
-            let repo_id = crate::rail::repo::RepoId(7);
-            app.plus_menu_open = true;
-            app.plus_menu_repo_anchor = Some(repo_id);
-            assert!(app.close_all_menu_surfaces(cx));
-            assert_eq!(
-                app.plus_menu_repo_anchor, None,
-                "the anchor must be cleared with the menu it belongs to, or the next tab-strip \
-                 + menu would paint off a rail repo header's bounds"
-            );
         });
     }
 }

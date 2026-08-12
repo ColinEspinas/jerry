@@ -752,6 +752,44 @@ pub(crate) enum ShadowIndexContent {
     TrackedOnly,
 }
 
+/// Filename prefix every shadow index carries, so a file left behind by a hard-killed process is
+/// recognisable as this app's and not mistaken for something git itself owns. Leading dot for the
+/// same reason git's own transient files use one.
+const SHADOW_INDEX_PREFIX: &str = ".jerry-shadow-index-";
+
+/// Creates the throwaway index file [`prepare_shadow_index`] hands to `GIT_INDEX_FILE`, in the
+/// directory holding `real_index_path` - this worktree's own git directory (`<repo>/.git` for a
+/// main checkout, `<common-dir>/worktrees/<name>` for a linked one, since
+/// `git rev-parse --git-path index` already resolves that distinction for us). See
+/// [`prepare_shadow_index`]'s own "Where the shadow index file lives" docs for why this is not
+/// `std::env::temp_dir()`.
+///
+/// Falls back to the OS temp directory in the two cases where the git directory genuinely can't
+/// host the file: `real_index_path` has no parent at all (not reachable through any real
+/// `rev-parse` output, guarded rather than unwrapped), or creating a file there fails - a
+/// repository checked out on a read-only mount being the real instance of the latter, which still
+/// diffs fine through a temp-dir shadow index because an `--intent-to-add` pass writes nothing
+/// into the repository itself. The fallback is deliberately *not* silent about failing too: if
+/// both locations refuse, the git directory's own error is what propagates, since that's the one
+/// describing the repository the caller actually asked about.
+fn shadow_index_file(real_index_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
+    let builder = || {
+        tempfile::Builder::new()
+            .prefix(SHADOW_INDEX_PREFIX)
+            .tempfile()
+    };
+    let Some(git_dir) = real_index_path.parent() else {
+        return builder().map_err(Error::WorktreeIo);
+    };
+    match tempfile::Builder::new()
+        .prefix(SHADOW_INDEX_PREFIX)
+        .tempfile_in(git_dir)
+    {
+        Ok(file) => Ok(file),
+        Err(git_dir_err) => builder().map_err(|_| Error::WorktreeIo(git_dir_err)),
+    }
+}
+
 /// Builds a temporary, throwaway copy of the worktree's index with untracked files added,
 /// either as "intent to add" stubs or with their real content ([`ShadowIndexContent`]), so
 /// `git diff <merge-base>` - which only ever considers paths already present in the index or in
@@ -777,6 +815,31 @@ pub(crate) enum ShadowIndexContent {
 /// racy-index rule). See the inline comment at the copy itself, and the
 /// `a_same_length_edit_racy_against_the_index_timestamp_is_still_reported` test, for the real
 /// bug (GitHub issue #163) that came of not doing this.
+///
+/// ## Where the shadow index file lives
+///
+/// Next to the **real** index, inside this worktree's own git directory
+/// ([`shadow_index_file`]) - deliberately *not* `std::env::temp_dir()`. `git add` writes an
+/// index by creating `<GIT_INDEX_FILE>.lock` beside the target and renaming it over the top,
+/// so whichever directory this file sits in is the directory git has to be able to create,
+/// write, fsync and rename within. Pointing that at the OS-wide temp directory made every
+/// shadow-index-backed operation in this crate (`compute_diff`,
+/// [`crate::review::snapshot_worktree_tree`], [`crate::review::changed_paths_against_tree`])
+/// silently depend on a directory that has nothing to do with the repository being diffed, and
+/// that a real environment can make unusable in ways the repository itself is not: a `TMPDIR`
+/// pointed at a different (or cross-OS-mounted) filesystem, a sandbox with its own private
+/// `/tmp`, a full or quota-exceeded temp filesystem, or a cleanup daemon deleting files by age
+/// (which this function actively invites, since it back-dates the copy's mtime to the real
+/// index's possibly weeks-old mtime just above). A user running against a real repository hit
+/// exactly this class of failure: `git add --intent-to-add -A -- .` exiting 128 with
+/// `fatal: unable to write new index file`, which is git failing to write/rename the index at
+/// this very path. The git directory is guaranteed to be on the same filesystem as the
+/// repository git is already reading and writing, so if git can operate on the repo at all it
+/// can write here.
+///
+/// The file is still a real [`tempfile::NamedTempFile`] with unchanged drop-based cleanup -
+/// only its parent directory changed - and `.git` is never part of the worktree scan, so the
+/// `git add -A -- .` below cannot see (let alone stage) it.
 pub(crate) fn prepare_shadow_index(
     worktree_path: &Path,
     content: ShadowIndexContent,
@@ -795,7 +858,7 @@ pub(crate) fn prepare_shadow_index(
         }
     };
 
-    let shadow = tempfile::NamedTempFile::new().map_err(Error::WorktreeIo)?;
+    let shadow = shadow_index_file(&real_index_path)?;
     match std::fs::read(&real_index_path) {
         Ok(real_index_bytes) => {
             use std::io::Write as _;
@@ -835,7 +898,7 @@ pub(crate) fn prepare_shadow_index(
             // `git init`, before any commit), or one whose index momentarily can't be read
             // (a real interleaving hazard: an agent CLI's own `git add`/`git commit`
             // rewriting the index at the exact moment this reads it), has no real bytes to
-            // seed the shadow copy with. `NamedTempFile::new()` above already created a
+            // seed the shadow copy with. `shadow_index_file` above already created a
             // real, empty *file* at this path though - and an empty-but-*existing* file is
             // not what git treats as "no index yet": confirmed directly (`GIT_INDEX_FILE`
             // pointed at a 0-byte file makes real `git add` fail outright with `fatal: ...
@@ -1711,6 +1774,149 @@ mod tests {
                 .any(|f| f.path == Path::new("brand_new.txt")),
             "the diff must still compute (and still see the real untracked file) even when \
              the real index couldn't be read to seed the shadow copy"
+        );
+    }
+
+    /// The shadow index must be created inside the worktree's own git directory, next to the
+    /// real index - never in `std::env::temp_dir()`. See `prepare_shadow_index`'s own "Where the
+    /// shadow index file lives" docs: `git add` creates `<GIT_INDEX_FILE>.lock` beside this file
+    /// and renames it over the top, so this directory is exactly the one git must be able to
+    /// write and rename within, and the OS temp directory is a real, environment-specific
+    /// liability there (a `TMPDIR` on another mount, a sandboxed private `/tmp`, a full temp
+    /// filesystem, an age-based cleanup daemon).
+    ///
+    /// This is a stronger assertion than "diffing still works with a hostile `TMPDIR`", and is
+    /// the reason no test here mutates `TMPDIR`: `std::env::set_var` is process-global, and this
+    /// test binary runs its tests in parallel threads that use `tempfile` (`TempDir::new` in
+    /// every `init_repo` call) throughout, so pointing the whole process's temp directory
+    /// somewhere unusable mid-run would corrupt unrelated tests rather than prove anything about
+    /// this one. Asserting the real parent directory proves the property directly instead.
+    #[test]
+    fn the_shadow_index_lives_in_the_git_directory_not_the_os_temp_directory() {
+        let repo = init_repo();
+        fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+
+        let git_dir = repo.path().join(".git");
+        let parent = shadow.path().parent().expect("shadow index has a parent");
+        assert_eq!(
+            fs::canonicalize(parent).expect("canonicalize shadow parent"),
+            fs::canonicalize(&git_dir).expect("canonicalize git dir"),
+            "the shadow index must be created inside the repository's own git directory"
+        );
+        assert_ne!(
+            fs::canonicalize(parent).expect("canonicalize shadow parent"),
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir"),
+            "the shadow index must not depend on the OS-wide temp directory at all"
+        );
+        assert!(
+            shadow
+                .path()
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .starts_with(SHADOW_INDEX_PREFIX),
+            "a shadow index left behind by a killed process must be recognisably ours"
+        );
+
+        // Dropping it really deletes it - the `NamedTempFile` cleanup contract is unchanged by
+        // the new parent directory, so a `.git` directory doesn't slowly fill with these.
+        let path = shadow.path().to_path_buf();
+        assert!(path.exists());
+        drop(shadow);
+        assert!(
+            !path.exists(),
+            "the shadow index must still be cleaned up on drop now that it lives under .git"
+        );
+    }
+
+    /// A linked worktree has its *own* private git directory
+    /// (`<common-dir>/worktrees/<name>`), which is where its own index lives - the shadow index
+    /// must land there, not in the main checkout's `.git`, so the two never contend and the
+    /// same-filesystem guarantee holds for a worktree created anywhere on disk.
+    #[test]
+    fn a_linked_worktrees_shadow_index_lives_in_that_worktrees_own_git_directory() {
+        let repo = init_repo();
+        let holder = TempDir::new().expect("tempdir");
+        let wt_path = holder.path().join("linked");
+        drop(holder);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt_path.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(wt_path.join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(&wt_path, ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+        let parent = shadow
+            .path()
+            .parent()
+            .expect("shadow index has a parent")
+            .to_path_buf();
+        assert!(
+            parent.ends_with(Path::new("worktrees").join("linked")),
+            "expected the linked worktree's own admin directory, got {}",
+            parent.display()
+        );
+        drop(shadow);
+        let _ = fs::remove_dir_all(&wt_path);
+    }
+
+    /// The real, reported failure's own shape: a repository with a genuine embedded git
+    /// repository (its own `.git` directory, with its own commit) sitting untracked inside the
+    /// worktree - which is exactly this app's own dogfooding checkout, where `vendor/zed` is a
+    /// real vendored clone. `git add -A` prints a loud multi-line "adding embedded git
+    /// repository" warning on stderr for it, and `compute_diff` must still succeed: that warning
+    /// is stderr noise on a *successful* command, not a failure, and nothing in the diff pipeline
+    /// may treat it as one.
+    #[test]
+    fn an_embedded_git_repository_in_the_worktree_does_not_fail_the_diff() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
+
+        // A real nested repository with a real commit of its own - an embedded repo with *no*
+        // commit checked out is a different case entirely (`git add` fails it outright with
+        // "does not have a commit checked out"), and is not what the report showed.
+        let embedded = repo.path().join("vendor").join("inner");
+        fs::create_dir_all(&embedded).expect("create embedded repo dir");
+        git(&embedded, &["init", "-b", "main"]);
+        git(&embedded, &["config", "user.email", "test@example.com"]);
+        git(&embedded, &["config", "user.name", "Test User"]);
+        fs::write(embedded.join("inner.txt"), "inner\n").expect("write");
+        git(&embedded, &["add", "inner.txt"]);
+        git(&embedded, &["commit", "-m", "inner commit"]);
+
+        let result = diff_against_base(repo.path())
+            .expect("an embedded git repository must not fail the whole diff computation");
+        let DiffBase::Diff(diff) = result else {
+            panic!("expected DiffBase::Diff, got {result:?}");
+        };
+        assert!(
+            diff.files
+                .iter()
+                .any(|f| f.path == Path::new("brand_new.txt")),
+            "the real untracked file must still be reported alongside the embedded repository"
+        );
+
+        // And the real index is still untouched - the embedded repo is still untracked.
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_text.contains("?? vendor/"),
+            "the embedded repository must still be untracked afterwards, got: {status_text}"
         );
     }
 

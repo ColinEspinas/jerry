@@ -1083,23 +1083,45 @@ impl AdeApp {
         group_div
     }
 
-    /// The repo header's own `+` (GitHub issue #113) - the rail-native way to create a terminal
-    /// or agent session directly in a repo, even one with zero open worktrees, without first
-    /// hunting for the tab strip's identical control. Checks `repo_id` out
-    /// ([`Self::checkout_repo_from_rail`] - a no-op if it's already focused) and then opens
-    /// exactly the same real popover the tab strip's own `+` does
-    /// ([`crate::work_surface::render::AdeApp::render_plus_menu`]), rather than reimplementing
-    /// any of its five actions (New terminal, New agent, Git graph, Open file…, Next changed
-    /// file) here: this button only ever decides *which repo* those actions target, never what
-    /// they do once clicked. `Self::load_agent_rows` refresh mirrors
-    /// `crate::work_surface::render::AdeApp::render_tab_strip_plus`'s own click handler, so the
-    /// menu's "New agent" row reflects a fresh `$PATH` search here too.
+    /// The repo header's own `+` - **deliberately inert**, and rendered in this file's own
+    /// disabled-control treatment (dimmed to `theme::text::GHOSTER`, `cursor_default()`, no
+    /// hover, and - per `crate::work_surface::render::render_dropdown_menu_row`'s own
+    /// `enabled: false` contract, which this mirrors - genuinely **no `.on_click` at all**, so
+    /// it can never be a control that looks actionable and silently does nothing).
     ///
-    /// `cx.stop_propagation()` keeps this click from also bubbling into the header's own
-    /// `on_click` right above it in the tree - both would call
-    /// [`Self::checkout_repo_from_rail`] harmlessly (its own guard makes the second call a
-    /// no-op), but only this handler should also open the menu, the same "inner control stops
-    /// the outer row's own click" pattern `render_worktree_row`'s caret already uses.
+    /// This button's real, intended meaning at the *repo* level is "add a new worktree to this
+    /// repo", and this app deliberately has no UI for that yet: `wt_core` has real
+    /// worktree-creation backend methods, but there is a standing decision in this project that
+    /// no "add worktree"/"add repo" entry point ships until a real design lands, so nothing here
+    /// may trigger that flow. Inventing one is out of scope; so is silently deleting the button,
+    /// which would leave an unexplained gap in the header's own layout where the affordance is
+    /// going to live.
+    ///
+    /// It previously did something else entirely, which was the actual bug: check `repo_id` out
+    /// ([`Self::checkout_repo_from_rail`]) and then open the *tab strip's* "add agent/terminal
+    /// tab" popover ([`crate::work_surface::render::AdeApp::render_plus_menu`]) anchored to this
+    /// button. That predates the multi-repo rail (GitHub issue #113), and the multi-repo work -
+    /// which made every added repo's header reachable rather than just the focused one's - is
+    /// what exposed how wrong it is: a repo header has no *worktree* context for those five
+    /// actions to spawn into, so "New terminal"/"New agent" fell through to
+    /// [`Self::active_agent_cwd`]'s repo-root fallback and opened a tab against the repo itself
+    /// rather than any worktree inside it. Tabs belong to worktrees here, not to repos.
+    ///
+    /// With that handler gone, the whole anchoring apparatus it needed went with it (the
+    /// `gpui::canvas` bounds capture, `AdeApp::rail_plus_button_bounds`, and
+    /// `AdeApp::plus_menu_repo_anchor`): nothing in the app opens the plus menu from the rail
+    /// anymore, so keeping a per-render bounds capture feeding a popover that can never anchor
+    /// here would be machinery bound to nothing. The tab strip's own `+`
+    /// (`crate::work_surface::render::AdeApp::render_tab_strip_plus`) is unchanged and is still
+    /// the one real way to open the plus menu - anchored, as it always was, to its own bounds.
+    ///
+    /// The one handler left is a bare `cx.stop_propagation()`, and it is what actually makes this
+    /// button inert: it paints *inside* [`Self::render_repo_group`]'s header, whose own `on_click`
+    /// checks the repo out, so a click landing here with no handler at all would bubble straight
+    /// into that and switch repos - a real side effect from a control drawn as disabled.
+    /// (`render_dropdown_menu_row`'s "a disabled control attaches no `on_click`" rule is about
+    /// never wiring a disabled control to an *action*; a click-through blocker is the opposite of
+    /// that, and doing nothing else here is what keeps it from being mistaken for one.)
     pub(in crate::rail) fn render_repo_group_new_button(
         &self,
         repo_id: repo::RepoId,
@@ -1114,42 +1136,14 @@ impl AdeApp {
             .flex()
             .items_center()
             .justify_center()
-            .cursor_pointer()
+            .cursor_default()
             .rounded(theme::radius::CHIP)
-            .text_color(theme::text::DIM)
+            .text_color(theme::text::GHOSTER)
             .text_size(self.ui_text_size(11.0))
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .child("+")
-            // Captures this button's own painted bounds into `Self::rail_plus_button_bounds`
-            // every render - the same `gpui::canvas` idiom `Self::plus_button_bounds` uses for
-            // the tab strip's `+` (`crate::work_surface::render::AdeApp::render_tab_strip_plus`),
-            // keyed by `repo_id` since more than one of these paints per frame. Lets
-            // `crate::work_surface::render::AdeApp::render_plus_menu` anchor the popover to
-            // *this* button rather than the tab strip's when this is the one that opened it - see
-            // `Self::plus_menu_repo_anchor`'s own docs.
-            .child({
-                let this = cx.entity();
-                gpui::canvas(
-                    move |bounds, _window, cx| {
-                        this.update(cx, |this, _cx| {
-                            this.rail_plus_button_bounds.insert(repo_id, bounds);
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full()
-            })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+            .tooltip(text_tooltip("Add worktree - not available yet"))
+            .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
-                this.checkout_repo_from_rail(repo_id, window, cx);
-                // GitHub issue #176 - see `AdeApp::close_menu_surfaces_except`. Runs before the
-                // two assignments below, since the sweep clears `plus_menu_repo_anchor`.
-                let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Plus));
-                this.plus_menu_open = true;
-                this.plus_menu_repo_anchor = Some(repo_id);
-                this.load_agent_rows(cx);
-                cx.notify();
             }))
     }
 
@@ -1336,7 +1330,16 @@ impl AdeApp {
 
         let path = row.path.clone();
         let header = div()
-            .id(id)
+            .id(id.clone())
+            // Test-only bounds lookup, the same real `gpui::VisualTestContext::debug_bounds`
+            // hook this file's `repo-group-header-N`/`repo-group-new-N` already carry - so a
+            // test can simulate a real mouse click at this row's painted position rather than
+            // reaching past the render side and calling its handler directly. Added for the
+            // cross-repo worktree click (`repo_checkout_tests::
+            // clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it`), whose
+            // whole point is that the row is genuinely rendered and genuinely clickable for a
+            // repo that isn't focused.
+            .debug_selector(move || id)
             .cursor_pointer()
             .flex()
             .items_center()
@@ -3020,16 +3023,219 @@ mod repo_checkout_tests {
         );
     }
 
-    /// The rail's own per-repo `+` (GitHub issue #113's second half: "let the user create a
-    /// terminal / agent session ... from the rail") must check the target repo out first and
-    /// then open the exact same real popover the tab strip's own `+` uses
-    /// (`crate::work_surface::render::AdeApp::render_plus_menu`) - not a second, reimplemented
-    /// spawn path. Driven end to end: click repo B's `+`, then click the real "New terminal" row
-    /// that popover renders, and confirm the spawned terminal's `cwd` is really repo B's.
+    /// Same linked-worktree idiom the sibling test modules use: created with no new commits of its
+    /// own, which is all these tests need from it (a second, real, selectable worktree row).
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> std::path::PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        path
+    }
+
+    /// The reported "I can't switch from a worktree to another repo's worktree". Before the
+    /// multi-repo rail, a non-focused repo's worktrees had no clickable rows at all, so
+    /// `crate::root::AdeApp::select_worktree_by_path`'s focused-repo-only lookup was never asked
+    /// about one; now every added repo renders its own real rows, and clicking one belonging to a
+    /// different repo silently did nothing whatsoever - the path genuinely isn't in
+    /// `AdeApp::worktrees`, so the lookup simply missed and the handler returned.
+    ///
+    /// Driven through a real click on the real painted row, so this covers the whole path from
+    /// `render_worktree_row`'s own `on_click` inward, not just the handler.
     #[gpui::test]
-    fn the_repo_headers_plus_button_opens_the_real_plus_menu_targeting_that_repo(
+    fn clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it(
         cx: &mut TestAppContext,
     ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let repo_b_feature = add_worktree(repo_b.path(), "feature", "b-feature");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_a.path(),
+                "sanity check: repo A is the focused repo, so repo B's worktrees are genuinely \
+                 absent from `app.worktrees`"
+            );
+            assert!(
+                !app.worktrees.iter().any(|item| item.path == repo_b_feature),
+                "sanity check: the row about to be clicked is not in the focused repo's own list \
+                 - which is exactly why the old lookup missed it"
+            );
+        });
+
+        // The row must genuinely have painted for repo B, from repo B's own `Repo::worktrees` -
+        // that is what made this click reachable (and this bug reachable) in the first place.
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        let index = groups
+            .iter()
+            .find(|group| group.repo_name == repo_b.path().file_name().unwrap().to_string_lossy())
+            .expect("repo B's group must exist")
+            .rows
+            .iter()
+            .position(|row| row.path == repo_b_feature)
+            .expect("repo B's linked worktree must be a real, rendered row");
+        let selector: &'static str = Box::leak(
+            format!("worktree-row-{index}-{}", repo_b_feature.display()).into_boxed_str(),
+        );
+        let row_bounds = cx
+            .debug_bounds(selector)
+            .expect("repo B's linked worktree row must have painted");
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_b.path(),
+                "clicking a worktree row under a non-focused repo must really switch focus to \
+                 that repo, not silently no-op"
+            );
+            let selected = app
+                .selected
+                .and_then(|index| app.worktrees.get(index))
+                .map(|item| item.path.clone());
+            assert_eq!(
+                selected,
+                Some(repo_b_feature.clone()),
+                "and the specific worktree that was clicked must be the selected one - not just \
+                 the repo's main checkout"
+            );
+            assert_eq!(
+                app.active_agent_cwd(),
+                repo_b_feature,
+                "the whole point of the switch: new work now targets the clicked worktree"
+            );
+            assert_eq!(
+                app.file_tree_root, repo_b_feature,
+                "and the real repo-scoped reload must have re-rooted at it, proving this went \
+                 through the same real switch machinery a same-repo selection uses"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&repo_b_feature);
+    }
+
+    /// The other half of the cross-repo switch: the seeded worktree list must survive the real
+    /// background `git worktree list --porcelain` fetch that
+    /// `crate::root::AdeApp::checkout_repo_from_rail` kicks off, landing moments later. The
+    /// selection is recorded before that fetch resolves, so
+    /// `crate::rail::worktrees::recover_selection` has to re-anchor it by path rather than leave a
+    /// stale index - if it didn't, the worktree would visibly "unselect itself" a beat after the
+    /// click.
+    #[gpui::test]
+    fn a_cross_repo_worktree_selection_survives_the_repos_own_background_fetch(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        // Two linked worktrees, so the target is not at index 0 and a stale index would be
+        // visible as a wrong selection rather than accidentally landing on the right row.
+        let _first = add_worktree(repo_b.path(), "first", "b-first");
+        let target = add_worktree(repo_b.path(), "second", "b-second");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        // The handler directly this time - `run_until_parked` afterwards is what lets the real
+        // fetch land on top of the synchronous seed.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree_by_path(&target, window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected
+                    .and_then(|i| app.worktrees.get(i))
+                    .map(|w| &w.path),
+                Some(&target),
+                "the selection must be real immediately, from the seeded list - not deferred to \
+                 whenever a background fetch happens to resolve"
+            );
+        });
+
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected
+                    .and_then(|i| app.worktrees.get(i))
+                    .map(|w| &w.path),
+                Some(&target),
+                "and it must still be the selection once repo B's own real fetch has landed and \
+                 replaced the seeded list"
+            );
+            assert!(
+                app.worktree_selection_notice.is_none(),
+                "nothing fell back to main, so no fallback notice may have been raised"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&_first);
+    }
+
+    /// The unchanged half of the contract: a path in no repo at all (a stale click racing a real
+    /// `git worktree remove`) must still do nothing - never a repo switch to something arbitrary.
+    #[gpui::test]
+    fn selecting_a_worktree_path_no_repo_knows_about_still_does_nothing(cx: &mut TestAppContext) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        let gone = repo_b.path().join("worktree-that-never-existed");
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree_by_path(&gone, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_a.path(),
+                "an unknown path must not switch repos"
+            );
+            assert_eq!(app.file_tree_root, repo_a.path());
+        });
+    }
+
+    /// The repo header's own `+` is deliberately inert until a real "add worktree" design lands -
+    /// see `Self::render_repo_group_new_button`'s own docs. It used to check the repo out and open
+    /// the *tab strip's* add-a-tab popover anchored to itself, which was simply the wrong action
+    /// at the repo level: tabs belong to worktrees here, so those rows had no worktree context to
+    /// spawn into and fell through to the repo root.
+    ///
+    /// Driven through a real click on the real painted button, not by reading the render code: it
+    /// must still paint (the affordance stays where it's going to live), and clicking it must
+    /// change nothing at all - no menu, no repo switch, no spawn.
+    #[gpui::test]
+    fn the_repo_headers_plus_button_is_inert(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir a");
         let repo_b = tempfile::tempdir().expect("tempdir b");
 
@@ -3039,59 +3245,157 @@ mod repo_checkout_tests {
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
         cx.run_until_parked();
 
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.agents
-                    .iter_for_cwd(repo_b.path().to_path_buf())
-                    .next()
-                    .is_none(),
-                "sanity check: repo B is a genuinely empty repo - no agents open in it yet"
-            );
-        });
+        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
 
         let new_button_selector: &'static str =
             Box::leak(format!("repo-group-new-{}", repo_b_id.0).into_boxed_str());
-        let new_button_bounds = cx
-            .debug_bounds(new_button_selector)
-            .expect("repo B's own + must have painted");
+        let new_button_bounds = cx.debug_bounds(new_button_selector).expect(
+            "repo B's own + must still paint - a silently removed button would leave an \
+             unexplained gap in the header's layout",
+        );
         cx.simulate_click(new_button_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.plus_menu_open,
+                "the repo header's + must no longer open the tab strip's add-a-tab menu - a repo \
+                 has no worktree context for those actions to spawn into"
+            );
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_a.path(),
+                "and it must no longer check the repo out either - only the header itself does \
+                 that, and this button stops that click propagating nowhere at all"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                agents_before,
+                "nothing may be spawned by a click on an inert control"
+            );
+        });
+
+        assert!(
+            cx.debug_bounds("dropdown-menu-row-New terminal").is_none(),
+            "no plus-menu row may have painted at all"
+        );
+    }
+
+    /// The real, reproduced root cause behind "I spawned a Claude agent and it never showed up in
+    /// the rail": a repo path that isn't fully resolved. `git worktree list --porcelain` always
+    /// reports resolved paths, `crate::root::AdeApp::active_agent_cwd` falls back to
+    /// `Self::focused_repo_path` whenever no worktree is selected (which is exactly the state a
+    /// fresh window - and every `Self::checkout_repo_from_rail` - leaves the app in), and
+    /// `crate::rail::state::build_worktree_rows_with_history` folds an agent into a worktree row
+    /// by exact path equality. So an agent spawned against an unresolved repo path matched *no*
+    /// row, and - because that function maps over worktrees and folds agents into them - was
+    /// dropped from the rail entirely, silently, with no row and no error.
+    ///
+    /// Driven through a symlinked repo path, which is precisely what `jerry ~/link-to-repo` (or
+    /// any `jerry .`/relative invocation) hands the app: the CLI argument used to be stored
+    /// verbatim as `Repo::path`. `crate::rail::repo::canonical_repo_path` normalizes it at the
+    /// boundary instead.
+    #[gpui::test]
+    fn an_agent_spawned_in_a_repo_opened_through_a_symlink_still_appears_in_the_rail(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let link_holder = TempDir::new().expect("tempdir");
+        let link = link_holder.path().join("repo-link");
+        std::os::unix::fs::symlink(repo.path(), &link).expect("symlink");
+        assert_ne!(
+            link,
+            repo.path(),
+            "sanity check: the symlink really is a different path from the real repo"
+        );
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, link.clone());
+        cx.run_until_parked();
+
+        // The real spawn chokepoint every "New agent" entry point funnels through.
+        let agent_id = app.update_in(cx, |app, window, cx| {
+            app.new_agent(ProcessKind::claude(), window, cx);
+            app.agents
+                .active()
+                .expect("New agent must really spawn an agent")
+                .id
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo.path(),
+                "the repo path must be stored fully resolved, not as the symlink it was opened \
+                 through - every per-worktree lookup in this app compares it against git's own \
+                 resolved paths by exact equality"
+            );
+        });
+
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        let group = groups.first().expect("the repo's group must exist");
+        let row = group
+            .all_rows
+            .iter()
+            .find(|row| row.path == repo.path())
+            .expect("the repo's own main checkout must be a real worktree row");
+        assert_eq!(
+            row.agents.len(),
+            1,
+            "the freshly spawned agent must be folded into its own worktree's row - before this \
+             fix its cwd was the unresolved symlink path, which matched no row at all and made \
+             the agent vanish from the rail completely"
+        );
+        assert_eq!(row.agents[0].id, agent_id);
+    }
+
+    /// The same normalization, applied to a repo opened *after* startup through
+    /// `Self::open_repo_in_current_window` (the "Open Folder…" path) rather than the CLI
+    /// argument - a second real entry point for a repo path, which must not be able to
+    /// reintroduce the unresolved-path bug on its own.
+    #[gpui::test]
+    fn opening_a_symlinked_folder_stores_the_resolved_repo_path(cx: &mut TestAppContext) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let link_holder = TempDir::new().expect("tempdir");
+        let link = link_holder.path().join("repo-b-link");
+        std::os::unix::fs::symlink(repo_b.path(), &link).expect("symlink");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(link.clone(), window, cx);
+        });
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.focused_repo_path(),
                 repo_b.path(),
-                "the rail's + must check repo B out before offering to spawn into it"
+                "Open Folder… on a symlinked directory must store the resolved repo path"
             );
             assert!(
-                app.plus_menu_open,
-                "the rail's + must open the real tab-strip plus menu, not spawn silently"
+                app.agents
+                    .iter_for_cwd(repo_b.path().to_path_buf())
+                    .next()
+                    .is_some(),
+                "and the shell it opens there must run in that same resolved path, so it folds \
+                 into the repo's own worktree row in the rail"
             );
         });
 
-        let new_terminal_bounds = cx.debug_bounds("dropdown-menu-row-New terminal").expect(
-            "the real plus menu's own New terminal row must have painted - proving this \
-             reuses `render_plus_menu` rather than a reimplemented popover",
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        let row = groups
+            .iter()
+            .flat_map(|group| group.all_rows.iter())
+            .find(|row| row.path == repo_b.path())
+            .expect("repo B's own main checkout must be a real worktree row");
+        assert_eq!(
+            row.path,
+            repo_b.path(),
+            "sanity check: the row is keyed by git's own resolved path"
         );
-        cx.simulate_click(new_terminal_bounds.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            assert!(
-                !app.plus_menu_open,
-                "picking a row must close the menu, same as every other plus-menu click"
-            );
-            let agent = app
-                .agents
-                .active()
-                .expect("New terminal must really spawn an agent and make it active");
-            assert_eq!(
-                agent.cwd,
-                repo_b.path(),
-                "the spawned terminal must run in repo B - the repo the rail's own + checked \
-                 out - not wherever was focused before the click"
-            );
-        });
     }
 }
 

@@ -1119,8 +1119,8 @@ impl AdeApp {
             )
             .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
             // Captures this tab's own painted bounds into `Self::tab_bounds` every render - the
-            // same `gpui::canvas` idiom `Self::plus_button_bounds`/`Self::rail_plus_button_bounds`
-            // already use. The only real source of a tab's on-screen width (GPUI's flex layout
+            // same `gpui::canvas` idiom `Self::plus_button_bounds`
+            // already uses. The only real source of a tab's on-screen width (GPUI's flex layout
             // means no two tabs are the same size), which `Self::drop_dragged_tab` reads for
             // whichever tab is dragged next, to compute how far a drop's shifted neighbours must
             // slide (`work_surface::state::tab_slide_offsets`'s own docs on why only the
@@ -1357,13 +1357,9 @@ impl AdeApp {
                 let opening = !this.plus_menu_open;
                 // GitHub issue #176: opening this menu closes whatever other menu was open, so
                 // two popovers can never be painted at once. Read *before* the sweep and applied
-                // after it, because the sweep clears `plus_menu_repo_anchor` too.
+                // after it, because the sweep clears `plus_menu_open` itself.
                 let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Plus));
                 this.plus_menu_open = opening;
-                // This is the tab strip's own `+`, not a rail repo header's - see
-                // `Self::plus_menu_repo_anchor`'s own docs for why `Self::render_plus_menu` needs
-                // to know which one opened it.
-                this.plus_menu_repo_anchor = None;
                 if this.plus_menu_open {
                     this.load_agent_rows(cx);
                 }
@@ -1396,18 +1392,10 @@ impl AdeApp {
     /// the spec keeps.
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
-        // See `Self::plus_menu_repo_anchor`'s own docs: a rail repo header's own `+` positions
-        // this popover off that header's own painted bounds, not the tab strip's - falling back
-        // to the tab strip's bounds if that repo's header hasn't painted this popover's anchor
-        // yet (defensive; not a real reachable path through this app's own UI).
-        let bounds = match self.plus_menu_repo_anchor {
-            Some(repo_id) => self
-                .rail_plus_button_bounds
-                .get(&repo_id)
-                .copied()
-                .unwrap_or(self.plus_button_bounds),
-            None => self.plus_button_bounds,
-        };
+        // The tab strip's own `+` is the only control that opens this popover, so its painted
+        // bounds are the only anchor - see `Self::plus_button_bounds`'s own docs for the rail
+        // per-repo anchor that used to exist here and why it's gone.
+        let bounds = self.plus_button_bounds;
 
         let resolved_kind = ProcessKind::from(self.resolved_new_agent_kind());
         let (agent_fg, agent_bg) = work_surface::agent_tint(resolved_kind);

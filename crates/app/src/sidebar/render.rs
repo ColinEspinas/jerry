@@ -3856,7 +3856,19 @@ mod fold_state_tests {
     /// cached, because `worktree_key` calls the blocking `std::fs::canonicalize` and the callers
     /// are clicks and per-ancestor reveals. What's asserted here is the part that would actually
     /// break if the cache were wrong: reaching a worktree through a symlink must record against
-    /// the *canonical* path, and a reveal through that symlink must still persist.
+    /// the *canonical* path, so opening it through the symlink and opening it directly share one
+    /// fold-state entry rather than silently keeping two.
+    ///
+    /// The reveal below goes through the **real** path, not the symlink, and that is the honest
+    /// shape of this now: `crate::rail::repo::canonical_repo_path` resolves the repo path where it
+    /// enters the app (the CLI argument, `AdeApp::add_repo`, `AdeApp::open_repo_in_current_
+    /// window`), so `AdeApp::file_tree_root` is already the real path here even though the app was
+    /// opened through the link - and every path the file tree/palette hands back to a reveal is
+    /// walked from that root, so no real UI path produces a symlinked one anymore. That
+    /// normalization exists for a separate, reproduced bug (an agent spawned against an unresolved
+    /// repo path matched no rail worktree row at all - see that function's docs); this test's own
+    /// property is unaffected by it, and the extra `file_tree_root` assertion below pins the new
+    /// behavior down rather than leaving it implied.
     #[cfg(unix)]
     #[gpui::test]
     fn the_cached_worktree_key_is_canonical_and_records_through_a_symlink(cx: &mut TestAppContext) {
@@ -3877,9 +3889,15 @@ mod fold_state_tests {
             "the cached key must be the canonicalized one, so the same worktree reached through \
              a symlink and through its real path is one entry rather than two"
         );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.file_tree_root.clone()),
+            real.path(),
+            "opening through a symlink must root the tree at the resolved path, so nothing this \
+             app walks or spawns from it carries the unresolved one"
+        );
 
         app.update_in(cx, |app, window, cx| {
-            app.open_palette_file_result(link.join("src/app/main.rs"), window, cx);
+            app.open_palette_file_result(real.path().join("src/app/main.rs"), window, cx);
         });
         cx.run_until_parked();
 
