@@ -2482,43 +2482,45 @@ impl AdeApp {
         self.start_status_polling(cx);
     }
 
-    /// GitHub issue #113's "click a repo header in the rail, even one with zero open
-    /// worktrees, and it checks out" - the rail-native sibling of
-    /// [`Self::open_repo_in_current_window`]. Shares that method's real repo-switch reload
+    /// The rail's real repo-switch engine - the rail-native sibling of
+    /// [`Self::open_repo_in_current_window`]. It began as GitHub issue #113's "click a repo
+    /// header in the rail and it checks out", but the repo header is deliberately **not
+    /// clickable at all anymore** (explicit user direction, after two subtler header-click
+    /// behaviors were both rejected in review - see
+    /// [`crate::rail::render::AdeApp::render_repo_group`]'s own docs: in the rail, only worktree
+    /// rows and agent rows are click targets). So today this has exactly one real caller:
+    /// [`Self::select_worktree_by_path`]'s cross-repo fallback, reached by clicking a worktree
+    /// row under a non-focused repo's group.
+    ///
+    /// Shares `open_repo_in_current_window`'s real repo-switch reload
     /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
     /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target, and real
     /// cross-repo agent persistence - see that method's own "Cross-repo agent persistence" docs,
     /// which apply here unchanged) but deliberately does **not** call [`Self::add_repo`] or spawn
     /// an initial shell: `id` must already be a known [`Self::repos`] entry (every row the rail
     /// renders came from there), and unlike "Open Folder…" - which always guarantees *some* real
-    /// terminal is running so a freshly opened folder is never inert - this gesture's whole point
-    /// is to make a genuinely empty repo (zero open worktrees/agents) reachable as a real
-    /// "focused, nothing open yet" state, so the user can choose what to open next themselves
-    /// (the tab strip's own `+` menu) instead of always landing in an unwanted shell.
+    /// terminal is running so a freshly opened folder is never inert - this focuses the repo
+    /// with nothing selected and nothing spawned, leaving the follow-up worktree selection to
+    /// its caller.
     ///
     /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
     /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
-    /// already [`Self::focused_repo`] (a plain re-click of the repo already showing must not
+    /// already [`Self::focused_repo`] (a repeat call for the repo already showing must not
     /// reset any of its live state).
     ///
     /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
-    /// that `id` has never had a real agent open in comes up genuinely empty, exactly the
-    /// "focused, nothing open yet" state this method's own module docs above describe - the user
-    /// opens something next via the tab strip's own `+` (the rail repo header's own `+` is inert
-    /// until a real "add worktree" design lands - see
+    /// that `id` has never had a real agent open in comes up genuinely empty, a real "focused,
+    /// nothing open yet" state - the user opens something next via the tab strip's own `+` (the
+    /// rail repo header's own `+` is inert until a real "add worktree" design lands - see
     /// [`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
     /// *before*, though, may already have real agents left running from that earlier visit (see
     /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
-    /// closed or respawned here, and [`Self::agents`]' `activate_for_worktree` call below makes
-    /// whichever one was last active in `id`'s repo the one the centre pane
-    /// ([`crate::work_surface::render::AdeApp::render_center_pane`]) actually shows again, the
-    /// same real re-activation [`Self::open_repo_in_current_window`] already does on every call.
-    /// Without it, [`Agents::active`](crate::work_surface::agents::Agents::active) would still
-    /// point at whatever was active in the repo just left, and the centre pane would keep
-    /// rendering *that* repo's terminal even though the rail now shows `id` focused - a real,
-    /// adversarial-audit-found gap this fixes rather than a defensive no-op. There is no
-    /// cross-restart persistence of *which tabs were open* for a repo yet - a real, disclosed gap,
-    /// not a silently stubbed one.
+    /// closed or respawned here, and none are *reactivated* either: `Agents::clear_active` below
+    /// leaves the centre pane showing nothing until a worktree row is genuinely selected (see
+    /// the inline comment below and `Agents::clear_active`'s own docs for why clearing, not
+    /// skipping, is the correct half-measure-free behavior). There is no cross-restart
+    /// persistence of *which tabs were open* for a repo yet - a real, disclosed gap, not a
+    /// silently stubbed one.
     pub(crate) fn checkout_repo_from_rail(
         &mut self,
         id: RepoId,
@@ -2553,17 +2555,18 @@ impl AdeApp {
         // status in the rail (`crate::rail::render::AdeApp::build_agent_rows` folds in every
         // repo's agents, not just the focused one's). What changes here is only which repo's
         // worktree rows the rail shows - explicitly, deliberately, *never* which tab (if any) the
-        // centre pane shows: a repo header is a pure navigation gesture, not a worktree
+        // centre pane shows: focusing a repo is a pure navigation gesture, not a worktree
         // selection, so nothing may spawn from it and nothing may reactivate through it. Two real
         // gaps closed to make that hold, not one: `Self::selected` staying `None` (below) closes
-        // "clicking the header can spawn a tab attributed to the repo itself" (the reported bug);
-        // `Agents::clear_active` closes the other half - reactivating whichever agent was last
-        // active in `id`'s repo *looked* like reasonable cross-repo persistence, but from the
-        // user's side it was the exact same "the repo itself has a tab" behavior, just reached
-        // through an existing agent instead of a freshly spawned one. See `Agents::clear_active`'s
-        // own docs for why this can't simply be *skipped* instead - the centre pane has no
-        // repo-scoping of its own, so doing nothing here would leave whatever was left's terminal
-        // rendering right alongside `id`'s own, unrelated rail rows.
+        // "checking out a repo can spawn a tab attributed to the repo itself" (the reported bug,
+        // back when the repo header was still clickable); `Agents::clear_active` closes the
+        // other half - reactivating whichever agent was last active in `id`'s repo *looked* like
+        // reasonable cross-repo persistence, but from the user's side it was the exact same "the
+        // repo itself has a tab" behavior, just reached through an existing agent instead of a
+        // freshly spawned one. See `Agents::clear_active`'s own docs for why this can't simply
+        // be *skipped* instead - the centre pane has no repo-scoping of its own, so doing
+        // nothing here would leave whatever was left's terminal rendering right alongside `id`'s
+        // own, unrelated rail rows.
         self.agents.clear_active(cx);
         self.selected = None;
         self.worktree_selection_notice = None;
@@ -4250,9 +4253,9 @@ mod repo_list_tests {
                 app.agents.active_id(),
                 None,
                 "checking out repo B again must leave nothing globally active, even though it \
-                 has a real, remembered agent of its own - a repo header click is pure \
-                 navigation, never a worktree selection, so the centre pane must show genuinely \
-                 nothing rather than reactivating it"
+                 has a real, remembered agent of its own - focusing a repo is pure navigation, \
+                 never a worktree selection, so the centre pane must show genuinely nothing \
+                 rather than reactivating it"
             );
             let repo_b_agent = app
                 .agents

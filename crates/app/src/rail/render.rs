@@ -914,9 +914,9 @@ impl AdeApp {
     pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let groups = self.build_repo_groups(cx);
 
-        // GitHub issue #113: a repo with zero open worktrees is still a real, clickable rail
-        // affordance now (`Self::render_repo_group` renders and wires up every group's header
-        // regardless of `rows`/`all_rows`), so the only case left with genuinely nothing to show
+        // GitHub issue #113: a repo with zero open worktrees still renders its own group
+        // (`Self::render_repo_group` paints every group's header regardless of
+        // `rows`/`all_rows`), so the only case left with genuinely nothing to show
         // is no repo at all - defensive rather than reachable through any real UI path today,
         // since `Self::render_rail` (this function's only caller) is itself only ever rendered
         // once `Self::focused_repo` is `Some`, which requires at least one entry in `Self::repos`.
@@ -953,18 +953,22 @@ impl AdeApp {
     /// waiting` when non-zero, and a per-repo `+`), then either every worktree row already
     /// ranked most-urgent-first by [`rail::group_worktrees_by_repo`], or - GitHub issue #113 - a
     /// real inline message when this repo has none to show, rather than the header (and the repo
-    /// itself) simply disappearing from the rail. Every repo's header renders and is clickable
-    /// regardless of `rows`/`all_rows`: [`Self::checkout_repo_from_rail`] is the same real
-    /// "focus/load a different repo" flow `Self::open_repo_in_current_window` (Open Folder…)
-    /// already uses, so a repo with zero open worktrees is a real, reachable "focused, nothing
-    /// open yet" state - not a dead end.
+    /// itself) simply disappearing from the rail. Every repo's header renders regardless of
+    /// `rows`/`all_rows`, but the header is deliberately **not clickable** - no `on_click`, no
+    /// cursor/hover affordance. That is an explicit product decision, made after two subtler
+    /// header-click behaviors were both rejected in review: in the rail, only worktree rows and
+    /// agent rows are click targets, and only worktrees have tabs; a repo header is a plain
+    /// group label. Switching to a different repo is done by clicking any worktree row under its
+    /// group - [`crate::root::AdeApp::select_worktree_by_path`]'s cross-repo fallback runs the
+    /// entire real repo switch ([`Self::checkout_repo_from_rail`]) itself, so the header never
+    /// needs a click handler for repo switching to work.
     ///
     /// The header's `N wt` and (via [`rail::RepoGroup::waiting_count`]) `N worktrees waiting`
     /// are read from `group.all_rows`, **not** `group.rows` - see [`Self::build_repo_groups`]'s
     /// docs for why: this repo's real, complete worktree list, unaffected by the rail's filter
     /// query or by which repo is currently focused. Only the rows actually rendered below the
     /// header (`group.rows`) may be narrower - and only that narrower list, never the header
-    /// click target or the `+`, is affected by an empty vs. filtered-away distinction (see the
+    /// or the `+`, is affected by an empty vs. filtered-away distinction (see the
     /// inline message below, which does distinguish the two for its own wording).
     ///
     /// `group.rows_loaded` gates the `N wt` count itself: `false` (a repo whose own first real
@@ -979,7 +983,6 @@ impl AdeApp {
     ) -> impl IntoElement {
         let waiting_label = rail::waiting_count_label(group.waiting_count());
         let repo_id = group.repo_id;
-        let is_focused_repo = self.focused_repo == Some(repo_id);
 
         let header = div()
             .id(("repo-group-header", repo_id.0))
@@ -991,19 +994,11 @@ impl AdeApp {
             .pt(px(8.0))
             .px(px(12.0))
             .pb(px(4.0))
-            // The already-focused repo's own header isn't a real click target (see
-            // `Self::checkout_repo_from_rail`'s own no-op-when-already-focused guard) - no
-            // `cursor_pointer`/hover affordance for a click that would do nothing, matching
-            // `render_worktree_row`'s identical `is_selected` convention just below in this same
-            // file (see the comment near line 1407 for this file's established "non-actionable
-            // control drops cursor_pointer/hover/on_click" rule).
-            .when(!is_focused_repo, |el| {
-                el.cursor_pointer()
-                    .hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
-            })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.checkout_repo_from_rail(repo_id, window, cx);
-            }))
+            // Deliberately no `on_click`, no `cursor_pointer`, no hover background: this header
+            // is a plain label, not a control - see this function's own docs. Per this file's
+            // established "non-actionable control drops cursor_pointer/hover/on_click" rule (the
+            // comment near `render_worktree_row`'s `is_selected` handling), an unclickable row
+            // must not carry click affordances either.
             .child(
                 div()
                     .font(font(theme::font::SANS))
@@ -1038,7 +1033,7 @@ impl AdeApp {
                         .child(text),
                 )
             })
-            .child(self.render_repo_group_new_button(repo_id, cx));
+            .child(self.render_repo_group_new_button(repo_id));
 
         let mut group_div = div()
             .id(("repo-group", repo_id.0))
@@ -1064,7 +1059,11 @@ impl AdeApp {
                     .text_size(self.ui_text_size(9.5))
                     .text_color(theme::text::GHOSTER)
                     .child(if !group.rows_loaded {
-                        "not loaded yet \u{2013} click to open"
+                        // No "click to open" here: the header is not clickable (see this
+                        // function's own docs), and this repo's own real background fetch
+                        // (`crate::root::AdeApp::start_repo_worktrees_polling`) resolves this
+                        // state on its own moments later.
+                        "not loaded yet"
                     } else if group.all_rows.is_empty() {
                         "no worktrees open yet"
                     } else {
@@ -1115,17 +1114,16 @@ impl AdeApp {
     /// (`crate::work_surface::render::AdeApp::render_tab_strip_plus`) is unchanged and is still
     /// the one real way to open the plus menu - anchored, as it always was, to its own bounds.
     ///
-    /// The one handler left is a bare `cx.stop_propagation()`, and it is what actually makes this
-    /// button inert: it paints *inside* [`Self::render_repo_group`]'s header, whose own `on_click`
-    /// checks the repo out, so a click landing here with no handler at all would bubble straight
-    /// into that and switch repos - a real side effect from a control drawn as disabled.
-    /// (`render_dropdown_menu_row`'s "a disabled control attaches no `on_click`" rule is about
-    /// never wiring a disabled control to an *action*; a click-through blocker is the opposite of
-    /// that, and doing nothing else here is what keeps it from being mistaken for one.)
+    /// A bare `cx.stop_propagation()` click-through blocker used to be attached here too, back
+    /// when this button painted inside a header whose own `on_click` checked the repo out - a
+    /// click landing on a disabled `+` must not fall through and switch repos. The header's
+    /// `on_click` is gone now (a repo header is not a click target at all - see
+    /// [`Self::render_repo_group`]'s own docs), so there is nothing left to block and this
+    /// control follows `render_dropdown_menu_row`'s `enabled: false` contract exactly:
+    /// genuinely no `.on_click` at all.
     pub(in crate::rail) fn render_repo_group_new_button(
         &self,
         repo_id: repo::RepoId,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
             .id(("repo-group-new", repo_id.0))
@@ -1142,9 +1140,6 @@ impl AdeApp {
             .text_size(self.ui_text_size(11.0))
             .child("+")
             .tooltip(text_tooltip("Add worktree - not available yet"))
-            .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-            }))
     }
 
     /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
@@ -2703,12 +2698,15 @@ mod rail_row_tests {
     }
 }
 
-/// GitHub issue #113: "no way to select an empty repo (one with no worktrees/sessions open yet)
-/// from the rail." Real click-through coverage against the live `AdeApp`/window, mirroring
-/// `crate::code_surface::render`'s own `cx.simulate_click`-against-`debug_bounds` technique -
-/// not just calling `Self::checkout_repo_from_rail` directly, since the bug this closes was two
-/// real gaps in the *render* side (no `on_click` on the header at all, and the whole group
-/// vanishing when it had no rows) that a handler-level test alone wouldn't catch a regression of.
+/// Real click-through coverage of the rail's repo groups against the live `AdeApp`/window,
+/// mirroring `crate::code_surface::render`'s own `cx.simulate_click`-against-`debug_bounds`
+/// technique - not just calling handlers directly, since what these tests pin down is the
+/// *render* side's wiring (which elements have click handlers at all, and which deliberately
+/// don't). The rail's click contract, per explicit user direction after two subtler repo-header
+/// behaviors were both rejected: only worktree rows and agent rows are clickable; the repo
+/// header and its `+` are plain, inert chrome; and only worktrees have tabs. Repo switching
+/// happens exclusively through a worktree row under the target repo's group
+/// (`crate::root::AdeApp::select_worktree_by_path`'s cross-repo fallback).
 #[cfg(test)]
 mod repo_checkout_tests {
     use crate::root::focus::palette_focus_tests;
@@ -2749,14 +2747,20 @@ mod repo_checkout_tests {
         dir
     }
 
-    /// Repo B is added (`Self::add_repo`) but never focused - the exact "known to the rail, zero
-    /// open worktrees/agents" state the issue describes: `Self::build_repo_groups` only
-    /// populates real row data for `Self::focused_repo` (see that function's own docs), so repo
-    /// B's group renders with both `rows` and `all_rows` empty. Before this change,
-    /// `Self::render_rail_list` dropped that whole group (header included) from the rail
-    /// entirely; now the header must still paint, with a real, working click target.
+    /// The repo header is **not a click target** - per explicit user direction, after two
+    /// subtler header-click behaviors were both rejected in review (auto-selecting the repo's
+    /// main worktree; then a "pure navigation" focus switch that still re-rooted the sidebar):
+    /// clicking a repo header must do *nothing at all*. Only worktree rows and agent rows are
+    /// clickable in the rail, and repo switching happens exclusively through a worktree row
+    /// (see `clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it` below).
+    ///
+    /// Driven through a real click on the header's own painted bounds - which must still paint
+    /// at all (GitHub issue #113's "the whole group vanished from the rail" half is unchanged) -
+    /// asserting the focused repo, file tree root, worktree selection, and the live agent set
+    /// are all exactly what they were before the click. That proves the header genuinely has no
+    /// `on_click`, not merely that it does something subtler than before.
     #[gpui::test]
-    fn clicking_an_empty_repos_header_checks_it_out(cx: &mut TestAppContext) {
+    fn clicking_a_non_focused_repos_header_does_nothing_at_all(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir a");
         let repo_b = tempfile::tempdir().expect("tempdir b");
         std::fs::write(repo_b.path().join("b.txt"), "b\n").expect("write");
@@ -2768,28 +2772,30 @@ mod repo_checkout_tests {
         cx.run_until_parked();
 
         let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
-        assert_eq!(
-            groups.len(),
-            2,
-            "sanity check: both repos must produce a group at all"
-        );
-        let repo_b_group = groups
-            .iter()
-            .find(|group| group.repo_id == repo_b_id)
-            .expect("repo B's group must render despite having zero rows - GitHub issue #113");
         assert!(
-            repo_b_group.rows.is_empty() && repo_b_group.all_rows.is_empty(),
-            "sanity check: repo B isn't a real git repository, so its real fetch resolves to a \
-             real (not fabricated) empty list"
+            groups.iter().any(|group| group.repo_id == repo_b_id),
+            "sanity check: repo B's group must still render at all (GitHub issue #113) - an \
+             unclickable header still paints"
         );
-        assert_ne!(
-            app.read_with(cx, |app, _| app.focused_repo_path()),
-            repo_b.path(),
+
+        let (focused_before, tree_root_before, selected_before, active_before, agents_before) = app
+            .read_with(cx, |app, _| {
+                (
+                    app.focused_repo_path(),
+                    app.file_tree_root.clone(),
+                    app.selected,
+                    app.agents.active_id(),
+                    app.agents.iter().count(),
+                )
+            });
+        assert_eq!(
+            focused_before,
+            repo_a.path(),
             "sanity check: repo B is not the focused repo before the click"
         );
 
-        // A real click on repo B's header's own painted bounds, not a direct method call - see
-        // this module's own docs for why the render side matters here.
+        // A real click on repo B's header's own painted bounds, not a direct method call - what
+        // this pins down is precisely that the render side attaches no handler.
         let selector: &'static str =
             Box::leak(format!("repo-group-header-{}", repo_b_id.0).into_boxed_str());
         let header_bounds = cx
@@ -2801,13 +2807,28 @@ mod repo_checkout_tests {
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.focused_repo_path(),
-                repo_b.path(),
-                "clicking repo B's header must check it out - focus its repo"
+                focused_before,
+                "clicking a repo header must not switch the focused repo - the header is not a \
+                 click target; only worktree and agent rows are"
             );
             assert_eq!(
-                app.file_tree_root,
-                repo_b.path(),
-                "checking out repo B must really load its own file tree, not just flip a focus id"
+                app.file_tree_root, tree_root_before,
+                "and it must not re-root or reload the file tree either - not \"pure \
+                 navigation\", nothing"
+            );
+            assert_eq!(
+                app.selected, selected_before,
+                "no worktree selection may change"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                active_before,
+                "no tab/agent may activate or deactivate"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                agents_before,
+                "and nothing may be spawned or closed"
             );
         });
     }
@@ -2986,10 +3007,11 @@ mod repo_checkout_tests {
         });
     }
 
-    /// A second click on the already-focused repo's own header must be a real no-op (matching
-    /// `Self::checkout_repo_from_rail`'s own guard) - proven by arming some real per-repo UI
-    /// state and confirming it survives the click, the same "did this actually reset anything"
-    /// shape `open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo`
+    /// The focused-repo half of "the header is not a click target": a click on the
+    /// already-focused repo's own header must also be a genuine no-op - proven by arming some
+    /// real per-repo UI state and confirming it survives the click, the same "did this actually
+    /// reset anything" shape
+    /// `open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo`
     /// (`crate::root::mod`) uses for the real switch case.
     #[gpui::test]
     fn clicking_the_already_focused_repos_header_does_not_reset_it(cx: &mut TestAppContext) {
@@ -3013,7 +3035,7 @@ mod repo_checkout_tests {
             Box::leak(format!("repo-group-header-{}", repo_id.0).into_boxed_str());
         let header_bounds = cx
             .debug_bounds(selector)
-            .expect("the focused repo's own header must still paint (and still be clickable)");
+            .expect("the focused repo's own header must still paint");
         cx.simulate_click(header_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
@@ -3265,8 +3287,8 @@ mod repo_checkout_tests {
             assert_eq!(
                 app.focused_repo_path(),
                 repo_a.path(),
-                "and it must no longer check the repo out either - only the header itself does \
-                 that, and this button stops that click propagating nowhere at all"
+                "and it must not check the repo out either - nothing in a repo group's header \
+                 (the header itself included) is a click target anymore"
             );
             assert_eq!(
                 app.agents.iter().count(),
