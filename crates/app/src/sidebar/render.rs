@@ -1793,17 +1793,18 @@ impl AdeApp {
             // similar-looking bare number that happens to already clear the *old*,
             // insufficient value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
-            .border_b_1()
-            .border_color(theme::border::ROW)
             .cursor_pointer()
-            // A real, separate child for the left selection edge - not `border_l_2()` inside the
-            // `when` below, which used to also silently recolour this row's own `border_b_1()`
-            // separator above (GPUI's `Style::border_color` is one shared value for every edge
-            // of a single element, not per-edge - confirmed directly in `gpui`'s own
-            // `style.rs`), and which only reserved its 2px of space *while* selected, shifting
-            // every row's content 2px right the instant it was clicked. See
+            // No bottom border at all - this row used to carry a permanent `border_b_1()`
+            // alongside a conditional `border_l_2()` inside the `when` below, and because GPUI's
+            // `Style::border_color` is one shared value for every edge of a single element (not
+            // per-edge - confirmed directly in `gpui`'s own `style.rs`), selecting a row silently
+            // recoloured the bottom edge to the selection colour too - a real border appearing
+            // along the bottom on selection, not an intended static separator. The old
+            // `border_l_2()` also only reserved its 2px of space *while* selected, shifting every
+            // row's content 2px right the instant it was clicked. See
             // `crate::graph_view::render::AdeApp::render_graph_row`'s identical fix for the full
-            // reasoning - same bug, same shape, same fix.
+            // reasoning - same bug, same shape, same fix: no bottom border, and a real, separate,
+            // always-painted child for the left selection edge.
             .child(
                 div()
                     .debug_selector({

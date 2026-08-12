@@ -400,14 +400,14 @@ impl AdeApp {
             .gap(px(6.0))
             .h(theme::band::CHANGE_ROW)
             .px(px(10.0))
-            .border_b_1()
-            .border_color(theme::border::ROW)
             .cursor_pointer()
-            // See `crate::graph_view::render::AdeApp::render_graph_row`'s identical fix for why
-            // this is a real, separate child rather than a conditional `border_l_2()`: GPUI's
-            // `Style::border_color` is one shared value for the whole element, so `border_l_2()`
-            // here used to silently recolour the `border_b_1()` separator above too, and only
-            // reserved its own space while selected, shifting every row's content on click.
+            // No bottom border at all - see `crate::graph_view::render::AdeApp::render_graph_row`'s
+            // identical fix for why: GPUI's `Style::border_color` is one shared value for the
+            // whole element, so a conditional `border_l_2()` here used to silently recolour a
+            // permanent `border_b_1()` separator too, a real border appearing along the bottom on
+            // selection - and it only reserved its own space while selected, shifting every row's
+            // content on click. Fixed the same way: no bottom border, and a real, separate,
+            // always-painted child for the left selection edge.
             .child(
                 div()
                     .debug_selector({

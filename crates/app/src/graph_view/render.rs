@@ -1715,21 +1715,21 @@ impl AdeApp {
             .items_center()
             .w_full()
             .h(theme::graph::ROW)
-            .border_b_1()
-            .border_color(theme::border::ROW)
             .cursor_pointer()
-            // The left selection edge is a real, separate child - not `border_l_2()` - because
-            // GPUI's `Style::border_color` is one shared value for every edge of a single
-            // element (confirmed directly in `gpui`'s own `style.rs`: `border_color:
-            // Option<Hsla>`, not per-edge). `border_l_2()` on this same div would silently
-            // overwrite the `border_b_1()` separator's colour above with whichever colour
-            // selection picks - toggling *both* edges together, so a selected row would flash a
-            // second border along its own bottom, not just gain one on the left. Splitting them
-            // into two real elements is what actually fixes that, on top of the layout-shift fix
-            // this already had: `left_0().top_0().bottom_0()` reserves the same 2px of space
-            // whether or not this row is selected (only its own `bg` colour toggles), the same
-            // "always paint the box, only recolour it" convention the tab strip's own selection
-            // underline already uses (`crate::work_surface::render::AdeApp::render_tab_chrome`'s
+            // No bottom border at all - a real, reported design bug, not the row's own intended
+            // separator: this row used to carry a permanent `border_b_1()` alongside a
+            // conditional `border_l_2()` for its selection edge, and because GPUI's
+            // `Style::border_color` is one shared value for every edge of a single element
+            // (confirmed directly in `gpui`'s own `style.rs`: `border_color: Option<Hsla>`, not
+            // per-edge), selecting a row silently recoloured the bottom edge to the selection
+            // colour too - a real border appearing along the bottom on selection, not merely an
+            // intended static separator. The correct fix is not "give the bottom edge its own
+            // colour" - it is "there is no bottom border here at all, only the left selection
+            // edge below", a real, separate child element: `left_0().top_0().bottom_0()`
+            // reserves the same 2px of space whether or not this row is selected (only its own
+            // `bg` colour toggles), the same "always paint the box, only recolour it" convention
+            // the tab strip's own selection underline already uses
+            // (`crate::work_surface::render::AdeApp::render_tab_chrome`'s
             // `div().flex_none().w_full().h(px(1.0)).bg(colors.underline)`).
             .child(
                 div()
@@ -3185,24 +3185,27 @@ fn render_graph_lane_canvas(
     let mut canvas = div()
         .relative()
         .flex_none()
-        // Pinned to the row's own top edge, never centred in it. `render_graph_row` is
-        // `.h(ROW).border_b_1()` and GPUI's taffy layout is *border-box* (`Style::to_taffy`,
-        // `vendor/zed/crates/gpui/src/taffy.rs`, never sets `box_sizing`, so taffy's own
-        // `BoxSizing::BorderBox` default applies) - so the row is 26 tall on the outside but its
-        // content box is only 25, while this canvas is a full `ROW` = 26. Under the row's
-        // `.items_center()` that centres to `(25 - 26) / 2` = **-0.5px**, and every horizontal 1px
-        // stroke in here - the elbow bridge's `h(px(1.0))` and both curve boxes' `border_t_1()`/
-        // `border_b_1()` - then lands on a half-pixel boundary and renders smeared across two
-        // physical pixel rows at half intensity, while the vertical lane lines (x is untouched)
-        // stay crisp. That is the reported "the lines and elbows do not align correctly
-        // vertically", and it is also why four earlier rounds of 1px elbow-seam fixes each only
-        // half-worked: the geometry was computed on an integer grid and every test measured that
-        // integer grid, but the whole canvas was painted half a pixel off it.
+        // Pinned to the row's own top edge, never centred in it. `render_graph_row` used to carry
+        // a permanent `border_b_1()` (removed - see that function's own docs for why a real
+        // border there was itself the bug), and GPUI's taffy layout is *border-box*
+        // (`Style::to_taffy`, `vendor/zed/crates/gpui/src/taffy.rs`, never sets `box_sizing`, so
+        // taffy's own `BoxSizing::BorderBox` default applies) - so with that border present the
+        // row was 26 tall on the outside but its content box was only 25, while this canvas is a
+        // full `ROW` = 26. Under the row's `.items_center()` that centred to `(25 - 26) / 2` =
+        // **-0.5px**, and every horizontal 1px stroke in here - the elbow bridge's `h(px(1.0))`
+        // and both curve boxes' `border_t_1()`/`border_b_1()` - then landed on a half-pixel
+        // boundary and rendered smeared across two physical pixel rows at half intensity, while
+        // the vertical lane lines (x is untouched) stayed crisp. That was the reported "the lines
+        // and elbows do not align correctly vertically", and it is also why four earlier rounds
+        // of 1px elbow-seam fixes each only half-worked: the geometry was computed on an integer
+        // grid and every test measured that integer grid, but the whole canvas was painted half a
+        // pixel off it.
         //
-        // The row has no *top* border, so its content-box top is its border-box top: pinning here
-        // puts the canvas on whole pixels and keeps consecutive canvases exactly `ROW` apart. The
-        // 1px it now overflows past the content box is the row's own separator border, which lane
-        // lines must run through anyway for a line to read as continuous across rows.
+        // `self_start()` is left in place now that the row's content box and border box are the
+        // same 26px (no border on any edge at all): it costs nothing, and it keeps this position
+        // correct - on whole pixels, `ROW` apart between consecutive rows - independent of
+        // whatever the row's own box model happens to be, rather than silently relying on content
+        // box and canvas height staying equal.
         .self_start()
         .overflow_hidden()
         .w(graph_lane_canvas_width(lane_count))
@@ -5374,14 +5377,18 @@ mod graph_elbow_render_tests {
     /// see: it only ever compares one lane canvas against *another* lane canvas, so a constant
     /// offset shared by every row passes it untouched.
     ///
-    /// `render_graph_row` is `.h(ROW).border_b_1()`, and GPUI's taffy layout is border-box
-    /// (`Style::to_taffy` in `vendor/zed/crates/gpui/src/taffy.rs` never sets `box_sizing`, so
-    /// taffy's `BoxSizing::BorderBox` default applies) - so the row's *content* box is 25px while
-    /// the lane canvas is a full `ROW` = 26px. The row's own `.items_center()` then centred it to
-    /// `(25 - 26) / 2` = -0.5px, and every horizontal 1px stroke in the canvas - the elbow's
-    /// straight bridge and both curve boxes' horizontal borders - landed on a half-pixel boundary,
-    /// rendering smeared over two physical pixel rows while the vertical lane lines stayed crisp.
-    /// `render_graph_lane_canvas`'s `.self_start()` is what holds this.
+    /// `render_graph_row` used to be `.h(ROW).border_b_1()`, and GPUI's taffy layout is
+    /// border-box (`Style::to_taffy` in `vendor/zed/crates/gpui/src/taffy.rs` never sets
+    /// `box_sizing`, so taffy's `BoxSizing::BorderBox` default applies) - so with that border
+    /// present the row's *content* box was 25px while the lane canvas is a full `ROW` = 26px.
+    /// The row's own `.items_center()` then centred it to `(25 - 26) / 2` = -0.5px, and every
+    /// horizontal 1px stroke in the canvas - the elbow's straight bridge and both curve boxes'
+    /// horizontal borders - landed on a half-pixel boundary, rendering smeared over two physical
+    /// pixel rows while the vertical lane lines stayed crisp. The row's bottom border is gone now
+    /// (a real, reported design bug in its own right - see `render_graph_row`'s own docs), so
+    /// content box and border box are equal and this could no longer occur even without
+    /// `render_graph_lane_canvas`'s own `.self_start()` - which stays regardless, since it costs
+    /// nothing and keeps this correct independent of the row's own box model.
     ///
     /// Asserted on the canvas' offset *within its own row*, and on the offset being a whole
     /// pixel - the two facts the centring broke, neither of which any existing test looked at.
@@ -5436,8 +5443,8 @@ mod graph_elbow_render_tests {
     /// tall and each sits `ROW` below the last, so the pixel row where one canvas' clip cuts the
     /// line is the very pixel row where the next canvas' own full-height `LaneSegment` resumes it.
     /// A gap or an overlap here would turn the clip into a visible dash (or bring back the doubled
-    /// line an earlier round fixed), and neither is visible from geometry alone - it depends on the
-    /// real flex layout of a row whose `border_b_1()` makes its content box shorter than `ROW`.
+    /// line an earlier round fixed), and neither is visible from geometry alone - it depends on
+    /// the row's own real flex layout, not just the two numbers this test's own docs cite.
     #[gpui::test]
     fn consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line(
         cx: &mut TestAppContext,
