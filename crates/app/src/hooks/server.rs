@@ -345,6 +345,20 @@ impl HookListener {
             inbox.forget(id);
         }
     }
+
+    /// This agent's most recently reported real Claude Code `session_id` (GitHub issue #227),
+    /// if it has ever reported one - the id `claude --resume`/`-r` takes, verified against a real
+    /// binary (see [`crate::hooks::event::HookReport::session_id`]).
+    ///
+    /// Deliberately **not** gated by [`event::HOOK_SIGNAL_TTL`] the way [`Self::text_for`] is: an
+    /// activity/question line describes the *present* and must not outlive its truth, but a
+    /// session id identifies a *conversation*, which stays exactly as resumable an hour after the
+    /// agent went quiet as it was the instant its last hook fired - the whole reason GitHub
+    /// issue #227 wants to persist it at all.
+    pub fn session_id_for(&self, id: AgentId) -> Option<String> {
+        let inbox = self.inbox.lock().ok()?;
+        inbox.get(id)?.report.session_id.clone()
+    }
 }
 
 impl Drop for HookListener {
@@ -720,6 +734,28 @@ mod tests {
         assert_eq!(question, None);
         // A different agent id must be untouched by another agent's event.
         assert_eq!(listener.signal_for(8).fact, None);
+    }
+
+    #[test]
+    fn a_real_session_id_round_trips_into_the_inbox_for_history_and_resume() {
+        // GitHub issue #227's whole resume flow starts here: the real `session_id` a hook payload
+        // carries must reach `session_id_for` unchanged.
+        let listener = HookListener::start().expect("listener must start");
+        let body =
+            r#"{"session_id":"5af4c210-34fa-4ab2-9c35-f6ceab76551c","hook_event_name":"Stop"}"#;
+        let response = post(
+            listener.port(),
+            listener.token(),
+            "event=Stop&agent=11",
+            body,
+        );
+        assert!(response.starts_with("HTTP/1.1 204"), "got {response:?}");
+        assert_eq!(
+            listener.session_id_for(11).as_deref(),
+            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c")
+        );
+        // No event ever recorded for this id: no session id to report.
+        assert_eq!(listener.session_id_for(12), None);
     }
 
     #[test]

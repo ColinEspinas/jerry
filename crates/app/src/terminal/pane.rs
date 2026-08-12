@@ -1105,6 +1105,15 @@ impl TerminalPane {
         self.font_size_px
     }
 
+    /// Test-only seam: the real [`TerminalSpec`] this pane was constructed with - lets a test
+    /// outside this module (GitHub issue #227's resume flow) assert on the actual program/args/env
+    /// a real [`crate::work_surface::agents::Agents::spawn`]/`spawn_resume` call produced, rather
+    /// than only on its side effects.
+    #[cfg(test)]
+    pub(crate) fn spec_for_test(&self) -> &TerminalSpec {
+        &self.spec
+    }
+
     /// Test-only seam: the palette the most recent real paint used - see
     /// [`Self::last_painted_palette`].
     #[cfg(test)]

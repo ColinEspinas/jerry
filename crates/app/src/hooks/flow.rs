@@ -5,15 +5,116 @@
 //! [`crate::root::AdeApp::agent_status_state`], and persists only when something genuinely
 //! changed.
 //!
-//! Nothing renders any of this. It exists so GitHub issue #227 ("Agent history and
-//! resume/recover") has real, structured, dated data to build on rather than having to invent a
-//! capture mechanism first - see [`crate::hooks::store`]'s module docs.
+//! Originally nothing rendered any of this - it existed so GitHub issue #227 ("Agent history and
+//! resume/recover") would have real, structured, dated data to build on rather than having to
+//! invent a capture mechanism first (see [`crate::hooks::store`]'s module docs). Issue #227's own
+//! read side now reads it back - [`crate::hooks::history`] and the rail's history rows.
 
-use gpui::Context;
+use gpui::{Context, Window};
 
 use crate::root::AdeApp;
+use crate::work_surface::agents::{AgentKind, ProcessKind};
 
 impl AdeApp {
+    /// Every currently open agent's own persisted-status key
+    /// (`crate::review::state::baseline_key`) - GitHub issue #227's "this one is still live, don't
+    /// show it twice under History" exclusion set for
+    /// [`crate::hooks::history::past_agents_for_worktree`].
+    ///
+    /// A live agent's key is computed the identical way [`Self::record_agent_statuses`] computes
+    /// it before writing - same function, same three inputs (`cwd`, `kind`, `spawned_at_unix`) -
+    /// so this can never drift into excluding the wrong record.
+    pub(crate) fn live_agent_status_keys(&self) -> std::collections::HashSet<String> {
+        self.agents
+            .iter()
+            .filter_map(|agent| {
+                let ProcessKind::Agent(kind) = agent.kind else {
+                    return None;
+                };
+                Some(crate::review::state::baseline_key(
+                    &agent.cwd,
+                    kind,
+                    agent.spawned_at_unix,
+                ))
+            })
+            .collect()
+    }
+
+    /// GitHub issue #227's resume action: looks `key` up in
+    /// [`Self::agent_status_state`], selects its worktree, and spawns a real agent back into it.
+    ///
+    /// **Literal conversation resume** (`claude --resume <session_id>`, via
+    /// [`crate::work_surface::agents::Agents::spawn_resume`]) when the record actually carries a
+    /// real Claude Code `session_id` - verified against a real `claude` 2.1.228 binary to
+    /// genuinely pick the same conversation back up (see
+    /// [`crate::hooks::event::HookReport::session_id`]'s own docs for how). Otherwise, a fresh
+    /// agent of the same recorded kind spawned into the same worktree - the honest fallback for a
+    /// Codex record (Codex has no hooks and so never captures a session id at all - Jerry never
+    /// claims otherwise) or for a Claude record predating this field. That fallback reconnects the
+    /// user to the right *place*, even though it cannot continue the exact prior conversation.
+    ///
+    /// A no-op returning `false` if `key` no longer names a decodable record, or its worktree is
+    /// no longer one of [`crate::root::AdeApp::worktrees`] (removed or pruned since it was
+    /// recorded) - there is no real place left to resume into.
+    pub(crate) fn resume_past_agent(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(past) = crate::hooks::history::find(&self.agent_status_state, key) else {
+            return false;
+        };
+        if !self
+            .worktrees
+            .iter()
+            .any(|item| item.path == past.worktree && item.error.is_none())
+        {
+            return false;
+        }
+
+        self.select_worktree_by_path(&past.worktree, window, cx);
+
+        let process_kind = ProcessKind::Agent(past.kind);
+        // GitHub issue #239 phase 2's injection, exactly as a fresh spawn would get it - a
+        // resumed conversation is exactly as real an agent as a new one, and should keep
+        // reporting its status through the same hook side-channel.
+        let hook_injection = self.hook_injection_for(process_kind);
+        let font_size = self.settings.appearance.terminal_font_size;
+        let shell_override = self.settings.terminal.shell_override();
+        let id = match (past.kind, past.session_id.clone()) {
+            (AgentKind::Claude, Some(session_id)) => self.agents.spawn_resume(
+                AgentKind::Claude,
+                past.worktree.clone(),
+                font_size,
+                shell_override,
+                hook_injection.as_ref(),
+                session_id,
+                window,
+                cx,
+            ),
+            _ => self.agents.spawn(
+                process_kind,
+                past.worktree.clone(),
+                font_size,
+                shell_override,
+                hook_injection.as_ref(),
+                window,
+                cx,
+            ),
+        };
+        // Mirrors `crate::work_surface::render::AdeApp::new_agent`'s own post-spawn steps: a real
+        // review baseline for the newly spawned pane, closing a now-invalid gated review tab, and
+        // moving focus onto it.
+        self.capture_review_baseline(id, cx);
+        self.close_gated_review_tab(window, cx);
+        self.focus_newly_spawned_agent(window, cx);
+        self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
+        cx.notify();
+        true
+    }
+
     /// The hook injection for an agent about to be spawned, bringing the listener up on first use.
     ///
     /// `None` for anything that isn't a Claude agent, and `None` if the runtime can't start - both
@@ -119,7 +220,7 @@ impl AdeApp {
             return;
         }
 
-        let entries: Vec<(String, std::path::PathBuf, &'static str, i64, _, _, _)> = recordable
+        let entries: Vec<(String, std::path::PathBuf, &'static str, i64, _, _, _, _)> = recordable
             .into_iter()
             .filter_map(|(id, key, cwd, kind_label, spawned_at_unix)| {
                 let agent = self.agents.iter().find(|agent| agent.id == id)?;
@@ -128,6 +229,15 @@ impl AdeApp {
                     Some(runtime) => runtime.text_for(id),
                     None => (None, None),
                 };
+                // GitHub issue #227: the real Claude Code session id this agent's hooks have
+                // reported, if any - deliberately read without the `fresh()`/TTL gate
+                // `text_for` applies (see `HookRuntime::session_id_for`'s own docs), since a
+                // conversation stays exactly as resumable after its hooks go quiet as it was
+                // the instant its last one fired.
+                let session_id = self
+                    .hook_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.session_id_for(id));
                 Some((
                     key,
                     cwd,
@@ -136,11 +246,14 @@ impl AdeApp {
                     status,
                     activity,
                     question,
+                    session_id,
                 ))
             })
             .collect();
 
-        for (key, cwd, kind_label, spawned_at_unix, status, activity, question) in entries {
+        for (key, cwd, kind_label, spawned_at_unix, status, activity, question, session_id) in
+            entries
+        {
             if self.agent_status_state.set(
                 key.clone(),
                 &cwd,
@@ -149,6 +262,7 @@ impl AdeApp {
                 status,
                 activity,
                 question,
+                session_id,
                 now,
             ) {
                 changed = true;

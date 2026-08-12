@@ -109,6 +109,22 @@ pub struct HookReport {
     /// The real permission reason / notification message, already truncated to
     /// [`QUESTION_MAX_CHARS`]. `None` unless the event actually carries human-facing text.
     pub question: Option<String>,
+    /// The real Claude Code `session_id` this payload carried, if any (GitHub issue #227).
+    ///
+    /// Verified present on *every* real event type this module parses - a real `claude` 2.1.228
+    /// binary was driven through `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`
+    /// and `Stop` (a scratch project, `--settings` pointed at a capture script) and every single
+    /// payload carried the same `session_id` for the whole conversation, including across a real
+    /// `claude --resume <session_id>` re-invocation (`SessionStart`'s `source` simply reads
+    /// `"resume"` instead of `"startup"`). That is the real, durable identifier `claude
+    /// --resume`/`-r` takes - confirmed against the same real binary: resuming by this id and
+    /// asking what the agent had just done answered correctly, proving it is the *same*
+    /// conversation rather than a fresh one that merely inherited some context.
+    ///
+    /// `None` for a payload that omits it (untrusted input off the socket - not every hand-made
+    /// or malformed request will carry one), which a reader must treat as "no id available",
+    /// never as a reason to fail the rest of the report.
+    pub session_id: Option<String>,
 }
 
 impl HookReport {
@@ -119,6 +135,7 @@ impl HookReport {
             fact,
             activity: None,
             question: None,
+            session_id: None,
         }
     }
 }
@@ -209,7 +226,16 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
         return None;
     }
 
-    match event_name {
+    // Read once, attached to whatever report the match below produces (GitHub issue #227): every
+    // real event carries the same session-scoped `session_id`, so extracting it per-arm would be
+    // pure repetition - see [`HookReport::session_id`]'s own docs for why this field exists at
+    // all and how it was verified.
+    let session_id = value
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+
+    let report = match event_name {
         "SessionStart" | "UserPromptSubmit" => Some(HookReport::bare(HookFact::Working)),
 
         "PreToolUse" | "PostToolUse" => {
@@ -223,6 +249,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 fact: HookFact::Working,
                 activity,
                 question: None,
+                session_id: None,
             })
         }
 
@@ -238,6 +265,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .get("error")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|error| truncated(error, QUESTION_MAX_CHARS)),
+                session_id: None,
             })
         }
 
@@ -257,6 +285,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 fact: HookFact::NeedsInput,
                 activity: None,
                 question,
+                session_id: None,
             })
         }
 
@@ -275,6 +304,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .get("message")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
+                session_id: None,
             })
         }
 
@@ -287,10 +317,16 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 .get("error_message")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
+            session_id: None,
         }),
 
         _ => None,
-    }
+    }?;
+
+    Some(HookReport {
+        session_id,
+        ..report
+    })
 }
 
 #[cfg(test)]
@@ -319,6 +355,7 @@ mod tests {
             Some("Bash: echo hello-from-jerry")
         );
         assert_eq!(report.question, None);
+        assert_eq!(report.session_id.as_deref(), Some("5a4bef04"));
     }
 
     #[test]
@@ -331,6 +368,7 @@ mod tests {
             report.activity.as_deref(),
             Some("Write: /tmp/capture/done.txt")
         );
+        assert_eq!(report.session_id.as_deref(), Some("5a4bef04"));
     }
 
     #[test]
@@ -341,6 +379,37 @@ mod tests {
         // see the module docs.
         assert_eq!(report.activity, None);
         assert_eq!(report.question, None);
+        // A turn-boundary event still carries the real session id - GitHub issue #227's resume
+        // flow needs it from `Stop` just as much as from a `PreToolUse`, since `Stop` is the last
+        // event an agent that then sits idle (and is later closed) will ever send.
+        assert_eq!(report.session_id.as_deref(), Some("5a4bef04"));
+    }
+
+    #[test]
+    fn a_payload_with_no_session_id_leaves_it_none_rather_than_a_fabricated_value() {
+        // Untrusted input off the socket: a hand-made or malformed request may simply omit the
+        // field, and that must read back as "no id available", not panic or a wrong guess.
+        let report = parse(
+            "Stop",
+            br#"{"hook_event_name":"Stop","stop_hook_active":false}"#,
+        )
+        .expect("must parse");
+        assert_eq!(report.session_id, None);
+    }
+
+    #[test]
+    fn a_resumed_sessions_hooks_report_the_same_session_id() {
+        // The real proof this field is worth persisting: `claude --resume <id>` (verified against
+        // a real 2.1.228 binary) keeps firing hooks under the *same* `session_id` it resumed -
+        // only `SessionStart`'s `source` changes, from `"startup"` to `"resume"`. Pinned from a
+        // real captured payload of exactly that resumed run.
+        let real_resumed_session_start = br#"{"session_id":"5af4c210-34fa-4ab2-9c35-f6ceab76551c","transcript_path":"/home/colin/.claude/projects/x/5af4c210.jsonl","cwd":"/tmp/hook_capture/project","hook_event_name":"SessionStart","source":"resume"}"#;
+        let report = parse("SessionStart", real_resumed_session_start).expect("must parse");
+        assert_eq!(report.fact, HookFact::Working);
+        assert_eq!(
+            report.session_id.as_deref(),
+            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c")
+        );
     }
 
     #[test]

@@ -2802,6 +2802,66 @@ mod tab_scoping_tests {
         );
     }
 
+    /// GitHub issue #227's resume flow: `Agents::spawn_resume` must really produce a
+    /// `claude --resume <session_id> --settings <path>` spawn - `--resume` prepended ahead of the
+    /// real hook injection's own `--settings`, not dropped in favour of it, and the hook
+    /// injection's `JERRY_*` environment still riding along so a resumed conversation keeps
+    /// reporting its status exactly like a fresh one. Uses a real [`crate::hooks::HookRuntime`]
+    /// (a real bound loopback listener, real generated files) rather than a hand-built
+    /// injection, so this exercises the exact object `crate::hooks::flow::AdeApp::
+    /// hook_injection_for` would hand a real spawn.
+    #[gpui::test]
+    fn spawn_resume_prepends_resume_ahead_of_the_real_hook_injection(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let hook_temp = tempfile::tempdir().expect("hook temp dir");
+        let runtime = crate::hooks::HookRuntime::start(hook_temp.path())
+            .expect("the hook runtime must start in a test sandbox");
+        let injection = runtime.injection();
+        let session_id = "5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned();
+
+        let pane = app.update_in(cx, |app, window, cx| {
+            let id = app.agents.spawn_resume(
+                AgentKind::Claude,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                Some(&injection),
+                session_id.clone(),
+                window,
+                cx,
+            );
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the agent this call just spawned")
+                .pane
+                .clone()
+        });
+
+        let spec = pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
+        assert_eq!(
+            spec.program,
+            PathBuf::from("claude"),
+            "a resumed agent must still spawn the real claude binary"
+        );
+        assert_eq!(
+            spec.args[0..2],
+            ["--resume".to_owned(), session_id],
+            "--resume <session_id> must lead the argument list"
+        );
+        assert_eq!(
+            spec.args[2], "--settings",
+            "the real hook injection's own --settings must still follow, not be dropped"
+        );
+        assert!(
+            !spec.env.is_empty(),
+            "the hook injection's JERRY_* environment must still ride along on a resume spawn, \
+             so a resumed conversation keeps reporting its status like a fresh one"
+        );
+    }
+
     /// The real gap this revision's own self-audit found: switching to a worktree with *no*
     /// open agent leaves `Agents::focus_active` with nothing to focus (a genuine no-op), so
     /// a previously-focused agent's pane - now unrendered once the tab strip's own

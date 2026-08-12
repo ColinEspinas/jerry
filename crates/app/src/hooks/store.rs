@@ -12,10 +12,12 @@
 //! `Edit: src/auth.rs`" is a real, dated, structured statement the agent itself made. That is
 //! worth keeping, so this module keeps it as it is learned.
 //!
-//! **No UI reads this yet, and that is intentional** - browsing and resuming past agents is issue
-//! #227's job, not this phase's. This module exists so that work has real data to build on rather
-//! than having to invent a capture mechanism first. It is written, and it round-trips; nothing
-//! renders it.
+//! **Originally, no UI read this back** - browsing and resuming past agents was left as issue
+//! #227's job, deliberately out of this phase's scope, so the module existed purely so that work
+//! would have real data to build on rather than having to invent a capture mechanism first. Issue
+//! #227's read side is [`crate::hooks::history`] (the plain `AgentStatusState` -> UI-facing
+//! `PastAgent` list) and the rail's own history rows - this module remains the write/persistence
+//! half only, unchanged in shape by that later work.
 //!
 //! ## Everything about the file format mirrors `crate::review::baseline_state`
 //!
@@ -23,9 +25,9 @@
 //! file, same lossless `utf8:`/`bytes:` worktree encoding, same atomic write (temp sibling,
 //! `sync_all`, rename, directory sync), and the same merge-on-save under
 //! `crate::persisted_state_lock::with_locked_merge` so a second Jerry instance can't erase this
-//! one's records. The keys are even the same [`crate::review::state::baseline_key`] values, so a
-//! future issue #227 implementation can join a persisted status straight onto its review
-//! baseline without a translation table.
+//! one's records. The keys are even the same [`crate::review::state::baseline_key`] values, so
+//! [`crate::hooks::history`] can join a persisted status straight onto its review baseline without
+//! a translation table.
 //!
 //! Like `baseline_state` and unlike its other siblings, a key absent from memory is **not**
 //! deleted from disk on save: this is history, and an agent the user closed is exactly the agent
@@ -79,6 +81,12 @@ pub struct PersistedAgentStatus {
     pub question: Option<String>,
     /// When this record was last updated.
     pub updated_at_unix: i64,
+    /// The real Claude Code `session_id` this agent's hooks last reported (GitHub issue #227) -
+    /// see `crate::hooks::event::HookReport::session_id` for what it is and how it was verified.
+    /// This is what makes a literal `claude --resume <session_id>` possible; `None` for a Codex
+    /// agent (no hooks exist for it at all) or a Claude agent whose hooks never fired before this
+    /// field started being captured.
+    pub session_id: Option<String>,
 }
 
 impl PersistedAgentStatus {
@@ -213,6 +221,7 @@ impl AgentStatusState {
         status: Status,
         activity: Option<String>,
         question: Option<String>,
+        session_id: Option<String>,
         now_unix: i64,
     ) -> bool {
         let record = PersistedAgentStatus {
@@ -223,6 +232,7 @@ impl AgentStatusState {
             activity,
             question,
             updated_at_unix: now_unix,
+            session_id,
         };
         // Compare on everything except the timestamp: a status that hasn't changed must not
         // rewrite the file (and re-fsync) purely because time passed.
@@ -233,6 +243,7 @@ impl AgentStatusState {
                 && existing.status == record.status
                 && existing.activity == record.activity
                 && existing.question == record.question
+                && existing.session_id == record.session_id
         });
         if unchanged {
             return false;
@@ -307,6 +318,7 @@ mod tests {
             Status::Review,
             Some("Edit: src/auth.rs".to_owned()),
             None,
+            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
             1_700_000_500,
         ));
 
@@ -323,6 +335,10 @@ mod tests {
         assert_eq!(record.activity.as_deref(), Some("Edit: src/auth.rs"));
         assert_eq!(record.question, None);
         assert_eq!(record.updated_at_unix, 1_700_000_500);
+        assert_eq!(
+            record.session_id.as_deref(),
+            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c")
+        );
     }
 
     #[test]
@@ -339,17 +355,18 @@ mod tests {
                 Status::Run,
                 Some("Bash: cargo test".to_owned()),
                 None,
+                None,
                 now,
             )
         };
-        let (k, w, kind, spawned, status, activity, question, now) = args(100);
+        let (k, w, kind, spawned, status, activity, question, session_id, now) = args(100);
         assert!(
-            state.set(k, w, kind, spawned, status, activity, question, now),
+            state.set(k, w, kind, spawned, status, activity, question, session_id, now),
             "the first record is a real change"
         );
-        let (k, w, kind, spawned, status, activity, question, now) = args(999);
+        let (k, w, kind, spawned, status, activity, question, session_id, now) = args(999);
         assert!(
-            !state.set(k, w, kind, spawned, status, activity, question, now),
+            !state.set(k, w, kind, spawned, status, activity, question, session_id, now),
             "only the timestamp differs - this must not count as a change"
         );
 
@@ -363,8 +380,47 @@ mod tests {
             Status::Review,
             Some("Bash: cargo test".to_owned()),
             None,
+            None,
             1000,
         ));
+    }
+
+    #[test]
+    fn a_newly_reported_session_id_counts_as_a_real_change() {
+        // Not just timestamps: an agent's hooks may only report a `session_id` after this record
+        // already exists (its first-ever hook could be `PostToolUseFailure`, which carries none -
+        // see `crate::hooks::event::parse`), and that must not be treated as a no-op write.
+        let mut state = AgentStatusState::default();
+        let key = key_for("/repo/wt-a", 20);
+        assert!(state.set(
+            key.clone(),
+            Path::new("/repo/wt-a"),
+            "Claude",
+            20,
+            Status::Run,
+            None,
+            None,
+            None,
+            100,
+        ));
+        assert!(
+            state.set(
+                key.clone(),
+                Path::new("/repo/wt-a"),
+                "Claude",
+                20,
+                Status::Run,
+                None,
+                None,
+                Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+                101,
+            ),
+            "a real session id appearing where there was none must count as a change"
+        );
+        assert_eq!(
+            state.get(&key).and_then(|record| record.session_id.clone()),
+            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned())
+        );
     }
 
     #[test]
@@ -383,6 +439,7 @@ mod tests {
             Status::Run,
             None,
             None,
+            None,
             5,
         );
         other
@@ -399,6 +456,7 @@ mod tests {
             Status::Ask,
             None,
             Some("Bash needs permission: rm -rf /".to_owned()),
+            None,
             6,
         );
         mine.save_merged_at(&path, &std::iter::once(mine_key.clone()).collect())
@@ -429,6 +487,7 @@ mod tests {
             Status::Review,
             None,
             None,
+            None,
             7,
         );
         let owned: BTreeSet<String> = std::iter::once(key.clone()).collect();
@@ -457,6 +516,7 @@ mod tests {
                 "Claude",
                 index,
                 Status::Idle,
+                None,
                 None,
                 None,
                 index, // updated_at_unix ascending, so higher index == more recent
@@ -491,6 +551,7 @@ mod tests {
             "Claude",
             1,
             Status::Run,
+            None,
             None,
             None,
             10,

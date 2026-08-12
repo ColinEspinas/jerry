@@ -28,6 +28,13 @@
 //!     └── AdeApp::agent_status ──▶ rail::status::derive_status(.., HookSignal, ..)
 //!     └── AdeApp::build_agent_rows ──▶ AgentRow::activity / question_preview
 //!                                       └── AgentStatusState (agent-status.toml)  [store]
+//!
+//!   agent closes / app restarts, later reopened (GitHub issue #227)
+//!     └── AdeApp::build_worktree_rows ──▶ history::past_agents_for_worktree(state, wt, live_keys)
+//!                                          └── WorktreeRow::history  ──▶  rail "History" rows
+//!     └── click Resume ──▶ AdeApp::resume_past_agent
+//!           ├── real session_id captured  ──▶ Agents::spawn_resume (`claude --resume <id>`)
+//!           └── no session_id (Codex, or predates this field) ──▶ Agents::spawn (fresh agent)
 //! ```
 //!
 //! ## Claude Code only, and per-launch only
@@ -47,6 +54,7 @@
 
 pub mod event;
 pub mod flow;
+pub mod history;
 pub mod server;
 pub mod settings_file;
 pub mod store;
@@ -127,6 +135,13 @@ impl HookRuntime {
     /// This agent's current hook-derived `(activity, question)` text, for its rail row.
     pub fn text_for(&self, id: AgentId) -> (Option<String>, Option<String>) {
         self.listener.text_for(id)
+    }
+
+    /// This agent's real Claude Code `session_id` (GitHub issue #227), if its hooks have ever
+    /// reported one - see [`server::HookListener::session_id_for`] for why this deliberately
+    /// isn't gated by staleness the way [`Self::text_for`] is.
+    pub fn session_id_for(&self, id: AgentId) -> Option<String> {
+        self.listener.session_id_for(id)
     }
 
     /// Drops an agent's recorded facts, so a future [`AgentId`] can't inherit them.

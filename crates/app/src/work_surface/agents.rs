@@ -52,6 +52,17 @@ impl AgentKind {
         }
     }
 
+    /// The inverse of [`Self::label`] - `None` for anything this build doesn't recognise, which a
+    /// reader of persisted data (`crate::hooks::store::PersistedAgentStatus::kind`, GitHub issue
+    /// #227) must treat as "this record isn't usable" rather than guessing a kind.
+    pub fn from_label(label: &str) -> Option<AgentKind> {
+        match label {
+            "Claude" => Some(AgentKind::Claude),
+            "Codex" => Some(AgentKind::Codex),
+            _ => None,
+        }
+    }
+
     /// The literal command name this agent's CLI spawns as. Infallible - there is no
     /// "this kind has no fixed binary" case to model, precisely because an `AgentKind` is never
     /// a shell (before the shell/agent split this was an `Option<&'static str>` every caller had
@@ -324,14 +335,89 @@ impl Agents {
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
+        self.spawn_inner(
+            kind,
+            cwd,
+            terminal_font_size_px,
+            shell_override,
+            hooks,
+            Vec::new(),
+            window,
+            cx,
+        )
+    }
+
+    /// [`Self::spawn`], but for a real Claude Code `--resume <session_id>` (GitHub issue #227):
+    /// spawns `agent_kind` into `cwd` exactly as a fresh agent would, plus `--resume
+    /// <session_id>` prepended to its arguments - verified against a real `claude` 2.1.228 binary
+    /// to genuinely pick the named conversation back up, not merely start a new one in the same
+    /// directory (`crate::hooks::event::HookReport::session_id`'s own docs cover how that was
+    /// checked).
+    ///
+    /// Still receives `hooks`, and still gets the same `--settings`/environment injection a fresh
+    /// [`AgentKind::Claude`] spawn would: a resumed conversation is exactly as real an agent as a
+    /// new one, and Jerry's rail should keep tracking it the same way (also verified against the
+    /// real binary - `--settings` and `--resume` coexist without conflict, and the resumed
+    /// session's hooks report the same `session_id` it resumed).
+    // Nine parameters, matching `Self::spawn`'s own already-`#[allow]`'d count plus the one real
+    // addition (`session_id`) - see that method's docs for why bundling the rest into a struct
+    // wouldn't reduce anything.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_resume(
+        &mut self,
+        agent_kind: AgentKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        shell_override: Option<&str>,
+        hooks: Option<&crate::hooks::HookInjection>,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        self.spawn_inner(
+            ProcessKind::Agent(agent_kind),
+            cwd,
+            terminal_font_size_px,
+            shell_override,
+            hooks,
+            vec!["--resume".to_owned(), session_id],
+            window,
+            cx,
+        )
+    }
+
+    /// The real shared core of [`Self::spawn`]/[`Self::spawn_resume`] - identical in every way
+    /// except which extra CLI arguments (if any) are prepended ahead of the hook injection's own
+    /// `--settings <path>`. Kept private and `#[allow(clippy::too_many_arguments)]`'d here rather
+    /// than on both public callers, so the many "no extra args" call sites through [`Self::spawn`]
+    /// keep their existing, unchanged arity.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        shell_override: Option<&str>,
+        hooks: Option<&crate::hooks::HookInjection>,
+        mut leading_args: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
 
         // Claude Code only, and gated here rather than inside `spec` so the gate is one
         // legible line next to the spawn it guards.
-        let extras = match (kind, hooks) {
+        let hook_extras = match (kind, hooks) {
             (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => hooks.spawn_extras(id),
             _ => None,
+        };
+        let extras = if leading_args.is_empty() {
+            hook_extras
+        } else {
+            let (mut hook_args, env) = hook_extras.unwrap_or_default();
+            leading_args.append(&mut hook_args);
+            Some((leading_args, env))
         };
         let spec = kind.spec(cwd.clone(), shell_override, extras);
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
@@ -595,6 +681,21 @@ mod tests {
         assert_eq!(ProcessKind::codex().label(), AgentKind::Codex.label());
         assert_eq!(AgentKind::Claude.label(), "Claude");
         assert_eq!(AgentKind::Codex.label(), "Codex");
+    }
+
+    #[test]
+    fn from_label_is_the_real_inverse_of_label_for_every_agent_kind() {
+        // GitHub issue #227's history reader (`crate::hooks::history`) decodes a persisted
+        // `PersistedAgentStatus::kind` string back into a real `AgentKind` through this - it must
+        // agree with `label` exactly, or a real persisted record would silently fail to decode.
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            assert_eq!(AgentKind::from_label(kind.label()), Some(kind));
+        }
+        assert_eq!(
+            AgentKind::from_label("SomeFutureAgent"),
+            None,
+            "an unrecognised label must be `None`, never a guessed kind"
+        );
     }
 
     #[test]
