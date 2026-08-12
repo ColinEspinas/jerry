@@ -238,6 +238,27 @@ pub(crate) const FILE_TREE_WATCH_POLL_INTERVAL: Duration = WORKTREE_WATCH_POLL_I
 pub(crate) const FILE_TREE_WATCH_TICK: Duration = WORKTREE_WATCH_TICK;
 pub(crate) const FILE_TREE_WATCH_SETTLE: Duration = WORKTREE_WATCH_SETTLE;
 
+/// How often [`AdeApp::start_repo_worktrees_polling`]'s sweep re-fetches every *non-focused*
+/// [`AdeApp::repos`] entry's own [`Repo::worktrees`] - see that method's own docs for the full
+/// reasoning. 5x [`STATUS_POLL_INTERVAL`]: a repo you aren't looking at right now has its
+/// worktree list (branches created/removed via `git worktree add`/`remove`) change far less
+/// often than an open agent's own running/idle/failed status does, and the *focused* repo
+/// already gets a near-instant refresh from its own real filesystem watcher
+/// ([`AdeApp::start_worktree_watch`]) - a background repo only needs to be "eventually live
+/// within a bounded window", not sub-second-fresh, so trading a little staleness there for far
+/// fewer real `git` subprocess spawns (a user can plausibly have dozens of repos added) is the
+/// right default.
+pub(crate) const REPO_WORKTREES_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The real cap on how many `git worktree list` subprocesses [`AdeApp::
+/// start_repo_worktrees_polling`]'s sweep lets run at once, regardless of how many repos are due
+/// for a refresh on a given tick - see [`crate::rail::repo::batch_repos_for_refresh`]'s own docs
+/// for the batching this bounds. Small and arbitrary-but-reasonable: large enough that a sweep
+/// across a realistic handful of added repos still finishes in roughly one batch, small enough
+/// that a user with dozens of repos added never fires dozens of real `git` child processes at
+/// once on a single tick.
+pub(crate) const REPO_WORKTREES_FETCH_CONCURRENCY: usize = 4;
+
 /// How often [`AdeApp::render_file_view`] calls `std::fs::metadata` for its freshness check -
 /// throttled rather than unconditional-per-render (see
 /// [`AdeApp::file_view_last_freshness_check`]).
@@ -323,10 +344,14 @@ pub struct AdeApp {
     /// See [`Self::fold_state_save_running`] - same contract, for the repo-list file.
     pub(crate) repo_state_save_running: bool,
     /// Every worktree of [`Self::focused_repo`], as read by `wt_core::list_worktrees` -
-    /// deliberately still a flat, single-repo list rather than living on the [`Repo`] itself
-    /// (see [`Repo::worktrees`]'s own docs): this phase is data-model-and-persistence only, and
-    /// rewiring every consumer of "the worktree list" onto a per-repo one is the rail-rendering
-    /// phase's job, not this one's.
+    /// deliberately still a flat, single-repo list rather than living on the [`Repo`] itself: the
+    /// file tree, diff view, command palette, and agent-spawn machinery all stay genuinely
+    /// single-repo-scoped (they only ever operate on whatever this window currently has focused),
+    /// so this remains their one real source of truth. [`Repo::worktrees`] is a *second*, parallel
+    /// data source - kept live for every added repo, focused or not, purely for the rail's own
+    /// passive per-repo group listing (see that field's own docs and [`Self::load_worktrees`],
+    /// which mirrors this exact list into the focused repo's own [`Repo::worktrees`] entry so the
+    /// two never disagree) - not a replacement for this field.
     pub(crate) worktrees: Vec<WorktreeItem>,
     pub(crate) worktrees_error: Option<String>,
     /// GitHub issue #12's "the user is notified" half of selection recovery - set by
@@ -1324,6 +1349,20 @@ pub struct AdeApp {
     /// load immediately, per GPUI's `Task`-drop-cancels semantics.
     pub(crate) _file_load_task: Option<Task<()>>,
     pub(crate) _status_poll_task: Option<Task<()>>,
+    /// Every in-flight one-shot [`Self::load_repo_worktrees`] fetch - a [`TaskPool`] since these
+    /// are genuinely independent, fire-and-forget per-repo loads (one per newly [`Self::
+    /// add_repo`]-ed repo, plus one per repo restored from `repos.toml` at startup), not a single
+    /// slot the way [`Self::_load_worktrees_task`] is for the one focused repo.
+    pub(crate) _repo_worktrees_tasks: TaskPool,
+    /// The single, long-lived periodic sweep (`crate::root::AdeApp::
+    /// start_repo_worktrees_polling`) that keeps every *non-focused* [`Self::repos`] entry's own
+    /// [`Repo::worktrees`] live - started once, at startup, and never reassigned per repo switch
+    /// (unlike [`Self::_worktree_watch_task`]/[`Self::_status_poll_task`], which are genuinely
+    /// scoped to whichever single repo is focused): this loop reads [`Self::repos`]/[`Self::
+    /// focused_repo`] fresh on every tick, so one instance already serves however many repos are
+    /// added, the same "started lazily, then never reset" shape [`Self::_lsp_poll_task`] uses for
+    /// an analogous "one loop, many independent things it watches" role.
+    pub(crate) _repo_worktrees_poll_task: Option<Task<()>>,
     pub(crate) _disk_usage_task: Option<Task<()>>,
     pub(crate) _prune_task: Option<Task<()>>,
     /// The single in-flight "keep all changes"/"discard worktree" background task, guarded by
@@ -2323,6 +2362,14 @@ impl AdeApp {
             self.repo_state_owned.insert(key);
         }
         self.persist_repo_state(cx);
+        // A real, immediate first fetch for this repo's own worktree list (see
+        // `Self::load_repo_worktrees`'s own docs) - so a freshly added repo's rail group shows a
+        // real count promptly rather than waiting for `Self::start_repo_worktrees_polling`'s own
+        // next tick (up to `REPO_WORKTREES_POLL_INTERVAL` later). Harmless even when `id` is
+        // about to be focused by the caller (`Self::open_repo_in_current_window`/startup, which
+        // both call `Self::load_worktrees` right afterward): that real fetch simply mirrors the
+        // same, now-current data into this same repo entry a moment later.
+        self.load_repo_worktrees(id, cx);
         cx.notify();
         id
     }
@@ -2373,10 +2420,11 @@ impl AdeApp {
     ///   silently dangle every global keybinding. [`OverlayFocus::forget_target`] is this
     ///   project's own established fix for exactly this class of bug (see its own docs).
     /// - every agent open before this call belonged to whatever repo (or the empty state) was
-    ///   focused *before* it - this app's worktree list/tab-strip filtering is still single-
-    ///   repo-scoped (see [`Self::repos`]' own docs: nothing yet renders more than the focused
-    ///   repo's own worktrees), so once focus moves to `path` none of them can be reached through
-    ///   this window's UI ever again. A deliberate choice, not an accidental process leak: shut
+    ///   focused *before* it - the tab strip/file tree/diff/command palette are still genuinely
+    ///   single-repo-scoped (only the rail's own passive worktree *listing* shows every added
+    ///   repo now - see [`Repo::worktrees`]'s own docs), so once focus moves to `path` none of
+    ///   them can be reached through this window's UI ever again. A deliberate choice, not an
+    ///   accidental process leak: shut
     ///   every one of them down cleanly via the same real PTY teardown [`Self::close_agent`]
     ///   always uses, rather than leaving their processes running invisibly until the whole
     ///   window closes. Skipped entirely when `path` resolves to the repo *already* focused (a
@@ -3913,8 +3961,8 @@ mod repo_list_tests {
 
     /// Critical fix (independent audit): switching folders used to leave the previous repo's real
     /// agent processes running but permanently unreachable through this window's own UI (this
-    /// app's worktree list/tab strip are still single-repo-scoped - see `Self::repos`' own docs).
-    /// A deliberate choice, not an accidental leak: `Self::open_repo_in_current_window` now shuts
+    /// app's tab strip is still single-repo-scoped - see `Self::repos`' own docs). A deliberate
+    /// choice, not an accidental leak: `Self::open_repo_in_current_window` now shuts
     /// every one of them down cleanly via the same real PTY teardown `Self::close_agent` always
     /// uses.
     #[gpui::test]
