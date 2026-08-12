@@ -2549,24 +2549,30 @@ impl AdeApp {
             .forget_target(&self.empty_state_focus_handle);
 
         // See this method's own docs: every agent open before this call, in every repo, stays
-        // alive - none of them are closed here. `id`'s own repo may already have real agents
-        // running from an earlier visit; this makes whichever one was last active there the one
-        // the centre pane actually shows, exactly as a fresh `Self::open_repo_in_current_window`
-        // switch already does.
-        self.agents.activate_for_worktree(&path, cx);
+        // alive - none of them are closed here, and every one of them still shows real live
+        // status in the rail (`crate::rail::render::AdeApp::build_agent_rows` folds in every
+        // repo's agents, not just the focused one's). What changes here is only which repo's
+        // worktree rows the rail shows - explicitly, deliberately, *never* which tab (if any) the
+        // centre pane shows: a repo header is a pure navigation gesture, not a worktree
+        // selection, so nothing may spawn from it and nothing may reactivate through it. Two real
+        // gaps closed to make that hold, not one: `Self::selected` staying `None` (below) closes
+        // "clicking the header can spawn a tab attributed to the repo itself" (the reported bug);
+        // `Agents::clear_active` closes the other half - reactivating whichever agent was last
+        // active in `id`'s repo *looked* like reasonable cross-repo persistence, but from the
+        // user's side it was the exact same "the repo itself has a tab" behavior, just reached
+        // through an existing agent instead of a freshly spawned one. See `Agents::clear_active`'s
+        // own docs for why this can't simply be *skipped* instead - the centre pane has no
+        // repo-scoping of its own, so doing nothing here would leave whatever was left's terminal
+        // rendering right alongside `id`'s own, unrelated rail rows.
+        self.agents.clear_active(cx);
+        self.selected = None;
         self.worktree_selection_notice = None;
-        // A freshly focused repo must land on a real worktree selection immediately, not wait on
-        // `Self::load_worktrees`'s own background fetch to land moments later (that fetch still
-        // runs below regardless, and re-syncs this the identical way any other refresh does) -
-        // see `Self::load_worktrees`'s own `NoPriorSelection` docs for the real bug this closes:
-        // with nothing selected, `Self::active_agent_cwd`'s fallback let a tab strip "+" click
-        // spawn rooted at the repository itself rather than any worktree inside it.
-        match seeded_worktrees {
-            Some(items) => {
-                self.selected = items.iter().position(|item| item.is_main);
-                self.worktrees = items;
-            }
-            None => self.selected = None,
+        // Still seeded synchronously from this repo's own already-known worktree list (see the
+        // field's own docs above) - this is purely a display fix (the rail must show repo B's
+        // real rows the instant repo B is focused, not repo A's stale ones for one frame), and
+        // carries no selection with it.
+        if let Some(items) = seeded_worktrees {
+            self.worktrees = items;
         }
         self.reset_repo_scoped_state(path, window, cx);
         self.load_worktrees(cx);
@@ -4169,6 +4175,98 @@ mod repo_list_tests {
         });
     }
 
+    /// "Repo headers should not be associated to tabs at all" - the user's own words, after two
+    /// earlier attempts at this same bug (auto-selecting the main worktree; blocking every spawn
+    /// while nothing is selected) both turned out wrong for different reasons. The centre pane
+    /// has no repo-scoping of its own (`crate::work_surface::render::AdeApp::render_center_pane`
+    /// reads `Agents::active` directly), so simply *not* reactivating anything on checkout was
+    /// tried and rejected too: repo A's agent stayed the globally active one, and its terminal
+    /// kept rendering right alongside repo B's own, unrelated rail rows. `Agents::clear_active`
+    /// is what actually closes this - checked here directly, not inferred from `Agents::active_id`
+    /// alone, since that alone wouldn't prove the *previous* repo's agent was the thing cleared.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_clears_the_centre_pane_instead_of_reactivating(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        // Give repo B a real agent of its own first, and make it `Agents::active_by_cwd`'s
+        // remembered tab for repo B's path - the exact state `Agents::activate_for_worktree`
+        // would resurrect on a later visit. Then leave repo B (back to A) before the real
+        // assertion below, so what's being tested is a genuine *re*-checkout, not a first visit.
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+        let repo_b_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo_b.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.active_id(),
+                Some(repo_b_agent_id),
+                "sanity check: repo B's freshly spawned agent really is the active one right now"
+            );
+        });
+
+        let repo_a_id = app.read_with(cx, |app, _| {
+            app.repos
+                .iter()
+                .find(|repo| repo.path == repo_a.path())
+                .expect("repo A is a known repo")
+                .id
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_a_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The real assertion: re-checking out repo B, with its own agent still alive and still
+        // `Agents::active_by_cwd`'s remembered tab for its path - exactly what
+        // `Agents::activate_for_worktree` would resurrect - must not reactivate it.
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.agents.active_id(),
+                None,
+                "checking out repo B again must leave nothing globally active, even though it \
+                 has a real, remembered agent of its own - a repo header click is pure \
+                 navigation, never a worktree selection, so the centre pane must show genuinely \
+                 nothing rather than reactivating it"
+            );
+            let repo_b_agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == repo_b_agent_id)
+                .expect("repo B's agent must still genuinely exist");
+            assert!(
+                repo_b_agent.pane.read(cx).is_running(),
+                "and it must still be a real, live process - only *which* tab is shown changed, \
+                 nothing about repo B's own background persistence"
+            );
+        });
+    }
+
     /// The reported "we can add a tab to the repo itself" - checking out a repo from the rail
     /// used to leave `AdeApp::selected` at `None` until the user explicitly clicked a worktree
     /// row, and `AdeApp::active_agent_cwd`'s fallback to the bare repo path for exactly that
@@ -4178,7 +4276,7 @@ mod repo_list_tests {
     /// synchronous seed in `AdeApp::checkout_repo_from_rail` itself, not just the fallback
     /// `AdeApp::load_worktrees` background fetch that lands moments later.
     #[gpui::test]
-    fn checking_out_a_repo_from_the_rail_lands_on_its_main_worktree_not_unselected(
+    fn checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own(
         cx: &mut TestAppContext,
     ) {
         let repo_a = init_repo();
@@ -4188,43 +4286,30 @@ mod repo_list_tests {
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
-        // Repo B's own worktree list is fetched and mirrored into `Repo::worktrees` here, before
-        // it is ever checked out - the real precondition for `checkout_repo_from_rail`'s own
-        // synchronous seed to have anything to seed from.
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
             app.checkout_repo_from_rail(repo_b_id, window, cx);
         });
 
-        // Deliberately no `run_until_parked()` between the checkout and this read: the whole
-        // point is that the selection is real *before* `load_worktrees`'s own background fetch
-        // could possibly have resolved.
         app.read_with(cx, |app, _| {
-            let selected_path = app
-                .selected
-                .and_then(|index| app.worktrees.get(index))
-                .map(|item| item.path.clone());
             assert_eq!(
-                selected_path,
-                Some(repo_b.path().to_path_buf()),
-                "checking out repo B must immediately select its own main worktree, not leave \
-                 `selected` at `None` until a user clicks a specific row"
-            );
-            assert_eq!(
-                app.active_agent_cwd(),
-                repo_b.path(),
-                "sanity check: a tab spawned right now would still target the right directory"
+                app.selected, None,
+                "checking out a repo must never select a worktree on the user's behalf - only \
+                 a real click on a worktree row does that. An earlier version of this fix \
+                 auto-selected the main worktree here, which just moved the \"repo itself is \
+                 actionable\" bug one level deeper (see `Self::new_agent`'s own docs for where \
+                 the real fix lives instead)"
             );
         });
 
-        // And the real background fetch landing moments later must not undo it.
+        // And the real background fetch landing moments later must not introduce one either.
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert!(
-                app.selected.is_some(),
-                "the real `load_worktrees` fetch that follows must not clobber the seeded \
-                 selection back to `None`"
+            assert_eq!(
+                app.selected, None,
+                "`Self::load_worktrees`'s own fetch must not auto-select anything either, for \
+                 the identical reason"
             );
         });
     }

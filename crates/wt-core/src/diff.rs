@@ -330,7 +330,7 @@ pub(crate) fn compute_diff(
         worktree_path,
         &args,
         MAX_DIFF_OUTPUT_BYTES,
-        Some(shadow_index.path()),
+        Some(&shadow_index),
     )?;
     let text = String::from_utf8_lossy(&output);
     let (files, files_truncated) = parse_git_diff(&text);
@@ -843,7 +843,7 @@ fn shadow_index_file(real_index_path: &Path) -> Result<tempfile::NamedTempFile, 
 pub(crate) fn prepare_shadow_index(
     worktree_path: &Path,
     content: ShadowIndexContent,
-) -> Result<tempfile::NamedTempFile, Error> {
+) -> Result<tempfile::TempPath, Error> {
     let index_path_args: Vec<OsString> =
         vec!["rev-parse".into(), "--git-path".into(), "index".into()];
     let output = run_git(worktree_path, &index_path_args)?;
@@ -859,8 +859,13 @@ pub(crate) fn prepare_shadow_index(
     };
 
     let shadow = shadow_index_file(&real_index_path)?;
+    // Whether the real index couldn't be read at all - decided here, acted on only *after* the
+    // handle below is closed. See this function's own "Why the handle must be closed" docs for
+    // why acting on it immediately (as this used to) was itself part of the bug.
+    let real_index_missing;
     match std::fs::read(&real_index_path) {
         Ok(real_index_bytes) => {
+            real_index_missing = false;
             use std::io::Write as _;
             (&shadow)
                 .write_all(&real_index_bytes)
@@ -904,11 +909,34 @@ pub(crate) fn prepare_shadow_index(
             // pointed at a 0-byte file makes real `git add` fail outright with `fatal: ...
             // index file smaller than expected`, exit 128), where a path that simply
             // doesn't exist at all is instead treated as a fresh empty index and succeeds.
-            // Delete the placeholder so the path git sees is genuinely missing, not merely
-            // empty - `git add` below then creates a real index there from scratch, exactly
-            // as it would for a brand-new repository's very first `git add`.
-            std::fs::remove_file(shadow.path()).map_err(Error::WorktreeIo)?;
+            // The placeholder is deleted below, once the handle is closed - `git add` then
+            // creates a real index there from scratch, exactly as it would for a brand-new
+            // repository's very first `git add`.
+            real_index_missing = true;
         }
+    }
+
+    // Why the handle must be closed before `git add` ever runs, not just *where the file lives*:
+    // a real, reported failure (`fatal: unable to write new index file`, two unrelated
+    // repositories, this app running natively on Windows) traced to this function itself, not
+    // anything external. `git add` writes an index by creating `<GIT_INDEX_FILE>.lock` and
+    // renaming it over the destination - and on Windows, that rename can fail outright whenever
+    // the destination has *any* open handle, even one opened with `FILE_SHARE_DELETE` (which
+    // `tempfile`'s default sharing mode already is): confirmed against git's own upstream fix,
+    // "compat/mingw: implement POSIX-style atomic renames over open files" (first shipped git
+    // 2.48, Jan 2025) - before that release, on any git version, filesystem, or Windows edition,
+    // this was a deterministic failure, not a transient one, because `shadow` above - a
+    // `NamedTempFile` - was kept alive (and so its handle open) for the *entire* `git add` child
+    // process below. Converting it to a [`tempfile::TempPath`] here closes that handle while
+    // keeping the same drop-based cleanup; every real caller of this function only ever uses the
+    // returned value's path, never its file content, so this is a pure signature narrowing, not
+    // a behavior change for anyone downstream.
+    let shadow = shadow.into_temp_path();
+    if real_index_missing {
+        // Now genuinely safe: with the handle already closed above, this is a real, immediate
+        // delete - not the delete-*pending* state Windows leaves a still-open file in, which
+        // would have left this exact path unusable for the `git add` below to recreate.
+        std::fs::remove_file(&shadow).map_err(Error::WorktreeIo)?;
     }
 
     let mut add_args: Vec<OsString> = vec!["add".into()];
@@ -924,26 +952,15 @@ pub(crate) fn prepare_shadow_index(
     }
     add_args.extend([OsString::from("--"), ".".into()]);
 
-    // Retries only `write new index file` - a real, reported failure (GitHub issue tracker, two
-    // independent real repositories, this app running natively on Windows/NTFS - confirmed
-    // directly, not a WSL cross-mount) that survives even the git-directory placement above:
-    // Windows real-time antivirus (Defender or otherwise) scans every newly created file,
-    // including the `<GIT_INDEX_FILE>.lock` git creates right here, and if that scan holds the
-    // file open at the exact instant git tries to rename it into place, the rename fails and git
-    // reports exactly this - the same well-documented interaction every major git GUI on Windows
-    // (SourceTree, GitKraken, VS Code) has its own issue thread about. That window is
-    // milliseconds wide and gone almost immediately, which is what makes a bounded retry the
-    // correct handling rather than a workaround: the write itself is fully idempotent (this
-    // shadow index has no state a second attempt could corrupt), the failure is a real, external,
-    // transient lock this process does not control and cannot avoid by choosing a different
-    // directory (moving the file does not move the antivirus), and retrying is exactly what git's
-    // own porcelain commands do for other transient-lock classes already. Every *other* `git add`
-    // failure - a genuinely broken repository, a permissions error that will not resolve itself -
-    // still surfaces immediately on the first attempt; retrying those would only delay a real
-    // error the user needs to see.
+    // A real, bounded retry remains here as defense-in-depth, *not* the fix above: even with our
+    // own handle closed, something else on the user's machine can still transiently hold this
+    // path open for a moment (real-time antivirus, a cloud-sync client watching the `.git`
+    // directory) on a git version/filesystem combination that still takes the handle-sensitive
+    // rename path. Scoped narrowly to that one failure text so a genuinely broken repository or a
+    // real permissions error still surfaces immediately, on the first attempt, with no delay.
     retry_transient_index_write_failure(|| {
         let output = git_command(worktree_path, &add_args)
-            .env("GIT_INDEX_FILE", shadow.path())
+            .env("GIT_INDEX_FILE", &shadow)
             .output()
             .map_err(|source| Error::GitSpawn {
                 args: format_args(&add_args),
@@ -1947,6 +1964,47 @@ mod tests {
         );
     }
 
+    /// The real, root-cause fix (not the retry, which is defense-in-depth only): `git add` must
+    /// never see an open handle on the shadow index's path when it runs, because Windows can
+    /// refuse to rename a lock file over a destination with any open handle at all (see
+    /// `prepare_shadow_index`'s own "Why the handle must be closed" docs for the exact upstream
+    /// git behavior this traces to, and the two real, unrelated repositories that hit it).
+    /// `/proc/self/fd` is a real, direct way to check this invariant on Linux even though the
+    /// failure mode itself is Windows-only: this process must hold no open file descriptor
+    /// pointing at the shadow index's path by the time [`prepare_shadow_index`] returns - if one
+    /// still exists, this test proves the regression this fix closes, regardless of which
+    /// platform is running it.
+    #[test]
+    fn prepare_shadow_index_closes_its_own_file_handle_before_returning() {
+        let repo = init_repo();
+        fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+        let shadow_path = fs::canonicalize(&*shadow).expect("canonicalize shadow path");
+
+        let fd_dir = Path::new("/proc/self/fd");
+        if !fd_dir.is_dir() {
+            // Not Linux (or no procfs) - the invariant this checks is real everywhere, but this
+            // particular check has no portable equivalent; the git-directory-placement test
+            // above and the retry-policy tests still cover this function on every platform.
+            return;
+        }
+        for entry in fs::read_dir(fd_dir).expect("read /proc/self/fd") {
+            let Ok(entry) = entry else { continue };
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            assert_ne!(
+                target,
+                shadow_path,
+                "this process must hold no open file descriptor on the shadow index's own path \
+                 by the time prepare_shadow_index returns - fd {:?} still points at it",
+                entry.path()
+            );
+        }
+    }
+
     #[test]
     fn the_shadow_index_lives_in_the_git_directory_not_the_os_temp_directory() {
         let repo = init_repo();
@@ -1956,7 +2014,7 @@ mod tests {
             .expect("prepare_shadow_index");
 
         let git_dir = repo.path().join(".git");
-        let parent = shadow.path().parent().expect("shadow index has a parent");
+        let parent = shadow.parent().expect("shadow index has a parent");
         assert_eq!(
             fs::canonicalize(parent).expect("canonicalize shadow parent"),
             fs::canonicalize(&git_dir).expect("canonicalize git dir"),
@@ -1969,7 +2027,6 @@ mod tests {
         );
         assert!(
             shadow
-                .path()
                 .file_name()
                 .expect("file name")
                 .to_string_lossy()
@@ -1979,7 +2036,7 @@ mod tests {
 
         // Dropping it really deletes it - the `NamedTempFile` cleanup contract is unchanged by
         // the new parent directory, so a `.git` directory doesn't slowly fill with these.
-        let path = shadow.path().to_path_buf();
+        let path = shadow.to_path_buf();
         assert!(path.exists());
         drop(shadow);
         assert!(
@@ -2013,7 +2070,6 @@ mod tests {
         let shadow = prepare_shadow_index(&wt_path, ShadowIndexContent::IntentToAdd)
             .expect("prepare_shadow_index");
         let parent = shadow
-            .path()
             .parent()
             .expect("shadow index has a parent")
             .to_path_buf();

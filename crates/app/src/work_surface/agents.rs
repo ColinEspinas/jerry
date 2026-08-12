@@ -568,6 +568,24 @@ impl Agents {
         self.sync_pane_cadence(cx);
     }
 
+    /// The other half of [`Self::activate_for_worktree`]'s own worktree-scoping fix: clears
+    /// [`Self::active`] outright, with no worktree to fall back into. `crate::root::AdeApp::
+    /// checkout_repo_from_rail` is the one real caller - focusing a repo from the rail is a pure
+    /// navigation gesture (which repo's worktrees the rail shows), never a worktree selection, so
+    /// nothing here may resolve to *some* agent the way `activate_for_worktree` does. Not calling
+    /// this at all was tried first and was itself the bug: [`Self::active`] would then still
+    /// point at whichever agent was active in the repo just *left*, and since [`Self::active`] is
+    /// read directly by the centre pane with no repo-scoping of its own
+    /// (`crate::work_surface::render::AdeApp::render_center_pane`), that repo's terminal kept
+    /// rendering right alongside the newly-focused repo's own rail rows - a real, worse
+    /// inconsistency than the one this exists to fix. `active_by_cwd`'s own remembered-tab
+    /// entries are untouched, so a later real worktree-row click still lands on the same agent
+    /// [`Self::activate_for_worktree`] would have picked before this call ever ran.
+    pub fn clear_active(&mut self, cx: &mut Context<AdeApp>) {
+        self.active = None;
+        self.sync_pane_cadence(cx);
+    }
+
     /// Moves keyboard focus onto the currently active agent's terminal pane, if there is
     /// one - a no-op when [`Self::active`] is `None`. See [`Self::spawn`]'s docs for why
     /// callers, not this method, decide whether it's safe to call.

@@ -238,7 +238,7 @@ pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<WorktreeSnapshot, 
 
     let args: Vec<OsString> = vec!["write-tree".into()];
     let output = git_command(worktree_path, &args)
-        .env("GIT_INDEX_FILE", shadow_index.path())
+        .env("GIT_INDEX_FILE", &shadow_index)
         .output()
         .map_err(|source| Error::GitSpawn {
             args: format_args(&args),
@@ -332,7 +332,7 @@ pub fn changed_paths_against_tree(
         worktree_path,
         &args,
         MAX_DIFF_OUTPUT_BYTES,
-        Some(shadow_index.path()),
+        Some(&shadow_index),
     )?;
 
     // With `-z` every complete record is NUL-*terminated*, so a well-formed run always ends in a

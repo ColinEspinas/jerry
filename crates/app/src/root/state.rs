@@ -761,24 +761,12 @@ impl AdeApp {
                 }
 
                 match worktrees::recover_selection(previously_selected.as_ref(), &this.worktrees) {
-                    // A freshly focused repo must land on a real worktree selection, never stay
-                    // unselected - see `crate::root::AdeApp::checkout_repo_from_rail`'s own docs
-                    // for the real, reported bug this fixes: with `Self::selected` left `None`
-                    // (both this and `Self::open_repo_in_current_window` set it to exactly that
-                    // right before this fetch), `Self::active_agent_cwd`'s fallback let a "New
-                    // agent"/"New terminal" click from the tab strip spawn a tab rooted at the
-                    // *repository* itself - a path this app has no worktree row for and no way to
-                    // distinguish from a real one, when the whole point of the rail is that tabs
-                    // belong to worktrees. The main worktree is always a real, valid selection
-                    // target (it is the repository's own checkout), so this can never regress
-                    // into selecting something that doesn't exist. No-op only when `this.worktrees`
-                    // itself is genuinely empty (a fetch error - `this.worktrees_error` already
-                    // covers surfacing that).
-                    worktrees::SelectionRecovery::NoPriorSelection => {
-                        if let Some(index) = this.worktrees.iter().position(|item| item.is_main) {
-                            this.selected = Some(index);
-                        }
-                    }
+                    // Deliberately stays unselected - see `crate::root::AdeApp::
+                    // checkout_repo_from_rail`'s own docs for why nothing here may auto-select a
+                    // worktree on the user's behalf. Real tab spawning is gated on
+                    // `Self::selected` directly ([`crate::work_surface::render::AdeApp::
+                    // new_agent`]/`new_agent_pane`'s own guard), not worked around here.
+                    worktrees::SelectionRecovery::NoPriorSelection => {}
                     worktrees::SelectionRecovery::Unchanged(index) => {
                         this.selected = Some(index);
                     }
