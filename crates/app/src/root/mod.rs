@@ -2405,7 +2405,7 @@ impl AdeApp {
     /// anything, since until now the only place that combination ran was startup, where the
     /// caller went on to do the reload itself right afterwards ([`Self::new_with_settings`]).
     ///
-    /// An independent audit of this method's first version found (and this now fixes) three real
+    /// An independent audit of this method's first version found (and this now fixes) two real
     /// gaps beyond the incomplete state reset above:
     /// - it never (re)started [`Self::start_worktree_watch`]/[`Self::start_status_polling`] - a
     ///   window that starts empty and only later opens a folder never got rail status polling at
@@ -2419,47 +2419,47 @@ impl AdeApp {
     ///   stops being part of the rendered tree at all, so restoring focus to it later would
     ///   silently dangle every global keybinding. [`OverlayFocus::forget_target`] is this
     ///   project's own established fix for exactly this class of bug (see its own docs).
-    /// - every agent open before this call belonged to whatever repo (or the empty state) was
-    ///   focused *before* it - the tab strip/file tree/diff/command palette are still genuinely
-    ///   single-repo-scoped (only the rail's own passive worktree *listing* shows every added
-    ///   repo now - see [`Repo::worktrees`]'s own docs), so once focus moves to `path` none of
-    ///   them can be reached through this window's UI ever again. A deliberate choice, not an
-    ///   accidental process leak: shut
-    ///   every one of them down cleanly via the same real PTY teardown [`Self::close_agent`]
-    ///   always uses, rather than leaving their processes running invisibly until the whole
-    ///   window closes. Skipped entirely when `path` resolves to the repo *already* focused (a
-    ///   plain re-affirmation, not a real switch) - closing and immediately not respawning that
-    ///   exact repo's own agents would be a real, surprising regression for that case.
+    ///
+    /// ## Cross-repo agent persistence
+    ///
+    /// Every agent open before this call, in *every* repo, stays exactly as it was: a real PTY
+    /// process left running in the background, never paused and never closed just because
+    /// `path` is about to become the focused repo instead. This used to shut down every other
+    /// repo's agents right here (the same real teardown [`Self::close_agent`] always uses) on the
+    /// reasoning that nothing yet let a user reach them again - the tab strip
+    /// ([`crate::work_surface::render::AdeApp::combined_tab_order`]) is still genuinely scoped to
+    /// the *active worktree* (`Agents::iter_for_cwd`), so a repo other than `path` shows none of
+    /// its own tabs the moment focus moves away. That reasoning no longer holds: the rail's own
+    /// per-repo groups ([`crate::rail::render::AdeApp::build_repo_groups`]) now fold every repo's
+    /// real open agents into their own rows regardless of focus, with genuinely live status, so a
+    /// background repo's agent is still fully reachable - just through the rail instead of the
+    /// tab strip - and closing it out from under the user the instant they looked away would be a
+    /// real, silent kill of work they never asked to stop. Switching back to that repo later
+    /// (another call here, or [`Self::checkout_repo_from_rail`]) finds the exact same
+    /// [`AgentId`]s mid-work, never a fresh respawn.
     ///
     /// Idempotent against a repo already known to this window (re-opening an already-added repo
     /// just re-focuses and reloads it, rather than duplicating anything) - the same
     /// [`Self::add_repo`] guarantee this builds on. A repo with no agent open yet in its own root
-    /// (a genuinely new repo, or one added but never focused before - by construction, always the
-    /// case whenever `path` differs from what was focused before, now that stale agents are
-    /// closed above) gets one spawned here, the same "a fresh window starts with one shell in the
-    /// repo root" default [`Self::new_with_settings`] gives a CLI-launched repo.
+    /// (a genuinely new repo, or one whose root worktree was closed by hand) gets one spawned
+    /// here, the same "a fresh window starts with one shell in the repo root" default
+    /// [`Self::new_with_settings`] gives a CLI-launched repo - a repo revisited after being
+    /// unfocused keeps whatever real agent(s) it already had running, per the cross-repo
+    /// persistence above, so this never spawns a redundant second shell into a worktree that
+    /// already has one.
     pub(crate) fn open_repo_in_current_window(
         &mut self,
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let previously_focused_id = self.focused_repo().map(|repo| repo.id);
         let id = self.add_repo(path.clone(), cx);
-        let switching_repos = previously_focused_id != Some(id);
         self.focus_repo(id, cx);
 
         self.settings_focus
             .forget_target(&self.empty_state_focus_handle);
         self.palette_focus
             .forget_target(&self.empty_state_focus_handle);
-
-        if switching_repos {
-            let stale_ids: Vec<AgentId> = self.agents.iter().map(|agent| agent.id).collect();
-            for stale_id in stale_ids {
-                self.close_agent(stale_id, window, cx);
-            }
-        }
 
         if self.agents.iter_for_cwd(path.clone()).next().is_none() {
             self.agents.spawn(
@@ -2486,30 +2486,38 @@ impl AdeApp {
     /// worktrees, and it checks out" - the rail-native sibling of
     /// [`Self::open_repo_in_current_window`]. Shares that method's real repo-switch reload
     /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
-    /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target) but deliberately
-    /// does **not** call [`Self::add_repo`] or spawn an initial shell: `id` must already be a
-    /// known [`Self::repos`] entry (every row the rail renders came from there), and unlike "Open
-    /// Folder…" - which always guarantees *some* real terminal is running so a freshly opened
-    /// folder is never inert - this gesture's whole point is to make a genuinely empty repo (zero
-    /// open worktrees/agents) reachable as a real "focused, nothing open yet" state, so the user
-    /// can choose what to open next themselves (the tab strip's own `+` menu, or the rail's own
-    /// per-repo `+` - [`crate::rail::render::AdeApp::render_repo_group`]) instead of always
-    /// landing in an unwanted shell.
+    /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target, and real
+    /// cross-repo agent persistence - see that method's own "Cross-repo agent persistence" docs,
+    /// which apply here unchanged) but deliberately does **not** call [`Self::add_repo`] or spawn
+    /// an initial shell: `id` must already be a known [`Self::repos`] entry (every row the rail
+    /// renders came from there), and unlike "Open Folder…" - which always guarantees *some* real
+    /// terminal is running so a freshly opened folder is never inert - this gesture's whole point
+    /// is to make a genuinely empty repo (zero open worktrees/agents) reachable as a real
+    /// "focused, nothing open yet" state, so the user can choose what to open next themselves
+    /// (the tab strip's own `+` menu, or the rail's own per-repo `+` -
+    /// [`crate::rail::render::AdeApp::render_repo_group`]) instead of always landing in an
+    /// unwanted shell.
     ///
     /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
     /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
     /// already [`Self::focused_repo`] (a plain re-click of the repo already showing must not
     /// reset any of its live state).
     ///
-    /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: `id`'s
-    /// repo starts genuinely empty (no agents) right after this call, exactly the "focused,
-    /// nothing open yet" state this method's own module docs above describe - the user opens
-    /// something next via the tab strip's own `+` or the rail's per-repo `+`
-    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`]). Every agent that was open
-    /// before this call belongs to whatever repo was focused *before* `id` (this app's tab strip
-    /// is still single-repo-scoped - see [`Self::repos`]'s own docs), and all of them are closed
-    /// a few lines below via the same real PTY teardown [`Self::close_agent`] always uses, the
-    /// identical real fix [`Self::open_repo_in_current_window`] already applies. There is no
+    /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
+    /// that `id` has never had a real agent open in comes up genuinely empty, exactly the
+    /// "focused, nothing open yet" state this method's own module docs above describe - the user
+    /// opens something next via the tab strip's own `+` or the rail's per-repo `+`
+    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
+    /// *before*, though, may already have real agents left running from that earlier visit (see
+    /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
+    /// closed or respawned here, and [`Self::agents`]' `activate_for_worktree` call below makes
+    /// whichever one was last active in `id`'s repo the one the centre pane
+    /// ([`crate::work_surface::render::AdeApp::render_center_pane`]) actually shows again, the
+    /// same real re-activation [`Self::open_repo_in_current_window`] already does on every call.
+    /// Without it, [`Agents::active`](crate::work_surface::agents::Agents::active) would still
+    /// point at whatever was active in the repo just left, and the centre pane would keep
+    /// rendering *that* repo's terminal even though the rail now shows `id` focused - a real,
+    /// adversarial-audit-found gap this fixes rather than a defensive no-op. There is no
     /// cross-restart persistence of *which tabs were open* for a repo yet - a real, disclosed gap,
     /// not a silently stubbed one.
     pub(crate) fn checkout_repo_from_rail(
@@ -2537,24 +2545,12 @@ impl AdeApp {
         self.palette_focus
             .forget_target(&self.empty_state_focus_handle);
 
-        // See this method's own docs: every currently open agent belongs to whatever repo was
-        // focused before this call (this app's tab strip is still single-repo-scoped), so all of
-        // them become permanently unreachable through this window's UI the instant focus moves
-        // to `id` - shut them down cleanly rather than leaking their real PTY processes, the
-        // identical real fix `Self::open_repo_in_current_window` already applies.
-        let stale_ids: Vec<AgentId> = self.agents.iter().map(|agent| agent.id).collect();
-        for stale_id in stale_ids {
-            self.close_agent(stale_id, window, cx);
-        }
-
-        // No `Agents::activate_for_worktree(&path, ...)` call here (unlike
-        // `Self::open_repo_in_current_window`, right after its own equivalent teardown loop
-        // above): `id` wasn't the focused repo before this call (checked at the top), and this
-        // app's tab strip is single-repo-scoped, so no agent can already have `cwd == path` at
-        // this point - the loop just above closed every agent that was open, and none of them
-        // belonged to `path` to begin with. Calling it would resolve to `active = None`, a real
-        // no-op - see this method's own docs above for why `id`'s repo is meant to come up
-        // genuinely empty here rather than restoring anything.
+        // See this method's own docs: every agent open before this call, in every repo, stays
+        // alive - none of them are closed here. `id`'s own repo may already have real agents
+        // running from an earlier visit; this makes whichever one was last active there the one
+        // the centre pane actually shows, exactly as a fresh `Self::open_repo_in_current_window`
+        // switch already does.
+        self.agents.activate_for_worktree(&path, cx);
         self.selected = None;
         self.worktree_selection_notice = None;
         self.reset_repo_scoped_state(path, window, cx);
@@ -3959,25 +3955,29 @@ mod repo_list_tests {
         });
     }
 
-    /// Critical fix (independent audit): switching folders used to leave the previous repo's real
-    /// agent processes running but permanently unreachable through this window's own UI (this
-    /// app's tab strip is still single-repo-scoped - see `Self::repos`' own docs). A deliberate
-    /// choice, not an accidental leak: `Self::open_repo_in_current_window` now shuts
-    /// every one of them down cleanly via the same real PTY teardown `Self::close_agent` always
-    /// uses.
+    /// Real cross-repo agent persistence (this feature's own whole point, GitHub issue #1 phase
+    /// e): switching folders away from repo A must leave its real agent process running in the
+    /// background - not paused, not closed, exactly the process the user was looking at a moment
+    /// before - and switching back must find that exact same agent, mid-work, never a fresh
+    /// respawn. This used to close every one of repo A's agents right here (the same real PTY
+    /// teardown `Self::close_agent` always uses) - see `Self::open_repo_in_current_window`'s own
+    /// "Cross-repo agent persistence" docs for why that's gone.
     #[gpui::test]
-    fn open_repo_in_current_window_closes_the_previous_repos_agents(cx: &mut TestAppContext) {
+    fn open_repo_in_current_window_leaves_the_previous_repos_agents_running(
+        cx: &mut TestAppContext,
+    ) {
         let repo_a = tempfile::tempdir().expect("tempdir");
         let repo_b = tempfile::tempdir().expect("tempdir");
 
         let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
-        app.read_with(cx, |app, _| {
+        let repo_a_agent_id = app.read_with(cx, |app, _| {
             assert_eq!(
                 app.agents.iter().count(),
                 1,
                 "sanity check: repo A's own initial shell agent"
             );
+            app.agents.iter().next().expect("repo A's agent").id
         });
 
         app.update_in(cx, |app, window, cx| {
@@ -3985,45 +3985,89 @@ mod repo_list_tests {
         });
         cx.run_until_parked();
 
-        app.read_with(cx, |app, _| {
+        app.read_with(cx, |app, cx| {
+            let repo_a_agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == repo_a_agent_id)
+                .expect(
+                    "repo A's own agent must still genuinely exist - real cross-repo \
+                     persistence, not merely hidden from the UI",
+                );
+            assert_eq!(
+                repo_a_agent.cwd,
+                repo_a.path(),
+                "sanity check: it's still really rooted in repo A"
+            );
+            assert!(
+                repo_a_agent.pane.read(cx).is_running(),
+                "repo A's agent must still be a real, live process - not paused, not killed"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                2,
+                "repo B gets its own fresh initial shell alongside repo A's untouched one - \
+                 never a replacement for it"
+            );
+        });
+
+        // Switch back to repo A - the exact same agent (same `AgentId`), not a fresh respawn,
+        // must be what's reachable again.
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_a.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
             assert_eq!(
                 app.agents
                     .iter()
                     .filter(|agent| agent.cwd == repo_a.path())
                     .count(),
-                0,
-                "repo A's own agent must have really been closed, not merely hidden from the UI"
+                1,
+                "revisiting repo A must not spawn a redundant second shell - its own real agent \
+                 was still there the whole time"
+            );
+            let repo_a_agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.cwd == repo_a.path())
+                .expect("repo A's agent");
+            assert_eq!(
+                repo_a_agent.id, repo_a_agent_id,
+                "switching back to repo A must find the exact same agent mid-work, not a new one"
+            );
+            assert!(
+                repo_a_agent.pane.read(cx).is_running(),
+                "still a real, live process after the round trip"
             );
             assert_eq!(
-                app.agents.iter().count(),
-                1,
-                "repo B should have exactly its own fresh initial shell agent"
+                app.agents.active_id(),
+                Some(repo_a_agent_id),
+                "switching back must re-activate repo A's own agent in the centre pane"
             );
         });
     }
 
-    /// The rail-native mirror of [`open_repo_in_current_window_closes_the_previous_repos_agents`]
-    /// just above - an independent checker audit of GitHub issue #113's fix flagged
-    /// [`AdeApp::checkout_repo_from_rail`] as untested destructive one-click teardown: clicking a
-    /// rail repo header closes every currently open agent (real PTY teardown, mirroring
-    /// [`AdeApp::open_repo_in_current_window`]'s own already-tested behavior above), but a much
-    /// cheaper gesture triggers it now - one click on a rail row, versus "File > Open Folder... >
-    /// pick a directory" before. Proves two real agents belonging to repo A (its initial shell
-    /// plus a spawned Claude session) are both really gone - removed from
-    /// [`crate::work_surface::agents::Agents`]'s own list, not merely hidden from the UI - after
-    /// checking out repo B from the rail, the same "really closed, not leaked" guarantee the
-    /// `open_repo_in_current_window` mirror test proves via the identical technique (asserting
-    /// against the live agent list, since [`crate::work_surface::agents::Agents::close`] always
-    /// calls `TerminalPane::shutdown` before removing an agent from that list).
+    /// The rail-native mirror of
+    /// [`open_repo_in_current_window_leaves_the_previous_repos_agents_running`] just above:
+    /// [`AdeApp::checkout_repo_from_rail`] shares the identical real cross-repo agent persistence
+    /// contract, not a partial or weaker version of it. Proves two real agents belonging to repo
+    /// A (its initial shell plus a spawned Claude session) are both still genuinely running -
+    /// still present in [`crate::work_surface::agents::Agents`]'s own list, real PTY processes
+    /// and all - after checking out repo B from the rail, the same "really alive, not leaked or
+    /// killed" guarantee the `open_repo_in_current_window` mirror test proves via the identical
+    /// technique (asserting against the live agent list and each one's own `TerminalPane::
+    /// is_running`).
     #[gpui::test]
-    fn checkout_repo_from_rail_closes_the_previous_repos_agents(cx: &mut TestAppContext) {
+    fn checkout_repo_from_rail_leaves_the_previous_repos_agents_running(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir");
         let repo_b = tempfile::tempdir().expect("tempdir");
 
         let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
-        app.update_in(cx, |app, window, cx| {
+        let claude_agent_id = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
                 ProcessKind::claude(),
                 repo_a.path().to_path_buf(),
@@ -4032,15 +4076,16 @@ mod repo_list_tests {
                 None,
                 window,
                 cx,
-            );
+            )
         });
         cx.run_until_parked();
-        app.read_with(cx, |app, _| {
+        let repo_a_agent_ids: std::collections::HashSet<AgentId> = app.read_with(cx, |app, _| {
             assert_eq!(
                 app.agents.iter().count(),
                 2,
                 "sanity check: repo A's initial shell plus the spawned Claude agent"
             );
+            app.agents.iter().map(|agent| agent.id).collect()
         });
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -4051,22 +4096,40 @@ mod repo_list_tests {
         });
         cx.run_until_parked();
 
-        app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.agents
+        app.read_with(cx, |app, cx| {
+            for id in &repo_a_agent_ids {
+                let agent = app
+                    .agents
                     .iter()
-                    .filter(|agent| agent.cwd == repo_a.path())
-                    .count(),
-                0,
-                "repo A's agents must have really been closed (real PTY teardown via \
-                 `Agents::close`), not merely hidden from the UI"
+                    .find(|agent| agent.id == *id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "repo A's agent {id:?} must still genuinely exist after checking \
+                             out repo B from the rail - real cross-repo persistence, not merely \
+                             hidden from the UI"
+                        )
+                    });
+                assert_eq!(
+                    agent.cwd,
+                    repo_a.path(),
+                    "sanity check: still really rooted in repo A"
+                );
+                assert!(
+                    agent.pane.read(cx).is_running(),
+                    "repo A's agent {id:?} must still be a real, live process"
+                );
+            }
+            assert!(
+                app.agents.iter().any(|agent| agent.id == claude_agent_id),
+                "the spawned Claude agent specifically must have survived, not just the shell"
             );
             assert_eq!(
                 app.agents.iter().count(),
-                0,
-                "unlike `open_repo_in_current_window`, checking out a repo from the rail must \
-                 not auto-spawn a fallback shell - repo B comes up genuinely empty, per \
-                 `checkout_repo_from_rail`'s own docs"
+                2,
+                "unlike `open_repo_in_current_window`, checking out a repo from the rail still \
+                 does not auto-spawn a fallback shell for repo B - repo B comes up with zero \
+                 agents of its own, per `checkout_repo_from_rail`'s own docs, while repo A's two \
+                 real agents are the only ones left running"
             );
             assert_eq!(
                 app.focused_repo_path(),
