@@ -3683,6 +3683,83 @@ mod repo_list_tests {
         });
     }
 
+    /// Real user report: a repo with zero linked worktrees (just the main checkout on its
+    /// current branch) correctly shows one worktree row right after opening it, but switching
+    /// away to a different repo and back makes that row disappear. Uses two real git repos
+    /// (`git init`, no linked worktrees on either) and `Self::open_repo_in_current_window` for
+    /// both switches, `cx.run_until_parked()` after each so [`AdeApp::load_worktrees`]'s real
+    /// background task has actually resolved before the next switch - this is a same-thread,
+    /// strictly-sequential repro, not a race between overlapping loads.
+    #[gpui::test]
+    fn switching_away_from_a_zero_linked_worktree_repo_and_back_keeps_its_worktree_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        git(repo_a.path(), &["init", "-b", "main"]);
+        git(repo_a.path(), &["config", "user.email", "test@example.com"]);
+        git(repo_a.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo_a.path().join("a.txt"), "hello\n").expect("write");
+        git(repo_a.path(), &["add", "a.txt"]);
+        git(repo_a.path(), &["commit", "-m", "init"]);
+
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        git(repo_b.path(), &["init", "-b", "main"]);
+        git(repo_b.path(), &["config", "user.email", "test@example.com"]);
+        git(repo_b.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo_b.path().join("b.txt"), "hello\n").expect("write");
+        git(repo_b.path(), &["add", "b.txt"]);
+        git(repo_b.path(), &["commit", "-m", "init"]);
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.worktrees.len(),
+                1,
+                "repo A must show its own main checkout as one real worktree row right after \
+                 opening, got: {:?}",
+                app.worktrees
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), repo_b.path());
+            assert_eq!(
+                app.worktrees.len(),
+                1,
+                "repo B must also show one real worktree row"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_a.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.focused_repo_path(), repo_a.path());
+            assert_eq!(
+                app.worktrees.len(),
+                1,
+                "switching back to repo A must still show its one real worktree row, not lose \
+                 it - got: {:?}",
+                app.worktrees
+            );
+            assert!(
+                app.worktrees[0].branch.is_some(),
+                "repo A's worktree row must still carry its real current branch after \
+                 switching back, got: {:?}",
+                app.worktrees
+            );
+        });
+    }
+
     fn git(dir: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .current_dir(dir)
