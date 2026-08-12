@@ -1074,6 +1074,20 @@ impl AdeApp {
         // `tree_context_menu` further down, leaving the graph's two menus behind (GitHub issue
         // #176's own audit of who closes what).
         let _ = self.close_menu_surfaces_except(None);
+        // GitHub issue #242 phase B fix: a real, independently reproduced bug - interactive
+        // rebase mode names a real worktree (`GraphTabState::rebase`'s own `worktree_root`) that
+        // this switch is about to move `self.diff_root` away from. Left alone, every subsequent
+        // rebase-mode click (`Continue`, `Start`, ...) would silently keep operating on the
+        // *original* worktree via its own stored root while the graph pane visibly showed a
+        // different one - or, worse, since every worktree of the same repository shares one real
+        // object database, a plan's commit ids can resolve fine in the *new* worktree too,
+        // letting a `Start`/`Continue` genuinely rewrite the wrong branch. Leaving rebase mode
+        // outright here (real agent resume included, via `Self::leave_rebase_mode`) is the real
+        // primary defense; `RebaseModeState::worktree_root`'s own stored-root check is the
+        // backstop in case some other path ever reaches a rebase op without going through this.
+        if self.graph_state.rebase.is_some() {
+            self.leave_rebase_mode(cx);
+        }
         // Reset per-worktree UI state (see `reset_per_worktree_ui_state`'s docs) so switching
         // never leaks a staged checkbox, open diff, or collapsed-dir entry from whatever was open
         // before. Deliberately runs *before* the focus-fallback block below: both
