@@ -15,6 +15,13 @@
 //!    replacing them. Skipped (loudly) when no binary is present, and tolerant of one that is
 //!    present but unusable (no auth, no network) - a sandbox without credentials must not fail
 //!    the suite, but it also must not silently look like a pass, so each of those paths logs why.
+//!
+//! Both tiers run on Unix *and* on native Windows. They used to bail out immediately unless
+//! `cfg!(unix)`, because hook injection was disabled on Windows outright; now that it is real
+//! there, the difference between the two platforms is exactly one thing - which shell Claude Code
+//! runs the generated `command` string through - and that is confined to [`shell_running`]. Every
+//! assertion below is the same on both, which is the point: a Windows-only regression in the
+//! generated command, the forwarder or the transport fails a real test rather than skipping one.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -24,6 +31,44 @@ use crate::hooks::server::HookListener;
 use crate::hooks::settings_file::{HookFiles, AGENT_ENV, PORT_ENV, TOKEN_ENV};
 use crate::rail::status::{derive_status, HookSignal, ProcessSignal, Status, TerminalSignal};
 use crate::work_surface::agents::ProcessKind;
+
+/// A `Command` that runs `command` through the same shell Claude Code would - `sh -c` on Unix,
+/// and on Windows the PowerShell that `crate::hooks::settings_file::windows_hook_entry`'s
+/// `"shell": "powershell"` asks Claude Code for.
+///
+/// The one platform difference in this whole file. Stdin is left for the caller to set, because
+/// the payload arriving on it is the thing under test.
+#[cfg(not(windows))]
+fn shell_running(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("/bin/sh");
+    process.arg("-c").arg(command);
+    process
+}
+
+/// See the `#[cfg(not(windows))]` twin above.
+#[cfg(windows)]
+fn shell_running(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new("powershell.exe");
+    process
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command);
+    process
+}
+
+/// The generated `command` string for `event`, read out of the real generated settings file rather
+/// than reconstructed - so these tests exercise the string Claude Code itself would run, including
+/// its platform-specific quoting.
+fn generated_command(files: &HookFiles, event: &str) -> String {
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(files.settings_path()).expect("read"))
+            .expect("valid JSON");
+    settings["hooks"][event][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a {event} command"))
+        .to_owned()
+}
 
 /// A real `PreToolUse` body, captured verbatim from a real `claude` 2.1.228 run on this machine.
 const REAL_PAYLOAD: &str = r#"{"session_id":"5a4bef04-9e59-4d75-874d-928b1f8c3958","cwd":"/tmp/capture","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test --workspace","description":"Run the test suite"},"tool_use_id":"toolu_017yNzAHSe1j6rqbwMkN7gJc"}"#;
@@ -43,9 +88,6 @@ fn wait_for(mut check: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn the_real_forwarder_script_delivers_a_real_payload_end_to_end() {
-    if !cfg!(unix) {
-        return;
-    }
     let temp = tempfile::tempdir().expect("temp dir");
     let listener = HookListener::start().expect("the listener must bind a real loopback port");
     let files = HookFiles::write_in(temp.path()).expect("the generated files must be written");
@@ -53,18 +95,10 @@ fn the_real_forwarder_script_delivers_a_real_payload_end_to_end() {
     // The real generated script, named by the real generated settings file - read the command out
     // of the settings rather than reconstructing it, so this exercises the path Claude Code would
     // actually run.
-    let settings: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(files.settings_path()).expect("read"))
-            .expect("valid JSON");
-    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        .as_str()
-        .expect("a PreToolUse command")
-        .to_owned();
+    let command = generated_command(&files, "PreToolUse");
 
     let agent_id = 42;
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&command)
+    let mut child = shell_running(&command)
         .env(PORT_ENV, listener.port().to_string())
         .env(TOKEN_ENV, listener.token())
         .env(AGENT_ENV, agent_id.to_string())
@@ -135,23 +169,12 @@ fn a_forwarder_run_outside_jerry_reaches_no_listener_at_all() {
     // The safety property that makes the generated command harmless if a user ever copies it into
     // their own settings: with no JERRY_* environment it must not post anywhere, even though a
     // real listener is running and would happily accept a correctly-tokened request.
-    if !cfg!(unix) {
-        return;
-    }
     let temp = tempfile::tempdir().expect("temp dir");
     let listener = HookListener::start().expect("listener");
     let files = HookFiles::write_in(temp.path()).expect("files");
-    let settings: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(files.settings_path()).expect("read"))
-            .expect("valid JSON");
-    let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .expect("a Stop command")
-        .to_owned();
+    let command = generated_command(&files, "Stop");
 
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&command)
+    let mut child = shell_running(&command)
         .env_remove(PORT_ENV)
         .env_remove(TOKEN_ENV)
         .env_remove(AGENT_ENV)
@@ -246,9 +269,6 @@ fn run_real_claude(
 
 #[test]
 fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_listener() {
-    if !cfg!(unix) {
-        return;
-    }
     let Some(binary) = real_claude() else {
         skip_or_fail(
             "no `claude` binary on PATH - the hook transport itself is still covered by the \
@@ -300,6 +320,14 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     // empirically rather than inferred - see `crate::hooks::settings_file`'s module docs. If a
     // future Claude Code release changed this to "replace", Jerry would silently switch off
     // hooks its users configured themselves, and this test is what would catch it.
+    //
+    // Still Unix-only, and for a reason that is about the *test*, not about Jerry: the two
+    // stand-in "user" hooks it plants are `echo ... >> <file>` shell commands, and it redirects
+    // `HOME` to keep the real `~/.claude` untouched. Neither has a one-line Windows equivalent
+    // (`USERPROFILE`, a different shell, a different settings location), and what is being pinned
+    // here is Claude Code's *merge* behaviour, which is a property of Claude Code rather than of
+    // the platform. The Windows-specific halves - the generated command, the forwarder, the
+    // transport - are covered by the two tests above, which do run there.
     if !cfg!(unix) {
         return;
     }
@@ -390,9 +418,6 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
 fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     cx: &mut gpui::TestAppContext,
 ) {
-    if !cfg!(unix) {
-        return;
-    }
     if real_claude().is_none() {
         skip_or_fail("no `claude` binary on PATH - the real spawn path cannot be exercised");
         return;
@@ -431,7 +456,7 @@ fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     );
     assert!(
         settings_path
-            .with_file_name("jerry-hook-forwarder.sh")
+            .with_file_name(crate::hooks::settings_file::FORWARDER_NAME)
             .is_file(),
         "the forwarder script the settings file names must really exist"
     );

@@ -81,11 +81,18 @@ impl HookRuntime {
     /// [`crate::root::AdeApp::hook_injection_for`] for why, and for the guarantee that there is
     /// still only ever one of these per `AdeApp`.
     ///
-    /// Returns `None` rather than an error if hook support can't be brought up - an unsupported
-    /// platform ([`settings_file::is_supported`]), a loopback that won't bind, an unwritable temp
-    /// directory. Every one of those is a real state, and none of them should stop Jerry
-    /// starting: without a runtime, every agent simply falls back to the Phase 1 title/OSC and
-    /// quiescence signals, which is exactly the behaviour that shipped before this phase.
+    /// Returns `None` rather than an error if hook support can't be brought up - a loopback that
+    /// won't bind, an unwritable temp directory, or a platform with no forwarder written for it
+    /// ([`settings_file::is_supported`]). Every one of those is a real state, and none of them
+    /// should stop Jerry starting: without a runtime, every agent simply falls back to the Phase 1
+    /// title/OSC and quiescence signals, which is exactly the behaviour that shipped before this
+    /// phase.
+    ///
+    /// The two machine-level failures - the port and the temp directory - apply identically on
+    /// every supported platform. The platform check is *not* the Unix-only gate it used to be:
+    /// macOS, Linux and native Windows all install real hooks, each through its own forwarder and
+    /// its own pinned shell (see [`settings_file`]'s module docs). It is only the genuinely
+    /// unwritten-for targets that fall through it now.
     pub fn start(parent: &Path) -> Option<HookRuntime> {
         if !settings_file::is_supported() {
             log::info!(
