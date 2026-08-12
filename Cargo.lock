@@ -302,6 +302,7 @@ dependencies = [
  "tree-sitter-yaml",
  "ttf-parser",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
  "wt-core",
 ]
 

@@ -3325,6 +3325,13 @@ mod repo_checkout_tests {
     /// any `jerry .`/relative invocation) hands the app: the CLI argument used to be stored
     /// verbatim as `Repo::path`. `crate::rail::repo::canonical_repo_path` normalizes it at the
     /// boundary instead.
+    ///
+    /// `#[cfg(unix)]` because the *setup* is - `std::os::unix::fs::symlink` does not exist on
+    /// Windows, so without this gate the whole `app` test target fails to compile there, taking
+    /// every unrelated Windows test down with it (`crate::hooks::settings_file`'s Windows suite
+    /// among them). The behaviour under test is not Unix-specific; only the way this test
+    /// manufactures an unresolved path is.
+    #[cfg(unix)]
     #[gpui::test]
     fn an_agent_spawned_in_a_repo_opened_through_a_symlink_still_appears_in_the_rail(
         cx: &mut TestAppContext,
@@ -3383,6 +3390,9 @@ mod repo_checkout_tests {
     /// `Self::open_repo_in_current_window` (the "Open Folder…" path) rather than the CLI
     /// argument - a second real entry point for a repo path, which must not be able to
     /// reintroduce the unresolved-path bug on its own.
+    ///
+    /// `#[cfg(unix)]` for the same reason as the test above: `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
     #[gpui::test]
     fn opening_a_symlinked_folder_stores_the_resolved_repo_path(cx: &mut TestAppContext) {
         let repo_a = init_repo();

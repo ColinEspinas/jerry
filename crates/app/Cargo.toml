@@ -263,6 +263,28 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows only, and the exact counterpart of the `libc` entry above: `crate::hooks::settings_file`
+# needs a real "does this pid still exist" check on Windows now that hook injection is genuinely
+# supported there (GitHub issue #239 - it used to be `cfg!(unix)`-gated off, and the Windows
+# `process_is_alive` was a hardcoded `true` that could never delete anything). There is no
+# `kill(pid, 0)` equivalent, so it is `OpenProcess` + `WaitForSingleObject` - see that function's
+# own docs for why both calls are needed and why `GetExitCodeProcess` is the wrong primitive.
+# `windows-sys` rather than the higher-level `windows` crate: both are already in this workspace's
+# lock file transitively (via `gpui_platform`'s Windows backend), and `windows-sys` is the raw,
+# no-runtime binding layer that matches how `libc` is used on the other side of this pair. Pinned
+# to the exact version `Cargo.lock` already resolves, so this promotes an already-locked crate to a
+# direct dependency rather than adding new build surface. Only the feature modules the handful of
+# items actually used live in are enabled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    # For `SYNCHRONIZE`, which is a *standard* access right shared by every securable object
+    # (`WaitForSingleObject` needs it on the process handle) and not a filesystem thing at all -
+    # this is just the module the generated bindings put it in.
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 # `test-support` unlocks GPUI's real interactive test harness (`#[gpui::test]`,
