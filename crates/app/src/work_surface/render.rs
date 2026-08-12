@@ -291,11 +291,42 @@ impl AdeApp {
             .find(|agent| agent.id == id)
             .map(|agent| agent.cwd.clone());
         if let Some(cwd) = cwd {
-            if let Some(index) = self.worktrees.iter().position(|item| item.path == cwd) {
-                if self.selected != Some(index) {
-                    self.select_worktree(index, window, cx);
-                    return;
-                }
+            // `crate::root::AdeApp::select_worktree_by_path`, not a plain `self.worktrees`
+            // lookup: this agent may belong to a worktree in a repo that isn't the focused one
+            // at all (the rail's own agent rows fold in every repo's agents, not just the
+            // focused repo's - `Self::build_agent_rows`'s own docs) - a real, reported bug:
+            // clicking such an agent set it globally active (`Agents::set_active` above) but
+            // never switched repos, so `Self::active_agent_cwd` kept resolving to whatever the
+            // *focused* repo's own selection was, `Self::combined_tab_order` built the tab strip
+            // from that wrong cwd, and it came up with zero tabs - visibly "the tab bar doesn't
+            // appear" - even though the agent genuinely was active underneath.
+            // `select_worktree_by_path` already does the real cross-repo checkout when needed;
+            // its own no-op-when-nothing-to-select guard is why the "already the right
+            // worktree" check happens first here, unchanged from before - a same-worktree agent
+            // switch (clicking between two terminals already open here) must stay cheap, with no
+            // worktree-switch reset at all.
+            let already_selected = self
+                .selected
+                .and_then(|index| self.worktrees.get(index))
+                .is_some_and(|item| item.path == cwd);
+            // A real regression this exact fix introduced and an adversarial test caught: `cwd`
+            // is only a real worktree row when *some* repo's own list actually contains it - an
+            // agent rooted directly at a repo with no git worktrees at all (a plain shell in a
+            // non-git or bare directory, exactly what this file's own tests use) has no such
+            // row anywhere, and `select_worktree_by_path` is correctly a no-op for a path it
+            // can't find. Unconditionally delegating to it and returning early - what this looked
+            // like right after the cross-repo fix - silently skipped everything below for that
+            // case too, including the real keyboard-focus restore GitHub issue #112 exists for.
+            // Checking findability first keeps that fallback reachable exactly as before.
+            let findable = !already_selected
+                && (self.worktrees.iter().any(|item| item.path == cwd)
+                    || self
+                        .repos
+                        .iter()
+                        .any(|repo| repo.worktrees.iter().any(|item| item.path == cwd)));
+            if findable {
+                self.select_worktree_by_path(&cwd, window, cx);
+                return;
             }
         }
         // GitHub issue #112: when no file tab was showing, nothing above moves real keyboard
@@ -5023,5 +5054,114 @@ mod terminal_clipboard_action_tests {
             "expected the active agent's real pty to echo back the clipboard text \
              TerminalPaste's handler writes"
         );
+    }
+}
+
+/// The reported "clicking an agent from another worktree/repo, the tab bar does not appear" -
+/// `Self::select_agent` used to look the clicked agent's own worktree up only in `Self::
+/// worktrees`, the *focused* repo's own list - the rail's own agent rows fold in every repo's
+/// agents, not just the focused one's (`crate::rail::render::AdeApp::build_agent_rows`'s own
+/// docs), so an agent from a non-focused repo was findable and clickable but its own worktree
+/// never was. `Agents::set_active` still ran, so the agent genuinely became active - but nothing
+/// switched repos, so `Self::active_agent_cwd` kept resolving to the *focused* repo's own
+/// selection, `Self::combined_tab_order` built the strip from that wrong cwd, and it came up
+/// empty: a real agent, active underneath, with no tab visible for it at all.
+#[cfg(test)]
+mod select_agent_cross_repo_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::work_surface::agents::ProcessKind;
+    use gpui::TestAppContext;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    #[gpui::test]
+    fn selecting_an_agent_in_a_non_focused_repo_switches_to_it_and_shows_its_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        // A real agent, spawned directly into repo B while repo A stays focused - exactly the
+        // state a real cross-repo-persisted agent is in.
+        let repo_b_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::claude(),
+                repo_b.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_a.path(),
+                "sanity check: repo A is still focused - repo B's agent was spawned in the \
+                 background, not through a real repo switch"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(repo_b_agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_b.path(),
+                "selecting an agent in a non-focused repo must really switch focus to that repo"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                Some(repo_b_agent_id),
+                "and the agent itself must really be the active one"
+            );
+            let tab_order = app.combined_tab_order();
+            assert!(
+                tab_order
+                    .iter()
+                    .any(|tab_ref| matches!(tab_ref, work_surface::TabRef::Agent(id) if *id == repo_b_agent_id)),
+                "the tab strip's own real tab order must include the selected agent - if it \
+                 doesn't, the tab bar has nothing to show for it even though the agent is active, \
+                 exactly the reported bug"
+            );
+            let _ = cx;
+        });
     }
 }
