@@ -1814,8 +1814,19 @@ impl AdeApp {
             })
             .when(!dir.is_empty(), |el| {
                 el.child(
+                    // GitHub issue #243: a deeply nested worktree can produce a `dir` long enough
+                    // to push `name`, the tag pill, and the stat counts clean off the row's right
+                    // edge - this used to be `.flex_none()` with no cap or overflow handling at
+                    // all. Capped rather than left in the shared flex-shrink pool with `name`
+                    // below: the filename is what actually identifies the row, so it keeps first
+                    // claim on whatever space is available, and the directory prefix truncates on
+                    // its own budget instead of squeezing the name down to make room.
                     div()
+                        .debug_selector(|| format!("change-row-dir-{}", file.path.display()))
                         .flex_none()
+                        .max_w(px(120.0))
+                        .overflow_hidden()
+                        .truncate()
                         .font(font(theme::font::MONO))
                         .text_size(self.ui_text_size(10.5))
                         .text_color(theme::text::GHOST)
@@ -1827,6 +1838,7 @@ impl AdeApp {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
+                    .truncate()
                     .font(font(theme::font::MONO))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_size(self.ui_text_size(11.5))
@@ -5363,6 +5375,85 @@ mod commit_composer_tests {
         assert!(
             cx.debug_bounds("changes-header-0-of-0-staged").is_some(),
             "with everything committed there is nothing stageable left at all"
+        );
+    }
+
+    /// **The regression test for GitHub issue #243.** A deeply nested worktree path used to push
+    /// the filename, tag pill, and stat counts clean off the row's right edge - `dir` was
+    /// `.flex_none()` with no cap, and `name` had `.overflow_hidden()` without the paired
+    /// `.truncate()` every other truncated row in this codebase carries. A whole-row bounds
+    /// check can't prove this: `uniform_list` gives every row a fixed-width layout slot
+    /// regardless of whether an unclipped `flex_none` child spills out of it visually - so this
+    /// measures the directory-prefix element directly, real bounds against its real
+    /// `.max_w(px(120.0))` cap, not a hand-inspected snapshot.
+    #[gpui::test]
+    fn a_deeply_nested_path_does_not_overflow_the_change_row(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write base.txt");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+
+        // Twelve real nested directories, each with a long, realistic segment name - the exact
+        // shape of path this issue was filed against, not a contrived worst case.
+        let nested_dir = repo.path().join(
+            [
+                "crates",
+                "app",
+                "src",
+                "components",
+                "very",
+                "deeply",
+                "nested",
+                "feature",
+                "module",
+                "implementation",
+                "details",
+                "internal",
+            ]
+            .iter()
+            .collect::<PathBuf>(),
+        );
+        std::fs::create_dir_all(&nested_dir).expect("mkdir -p");
+        let nested_file = nested_dir.join("a_reasonably_long_source_file_name.rs");
+        std::fs::write(&nested_file, "fn main() {}\n").expect("write nested file");
+
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let relative = nested_file
+            .strip_prefix(repo.path())
+            .expect("nested file is under the repo root")
+            .display()
+            .to_string();
+        // `debug_bounds` wants a `&'static str`; these selectors are built at runtime from a
+        // real path, so they're leaked once rather than compile-time literals - a real, if
+        // deliberately test-only, cost this codebase already accepts elsewhere for the same
+        // reason (see `AgentKind`-adjacent `Box::leak` uses).
+        let row_selector: &'static str =
+            Box::leak(format!("change-row-{relative}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(row_selector).is_some(),
+            "the row for {relative:?} must really render"
+        );
+
+        // The row's own outer bounds don't prove anything on their own - a `uniform_list` row
+        // slot is a fixed layout box regardless of whether an unclipped `flex_none` child spills
+        // out of it, so this measures the directory-prefix element directly instead: it is the
+        // one piece of this row `.max_w(px(120.0))` actually bounds, so twelve real nested
+        // segments (a directory prefix many times that width, unclipped) must still measure at
+        // or under the real cap - not the panel-relative check a whole-row assertion would be.
+        let dir_selector: &'static str =
+            Box::leak(format!("change-row-dir-{relative}").into_boxed_str());
+        let dir_bounds = cx
+            .debug_bounds(dir_selector)
+            .unwrap_or_else(|| panic!("the directory prefix for {relative:?} must render"));
+        assert!(
+            dir_bounds.size.width <= px(120.0),
+            "the directory prefix must never exceed its real cap - got {:?} for a twelve-\
+             segment nested path, which is exactly the case GitHub issue #243 was filed against",
+            dir_bounds.size.width
         );
     }
 }
