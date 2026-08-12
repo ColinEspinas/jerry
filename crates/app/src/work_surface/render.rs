@@ -759,10 +759,28 @@ impl AdeApp {
     ) -> Vec<String> {
         let is_bare = self.current_worktree_is_bare();
         let branch = self.current_worktree_branch();
-        let raw: Vec<String> = agent_ids
+
+        // Ordinals must be assigned in a real, stable order - `AgentId`'s own monotonic
+        // assignment at spawn time (`Agents::spawn`'s `next_id`), never `agent_ids`' own input
+        // order. The caller passes `agent_ids` from `Self::combined_tab_order`, which the tab
+        // strip's drag-to-reorder freely rewrites - a `#N` suffix that changes because a tab
+        // moved is not a real identifier, it just relabels whichever agent happens to render
+        // first. Sorting here keeps the numbers pinned to spawn order regardless of what order
+        // the tab strip currently renders in.
+        let mut stable: Vec<(AgentId, &Agent)> = agent_ids
             .iter()
-            .filter_map(|id| self.agents.iter().find(|agent| agent.id == *id))
-            .map(|agent| match work_surface::tab_chip_kind(agent.kind) {
+            .filter_map(|id| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.id == *id)
+                    .map(|agent| (*id, agent))
+            })
+            .collect();
+        stable.sort_unstable_by_key(|(id, _)| *id);
+
+        let raw: Vec<String> = stable
+            .iter()
+            .map(|(_, agent)| match work_surface::tab_chip_kind(agent.kind) {
                 work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
                 work_surface::TabChipKind::Term => {
                     if is_bare {
@@ -776,7 +794,20 @@ impl AdeApp {
                 }
             })
             .collect();
-        work_surface::disambiguate_tab_labels(raw)
+        let disambiguated = work_surface::disambiguate_tab_labels(raw);
+
+        // Re-align to `agent_ids`' own input order (this function's existing contract), which
+        // may differ from `stable`'s spawn order - the numbers themselves stay spawn-order-
+        // derived, only the returned vec's own ordering follows what the caller asked for.
+        let label_by_id: std::collections::HashMap<AgentId, String> = stable
+            .into_iter()
+            .map(|(id, _)| id)
+            .zip(disambiguated)
+            .collect();
+        agent_ids
+            .iter()
+            .filter_map(|id| label_by_id.get(id).cloned())
+            .collect()
     }
 
     /// The tab strip: one tab per entry of [`Self::combined_tab_order`], in that exact order -
@@ -3618,6 +3649,57 @@ mod tab_scoping_tests {
             labels,
             vec!["claude #1".to_string(), "claude #2".to_string()],
             "two agents of the same kind must never render two identical tab labels"
+        );
+    }
+
+    /// The bug this guards against: `current_worktree_agent_tab_labels` is called with
+    /// `agent_ids` from `Self::combined_tab_order`, which the tab strip's drag-to-reorder
+    /// freely rewrites - if ordinals were assigned in *that* order, dragging a tab past
+    /// another would relabel both, turning `#N` into a number that means nothing (it wouldn't
+    /// even stay attached to the same agent). Passing the two ids in reverse of spawn order -
+    /// exactly what a drag produces - must still yield the same `#1`/`#2` pinned to spawn
+    /// order, and the returned vec must still align to the *requested* (reversed) order.
+    #[gpui::test]
+    fn dragging_a_tab_past_another_never_changes_either_ordinal(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let first_id = app.agents.spawn(
+                ProcessKind::claude(),
+                wt_a.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            let second_id = app.agents.spawn(
+                ProcessKind::claude(),
+                wt_a.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            (first_id, second_id)
+        });
+
+        // Spawn order: [first_id, second_id]. A drag that moves the first tab past the second
+        // would hand this function [second_id, first_id] instead.
+        let labels = app.update(cx, |app, cx| {
+            app.current_worktree_agent_tab_labels(&[second_id, first_id], cx)
+        });
+        assert_eq!(
+            labels,
+            vec!["claude #2".to_string(), "claude #1".to_string()],
+            "the requested (post-drag) order must be preserved in the return value, but the \
+             ordinals themselves must stay pinned to real spawn order - `first_id` is always \
+             #1, `second_id` is always #2, regardless of which order they're asked for in"
         );
     }
 
