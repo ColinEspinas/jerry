@@ -1779,6 +1779,7 @@ impl AdeApp {
         div()
             .id(format!("change-row-{}", file.path.display()))
             .debug_selector(|| format!("change-row-{}", file.path.display()))
+            .relative()
             .flex()
             .w_full()
             .items_center()
@@ -1792,14 +1793,36 @@ impl AdeApp {
             // similar-looking bare number that happens to already clear the *old*,
             // insufficient value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
-            .border_b_1()
-            .border_color(theme::border::ROW)
             .cursor_pointer()
-            .when(selected, |el| {
-                el.bg(theme::surface::ROW_SELECTED)
-                    .border_l_2()
-                    .border_color(theme::border::SELECTED_EDGE)
-            })
+            // No bottom border at all - this row used to carry a permanent `border_b_1()`
+            // alongside a conditional `border_l_2()` inside the `when` below, and because GPUI's
+            // `Style::border_color` is one shared value for every edge of a single element (not
+            // per-edge - confirmed directly in `gpui`'s own `style.rs`), selecting a row silently
+            // recoloured the bottom edge to the selection colour too - a real border appearing
+            // along the bottom on selection, not an intended static separator. The old
+            // `border_l_2()` also only reserved its 2px of space *while* selected, shifting every
+            // row's content 2px right the instant it was clicked. See
+            // `crate::graph_view::render::AdeApp::render_graph_row`'s identical fix for the full
+            // reasoning - same bug, same shape, same fix: no bottom border, and a real, separate,
+            // always-painted child for the left selection edge.
+            .child(
+                div()
+                    .debug_selector({
+                        let path = file.path.clone();
+                        move || format!("change-row-{}-selection-edge", path.display())
+                    })
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(if selected {
+                        theme::border::SELECTED_EDGE.into()
+                    } else {
+                        work_surface::TRANSPARENT
+                    }),
+            )
+            .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
             })
@@ -3265,6 +3288,98 @@ mod virtualization_tests {
              GitHub issue #123's screenshot shows colliding with the scrollbar",
             header_button.right(),
             scrollbar.left(),
+        );
+    }
+}
+
+/// The reported "double border left and bottom" applied to the Changes panel's own rows - see
+/// `crate::graph_view::render::AdeApp::render_graph_row`'s own docs for the full GPUI
+/// `Style::border_color`-is-one-shared-value explanation this fix is built on.
+#[cfg(test)]
+mod change_row_selection_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Same real-diff shape `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted`
+    /// already establishes (a real feature branch, so this hits `wt_core::diff::DiffBase::Diff`,
+    /// not `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback).
+    #[gpui::test]
+    fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").expect("write");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("a.txt"), "base\nchanged\n").expect("write");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.current_diff().map(|d| d.files.len())),
+            Some(1),
+            "sanity check: the one real changed file must really be in the loaded diff"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            None,
+            "premise: nothing is selected yet, so this genuinely exercises the unselected case"
+        );
+
+        let edge_unselected = cx.debug_bounds("change-row-a.txt-selection-edge").expect(
+            "the selection-edge child must be painted even while the row is unselected - if \
+             it's `None` here, the edge is still only created `.when(selected, ...)`, the exact \
+             regression this test exists to catch",
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_change_diff(std::path::PathBuf::from("a.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(std::path::PathBuf::from("a.txt")),
+            "sanity check: the row really is selected now"
+        );
+
+        let edge_selected = cx
+            .debug_bounds("change-row-a.txt-selection-edge")
+            .expect("the selection-edge child must still be painted while the row is selected");
+
+        assert_eq!(
+            edge_unselected.origin, edge_selected.origin,
+            "the selection edge's own position must never move - only its colour toggles \
+             (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
+        );
+        assert_eq!(
+            edge_unselected.size, edge_selected.size,
+            "the selection edge's own size must never change (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
         );
     }
 }

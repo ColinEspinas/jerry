@@ -393,20 +393,39 @@ impl AdeApp {
         div()
             .id(format!("review-row-{}", file.path.display()))
             .debug_selector(|| format!("review-row-{}", file.path.display()))
+            .relative()
             .flex()
             .w_full()
             .items_center()
             .gap(px(6.0))
             .h(theme::band::CHANGE_ROW)
             .px(px(10.0))
-            .border_b_1()
-            .border_color(theme::border::ROW)
             .cursor_pointer()
-            .when(selected, |el| {
-                el.bg(theme::surface::ROW_SELECTED)
-                    .border_l_2()
-                    .border_color(theme::border::SELECTED_EDGE)
-            })
+            // No bottom border at all - see `crate::graph_view::render::AdeApp::render_graph_row`'s
+            // identical fix for why: GPUI's `Style::border_color` is one shared value for the
+            // whole element, so a conditional `border_l_2()` here used to silently recolour a
+            // permanent `border_b_1()` separator too, a real border appearing along the bottom on
+            // selection - and it only reserved its own space while selected, shifting every row's
+            // content on click. Fixed the same way: no bottom border, and a real, separate,
+            // always-painted child for the left selection edge.
+            .child(
+                div()
+                    .debug_selector({
+                        let path = file.path.clone();
+                        move || format!("review-row-{}-selection-edge", path.display())
+                    })
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(if selected {
+                        theme::border::SELECTED_EDGE.into()
+                    } else {
+                        work_surface::TRANSPARENT
+                    }),
+            )
+            .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
             })
@@ -1169,6 +1188,64 @@ mod review_flow_tests {
                  view's, which stays independent"
             );
         });
+    }
+
+    /// The reported "double border left and bottom" applied to the review panel's own rows -
+    /// see `crate::graph_view::render::AdeApp::render_graph_row`'s own docs for the full GPUI
+    /// `Style::border_color`-is-one-shared-value explanation this fix is built on.
+    #[gpui::test]
+    fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = diverged_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = sole_agent(&app, cx);
+        std::fs::write(repo.path().join("agent_work.rs"), "fn main() {}\n").expect("write");
+
+        app.update_in(cx, |app, window, cx| app.open_review_tab(id, window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("review-row-agent_work.rs").is_some(),
+            "sanity check: the real unreviewed file must really have painted as a row"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.open_change, None,
+                "premise: nothing is selected yet, so this genuinely exercises the unselected \
+                 case"
+            );
+        });
+
+        let edge_unselected = cx
+            .debug_bounds("review-row-agent_work.rs-selection-edge")
+            .expect(
+                "the selection-edge child must be painted even while the row is unselected - if \
+                 it's `None` here, the edge is still only created `.when(selected, ...)`, the \
+                 exact regression this test exists to catch",
+            );
+
+        app.update(cx, |app, cx| {
+            app.open_review_file(PathBuf::from("agent_work.rs"), cx)
+        });
+        cx.run_until_parked();
+
+        let edge_selected = cx
+            .debug_bounds("review-row-agent_work.rs-selection-edge")
+            .expect("the selection-edge child must still be painted while the row is selected");
+
+        assert_eq!(
+            edge_unselected.origin, edge_selected.origin,
+            "the selection edge's own position must never move - only its colour toggles \
+             (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
+        );
+        assert_eq!(
+            edge_unselected.size, edge_selected.size,
+            "the selection edge's own size must never change (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
+        );
     }
 
     /// **The reachability proof.** Every other test in this module opens the review tab by
