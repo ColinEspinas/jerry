@@ -30,6 +30,7 @@ pub mod review;
 pub mod root;
 pub mod settings;
 pub mod sidebar;
+pub mod sound;
 pub mod status_bar;
 pub mod terminal;
 pub mod text_history;

@@ -37,19 +37,23 @@ jobs:
     # this project's own dependency set never touches (libgit2 - wt-core uses `gix`, a
     # pure-Rust reimplementation, never libgit2; musl-tools/musl-dev - no musl target
     # is built here; pipewire/xdg-desktop-portal/libva-dev - GPUI's optional
-    # `screen-capture` feature, which nothing in this workspace enables). ALSA,
-    # OpenSSL, sqlite3, and zstd dev packages were dropped from this list after
-    # checking `Cargo.lock` directly: no `alsa`/`alsa-sys`, `openssl-sys`,
-    # `libsqlite3-sys`/`rusqlite`, or `zstd-sys`/`libz-sys` appears anywhere in this
-    # workspace's resolved dependency tree, so none of those four are actually needed
-    # to build it, despite being genuinely required by upstream Zed's own, larger
-    # workspace. `libxkbcommon-x11-dev` and `libx11-xcb-dev` were already on this list
-    # before `x11` was actually enabled (Revision R1 added them preemptively, R12
-    # turned that into a real dependency instead of a dead one) - `apt-cache depends`
-    # confirms both hard-`Depends:` (not merely `Recommends:`) on every other X11/xkb
-    # `-dev` package the `x11` feature needs (`libxcb-xkb-dev`, `libx11-dev`,
-    # `libxcb1-dev`), so `apt-get install`'s own dependency resolution pulls the rest
-    # in automatically - no new package names were needed for R12.
+    # `screen-capture` feature, which nothing in this workspace enables). OpenSSL,
+    # sqlite3, and zstd dev packages were dropped from this list after checking
+    # `Cargo.lock` directly: no `openssl-sys`, `libsqlite3-sys`/`rusqlite`, or
+    # `zstd-sys`/`libz-sys` appears anywhere in this workspace's resolved dependency
+    # tree, so none of those three are actually needed to build it, despite being
+    # genuinely required by upstream Zed's own, larger workspace. `libxkbcommon-x11-dev`
+    # and `libx11-xcb-dev` were already on this list before `x11` was actually enabled
+    # (Revision R1 added them preemptively, R12 turned that into a real dependency
+    # instead of a dead one) - `apt-cache depends` confirms both hard-`Depends:` (not
+    # merely `Recommends:`) on every other X11/xkb `-dev` package the `x11` feature
+    # needs (`libxcb-xkb-dev`, `libx11-dev`, `libxcb1-dev`), so `apt-get install`'s own
+    # dependency resolution pulls the rest in automatically - no new package names were
+    # needed for R12. `libasound2-dev` was dropped alongside OpenSSL/sqlite3/zstd for
+    # the same "not in Cargo.lock" reason, but GitHub issue #226's sound design module
+    # (`crate::sound`) now depends on `rodio`'s `playback` feature, which pulls in
+    # `cpal`, which links ALSA on Linux (`alsa-sys` now genuinely resolves in
+    # `Cargo.lock`) - so it's back, or this job fails to link on Linux.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,7 +74,8 @@ jobs:
             libwayland-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
-            libx11-xcb-dev
+            libx11-xcb-dev \
+            libasound2-dev
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master

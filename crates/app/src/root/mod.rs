@@ -2032,6 +2032,66 @@ pub struct AdeApp {
     /// `crate::title_bar::menu::AdeApp::file_menu_rows`) - a single slot, matching
     /// [`Self::_icon_pack_choose_task`]'s own one-dialog-at-a-time reasoning.
     pub(crate) _repo_folder_choose_task: Option<Task<()>>,
+    /// The sound library (GitHub issue #226): built-in sounds plus whatever the user has
+    /// imported into `~/.config/jerry/sounds/` at construction time - same "load once at
+    /// startup, before anything needs to resolve a settings-stored id against it" seam
+    /// [`Self::custom_themes`] already uses for themes. Every `Notifications` settings-page
+    /// dropdown lists this; [`crate::sound::flow`]'s gating resolves a `settings.toml`
+    /// `sound.*.sound` id against it before ever calling [`Self::sound_player`].
+    pub(crate) sound_library: Vec<crate::sound::LibrarySound>,
+    /// Real, honestly-reported load failures from the last time [`Self::sound_library`]'s user
+    /// half was (re)loaded - same shape as [`Self::custom_theme_load_errors`].
+    pub(crate) sound_load_errors: Vec<String>,
+    /// The Notifications page's most recent import action result - same shape as
+    /// [`Self::custom_theme_status`].
+    pub(crate) sound_import_status: Option<Result<String, String>>,
+    /// The in-flight "Import sound…" real native file-picker task
+    /// (`Self::start_import_sound`) - a single slot, matching
+    /// [`Self::_custom_theme_import_task`]'s own one-dialog-at-a-time reasoning.
+    pub(crate) _sound_import_task: Option<Task<()>>,
+    /// Which dropdown (if any) a sound-event row's "choose a sound" popover is currently open
+    /// for - `None` means every one of them is closed. Mirrors
+    /// `crate::settings::render::AdeApp::shell_suggestions_open`'s single-popover-at-a-time
+    /// shape, keyed by event since there are three independent dropdowns on this page rather
+    /// than one.
+    pub(crate) sound_picker_open: Option<crate::sound::SoundEventKind>,
+    /// Each sound-event row's own trigger button's real, window-space painted bounds - the same
+    /// `gpui::canvas` idiom [`Self::shell_field_bounds`] uses, kept per-event (a `HashMap` rather
+    /// than a single field) because all three rows exist on screen at once and the popover must
+    /// anchor to whichever one was actually clicked, not whichever rendered last.
+    pub(crate) sound_event_button_bounds:
+        std::collections::HashMap<crate::sound::SoundEventKind, gpui::Bounds<Pixels>>,
+    /// Every live agent's [`crate::rail::status::Status`] as of the *previous* status-poll tick,
+    /// [`crate::sound::flow::AdeApp::play_agent_status_sounds`]'s own real transition memory. An
+    /// agent id present here but no longer in [`crate::work_surface::agents::Agents`] (closed
+    /// since the last tick) is simply never looked at again, never explicitly pruned - the same
+    /// "a stale entry is harmless, not actively cleaned up" precedent [`Self::tab_slide`]'s own
+    /// docs describe.
+    pub(crate) prev_agent_statuses: std::collections::HashMap<
+        crate::work_surface::agents::AgentId,
+        crate::rail::status::Status,
+    >,
+    /// Whether [`Self::prev_agent_statuses`] has been populated at least once yet -
+    /// `play_agent_status_sounds`'s own "don't treat a fresh app launch's already-open agents as
+    /// a burst of transitions" guard. `false` until the very first status-poll tick after
+    /// construction runs; every tick after that leaves it `true`, permanently, for the life of
+    /// the window - see that method's own docs.
+    pub(crate) agent_sound_seeded: bool,
+    /// The real time [`Self::sound_player`] was last asked to play a sound *for an agent
+    /// transition* (never touched by an explicit settings-page preview click) -
+    /// [`crate::sound::flow::SOUND_COOLDOWN`]'s own enforcement point.
+    pub(crate) last_sound_at: Option<std::time::Instant>,
+    /// Whether this window currently has real OS focus - kept in sync by
+    /// [`Self::_window_activation_subscription`]'s callback (GitHub issue #176's existing
+    /// subscription, extended rather than duplicated) and read by
+    /// [`crate::sound::flow::AdeApp::play_agent_status_sounds`]: a sound only ever plays while
+    /// this is `false`, since a focused window already shows the same information visually.
+    /// Starts `true` - a window is real and focused the instant its constructor finishes.
+    pub(crate) window_active: bool,
+    /// The real audio-thread handle every sound in this window plays through
+    /// (`crate::sound::player::SoundPlayer`) - one per window, lazily opening a real output
+    /// device on the first sound actually played, never before.
+    pub(crate) sound_player: crate::sound::player::SoundPlayer,
 }
 
 impl AdeApp {
@@ -2855,6 +2915,16 @@ impl Render for AdeApp {
                     && self.settings_page == settings::SettingsPage::General
                     && self.shell_suggestions_open,
                 |el| el.child(self.render_shell_suggestions(cx)),
+            )
+            // Settings › Notifications' per-event sound picker (GitHub issue #226) - same
+            // "settings page clips its own children" reasoning as the Shell suggestion dropdown
+            // just above, gated the same way: only while Settings is really open on the page that
+            // paints these rows.
+            .when(
+                self.settings_open
+                    && self.settings_page == settings::SettingsPage::Notifications
+                    && self.sound_picker_open.is_some(),
+                |el| el.child(self.render_sound_picker(cx)),
             )
             .when(self.palette_open, |el| el.child(self.render_palette(cx)))
     }

@@ -7,15 +7,18 @@
 //!
 //! ## Which pages are real
 //!
-//! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, and Language servers
-//! render real, live-derived content (see [`SettingsPage::is_implemented`]). Notifications,
-//! Integrations, and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
+//! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, Language servers, and
+//! Notifications render real, live-derived content (see [`SettingsPage::is_implemented`]).
+//! Integrations and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
 //! copy, "not designed in this mockup". Editor is a partial exception, not a full one: its one
 //! real row is the minimap (`crate::code_surface::minimap`, GitHub issue #30's
 //! `editor.minimap.enabled`) - indentation/soft-wrap/whitespace-display still have no real
 //! backing anywhere in this codebase, so those stay left off the page entirely rather than
 //! growing controls bound to nothing, the same "only what's real" discipline every other page
-//! here already follows.
+//! here already follows. Notifications (GitHub issue #226) is the newest of the real pages -
+//! sound design, off by default, real settings-backed toggles and a real, importable sound
+//! library - see `crate::sound`'s own module docs and `crate::settings::render`'s
+//! `render_settings_notifications_page`.
 //!
 //! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
 //!
@@ -110,6 +113,7 @@ impl SettingsPage {
                 | SettingsPage::Keymap
                 | SettingsPage::Editor
                 | SettingsPage::LanguageServers
+                | SettingsPage::Notifications
         )
     }
 
@@ -143,6 +147,9 @@ impl SettingsPage {
             }
             SettingsPage::Editor => {
                 "The minimap (right of the code column) is real: syntax-colored overview, a draggable viewport slider, git-change ticks - saved for real and applied live. Search-match overlays, indentation, soft-wrap and whitespace display aren't built yet, so they're left off this page rather than shown inert."
+            }
+            SettingsPage::Notifications => {
+                "Off by default. Sound effects for app start and agent status changes, picked from a real, importable sound library - saved for real and applied live. Desktop/OS notifications and a dock badge aren't built yet, so they're left off this page rather than shown inert."
             }
             _ => "Not designed yet - this page has no real content in this build.",
         }
@@ -1378,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_eight_documented_pages_are_implemented() {
+    fn exactly_the_nine_documented_pages_are_implemented() {
         for page in SettingsPage::ALL {
             let expected = matches!(
                 page,
@@ -1390,6 +1397,7 @@ mod tests {
                     | SettingsPage::Keymap
                     | SettingsPage::Editor
                     | SettingsPage::LanguageServers
+                    | SettingsPage::Notifications
             );
             assert_eq!(
                 page.is_implemented(),
@@ -1402,7 +1410,10 @@ mod tests {
 
     #[test]
     fn nav_only_pages_share_the_same_honest_placeholder_subtitle() {
-        let placeholder = SettingsPage::Notifications.subtitle();
+        // `About`, not `Notifications`: GitHub issue #226 made Notifications a real, implemented
+        // page, so it no longer shows the shared nav-only placeholder text - `About` is still
+        // honestly nav-only and works as the reference for every other placeholder page.
+        let placeholder = SettingsPage::About.subtitle();
         for page in SettingsPage::ALL {
             if page.is_implemented() {
                 assert_ne!(

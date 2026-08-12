@@ -225,6 +225,23 @@ impl AdeApp {
             None => (Vec::new(), Vec::new()),
         };
 
+        // GitHub issue #226: the sound library, same "load once at startup, before anything
+        // needs to resolve a `settings.toml` id against it" seam as `custom_themes` just above -
+        // built-in sounds always come first (`crate::sound::library::builtin_sounds`), whatever
+        // the user has imported into `~/.config/jerry/sounds/` is appended after.
+        let (sound_library, sound_load_errors) = {
+            let mut library = crate::sound::library::builtin_sounds();
+            let mut errors = Vec::new();
+            if let Some(path) = settings_path.as_deref() {
+                let (user_sounds, user_errors) = crate::sound::library::load_user_sounds_from_dir(
+                    &crate::sound::library::sounds_dir_for(path),
+                );
+                library.extend(user_sounds);
+                errors = user_errors;
+            }
+            (library, errors)
+        };
+
         // A genuinely empty startup (no `resolved_repo_path`) has no real root to point these
         // at yet - an empty `PathBuf` is an honest placeholder, never read by anything: every
         // consumer of `file_tree_root`/`diff_root` lives inside `Self::render_workspace_body`,
@@ -521,10 +538,18 @@ impl AdeApp {
             // has to ask `Window::is_window_active` which one it is rather than assuming - the
             // same shape `vendor/zed/crates/workspace/src/workspace.rs`'s own
             // `on_window_activation_changed` uses.
+            //
+            // GitHub issue #226 reuses this exact subscription for `Self::window_active` rather
+            // than adding a second one: both are "something needs to know this window's real
+            // focus edge", and a second `cx.observe_window_activation` here would just be two
+            // independent callbacks racing to read the same `Window::is_window_active` on every
+            // fire for no benefit.
             _window_activation_subscription: cx.observe_window_activation(
                 window,
                 |this, window, cx| {
-                    if !window.is_window_active() {
+                    let active = window.is_window_active();
+                    this.window_active = active;
+                    if !active {
                         this.close_all_menu_surfaces(cx);
                     }
                 },
@@ -562,6 +587,19 @@ impl AdeApp {
             icon_pack_status: None,
             _icon_pack_choose_task: None,
             _repo_folder_choose_task: None,
+            sound_library,
+            sound_load_errors,
+            sound_import_status: None,
+            _sound_import_task: None,
+            sound_picker_open: None,
+            sound_event_button_bounds: HashMap::new(),
+            prev_agent_statuses: HashMap::new(),
+            agent_sound_seeded: false,
+            last_sound_at: None,
+            // A window is real and focused the instant its own constructor finishes - see this
+            // field's own docs for why the subscription below only ever *updates* it after this.
+            window_active: true,
+            sound_player: crate::sound::player::SoundPlayer::new(),
         };
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
@@ -694,6 +732,18 @@ impl AdeApp {
         // start_update_check_loop`'s own docs. Unconditional for the same reason the keybindings/
         // theme setup above is: it has nothing to do with which (if any) repo is focused.
         this.start_update_check_loop(cx);
+        // GitHub issue #226: the app-start sound. `crate::sound::claim_app_start_sound` is the
+        // real "once per process" gate - a second window (`File > New Window`,
+        // `crate::title_bar::menu`) constructs a second `AdeApp` and reaches this same line, but
+        // finds the process-global flag already claimed and skips straight past. Only once that
+        // gate is won does `Self::maybe_play_app_start_sound` even check whether the user wants
+        // this sound at all (`settings.sound.enabled` + its own toggle) - order matters here:
+        // checking the settings gate first would let a *disabled* first window's early return
+        // leave the process-global flag unclaimed, and a second window opened moments later with
+        // the setting since turned on would then wrongly play it.
+        if crate::sound::claim_app_start_sound() {
+            this.maybe_play_app_start_sound();
+        }
         this
     }
 
