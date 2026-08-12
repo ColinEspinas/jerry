@@ -657,6 +657,16 @@ impl AdeApp {
     /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
     /// drop can still fire on a tab the cursor technically never entered, e.g. a very fast
     /// release), then delegates to [`Self::reorder_tab`], and clears the now-stale caret state.
+    ///
+    /// Also records [`Self::tab_slide`] (task #65, GitHub issue #16's own remaining "neighbour
+    /// tabs teleport instead of sliding" gap) *before* [`Self::reorder_tab`] actually mutates the
+    /// order - `work_surface::state::tab_slide_offsets` needs the real pre-drop order to know
+    /// which tabs are about to shift, and the dragged tab's own real last-measured width
+    /// ([`Self::tab_bounds`]) to know by how much. `dragged_width` is `0px`
+    /// ([`Pixels::default`]) whenever that tab has never actually painted yet (e.g. a test that
+    /// never rendered a real window) - a real, honestly-measured `0` rather than an invented
+    /// placeholder width, so the recorded tabs are still correct even though nothing would
+    /// visibly move.
     pub(in crate::work_surface) fn drop_dragged_tab(
         &mut self,
         dragged: work_surface::TabRef,
@@ -669,6 +679,25 @@ impl AdeApp {
             .is_some_and(|(hovered, after)| *hovered == target && *after);
         self.next_tab_settle_id += 1;
         self.dropped_tab_settle = Some((dragged.clone(), self.next_tab_settle_id));
+
+        let old_order = self.combined_tab_order();
+        let dragged_width = self
+            .tab_bounds
+            .get(&dragged)
+            .map(|bounds| bounds.size.width)
+            .unwrap_or_default();
+        let slide_id = self.next_tab_settle_id;
+        self.tab_slide = work_surface::tab_slide_offsets(
+            &old_order,
+            &dragged,
+            &target,
+            insert_after,
+            dragged_width,
+        )
+        .into_iter()
+        .map(|(tab_ref, offset)| (tab_ref, (offset, slide_id)))
+        .collect();
+
         self.reorder_tab(dragged, target, insert_after, cx);
         self.tab_drag_insertion = None;
         self.dragging_tab = None;
@@ -919,12 +948,13 @@ impl AdeApp {
     /// the opacity dim while this tab's own drag ghost is the real thing following the cursor,
     /// the full `on_drag`/`on_drag_move`/`on_drop` wiring (GitHub issue #16's unified
     /// drag-to-reorder system - see [`DraggedTab`]'s own docs), the insertion caret, middle-click
-    /// close, and the drop settle-fade (GitHub issue #16 §5). Every real per-kind visual (chip,
-    /// label, dirty/status dot, the close button itself) is still supplied by the caller as
+    /// close, the drop settle-fade (GitHub issue #16 §5), and the neighbour-slide animation for
+    /// every *other* tab a drop shifted (task #65). Every real per-kind visual (chip, label,
+    /// dirty/status dot, the close button itself) is still supplied by the caller as
     /// `args.content`, in the order it should render - only the chrome around it is shared now,
     /// which is what makes the exact bug class GitHub issue #96 was structurally impossible:
-    /// there is now exactly one place that wires drag/close/settle-fade for every tab kind, not
-    /// three.
+    /// there is now exactly one place that wires drag/close/settle-fade/slide for every tab kind
+    /// (agent, file, graph, review), not four.
     pub(crate) fn render_tab_chrome(
         &self,
         args: TabChromeArgs,
@@ -948,9 +978,13 @@ impl AdeApp {
         };
         let is_dragging = self.dragging_tab.as_ref() == Some(&tab_ref);
         let settle_animation_id = tab_settle_animation_id(&self.dropped_tab_settle, &tab_ref);
+        let slide = self.tab_slide.get(&tab_ref).copied();
+        let outer_id_for_slide = outer_id.clone();
         let this_entity = cx.entity();
+        let this_entity_for_bounds = this_entity.clone();
         let tab_ref_for_drag = tab_ref.clone();
         let tab_ref_for_drag_move = tab_ref.clone();
+        let tab_ref_for_bounds = tab_ref.clone();
         let tab_ref_for_drop = tab_ref;
 
         let tab_div = div()
@@ -1012,22 +1046,67 @@ impl AdeApp {
                     }))
                     .children(content),
             )
-            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline));
+            .child(div().flex_none().w_full().h(px(1.0)).bg(colors.underline))
+            // Captures this tab's own painted bounds into `Self::tab_bounds` every render - the
+            // same `gpui::canvas` idiom `Self::plus_button_bounds`/`Self::rail_plus_button_bounds`
+            // already use. The only real source of a tab's on-screen width (GPUI's flex layout
+            // means no two tabs are the same size), which `Self::drop_dragged_tab` reads for
+            // whichever tab is dragged next, to compute how far a drop's shifted neighbours must
+            // slide (`work_surface::state::tab_slide_offsets`'s own docs on why only the
+            // *dragged* tab's own width is ever needed).
+            .child({
+                let this = this_entity_for_bounds;
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.tab_bounds.insert(tab_ref_for_bounds.clone(), bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            });
 
         // A real drop's own settle-in fade (GitHub issue #16's "dropping animates the tab
         // settling into its slot") - see `tab_settle_animation_id`'s own docs for why a fresh id
         // is required, and why this branches to `gpui::AnyElement` rather than a plain
         // `.when_some` (`gpui::AnimationExt::with_animation` returns a different wrapper type,
-        // not `Self`).
-        match settle_animation_id {
-            Some(id) => tab_div
+        // not `Self`). Mutually exclusive with the neighbour-slide branch below: the dropped tab
+        // itself is never in `Self::tab_slide` (`work_surface::state::tab_slide_offsets`'s own
+        // docs), so a tab is never asked to fade and slide at once.
+        match (settle_animation_id, slide) {
+            (Some(id), _) => tab_div
                 .with_animation(
                     id,
                     Animation::new(TAB_SETTLE_ANIMATION_DURATION),
                     |el, delta| el.opacity(0.55 + 0.45 * delta),
                 )
                 .into_any_element(),
-            None => tab_div.into_any_element(),
+            // The remaining GitHub issue #16 gap this closes (task #65): a tab whose slot shifted
+            // as a side effect of a drop slides from its own real pre-drop position (`offset`)
+            // down to `0` - its already-correct new position - rather than teleporting there.
+            // `.left()`, not `.opacity()`, and `tab_div` stays `position: relative` (never
+            // `.absolute()`): a `position: relative` element's `inset`/`left` is a pure paint-time
+            // offset from its own normal flex slot (`taffy`, this app's real flex layout engine -
+            // see `vendor/zed/crates/gpui/src/taffy.rs`'s `inset` translation, and `taffy` itself:
+            // "Offset is the relative position from the item's natural flow position ... Does not
+            // include margin/padding/border") - so every *other* tab's own flex position is
+            // completely unaffected by this tab's temporary offset, exactly like the dropped
+            // tab's own opacity dim above never shifts its neighbours. The animation id mixes in
+            // this tab's own `outer_id` (unlike the settle-fade above, more than one tab can slide
+            // from the same drop at once, so the batch id alone would collide across siblings) and
+            // `slide_id` (the same "GPUI keys animation progress purely by id string, so two
+            // different drops must never share an id" reason `tab_settle_animation_id`'s own docs
+            // give).
+            (None, Some((offset, slide_id))) => tab_div
+                .with_animation(
+                    format!("tab-slide-{outer_id_for_slide}-{slide_id}"),
+                    Animation::new(TAB_SLIDE_ANIMATION_DURATION),
+                    move |el, delta| el.left(offset * (1.0 - delta)),
+                )
+                .into_any_element(),
+            (None, None) => tab_div.into_any_element(),
         }
     }
 
@@ -2634,6 +2713,15 @@ pub(in crate::work_surface) fn render_tab_insertion_caret(insert_after: bool) ->
 pub(in crate::work_surface) const TAB_SETTLE_ANIMATION_DURATION: Duration =
     Duration::from_millis(150);
 
+/// How long a neighbour tab's own slide-into-place animation runs, when a drop shifts its slot
+/// (task #65, the remaining GitHub issue #16 gap: before this, every tab other than the one
+/// actually dropped just teleported to its new slot). Deliberately the same value as
+/// [`TAB_SETTLE_ANIMATION_DURATION`] - one drop kicks off both animations together, and having
+/// them run for different durations would read as two unrelated effects rather than one drop
+/// settling everything it touched.
+pub(in crate::work_surface) const TAB_SLIDE_ANIMATION_DURATION: Duration =
+    TAB_SETTLE_ANIMATION_DURATION;
+
 /// A fresh `gpui::AnimationExt::with_animation` id for `tab_ref`, if [`AdeApp::dropped_tab_settle`]
 /// says it's the tab a real drop most recently placed - `None` for every other tab, and for a
 /// tab that was never the target of a real drop this session. A distinct `String` per drop
@@ -3571,6 +3659,125 @@ mod tab_scoping_tests {
         assert_ne!(
             first_id, second_id_recorded,
             "a later drop must never reuse an earlier drop's own settle id"
+        );
+    }
+
+    /// The remaining GitHub issue #16 gap this closes (task #65): a drop must not just
+    /// settle-fade the tab that was dragged - every *other* tab whose slot it passed over must
+    /// slide too. Proven end to end against `Self::tab_bounds`'s own real, `gpui::canvas`-painted
+    /// width (`cx.run_until_parked()` lets that canvas actually paint, exactly like the plus
+    /// button's own bounds tests do) - not a fabricated placeholder offset. Three real agent tabs
+    /// dragging tab 1 to land after tab 3 must shift both 2 and 3 (each by tab 1's own real
+    /// width), and must never record tab 1 itself - it already has its own settle-fade
+    /// (`drop_dragged_tab_records_a_fresh_settle_id_for_the_dropped_tab`, just above).
+    #[gpui::test]
+    fn drop_dragged_tab_records_real_slide_offsets_for_every_shifted_neighbour(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        let (first_id, second_id, third_id) = app.update_in(cx, |app, window, cx| {
+            let first_id = app.agents.active_id().expect("initial shell agent");
+            let second_id = app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            let third_id = app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            );
+            (first_id, second_id, third_id)
+        });
+        cx.run_until_parked();
+
+        let dragged_width = app
+            .read_with(cx, |app, _| {
+                app.tab_bounds
+                    .get(&work_surface::TabRef::Agent(first_id))
+                    .map(|bounds| bounds.size.width)
+            })
+            .expect(
+                "tab 1 must have really painted at least once (via the shared chrome's own \
+                 `gpui::canvas`) before a drag off it can be measured",
+            );
+        assert!(
+            dragged_width > px(0.0),
+            "a real, already-painted tab must have nonzero measured width"
+        );
+
+        // Simulates what a real `on_drag_move` tick over the right half of tab 3's own tab would
+        // already have recorded, just before the drop - the same precedent
+        // `dropping_a_tab_clears_dragging_tab` (just below) uses.
+        app.update(cx, |app, _cx| {
+            app.tab_drag_insertion = Some((work_surface::TabRef::Agent(third_id), true));
+        });
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Agent(first_id),
+                work_surface::TabRef::Agent(third_id),
+                cx,
+            );
+        });
+
+        let slide = app.read_with(cx, |app, _| app.tab_slide.clone());
+        assert_eq!(
+            slide.len(),
+            2,
+            "tabs 2 and 3 both sat between tab 1's old slot (0) and its new one (2) - both, and \
+             only both, must slide: {slide:?}"
+        );
+        let (offset_2, _) = slide[&work_surface::TabRef::Agent(second_id)];
+        let (offset_3, _) = slide[&work_surface::TabRef::Agent(third_id)];
+        assert_eq!(
+            offset_2, dragged_width,
+            "tab 2 must slide by exactly tab 1's own real measured width"
+        );
+        assert_eq!(
+            offset_3, dragged_width,
+            "tab 3 must slide by exactly tab 1's own real measured width too - not by its own \
+             (different) width"
+        );
+        assert!(
+            !slide.contains_key(&work_surface::TabRef::Agent(first_id)),
+            "the dragged tab itself must never be recorded here - it already got its own \
+             settle-fade, never both at once"
+        );
+    }
+
+    /// A no-op drop (dragging a tab onto its own current slot) must record no slide state at all
+    /// - nothing actually changed position, so nothing may animate
+    /// (`drag_reorder_is_a_no_op_for_an_unknown_or_identical_id`'s own proof for the underlying
+    /// reorder itself; this is that same guarantee for the slide it now also kicks off).
+    #[gpui::test]
+    fn drop_dragged_tab_records_no_slide_state_for_a_no_op_drop(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let initial_id = app.read_with(cx, |app, _| {
+            app.agents.active_id().expect("initial shell agent")
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.drop_dragged_tab(
+                work_surface::TabRef::Agent(initial_id),
+                work_surface::TabRef::Agent(initial_id),
+                cx,
+            );
+        });
+
+        let slide = app.read_with(cx, |app, _| app.tab_slide.clone());
+        assert!(
+            slide.is_empty(),
+            "dropping the only tab onto itself changed nothing - nothing may slide: {slide:?}"
         );
     }
 

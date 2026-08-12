@@ -1870,9 +1870,40 @@ pub struct AdeApp {
     /// frames for it once done (`AnimationElement::request_layout`'s own `if !done {
     /// request_animation_frame() }`).
     pub(crate) dropped_tab_settle: Option<(work_surface::TabRef, u64)>,
-    /// The next fresh id [`Self::drop_dragged_tab`] will stamp into [`Self::dropped_tab_settle`] -
-    /// see that field's own docs for why a fresh id matters every time.
+    /// The next fresh id [`Self::drop_dragged_tab`] will stamp into [`Self::dropped_tab_settle`]
+    /// (and, since Revision task #65, into [`Self::tab_slide`] too - one drop kicks off both
+    /// animations at once, so both can safely share one fresh id per drop) - see that field's own
+    /// docs for why a fresh id matters every time.
     pub(crate) next_tab_settle_id: u64,
+    /// Each currently-rendered tab's own real painted bounds, captured every render by a
+    /// `gpui::canvas` overlay in [`work_surface::render::AdeApp::render_tab_chrome`] - the same
+    /// idiom [`Self::plus_button_bounds`]/[`Self::rail_plus_button_bounds`] already use, keyed by
+    /// [`work_surface::TabRef`] since every tab paints its own each frame. This is the *only*
+    /// real source of a tab's on-screen width (GPUI's flex layout means no two tabs are the same
+    /// size), which [`Self::drop_dragged_tab`] needs to compute how far a drop's neighbouring
+    /// tabs must visually slide (see [`Self::tab_slide`]'s own docs). Never pruned when a tab
+    /// closes - a harmless, bounded leak, the same tradeoff [`Self::rail_plus_button_bounds`]
+    /// already makes.
+    pub(crate) tab_bounds: std::collections::HashMap<work_surface::TabRef, gpui::Bounds<Pixels>>,
+    /// The unified tab strip's real neighbour-slide animation - the "every tab other than the
+    /// one actually dropped just teleports to its new slot" gap GitHub issue #16 left open
+    /// (tracked internally as task #65), now closed the same way [`Self::dropped_tab_settle`]
+    /// closed the dropped tab's own "instant, no visual feedback" gap. `tab_ref -> (start_offset,
+    /// id)` for every tab whose horizontal slot moved as a side effect of the most recent drop -
+    /// never the dragged tab itself, which keeps its own settle-fade instead
+    /// (`work_surface::state::tab_slide_offsets`'s own docs on why the two are always disjoint).
+    /// `start_offset` is a real pixel distance (`work_surface::state::tab_slide_offsets`'s own
+    /// docs on why only the *dragged* tab's own last-measured [`Self::tab_bounds`] width is ever
+    /// needed to compute it, not each shifted tab's), `id` a fresh [`Self::next_tab_settle_id`]
+    /// value for the same "GPUI keys animation progress purely by id string" reason
+    /// [`Self::dropped_tab_settle`]'s own docs give - doubly so here, since *multiple* sibling
+    /// tabs can carry a slide at once, so [`work_surface::render::AdeApp::render_tab_chrome`]
+    /// mixes each tab's own [`gpui::ElementId`] into the animation id too. Replaced wholesale by
+    /// every new drop rather than merged - a stale entry left over from a finished animation is
+    /// harmless (it just keeps resolving to a `0` offset, [`Self::dropped_tab_settle`]'s own
+    /// "left set, never explicitly cleared" precedent), and a fresh drop's own set of shifted
+    /// tabs is never a superset of the previous drop's anyway.
+    pub(crate) tab_slide: std::collections::HashMap<work_surface::TabRef, (Pixels, u64)>,
     /// User-authored themes loaded from `~/.config/jerry/themes/*.toml` at construction time
     /// (GitHub issue #5) - real, additional `crate::settings::custom_theme::CustomTheme` entries
     /// layered on top of the six built-in `settings::THEME_DEFS`, not a replacement for them. See

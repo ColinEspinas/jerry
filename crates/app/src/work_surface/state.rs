@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use gpui::Rgba;
+use gpui::{Pixels, Rgba};
 
 use crate::rail::status::Status;
 use crate::sidebar::file_tree::LangChip;
@@ -26,7 +26,7 @@ use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
 /// there is only ever at most one real graph tab per window (`crate::root::AdeApp::
 /// graph_tab_open`'s own "one per window" docs), so there is nothing to distinguish one from
 /// another the way an `AgentId`/`PathBuf` does for its own kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabRef {
     Agent(AgentId),
     File(PathBuf),
@@ -135,6 +135,74 @@ pub fn move_tab_order(
         to += 1;
     }
     order.insert(to, item);
+}
+
+/// The real starting pixel offset for every tab whose horizontal slot moves as a side effect of
+/// dragging `dragged` to land beside `target` - GitHub issue #16's own remaining gap (tracked
+/// internally as task #65): before this, every tab other than the one actually dropped just
+/// teleported to its new slot on the next render, with no visual feedback at all that a reorder
+/// had happened to *them*. `crate::root::AdeApp::render_tab_chrome` interpolates each returned
+/// tab's own `.left()` from this offset down to `0` (its already-correct new position - flexbox
+/// itself, not this offset, is what actually re-seats a tab; this only makes the *seating* look
+/// animated rather than instant) over a short, fixed duration, the same idiom
+/// `crate::root::AdeApp::dropped_tab_settle`'s own settle-fade already uses for the dropped tab
+/// itself.
+///
+/// Only `dragged`'s own width (`dragged_width`, [`crate::root::AdeApp::tab_bounds`]'s own
+/// last-measured value for it) is ever needed, not each shifted tab's own width - removing and
+/// re-inserting exactly one item always shifts every tab strictly between its old and new slot by
+/// exactly that one item's width, regardless of how wide any of *them* individually are: a tab's
+/// old on-screen position already counted `dragged`'s width once, on one side of the splice; its
+/// new position counts it on the other side, or not at all. Either way the difference is always
+/// `dragged`'s own width, never a sum of any of the other tabs' widths. Never includes `dragged`
+/// itself in the result - that tab gets its own settle-fade instead
+/// ([`crate::root::AdeApp::dropped_tab_settle`]), never both.
+///
+/// Empty whenever [`move_tab_order`] itself would be a no-op (`dragged`/`target` unknown, or
+/// dropping a tab onto its own already-correct slot) - the same real no-op cases
+/// `drag_reorder_is_a_no_op_for_an_unknown_or_identical_id` proves for the underlying reorder
+/// itself, so a no-op drop animates nothing here either.
+pub fn tab_slide_offsets(
+    old_order: &[TabRef],
+    dragged: &TabRef,
+    target: &TabRef,
+    insert_after: bool,
+    dragged_width: Pixels,
+) -> Vec<(TabRef, Pixels)> {
+    let mut new_order = old_order.to_vec();
+    move_tab_order(&mut new_order, dragged, target, insert_after);
+
+    let Some(old_index) = old_order.iter().position(|tab_ref| tab_ref == dragged) else {
+        return Vec::new();
+    };
+    let Some(new_index) = new_order.iter().position(|tab_ref| tab_ref == dragged) else {
+        return Vec::new();
+    };
+    if old_index == new_index {
+        return Vec::new();
+    }
+
+    let (span_start, span_end) = if old_index < new_index {
+        (old_index, new_index)
+    } else {
+        (new_index, old_index)
+    };
+    // Dragging rightward (`old_index < new_index`) removes `dragged` from in front of everything
+    // between the two slots, so each of them visually starts `dragged_width` to the right of
+    // (i.e. a *positive* offset from) its own already-correct new position and slides left to
+    // `0`. Dragging leftward does the reverse: `dragged` lands in front of them, so each one
+    // starts `dragged_width` to the left of its new position and slides right to `0`.
+    let offset = if old_index < new_index {
+        dragged_width
+    } else {
+        -dragged_width
+    };
+
+    old_order[span_start..=span_end]
+        .iter()
+        .filter(|tab_ref| *tab_ref != dragged)
+        .map(|tab_ref| (tab_ref.clone(), offset))
+        .collect()
 }
 
 /// Fully transparent - used for the "outline"/"ghost" button variants and an inactive tab's
@@ -563,6 +631,7 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::px;
 
     #[test]
     fn agent_kinds_get_the_cli_chip_and_shell_gets_the_terminal_chip() {
@@ -1025,5 +1094,103 @@ mod tests {
         move_tab_order(&mut order, &TabRef::Agent(99), &TabRef::Agent(1), false);
         move_tab_order(&mut order, &TabRef::Agent(1), &TabRef::Agent(99), false);
         assert_eq!(order, original);
+    }
+
+    /// Dragging rightward (into a later slot) must slide every tab it passed over - and only
+    /// those tabs - left by exactly the dragged tab's own width, never by any of *their* own
+    /// widths (`tab_slide_offsets`'s own docs on why only `dragged_width` is ever needed). The
+    /// dragged tab itself must never appear in the result, and a tab outside the passed-over span
+    /// (here, nothing - every other tab actually is between the two slots) must never appear
+    /// either.
+    #[test]
+    fn tab_slide_offsets_slides_every_passed_over_tab_left_by_the_dragged_tabs_own_width() {
+        let order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
+        let width = px(40.0);
+
+        let slides = tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(3), true, width);
+
+        assert_eq!(
+            slides,
+            vec![(TabRef::Agent(2), width), (TabRef::Agent(3), width)]
+        );
+    }
+
+    /// The mirror image of the rightward case: dragging leftward must slide every passed-over tab
+    /// *right* by the dragged tab's own width (a negative starting offset, sliding back to `0`),
+    /// not left.
+    #[test]
+    fn tab_slide_offsets_slides_every_passed_over_tab_right_when_dragging_leftward() {
+        let order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
+        let width = px(40.0);
+
+        let slides = tab_slide_offsets(&order, &TabRef::Agent(3), &TabRef::Agent(1), false, width);
+
+        assert_eq!(
+            slides,
+            vec![(TabRef::Agent(1), -width), (TabRef::Agent(2), -width)]
+        );
+    }
+
+    /// A tab outside the span the dragged tab actually passed over must never slide - only its
+    /// own real neighbours-in-transit do. Dragging tab 1 to sit immediately after tab 2 only ever
+    /// passes over tab 2 itself; tabs 3 and 4 never moved and must not appear in the result.
+    #[test]
+    fn tab_slide_offsets_never_slides_a_tab_outside_the_passed_over_span() {
+        let order = vec![
+            TabRef::Agent(1),
+            TabRef::Agent(2),
+            TabRef::Agent(3),
+            TabRef::Agent(4),
+        ];
+        let width = px(25.0);
+
+        let slides = tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(2), true, width);
+
+        assert_eq!(
+            slides,
+            vec![(TabRef::Agent(2), width)],
+            "only tab 2, the one real tab dragged-tab 1 passed over, may slide - tabs 3 and 4 \
+             never changed position"
+        );
+    }
+
+    /// Dropping a tab immediately before its own already-adjacent slot is a real no-op
+    /// (`move_tab_order`'s own docs) - nothing actually changed position, so nothing may slide.
+    #[test]
+    fn tab_slide_offsets_is_empty_when_the_drop_lands_on_the_tabs_own_already_adjacent_slot() {
+        let order = vec![
+            TabRef::Agent(1),
+            TabRef::Agent(2),
+            TabRef::Agent(3),
+            TabRef::Agent(4),
+        ];
+        let width = px(25.0);
+
+        let slides = tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(2), false, width);
+
+        assert!(slides.is_empty());
+    }
+
+    /// `move_tab_order`'s own no-op rules (unknown dragged/target entry, or dropping a tab onto
+    /// its own slot) must produce zero slide offsets too - a no-op reorder must animate nothing,
+    /// mirroring `drag_reorder_is_a_no_op_for_an_unknown_or_identical_id`'s own proof for the
+    /// underlying reorder.
+    #[test]
+    fn tab_slide_offsets_is_empty_for_every_move_tab_order_no_op() {
+        let order = vec![TabRef::Agent(1), TabRef::Agent(2)];
+        let width = px(40.0);
+
+        assert!(
+            tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(1), false, width)
+                .is_empty()
+        );
+        assert!(
+            tab_slide_offsets(&order, &TabRef::Agent(99), &TabRef::Agent(1), false, width)
+                .is_empty()
+        );
+        assert!(
+            tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(99), false, width)
+                .is_empty()
+        );
     }
 }
