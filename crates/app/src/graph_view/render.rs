@@ -848,6 +848,12 @@ impl AdeApp {
     /// `crate::work_surface::render::AdeApp::render_center_pane` whenever `graph_tab_active` is
     /// `true`, taking priority over a file tab or agent pane.
     pub(crate) fn render_graph_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // GitHub issue #242 phase B: the graph pane's own interactive-rebase mode entirely
+        // replaces the ordinary toolbar/commit-list body while active - see
+        // `crate::graph_view::rebase_render`'s own module docs.
+        if self.graph_state.rebase.is_some() {
+            return self.render_rebase_view(cx);
+        }
         let container = div()
             .id("graph-view")
             .track_focus(&self.graph_focus_handle)
@@ -1622,15 +1628,22 @@ impl AdeApp {
                         }
                     })),
                 )
-                .child(render_dropdown_menu_row(
-                    "\u{2191}",
-                    theme::text::GHOST.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Interactive rebase from here",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Interactive rebase from here",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.enter_rebase_mode(index, cx);
+                        },
+                    )),
+                )
                 .child(render_graph_row_menu_header("Reset"))
                 .child(render_dropdown_menu_row(
                     "\u{21ba}",
@@ -1707,7 +1720,7 @@ impl AdeApp {
             .into_any_element()
     }
 
-    fn current_graph_row(&self, index: usize) -> Option<&GraphRow> {
+    pub(in crate::graph_view) fn current_graph_row(&self, index: usize) -> Option<&GraphRow> {
         match &self.graph_state.load {
             GraphLoadState::Loaded(graph) => graph.rows.get(index),
             _ => None,
@@ -1718,6 +1731,14 @@ impl AdeApp {
     /// Branches (design spec §5). Called from `crate::sidebar::render::AdeApp::
     /// render_right_sidebar` whenever `graph_tab_active` is `true`.
     pub(crate) fn render_graph_right_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // GitHub issue #242 phase B: the interactive-rebase mode's own Result panel (design spec
+        // §1.6) replaces the ordinary Commit/Branches toggle entirely - short-circuiting here,
+        // before `options`/`toggle` are even built, keeps every existing
+        // `set_graph_right_panel(GraphRightPanel::Branches, ...)` call site (forcing the
+        // Branches tab open on unrelated flows) working unchanged once rebase mode is left.
+        if self.graph_state.rebase.is_some() {
+            return self.render_rebase_result_panel(cx);
+        }
         let options = [
             widgets::ChoiceOption::new("Commit"),
             widgets::ChoiceOption::new("Branches"),

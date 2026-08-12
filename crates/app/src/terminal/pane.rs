@@ -841,6 +841,29 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Suspends this pane's real child process in place via `PtySession::pause` (a real
+    /// `SIGSTOP`), without killing it - GitHub issue #242 phase B's interactive-rebase UI's
+    /// "Pause now" action, used to freeze a running agent process while a rebase rewrites files
+    /// out from under it. A no-op (not an error) when no session is live yet. See
+    /// [`Self::resume`] and `pty_core::PtySession::pause`'s own docs for the platform scope
+    /// (unix only - a real, honest error on a platform with no `SIGSTOP` equivalent).
+    pub fn pause(&self) -> Result<(), PtyError> {
+        match &self.session {
+            Some(session) => session.pause(),
+            None => Ok(()),
+        }
+    }
+
+    /// Resumes a process this pane's own [`Self::pause`] suspended, via a real `SIGCONT`. Safe
+    /// to call even if the process was never actually paused - see `pty_core::PtySession::
+    /// resume`'s own docs.
+    pub fn resume(&self) -> Result<(), PtyError> {
+        match &self.session {
+            Some(session) => session.resume(),
+            None => Ok(()),
+        }
+    }
+
     // ------------------------------------------------------------ clipboard (GitHub issue #158)
 
     /// Writes this pane's real current selection to the real OS clipboard

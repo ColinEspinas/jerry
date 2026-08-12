@@ -1,5 +1,6 @@
 //! Pure state and formatting for the git graph tab - see `super`'s module docs.
 
+use super::rebase::RebaseModeState;
 use crate::root::AdeApp;
 use crate::text_history::TextField;
 use crate::theme;
@@ -154,6 +155,10 @@ pub(crate) struct GraphTabState {
     pub commit_panel_scroll_handle: ScrollHandle,
     /// The Branches panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
     pub branches_scroll_handle: ScrollHandle,
+    /// GitHub issue #242 phase B: `Some` only while the graph pane is showing its interactive-
+    /// rebase mode (design spec §1) instead of its ordinary commit list - see
+    /// `crate::graph_view::rebase`'s own module docs.
+    pub rebase: Option<RebaseModeState>,
 }
 
 impl GraphTabState {
@@ -182,6 +187,7 @@ impl GraphTabState {
             rows_scroll_handle: UniformListScrollHandle::new(),
             commit_panel_scroll_handle: ScrollHandle::new(),
             branches_scroll_handle: ScrollHandle::new(),
+            rebase: None,
         }
     }
 }

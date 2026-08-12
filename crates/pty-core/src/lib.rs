@@ -254,6 +254,8 @@ pub enum PtyError {
     CurrentDir(#[source] std::io::Error),
     #[error("pty session was already shut down")]
     AlreadyShutDown,
+    #[error("failed to signal child process: {0}")]
+    Signal(String),
 }
 
 /// Describes a process to spawn on a new PTY, plus the PTY's initial size.
@@ -748,6 +750,72 @@ impl PtySession {
         Ok(())
     }
 
+    /// Suspends the child process in place via a real `SIGSTOP`, without killing it - the
+    /// direct process-level primitive GitHub issue #242 phase B's interactive-rebase UI uses to
+    /// freeze a running agent process while a rebase rewrites files out from under it (see
+    /// `crate::work_surface::agents::Agents::pause_agents_for_cwd` in the `app` crate, the real
+    /// caller). The counterpart to [`Self::resume`].
+    ///
+    /// A no-op, not an error, if the child has already exited (mirrors [`Self::kill`]'s own
+    /// "already gone" handling) or if the platform exposes no pid at all.
+    ///
+    /// Unix only - see [`Self::resume`]'s Windows twin below for why there is no real equivalent
+    /// there (mirrors [`Self::kill`]'s own unix/windows split, same crate-level "Platform scope"
+    /// docs).
+    #[cfg(unix)]
+    pub fn pause(&self) -> Result<(), PtyError> {
+        if self.exited.is_some() {
+            return Ok(());
+        }
+        let Some(pid) = self.process_id() else {
+            return Ok(());
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .map_err(|err| PtyError::Signal(err.to_string()))
+    }
+
+    /// Resumes a process previously [`Self::pause`]d via a real `SIGCONT`. Safe to call even if
+    /// the process was never actually paused (`SIGCONT` on an already-running process is a
+    /// harmless no-op at the OS level) - see [`Self::pause`]'s own docs.
+    #[cfg(unix)]
+    pub fn resume(&self) -> Result<(), PtyError> {
+        if self.exited.is_some() {
+            return Ok(());
+        }
+        let Some(pid) = self.process_id() else {
+            return Ok(());
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        )
+        .map_err(|err| PtyError::Signal(err.to_string()))
+    }
+
+    /// Windows has no `SIGSTOP`/`SIGCONT` equivalent without a distinct, `unsafe`-FFI-heavy job-
+    /// object API this project's no-`unsafe` rule rules out adding (mirrors [`Self::kill`]'s own
+    /// Windows-side process-tree limitation, same crate-level "Platform scope" docs) - a real,
+    /// honest error rather than silently pretending to pause. The caller (`app`'s interactive-
+    /// rebase UI) is documented to only ever offer its "Pause now" action where this can
+    /// actually succeed.
+    #[cfg(windows)]
+    pub fn pause(&self) -> Result<(), PtyError> {
+        Err(PtyError::Signal(
+            "pausing a process is not supported on this platform".to_string(),
+        ))
+    }
+
+    /// See [`Self::pause`]'s Windows twin above - there is nothing real to resume from either.
+    #[cfg(windows)]
+    pub fn resume(&self) -> Result<(), PtyError> {
+        Err(PtyError::Signal(
+            "resuming a process is not supported on this platform".to_string(),
+        ))
+    }
+
     /// Deterministically tears the session down: signals the child's process tree
     /// (`SIGHUP`, a bounded grace period, then `SIGKILL`), blocks until the direct
     /// child is reaped, signals the reader thread to stop via the shutdown pipe and
@@ -1231,6 +1299,92 @@ mod tests {
             "child pid {pid} should be fully reaped (not even a zombie) immediately \
              after shutdown() returns"
         );
+    }
+
+    /// GitHub issue #242 phase B: real, live-observed proof that [`PtySession::pause`]/
+    /// [`PtySession::resume`] genuinely stop and restart a real process, not just that they
+    /// return `Ok(())` - reads `/proc/<pid>/status`'s real `State:` line, which the kernel
+    /// itself only ever reports as `T (stopped)` for a process a real `SIGSTOP` has actually
+    /// landed on (a `SIGCONT`-resumed process goes back to `S (sleeping)`/`R (running)`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pause_really_stops_the_process_and_resume_really_restarts_it() {
+        fn proc_state(pid: u32) -> String {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .expect("reading /proc/<pid>/status should succeed while the process is alive");
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("State:"))
+                .map(|rest| rest.trim().to_string())
+                .expect("State: line should be present")
+        }
+
+        let session = spawn(SpawnOptions::new("sleep").arg("100")).expect("spawning `sleep 100`");
+        let pid = session
+            .process_id()
+            .expect("a spawned unix child should report a pid");
+
+        // Give the kernel a moment to settle the freshly spawned process into a steady
+        // running/sleeping state before asserting anything about it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !proc_state(pid).starts_with('S') && !proc_state(pid).starts_with('R') {
+            assert!(
+                Instant::now() < deadline,
+                "process never reached a steady state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        session.pause().expect("pause should succeed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = proc_state(pid);
+            if state.starts_with('T') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} never reached the real kernel-reported stopped state \
+                 (State: T) after pause() - last observed state: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        session.resume().expect("resume should succeed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = proc_state(pid);
+            if state.starts_with('S') || state.starts_with('R') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} never left the real kernel-reported stopped state after \
+                 resume() - last observed state: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pause_and_resume_are_a_harmless_no_op_once_the_child_has_already_exited() {
+        let mut session = spawn(SpawnOptions::new("true")).expect("spawning `true`");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session
+            .try_wait()
+            .expect("try_wait should not error")
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "`true` never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session
+            .pause()
+            .expect("pause on an already-exited child must be a harmless no-op");
+        session
+            .resume()
+            .expect("resume on an already-exited child must be a harmless no-op");
     }
 
     #[test]

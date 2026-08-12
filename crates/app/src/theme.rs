@@ -2438,6 +2438,10 @@ pub mod graph {
 
     /// The toolbar band's height (§4: "Toolbar 35 high").
     pub const TOOLBAR: Pixels = px(35.0);
+    /// GitHub issue #242 phase B's interactive-rebase banner band height (design spec §1.2:
+    /// "44px tall"). Sits where [`TOOLBAR`] normally would while the graph pane is in rebase
+    /// mode - see `crate::graph_view::rebase_render`'s module docs.
+    pub const REBASE_BANNER: Pixels = px(44.0);
     /// The column header band's height (`revision 3/REVISION-2026-07-31.md` §6.1: "Column
     /// header, 22 high"). Sits between [`TOOLBAR`] and the row list -
     /// `crate::graph_view::render::AdeApp::render_graph_view` renders it as a real sibling band,

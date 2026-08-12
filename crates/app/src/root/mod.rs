@@ -2785,6 +2785,10 @@ impl AdeApp {
                     if this.cancel_any_tab_drag() {
                         cx.notify();
                     }
+                    // GitHub issue #242 phase B: the interactive-rebase plan row's own drag
+                    // handle needs the identical defensive cleanup, for the identical reason -
+                    // `Self::cancel_rebase_row_drag` already calls `cx.notify()` itself.
+                    this.cancel_rebase_row_drag(cx);
                 }),
             )
             // Captures the body's paint bounds into `Self::body_bounds` every render, the same

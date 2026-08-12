@@ -10,6 +10,9 @@
 //! - [`render`] - the real GPUI surface: the tab strip entry, the toolbar, the lane canvas and
 //!   row list, the row `⋯` menu, the Push `▾` menu, and the Commit/Branches right panel, plus
 //!   the `impl AdeApp` glue that opens/closes/loads the tab.
+//! - [`rebase`]/[`rebase_render`] - GitHub issue #242 phase B: the graph pane's own interactive-
+//!   rebase mode (state/mutation glue and rendering respectively), entered from the row `⋯`
+//!   menu's "Interactive rebase from here…" row - see [`rebase`]'s own module docs.
 //!
 //! ## Scope
 //!
@@ -20,14 +23,13 @@
 //! module's own docs for the fetch/pull/push implementations and
 //! [`state::GraphTabState::push_force_confirm_armed`] for the real two-click confirmation the
 //! two force variants require. The row `⋯` menu's Branch/Apply/Reset groups remain real,
-//! visible menu rows (per the design spec) but every entry that would perform a *different*
-//! destructive git operation (check out, cherry-pick, revert, rebase, reset, "start an agent
-//! from this commit") is still rendered **disabled** -
-//! `crate::work_surface::render::render_dropdown_menu_row`'s existing `enabled: false`
-//! treatment, with no `.on_click` attached - because none of those specific operations exist in
-//! `wt_core` yet (real, separate follow-up work, not yet started). Only the Copy group's
-//! entries (real clipboard writes of already-loaded data), the toolbar's read-only scope
-//! segment, and now Fetch/Pull/Push are actually wired. Agent-to-commit correlation (which agent
+//! visible menu rows (per the design spec); GitHub issue #241 wired Cherry-pick/Revert/"Rebase
+//! onto this commit" to real `wt_core::rewrite` calls, and GitHub issue #242 phase B wired
+//! "Interactive rebase from here…" to the real [`rebase`] mode. What's left rendered
+//! **disabled** (check out, create branch here, "start an agent from this commit", reset) still
+//! uses `crate::work_surface::render::render_dropdown_menu_row`'s `enabled: false` treatment,
+//! with no `.on_click` attached, because those specific operations don't exist in `wt_core` yet
+//! (real, separate follow-up work, not yet started). Agent-to-commit correlation (which agent
 //! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
@@ -37,13 +39,16 @@
 //! also gained a real column header band (§6.1) in that same revision.
 //!
 //! `render` glob-imports [`state`] (`use super::*`), mirroring `crate::sidebar::render`'s own
-//! convention.
+//! convention; `rebase`/`rebase_render` do the same (each also imports the other's public
+//! items directly, since they're siblings rather than parent/child).
 
 use crate::root::*;
 use crate::theme;
 use crate::work_surface::state as work_surface;
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, Window};
 
+pub(crate) mod rebase;
+pub(crate) mod rebase_render;
 pub(crate) mod render;
 pub(crate) mod state;
 
