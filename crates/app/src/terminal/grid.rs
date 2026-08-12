@@ -21,9 +21,9 @@
 //!   `screen_lines`/`columns` - see [`GridSize`].
 //! - `Term<T>` only requires `T: EventListener` for `renderable_content`/the `Handler` impl.
 //!   This pane polls the grid directly every tick (see `crate::terminal::pane`'s poll loop)
-//!   rather than reacting to most events (title changes, bell, clipboard, ...), which
-//!   [`PtyWriteQueue`] does still drop. `Event::PtyWrite` is the one real exception - see that
-//!   type's own docs for why dropping it is a genuine correctness bug, not a scope cut.
+//!   rather than reacting to most events (bell, clipboard, ...), which [`TermEventSink`] does
+//!   still drop. `Event::PtyWrite` and `Event::Title`/`Event::ResetTitle` are the real
+//!   exceptions - see that type's own docs for why each is captured.
 //! - Feeding bytes: `Processor::<StdSyncHandler>::advance(&mut self, handler: &mut H, bytes:
 //!   &[u8]) where H: Handler` (`vte-0.15.0/src/ansi.rs:298`); `Term<T: EventListener>`
 //!   implements `Handler`. `alacritty_terminal` re-exports its exact `vte` dependency as
@@ -106,6 +106,7 @@
 //! an alt-screen swap (`Term::swap_alt`, `:733`) - which is why [`TerminalGrid::clear`], itself
 //! just an `ESC[2J` through the same parser, needs no selection handling of its own.
 
+use crate::terminal::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -137,11 +138,13 @@ impl Dimensions for GridSize {
     }
 }
 
-/// Captures [`AlacEvent::PtyWrite`] and drops every other [`AlacEvent`] (title changes, bell,
-/// clipboard, ...) - see the module docs' API surface section for why those others are a
-/// deliberate scope cut.
+/// Captures the two [`AlacEvent`]s this app actually acts on - [`AlacEvent::PtyWrite`] and the
+/// window-title pair [`AlacEvent::Title`]/[`AlacEvent::ResetTitle`] - and drops every other one
+/// (bell, clipboard, cursor-blink requests, ...): see the module docs' API surface section for
+/// why those others are a deliberate scope cut.
 ///
-/// `PtyWrite` is different: `alacritty_terminal`'s own `Handler` impl for `Term` emits it
+/// `PtyWrite` is the original reason this type exists at all: `alacritty_terminal`'s own
+/// `Handler` impl for `Term` emits it
 /// whenever the VT parser sees a query the *terminal* (not the running program) is supposed to
 /// answer back into the pty's stdin - e.g. `ESC[6n` (Device Status Report / cursor position
 /// report), already correctly formatted as `ESC[<row>;<col>R` by `Term::device_status`
@@ -156,19 +159,52 @@ impl Dimensions for GridSize {
 /// then never read another byte, because ConPTY was sitting there waiting on the CPR reply this
 /// listener used to throw away.
 ///
+/// `Title`/`ResetTitle` are the second capture (GitHub issue #239). `alacritty_terminal` emits
+/// `Event::Title(String)` for OSC 0 (icon name + window title) and OSC 2 (window title only),
+/// and `Event::ResetTitle` for OSC 0/2 with no argument - confirmed against the pinned rev's
+/// own `Term::set_title`/`reset_title` (`term/mod.rs`) and `vte::ansi`'s `b"0" | b"2"`
+/// `osc_dispatch` arm. Real agent CLIs put a live status glyph in that title (Claude Code and
+/// Gemini CLI both do - observed directly, see `crate::rail::title_signal`), which is a far
+/// faster and more honest "is this agent busy or waiting on me" signal than the pty-quiescence
+/// timer `crate::rail::status` otherwise has to fall back on.
+///
 /// `Rc<RefCell<..>>`, not a channel: [`EventListener::send_event`] takes `&self`
 /// (`Term<T>` only ever holds a `T`, no `&mut` access once constructed), and this needs to be
 /// cheaply `Clone`d so [`TerminalGrid`] can hand `Term::new` its own copy while keeping one to
 /// drain from - a `Rc`'d interior-mutable buffer is the direct way to satisfy both without a
 /// background thread/channel this is far too small to warrant.
 #[derive(Debug, Clone, Default)]
-struct PtyWriteQueue(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+struct TermEventSink {
+    /// Bytes the VT parser generated as a reply owed back to the pty, appended in arrival order.
+    pty_writes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    /// The pending window-title change, if one arrived since [`Self::take_title_update`] last
+    /// looked. Two levels of `Option` on purpose, and they mean different things: the outer one
+    /// is "did a title event happen at all", the inner one is "what it set the title to" -
+    /// `Some(None)` is a real [`AlacEvent::ResetTitle`] clearing the title, which a single
+    /// `Option<String>` could not tell apart from "nothing happened".
+    title: std::rc::Rc<std::cell::RefCell<Option<Option<String>>>>,
+}
 
-impl EventListener for PtyWriteQueue {
+impl EventListener for TermEventSink {
     fn send_event(&self, event: AlacEvent) {
-        if let AlacEvent::PtyWrite(text) = event {
-            self.0.borrow_mut().extend_from_slice(text.as_bytes());
+        match event {
+            AlacEvent::PtyWrite(text) => {
+                self.pty_writes
+                    .borrow_mut()
+                    .extend_from_slice(text.as_bytes());
+            }
+            AlacEvent::Title(title) => *self.title.borrow_mut() = Some(Some(title)),
+            AlacEvent::ResetTitle => *self.title.borrow_mut() = Some(None),
+            _ => {}
         }
+    }
+}
+
+impl TermEventSink {
+    /// Takes the pending title change, if any - see [`Self::title`]'s docs for what each layer
+    /// of the returned `Option` means.
+    fn take_title_update(&self) -> Option<Option<String>> {
+        self.title.borrow_mut().take()
     }
 }
 
@@ -450,12 +486,20 @@ fn grid_cell_from_alacritty(
 /// `pty-core`, fed in through [`TerminalGrid::append_bytes`]) are parsed as real ANSI/VT100 and
 /// land in a real cursor-addressed grid.
 pub struct TerminalGrid {
-    term: Term<PtyWriteQueue>,
+    term: Term<TermEventSink>,
     processor: Processor<StdSyncHandler>,
     size: GridSize,
-    /// The other half of the `Term`'s own [`PtyWriteQueue`] - see that type's docs for why this
+    /// The other half of the `Term`'s own [`TermEventSink`] - see that type's docs for why this
     /// is an `Rc`'d clone rather than reading straight off `term`.
-    pending_pty_writes: PtyWriteQueue,
+    events: TermEventSink,
+    /// The window title the child process last set via OSC 0/2, drained out of [`Self::events`]
+    /// at the end of every [`Self::append_bytes`] so [`Self::title`] can hand out a plain
+    /// borrow instead of forcing every reader through the sink's `RefCell`.
+    title: Option<String>,
+    /// The tee'd OSC 9 / 9;4 / 777 parser - see [`crate::terminal::osc`]'s module docs for why
+    /// this is a second, independent parser over the same bytes rather than an extension of
+    /// [`Self::processor`].
+    osc: OscWatcher,
     /// `true` once the backing process has exited; the grid stops changing after this but
     /// keeps whatever it last rendered, mirroring step 3's `TerminalBuffer::ended`.
     pub ended: bool,
@@ -467,23 +511,53 @@ impl TerminalGrid {
             rows: rows.max(1) as usize,
             cols: cols.max(1) as usize,
         };
-        let pending_pty_writes = PtyWriteQueue::default();
-        let term = Term::new(Config::default(), &size, pending_pty_writes.clone());
+        let events = TermEventSink::default();
+        let term = Term::new(Config::default(), &size, events.clone());
         Self {
             term,
             processor: Processor::new(),
             size,
-            pending_pty_writes,
+            events,
+            title: None,
+            osc: OscWatcher::default(),
             ended: false,
         }
     }
 
     /// Feeds a chunk of raw pty bytes into the VT100 parser (`Processor::advance`), which
     /// drives the real `Term` grid state (cursor movement, SGR colors, screen clears, etc.) and
-    /// may also queue bytes into [`Self::pending_pty_writes`] for [`Self::take_pending_pty_writes`]
-    /// to hand back to the pty - see [`PtyWriteQueue`]'s own docs.
+    /// may also queue bytes into [`Self::events`] for [`Self::take_pending_pty_writes`]
+    /// to hand back to the pty, and update [`Self::title`] - see [`TermEventSink`]'s own docs.
+    ///
+    /// The same slice is also tee'd into [`Self::osc`], the independent parser that recovers the
+    /// OSC 9 / 9;4 / 777 sequences `Processor` drops on the floor (see
+    /// [`crate::terminal::osc`]). Both parsers must see identical bytes in identical order:
+    /// either one's state machine can be mid-sequence at a chunk boundary.
     pub fn append_bytes(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        self.osc.feed(bytes);
+        if let Some(update) = self.events.take_title_update() {
+            self.title = update;
+        }
+    }
+
+    /// The window title the child process last set via OSC 0/2, or `None` if it has never set
+    /// one or last sent a title reset. See [`TermEventSink`]'s docs; classified into a coarse
+    /// status signal by `crate::rail::title_signal`.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Consumes the "an OSC 9 / OSC 777 desktop notification fired" flag - see
+    /// [`crate::terminal::osc::OscWatcher::take_attention_ping`] for why it is consumed rather
+    /// than latched here.
+    pub fn take_attention_ping(&mut self) -> bool {
+        self.osc.take_attention_ping()
+    }
+
+    /// The most recent OSC 9;4 progress report, if the child process is speaking that protocol.
+    pub fn progress(&self) -> Option<Progress> {
+        self.osc.progress()
     }
 
     /// Drains and returns any bytes the VT parser generated in response to a terminal query
@@ -494,7 +568,7 @@ impl TerminalGrid {
     /// case - a plain `Vec` (not an `Option`) so the caller can check emptiness without an extra
     /// match arm.
     pub fn take_pending_pty_writes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut *self.pending_pty_writes.0.borrow_mut())
+        std::mem::take(&mut *self.events.pty_writes.borrow_mut())
     }
 
     /// Resizes the grid to match a new pty size. Must be called alongside `PtySession::resize`
@@ -634,10 +708,10 @@ mod tests {
         assert!(row_text(&rows[0]).starts_with("hello"));
     }
 
-    /// [`PtyWriteQueue`]'s real regression coverage: a Device Status Report query (`ESC[6n`,
+    /// [`TermEventSink`]'s real regression coverage: a Device Status Report query (`ESC[6n`,
     /// "where's the cursor?") must produce a real, correctly formatted `ESC[<row>;<col>R` reply
     /// queued for the pty - not silently dropped, which is exactly what real Windows ConPTY
-    /// hangs on during its own startup handshake (see [`PtyWriteQueue`]'s own docs for the live
+    /// hangs on during its own startup handshake (see [`TermEventSink`]'s own docs for the live
     /// Windows repro this fixes). Uses `\x1b[3;5H` first (the same cursor-positioning sequence
     /// [`cursor_positioning_places_text_at_the_addressed_cell`] already proves lands the cursor
     /// correctly) so the expected reply has a real, non-default row/col to check against - a
@@ -671,6 +745,78 @@ mod tests {
             "the queue must be genuinely drained by the previous take_pending_pty_writes call, \
              not left with the same reply queued forever"
         );
+    }
+
+    /// [`TermEventSink`]'s title half (GitHub issue #239): a real OSC 0 / OSC 2 sequence through
+    /// the real parser must land in [`TerminalGrid::title`], and must not print anything into
+    /// the grid - a title is metadata about the window, not screen content.
+    #[test]
+    fn a_real_osc_title_sequence_is_captured_and_prints_nothing() {
+        let mut grid = TerminalGrid::new(5, 40);
+        assert_eq!(
+            grid.title(),
+            None,
+            "sanity check: no title before any is set"
+        );
+
+        // Exactly what Claude Code writes while working, byte for byte (OSC 0, BEL-terminated).
+        grid.append_bytes("\x1b]0;\u{25d0} Claude Code\x07".as_bytes());
+        assert_eq!(grid.title(), Some("\u{25d0} Claude Code"));
+
+        let rows = grid.visible_rows(&TerminalPalette::default());
+        assert_eq!(
+            row_text(&rows[0]).trim(),
+            "",
+            "an OSC title must be consumed by the parser, never painted into the grid"
+        );
+
+        // OSC 2 (title only) and ST termination are the other real spellings.
+        grid.append_bytes(b"\x1b]2;second title\x1b\\");
+        assert_eq!(grid.title(), Some("second title"));
+    }
+
+    /// The [`AlacEvent::ResetTitle`] half of the same capture. `alacritty_terminal` only ever
+    /// emits it from `Term::pop_title` (`term/mod.rs:2249`) restoring a `None` that was pushed
+    /// before any title existed - the XTPUSHTITLE/XTPOPTITLE pair `ESC[22t`/`ESC[23t`
+    /// (`vte-0.15.0/src/ansi.rs:1742`) - so that is what this drives, rather than a synthetic
+    /// event a real process could never produce.
+    #[test]
+    fn a_real_title_reset_clears_the_captured_title() {
+        let mut grid = TerminalGrid::new(5, 40);
+        grid.append_bytes(b"\x1b[22t"); // push the current (absent) title
+        grid.append_bytes(b"\x1b]0;working\x07");
+        assert_eq!(grid.title(), Some("working"));
+
+        grid.append_bytes(b"\x1b[23t"); // pop it back to "no title"
+        assert_eq!(
+            grid.title(),
+            None,
+            "a title reset must clear the stored title, not leave the stale one standing"
+        );
+    }
+
+    /// The tee'd OSC parser reached through the same `append_bytes` the renderer uses - proof
+    /// that both parsers really see the same bytes (see [`crate::terminal::osc`]'s module docs).
+    #[test]
+    fn osc_9_family_sequences_reach_the_teed_parser_through_append_bytes() {
+        let mut grid = TerminalGrid::new(5, 40);
+        assert!(!grid.take_attention_ping());
+        assert_eq!(grid.progress(), None);
+
+        grid.append_bytes(b"hello\x1b]9;Agent needs you\x07 world\x1b]9;4;1;60\x07");
+
+        assert!(grid.take_attention_ping());
+        assert_eq!(
+            grid.progress(),
+            Some(Progress {
+                state: crate::terminal::osc::ProgressState::Normal,
+                percent: Some(60)
+            })
+        );
+        // The surrounding plain text still rendered normally: the tee must not consume bytes
+        // from, or otherwise disturb, the primary pipeline.
+        let rows = grid.visible_rows(&TerminalPalette::default());
+        assert_eq!(row_text(&rows[0]).trim_end(), "hello world");
     }
 
     /// The key proof that this is real cursor-addressed grid emulation rather than a plain-text

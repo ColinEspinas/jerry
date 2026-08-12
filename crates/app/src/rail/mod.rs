@@ -17,6 +17,9 @@
 //! - [`status`] - derives an agent's `Status` ("who needs me") from already-read process
 //!   signals; the rail's whole reason for existing, and shared with the tab strip and
 //!   status bar that surface the same answer.
+//! - [`title_signal`] - the pure classifier turning an agent CLI's own terminal title into the
+//!   coarse busy/idle/needs-you signal [`status`] refines its quiescence heuristic with
+//!   (GitHub issue #239). No `gpui`, and no terminal types either.
 //! - [`render`] - the real GPUI rail, its rows, hover affordances and click handlers, as
 //!   `impl AdeApp` methods.
 //!
@@ -43,6 +46,7 @@ use std::time::Instant;
 pub mod repo;
 pub mod state;
 pub mod status;
+pub mod title_signal;
 pub mod worktree_watch;
 pub mod worktrees;
 

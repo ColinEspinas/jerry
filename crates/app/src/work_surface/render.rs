@@ -332,6 +332,16 @@ impl AdeApp {
         } else {
             status::ProcessSignal::NoProcess
         };
+        // GitHub issue #239: the second, structural signal - what the process said about itself
+        // through its own terminal (title glyph, OSC 9/777 notification, OSC 9;4 progress),
+        // rather than what its silence implies. Gathered for every kind and gated inside
+        // `derive_status`, which consults it only for a real agent session: a shell's title can
+        // say anything and must never be able to fake agent-ness (see that module's docs).
+        let terminal = status::TerminalSignal {
+            title: pane.title().map(title_signal::classify_title),
+            attention_pinged: pane.has_pending_attention_ping(),
+            progress: pane.progress(),
+        };
         // GitHub issue #225: what makes an exited agent "review ready" is now whether *it* has a
         // real, unreviewed diff against *its own* baseline - not whether its worktree's branch
         // differs from the default branch, which is a different question and was producing a
@@ -344,7 +354,7 @@ impl AdeApp {
         // readiness it can't honestly substantiate. Such an agent lands on `Idle` instead, which
         // is the same state it would show with an empty review.
         let has_unreviewed_changes = self.agent_has_unreviewed_changes(agent.id);
-        status::derive_status(agent.kind, signal, has_unreviewed_changes)
+        status::derive_status(agent.kind, signal, terminal, has_unreviewed_changes)
     }
 
     /// The context bar's and idle-status footer's `Archive` action - closes the tab via

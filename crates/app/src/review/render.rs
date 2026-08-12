@@ -1232,6 +1232,9 @@ mod review_flow_tests {
         let status_on_exit = crate::rail::status::derive_status(
             ProcessKind::claude(),
             crate::rail::status::ProcessSignal::Exited { success: true },
+            // An exit is an exact fact; no terminal-title/OSC signal takes part in it (see
+            // `crate::rail::status`'s module docs), so the default "said nothing" is right here.
+            crate::rail::status::TerminalSignal::default(),
             has_unreviewed,
         );
         assert_eq!(

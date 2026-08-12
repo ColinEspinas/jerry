@@ -93,6 +93,7 @@ use crate::terminal::grid::{
     CellPosition, CellSide, CellWidth, GridCell, TerminalGrid, TerminalPalette,
 };
 use crate::terminal::links::{self as terminal_links, LinkMatch};
+use crate::terminal::osc::Progress;
 use crate::theme;
 
 /// How often the poll task of the *globally active* agent's pane (see
@@ -573,6 +574,20 @@ pub struct TerminalPane {
     /// from; intentionally not itself a `Status` - this pane only knows "when did I last see
     /// this process do something".
     activity_at: Option<Instant>,
+    /// When this pane's process last fired an OSC 9 / OSC 777 desktop notification that the
+    /// human has not yet answered, or `None` if it never has or the human has since answered
+    /// (GitHub issue #239).
+    ///
+    /// This is the latch that turns the *event* the pty carries into the *state* the rail needs.
+    /// [`crate::terminal::osc::OscWatcher::take_attention_ping`] is deliberately consume-on-read,
+    /// because a notification is a point-in-time "now" that nothing in the protocol ever
+    /// un-fires; but `crate::rail::status` is read from the render path many times a second, so
+    /// consuming it *there* would make an agent's "needs input" status blink out one frame after
+    /// it appeared. So the poll loop consumes the one-shot flag exactly once, here, and holds it
+    /// until something real answers it: the human typing into this pane
+    /// ([`Self::handle_key_down`]), or a new process starting ([`Self::spawn_process`]). It
+    /// cannot leak across either boundary, and it never outlives the session that raised it.
+    attention_ping_at: Option<Instant>,
     /// `true` from the moment pty EOF is observed until the child's exit status is either
     /// confirmed or given up on - see [`eof_poll_decision`]'s docs for the bug this state
     /// exists to fix. While `true`, [`Self::session`] is deliberately not yet cleared: the
@@ -655,6 +670,7 @@ impl TerminalPane {
             spawn_error: None,
             exit_status: None,
             activity_at: None,
+            attention_ping_at: None,
             eof_pending: false,
             eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
@@ -746,6 +762,36 @@ impl TerminalPane {
     /// field docs for exactly when this becomes `Some`.
     pub fn exit_status(&self) -> Option<&ExitStatus> {
         self.exit_status.as_ref()
+    }
+
+    /// The window title this pane's process last set via OSC 0/2, if any (GitHub issue #239).
+    ///
+    /// Real agent CLIs put a live status glyph here - Claude Code alternates a `\u{25d0}`-family
+    /// spinner while working and rests on `\u{2733}`; Gemini CLI writes `\u{25c7}  Ready (...)`
+    /// when idle (both observed directly against real CLIs; see
+    /// `crate::rail::title_signal`, which is what turns this raw string into a status signal).
+    pub fn title(&self) -> Option<&str> {
+        self.grid.title()
+    }
+
+    /// Whether this pane's process has fired an OSC 9 / OSC 777 desktop notification that the
+    /// human hasn't answered yet - see [`Self::attention_ping_at`]'s field docs for the exact
+    /// lifecycle, and `crate::terminal::osc` for the sequences involved.
+    pub fn has_pending_attention_ping(&self) -> bool {
+        self.attention_ping_at.is_some()
+    }
+
+    /// The most recent OSC 9;4 progress report from this pane's process, if it speaks that
+    /// protocol - see [`crate::terminal::osc::Progress`].
+    pub fn progress(&self) -> Option<Progress> {
+        self.grid.progress()
+    }
+
+    /// Marks this pane's outstanding attention ping as answered - called when the human
+    /// actually responds to it, which is when they type into this pane, and when a new process
+    /// takes the pane over. See [`Self::attention_ping_at`]'s field docs.
+    fn clear_attention_ping(&mut self) {
+        self.attention_ping_at = None;
     }
 
     /// Tells this pane whether its agent is the globally active tab - see
@@ -1107,6 +1153,9 @@ impl TerminalPane {
                     // a still-spawning agent from being immediately misread as long-idle by
                     // `crate::rail::status::derive_status`.
                     this.activity_at = Some(std::time::Instant::now());
+                    // A previous process's unanswered attention ping is not this one's - see
+                    // `attention_ping_at`'s field docs.
+                    this.clear_attention_ping();
                     // The pane may already have rendered (and computed a target grid size)
                     // before this task's background spawn finished - there was no live
                     // session yet for that call to reach, so retry it now that one exists,
@@ -1177,6 +1226,13 @@ impl TerminalPane {
                                     drained_bytes += chunk.len().max(1);
                                     this.grid.append_bytes(&chunk);
                                     this.activity_at = Some(Instant::now());
+                                    // Consume the grid's one-shot OSC 9 / 777 notification flag
+                                    // right where the bytes that could have set it were parsed,
+                                    // and latch it - see `attention_ping_at`'s field docs for
+                                    // why this must not be consumed from the render path.
+                                    if this.grid.take_attention_ping() {
+                                        this.attention_ping_at = Some(Instant::now());
+                                    }
                                     appended = true;
                                 }
                                 Err(TryRecvError::Empty) => break,
@@ -1201,7 +1257,7 @@ impl TerminalPane {
                         // `this.grid`. This is never a no-op-safe skip: real Windows ConPTY
                         // sends exactly this query as part of its own startup handshake and
                         // blocks its entire output stream on a real answer (confirmed live -
-                        // see `PtyWriteQueue`'s own docs), so a dropped reply here doesn't just
+                        // see `TermEventSink`'s own docs), so a dropped reply here doesn't just
                         // misrender a query response, it silently hangs the whole pane forever.
                         if appended {
                             let pending_writes = this.grid.take_pending_pty_writes();
@@ -1291,7 +1347,15 @@ impl TerminalPane {
         let Some(bytes) = keystroke_to_bytes(&event.keystroke) else {
             return;
         };
-        if let Err(err) = session.write_input(&bytes) {
+        // Bound rather than matched inline so the `&self.session` borrow ends before
+        // `clear_attention_ping` takes `&mut self` below.
+        let write_result = session.write_input(&bytes);
+        // The human is typing at this pane: whatever the agent pinged for attention about, this
+        // is them answering it. Placed after `keystroke_to_bytes` so a keystroke that isn't real
+        // terminal input (a bare modifier, an unmapped key) doesn't count as an answer. See
+        // `attention_ping_at`'s field docs.
+        self.clear_attention_ping();
+        if let Err(err) = write_result {
             self.spawn_error = Some(format!("failed to write input: {err}"));
             cx.notify();
         }
@@ -2885,6 +2949,167 @@ mod clear_pty_signal_tests {
              appear in the grid - this is what actually proves the byte reached the pty, not \
              just that write_input() was called"
         );
+    }
+}
+
+/// GitHub issue #239's structural status signal, end to end through a **real pty**: a real child
+/// process writes real escape sequences into a real pty, this pane's real poll loop reads them,
+/// and the pane's accessors report what was parsed. Nothing here is injected or simulated - the
+/// escape bytes are produced by a real `printf`, exactly as a real agent CLI produces them.
+#[cfg(test)]
+mod terminal_signal_tests {
+    use super::*;
+    use crate::rail::title_signal::{classify_title, TitleSignal};
+    use crate::terminal::osc::{Progress, ProgressState};
+    use gpui::TestAppContext;
+
+    /// Spawns a real `sh` that writes `script`'s escape sequences and then blocks, so the
+    /// process is still alive (and the pane still `is_running`) while the assertions run - the
+    /// same real-pty pattern this module's other tests use, and `sh` rather than bare `printf`
+    /// so the sequences and the sleep are one child process.
+    fn pane_emitting(cx: &mut TestAppContext, script: &str) -> gpui::Entity<TerminalPane> {
+        cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command(
+                    "sh",
+                    vec!["-c".to_string(), format!("{script}; sleep 60")],
+                    std::env::temp_dir(),
+                ),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        })
+    }
+
+    /// Drives the pane's real poll loop until `done` reports true, or gives up. The pty write
+    /// itself takes real wall time (a real process, real fd) while the *drain* only happens on
+    /// poll ticks, which the test executor's clock drives - hence both a real sleep and the
+    /// virtual-clock loop, matching `cadence_tests`' own approach.
+    fn poll_until(
+        cx: &mut TestAppContext,
+        pane: &gpui::Entity<TerminalPane>,
+        done: impl Fn(&TerminalPane) -> bool,
+    ) -> bool {
+        cx.run_until_parked();
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(50));
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            if pane.read_with(cx, |pane, _| done(pane)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[gpui::test]
+    fn a_real_pty_process_setting_its_title_is_captured_and_classified(cx: &mut TestAppContext) {
+        // Byte for byte what Claude Code writes while it is working - see
+        // `crate::rail::title_signal`'s module docs for the live capture this came from.
+        // The glyph goes in as a literal UTF-8 character rather than a `printf` escape: `\033`
+        // and `\007` are POSIX octal escapes every `printf` supports, but `\u` is not portable.
+        let pane = pane_emitting(cx, "printf '\\033]0;\u{25d0} Claude Code\\007'");
+        assert!(
+            poll_until(cx, &pane, |pane| pane.title().is_some()),
+            "the pane never captured a title from a real pty"
+        );
+
+        let title = pane.read_with(cx, |pane, _| pane.title().map(str::to_string));
+        assert_eq!(title.as_deref(), Some("\u{25d0} Claude Code"));
+        assert_eq!(
+            classify_title(title.as_deref().unwrap()),
+            TitleSignal::Busy,
+            "a real agent CLI's real working title must classify as Busy end to end"
+        );
+
+        pane.update(cx, |pane, cx| pane.shutdown(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_real_osc_9_notification_from_a_pty_process_latches_an_attention_ping(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = pane_emitting(cx, "printf '\\033]9;Agent needs your input\\007'");
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.has_pending_attention_ping()),
+            "sanity check: nothing pinged before the process wrote anything"
+        );
+        assert!(
+            poll_until(cx, &pane, |pane| pane.has_pending_attention_ping()),
+            "a real OSC 9 notification off a real pty never reached the pane"
+        );
+        // The latch is state, not a one-shot: reading it twice must not consume it, or the
+        // render path would see "needs input" for exactly one frame. See
+        // `TerminalPane::attention_ping_at`'s field docs.
+        assert!(
+            pane.read_with(cx, |pane, _| pane.has_pending_attention_ping()),
+            "the pane's ping must survive being read"
+        );
+
+        pane.update(cx, |pane, cx| pane.shutdown(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_real_osc_777_notify_from_a_pty_process_also_pings(cx: &mut TestAppContext) {
+        let pane = pane_emitting(cx, "printf '\\033]777;notify;Gemini;your turn\\007'");
+        assert!(
+            poll_until(cx, &pane, |pane| pane.has_pending_attention_ping()),
+            "a real OSC 777 notify off a real pty never reached the pane"
+        );
+
+        pane.update(cx, |pane, cx| pane.shutdown(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_real_osc_9_4_progress_report_from_a_pty_process_is_parsed(cx: &mut TestAppContext) {
+        let pane = pane_emitting(cx, "printf '\\033]9;4;1;73\\007'");
+        assert!(
+            poll_until(cx, &pane, |pane| pane.progress().is_some()),
+            "a real OSC 9;4 progress report off a real pty never reached the pane"
+        );
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.progress()),
+            Some(Progress {
+                state: ProgressState::Normal,
+                percent: Some(73)
+            })
+        );
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.has_pending_attention_ping()),
+            "a progress report is not a notification - OSC 9;4 must not ping for attention"
+        );
+
+        pane.update(cx, |pane, cx| pane.shutdown(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_pty_process_that_says_nothing_reports_no_signal_at_all(cx: &mut TestAppContext) {
+        // The honest default, and the one every non-agent process hits: a `cat` sitting on a
+        // real pty has no title, no ping and no progress - not an invented one.
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.title(), None);
+            assert!(!pane.has_pending_attention_ping());
+            assert_eq!(pane.progress(), None);
+        });
+
+        pane.update(cx, |pane, cx| pane.shutdown(cx));
+        cx.run_until_parked();
     }
 }
 

@@ -20,6 +20,7 @@ use crate::keymap::{self};
 use crate::merge::state as merge;
 use crate::palette::state as palette;
 use crate::rail::status::{self, Status};
+use crate::rail::title_signal;
 use crate::root::*;
 use crate::settings::state as settings;
 use crate::sidebar::file_tree::{self};
