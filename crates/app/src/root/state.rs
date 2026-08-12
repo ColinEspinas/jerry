@@ -8,6 +8,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// uniqueness isn't enough.
 static NEXT_TREE_UNDO_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Why a `git worktree list --porcelain` fetch is happening - the one thing that differs between
+/// [`AdeApp::load_worktrees`] and [`AdeApp::load_worktrees_for_opened_repo`], passed explicitly
+/// rather than inferred from state once the fetch lands.
+///
+/// It has to be explicit: by the time the fetch resolves, "this repo was just opened" and "a
+/// background poll tick fired for a repo that happens to have nothing selected" are
+/// indistinguishable from [`AdeApp`]'s own fields alone, and they must behave in opposite ways -
+/// the first *must* land on a real worktree (leaving it unselected is the reported bug), the
+/// second must never select anything on the user's behalf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreeLoadIntent {
+    /// A steady-state reload: the live watcher/poll loop, a post-prune or post-merge refresh, or
+    /// [`AdeApp::checkout_repo_from_rail`]'s own follow-up fetch. Never changes *whether*
+    /// something is selected, only re-anchors an existing selection by path
+    /// ([`crate::rail::worktrees::recover_selection`]).
+    Refresh,
+    /// A repo is being opened for real work - a CLI launch or "Open Folder…". `opened_path` is
+    /// the path the user actually named (which may be the repo root, a linked worktree, or a
+    /// mere subdirectory of the repo - see
+    /// [`crate::rail::worktrees::selection_for_opened_repo`] for how each resolves).
+    Opening { opened_path: PathBuf },
+}
+
 impl AdeApp {
     /// Production entry point - loads `~/.config/jerry/settings.toml` (`Settings::load_or_init`)
     /// and delegates to [`Self::new_with_settings`]. Blocking the foreground thread here is a
@@ -637,29 +660,26 @@ impl AdeApp {
         this.apply_theme_selection(cx);
         match resolved_repo_path {
             Some(path) => {
-                // A fresh window starts with one shell in the repo root, as a tab like any
-                // other. `focus_active` below moves real keyboard focus onto it - see
-                // `Agents::focus_active`'s docs and this crate's `OverlayFocus`/`restore_focus`
-                // docs for why a *focused* window must never start with `Window::focus == None`.
-                let startup_agent = this.agents.spawn(
-                    ProcessKind::Shell,
-                    path.clone(),
-                    this.settings.appearance.terminal_font_size,
-                    this.settings.terminal.shell_override(),
-                    None,
-                    window,
-                    cx,
-                );
-                // GitHub issue #225: the startup shell is a real agent like any other and needs a
-                // real review baseline too. This is the *second* `Agents::spawn` call site in the
-                // app (`Self::new_agent` is the other), and it is deliberately hooked separately
-                // rather than folded into `Agents::spawn` itself - see
-                // `crate::review::flow::AdeApp::capture_review_baseline`'s docs for why `Agents`
-                // stays out of the git-snapshot business. Missing this would have left exactly one
-                // agent - the one every window starts with - permanently without a review.
-                this.capture_review_baseline(startup_agent, cx);
-                this.agents.focus_active(window, cx);
-                this.load_worktrees(cx);
+                // A fresh window starts with one shell - but in the repo's real, genuinely
+                // *selected* worktree, not in the bare repo path. `load_worktrees_for_opened_repo`
+                // owns that whole sequence (resolve the real worktree list, select the right
+                // worktree of it, spawn the initial shell into that worktree, focus it); see its
+                // own docs for why the spawn is deferred until that real fetch lands rather than
+                // done synchronously right here, as it used to be.
+                //
+                // This constructor previously duplicated `Self::open_repo_in_current_window`'s
+                // spawn/baseline/focus block almost verbatim; both now funnel through that one
+                // method, so a CLI launch and "Open Folder…" can no longer drift apart on which
+                // worktree the window lands in.
+                this.load_worktrees_for_opened_repo(path.clone(), cx);
+                // Keyboard focus while that fetch is in flight. Without this the window would
+                // render its first frames with `Window::focus == None` - the dangling-focus bug
+                // class this crate's `OverlayFocus`/`restore_focus` machinery exists to prevent -
+                // since the agent that focus used to land on doesn't exist yet. The rail's own
+                // root container is part of the rendered tree for exactly this state (a focused
+                // repo showing the workspace body), and `spawn_initial_shell_for_opened_repo`
+                // moves focus onto the real terminal the moment there is one.
+                window.focus(&this.rail_focus_handle, cx);
                 this.load_file_tree(path.clone(), cx);
                 this.load_diff(path, cx);
                 this.start_status_polling(cx);
@@ -718,6 +738,105 @@ impl AdeApp {
     /// effect; gone or newly broken → falls back to the main worktree and sets
     /// [`Self::worktree_selection_notice`]. See that function's docs for the full state machine.
     pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.load_worktrees_with_intent(WorktreeLoadIntent::Refresh, cx);
+    }
+
+    /// Gives a just-opened repo its guaranteed initial shell, in the worktree that was *genuinely
+    /// selected* a moment earlier - the second half of [`Self::load_worktrees_for_opened_repo`]'s
+    /// own contract, split out so the "which worktree" decision and the "spawn into it" step are
+    /// visibly separate steps rather than one tangled block.
+    ///
+    /// Spawns into [`Self::active_agent_cwd`] and refuses outright when that is `None`, which is
+    /// the whole point: there is no such thing as a tab attributed to a repo rather than to a
+    /// worktree, so if nothing real is selected there is nothing legitimate to spawn. (Today the
+    /// caller has already either selected a real worktree or fallen into
+    /// `active_agent_cwd`'s one documented last resort, so `None` here means the repo stopped
+    /// being focused entirely between the fetch being issued and it landing - a real race, worth
+    /// refusing rather than guessing through.)
+    ///
+    /// Idempotent against a worktree that already has a real agent open - a repo revisited after
+    /// being unfocused keeps whatever agents it already had running (see
+    /// [`crate::root::AdeApp::open_repo_in_current_window`]'s cross-repo persistence docs), so
+    /// this must never stack a redundant second shell onto one that is already there.
+    fn spawn_initial_shell_for_opened_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = self.active_agent_cwd() else {
+            return;
+        };
+        if self.agents.iter_for_cwd(cwd.clone()).next().is_none() {
+            let startup_agent = self.agents.spawn(
+                ProcessKind::Shell,
+                cwd.clone(),
+                self.settings.appearance.terminal_font_size,
+                self.settings.terminal.shell_override(),
+                // A shell, so no hook injection - `Agents::spawn` would discard one anyway.
+                None,
+                window,
+                cx,
+            );
+            // GitHub issue #225: the startup shell is a real agent like any other and needs a
+            // real review baseline too - see `crate::review::flow::AdeApp::
+            // capture_review_baseline`'s docs for why this is hooked at the `Agents::spawn` call
+            // site rather than inside `Agents` itself. Missing this would leave exactly one agent
+            // - the one every window starts with - permanently without a review.
+            self.capture_review_baseline(startup_agent, cx);
+        }
+        // Makes this worktree's own tab the globally active one, whether it was just spawned
+        // above or was already running from an earlier visit.
+        self.agents.activate_for_worktree(&cwd, cx);
+        // `focus_newly_spawned_agent`, not a bare `Agents::focus_active`: a focused window must
+        // never be left with `Window::focus == None` (see this crate's `OverlayFocus`/
+        // `restore_focus` docs), but it must equally never point focus at a terminal pane that
+        // isn't in the rendered tree. "Open Folder…" is reachable *with Settings open* (the File
+        // menu is an unconditional sibling of the Settings/workspace-body swap), and Settings
+        // replaces the entire workspace body - so that guard is a real one here, not a formality.
+        self.focus_newly_spawned_agent(window, cx);
+        cx.notify();
+    }
+
+    /// [`Self::load_worktrees`] for the two real "this repo is being opened for genuine work"
+    /// gestures - a CLI launch ([`Self::new_with_settings`]) and GitHub issue #90's "Open
+    /// Folder…" ([`crate::root::AdeApp::open_repo_in_current_window`]).
+    ///
+    /// Both used to spawn their guaranteed initial shell *immediately*, into the bare repo path,
+    /// and leave [`Self::selected`] at `None` - so the tab that shell produced belonged to no
+    /// worktree at all and only rendered because [`Self::active_agent_cwd`]'s old repo-root
+    /// fallback happened to coincide with the main worktree's own path. That is the reported bug
+    /// ("at the start of the program you select something and a tab bar has a terminal; then I
+    /// select a worktree and this is lost"), and its fix is not to patch the fallback but to make
+    /// the opening gesture do the real thing: resolve the repo's actual worktree list, genuinely
+    /// select the right worktree of it ([`crate::rail::worktrees::selection_for_opened_repo`]),
+    /// and spawn the initial shell into *that concretely-selected worktree*.
+    ///
+    /// The initial shell is therefore deliberately deferred until this real fetch lands rather
+    /// than spawned synchronously beforehand. `git worktree list --porcelain` is a background
+    /// call (this method never blocks the main thread on git - see [`Self::load_worktrees`]'s own
+    /// task), and there is genuinely nothing correct to spawn *into* until it answers: a
+    /// synchronous spawn would have to guess a cwd, and guessing the repo root is precisely the
+    /// bug being removed. The interim frame or two is a real, honest "focused repo, nothing
+    /// selected yet, empty tab strip" - not a fabricated tab - and [`Self::rail_focus_handle`]
+    /// holds keyboard focus meanwhile so no frame ever renders with `Window::focus` dangling.
+    ///
+    /// Seeding synchronously from already-known data (the trick
+    /// [`Self::select_worktree_by_path`]'s cross-repo case uses) is deliberately *not* used here:
+    /// that case can only work because the row the user clicked was itself rendered from a
+    /// [`crate::rail::repo::Repo::worktrees`] list that had already been fetched. A repo being
+    /// opened for the first time has no such list by definition, so there would be nothing real
+    /// to seed from in exactly the case that matters.
+    pub(crate) fn load_worktrees_for_opened_repo(
+        &mut self,
+        opened_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_worktrees_with_intent(WorktreeLoadIntent::Opening { opened_path }, cx);
+    }
+
+    /// The shared body of [`Self::load_worktrees`]/[`Self::load_worktrees_for_opened_repo`] -
+    /// one real `git worktree list --porcelain` fetch, with `intent` deciding only what happens
+    /// to [`Self::selected`] once it lands. Kept as one function (rather than two similar ones)
+    /// so the fetch, the [`crate::rail::repo::Repo::worktrees`] mirror, and the
+    /// [`crate::rail::worktrees::recover_selection`] state machine can never drift apart between
+    /// the opening path and the steady-state refresh path.
+    fn load_worktrees_with_intent(&mut self, intent: WorktreeLoadIntent, cx: &mut Context<Self>) {
         let repo_path = self.focused_repo_path();
         // Captured now, not re-read via `this.focused_repo` once the fetch below completes: a
         // rapid double repo-switch could otherwise land this fetch's *old* result on whatever
@@ -728,7 +847,11 @@ impl AdeApp {
                 .background_executor()
                 .spawn(async move { wt_core::list_worktrees_porcelain(&repo_path) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            // `update_in`, not `update`: the `Opening` intent below performs a real worktree
+            // selection and spawns this window's initial shell, both of which need a genuine
+            // `&mut Window` (moving keyboard focus onto the terminal that results). The same
+            // real pattern `Self::start_choose_repo_folder`'s own picker continuation uses.
+            let _ = this.update_in(cx, |this, window, cx| {
                 // Captured *before* `this.worktrees` is overwritten below - `recover_selection`
                 // needs the old entry's own path/label, which won't exist in the new list.
                 let previously_selected = this
@@ -761,11 +884,22 @@ impl AdeApp {
                 }
 
                 match worktrees::recover_selection(previously_selected.as_ref(), &this.worktrees) {
-                    // Deliberately stays unselected - see `crate::root::AdeApp::
-                    // checkout_repo_from_rail`'s own docs for why nothing here may auto-select a
-                    // worktree on the user's behalf. Real tab spawning is gated on
-                    // `Self::selected` directly ([`crate::work_surface::render::AdeApp::
-                    // new_agent`]/`new_agent_pane`'s own guard), not worked around here.
+                    // Nothing was selected before this fetch. What that *means* depends entirely
+                    // on why the fetch happened, which is why `intent` is an explicit parameter
+                    // rather than something guessed at from state here:
+                    //
+                    // - `Opening`: this repo is being opened for real work, and leaving it
+                    //   unselected is exactly the reported bug - a focused repo with a live
+                    //   startup terminal that belongs to no worktree. Land on a real worktree
+                    //   (`selection_for_opened_repo`) and spawn the initial shell into it.
+                    // - `Refresh`: a background watcher/poll tick, a post-prune reload, or
+                    //   `checkout_repo_from_rail`'s own follow-up fetch. None of these are a
+                    //   user asking to work somewhere, so none may select on the user's behalf -
+                    //   see `crate::root::AdeApp::checkout_repo_from_rail`'s own docs. This is
+                    //   now genuinely inert rather than merely *looking* inert: with
+                    //   `Self::active_agent_cwd`'s repo-root fallback gone, an unselected repo
+                    //   renders an honestly empty tab strip and no selected rail row, instead of
+                    //   the three-way rail/tab-strip/centre-pane disagreement it used to.
                     worktrees::SelectionRecovery::NoPriorSelection => {}
                     worktrees::SelectionRecovery::Unchanged(index) => {
                         this.selected = Some(index);
@@ -792,6 +926,37 @@ impl AdeApp {
                         this.load_file_tree(new_root.clone(), cx);
                         this.load_diff(new_root, cx);
                     }
+                }
+
+                // Deliberately *after* the recovery match rather than inside its
+                // `NoPriorSelection` arm, and keyed off `this.selected` rather than off which arm
+                // ran. Both matter, for the same real race: this fetch is asynchronous, so the
+                // user can click a worktree row while it is still in flight. That click sets
+                // `Self::selected`, which makes `recover_selection` report `Unchanged`/
+                // `FellBackToMain` here instead of `NoPriorSelection` - and an `Opening` handler
+                // living inside that one arm would then silently skip the window's *guaranteed*
+                // initial shell entirely, leaving a freshly opened repo with no terminal at all.
+                //
+                // Written this way, a raced click is simply respected: the worktree the user
+                // actually chose stays selected, and the initial shell is spawned into that, not
+                // into whatever this fetch would have picked on its own.
+                if let WorktreeLoadIntent::Opening { opened_path } = &intent {
+                    if this.selected.is_none() {
+                        if let Some(index) =
+                            worktrees::selection_for_opened_repo(opened_path, &this.worktrees)
+                        {
+                            // The one real selection entry point, deliberately - it is what
+                            // re-roots the file tree/diff, activates the worktree's own remembered
+                            // tab, and moves focus. Reimplementing a partial copy here is exactly
+                            // how the opening path would drift away from an ordinary rail click.
+                            this.select_worktree(index, window, cx);
+                        }
+                    }
+                    // Runs whether or not a worktree was selectable: a repo with no usable
+                    // worktree at all (an unreadable path, or a directory that is not a git
+                    // repository) still gets its guaranteed initial shell, via
+                    // `Self::active_agent_cwd`'s one documented last resort. See its own docs.
+                    this.spawn_initial_shell_for_opened_repo(window, cx);
                 }
 
                 this.load_disk_usage(cx);
@@ -1193,15 +1358,68 @@ impl AdeApp {
         self._file_tree_watch_task = Some(task);
     }
 
-    /// The worktree a *new* agent should be spawned into: the selected worktree's real
-    /// path if one is selected and readable, otherwise the repo root - see the module docs'
-    /// "Agents/tabs" section for why this is resolved at spawn time rather than tracked as
-    /// a per-tab "current worktree".
-    pub(crate) fn active_agent_cwd(&self) -> PathBuf {
-        match self.selected.and_then(|index| self.worktrees.get(index)) {
-            Some(item) if item.error.is_none() => item.path.clone(),
-            _ => self.focused_repo_path(),
+    /// The **one** real answer to "which worktree is the app currently working in" - the single
+    /// path the tab strip is scoped to, a new agent spawns into, and the rail draws its selected
+    /// row from. See the module docs' "Agents/tabs" section for why this is resolved on demand
+    /// rather than tracked as a per-tab "current worktree".
+    ///
+    /// ## Why this returns `Option`
+    ///
+    /// This used to be infallible, falling back to [`Self::focused_repo_path`] whenever
+    /// [`Self::selected`] was `None`. That fallback was the shared root cause of a family of
+    /// reported bugs - the same underlying flaw as the three already fixed on this branch, not a
+    /// separate one - because *a repo root is not a worktree*. Concretely, live-reproduced:
+    ///
+    /// - **A real tab that no rail row claims.** Launching against a subdirectory of a repo
+    ///   (`jerry ./crates` - an entirely ordinary invocation) made this resolve to
+    ///   `<repo>/crates`, which `git worktree list --porcelain` reports as no worktree at all.
+    ///   The startup shell spawned there rendered a real tab in the strip while *every* rail row
+    ///   read as unselected, and the instant any worktree row was clicked the tab vanished with
+    ///   no path back - its `cwd` could never again equal any row's path, so the live PTY was
+    ///   permanently orphaned.
+    /// - **The rail, the tab strip, and the centre pane disagreeing three ways.** With
+    ///   [`Self::selected`] `None` but a real agent already open in the repo root, the rail drew
+    ///   its main-worktree row as selected (this fallback matched it), the tab strip drew that
+    ///   agent's tab (`Self::combined_tab_order` scoped to this same fallback), and the centre
+    ///   pane rendered nothing at all (`Agents::active` having been genuinely cleared).
+    /// - **The reported "I select a worktree and the startup terminal is lost."** The startup
+    ///   shell's tab showed only because this fallback happened to coincide with the main
+    ///   worktree's own path while nothing was selected - so the user never performed the
+    ///   selection that owned it, and had no model of where it went or that clicking the main
+    ///   row brings it back.
+    ///
+    /// `None` is therefore a real, honest state now - "no worktree is genuinely selected" - and
+    /// every caller renders it as such (an empty tab strip, an empty centre pane, no rail row
+    /// reading as selected, and no spawn) rather than silently substituting the repo root.
+    ///
+    /// ## The one documented last resort
+    ///
+    /// A focused repo whose worktree list has genuinely *landed* and contains nothing usable -
+    /// an unreadable path, or a directory that isn't a git repository at all, both of which
+    /// `wt_core::list_worktrees_porcelain` reports as a real `Err` that
+    /// [`Self::load_worktrees`] turns into an empty [`Self::worktrees`] - still resolves to the
+    /// repo root. This is a real error state, not the common path, and it is self-consistent in
+    /// a way the old blanket fallback never was: there are no worktree rows at all, so there is
+    /// no row that could disagree with it, and the repo root is the only honest place left to
+    /// work in. Gated on [`crate::rail::repo::Repo::worktrees_loaded`] specifically so the
+    /// window *before* the first fetch lands - when [`Self::worktrees`] is empty merely because
+    /// nothing has been asked yet - reports the honest `None` instead of briefly reintroducing
+    /// the very fallback this removes.
+    pub(crate) fn active_agent_cwd(&self) -> Option<PathBuf> {
+        if let Some(item) = self.selected.and_then(|index| self.worktrees.get(index)) {
+            if item.error.is_none() {
+                return Some(item.path.clone());
+            }
         }
+        // See "The one documented last resort" above.
+        let list_has_landed = self
+            .focused_repo()
+            .is_some_and(|repo| repo.worktrees_loaded);
+        let nothing_usable = !self.worktrees.iter().any(|item| item.error.is_none());
+        if list_has_landed && nothing_usable {
+            return Some(self.focused_repo_path());
+        }
+        None
     }
 
     pub(crate) fn select_worktree(
