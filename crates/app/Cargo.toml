@@ -237,10 +237,18 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
     "x11",
 ] }
 
-# macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, so no
-# feature request is needed or possible here.
+# macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, but text
+# rendering is NOT automatic - `gpui_macos`'s own `font-kit` feature (which pulls in its real
+# `zed-font-kit`-backed system font matching/shaping) is optional and off by default, and
+# `gpui_platform` only forwards it via its own same-named `font-kit` feature
+# (`font-kit = ["gpui_macos/font-kit"]` in `vendor/zed/crates/gpui_platform/Cargo.toml`).
+# Without it, the app builds and runs but logs `gpui_macos::platform: gpui_macos was compiled
+# without the "font-kit" feature, so no text will be rendered` and shows a real, empty window -
+# confirmed the hard way running this app on macOS for the first time (see BUILD-LOG.md).
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36", features = [
+    "font-kit",
+] }
 
 # Windows: same as macOS - `gpui_windows` (and `gpui`'s own `windows-manifest` feature) are
 # pulled in automatically by `gpui_platform`'s own Windows target section.

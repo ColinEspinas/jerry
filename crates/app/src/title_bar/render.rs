@@ -12,13 +12,23 @@ use crate::root::focus::palette_focus_tests;
 const CLOSE_GLYPH_HALF_DIAGONAL: f32 = 3.889_87; // 5.5 * cos(45°)
 
 impl AdeApp {
-    /// The three flat-circle window controls in the title bar's left cluster, wired to real GPUI
-    /// window-control methods (`Window::remove_window`/`minimize_window`/`zoom_window`, verified
-    /// against `vendor/zed/crates/gpui/src/window.rs:2016,5520,2489`) - the same calls
+    /// The three flat-circle window controls in the title bar's left cluster - macOS-only (see
+    /// [`Self::render_macos_title_bar_left`]), wired to real GPUI window-control methods
+    /// (`Window::remove_window`/`minimize_window`, verified against
+    /// `vendor/zed/crates/gpui/src/window.rs:2016,5520`). Left-to-right order (close, minimize,
+    /// maximize) follows the macOS traffic-light convention; the design doesn't colour-code
+    /// these dots, so there's no ordering hint from the mockup itself.
+    ///
+    /// The third dot deliberately calls `Window::toggle_fullscreen`, not `Window::zoom_window`:
+    /// an earlier version called `zoom_window` here, copied from
     /// `vendor/zed/crates/platform_title_bar/src/platforms/platform_linux.rs`'s own
-    /// `WindowControl::on_click` makes. Left-to-right order (close, minimize, maximize) follows
-    /// the macOS traffic-light convention; the design doesn't colour-code these dots, so there's
-    /// no ordering hint from the mockup itself.
+    /// `WindowControl::on_click` - correct for Linux, where the third caption button really is a
+    /// zoom/restore toggle, but wrong for macOS, where the green traffic light's real convention
+    /// is a fullscreen toggle. `Window::zoom_window` calls AppKit's `zoom(_:)`, which Apple
+    /// documents as a no-op while the window is already in full-screen mode - so the old code
+    /// could enter fullscreen (via the real, OS-drawn traffic light underneath, before this dot
+    /// existed) but this dot itself could never leave it again: a real, reproduced dead end,
+    /// found running this app on macOS for the first time (see BUILD-LOG.md).
     ///
     /// The wrapping row stops left-click propagation on mouse-down so pressing a dot can never
     /// also arm [`Self::render_title_bar`]'s window-move drag.
@@ -38,7 +48,7 @@ impl AdeApp {
                 window.minimize_window();
             }))
             .child(window_control_dot("title-bar-maximize", |window, _cx| {
-                window.zoom_window();
+                window.toggle_fullscreen();
             }))
     }
 
@@ -147,11 +157,14 @@ impl AdeApp {
 
     /// The Windows/Linux title bar's three caption buttons (minimise/maximise/close), pinned to
     /// the band's right edge, 44px wide × full band height, bleeding past the band's own 12px
-    /// right padding (`.mr(px(-12.0))`). Wired to the same [`Window::minimize_window`]/
-    /// [`Window::zoom_window`]/[`Window::remove_window`] calls [`Self::render_window_controls`]
-    /// uses - the macOS dot cluster and these caption buttons are two skins over identical real
-    /// window-control behaviour, not two independently implemented ones. Only the close button's
-    /// glyph uses [`theme::text::SECONDARY`]; minimize/maximize use the dimmer
+    /// right padding (`.mr(px(-12.0))`). Minimize/close call the same real
+    /// [`Window::minimize_window`]/[`Window::remove_window`] [`Self::render_window_controls`]'s
+    /// macOS dot cluster uses - two skins over identical real window-control behaviour there, not
+    /// two independently implemented ones. Maximize does not: this button keeps
+    /// [`Window::zoom_window`] (real Windows/Linux "restore/maximize" semantics), while the macOS
+    /// cluster's third dot calls [`Window::toggle_fullscreen`] instead (real macOS green-light
+    /// semantics) - see that dot's own docs for why they diverge. Only the close button's glyph
+    /// uses [`theme::text::SECONDARY`]; minimize/maximize use the dimmer
     /// [`render_minimize_glyph`]/[`render_maximize_glyph`] default.
     fn render_windows_caption_buttons(&self) -> impl IntoElement {
         div()
@@ -526,8 +539,10 @@ fn render_close_glyph(color: gpui::Rgba) -> impl IntoElement {
 ///
 /// ## Why only `close` gets a live-click test here
 ///
-/// Minimise/maximise call the same real `Window::minimize_window`/`Window::zoom_window` the
-/// macOS dot cluster already uses, but the test backend's `TestWindow: PlatformWindow` impl
+/// Minimise calls the same real `Window::minimize_window` the macOS dot cluster's own minimize
+/// dot already uses; maximise calls `Window::zoom_window` (see
+/// [`Self::render_windows_caption_buttons`]'s own docs for why that's Windows/Linux-only now).
+/// Either way, the test backend's `TestWindow: PlatformWindow` impl
 /// (`vendor/zed/crates/gpui/src/platform/test/window.rs`) has both `fn minimize(&self) {
 /// unimplemented!() }` and `fn zoom(&self) { unimplemented!() }` as deliberate panics
 /// (`is_maximized` always returns `false` too, so there's no toggled state to assert against
@@ -611,6 +626,71 @@ mod caption_button_tests {
              backend's own `unimplemented!()` for that call would have panicked this test process \
              instead of reaching this assertion"
         );
+    }
+}
+
+/// Real, interactive coverage for the macOS dot cluster's third ("maximize") dot - unlike
+/// [`caption_button_tests`]'s minimise/maximise, this one can be live-click-tested: it now calls
+/// [`Window::toggle_fullscreen`] (this module's own fix for the dead end this bug report is
+/// named after), and unlike `zoom`/`minimize`, GPUI's `TestWindow` gives `toggle_fullscreen` a
+/// real implementation (`vendor/zed/crates/gpui/src/platform/test/window.rs`: flips a real
+/// `is_fullscreen` flag, no `unimplemented!()`), so a click here can be asserted against instead
+/// of only verified manually.
+#[cfg(test)]
+mod macos_dot_cluster_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Clicking the real macOS "maximize" dot toggles the real window's fullscreen state both
+    /// ways - into fullscreen, and back out again. Before this module's fix, the second click
+    /// called `Window::zoom_window` (AppKit's `zoom(_:)`), which Apple documents as a no-op while
+    /// already fullscreen: the window would have stayed stuck in fullscreen exactly as it did
+    /// running this app on macOS for the first time (see BUILD-LOG.md) - this test would have
+    /// caught that regression by failing its second assertion.
+    #[gpui::test]
+    fn clicking_the_macos_maximize_dot_toggles_fullscreen_both_ways(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        // Pin the macOS dot-cluster variant regardless of the real host OS this test happens to
+        // run on, so the test is deterministic everywhere (the same reasoning
+        // `caption_button_tests` pins the opposite variant for).
+        app.update(cx, |app, cx| {
+            app.set_window_controls_style(WindowControlsStyle::MacosStyle, cx);
+        });
+        cx.run_until_parked();
+
+        // Left cluster offset from the window's left edge: the title bar's own 12px padding
+        // (`render_title_bar`'s `.px(px(12.0))`) + the macOS left cluster's 2px (`
+        // render_macos_title_bar_left`'s `.pl(px(2.0))`) + the dot row's own 2px (`
+        // render_window_controls`'s `.pl(px(2.0))`) = 16px to the close dot's left edge. Each dot
+        // is 11px wide with an 8px gap (`render_window_controls`'s `.gap(px(8.0))`), so the third
+        // ("maximize") dot's box starts at 16 + 2 * (11 + 8) = 54px; its center is 5.5px further.
+        // Vertical center is the same 19px (half of the 38px `theme::band::TITLE_BAR`)
+        // `caption_button_tests`'s own close-button test already uses.
+        let maximize_dot_center = gpui::point(px(54.0) + px(5.5), px(19.0));
+
+        assert!(
+            !cx.update(|window, _app| window.is_fullscreen()),
+            "window must not start fullscreen"
+        );
+
+        cx.simulate_click(maximize_dot_center, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, _app| window.is_fullscreen()),
+            "clicking the maximize dot once must enter fullscreen"
+        );
+
+        cx.simulate_click(maximize_dot_center, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, _app| window.is_fullscreen()),
+            "clicking the maximize dot a second time must leave fullscreen again - this is the \
+             exact click that used to reach `Window::zoom_window` and silently do nothing"
+        );
+
+        let _ = app;
     }
 }
 
