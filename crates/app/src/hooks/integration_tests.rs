@@ -370,3 +370,156 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
         "and Jerry's own hooks must fire too - got {fired:?}"
     );
 }
+
+/// The end-to-end test that covers what a *user* does, through the objects a user's click really
+/// goes through: [`crate::root::AdeApp::new_agent`] (what the palette's "New Claude agent", the
+/// Agent menu and the rail's "+" all call), a real
+/// [`crate::work_surface::agents::Agents::spawn`], a real pty, a real `claude`, and a real
+/// [`crate::hooks::HookRuntime`] brought up by the real lazy `hook_injection_for` gate - then
+/// asserts the fact comes back out of the app's own runtime under that agent's own real id.
+///
+/// The tests above this one hand-assemble the `--settings` argument and the `JERRY_*` environment
+/// from the production helpers and hand them to a `std::process::Command`. That pins Claude
+/// Code's half of the contract and nothing at all of Jerry's: every step between a click and the
+/// child process - the lazy runtime bring-up, the Claude-only gate, whether the `AgentId` in the
+/// environment is the one the rail reads back, `ProcessKind::spec`, `TerminalSpec::env`,
+/// `pty_core`'s `CommandBuilder` - is skipped by all of them. This one skips none of it, which is
+/// the whole reason it exists: a regression anywhere along that chain would leave every other
+/// test in this file green.
+#[gpui::test]
+fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
+    cx: &mut gpui::TestAppContext,
+) {
+    if !cfg!(unix) {
+        return;
+    }
+    if real_claude().is_none() {
+        skip_or_fail("no `claude` binary on PATH - the real spawn path cannot be exercised");
+        return;
+    }
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let (app, cx) =
+        crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+    let (id, pane) = app.update_in(cx, |app, window, cx| {
+        app.new_agent(ProcessKind::claude(), window, cx);
+        let agent = app
+            .agents
+            .iter()
+            .last()
+            .expect("the agent `new_agent` just spawned");
+        (agent.id, agent.pane.clone())
+    });
+    cx.run_until_parked();
+
+    // The real command line and environment this spawn produced - asserted from the pane the app
+    // itself built, not from a reconstruction of what it ought to have built.
+    let spec = pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
+    assert_eq!(spec.program, std::path::PathBuf::from("claude"));
+    assert_eq!(
+        spec.args.first().map(String::as_str),
+        Some("--settings"),
+        "a real Claude spawn must carry the generated settings file, got {:?}",
+        spec.args
+    );
+    let settings_path = std::path::PathBuf::from(&spec.args[1]);
+    assert!(
+        settings_path.is_file(),
+        "the settings path handed to `claude` must really exist on disk: {}",
+        settings_path.display()
+    );
+    assert!(
+        settings_path
+            .with_file_name("jerry-hook-forwarder.sh")
+            .is_file(),
+        "the forwarder script the settings file names must really exist"
+    );
+    let injected: std::collections::HashMap<&str, &str> = spec
+        .env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    assert_eq!(
+        injected.get(AGENT_ENV).copied(),
+        Some(id.to_string().as_str()),
+        "the environment must name the same agent id the rail reads this agent's status back under"
+    );
+    assert!(injected.contains_key(PORT_ENV) && injected.contains_key(TOKEN_ENV));
+    assert!(
+        app.read_with(cx, |app, _| app.hook_runtime.is_some()),
+        "the lazy runtime must have been brought up by this spawn"
+    );
+
+    // Claude Code will not start a session in a directory it has never seen until a human answers
+    // "do you trust this folder?", and until it does, *no hook fires at all*. Jerry's whole
+    // product is spawning agents into freshly created worktrees, so that screen is the normal
+    // first thing a real agent shows, not an edge case. Answer it with a real keystroke on the
+    // real pane, exactly as a user does.
+    fn pump(cx: &mut gpui::VisualTestContext, rounds: usize) {
+        for _ in 0..rounds {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        pump(cx, 10);
+        let asking = pane.read_with(cx, |pane, _| {
+            pane.visible_text_lines()
+                .iter()
+                .any(|line| line.contains("trust this folder"))
+        });
+        if asking {
+            cx.simulate_keystrokes("enter");
+            pump(cx, 10);
+            break;
+        }
+    }
+
+    // `SessionStart` fires as soon as the session really starts, so nothing has to be typed.
+    let started = Instant::now();
+    let mut fact = None;
+    while started.elapsed() < Duration::from_secs(90) && fact.is_none() {
+        pump(cx, 4);
+        fact = app.read_with(cx, |app, _| {
+            app.hook_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.signal_for(id).fact)
+        });
+    }
+
+    if fact.is_none() {
+        // A sandbox with no credentials can't start a session at all - the same "`claude` is
+        // installed but unusable here" case the tests above tolerate. Reported, never silently
+        // passed off as a green run.
+        let screen = pane.read_with(cx, |pane, _| pane.visible_text_lines().join("\n"));
+        app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
+        skip_or_fail(&format!(
+            "the installed `claude` never started a session through the real spawn path; the \
+             pane showed:\n{}",
+            screen.trim()
+        ));
+        return;
+    }
+
+    assert_eq!(
+        fact,
+        Some(HookFact::Working),
+        "a session that has really started reports itself as working"
+    );
+    // And the real session id GitHub issue #227's resume path needs comes back the same way.
+    assert!(
+        app.read_with(cx, |app, _| app
+            .hook_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.session_id_for(id))
+            .is_some()),
+        "the real Claude Code session id must reach the app through the real path too"
+    );
+
+    app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
+    cx.run_until_parked();
+}

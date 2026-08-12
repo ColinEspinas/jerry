@@ -98,9 +98,47 @@ pub enum HookFact {
     TurnFailed,
 }
 
+/// Whether an event is a real lifecycle **transition** or merely a **nudge** re-announcing a
+/// state the agent is already in.
+///
+/// This distinction is not cosmetic, and it was found empirically rather than reasoned about: a
+/// real `claude` 2.1.228 session emits `Notification` immediately *after* the lifecycle event that
+/// caused it, and every `Notification` message is one of a handful of fixed generic strings.
+/// Against [`crate::hooks::server::HookInbox`]'s "latest wins" rule that made every hook fact
+/// Jerry could ever show one of those constants:
+///
+/// - A real permission prompt fires `PermissionRequest` (carrying the real tool and its real
+///   argument - "Write needs permission: notes.txt") and then, milliseconds later, a
+///   `Notification` whose entire message is `"Claude needs your permission"`. The specific
+///   question this module carefully builds was overwritten before it could ever be rendered.
+/// - A finished turn fires `Stop` ([`HookFact::TurnEnded`], the turn boundary the whole review
+///   surface hangs off) and then, about a minute later, an `idle_prompt` `Notification`. That
+///   flipped every finished agent from `Review`/`Idle` back to `Ask` with the constant
+///   `"Claude is waiting for your input"` - erasing exactly the "a turn that ended is a review
+///   boundary" capability this phase exists to add, roughly one minute after it appeared.
+///
+/// Both were observed live against a real binary before this type existed. See
+/// [`crate::hooks::server::HookInbox::record`] for the rule that acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// A real lifecycle event: the agent moved from one state to another, and this report is the
+    /// whole truth about where it is now. Everything except `Notification`.
+    Transition,
+    /// A `Notification` that announces a *block* (`permission_prompt`, `agent_needs_input`,
+    /// `elicitation_dialog`). It may be the first Jerry hears of the block, so it can still move a
+    /// finished agent back to [`HookFact::NeedsInput`] - it just must not overwrite the richer
+    /// question a `PermissionRequest` already gave for the same block.
+    BlockedNudge,
+    /// The `idle_prompt` `Notification`: "you have not typed for a while". It carries no state at
+    /// all beyond what a turn boundary already said, so it must never overwrite one.
+    IdleNudge,
+}
+
 /// One parsed hook event, reduced to exactly what the rail row needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookReport {
+    /// Whether this event is a real transition or a re-announcement - see [`EventKind`].
+    pub kind: EventKind,
     /// The state fact - see [`HookFact`].
     pub fact: HookFact,
     /// Trailing "what it is doing" text for a running row, roughly `"{tool}: {argument}"`, already
@@ -132,6 +170,7 @@ impl HookReport {
     /// have no text worth rendering (see the module docs on `last_assistant_message`).
     fn bare(fact: HookFact) -> HookReport {
         HookReport {
+            kind: EventKind::Transition,
             fact,
             activity: None,
             question: None,
@@ -246,6 +285,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 None => truncated(tool, ACTIVITY_MAX_CHARS),
             };
             Some(HookReport {
+                kind: EventKind::Transition,
                 fact: HookFact::Working,
                 activity,
                 question: None,
@@ -259,6 +299,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
         "PostToolUseFailure" => {
             let tool = value.get("tool_name").and_then(serde_json::Value::as_str)?;
             Some(HookReport {
+                kind: EventKind::Transition,
                 fact: HookFact::TurnFailed,
                 activity: truncated(tool, ACTIVITY_MAX_CHARS),
                 question: value
@@ -282,6 +323,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 None => truncated(&format!("{tool} needs permission"), QUESTION_MAX_CHARS),
             };
             Some(HookReport {
+                kind: EventKind::Transition,
                 fact: HookFact::NeedsInput,
                 activity: None,
                 question,
@@ -298,6 +340,12 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 return None;
             }
             Some(HookReport {
+                // `idle_prompt` is the one type that says nothing a turn boundary hasn't already
+                // said - see [`EventKind`] for the real behaviour this distinction was found in.
+                kind: match notification_type {
+                    "idle_prompt" => EventKind::IdleNudge,
+                    _ => EventKind::BlockedNudge,
+                },
                 fact: HookFact::NeedsInput,
                 activity: None,
                 question: value
@@ -311,6 +359,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
         "Stop" => Some(HookReport::bare(HookFact::TurnEnded)),
 
         "StopFailure" => Some(HookReport {
+            kind: EventKind::Transition,
             fact: HookFact::TurnFailed,
             activity: None,
             question: value
@@ -467,6 +516,71 @@ mod tests {
                 parse("Notification", payload.as_bytes()),
                 None,
                 "{informational} must not be treated as needing a human"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notification_is_classified_as_a_nudge_and_every_lifecycle_event_as_a_transition() {
+        // The classification `crate::hooks::server::merge_nudge` acts on. Getting `idle_prompt`
+        // wrong here is what erased the review boundary one minute after every finished turn, and
+        // getting `permission_prompt` wrong is what replaced every real permission question with
+        // a constant - see `EventKind`'s own docs for both, observed live.
+        let notification = |kind: &str| {
+            let payload = format!(
+                r#"{{"hook_event_name":"Notification","notification_type":"{kind}","message":"m"}}"#
+            );
+            parse("Notification", payload.as_bytes())
+                .unwrap_or_else(|| panic!("{kind} must parse"))
+                .kind
+        };
+        assert_eq!(notification("idle_prompt"), EventKind::IdleNudge);
+        for blocking in [
+            "permission_prompt",
+            "agent_needs_input",
+            "elicitation_dialog",
+        ] {
+            assert_eq!(
+                notification(blocking),
+                EventKind::BlockedNudge,
+                "{blocking}"
+            );
+        }
+
+        for (event, payload) in [
+            ("SessionStart", r#"{"hook_event_name":"SessionStart"}"#),
+            (
+                "UserPromptSubmit",
+                r#"{"hook_event_name":"UserPromptSubmit"}"#,
+            ),
+            (
+                "PreToolUse",
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            ),
+            (
+                "PostToolUse",
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            ),
+            (
+                "PostToolUseFailure",
+                r#"{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","error":"exit 1"}"#,
+            ),
+            (
+                "PermissionRequest",
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"a.txt"}}"#,
+            ),
+            ("Stop", r#"{"hook_event_name":"Stop"}"#),
+            (
+                "StopFailure",
+                r#"{"hook_event_name":"StopFailure","error_message":"boom"}"#,
+            ),
+        ] {
+            let report =
+                parse(event, payload.as_bytes()).unwrap_or_else(|| panic!("{event} must parse"));
+            assert_eq!(
+                report.kind,
+                EventKind::Transition,
+                "{event} is a real lifecycle transition and must supersede whatever came before it"
             );
         }
     }

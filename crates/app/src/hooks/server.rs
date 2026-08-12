@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::hooks::event::{self, HookReport, MAX_PAYLOAD_BYTES};
+use crate::hooks::event::{self, HookFact, HookReport, MAX_PAYLOAD_BYTES};
 use crate::work_surface::agents::AgentId;
 
 /// How long a single blocking read may wait for *some* data to arrive.
@@ -147,6 +147,13 @@ pub struct HookRecord {
 /// pinning a row to "Failed": the very next `PreToolUse` overwrites it. A failure only *stays*
 /// visible if the agent produced no further events after it, which is exactly the case where a
 /// human really does want to know something broke and nothing has happened since.
+///
+/// The one real exception - found by watching a live session rather than by reading the docs - is
+/// that not every hook event *is* a transition. A `Notification` is Claude Code re-announcing a
+/// state it has already reported precisely, with a fixed generic message, so under a literal
+/// "latest wins" it destroyed the better fact that had arrived moments earlier. See
+/// [`merge_nudge`] and [`event::EventKind`] for the two bugs that caused and for the rule that
+/// replaced it.
 #[derive(Debug, Default)]
 pub struct HookInbox {
     latest: HashMap<AgentId, HookRecord>,
@@ -161,6 +168,13 @@ impl HookInbox {
     /// Records a freshly parsed event as `id`'s current state, evicting the oldest entry if that
     /// would push the inbox past [`MAX_TRACKED_AGENTS`].
     ///
+    /// "Latest wins" holds for real lifecycle *transitions* only. A `Notification`
+    /// ([`event::EventKind::BlockedNudge`]/[`event::EventKind::IdleNudge`]) is Claude Code
+    /// re-announcing a state it has already reported through a precise event, and is folded into
+    /// what Jerry already knows rather than replacing it - see [`merge_nudge`] and
+    /// [`event::EventKind`] for the two real, live-observed bugs that came from treating them as
+    /// equals.
+    ///
     /// The cap exists because the id in a request is not checked against the set of live agents -
     /// the listener has no view of that, and adding one would couple it to `AdeApp` state behind
     /// a lock it would then hold on every request. So a client that knows the token (see the
@@ -169,6 +183,15 @@ impl HookInbox {
     /// the real agents - the ones actually emitting events - and sheds invented ids that never
     /// report again.
     pub fn record(&mut self, id: AgentId, report: HookReport) {
+        // Only a *fresh* previous record is worth folding into: past the TTL the rail has already
+        // stopped believing it (see `crate::rail::status::HookSignal::fresh`), so a nudge is then
+        // the only real evidence there is and must stand on its own.
+        let report = match self.latest.get(&id) {
+            Some(previous) if previous.received_at.elapsed() < event::HOOK_SIGNAL_TTL => {
+                merge_nudge(&previous.report, report)
+            }
+            _ => report,
+        };
         if self.latest.len() >= MAX_TRACKED_AGENTS && !self.latest.contains_key(&id) {
             if let Some(oldest) = self
                 .latest
@@ -192,6 +215,60 @@ impl HookInbox {
     /// [`AgentId`] can never inherit a dead agent's status.
     pub fn forget(&mut self, id: AgentId) {
         self.latest.remove(&id);
+    }
+}
+
+/// Folds a `Notification` into the fact Jerry already holds for the same agent, returning the
+/// report that should actually be stored.
+///
+/// A real lifecycle transition is returned untouched - it is the whole truth about where the agent
+/// now is, and it supersedes everything before it. A `Notification` is not: Claude Code emits one
+/// *because of* an event it has already reported, with a fixed generic message, so taken as an
+/// equal it destroys strictly better information. Both of these were observed live against a real
+/// `claude` 2.1.228 driven through Jerry's own spawn path:
+///
+/// - `PermissionRequest` ("Write needs permission: notes.txt") followed milliseconds later by a
+///   `permission_prompt` `Notification` ("Claude needs your permission"). Every permission
+///   question the rail could ever show was that one constant, and the real per-tool question this
+///   codebase parses was unreachable in practice.
+/// - `Stop` ([`HookFact::TurnEnded`] - the review boundary) followed about a minute later by an
+///   `idle_prompt` `Notification`, which flipped the finished agent to `Ask` and erased the
+///   review-ready state phase 2 exists to produce.
+///
+/// So: a nudge keeps the previous fact whenever the previous fact already *implies* it, and only
+/// takes over when it genuinely carries news.
+fn merge_nudge(previous: &HookReport, incoming: HookReport) -> HookReport {
+    let keep_previous = match incoming.kind {
+        // Not a nudge at all.
+        event::EventKind::Transition => false,
+        // A block Jerry may not have heard about yet: it must still be able to move a working or
+        // finished agent to "needs you". The one thing it may not do is overwrite the specific
+        // question a `PermissionRequest` gave for the very block it is announcing.
+        event::EventKind::BlockedNudge => previous.fact == HookFact::NeedsInput,
+        // "You have not typed for a while" - true of every agent that is blocked or done, and
+        // news about neither.
+        event::EventKind::IdleNudge => matches!(
+            previous.fact,
+            HookFact::NeedsInput | HookFact::TurnEnded | HookFact::TurnFailed
+        ),
+    };
+    if !keep_previous {
+        return incoming;
+    }
+    HookReport {
+        kind: incoming.kind,
+        fact: previous.fact,
+        activity: previous.activity.clone(),
+        // A question belongs to a row that is actually blocked. When the kept fact is a turn
+        // boundary, the generic "waiting for your input" would be rendered next to a `Review`
+        // row and describe nothing it doesn't already say.
+        question: match previous.fact {
+            HookFact::NeedsInput => previous.question.clone().or(incoming.question),
+            _ => previous.question.clone(),
+        },
+        // The nudge is the more recent payload, so prefer its session id, but never lose one by
+        // taking a payload that happened to omit it.
+        session_id: incoming.session_id.or_else(|| previous.session_id.clone()),
     }
 }
 
@@ -1041,6 +1118,142 @@ mod tests {
             Some(HookFact::Working),
             "the next real event must supersede the failure"
         );
+    }
+
+    /// The real event sequence a permission prompt produces, captured verbatim from a `claude`
+    /// 2.1.228 session driven through Jerry's own spawn path: `PreToolUse`, then
+    /// `PermissionRequest` carrying the real tool and argument, then - milliseconds later - a
+    /// `Notification` whose entire message is the constant `"Claude needs your permission"`.
+    ///
+    /// Under plain "latest wins" the rail could therefore *never* show the specific question this
+    /// codebase goes to the trouble of parsing: it was overwritten by the constant every single
+    /// time, for every tool, which made `crate::hooks::event`'s whole `PermissionRequest` arm
+    /// unreachable in practice. Observed live on the real rail before it was fixed.
+    #[test]
+    fn a_generic_permission_notification_cannot_overwrite_the_real_permission_question() {
+        let listener = HookListener::start().expect("listener must start");
+        let port = listener.port();
+        let token = listener.token().to_owned();
+
+        post(
+            port,
+            &token,
+            "event=PreToolUse&agent=4",
+            r#"{"session_id":"s-1","hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"probe-notes.txt"}}"#,
+        );
+        post(
+            port,
+            &token,
+            "event=PermissionRequest&agent=4",
+            r#"{"session_id":"s-1","hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"probe-notes.txt"}}"#,
+        );
+        assert_eq!(
+            listener.text_for(4).1.as_deref(),
+            Some("Write needs permission: probe-notes.txt")
+        );
+
+        post(
+            port,
+            &token,
+            "event=Notification&agent=4",
+            r#"{"session_id":"s-1","hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission"}"#,
+        );
+
+        assert_eq!(
+            listener.signal_for(4).fact,
+            Some(HookFact::NeedsInput),
+            "the agent is still blocked on the human"
+        );
+        assert_eq!(
+            listener.text_for(4).1.as_deref(),
+            Some("Write needs permission: probe-notes.txt"),
+            "the generic notification must not replace the real question for the same block"
+        );
+    }
+
+    /// The other half of the same real sequence: a completed turn fires `Stop`, and about a minute
+    /// later Claude Code fires an `idle_prompt` `Notification` because nobody has typed since.
+    ///
+    /// Treating that as a state transition flipped every finished agent from `Review`/`Idle` back
+    /// to `Ask` roughly one minute after it finished - erasing the "a turn that ended is a review
+    /// boundary even though the process is still alive" capability that is the entire point of
+    /// this phase, and replacing its question with the constant "Claude is waiting for your
+    /// input". Also observed live on the real rail.
+    #[test]
+    fn an_idle_notification_cannot_erase_the_turn_boundary_a_real_stop_established() {
+        let listener = HookListener::start().expect("listener must start");
+        let port = listener.port();
+        let token = listener.token().to_owned();
+
+        post(
+            port,
+            &token,
+            "event=Stop&agent=6",
+            r#"{"session_id":"s-2","hook_event_name":"Stop"}"#,
+        );
+        assert_eq!(listener.signal_for(6).fact, Some(HookFact::TurnEnded));
+
+        post(
+            port,
+            &token,
+            "event=Notification&agent=6",
+            r#"{"session_id":"s-2","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}"#,
+        );
+
+        assert_eq!(
+            listener.signal_for(6).fact,
+            Some(HookFact::TurnEnded),
+            "the turn really did end; an idle nudge is not evidence that it didn't"
+        );
+        assert_eq!(
+            listener.text_for(6).1,
+            None,
+            "a finished row must not carry a question describing nothing it doesn't already say"
+        );
+        // ...and the session id a resume needs must survive the fold.
+        assert_eq!(listener.session_id_for(6).as_deref(), Some("s-2"));
+    }
+
+    #[test]
+    fn a_notification_still_reports_a_block_jerry_has_not_already_heard_about() {
+        // The other side of the rule: nudges are folded in, never ignored. An agent Jerry last saw
+        // *working* that hits a permission prompt must still land on `NeedsInput` off the
+        // notification alone - which is the only signal at all for a block that fires no
+        // `PermissionRequest`.
+        let listener = HookListener::start().expect("listener must start");
+        let port = listener.port();
+        let token = listener.token().to_owned();
+
+        post(
+            port,
+            &token,
+            "event=PreToolUse&agent=7",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        );
+        assert_eq!(listener.signal_for(7).fact, Some(HookFact::Working));
+
+        post(
+            port,
+            &token,
+            "event=Notification&agent=7",
+            r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission"}"#,
+        );
+        assert_eq!(listener.signal_for(7).fact, Some(HookFact::NeedsInput));
+        assert_eq!(
+            listener.text_for(7).1.as_deref(),
+            Some("Claude needs your permission"),
+            "with no better question on record, the notification's own message is the best there is"
+        );
+
+        // And a real transition after it still wins outright - the fold applies to nudges only.
+        post(
+            port,
+            &token,
+            "event=PostToolUse&agent=7",
+            r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        );
+        assert_eq!(listener.signal_for(7).fact, Some(HookFact::Working));
+        assert_eq!(listener.text_for(7).1, None);
     }
 
     #[test]
