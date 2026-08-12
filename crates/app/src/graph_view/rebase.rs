@@ -24,6 +24,7 @@ use crate::text_history::TextField;
 use crate::work_surface::agents::AgentId;
 use gpui::{FocusHandle, KeyDownEvent, Task};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 use wt_core::rebase::{RebaseAction, RebaseOutcome, RebasePlanEntry};
 
@@ -161,6 +162,20 @@ pub(crate) enum RebasePhase {
 /// The interactive-rebase mode's whole real state - `Some` only while the graph pane is showing
 /// it, owned by `GraphTabState::rebase`. `None` is the pane's ordinary commit-list mode.
 pub(crate) struct RebaseModeState {
+    /// The real worktree this rebase was entered against, captured once from `self.diff_root` at
+    /// [`AdeApp::enter_rebase_mode`] time and used for every real git call this mode ever makes -
+    /// never `self.diff_root` read fresh at click time. GitHub issue #242 phase B's own real,
+    /// independently-reproduced bug: without this, switching worktrees/repos in the rail while
+    /// rebase mode was still live silently re-pointed every subsequent click (`Continue`,
+    /// `Start`, ...) at whatever `self.diff_root` had since become - since every worktree of the
+    /// same repo shares one real object database, commit ids from the *original* worktree
+    /// resolved fine there too, so a `Continue` genuinely amended the *new* worktree's `HEAD` and
+    /// a `Start` genuinely rewrote its branch. [`AdeApp::reset_repo_scoped_state`]/[`AdeApp::
+    /// close_git_graph_tab`] are the real primary defense now (they leave rebase mode outright on
+    /// any such switch - see [`AdeApp::leave_rebase_mode`]); this field is the backstop
+    /// (`AdeApp::rebase_worktree_root`'s own docs) for the case that primary defense somehow
+    /// doesn't catch.
+    pub worktree_root: PathBuf,
     pub branch: String,
     /// The real commit-ish `wt_core::rebase::start_interactive_rebase` bases the plan onto - the
     /// row the user opened "Interactive rebase from here…" on. Never itself a row in
@@ -354,7 +369,9 @@ impl AdeApp {
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| "(detached)".to_string());
 
+        let worktree_root = self.diff_root.clone();
         self.graph_state.rebase = Some(RebaseModeState {
+            worktree_root: worktree_root.clone(),
             branch,
             onto: onto.clone(),
             onto_short,
@@ -370,7 +387,7 @@ impl AdeApp {
         });
         cx.notify();
 
-        let root = self.diff_root.clone();
+        let root = worktree_root;
         let task = cx.spawn(async move |this, cx| {
             let root_for_bg = root.clone();
             let onto_for_bg = onto.clone();
@@ -398,12 +415,22 @@ impl AdeApp {
 
             let _ = this.update(cx, |this, cx| {
                 if this.graph_state.rebase.is_none() {
+                    // The mode was left (Cancel, a worktree/repo switch, the tab was closed)
+                    // while this real background load was still running - nothing left to
+                    // populate.
                     return;
                 }
                 match result {
                     Ok((commits, already_on_upstream, files)) => {
                         let subjects = this.rebase_commit_subjects(&commits);
-                        let rebase_state = this.graph_state.rebase.as_mut().expect("still open");
+                        let Some(rebase_state) = this.graph_state.rebase.as_mut() else {
+                            // Re-checked rather than assumed: `rebase_commit_subjects` above
+                            // takes no `&mut self`, but nothing guarantees the mode is still
+                            // open by the time this line runs on a future edit - never a real
+                            // panic in production code for a state that can genuinely change
+                            // out from under an in-flight task.
+                            return;
+                        };
                         rebase_state.plan = commits
                             .iter()
                             .zip(files)
@@ -429,7 +456,11 @@ impl AdeApp {
                     Err(err) => {
                         this.graph_state.status_message =
                             Some(format!("Interactive rebase failed to load: {err}"));
-                        this.graph_state.rebase = None;
+                        // GitHub issue #242 phase B fix: a real "Pause now" click during this
+                        // load must still be resumed for real if the load itself then fails -
+                        // an independent review found this path used to drop `graph_state.rebase`
+                        // directly, silently leaking any agent this session had paused.
+                        this.leave_rebase_mode(cx);
                     }
                 }
                 cx.notify();
@@ -463,18 +494,48 @@ impl AdeApp {
 
     /// The Planning-phase banner's `Cancel` (design spec §1.2) - discards the in-progress plan
     /// and returns to the normal commit list, resuming any agent this session's own "Pause now"
-    /// suspended.
+    /// suspended. Guarded on [`RebaseModeState::op_in_flight`] exactly like every other banner
+    /// button now (see `crate::graph_view::rebase_render`'s own docs on
+    /// `render_rebase_banner_actions`) - GitHub issue #242 phase B fix: an independent review
+    /// found Cancel had no guard at all, so clicking it while `Start rebase`'s real subprocess
+    /// was still running dropped `graph_state.rebase` out from under it, leaving the repository
+    /// genuinely mid-rebase with no banner left to recover it from. Once `Start`/`Continue`/
+    /// `Skip`/`Abort` are all disabled during their own real operation, this button is too, so
+    /// there is never a window where the only real recovery surface can be discarded mid-flight.
     pub(crate) fn cancel_rebase_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
+            return;
+        };
+        if rebase_state.op_in_flight {
+            return;
+        }
+        self.leave_rebase_mode(cx);
+        cx.notify();
+    }
+
+    /// The single, real exit path every place that leaves rebase mode funnels through - resumes
+    /// any paused agents first (real `SIGCONT`, [`Self::resume_paused_rebase_agents`]), then
+    /// clears the mode. GitHub issue #242 phase B fix: an independent review found several real
+    /// exit paths (`close_git_graph_tab`, `reset_repo_scoped_state`'s worktree/repo switch, the
+    /// plan-load error arm) used to clear `graph_state.rebase` directly, silently leaking any
+    /// agent this session had paused - a permanent, silent `SIGSTOP` with no surface left to
+    /// resume it from. Every real exit now goes through this one function instead.
+    pub(crate) fn leave_rebase_mode(&mut self, cx: &mut Context<Self>) {
         self.resume_paused_rebase_agents(cx);
         self.graph_state.rebase = None;
-        cx.notify();
     }
 
     /// Real `SIGCONT` (`crate::work_surface::agents::Agents::resume_agents`) against every agent
     /// [`RebaseModeState::paused_agents`] this session's own "Pause now" suspended -
     /// design spec §1.6 warning 1's "Resume after" contract: automatic the moment the mode
-    /// reaches a terminal state. Called from every real exit path (Cancel, Abort, and a real
-    /// `RebaseOutcome::Completed`).
+    /// reaches a terminal state. Called from every real exit path via [`Self::leave_rebase_mode`].
+    ///
+    /// Known, accepted gap (documented rather than silently unhandled - GitHub issue #242 phase B
+    /// review): a real app crash or `SIGKILL` with no destructor run leaves a paused process
+    /// exactly as stopped as `pause` left it, with no next-launch recovery in this revision - a
+    /// `SIGSTOP`'d process cannot even react to the pty's own master-close `SIGHUP` while
+    /// stopped. Recovering from that would mean persisting paused pids to disk and `SIGCONT`ing
+    /// them on the next real startup; not implemented here.
     fn resume_paused_rebase_agents(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_mut() else {
             return;
@@ -485,13 +546,39 @@ impl AdeApp {
         }
     }
 
+    /// Real defense in depth for the same bug [`RebaseModeState::worktree_root`]'s own docs
+    /// describe: every rebase-mutating op reads the worktree this mode was really entered
+    /// against from there, never `self.diff_root` fresh at click time. [`Self::
+    /// reset_repo_scoped_state`]/[`Self::close_git_graph_tab`] are the real primary defense (they
+    /// leave rebase mode outright via [`Self::leave_rebase_mode`] on any worktree/repo switch);
+    /// this is the backstop in case that primary defense somehow doesn't catch a given path -
+    /// refuses (`None`) rather than silently running a real git mutation against whatever
+    /// `self.diff_root` now happens to be if the two have still drifted apart.
+    fn rebase_worktree_root(&self) -> Option<PathBuf> {
+        let rebase_state = self.graph_state.rebase.as_ref()?;
+        if rebase_state.worktree_root != self.diff_root {
+            log::warn!(
+                "refusing a rebase-mode git operation: worktree_root {:?} no longer matches the \
+                 currently focused diff_root {:?} - the rebase-mode-exit guards should have \
+                 already left the mode on this switch",
+                rebase_state.worktree_root,
+                self.diff_root
+            );
+            return None;
+        }
+        Some(rebase_state.worktree_root.clone())
+    }
+
     /// Design spec §1.6 warning 1's `Pause now` - real `SIGSTOP` against every real agent session
-    /// currently open in this pane's own worktree (`crate::work_surface::agents::Agents::
-    /// pause_agents_for_cwd`), recording exactly which ones this call really paused so
-    /// [`Self::resume_paused_rebase_agents`] resumes precisely that set later, never an agent
-    /// some other mechanism paused.
+    /// currently open in this mode's own real worktree (`crate::work_surface::agents::Agents::
+    /// pause_agents_for_cwd`, [`Self::rebase_worktree_root`] - never `self.diff_root` fresh),
+    /// recording exactly which ones this call really paused so [`Self::
+    /// resume_paused_rebase_agents`] resumes precisely that set later, never an agent some other
+    /// mechanism paused.
     pub(crate) fn pause_rebase_agents(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.diff_root.clone();
+        let Some(cwd) = self.rebase_worktree_root() else {
+            return;
+        };
         let paused = self.agents.pause_agents_for_cwd(&cwd, cx);
         if let Some(rebase_state) = self.graph_state.rebase.as_mut() {
             for id in paused {
@@ -658,31 +745,52 @@ impl AdeApp {
         if rebase_state.op_in_flight {
             return;
         }
+        let Some(root) = self.rebase_worktree_root() else {
+            return;
+        };
+        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         let entries: Vec<RebasePlanEntry> = rebase_state
             .plan
             .iter()
             .map(RebasePlanRow::to_plan_entry)
             .collect();
         let onto = rebase_state.onto.clone();
-        let root = self.diff_root.clone();
         self.run_rebase_op(cx, move || {
             wt_core::rebase::start_interactive_rebase(&root, &onto, &entries)
         });
     }
 
-    /// The Stopped-phase banner's `Continue` (design spec §1.2).
+    /// The Stopped-phase banner's `Continue` (design spec §1.2). Guarded on
+    /// [`RebaseModeState::op_in_flight`] - GitHub issue #242 phase B fix: an independent review
+    /// reproduced a real double-click bug here. `run_rebase_op` itself now refuses a second
+    /// overlapping call (see that method's own docs), but the *message* this function reads for
+    /// the amend below is captured from `rebase_state.phase` *before* that guard would matter -
+    /// without this function's own early check, two rapid clicks could each capture the message
+    /// visible at that instant and both proceed to spawn their own real `amend_head_message` +
+    /// `continue_rebase` pair, with the second one racing to amend whatever commit the *first*
+    /// call's own `continue_rebase` had, by then, already advanced `HEAD` to.
     pub(crate) fn continue_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
             return;
         };
+        if rebase_state.op_in_flight {
+            return;
+        }
+        let Some(root) = self.rebase_worktree_root() else {
+            return;
+        };
+        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         // Real, load-bearing gap `wt_core::rebase`'s own module docs call out: the reword-message
         // queue its `GIT_EDITOR` script reads from is fixed at `start_interactive_rebase` time -
         // a message obtained only *after* a message-less-reword stop can never be picked up by
         // that queue retroactively. The real fix, matching this module's own test precedent
         // (`reword_with_no_message_stops_and_reports_the_right_commit_and_reason`), is a real
         // `git commit --amend` against the stopped commit before `git rebase --continue` runs -
-        // exactly what a command-line user would do by hand.
-        let amend_message = if let RebasePhase::Stopped {
+        // exactly what a command-line user would do by hand. `amend_head_message` is handed the
+        // real stopped commit id as `expected_head_original` - a real, on-disk identity check
+        // (`git rev-parse HEAD` must still match it) that refuses rather than amending whatever
+        // commit `HEAD` happens to be by the time this real background call actually runs.
+        let amend = if let RebasePhase::Stopped {
             outcome:
                 RebaseOutcome::StoppedForEdit {
                     commit,
@@ -695,29 +803,38 @@ impl AdeApp {
                 .iter()
                 .find(|row| &row.commit == commit)
                 .filter(|row| row.has_supplied_reword_message())
-                .map(|row| row.reword_message.as_str().to_string())
+                .map(|row| (commit.clone(), row.reword_message.as_str().to_string()))
         } else {
             None
         };
-        let root = self.diff_root.clone();
         self.run_rebase_op(cx, move || {
-            if let Some(message) = amend_message {
-                wt_core::rebase::amend_head_message(&root, &message)?;
+            if let Some((expected_head, message)) = amend {
+                wt_core::rebase::amend_head_message(&root, &expected_head, &message)?;
             }
             wt_core::rebase::continue_rebase(&root)
         });
     }
 
-    /// The Stopped-phase banner's `Skip` (design spec §1.2).
+    /// The Stopped-phase banner's `Skip` (design spec §1.2). Guarded on [`RebaseModeState::
+    /// op_in_flight`] the same as [`Self::continue_rebase`] - see that method's own docs for the
+    /// real double-click bug this closes.
     pub(crate) fn skip_rebase(&mut self, cx: &mut Context<Self>) {
-        let root = self.diff_root.clone();
+        let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
+            return;
+        };
+        if rebase_state.op_in_flight {
+            return;
+        }
+        let Some(root) = self.rebase_worktree_root() else {
+            return;
+        };
         self.run_rebase_op(cx, move || wt_core::rebase::skip_rebase_commit(&root));
     }
 
     /// The Stopped-phase banner's `Abort` (design spec §1.2) - real `wt_core::rebase::
     /// abort_rebase`, returning to the normal commit list exactly like [`Self::cancel_rebase_mode`]
-    /// (real agent resume included), reloading the graph since `abort_rebase` really moves `HEAD`
-    /// back.
+    /// (real agent resume included, via [`Self::leave_rebase_mode`]), reloading the graph since
+    /// `abort_rebase` really moves `HEAD` back.
     pub(crate) fn abort_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
             return;
@@ -725,11 +842,13 @@ impl AdeApp {
         if rebase_state.op_in_flight {
             return;
         }
+        let Some(root) = self.rebase_worktree_root() else {
+            return;
+        };
         if let Some(rs) = self.graph_state.rebase.as_mut() {
             rs.op_in_flight = true;
         }
         cx.notify();
-        let root = self.diff_root.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -738,8 +857,7 @@ impl AdeApp {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
-                        this.resume_paused_rebase_agents(cx);
-                        this.graph_state.rebase = None;
+                        this.leave_rebase_mode(cx);
                         this.load_graph(cx);
                     }
                     Err(err) => {
@@ -764,14 +882,22 @@ impl AdeApp {
     /// `Self::run_graph_remote_op`'s own background-spawn/repaint shape (see that method's docs),
     /// but returns a real `RebaseOutcome` rather than `Result<(), Error>`, so it's a distinct
     /// function rather than a reuse of that one.
+    ///
+    /// Refuses (a no-op) if a rebase operation is already in flight - the shared half of the
+    /// real double-click guard every caller also checks itself before doing any real work (see
+    /// [`Self::continue_rebase`]'s own docs for why the caller-side check still matters too).
     fn run_rebase_op(
         &mut self,
         cx: &mut Context<Self>,
         op: impl FnOnce() -> Result<RebaseOutcome, wt_core::Error> + Send + 'static,
     ) {
-        if let Some(rs) = self.graph_state.rebase.as_mut() {
-            rs.op_in_flight = true;
+        let Some(rs) = self.graph_state.rebase.as_mut() else {
+            return;
+        };
+        if rs.op_in_flight {
+            return;
         }
+        rs.op_in_flight = true;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { op() }).await;
@@ -785,10 +911,11 @@ impl AdeApp {
     }
 
     /// Applies a real `Result<RebaseOutcome, Error>` from `Self::run_rebase_op` - a real
-    /// `Completed` leaves rebase mode entirely and reloads the graph (the freshly rewritten
-    /// history); a real stop transitions to [`RebasePhase::Stopped`]; a genuine error is
-    /// surfaced as a status message with the mode left exactly as it was (never silently
-    /// discarded - the user can retry `Continue`/`Skip`/`Abort`).
+    /// `Completed` leaves rebase mode entirely (via [`Self::leave_rebase_mode`], real agent
+    /// resume included) and reloads the graph (the freshly rewritten history); a real stop
+    /// transitions to [`RebasePhase::Stopped`]; a genuine error is surfaced as a status message
+    /// with the mode left exactly as it was (never silently discarded - the user can retry
+    /// `Continue`/`Skip`/`Abort`).
     fn apply_rebase_outcome(
         &mut self,
         result: Result<RebaseOutcome, wt_core::Error>,
@@ -796,8 +923,7 @@ impl AdeApp {
     ) {
         match result {
             Ok(RebaseOutcome::Completed) => {
-                self.resume_paused_rebase_agents(cx);
-                self.graph_state.rebase = None;
+                self.leave_rebase_mode(cx);
                 self.load_graph(cx);
             }
             Ok(outcome) => {
@@ -846,7 +972,10 @@ impl AdeApp {
         let Some(first) = conflicted_files.first() else {
             return;
         };
-        let absolute = self.diff_root.join(first);
+        let Some(root) = self.rebase_worktree_root() else {
+            return;
+        };
+        let absolute = root.join(first);
         self.open_file_view(absolute, window, cx);
     }
 }

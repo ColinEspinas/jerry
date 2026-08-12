@@ -750,14 +750,24 @@ impl PtySession {
         Ok(())
     }
 
-    /// Suspends the child process in place via a real `SIGSTOP`, without killing it - the
-    /// direct process-level primitive GitHub issue #242 phase B's interactive-rebase UI uses to
-    /// freeze a running agent process while a rebase rewrites files out from under it (see
-    /// `crate::work_surface::agents::Agents::pause_agents_for_cwd` in the `app` crate, the real
-    /// caller). The counterpart to [`Self::resume`].
+    /// Suspends the child's real process group *and* any descendants that escaped it (e.g. via
+    /// their own `setsid()`) via a real `SIGSTOP`, without killing anything - the process-level
+    /// primitive GitHub issue #242 phase B's interactive-rebase UI uses to freeze a running
+    /// agent process (and everything it spawned - a build step, a tool call) while a rebase
+    /// rewrites files out from under it (see `crate::work_surface::agents::Agents::
+    /// pause_agents_for_cwd` in the `app` crate, the real caller). Mirrors
+    /// [`terminate_process_tree`]'s own real process-group-plus-escaped-descendants approach,
+    /// for the same reason: an earlier version of this method sent a plain `kill(pid, SIGSTOP)`
+    /// against only the direct child, which left every real grandchild process running and
+    /// still writing files - exactly the hazard "Pause now" exists to remove. The counterpart to
+    /// [`Self::resume`].
     ///
     /// A no-op, not an error, if the child has already exited (mirrors [`Self::kill`]'s own
-    /// "already gone" handling) or if the platform exposes no pid at all.
+    /// "already gone" handling) or if the platform exposes no pid at all. The direct process
+    /// group's own `killpg` is the primary target and surfaces a real error if it fails;
+    /// individual escaped descendants are signaled best-effort (errors ignored, matching
+    /// [`terminate_process_tree`]'s own "make a best effort" contract) so one already-exited
+    /// descendant can't stop the primary group from being paused.
     ///
     /// Unix only - see [`Self::resume`]'s Windows twin below for why there is no real equivalent
     /// there (mirrors [`Self::kill`]'s own unix/windows split, same crate-level "Platform scope"
@@ -770,16 +780,29 @@ impl PtySession {
         let Some(pid) = self.process_id() else {
             return Ok(());
         };
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGSTOP,
-        )
-        .map_err(|err| PtyError::Signal(err.to_string()))
+        // Collected *before* signaling anything, matching `collect_descendant_pids`'s own
+        // ordering contract - irrelevant for reparenting here (nothing dies), but a stopped
+        // process cannot fork further children, so whatever this walk finds is the complete,
+        // frozen-in-place set from the moment `killpg` below actually lands.
+        let descendants = collect_descendant_pids(pid);
+        let pgid = nix::unistd::Pid::from_raw(pid as i32);
+        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGSTOP)
+            .map_err(|err| PtyError::Signal(err.to_string()))?;
+        for descendant in &descendants {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*descendant as i32),
+                nix::sys::signal::Signal::SIGSTOP,
+            );
+        }
+        Ok(())
     }
 
-    /// Resumes a process previously [`Self::pause`]d via a real `SIGCONT`. Safe to call even if
-    /// the process was never actually paused (`SIGCONT` on an already-running process is a
-    /// harmless no-op at the OS level) - see [`Self::pause`]'s own docs.
+    /// Resumes a process (and its process group and escaped descendants) previously
+    /// [`Self::pause`]d via a real `SIGCONT`, in the reverse order `pause` signaled them
+    /// (descendants first, then the process group) - safe to call even if the process was never
+    /// actually paused (`SIGCONT` on an already-running process is a harmless no-op at the OS
+    /// level) - see [`Self::pause`]'s own docs for the process-group-plus-descendants shape and
+    /// its error-handling split.
     #[cfg(unix)]
     pub fn resume(&self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -788,11 +811,19 @@ impl PtySession {
         let Some(pid) = self.process_id() else {
             return Ok(());
         };
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGCONT,
-        )
-        .map_err(|err| PtyError::Signal(err.to_string()))
+        // A stopped process tree cannot fork further children on its own, so re-walking here
+        // (rather than remembering `pause`'s own set) finds exactly the same real descendants,
+        // still frozen exactly as `pause` left them.
+        let descendants = collect_descendant_pids(pid);
+        for descendant in descendants.iter().rev() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*descendant as i32),
+                nix::sys::signal::Signal::SIGCONT,
+            );
+        }
+        let pgid = nix::unistd::Pid::from_raw(pid as i32);
+        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGCONT)
+            .map_err(|err| PtyError::Signal(err.to_string()))
     }
 
     /// Windows has no `SIGSTOP`/`SIGCONT` equivalent without a distinct, `unsafe`-FFI-heavy job-
@@ -1364,6 +1395,76 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// GitHub issue #242 phase B fix: an earlier version of `pause`/`resume` sent a plain
+    /// `kill(pid, SIGSTOP)` against only the direct child - real, live-reproduced proof that the
+    /// fixed version really reaches a real *grandchild* process too (one that escaped the
+    /// process group via its own `setsid()`, exactly `terminate_process_tree`'s own escaped-
+    /// descendant case), not just the direct child. If this regressed back to a bare `kill`,
+    /// the grandchild would keep running (and keep writing files) as if nothing had paused at
+    /// all - exactly the silent hazard "Pause now" exists to remove.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pause_and_resume_really_reach_an_escaped_grandchild_process_too() {
+        fn proc_state(pid: u32) -> String {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .expect("reading /proc/<pid>/status should succeed while the process is alive");
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("State:"))
+                .map(|rest| rest.trim().to_string())
+                .expect("State: line should be present")
+        }
+
+        fn wait_for_state(pid: u32, prefix: char, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = proc_state(pid);
+                if state.starts_with(prefix) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "process {pid} never reached {what} - last observed state: {state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let session = spawn(
+            SpawnOptions::new("sh")
+                .arg("-c")
+                .arg("setsid sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
+        )
+        .expect("spawning the shell pipeline should succeed");
+
+        let grandchild_pid =
+            read_line_after_prefix(&session, "GRANDCHILD:", Duration::from_secs(5))
+                .and_then(|line| line.trim().parse::<u32>().ok())
+                .expect("shell should report the detached grandchild's pid over the pty");
+
+        wait_for_state(
+            grandchild_pid,
+            'S',
+            "a real steady sleeping state before pause",
+        );
+
+        session.pause().expect("pause should succeed");
+        wait_for_state(
+            grandchild_pid,
+            'T',
+            "the real kernel-reported stopped state (State: T) after pause() - a plain \
+             kill(pid, SIGSTOP) against only the direct child would never reach this escaped \
+             grandchild at all",
+        );
+
+        session.resume().expect("resume should succeed");
+        wait_for_state(
+            grandchild_pid,
+            'S',
+            "a real steady sleeping state again after resume()",
+        );
     }
 
     #[cfg(unix)]

@@ -235,6 +235,31 @@ pub enum Error {
         actual: String,
     },
 
+    /// [`crate::rebase::amend_head_message`]'s own identity guard: `HEAD` no longer matches the
+    /// commit id the caller expected to be amending - the rebase already advanced past this stop,
+    /// something else moved `HEAD` in the meantime, or the caller is stale. Refuses rather than
+    /// amending whatever commit `HEAD` now happens to be, the same "never silently discard
+    /// something else's real work" reasoning [`Error::HeadMovedSinceRecorded`] documents.
+    #[error(
+        "refusing to amend HEAD in {path}: expected it to still be {expected}, but it is now \
+         {actual} (the rebase already moved on, or something else changed HEAD)"
+    )]
+    RebaseAmendHeadMoved {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+
+    /// [`crate::rebase::amend_head_message`] found real staged changes (`git diff --cached`)
+    /// already in the index before amending. Refused rather than silently folding unrelated
+    /// staged content (something else - an unpaused agent, a stray `git add` - added while the
+    /// rebase was stopped) into the amended commit alongside the real message change.
+    #[error(
+        "refusing to amend HEAD in {path}: the index has real staged changes that were never \
+         part of this amend"
+    )]
+    RebaseAmendIndexDirty { path: PathBuf },
+
     /// [`crate::undo::undo_commit_all_changes`] needs to un-make a branch that had no parent
     /// commit (the very first commit ever made on it), but the worktree's `HEAD` isn't a real
     /// branch (detached) - there is no ref for `git update-ref -d` to remove. Not reachable in

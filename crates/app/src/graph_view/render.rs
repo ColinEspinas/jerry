@@ -146,6 +146,14 @@ impl AdeApp {
     pub(crate) fn close_git_graph_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.graph_tab_open = false;
         self.leave_graph_tab(window, cx);
+        // GitHub issue #242 phase B fix: closing the tab outright while interactive rebase mode
+        // was live used to leave `graph_state.rebase` (and any agent this session had paused via
+        // "Pause now") stranded - the only real recovery surface (the rebase banner) had just
+        // been removed with no way to trigger a real resume. Routes through the same real exit
+        // path every other rebase-mode departure now uses.
+        if self.graph_state.rebase.is_some() {
+            self.leave_rebase_mode(cx);
+        }
         self.graph_state.load = GraphLoadState::NotLoaded;
         self.graph_state.row_menu_open = None;
         self.graph_state.push_menu_open = false;

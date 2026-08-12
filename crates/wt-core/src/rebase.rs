@@ -631,8 +631,59 @@ pub fn start_interactive_rebase(
 /// at [`start_interactive_rebase`] time (see the module docs); a message obtained *after* a
 /// message-less stop can only be applied this way, not by retroactively feeding the queue.
 ///
+/// Two real guards, both refusals rather than silent corruption:
+/// - `expected_head_original` must be the real, full commit id `HEAD` is still expected to be
+///   pointing at (the stopped row's own commit) - a live `git rev-parse HEAD` mismatch means the
+///   rebase already moved on (a double-`Continue`, a resumed-then-re-amended stale caller) and
+///   this refuses with [`Error::RebaseAmendHeadMoved`] rather than amending whatever commit
+///   `HEAD` now happens to be.
+/// - The real index must have no staged changes (`git diff --cached --quiet`) - refuses with
+///   [`Error::RebaseAmendIndexDirty`] rather than silently folding unrelated staged content
+///   (something else - an unpaused agent, a stray `git add` - added while the rebase was
+///   stopped) into the amended commit alongside the real message change.
+///
 /// Performs blocking I/O.
-pub fn amend_head_message(worktree_path: &Path, message: &str) -> Result<(), Error> {
+pub fn amend_head_message(
+    worktree_path: &Path,
+    expected_head_original: &str,
+    message: &str,
+) -> Result<(), Error> {
+    let head_args: Vec<OsString> = vec!["rev-parse".into(), "HEAD".into()];
+    let head_output = run_git(worktree_path, &head_args)?;
+    check_success(&head_args, &head_output)?;
+    let actual_head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
+    if actual_head != expected_head_original {
+        return Err(Error::RebaseAmendHeadMoved {
+            path: worktree_path.to_path_buf(),
+            expected: expected_head_original.to_string(),
+            actual: actual_head,
+        });
+    }
+
+    let diff_args: Vec<OsString> = vec!["diff".into(), "--cached".into(), "--quiet".into()];
+    let diff_output = run_git(worktree_path, &diff_args)?;
+    match diff_output.status.code() {
+        // `git diff --cached --quiet` exits 0 when there is no staged diff, 1 when there is -
+        // confirmed exit-code convention for `--quiet`, mirroring `crate::merge`'s own use of
+        // `git diff --name-only --diff-filter=U` conventions elsewhere in this crate for reading
+        // real git state through exit codes rather than parsing output.
+        Some(0) => {}
+        Some(1) => {
+            return Err(Error::RebaseAmendIndexDirty {
+                path: worktree_path.to_path_buf(),
+            });
+        }
+        _ => {
+            return Err(Error::GitCommand {
+                args: format_args(&diff_args),
+                exit: GitExit::from_status(&diff_output.status),
+                stderr: String::from_utf8_lossy(&diff_output.stderr).into_owned(),
+            });
+        }
+    }
+
     let args: Vec<OsString> = vec![
         "commit".into(),
         "--amend".into(),
@@ -982,11 +1033,65 @@ mod tests {
     fn amend_head_message_replaces_the_real_committed_message() {
         let repo = init_repo();
         commit(repo.path(), "a.txt", "1", "original message");
-
-        amend_head_message(repo.path(), "a real new message").expect("amend_head_message");
-
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        assert_eq!(commit_message(repo.path(), &head), "a real new message");
+
+        amend_head_message(repo.path(), &head, "a real new message").expect("amend_head_message");
+
+        let new_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(commit_message(repo.path(), &new_head), "a real new message");
+    }
+
+    #[test]
+    fn amend_head_message_refuses_when_head_has_moved_since_expected() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "1", "original message");
+        let stale_expected = "0000000000000000000000000000000000000000".to_string();
+
+        let err = amend_head_message(repo.path(), &stale_expected, "a real new message")
+            .expect_err("HEAD no longer matching the expected commit must refuse");
+        assert!(
+            matches!(err, Error::RebaseAmendHeadMoved { .. }),
+            "expected RebaseAmendHeadMoved, got a different error: {err:?}"
+        );
+
+        // Refused, not partially applied - the real message must be untouched.
+        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(commit_message(repo.path(), &head), "original message");
+    }
+
+    #[test]
+    fn amend_head_message_refuses_when_the_real_index_has_staged_changes() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "1", "original message");
+        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+
+        // A real staged change unrelated to the amend - the exact hazard the guard exists to
+        // catch (an unpaused agent, or a stray `git add`, staging something while the rebase is
+        // stopped).
+        fs::write(repo.path().join("sneaky.txt"), "sneaky").expect("write sneaky.txt");
+        git(repo.path(), &["add", "sneaky.txt"]);
+
+        let err = amend_head_message(repo.path(), &head, "a real new message")
+            .expect_err("real staged changes must refuse the amend");
+        assert!(
+            matches!(err, Error::RebaseAmendIndexDirty { .. }),
+            "expected RebaseAmendIndexDirty, got a different error: {err:?}"
+        );
+
+        // Refused, not partially applied - neither the message nor the tree changed.
+        let after_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(after_head, head);
+        assert_eq!(commit_message(repo.path(), &head), "original message");
+        let sneaky_in_head_tree = Command::new("git")
+            .current_dir(repo.path())
+            .args(["cat-file", "-e", "HEAD:sneaky.txt"])
+            .status()
+            .expect("failed to spawn git")
+            .success();
+        assert!(
+            !sneaky_in_head_tree,
+            "the sneaky staged file must never have been folded into HEAD"
+        );
     }
 
     // --- Deliberate stops: reword-without-message and edit -----------------------------------

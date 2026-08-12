@@ -131,6 +131,17 @@ impl AdeApp {
         rebase_state: &RebaseModeState,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // GitHub issue #242 phase B fix: an independent review reproduced two real bugs traced
+        // back to buttons staying clickable while a real background operation (the initial plan
+        // load, or a real `wt_core::rebase` call) was already in flight - a double-click on
+        // Continue could amend the wrong commit (task B's stale message landing on the *new*
+        // HEAD task A's own amend had already advanced past), and Cancel had no guard at all, so
+        // clicking it while `Start rebase`'s subprocess was still running abandoned a real,
+        // running rebase with no banner left to recover it from. Disabling every banner button -
+        // Cancel included - for the whole duration of `op_in_flight` closes both: `Self::
+        // cancel_rebase_mode`/`Self::continue_rebase`/`Self::skip_rebase` all guard on the same
+        // flag now too, so a disabled button and a guarded handler can never disagree.
+        let enabled = !rebase_state.op_in_flight;
         match &rebase_state.phase {
             RebasePhase::Planning => {
                 let (n, m) = (
@@ -148,39 +159,48 @@ impl AdeApp {
                             .text_color(theme::text::DIM)
                             .child(format!("{n} \u{2192} {m} commits")),
                     )
-                    .child(render_rebase_button("Cancel", false).on_click(cx.listener(
-                        |this, _event: &ClickEvent, _window, cx| {
-                            this.cancel_rebase_mode(cx);
-                        },
-                    )))
                     .child(
-                        render_rebase_button("Start rebase", true).on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
-                                this.start_rebase(cx);
-                            },
-                        )),
+                        render_rebase_button("Cancel", false, enabled).when(enabled, |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.cancel_rebase_mode(cx);
+                            }))
+                        }),
                     )
+                    .child(render_rebase_button("Start rebase", true, enabled).when(
+                        enabled,
+                        |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.start_rebase(cx);
+                            }))
+                        },
+                    ))
                     .into_any_element()
             }
             RebasePhase::Stopped { .. } => div()
                 .flex()
                 .items_center()
                 .gap(px(10.0))
-                .child(render_rebase_button("Abort", false).on_click(cx.listener(
-                    |this, _event: &ClickEvent, _window, cx| {
-                        this.abort_rebase(cx);
-                    },
-                )))
-                .child(render_rebase_button("Skip", false).on_click(cx.listener(
-                    |this, _event: &ClickEvent, _window, cx| {
-                        this.skip_rebase(cx);
-                    },
-                )))
-                .child(render_rebase_button("Continue", true).on_click(cx.listener(
-                    |this, _event: &ClickEvent, _window, cx| {
-                        this.continue_rebase(cx);
-                    },
-                )))
+                .child(
+                    render_rebase_button("Abort", false, enabled).when(enabled, |el| {
+                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.abort_rebase(cx);
+                        }))
+                    }),
+                )
+                .child(
+                    render_rebase_button("Skip", false, enabled).when(enabled, |el| {
+                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.skip_rebase(cx);
+                        }))
+                    }),
+                )
+                .child(
+                    render_rebase_button("Continue", true, enabled).when(enabled, |el| {
+                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.continue_rebase(cx);
+                        }))
+                    }),
+                )
                 .into_any_element(),
         }
     }
@@ -628,7 +648,7 @@ impl AdeApp {
 
         panel = panel.child(div().flex_1());
 
-        if let Some(warning) = self.render_rebase_agent_warning(cx) {
+        if let Some(warning) = self.render_rebase_agent_warning(rebase_state.op_in_flight, cx) {
             panel = panel.child(warning);
         }
         if let Some(warning) = render_rebase_remote_warning(rebase_state) {
@@ -644,8 +664,15 @@ impl AdeApp {
     /// Design spec §1.6 warning 1 - only rendered when this pane's own worktree really has at
     /// least one running agent (`crate::work_surface::agents::Agents::count_for_cwd`-style live
     /// check, `is_agent_session` filtered - see `Self::pause_rebase_agents`'s own docs for why a
-    /// bare shell never counts).
-    fn render_rebase_agent_warning(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// bare shell never counts). `op_in_flight` disables the real `Pause now` click (no
+    /// `.on_click` attached at all while `true`) for the same double-click-safety reason every
+    /// other banner button is disabled during any in-flight operation - see `Self::
+    /// render_rebase_banner_actions`'s own docs.
+    fn render_rebase_agent_warning(
+        &self,
+        op_in_flight: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let cwd = self.diff_root.clone();
         let running = self
             .agents
@@ -655,6 +682,7 @@ impl AdeApp {
         if running == 0 {
             return None;
         }
+        let enabled = !op_in_flight;
         Some(
             render_rebase_warning_shell(format!(
                 "{running} agent(s) running in this worktree - a rebase rewrites files under \
@@ -664,18 +692,21 @@ impl AdeApp {
                 div()
                     .id("rebase-pause-agents")
                     .debug_selector(|| "rebase-pause-agents".to_string())
-                    .cursor_pointer()
                     .px(px(8.0))
                     .py(px(3.0))
                     .rounded(theme::radius::CHIP)
+                    .when(enabled, |el| el.cursor_pointer())
+                    .when(!enabled, |el| el.cursor_default().opacity(0.5))
                     .bg(theme::status::ASK_BG)
                     .font(font(theme::font::SANS))
                     .text_size(px(10.0))
                     .text_color(theme::status::ASK)
                     .child("Pause now")
-                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                        this.pause_rebase_agents(cx);
-                    })),
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.pause_rebase_agents(cx);
+                        }))
+                    }),
             )
             .into_any_element(),
         )
@@ -787,7 +818,15 @@ fn render_rebase_warning_shell(text: String) -> gpui::Div {
         )
 }
 
-fn render_rebase_button(label: &'static str, primary: bool) -> gpui::Stateful<gpui::Div> {
+/// `enabled` reflects `!op_in_flight` at every real call site (see `Self::
+/// render_rebase_banner_actions`'s own docs) - a disabled button renders dimmed, with no
+/// `cursor_pointer`, and (the caller's own job - see that method) no `.on_click` attached at all,
+/// so it is genuinely inert, not just styled to look that way.
+fn render_rebase_button(
+    label: &'static str,
+    primary: bool,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(format!("rebase-banner-button-{label}"))
         .debug_selector(move || format!("rebase-banner-button-{label}"))
@@ -797,15 +836,20 @@ fn render_rebase_button(label: &'static str, primary: bool) -> gpui::Stateful<gp
         .items_center()
         .justify_center()
         .rounded(theme::radius::BUTTON)
-        .cursor_pointer()
-        .when(primary, |el| {
+        .when(enabled, |el| el.cursor_pointer())
+        .when(!enabled, |el| el.cursor_default().opacity(0.45))
+        .when(enabled && primary, |el| {
             el.bg(theme::button::BLUE_BG)
                 .text_color(theme::button::BLUE_FG)
         })
-        .when(!primary, |el| {
+        .when(enabled && !primary, |el| {
             el.bg(theme::surface::CHIP_NEUTRAL)
                 .text_color(theme::text::HEADING)
                 .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+        })
+        .when(!enabled, |el| {
+            el.bg(theme::surface::CHIP_NEUTRAL)
+                .text_color(theme::text::GHOST)
         })
         .font(font(theme::font::SANS))
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -1389,6 +1433,291 @@ mod rebase_flow_tests {
         });
         cx.run_until_parked();
 
+        wait_for_proc_state_not(pid, "T");
+    }
+
+    fn worktree_item(
+        path: std::path::PathBuf,
+        label: &str,
+    ) -> crate::rail::worktrees::WorktreeItem {
+        crate::rail::worktrees::WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// GitHub issue #242 phase B review fix #1 - real, independently reproduced: switching
+    /// worktrees in the rail while rebase mode was live used to leave `graph_state.rebase`
+    /// (and any paused agent) pointed at the worktree that had just stopped being
+    /// `self.diff_root`, so every subsequent click silently ran real git against the wrong
+    /// worktree. `Self::select_worktree` -> `Self::reset_repo_scoped_state` must leave the mode
+    /// outright (real agent resume included) the instant that switch happens.
+    #[gpui::test]
+    fn switching_worktrees_while_rebase_mode_is_live_leaves_the_mode_and_resumes_paused_agents(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo_a, app, cx) = open_seeded_graph(cx);
+
+        let repo_b = tempfile::tempdir().expect("tempdir b");
+        git(repo_b.path(), &["init", "-b", "main"]);
+        git(repo_b.path(), &["config", "user.email", "test@example.com"]);
+        git(repo_b.path(), &["config", "user.name", "Test User"]);
+        commit(repo_b.path(), "b.txt", "1", "repo b base");
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![
+                worktree_item(repo_a.path().to_path_buf(), "repo-a"),
+                worktree_item(repo_b.path().to_path_buf(), "repo-b"),
+            ];
+        });
+
+        let agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo_a.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(agent_id, ProcessKind::from(AgentKind::Claude));
+        });
+        cx.run_until_parked();
+        let pid = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .expect("agent spawned")
+                .pane
+                .read(cx)
+                .pid()
+                .expect("a real shell process must have a real pid by now")
+        });
+
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.pause_rebase_agents(cx);
+        });
+        cx.run_until_parked();
+        wait_for_proc_state(pid, "T");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.rebase.is_some(),
+                "sanity check: still in rebase mode before the switch"
+            );
+        });
+
+        // The real rail gesture: select the *other* worktree.
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(1, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.rebase.is_none(),
+                "switching worktrees while rebase mode was live must leave the mode outright"
+            );
+        });
+        wait_for_proc_state_not(pid, "T");
+    }
+
+    /// GitHub issue #242 phase B review fix #2 - real, independently reproduced: `Continue`/
+    /// `Skip` had no `op_in_flight` guard, so a second click (here, a real `Skip` fired right
+    /// after a real `Continue`, both before the first's own background call resolves) could run
+    /// concurrently with the first's still-in-flight real `wt_core::rebase` call. Proven here by
+    /// a real, materially different final result if the guard is missing: an unguarded `Skip`
+    /// racing a real `Continue` from an `edit` stop would really drop the plan's next commit from
+    /// history; with the guard, `Skip` is refused outright and the plan completes with every real
+    /// commit intact.
+    #[gpui::test]
+    fn a_second_op_click_while_the_first_is_still_in_flight_is_refused_not_raced(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Edit, cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.graph_state.rebase.as_ref().expect("stopped").phase,
+                RebasePhase::Stopped {
+                    outcome: RebaseOutcome::StoppedForEdit { .. }
+                }
+            ));
+        });
+
+        // Both calls happen before either background call has a chance to resolve - the exact
+        // double-click race the review reproduced.
+        app.update_in(cx, |app, _window, cx| {
+            app.continue_rebase(cx);
+            app.skip_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.rebase.is_none(),
+                "the guarded Continue must have completed the plan for real"
+            );
+        });
+        let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
+        assert_eq!(
+            subjects, "base\nsecond\nthird",
+            "a raced, unguarded Skip would have really dropped `third` from history - the guard \
+             must have refused it outright, leaving every real commit intact"
+        );
+    }
+
+    /// GitHub issue #242 phase B review fix #3 - real, independently reproduced: `Cancel` had no
+    /// `op_in_flight` guard at all, so clicking it while `Start rebase`'s real subprocess was
+    /// still running dropped `graph_state.rebase` out from under it, leaving the repository
+    /// genuinely mid-rebase with no banner left to recover it from. Proven here: a real `Cancel`
+    /// click fired immediately after `Start`, before its own background call resolves, must be a
+    /// no-op - the real outcome still lands and rebase mode is left through the genuine
+    /// `Completed` path, not silently discarded.
+    #[gpui::test]
+    fn cancel_is_refused_while_start_rebase_is_in_flight_and_the_real_outcome_still_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        // A plan that genuinely *stops* (not one that completes cleanly) is the scenario that
+        // actually exposes the bug: if `Cancel` is allowed to discard `graph_state.rebase`
+        // while `Start rebase`'s subprocess is still running, the repository still really ends
+        // up stopped mid-rebase on disk (`.git/rebase-merge/` real and present) once that
+        // subprocess finishes, but `apply_rebase_outcome`'s non-`Completed` arm has nothing left
+        // to write the real `RebaseOutcome::StoppedForEdit` into (`graph_state.rebase` is
+        // already `None`) - the real stop is silently dropped, with no banner and no in-app way
+        // to `Abort`/`Continue`/`Skip` it. A plan that completes cleanly can't tell the two
+        // apart (the real git operation runs to completion either way, regardless of what the
+        // UI-side state shows), which is exactly why that shape doesn't belong in this test.
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Edit, cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+            // Fired in the exact same synchronous window, before the background call above has
+            // any chance to resolve.
+            app.cancel_rebase_mode(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect(
+                "the guarded Cancel must have been refused, leaving the real stop for \
+                         the mode to receive and show - not abandoned",
+            );
+            assert!(
+                matches!(
+                    rebase_state.phase,
+                    RebasePhase::Stopped {
+                        outcome: RebaseOutcome::StoppedForEdit { .. }
+                    }
+                ),
+                "expected the real StoppedForEdit outcome to have landed, got {:?}",
+                rebase_state.phase
+            );
+        });
+        // The real, on-disk rebase must still be genuinely recoverable - proven by actually
+        // recovering it for real, through the same `Abort` a stuck user would reach for.
+        app.update_in(cx, |app, _window, cx| {
+            app.abort_rebase(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.graph_state.rebase.is_none());
+        });
+        let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
+        assert_eq!(
+            subjects, "base\nsecond\nthird",
+            "abort must have restored the exact pre-rebase history"
+        );
+    }
+
+    /// GitHub issue #242 phase B review fix #5(a) - real, independently reproduced: closing the
+    /// graph tab outright while rebase mode was live used to drop `graph_state.rebase` (and any
+    /// paused agent) directly, with no real resume - the only surface that could trigger one had
+    /// just been removed.
+    #[gpui::test]
+    fn closing_the_graph_tab_mid_rebase_resumes_a_paused_agent(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_graph(cx);
+
+        let agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(agent_id, ProcessKind::from(AgentKind::Claude));
+        });
+        cx.run_until_parked();
+        let pid = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .expect("agent spawned")
+                .pane
+                .read(cx)
+                .pid()
+                .expect("a real shell process must have a real pid by now")
+        });
+
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.pause_rebase_agents(cx);
+        });
+        cx.run_until_parked();
+        wait_for_proc_state(pid, "T");
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_git_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(app.graph_state.rebase.is_none());
+        });
         wait_for_proc_state_not(pid, "T");
     }
 
