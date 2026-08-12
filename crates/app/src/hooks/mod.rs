@@ -54,7 +54,7 @@ pub mod store;
 #[cfg(test)]
 mod integration_tests;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::work_surface::agents::AgentId;
 
@@ -113,7 +113,7 @@ impl HookRuntime {
     /// restructuring `AdeApp`'s field ownership around it.
     pub fn injection(&self) -> HookInjection {
         HookInjection {
-            settings_path: self.files.settings_path().to_string_lossy().into_owned(),
+            settings_path: self.files.settings_path().to_path_buf(),
             port: self.listener.port(),
             token: self.listener.token().to_owned(),
         }
@@ -138,7 +138,15 @@ impl HookRuntime {
 /// An owned, spawn-time snapshot of a [`HookRuntime`] - see [`HookRuntime::injection`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookInjection {
-    settings_path: String,
+    /// Kept as a real [`PathBuf`], not a `String`.
+    ///
+    /// It used to be built with `to_string_lossy().into_owned()`, which is silently wrong on a
+    /// non-UTF-8 `TMPDIR`: the invalid bytes become U+FFFD, and `claude --settings` is then handed
+    /// a path that does not exist, with no error anywhere and hooks simply never firing. A
+    /// `PathBuf` survives any byte sequence the OS accepts, and the one place a conversion is
+    /// genuinely unavoidable ([`Self::spawn_extras`], because
+    /// `crate::terminal::pane::TerminalSpec::args` is `Vec<String>`) now fails loudly instead.
+    settings_path: PathBuf,
     port: u16,
     token: String,
 }
@@ -151,13 +159,26 @@ impl HookInjection {
     /// exactly why one generated file serves every agent this launch spawns: the file is
     /// identical for all of them, and `JERRY_AGENT_ID` is what tells the listener which row an
     /// event belongs to.
-    pub fn spawn_extras(&self, id: AgentId) -> (Vec<String>, Vec<(String, String)>) {
-        let args = vec!["--settings".to_owned(), self.settings_path.clone()];
+    /// `None` if the settings path is not representable as UTF-8, which is the only place the
+    /// `PathBuf` -> `String` conversion cannot be avoided (`TerminalSpec::args` is `Vec<String>`).
+    /// Refusing loudly here means such an agent spawns with no hooks and a real log line, rather
+    /// than with a mangled `--settings` path that silently points at nothing.
+    pub fn spawn_extras(&self, id: AgentId) -> Option<crate::work_surface::agents::SpawnExtras> {
+        let Some(settings_path) = self.settings_path.to_str() else {
+            log::warn!(
+                "the generated hook settings path ({}) is not valid UTF-8, so it cannot be passed \
+                 as a command-line argument - this agent will fall back to the terminal-title and \
+                 quiescence signals",
+                self.settings_path.display()
+            );
+            return None;
+        };
+        let args = vec!["--settings".to_owned(), settings_path.to_owned()];
         let env = vec![
             (settings_file::PORT_ENV.to_owned(), self.port.to_string()),
             (settings_file::TOKEN_ENV.to_owned(), self.token.clone()),
             (settings_file::AGENT_ENV.to_owned(), id.to_string()),
         ];
-        (args, env)
+        Some((args, env))
     }
 }

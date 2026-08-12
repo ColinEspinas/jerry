@@ -36,7 +36,14 @@ impl AdeApp {
         if !matches!(kind, ProcessKind::Agent(AgentKind::Claude)) {
             return None;
         }
-        if self.hook_runtime.is_none() {
+        // Bring-up is attempted exactly once per `AdeApp`. Keyed on a `tried` flag rather than on
+        // `hook_runtime.is_none()`, because those differ precisely in the failure case: without
+        // it, an instance that cannot start a runtime re-ran the whole attempt - a `bind`, a
+        // directory sweep, a `mkdir`, two file writes - on the UI thread on *every* subsequent
+        // Claude spawn, and re-logged the same warning each time, for a condition (no usable
+        // loopback, an unwritable temp directory) that will not have changed since the last try.
+        if !self.hook_runtime_tried {
+            self.hook_runtime_tried = true;
             self.hook_runtime = crate::hooks::HookRuntime::start(&std::env::temp_dir());
         }
         self.hook_runtime
@@ -93,8 +100,10 @@ impl AdeApp {
                 let crate::work_surface::agents::ProcessKind::Agent(kind) = agent.kind else {
                     return None;
                 };
-                // The gate: a real, unexpired hook fact, or this agent is not recorded at all.
-                runtime.signal_for(agent.id).fact?;
+                // The gate: a real, *unexpired* hook fact, or this agent is not recorded at all.
+                // `fresh()` rather than `.fact`, and the difference is the whole point - see
+                // `crate::rail::status::HookSignal::fresh`'s own docs.
+                runtime.signal_for(agent.id).fresh()?;
                 let key =
                     crate::review::state::baseline_key(&agent.cwd, kind, agent.spawned_at_unix);
                 Some((

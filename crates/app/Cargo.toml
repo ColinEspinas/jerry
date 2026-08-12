@@ -247,6 +247,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 
+# Unix only, and used for exactly one thing: `kill(pid, 0)` as the portable POSIX check for
+# whether a process still exists, so `crate::hooks::settings_file` can sweep launch directories
+# left behind by a Jerry that was SIGKILLed (where `Drop` never runs) without ever deleting a
+# live instance's working directory - an age-based sweep would eventually do exactly that to a
+# long-running window. Already in the lock file transitively, so no new build surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # `test-support` unlocks GPUI's real interactive test harness (`#[gpui::test]`,

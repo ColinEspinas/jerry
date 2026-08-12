@@ -43,6 +43,12 @@ use crate::rail::status::Status;
 /// `crate::review::baseline_state::REVIEW_BASELINE_FILE_NAME`.
 pub const AGENT_STATUS_FILE_NAME: &str = "agent-status.toml";
 
+/// How many agent records are kept - see [`AgentStatusState::prune_to_most_recent`].
+///
+/// Generous for a history UI (issue #227) while keeping the file small enough that rewriting it
+/// on every status change stays cheap.
+pub const MAX_RECORDED_AGENTS: usize = 500;
+
 /// The status file for a given real settings-file path - identical reasoning to
 /// `crate::review::baseline_state::review_baseline_path_for`: a test supplying a temp-dir
 /// settings path gets real, isolated persistence there, and a `None` settings path gets none.
@@ -190,6 +196,7 @@ impl AgentStatusState {
                     merged.agents.insert(key.clone(), entry.clone());
                 }
             }
+            merged.prune_to_most_recent(MAX_RECORDED_AGENTS);
             merged.save_at(path)
         })
     }
@@ -237,6 +244,34 @@ impl AgentStatusState {
     /// One recorded agent, if present and readable.
     pub fn get(&self, key: &str) -> Option<&PersistedAgentStatus> {
         self.agents.get(key)
+    }
+
+    /// Keeps only the `limit` most recently updated records, dropping the oldest.
+    ///
+    /// This file is history and never deletes a key on its own (see the module docs), which on its
+    /// own means unbounded growth: every agent ever run adds a permanent entry, and the whole file
+    /// is re-serialised and `fsync`ed - under the process-wide persistence lock - on every change.
+    /// A user who runs a few dozen agents a day would be rewriting an ever-larger file forever.
+    ///
+    /// Trimming by `updated_at_unix` keeps exactly what GitHub issue #227 would want to show
+    /// first - the most recent agents - and discards the tail no history UI would realistically
+    /// page back to. Applied at save time rather than on insert so a merge that pulls in another
+    /// instance's records is bounded too.
+    pub fn prune_to_most_recent(&mut self, limit: usize) {
+        if self.agents.len() <= limit {
+            return;
+        }
+        let mut by_recency: Vec<(String, i64)> = self
+            .agents
+            .iter()
+            .map(|(key, record)| (key.clone(), record.updated_at_unix))
+            .collect();
+        // Most recent first; the key breaks ties so the result is deterministic rather than
+        // dependent on iteration order for records written in the same second.
+        by_recency.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (key, _) in by_recency.into_iter().skip(limit) {
+            self.agents.remove(&key);
+        }
     }
 }
 
@@ -407,6 +442,62 @@ mod tests {
             AgentStatusState::load_at(&path).get(&key).is_some(),
             "a closed agent's record must not be deleted"
         );
+    }
+
+    #[test]
+    fn the_record_is_capped_keeping_the_most_recent_agents() {
+        // This file never deletes a key on its own (it is history), which without a cap means it
+        // grows forever and is fully re-serialised and fsynced on every change.
+        let mut state = AgentStatusState::default();
+        for index in 0..(MAX_RECORDED_AGENTS as i64 + 25) {
+            let key = key_for(&format!("/repo/wt-{index}"), index);
+            state.set(
+                key,
+                Path::new(&format!("/repo/wt-{index}")),
+                "Claude",
+                index,
+                Status::Idle,
+                None,
+                None,
+                index, // updated_at_unix ascending, so higher index == more recent
+            );
+        }
+        assert!(state.agents.len() > MAX_RECORDED_AGENTS);
+        state.prune_to_most_recent(MAX_RECORDED_AGENTS);
+        assert_eq!(state.agents.len(), MAX_RECORDED_AGENTS);
+
+        // The most recent survive; the oldest are the ones dropped.
+        let newest = key_for(
+            &format!("/repo/wt-{}", MAX_RECORDED_AGENTS as i64 + 24),
+            MAX_RECORDED_AGENTS as i64 + 24,
+        );
+        assert!(
+            state.get(&newest).is_some(),
+            "the newest record must be kept"
+        );
+        assert!(
+            state.get(&key_for("/repo/wt-0", 0)).is_none(),
+            "the oldest record must be the one pruned"
+        );
+    }
+
+    #[test]
+    fn pruning_a_file_already_under_the_cap_changes_nothing() {
+        let mut state = AgentStatusState::default();
+        let key = key_for("/repo/wt-a", 1);
+        state.set(
+            key.clone(),
+            Path::new("/repo/wt-a"),
+            "Claude",
+            1,
+            Status::Run,
+            None,
+            None,
+            10,
+        );
+        let before = state.clone();
+        state.prune_to_most_recent(MAX_RECORDED_AGENTS);
+        assert_eq!(state, before);
     }
 
     #[test]

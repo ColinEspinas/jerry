@@ -26,13 +26,18 @@
 //!   it is refused before its body is read, let alone parsed. There is deliberately no "no token
 //!   configured" fallback path: the token is generated in [`HookListener::start`] and is not
 //!   optional, so there is no configuration under which the check silently becomes a no-op.
-//! - **Hard bounds on everything read.** A 2-second read timeout, an 8 KiB cap on the request
-//!   line plus headers, a 100-header cap, and [`crate::hooks::event::MAX_PAYLOAD_BYTES`] on the
-//!   body - refused by `Content-Length` *before* a single body byte is buffered, and enforced
-//!   again while reading in case the header lied. A connection that stalls mid-request dies on
-//!   the read timeout rather than pinning a thread.
+//! - **Hard bounds on everything read.** An 8 KiB cap on the request line plus headers, a
+//!   100-header cap, and [`crate::hooks::event::MAX_PAYLOAD_BYTES`] on the body - refused by
+//!   `Content-Length` *before* a single body byte is buffered, and enforced again while reading
+//!   in case the header lied.
+//! - **A bound on request *time*, not just size.** [`REQUEST_DEADLINE`] caps the whole exchange
+//!   from a single absolute instant, and each blocking read is clamped to the time left. A
+//!   per-read timeout alone is not enough and was a real hole: `SO_RCVTIMEO` resets on every byte
+//!   that arrives, so a client dripping one byte per second held a handler for hours - pre-auth,
+//!   since the token is not checked until the headers are read.
 //! - **A cap on concurrent handlers.** [`MAX_IN_FLIGHT`] connections are handled at once; past
-//!   that, new connections are closed immediately rather than spawning unbounded threads.
+//!   that, new connections are closed immediately rather than spawning unbounded threads. Slots
+//!   are released by an RAII guard ([`InFlightSlot`]), so a panic cannot leak one.
 //!
 //! What this deliberately does *not* defend against: another process running as this same user
 //! reading Jerry's generated settings file to learn the token. That is not a boundary this can
@@ -47,7 +52,7 @@
 //! [`crate::rail::status::derive_status`]).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,8 +61,26 @@ use std::time::{Duration, Instant};
 use crate::hooks::event::{self, HookReport, MAX_PAYLOAD_BYTES};
 use crate::work_surface::agents::AgentId;
 
-/// How long a single connection may take to deliver its request before it is dropped.
+/// How long a single blocking read may wait for *some* data to arrive.
+///
+/// This alone is not a bound on the request: see [`REQUEST_DEADLINE`].
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The wall-clock budget for one entire request, start to finish.
+///
+/// [`READ_TIMEOUT`] is a socket option (`SO_RCVTIMEO`) and therefore bounds each individual
+/// `recv`, not the request - every byte that arrives resets it. A client dripping one byte just
+/// inside that window, never sending a newline, keeps a handler thread alive for
+/// `MAX_HEAD_BYTES * READ_TIMEOUT` - hours - and doing that on [`MAX_IN_FLIGHT`] connections
+/// starves every real hook for as long as it cares to. Worse, it costs nothing to mount: the
+/// token is not checked until the headers have been read, so this is reachable *pre-auth*.
+///
+/// So every read is additionally bounded by an absolute deadline taken once per connection, and
+/// each blocking read's timeout is clamped to the time actually left. Five seconds is generous
+/// for a loopback POST of a few hundred bytes from a `curl` on the same machine, and is the
+/// timeout the forwarder itself gives up at anyway (`--max-time 5`), so a request still running
+/// past this has already lost its client.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Cap on the request line plus all headers. Real Claude Code hook requests carry a handful of
 /// short headers; anything approaching this is either broken or hostile.
@@ -73,6 +96,16 @@ const MAX_IN_FLIGHT: usize = 16;
 
 /// The header the forwarder puts the token in.
 const AUTH_HEADER: &str = "authorization";
+
+/// Most agents [`HookInbox`] will track at once - see [`HookInbox::record`].
+///
+/// Far above any real usage (each entry is one live agent pane) and far below anything that
+/// matters for memory, which is the right place for a bound whose only job is to stop unbounded
+/// growth.
+const MAX_TRACKED_AGENTS: usize = 512;
+
+/// How long [`HookListener::drop`]'s self-connect may block the dropping thread - see that impl.
+const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One agent's most recent hook fact, as stored for the rail to read.
 #[derive(Debug, Clone)]
@@ -103,8 +136,27 @@ impl HookInbox {
         self.latest.get(&id)
     }
 
-    /// Records a freshly parsed event as `id`'s current state.
+    /// Records a freshly parsed event as `id`'s current state, evicting the oldest entry if that
+    /// would push the inbox past [`MAX_TRACKED_AGENTS`].
+    ///
+    /// The cap exists because the id in a request is not checked against the set of live agents -
+    /// the listener has no view of that, and adding one would couple it to `AdeApp` state behind
+    /// a lock it would then hold on every request. So a client that knows the token (see the
+    /// module docs on what that does and does not defend) can name arbitrary ids, and without a
+    /// cap each one would allocate a permanent entry. Eviction is by arrival time, which keeps
+    /// the real agents - the ones actually emitting events - and sheds invented ids that never
+    /// report again.
     pub fn record(&mut self, id: AgentId, report: HookReport) {
+        if self.latest.len() >= MAX_TRACKED_AGENTS && !self.latest.contains_key(&id) {
+            if let Some(oldest) = self
+                .latest
+                .iter()
+                .min_by_key(|(_, record)| record.received_at)
+                .map(|(id, _)| *id)
+            {
+                self.latest.remove(&oldest);
+            }
+        }
         self.latest.insert(
             id,
             HookRecord {
@@ -118,6 +170,29 @@ impl HookInbox {
     /// [`AgentId`] can never inherit a dead agent's status.
     pub fn forget(&mut self, id: AgentId) {
         self.latest.remove(&id);
+    }
+}
+
+/// Holds one of the [`MAX_IN_FLIGHT`] connection slots, releasing it on drop.
+///
+/// An RAII guard rather than a `fetch_sub` at the end of the handler: the handler parses
+/// untrusted input, and a panic anywhere in it would skip a trailing decrement and leak the slot
+/// permanently. Sixteen such panics and the listener stops accepting anything, for the rest of
+/// the session, with no error path that would ever say so. No such panic exists today - every
+/// parse step returns `Option` - but "no panic today" is a property of the current code, whereas
+/// this is a property of the type.
+struct InFlightSlot(Arc<AtomicUsize>);
+
+impl InFlightSlot {
+    fn take(counter: Arc<AtomicUsize>) -> InFlightSlot {
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlightSlot(counter)
+    }
+}
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -168,18 +243,21 @@ impl HookListener {
                         let _ = stream.shutdown(Shutdown::Both);
                         continue;
                     }
-                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    // The slot is released by `InFlightSlot`'s `Drop`, so a panic anywhere in
+                    // the handler returns it instead of leaking it - see that type's docs.
+                    let slot = InFlightSlot::take(Arc::clone(&in_flight));
                     let handler_token = thread_token.clone();
                     let handler_inbox = Arc::clone(&thread_inbox);
-                    let handler_in_flight = Arc::clone(&in_flight);
                     let spawned = std::thread::Builder::new()
                         .name("jerry-hook-conn".to_owned())
                         .spawn(move || {
+                            let _slot = slot;
                             handle_connection(stream, &handler_token, &handler_inbox);
-                            handler_in_flight.fetch_sub(1, Ordering::Relaxed);
                         });
-                    if spawned.is_err() {
-                        in_flight.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(err) = spawned {
+                        // The slot was moved into the closure only on success; on failure it was
+                        // dropped with the un-spawned closure, which already released it.
+                        log::warn!("could not spawn a hook connection handler: {err}");
                     }
                 }
             })?;
@@ -248,12 +326,21 @@ impl HookListener {
 }
 
 impl Drop for HookListener {
+    /// Signals the accept loop to stop and wakes it so it notices.
+    ///
+    /// `incoming()` is blocking, so setting the flag alone would leave the thread parked in
+    /// `accept` until the next real connection; a self-connect is the portable way to wake it.
+    /// It uses `connect_timeout` rather than a plain `connect` because this runs on whichever
+    /// thread drops `AdeApp` - in practice the UI thread - and a bare loopback connect, though
+    /// almost always instant, has no upper bound the OS is obliged to honour.
+    ///
+    /// The accept thread is deliberately *not* joined. It exits on its own as soon as it observes
+    /// the flag, holding nothing but its own listener, and joining would trade a bounded wake-up
+    /// for an unbounded wait on the UI thread - the very thing the timeout above is avoiding.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Unblock the accept loop so the flag is actually observed: `incoming()` is blocking, so
-        // setting the flag alone would leave the thread parked in `accept` until the next real
-        // connection. A self-connect is the portable way to wake it.
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        let address = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let _ = TcpStream::connect_timeout(&address, SHUTDOWN_WAKE_TIMEOUT);
     }
 }
 
@@ -368,10 +455,14 @@ impl Response {
 
 /// Reads one request off `stream`, records whatever it turned out to be, and writes a response.
 fn handle_connection(mut stream: TcpStream, token: &str, inbox: &Arc<Mutex<HookInbox>>) {
+    // One absolute budget for the whole exchange, taken before the first byte is read - see
+    // `REQUEST_DEADLINE`.
+    let deadline = Instant::now() + REQUEST_DEADLINE;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
-    let response = read_and_record(&mut stream, token, inbox).unwrap_or(Response::BadRequest);
+    let response =
+        read_and_record(&mut stream, token, inbox, deadline).unwrap_or(Response::BadRequest);
 
     // Always `Connection: close` and always a `Content-Length: 0` body, so a client that speaks
     // HTTP/1.1 keep-alive doesn't sit waiting for a body that isn't coming.
@@ -390,13 +481,14 @@ fn read_and_record(
     stream: &mut TcpStream,
     token: &str,
     inbox: &Arc<Mutex<HookInbox>>,
+    deadline: Instant,
 ) -> Option<Response> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
 
-    // -- request line, bounded --
+    // -- request line, bounded in bytes and in time --
     let mut request_line = String::new();
     let mut head_budget = MAX_HEAD_BYTES;
-    let read = read_line_bounded(&mut reader, &mut request_line, head_budget)?;
+    let read = read_line_bounded(&mut reader, &mut request_line, head_budget, deadline)?;
     head_budget = head_budget.saturating_sub(read);
 
     let mut parts = request_line.split_whitespace();
@@ -411,7 +503,7 @@ fn read_and_record(
     let mut authorization: Option<String> = None;
     for _ in 0..MAX_HEADERS {
         let mut line = String::new();
-        let read = read_line_bounded(&mut reader, &mut line, head_budget)?;
+        let read = read_line_bounded(&mut reader, &mut line, head_budget, deadline)?;
         head_budget = head_budget.saturating_sub(read);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -454,14 +546,11 @@ fn read_and_record(
         return Some(Response::PayloadTooLarge);
     }
     let mut body = vec![0u8; length];
-    // `read_exact` over a `take` so a `Content-Length` that overstates the real body dies on the
-    // read timeout instead of blocking forever, and one that understates it can't bleed the next
-    // request's bytes into this payload.
-    reader
-        .by_ref()
-        .take(length as u64)
-        .read_exact(&mut body)
-        .ok()?;
+    // Exactly `length` bytes and no more, so a `Content-Length` that understates the real body
+    // can't bleed the next request's bytes into this payload - and under the same absolute
+    // deadline, so one that *overstates* it (or a client that simply stops sending) fails fast
+    // instead of holding the handler for as long as the client keeps dripping.
+    read_exact_bounded(&mut reader, &mut body, deadline)?;
 
     let event_name = query_value(query, "event").unwrap_or_default();
     let agent_id: Option<AgentId> = query_value(query, "agent").and_then(|id| id.parse().ok());
@@ -477,26 +566,76 @@ fn read_and_record(
     Some(Response::NoContent)
 }
 
-/// [`BufRead::read_line`] with a hard byte budget, so a client that never sends a newline can't
-/// grow Jerry's memory without bound. Returns the bytes consumed.
+/// Time left before `deadline`, or `None` once it has passed.
+fn time_left(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    (now < deadline).then(|| deadline - now)
+}
+
+/// Arms the socket so the *next* blocking read cannot outlast `deadline`, returning `None` once
+/// there is no time left.
+///
+/// Clamping to the remaining budget is what makes [`REQUEST_DEADLINE`] real rather than advisory:
+/// without it a drip-feeding client resets [`READ_TIMEOUT`] forever and no single read ever fails.
+fn arm_read(reader: &BufReader<TcpStream>, deadline: Instant) -> Option<()> {
+    let left = time_left(deadline)?;
+    reader
+        .get_ref()
+        .set_read_timeout(Some(left.min(READ_TIMEOUT)))
+        .ok()
+}
+
+/// Reads one `\n`-terminated line under both a byte budget and an absolute deadline. Returns the
+/// bytes consumed.
+///
+/// Reads a byte at a time deliberately. [`BufRead::read_until`] loops internally until it finds
+/// the delimiter, so the deadline could only be checked *after* it returned - which is exactly
+/// the hole a drip-feeding client walks through. Going byte by byte puts a deadline check between
+/// every byte; it is not a syscall per byte, because [`BufReader`] serves them from its buffer.
 fn read_line_bounded(
     reader: &mut BufReader<TcpStream>,
     out: &mut String,
     budget: usize,
+    deadline: Instant,
 ) -> Option<usize> {
-    let mut limited = reader.take(budget as u64);
     let mut raw = Vec::new();
-    let read = limited.read_until(b'\n', &mut raw).ok()?;
-    if read == 0 {
-        return None;
+    while raw.len() < budget {
+        arm_read(reader, deadline)?;
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            // A clean EOF mid-line is a truncated request, not a complete one.
+            Ok(0) => return None,
+            Ok(_) => raw.push(byte[0]),
+            // A timeout lands here too, which is the deadline doing its job.
+            Err(_) => return None,
+        }
+        if byte[0] == b'\n' {
+            out.push_str(&String::from_utf8_lossy(&raw));
+            return Some(raw.len());
+        }
     }
-    // A line that exactly consumed the budget without a terminator is over-long: refuse rather
-    // than silently treating the truncation as a complete line.
-    if read == budget && !raw.ends_with(b"\n") {
-        return None;
+    // Budget exhausted with no terminator: over-long, so refuse rather than silently treating the
+    // truncation as a complete line.
+    None
+}
+
+/// Fills `buf` under an absolute deadline - [`Read::read_exact`]'s bounded counterpart, for the
+/// same reason [`read_line_bounded`] exists.
+fn read_exact_bounded(
+    reader: &mut BufReader<TcpStream>,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Option<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        arm_read(reader, deadline)?;
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => return None,
+            Ok(read) => filled += read,
+            Err(_) => return None,
+        }
     }
-    out.push_str(&String::from_utf8_lossy(&raw));
-    Some(read)
+    Some(())
 }
 
 #[cfg(test)]
@@ -658,6 +797,121 @@ mod tests {
         );
         assert!(good.starts_with("HTTP/1.1 204"), "got {good:?}");
         assert_eq!(listener.signal_for(1).fact, Some(HookFact::TurnEnded));
+    }
+
+    #[test]
+    fn a_slow_drip_client_is_cut_off_by_the_deadline_instead_of_holding_a_handler() {
+        // The hole `REQUEST_DEADLINE` exists to close, and one the existing hostile-request test
+        // structurally cannot catch because it sends everything in a single `write_all`:
+        // `SO_RCVTIMEO` bounds each `recv`, not the request, so a client dripping a byte just
+        // inside the window and never sending a newline resets the clock forever. Pre-auth, so
+        // it costs an attacker nothing.
+        let listener = HookListener::start().expect("listener");
+        let port = listener.port();
+
+        // Absolute bounds, deliberately not expressed in terms of `REQUEST_DEADLINE`: an
+        // assertion scaled by the very constant under test passes trivially when that constant is
+        // wrong, which is exactly how a test like this fails to catch the bug it was written for.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        let started = Instant::now();
+        // Never a newline, so the request line never completes. Drips for up to 30s, which is far
+        // longer than the handler is allowed to wait.
+        let dripped = std::thread::spawn(move || {
+            for _ in 0..60 {
+                if stream.write_all(b"A").is_err() || stream.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+
+        let response = dripped.join().expect("the drip thread must finish");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the handler must give up on a drip-feeding client, but the connection lived {elapsed:?}"
+        );
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 400"),
+            "a request that never completed must not be accepted, got {response:?}"
+        );
+
+        // The listener must still be fully usable afterwards - the slot has to have been
+        // released, not leaked.
+        let good = post(
+            port,
+            listener.token(),
+            "event=Stop&agent=1",
+            r#"{"hook_event_name":"Stop"}"#,
+        );
+        assert!(good.starts_with("HTTP/1.1 204"), "got {good:?}");
+    }
+
+    #[test]
+    fn many_slow_clients_at_once_cannot_starve_a_real_hook() {
+        // The reason the deadline matters in practice: `MAX_IN_FLIGHT` drip-feeders holding every
+        // handler thread would silently stop every real Claude hook for as long as they liked.
+        let listener = HookListener::start().expect("listener");
+        let port = listener.port();
+
+        // Every slot occupied by a client that drips for ~25s and never completes a request.
+        let mut drips = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            drips.push(std::thread::spawn(move || {
+                let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+                    return;
+                };
+                for _ in 0..50 {
+                    if stream.write_all(b"A").is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }));
+        }
+
+        // A fixed wait, longer than the handler deadline but well inside the drippers' lifetime,
+        // so the only way real traffic gets served here is if the handlers really did give up.
+        // Absolute rather than derived from `REQUEST_DEADLINE` - see the sibling test.
+        std::thread::sleep(Duration::from_secs(9));
+        let good = post(
+            port,
+            listener.token(),
+            "event=Stop&agent=99",
+            r#"{"hook_event_name":"Stop"}"#,
+        );
+        assert!(
+            good.starts_with("HTTP/1.1 204"),
+            "a real hook must still be served while slow clients are connected, got {good:?}"
+        );
+        assert_eq!(listener.signal_for(99).fact, Some(HookFact::TurnEnded));
+
+        for drip in drips {
+            let _ = drip.join();
+        }
+    }
+
+    #[test]
+    fn the_inbox_is_capped_so_invented_agent_ids_cannot_grow_it_without_bound() {
+        let mut inbox = HookInbox::default();
+        let report = crate::hooks::event::parse("Stop", br#"{"hook_event_name":"Stop"}"#)
+            .expect("must parse");
+        for id in 0..(MAX_TRACKED_AGENTS as u64 + 50) {
+            inbox.record(id, report.clone());
+        }
+        assert_eq!(
+            inbox.latest.len(),
+            MAX_TRACKED_AGENTS,
+            "the inbox must not grow past its cap"
+        );
+        // Eviction is oldest-first, so the most recent ids - the ones still reporting - survive.
+        assert!(inbox.get(MAX_TRACKED_AGENTS as u64 + 49).is_some());
+        assert!(inbox.get(0).is_none());
     }
 
     #[test]

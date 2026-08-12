@@ -77,6 +77,10 @@ pub const TOKEN_ENV: &str = "JERRY_HOOK_TOKEN";
 /// Env var carrying the pane's `crate::work_surface::agents::AgentId`.
 pub const AGENT_ENV: &str = "JERRY_AGENT_ID";
 
+/// Name prefix of every launch directory - see [`create_private_dir`] and
+/// [`sweep_stale_directories`], which are the two places that have to agree on it.
+const DIRECTORY_PREFIX: &str = "jerry-hooks-";
+
 /// The forwarder script's file name inside the launch directory.
 const FORWARDER_NAME: &str = "jerry-hook-forwarder.sh";
 /// The generated settings file's name inside the launch directory.
@@ -128,35 +132,18 @@ impl HookFiles {
     /// `--settings`, so a `claude` the user starts from their own terminal is completely
     /// untouched by Jerry having been installed.
     pub fn write_in(parent: &Path) -> io::Result<HookFiles> {
-        // Process id *and* a process-global counter, exactly like
-        // `crate::review::baseline_state::ReviewBaselineState::save_at`'s temp-file naming and for
-        // the identical reason: several `AdeApp` instances genuinely share one process (GitHub
-        // issue #90's "New Window", and every test that builds more than one app). A pid-only name
-        // would make all of them share one directory - so the second instance's `write_in` would
-        // delete the first's files out from under its running agents, and whichever instance
-        // closed first would remove the directory the other was still using, silently killing its
-        // hooks for the rest of the session.
-        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let instance = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let directory = parent.join(format!("jerry-hooks-{}-{instance}", std::process::id()));
-        // A stale directory left by a dead process that happened to reuse this pid is removed
-        // rather than merged into, so a leftover file can never be reused with a dead launch's
-        // token.
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory)?;
-        restrict_to_owner(&directory, 0o700)?;
+        // Tidy away anything a previously crashed Jerry left here. Best-effort and never fatal.
+        sweep_stale_directories(parent);
+
+        let directory = create_private_dir(parent)?;
 
         let forwarder = directory.join(FORWARDER_NAME);
-        std::fs::write(&forwarder, FORWARDER_SCRIPT)?;
-        // Executable, but only by this user - the settings file next to it holds the token.
-        restrict_to_owner(&forwarder, 0o700)?;
+        // Executable, but only by this user.
+        write_private_file(&forwarder, FORWARDER_SCRIPT.as_bytes(), 0o700)?;
 
         let settings = directory.join(SETTINGS_NAME);
-        std::fs::write(&settings, settings_json(&forwarder)?)?;
-        // Not executable, and readable only by this user: this file names the forwarder, and the
-        // directory it lives in is the thing an attacker would want to tamper with.
-        restrict_to_owner(&settings, 0o600)?;
+        // Not executable, and readable only by this user.
+        write_private_file(&settings, settings_json(&forwarder)?.as_bytes(), 0o600)?;
 
         Ok(HookFiles {
             directory,
@@ -175,17 +162,162 @@ impl Drop for HookFiles {
     }
 }
 
-/// Sets owner-only permissions on Unix. A no-op elsewhere - see [`is_supported`] for why this
-/// path isn't reached on Windows at all.
-#[cfg(unix)]
-fn restrict_to_owner(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+/// Creates this instance's launch directory: unpredictably named, owner-only from the instant it
+/// exists, and refusing to reuse anything already at that path.
+///
+/// All three properties are load-bearing, and an earlier version of this had none of them. It
+/// built a fully predictable name (`jerry-hooks-<pid>-<counter>`) under the world-writable OS temp
+/// directory, called `create_dir_all`, and only *then* chmod'ed to `0o700`. That is two real bugs:
+///
+/// - **A permissions window.** `mkdir` applies `0o777 & !umask`, so under a permissive umask
+///   (`002`, `000` - both real in the wild) the directory was group- or world-writable for the
+///   window between creation and the chmod.
+/// - **A symlink attack, which is the serious one.** `create_dir_all` on a path that is already a
+///   symlink to a directory returns `Ok`, and `set_permissions` follows symlinks. So a local
+///   attacker who pre-created `<temp>/jerry-hooks-<pid>-0` as a symlink - trivial, since every
+///   component of the name was predictable - got the forwarder script written into, and `0o700`
+///   applied to, a directory of their choosing. Verified empirically before fixing.
+///
+/// The fix is to make creation itself atomic and exclusive rather than to repair the state after:
+/// [`std::fs::DirBuilder`] with an explicit `mode` applies the permissions in the `mkdir` syscall
+/// (umask can only *remove* bits, so the result is never more permissive than `0o700`), and
+/// `create` - unlike `recursive(true)` - fails with `AlreadyExists` if anything is already at the
+/// path, symlink included. A random suffix then removes the predictability that made pre-creation
+/// worth attempting at all, and the retry loop covers the (vanishing) chance of a collision.
+///
+/// The pid stays in the name so [`sweep_stale_directories`] can still tell a dead instance's
+/// leftovers from a live instance's working directory.
+fn create_private_dir(parent: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(parent)?;
+    let mut last_error = None;
+    for _ in 0..16 {
+        let directory = parent.join(format!(
+            "{DIRECTORY_PREFIX}{}-{}",
+            std::process::id(),
+            random_suffix()
+        ));
+        match new_dir_owner_only(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("could not create a private hook directory")))
 }
 
+/// `mkdir(path, 0o700)`, failing if anything already exists at `path`.
+#[cfg(unix)]
+fn new_dir_owner_only(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Windows has no `mode`; hook injection is disabled there anyway ([`is_supported`]), so this
+/// exists only to keep the module compiling.
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
+fn new_dir_owner_only(path: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
+/// Writes `contents` to a newly created file with `mode`, refusing to follow or overwrite
+/// anything already at `path`.
+///
+/// `create_new` is `O_EXCL | O_CREAT`, which fails on an existing file *and* on a symlink rather
+/// than writing through it, and the mode is applied by `open` itself rather than by a later
+/// chmod - the same "atomic, not repaired afterwards" reasoning as [`create_private_dir`]. The
+/// containing directory is already `0o700` and unpredictably named by the time this runs, so this
+/// is defence in depth rather than the primary barrier.
+fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Removes launch directories left behind by Jerry instances that are no longer running.
+///
+/// [`HookFiles::drop`] handles the normal case, but `Drop` does not run for a `SIGKILL`, a hard
+/// crash, or an `abort` - so without this, every abnormal exit leaves a small directory in the OS
+/// temp directory forever. Called once per [`HookFiles::write_in`], which is the only moment
+/// Jerry is guaranteed to be looking at this directory anyway.
+///
+/// Liveness is decided by the pid embedded in the name, *not* by age. An age-based sweep - the
+/// convention this codebase uses for its `*.tmp` siblings - would be wrong here: a Jerry left open
+/// for a week is entirely normal, and deleting its forwarder script out from under its running
+/// agents would silently kill their hooks, which is precisely the bug the per-instance directory
+/// naming exists to prevent.
+///
+/// Everything is best-effort. A directory whose name doesn't parse, or that belongs to a live
+/// process, or that refuses to delete (another user's, on a shared temp directory) is simply left
+/// alone - this is tidying, and it must never be able to fail a launch.
+fn sweep_stale_directories(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let own_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(DIRECTORY_PREFIX) else {
+            continue;
+        };
+        // `<pid>-<random>`; anything else was not written by this code.
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid || process_is_alive(pid) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Whether a process with this id currently exists.
+///
+/// `kill(pid, 0)` is the portable POSIX existence check - it sends no signal and only reports
+/// whether the process exists and could be signalled. `EPERM` counts as alive: the process is
+/// real, it simply belongs to another user, which is a case that genuinely occurs on a shared
+/// `/tmp` and must not be read as "dead, delete its files".
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 performs only an existence/permission check. It has no effect
+    // on the target process, and takes no pointers, so there is nothing to invalidate.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied
+}
+
+/// Windows: hook injection is disabled ([`is_supported`]), so nothing is ever written to sweep.
+/// Reporting "alive" is the conservative answer - it deletes nothing.
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// A short random, hex-encoded suffix - see [`create_private_dir`].
+fn random_suffix() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Whether Jerry can install hooks on this platform at all.
@@ -302,6 +434,152 @@ mod tests {
                 "the settings file must be owner-read/write only"
             );
         }
+    }
+
+    #[test]
+    fn a_pre_planted_symlink_cannot_capture_the_generated_files() {
+        // The real attack the old `create_dir_all` + chmod sequence allowed: the directory name
+        // was fully predictable, `create_dir_all` returns `Ok` on an existing symlink-to-dir, and
+        // `set_permissions` follows it - so a local attacker got Jerry's forwarder script written
+        // into, and 0o700 applied to, a directory of their choosing.
+        //
+        // Two properties now block that, and this asserts both: the name is unpredictable, and
+        // creation is exclusive (`mkdir` fails rather than reusing whatever is already there).
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let parent = temp.path().join("parent");
+        let attacker = temp.path().join("attacker-owned");
+        std::fs::create_dir_all(&parent).expect("parent");
+        std::fs::create_dir_all(&attacker).expect("attacker dir");
+
+        // Plant symlinks over every name the old scheme would have used.
+        #[cfg(unix)]
+        for instance in 0..4 {
+            let planted = parent.join(format!(
+                "{DIRECTORY_PREFIX}{}-{instance}",
+                std::process::id()
+            ));
+            std::os::unix::fs::symlink(&attacker, &planted).expect("plant symlink");
+        }
+
+        let files = HookFiles::write_in(&parent).expect("must still succeed");
+
+        // Nothing may have been written through a symlink into the attacker's directory.
+        let captured: Vec<_> = std::fs::read_dir(&attacker)
+            .expect("read attacker dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            captured.is_empty(),
+            "files were captured by a planted symlink: {captured:?}"
+        );
+
+        // And the real directory must be a genuine directory, not a symlink.
+        let metadata = std::fs::symlink_metadata(&files.directory).expect("stat");
+        assert!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "the launch directory must be a real directory Jerry created itself"
+        );
+
+        // Pin the exclusivity property on its own, independently of the name being unpredictable -
+        // an attacker who guessed the name anyway must still get a hard error rather than a
+        // captured directory. This is the assertion that would fail against the old
+        // `create_dir_all`, which returns `Ok` here.
+        #[cfg(unix)]
+        {
+            let guessed = parent.join("guessed-name");
+            std::os::unix::fs::symlink(&attacker, &guessed).expect("plant");
+            let error = new_dir_owner_only(&guessed).expect_err("must refuse an existing path");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "creation must be exclusive, never reuse-what's-there"
+            );
+            // Same for the files.
+            let planted_file = parent.join("planted-file");
+            std::os::unix::fs::symlink(attacker.join("captured.sh"), &planted_file).expect("plant");
+            let error = write_private_file(&planted_file, b"x", 0o600)
+                .expect_err("must refuse to write through a symlink");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert!(
+                !attacker.join("captured.sh").exists(),
+                "nothing may be written through the planted symlink"
+            );
+        }
+    }
+
+    #[test]
+    fn the_launch_directory_is_owner_only_from_the_moment_it_exists() {
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = HookFiles::write_in(temp.path()).expect("files");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = files.directory.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "the launch directory must never be group- or world-accessible"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_instance_s_directory_is_swept_but_a_live_one_s_is_left_alone() {
+        // `Drop` cannot run for a SIGKILLed Jerry, so without a sweep every hard crash leaves a
+        // directory behind forever. The sweep must be keyed on process liveness, not age: deleting
+        // a *live* instance's directory would remove the forwarder script out from under its
+        // running agents.
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // pid 1 always exists; a "dead" pid that no longer does.
+        let live = temp.path().join(format!("{DIRECTORY_PREFIX}1-deadbeef"));
+        let dead = temp
+            .path()
+            .join(format!("{DIRECTORY_PREFIX}4294967294-cafebabe"));
+        // Something that simply isn't ours.
+        let unrelated = temp.path().join("someone-elses-directory");
+        for path in [&live, &dead, &unrelated] {
+            std::fs::create_dir_all(path).expect("create");
+            std::fs::write(path.join("marker"), b"x").expect("write");
+        }
+
+        sweep_stale_directories(temp.path());
+
+        assert!(
+            live.exists(),
+            "a live instance's directory must be left alone"
+        );
+        assert!(!dead.exists(), "a dead instance's directory must be swept");
+        assert!(
+            unrelated.exists(),
+            "unrelated entries must never be touched"
+        );
+    }
+
+    #[test]
+    fn the_sweep_never_removes_this_instance_s_own_directory() {
+        // The sweep runs from inside `write_in`, so getting this wrong would delete the files of
+        // the very instance that just asked for them - and of every sibling window in this process.
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let first = HookFiles::write_in(temp.path()).expect("first");
+        let second = HookFiles::write_in(temp.path()).expect("second");
+        assert!(
+            first.settings_path().is_file(),
+            "the first instance's files must survive the second's startup sweep"
+        );
+        assert!(second.settings_path().is_file());
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl Agents {
         // Claude Code only, and gated here rather than inside `spec` so the gate is one
         // legible line next to the spawn it guards.
         let extras = match (kind, hooks) {
-            (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => Some(hooks.spawn_extras(id)),
+            (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => hooks.spawn_extras(id),
             _ => None,
         };
         let spec = kind.spec(cwd.clone(), shell_override, extras);

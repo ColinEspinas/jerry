@@ -175,6 +175,26 @@ fn a_forwarder_run_outside_jerry_reaches_no_listener_at_all() {
     }
 }
 
+/// Set `JERRY_REQUIRE_REAL_CLAUDE=1` to turn every "no usable `claude` here" skip below into a
+/// hard failure.
+///
+/// Without this the real-binary tests pass vacuously wherever no binary or no credentials exist,
+/// which means a green CI run says nothing at all about the two behaviours they exist to pin
+/// (that `--settings` hooks fire, and that they merge with the user's own rather than replacing
+/// them). Those are behaviours of a third-party binary that can change under Jerry without any
+/// change to Jerry, so they need a job where the skip is not an option. This is the switch that
+/// job sets; the default stays skip-friendly so a contributor without Claude Code installed can
+/// still run the suite.
+const REQUIRE_REAL_CLAUDE_ENV: &str = "JERRY_REQUIRE_REAL_CLAUDE";
+
+/// Reports a skip, or panics if [`REQUIRE_REAL_CLAUDE_ENV`] demands a real run.
+fn skip_or_fail(reason: &str) {
+    if std::env::var(REQUIRE_REAL_CLAUDE_ENV).is_ok_and(|value| value == "1") {
+        panic!("{REQUIRE_REAL_CLAUDE_ENV}=1 was set, but {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
 /// The real `claude` binary, if one is installed and looks usable.
 fn real_claude() -> Option<std::path::PathBuf> {
     pty_core::resolve_on_path("claude")
@@ -209,16 +229,16 @@ fn run_real_claude(
     match command.output() {
         Ok(output) => {
             if !output.status.success() {
-                eprintln!(
-                    "skipping: the installed `claude` could not complete a turn here ({:?}): {}",
+                skip_or_fail(&format!(
+                    "the installed `claude` could not complete a turn here ({:?}): {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr)
-                );
+                ));
             }
             output.status.success()
         }
         Err(err) => {
-            eprintln!("skipping: could not run `claude` ({err})");
+            skip_or_fail(&format!("could not run `claude` ({err})"));
             false
         }
     }
@@ -230,7 +250,10 @@ fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_listener() {
         return;
     }
     let Some(binary) = real_claude() else {
-        eprintln!("skipping: no `claude` binary on PATH - the hook transport is still covered by the non-`claude` end-to-end test above");
+        skip_or_fail(
+            "no `claude` binary on PATH - the hook transport itself is still covered by the \
+             non-`claude` end-to-end test above",
+        );
         return;
     };
 

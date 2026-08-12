@@ -412,6 +412,10 @@ pub struct AdeApp {
     /// it - in both cases every agent simply falls back to the Phase 1 terminal-title and
     /// quiescence signals, which is exactly the pre-phase-2 behaviour.
     pub(crate) hook_runtime: Option<crate::hooks::HookRuntime>,
+    /// Whether bring-up of [`Self::hook_runtime`] has already been attempted, so a *failed*
+    /// attempt is not silently retried on every subsequent Claude spawn - see
+    /// `crate::hooks::flow::AdeApp::hook_injection_for`.
+    pub(crate) hook_runtime_tried: bool,
     /// The on-disk record of what [`Self::hook_runtime`] learned, for GitHub issue #227 to build
     /// on - see `crate::hooks::store`'s module docs, including the honest note that no UI reads
     /// it back yet.

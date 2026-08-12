@@ -281,7 +281,14 @@ pub struct HookSignal {
 impl HookSignal {
     /// The fact, but only while it is still recent enough to describe the present - see
     /// [`crate::hooks::event::HOOK_SIGNAL_TTL`] for why an expiry exists at all.
-    fn fresh(self) -> Option<HookFact> {
+    ///
+    /// `pub(crate)` so callers outside status derivation ask the same question the same way.
+    /// `crate::hooks::flow` in particular must use *this* rather than testing `fact.is_some()`:
+    /// gating on the raw field means an expired fact still qualifies its agent for persistence,
+    /// while the status derived for that agent has already fallen back to the quiescence
+    /// heuristic and resumed oscillating - which puts the fsync-per-transition storm straight
+    /// back, just narrowed to agents whose hooks have gone stale.
+    pub(crate) fn fresh(self) -> Option<HookFact> {
         self.fact.filter(|_| self.age < HOOK_SIGNAL_TTL)
     }
 }

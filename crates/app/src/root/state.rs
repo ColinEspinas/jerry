@@ -262,6 +262,7 @@ impl AdeApp {
             review_baselines_owned: std::collections::BTreeSet::new(),
             review_mark_in_flight: None,
             hook_runtime,
+            hook_runtime_tried: false,
             agent_status_state,
             agent_status_path,
             agent_status_owned: std::collections::BTreeSet::new(),

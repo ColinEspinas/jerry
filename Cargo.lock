@@ -273,6 +273,7 @@ dependencies = [
  "env_logger",
  "gpui",
  "gpui_platform",
+ "libc",
  "log",
  "lsp-core",
  "notify",
