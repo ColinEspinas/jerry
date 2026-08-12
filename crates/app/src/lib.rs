@@ -203,6 +203,13 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     // `modifiers.platform` set, so a real Cmd-modified key never reaches a pty in the first
     // place - the same real fact `"cmd-k"`/`"cmd-c"`/`"cmd-v"` below already rely on for
     // `TerminalClear`/`TerminalCopy`/`TerminalPaste`.
+    // `mut` is real, but only on macOS: the `Cmd+Q` binding below is `#[cfg(target_os = "macos")]`,
+    // so on every other platform nothing is ever pushed and `unused_mut` fires - which under this
+    // project's `-D warnings` is a hard build failure on Linux and Windows while macOS stays
+    // green. Silenced exactly where it is spurious rather than taken at its word: clippy's own
+    // suggestion here is to drop the `mut`, which is platform-blind advice that would break the
+    // macOS build outright.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut bindings = vec![
         gpui::KeyBinding::new("secondary-n", root::NewAgent, None),
         // The palette's real shortcut, matching the VS Code/Sublime "command palette" convention
