@@ -537,18 +537,24 @@ impl AdeApp {
         };
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
-        // Revision R12's git graph tab) and `new_file_focus_handle` are two more genuine
-        // caret-bearing `FocusHandle`s - real, hand-rolled `text_history::TextField` inputs, the
-        // same shape as the six wired above - that never got threaded through
-        // `Self::wire_caret_blink`. They can't join that earlier call: it runs before `this`
-        // exists, and both handles live *inside* `this` (one nested in `graph_state`, built by
-        // this same literal). Wired here instead, appending onto the very same
-        // `_caret_blink_subscriptions` vec so there's still exactly one place holding every real
-        // caret subscription this app has, not two.
+        // Revision R12's git graph tab), `new_file_focus_handle`, and (GitHub issue #241)
+        // `graph_state.create_branch_focus_handle` are three more genuine caret-bearing
+        // `FocusHandle`s - real, hand-rolled `text_history::TextField` inputs, the same shape as
+        // the six wired above - that never got threaded through `Self::wire_caret_blink`. They
+        // can't join that earlier call: it runs before `this` exists, and every one of these
+        // handles lives *inside* `this` (two nested in `graph_state`, built by this same
+        // literal). Wired here instead, appending onto the very same `_caret_blink_subscriptions`
+        // vec so there's still exactly one place holding every real caret subscription this app
+        // has, not two.
         let extra_caret_blink_subscriptions = AdeApp::wire_caret_blink(
             &[
                 &this.graph_state.branches_filter_focus_handle,
                 &this.new_file_focus_handle,
+                // GitHub issue #241: the row menu's "Create branch here" prompt is a third real
+                // hand-rolled `TextField` input built after this same `graph_state` literal, so
+                // it joins this later call for the same reason `branches_filter_focus_handle`
+                // does - see this call's own docs just above.
+                &this.graph_state.create_branch_focus_handle,
             ],
             window,
             cx,
