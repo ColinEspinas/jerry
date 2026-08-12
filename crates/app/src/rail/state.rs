@@ -52,11 +52,17 @@ pub struct AgentRow {
     /// rather than every one of those call sites suddenly needing to supply or ignore an
     /// `activity` payload for a `Run` variant they don't care about.
     ///
-    /// **Always `None` today.** The real PTY-output-to-activity-text heuristic is a separate,
-    /// parallel piece of work (this revision's Phase 0 is data-model-and-persistence only); this
-    /// field exists so that work has a real, already-plumbed-through place to write into -
-    /// [`crate::rail::render::AdeApp::build_agent_rows`] is where a live value would be filled
-    /// in, the same real construction site [`Self::question_preview`] is already filled in from.
+    /// Real as of GitHub issue #239 phase 2, and only ever from a real source: this is a Claude
+    /// Code hook payload's own `tool_name` plus the relevant `tool_input` field (`Bash: cargo
+    /// test`, `Edit: src/auth.rs`), parsed by `crate::hooks::event`. It was deliberately left
+    /// `None` before that, rather than filled from a PTY-output heuristic, because guessing "the
+    /// live tool call" from rendered terminal text is exactly the kind of plausible-but-wrong
+    /// string this field would be worst as.
+    ///
+    /// Still `None` whenever there is no real answer: a Codex agent or a shell (neither has
+    /// hooks), a Claude agent whose hooks haven't fired yet or have gone stale
+    /// (`crate::hooks::event::HOOK_SIGNAL_TTL`), and any row that isn't [`Status::Run`] - a
+    /// finished agent's last tool call describes the past, not what it is doing.
     pub activity: Option<String>,
     /// Wall-clock time since `crate::work_surface::agents::Agent::spawned_at` - the agent
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for

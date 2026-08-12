@@ -405,6 +405,24 @@ pub struct AdeApp {
     /// a double-click starting two overlapping `git write-tree` runs against the same worktree,
     /// mirroring [`Self::worktree_history_op_in_flight`]'s own single-flight discipline.
     pub(crate) review_mark_in_flight: Option<AgentId>,
+    /// The live agent-hook side-channel for this launch (GitHub issue #239 phase 2): a loopback
+    /// listener plus the generated `--settings`/forwarder files every Claude agent is spawned
+    /// against. `None` when hook support couldn't start (an unsupported platform, a loopback that
+    /// wouldn't bind, an unwritable temp directory) *or* for the many tests that never opted into
+    /// it - in both cases every agent simply falls back to the Phase 1 terminal-title and
+    /// quiescence signals, which is exactly the pre-phase-2 behaviour.
+    pub(crate) hook_runtime: Option<crate::hooks::HookRuntime>,
+    /// The on-disk record of what [`Self::hook_runtime`] learned, for GitHub issue #227 to build
+    /// on - see `crate::hooks::store`'s module docs, including the honest note that no UI reads
+    /// it back yet.
+    pub(crate) agent_status_state: crate::hooks::store::AgentStatusState,
+    /// Where [`Self::agent_status_state`] is persisted - a sibling of the real `settings.toml`, or
+    /// `None` for a test that hasn't opted into real persistence, mirroring
+    /// [`Self::review_baseline_path`].
+    pub(crate) agent_status_path: Option<PathBuf>,
+    /// Which persisted agent-status keys *this* instance owns, for the merge-not-clobber write
+    /// path - mirrors [`Self::review_baselines_owned`].
+    pub(crate) agent_status_owned: std::collections::BTreeSet<String>,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
@@ -780,6 +798,10 @@ pub struct AdeApp {
     /// here (unlike the two above), because every save writes the *whole* merged state, so a
     /// newer one genuinely supersedes an older one. Mirrors `AdeApp::_tab_order_save_task`.
     pub(crate) _review_persist_task: Option<Task<()>>,
+    /// Holds the in-flight write of [`Self::agent_status_state`] - see
+    /// `crate::hooks::flow::AdeApp::record_agent_statuses`. A `Task` cancels on drop, so this
+    /// must be stored for the write to actually land.
+    pub(crate) _agent_status_persist_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,
@@ -2362,6 +2384,8 @@ impl AdeApp {
                 path.clone(),
                 self.settings.appearance.terminal_font_size,
                 self.settings.terminal.shell_override(),
+                // A shell, so no hook injection - `Agents::spawn` would discard one anyway.
+                None,
                 window,
                 cx,
             );
@@ -3829,6 +3853,7 @@ mod repo_list_tests {
                 ProcessKind::claude(),
                 repo_a.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,

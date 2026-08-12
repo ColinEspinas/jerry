@@ -130,14 +130,34 @@ impl AdeApp {
                     .find(|item| item.path == agent.cwd)
                     .and_then(|item| item.branch.clone());
 
-                let question_preview = if status_value == Status::Ask {
-                    pane.visible_text_lines()
-                        .into_iter()
-                        .rev()
-                        .find(|line| !line.trim().is_empty())
-                } else {
-                    None
+                // GitHub issue #239 phase 2: real, structured text straight from this agent's own
+                // hook payloads, when it has fired any recently enough to still be describing the
+                // present (`crate::hooks::event::HOOK_SIGNAL_TTL`).
+                let (hook_activity, hook_question) = match &self.hook_runtime {
+                    Some(runtime) => runtime.text_for(agent.id),
+                    None => (None, None),
                 };
+
+                // The grid scrape stays, as the fallback it now is. It is a genuinely worse
+                // signal - the last non-blank line of whatever the CLI happened to have rendered,
+                // which for a permission prompt is as likely to be a box-drawing border or a
+                // truncated menu item as the actual question - but it is the *only* signal for
+                // a Codex agent, a shell, or a Claude agent whose hooks haven't fired yet, so
+                // removing it would be a real regression for every one of those.
+                let question_preview = hook_question.or_else(|| {
+                    if status_value == Status::Ask {
+                        pane.visible_text_lines()
+                            .into_iter()
+                            .rev()
+                            .find(|line| !line.trim().is_empty())
+                    } else {
+                        None
+                    }
+                });
+
+                // Only shown while the agent is actually running: a stale "Bash: cargo test" next
+                // to an idle or review-ready row would describe something that already finished.
+                let activity = hook_activity.filter(|_| status_value == Status::Run);
 
                 let title = match agent.cwd.file_name() {
                     Some(name) => name.to_string_lossy().into_owned(),
@@ -167,9 +187,7 @@ impl AdeApp {
                     del: diff.map(|summary| summary.del).unwrap_or(0),
                     question_preview,
                     exit_code: pane.exit_status().map(|status| status.exit_code()),
-                    // See `AgentRow::activity`'s own docs: no real PTY-activity heuristic is
-                    // wired up yet, so every row threads `None` through for now.
-                    activity: None,
+                    activity,
                     elapsed: agent.spawned_at.elapsed(),
                     review_file_count,
                 }
@@ -326,6 +344,11 @@ impl AdeApp {
                     this.ahead_behind_cache = snapshot.ahead_behind;
                     this.process_stats = process_samples;
                     this.apply_review_measurements(review_measurements);
+                    // GitHub issue #239 phase 2: fold each agent's real, hook-derived state into
+                    // the persisted record for issue #227 to build on. Rides this existing timer
+                    // rather than adding one, and only touches the disk when something actually
+                    // changed - see `AdeApp::record_agent_statuses`.
+                    this.record_agent_statuses(cx);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -1849,6 +1872,7 @@ mod rail_row_tests {
                 repo.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -1917,6 +1941,7 @@ mod rail_row_tests {
                 wt.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -1975,6 +2000,7 @@ mod rail_row_tests {
                 ProcessKind::Shell,
                 wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2039,6 +2065,7 @@ mod rail_row_tests {
                 wt_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2047,6 +2074,7 @@ mod rail_row_tests {
                 ProcessKind::Shell,
                 wt_b.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2103,6 +2131,7 @@ mod rail_row_tests {
                 busy_wt.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -2110,6 +2139,7 @@ mod rail_row_tests {
                 ProcessKind::codex(),
                 busy_wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -2586,6 +2616,7 @@ mod agent_chip_icon_pack_tests {
                 ProcessKind::claude(),
                 wt.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,

@@ -116,6 +116,23 @@ impl AdeApp {
             .map(crate::review::baseline_state::ReviewBaselineState::load_at)
             .unwrap_or_default();
 
+        // GitHub issue #239 phase 2's hook-learned agent statuses resolve identically, and for
+        // the identical reason (see `crate::hooks::store`'s module docs, including the honest
+        // note that no UI reads these back yet - that is issue #227's job).
+        let agent_status_path = settings_path
+            .as_deref()
+            .map(crate::hooks::store::agent_status_path_for);
+        let agent_status_state = agent_status_path
+            .as_deref()
+            .map(crate::hooks::store::AgentStatusState::load_at)
+            .unwrap_or_default();
+
+        // The hook side-channel starts out absent and is brought up lazily, on the first Claude
+        // agent this instance spawns - see `AdeApp::hook_injection_for`. Still exactly one
+        // listener per instance, shared by every Claude agent it ever spawns; just not one opened
+        // by a window that may never run an agent at all.
+        let hook_runtime = None;
+
         // The repo-list file mirrors the fold-state file's own resolution one line up (see
         // `rail::repo`'s module docs for why it's the identical pattern): a sibling of whatever
         // settings path this instance was given, `None` (and so no persistence at all) for a test
@@ -244,6 +261,10 @@ impl AdeApp {
             review_baseline_path,
             review_baselines_owned: std::collections::BTreeSet::new(),
             review_mark_in_flight: None,
+            hook_runtime,
+            agent_status_state,
+            agent_status_path,
+            agent_status_owned: std::collections::BTreeSet::new(),
             review_tab_open: None,
             review_tab_active: false,
             review_focus_handle: cx.focus_handle(),
@@ -255,6 +276,7 @@ impl AdeApp {
             _review_mark_task: None,
             _review_release_tasks: HashMap::new(),
             _review_persist_task: None,
+            _agent_status_persist_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
@@ -605,6 +627,7 @@ impl AdeApp {
                     path.clone(),
                     this.settings.appearance.terminal_font_size,
                     this.settings.terminal.shell_override(),
+                    None,
                     window,
                     cx,
                 );

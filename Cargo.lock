@@ -277,6 +277,7 @@ dependencies = [
  "lsp-core",
  "notify",
  "pty-core",
+ "rand 0.9.5",
  "regex",
  "self_update",
  "serde",

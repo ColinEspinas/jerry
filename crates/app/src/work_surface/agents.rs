@@ -110,11 +110,30 @@ impl ProcessKind {
     /// (`crate::settings::store::TerminalSettings::shell_override`, GitHub issue #213) and only
     /// reaches [`ProcessKind::Shell`]: an agent CLI spawns its own fixed binary directly, never
     /// through a shell, so which shell the user prefers genuinely cannot affect it.
-    fn spec(self, cwd: PathBuf, shell_override: Option<&str>) -> TerminalSpec {
+    ///
+    /// `extras` is `(args, env)` to append for a real agent CLI - in practice
+    /// `crate::hooks::HookRuntime::spawn_extras`'s `--settings <path>` plus the `JERRY_*`
+    /// environment that lets that agent's hooks find their way home (GitHub issue #239 phase 2).
+    /// It is deliberately handed in by the caller rather than derived here: whether hooks are
+    /// available at all is a live, per-launch fact owned by `crate::root::AdeApp`, and this
+    /// function is a pure `ProcessKind` -> `TerminalSpec` mapping that must stay testable without
+    /// one.
+    ///
+    /// A [`ProcessKind::Shell`] discards `extras` outright. That is a real gate, not an
+    /// oversight: a shell must never be handed the hook token or an agent id, because a shell is
+    /// an interactive terminal running whatever the user types, and anything it ran would inherit
+    /// the credentials for reporting status as some other pane.
+    fn spec(
+        self,
+        cwd: PathBuf,
+        shell_override: Option<&str>,
+        extras: Option<SpawnExtras>,
+    ) -> TerminalSpec {
         match self {
             ProcessKind::Shell => TerminalSpec::shell(cwd, shell_override),
             ProcessKind::Agent(agent) => {
-                TerminalSpec::command(agent.binary_name(), Vec::new(), cwd)
+                let (args, env) = extras.unwrap_or_default();
+                TerminalSpec::command_with_env(agent.binary_name(), args, cwd, env)
             }
         }
     }
@@ -129,6 +148,10 @@ impl ProcessKind {
         matches!(self, ProcessKind::Agent(_))
     }
 }
+
+/// Extra spawn arguments and environment for one agent - `(args, env)`, as produced by
+/// `crate::hooks::HookInjection::spawn_extras` and consumed by [`ProcessKind::spec`].
+pub type SpawnExtras = (Vec<String>, Vec<(String, String)>);
 
 impl From<AgentKind> for ProcessKind {
     fn from(agent: AgentKind) -> Self {
@@ -279,19 +302,38 @@ impl Agents {
     /// shell (`crate::settings::store::TerminalSettings::shell_override`) - `None` means "the
     /// real OS default", and it only affects [`ProcessKind::Shell`] tabs (see
     /// [`ProcessKind::spec`]).
+    ///
+    /// `hooks` is this launch's hook injection (GitHub issue #239 phase 2), or `None` when hook
+    /// support isn't running - see [`crate::hooks::HookRuntime::start`] for every real reason it
+    /// may not be. It is consumed *only* for [`AgentKind::Claude`]: hooks are a Claude Code
+    /// feature, so a Codex agent and a shell are spawned byte-for-byte as they were before this
+    /// phase, and both fall back to the terminal-title and quiescence signals.
+    // Eight parameters, one past clippy's threshold. Every one is a distinct, live value read
+    // fresh from settings or app state at each of this method's ~40 call sites (see the docs
+    // above for why each is threaded rather than read here), so bundling them into a struct would
+    // add a type whose only purpose is to be constructed inline at every call site and
+    // immediately destructured here - moving the argument count rather than reducing it.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         &mut self,
         kind: ProcessKind,
         cwd: PathBuf,
         terminal_font_size_px: f32,
         shell_override: Option<&str>,
+        hooks: Option<&crate::hooks::HookInjection>,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
 
-        let spec = kind.spec(cwd.clone(), shell_override);
+        // Claude Code only, and gated here rather than inside `spec` so the gate is one
+        // legible line next to the spawn it guards.
+        let extras = match (kind, hooks) {
+            (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => Some(hooks.spawn_extras(id)),
+            _ => None,
+        };
+        let spec = kind.spec(cwd.clone(), shell_override, extras);
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
         let link_subscription =
             cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {
@@ -566,6 +608,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_shell_never_receives_the_hook_injection_even_when_one_is_offered() {
+        // A shell runs whatever the user types, so handing it the hook token and an agent id
+        // would let anything it ran report status as some other pane. `spec` discards `extras`
+        // for the shell arm outright - this pins that.
+        let extras = Some((
+            vec!["--settings".to_owned(), "/tmp/jerry.json".to_owned()],
+            vec![("JERRY_HOOK_TOKEN".to_owned(), "secret".to_owned())],
+        ));
+        let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), None, extras);
+        assert!(shell.args.is_empty(), "a shell must get no injected args");
+        assert!(
+            shell.env.is_empty(),
+            "a shell must never see the hook token"
+        );
+    }
+
+    #[test]
+    fn an_agent_given_a_hook_injection_really_spawns_with_it() {
+        // The other half: the injection must actually reach the spawn, or the whole side-channel
+        // silently does nothing.
+        let extras = Some((
+            vec!["--settings".to_owned(), "/tmp/jerry.json".to_owned()],
+            vec![("JERRY_HOOK_PORT".to_owned(), "5000".to_owned())],
+        ));
+        let spec = ProcessKind::claude().spec(PathBuf::from("/tmp"), None, extras);
+        assert_eq!(spec.program, PathBuf::from("claude"));
+        assert_eq!(spec.args, vec!["--settings", "/tmp/jerry.json"]);
+        assert_eq!(
+            spec.env,
+            vec![("JERRY_HOOK_PORT".to_owned(), "5000".to_owned())]
+        );
+    }
+
     /// `spec` is private, but the fact it reads through `AgentKind::binary_name` (rather than a
     /// second hardcoded list) is what keeps the Settings › Agents `$PATH` search honest: the name
     /// that card searches for must be the name actually spawned. This asserts the shared source,
@@ -573,7 +649,7 @@ mod tests {
     #[test]
     fn the_settings_path_search_and_the_real_spawn_read_the_same_binary_name() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {
-            let spec = ProcessKind::Agent(agent).spec(PathBuf::from("/tmp"), None);
+            let spec = ProcessKind::Agent(agent).spec(PathBuf::from("/tmp"), None, None);
             assert_eq!(
                 spec.program,
                 PathBuf::from(agent.binary_name()),
@@ -581,19 +657,23 @@ mod tests {
             );
             assert!(
                 spec.args.is_empty(),
-                "{agent:?} is spawned bare, with no arguments"
+                "{agent:?} with no hook injection is spawned bare, exactly as before issue #239"
+            );
+            assert!(
+                spec.env.is_empty(),
+                "{agent:?} with no hook injection gets no extra environment either"
             );
         }
         // `shell_override` reaches only the shell arm - an agent CLI is spawned directly, never
         // through a shell, so the user's preferred shell genuinely cannot affect it.
-        let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), Some("/bin/dash"));
+        let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), Some("/bin/dash"), None);
         assert_eq!(
             shell.program,
             PathBuf::from("/bin/dash"),
             "a shell resolves the user's configured shell, not a fixed agent binary"
         );
         let agent_ignoring_override =
-            ProcessKind::claude().spec(PathBuf::from("/tmp"), Some("/bin/dash"));
+            ProcessKind::claude().spec(PathBuf::from("/tmp"), Some("/bin/dash"), None);
         assert_eq!(
             agent_ignoring_override.program,
             PathBuf::from("claude"),

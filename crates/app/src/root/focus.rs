@@ -604,6 +604,7 @@ mod tab_strip_keybinding_tests {
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -649,6 +650,7 @@ mod tab_strip_keybinding_tests {
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -852,6 +854,7 @@ mod tab_strip_keybinding_tests {
                     repo.path().to_path_buf(),
                     app.settings.appearance.terminal_font_size,
                     app.settings.terminal.shell_override(),
+                    None,
                     window,
                     cx,
                 )

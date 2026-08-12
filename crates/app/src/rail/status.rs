@@ -80,9 +80,47 @@
 //! sense: a shell prompt, a `vim` session, or a `printf '\e]0;...\a'` in someone's `.bashrc` can
 //! put any glyph or word in a shell's title, and none of that makes a shell an agent session
 //! that can need input. That gate is pinned by its own test below.
+//!
+//! ## The third signal: what the agent *reports* (GitHub issue #239, phase 2)
+//!
+//! A title glyph is still presentation - something the CLI drew for a human, which Jerry reads
+//! over its shoulder. Claude Code also emits a real, documented, structured side-channel for
+//! programs: hooks, fired at named lifecycle events, each handed a JSON payload. Jerry installs
+//! those per-launch and receives them on a loopback listener (`crate::hooks`), and
+//! [`HookSignal`] carries the resulting fact here.
+//!
+//! It is ranked above both other signals, because it is a categorically different kind of
+//! evidence - the agent stating what it just did, rather than Jerry inferring it from silence or
+//! from a spinner. Concretely: [`HookFact::Working`] means [`Status::Run`],
+//! [`HookFact::NeedsInput`] means [`Status::Ask`], [`HookFact::TurnFailed`] means
+//! [`Status::Fail`].
+//!
+//! [`HookFact::TurnEnded`] is the one that buys a genuinely new capability rather than a faster
+//! version of an old one. Before this, [`Status::Review`] was reachable *only* by a process
+//! exiting - but a real Claude Code session does not exit when it finishes a turn, it sits at its
+//! prompt waiting for the next one. So the single most useful moment in the whole workflow ("this
+//! agent just finished; there is something to look at") was invisible until the user closed the
+//! CLI outright. A `Stop` hook is exactly that moment, and it is gated on the same real #225
+//! review-baseline diff the exit path uses, so `Review` means the same thing however it is
+//! reached.
+//!
+//! Three limits keep this from being another way to be confidently wrong:
+//!
+//! - **It expires.** A hook fact is a point-in-time observation, so it only outranks the other
+//!   signals while fresh ([`crate::hooks::event::HOOK_SIGNAL_TTL`]); past that the quiescence
+//!   floor takes back over. An agent whose hooks silently stopped firing must not pin a stale
+//!   status forever.
+//! - **It never argues with an exit.** Like [`TerminalSignal`], it is consulted only in the
+//!   [`ProcessSignal::Running`] branch. A process that has exited is an exact fact.
+//! - **It never reaches a shell.** Hooks are only ever installed for
+//!   [`crate::work_surface::agents::AgentKind::Claude`] spawns, so a shell should structurally
+//!   never have one - and this function additionally refuses to consult it for a
+//!   [`crate::work_surface::agents::ProcessKind::Shell`] even if one somehow arrived, which is
+//!   pinned by its own test below.
 
 use std::time::Duration;
 
+use crate::hooks::event::{HookFact, HOOK_SIGNAL_TTL};
 use crate::rail::title_signal::TitleSignal;
 use crate::terminal::osc::Progress;
 use crate::work_surface::agents::ProcessKind;
@@ -223,19 +261,75 @@ impl TerminalSignal {
     }
 }
 
+/// What the agent said about itself through Claude Code's real hook side-channel, as opposed to
+/// what it rendered into its terminal ([`TerminalSignal`]) or what its silence implies
+/// ([`ProcessSignal`]) - see the module docs' "third signal" section (GitHub issue #239, phase 2).
+///
+/// Built by the caller (`crate::work_surface::render::AdeApp::agent_status`) from
+/// `crate::hooks::server::HookListener::signal_for`. [`Default`] is "this agent has never
+/// reported a hook", which is both the honest starting state and what every non-Claude agent and
+/// every shell is handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HookSignal {
+    /// The most recent hook fact this agent reported, if any.
+    pub fact: Option<HookFact>,
+    /// How long ago it arrived - the freshness check against
+    /// [`crate::hooks::event::HOOK_SIGNAL_TTL`]. Meaningless when `fact` is `None`.
+    pub age: Duration,
+}
+
+impl HookSignal {
+    /// The fact, but only while it is still recent enough to describe the present - see
+    /// [`crate::hooks::event::HOOK_SIGNAL_TTL`] for why an expiry exists at all.
+    fn fresh(self) -> Option<HookFact> {
+        self.fact.filter(|_| self.age < HOOK_SIGNAL_TTL)
+    }
+}
+
 /// Derives the [`Status`] for one agent from its process signal, what its own terminal claims
-/// about it ([`TerminalSignal`]), and whether it has a non-empty diff against its worktree's
-/// base - see the module docs for the Run/Ask split and how the two signals combine.
+/// about it ([`TerminalSignal`]), what it reported through the hook side-channel
+/// ([`HookSignal`]), and whether it has a non-empty diff against its worktree's base - see the
+/// module docs for the Run/Ask split and how the three signals combine.
 pub fn derive_status(
     kind: ProcessKind,
     signal: ProcessSignal,
     terminal: TerminalSignal,
+    hooks: HookSignal,
     has_reviewable_diff: bool,
 ) -> Status {
     match signal {
         ProcessSignal::NoProcess => Status::Idle,
         ProcessSignal::Running { idle } => {
             if kind.is_agent_session() {
+                // The hook signal outranks both the title/OSC signal and the idle clock, because
+                // it is categorically better evidence: the other two are inferences from what the
+                // process rendered or from how long it has been quiet, while this is the agent
+                // reporting its own lifecycle event through a documented, structured channel.
+                // It is checked only for a real agent session, and only for a live process, so a
+                // stale fact can never argue with an exit (see the `Exited` arm below).
+                if let Some(fact) = hooks.fresh() {
+                    return match fact {
+                        HookFact::Working => Status::Run,
+                        HookFact::NeedsInput => Status::Ask,
+                        HookFact::TurnFailed => Status::Fail,
+                        // The real new capability this phase adds: a turn that *ended* is a
+                        // review boundary even though the process is still very much alive.
+                        // Before hooks, `Review` could only ever be reached by a process
+                        // exiting - so an agent that finished its work and sat waiting at its
+                        // prompt (which is what Claude Code actually does) was reported as
+                        // `Ask` or `Idle`, and the review surface for it only appeared once the
+                        // user closed the CLI. The gate is the same real #225 review-baseline
+                        // diff used by the exit path immediately below, so "review ready" means
+                        // exactly the same thing however it was reached.
+                        HookFact::TurnEnded => {
+                            if has_reviewable_diff {
+                                Status::Review
+                            } else {
+                                Status::Idle
+                            }
+                        }
+                    };
+                }
                 // Both of these deliberately outrank the idle clock in both directions - see the
                 // module docs' "second signal" section. `wants_attention` is checked first: an
                 // agent that is both spinning a busy glyph and has an unanswered notification
@@ -275,6 +369,37 @@ pub fn derive_status(
 mod tests {
     use super::*;
     use crate::terminal::osc::ProgressState;
+
+    /// The pre-phase-2 four-argument call shape, deliberately shadowing [`super::derive_status`]
+    /// for the tests below.
+    ///
+    /// Every test written before the hook side-channel existed means "this agent has never
+    /// reported a hook", and every one of them must keep producing exactly the same answer now
+    /// that a third signal exists - that is the real claim, and routing them through this
+    /// forwarder states it once instead of sprinkling `HookSignal::default()` through thirty call
+    /// sites. The phase-2 tests call `super::derive_status` directly with a real signal.
+    fn derive_status(
+        kind: ProcessKind,
+        signal: ProcessSignal,
+        terminal: TerminalSignal,
+        has_reviewable_diff: bool,
+    ) -> Status {
+        super::derive_status(
+            kind,
+            signal,
+            terminal,
+            HookSignal::default(),
+            has_reviewable_diff,
+        )
+    }
+
+    /// A hook fact that arrived just now - the normal live case.
+    fn hooked(fact: HookFact) -> HookSignal {
+        HookSignal {
+            fact: Some(fact),
+            age: Duration::ZERO,
+        }
+    }
 
     /// The "this process said nothing through its terminal" signal - what every pre-existing
     /// test below means, and exactly what a CLI that sets no title and sends no OSC produces.
@@ -649,6 +774,263 @@ mod tests {
             derive_status(ProcessKind::claude(), signal, quiet(), false),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn a_fresh_hook_fact_maps_onto_the_status_it_reports() {
+        // The core of phase 2. Checked at an idle time that would otherwise say `Ask` (well past
+        // the threshold), so every one of these is genuinely the hook signal deciding and not the
+        // quiescence heuristic agreeing by coincidence.
+        let long_quiet = ProcessSignal::Running {
+            idle: AGENT_ASK_IDLE_THRESHOLD * 10,
+        };
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                long_quiet,
+                quiet(),
+                HookSignal::default(),
+                false
+            ),
+            Status::Ask,
+            "baseline: with no hook signal this is the old quiescence answer"
+        );
+        for (fact, expected) in [
+            (HookFact::Working, Status::Run),
+            (HookFact::NeedsInput, Status::Ask),
+            (HookFact::TurnFailed, Status::Fail),
+        ] {
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::claude(),
+                    long_quiet,
+                    quiet(),
+                    hooked(fact),
+                    false
+                ),
+                expected,
+                "{fact:?} must report {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_hook_reaches_review_without_the_process_ever_exiting() {
+        // The genuinely new capability: before phase 2, `Review` was reachable only via
+        // `ProcessSignal::Exited`. A real Claude Code session does not exit when it finishes a
+        // turn - it sits at its prompt - so this moment was previously invisible.
+        let alive = ProcessSignal::Running {
+            idle: Duration::from_millis(50),
+        };
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                alive,
+                quiet(),
+                hooked(HookFact::TurnEnded),
+                true
+            ),
+            Status::Review,
+            "a finished turn with real unreviewed changes is review-ready while still running"
+        );
+        // ...and the gate is real: nothing to review means idle, not a review row with nothing in it.
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                alive,
+                quiet(),
+                hooked(HookFact::TurnEnded),
+                false
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn a_hook_fact_outranks_a_contradicting_title_and_progress_report() {
+        // A title glyph is what the CLI drew for a human; a hook is what it reported. When they
+        // disagree, the report wins - see the module docs' "third signal" section.
+        let busy_looking = TerminalSignal {
+            title: Some(TitleSignal::Busy),
+            attention_pinged: false,
+            progress: Some(Progress {
+                state: ProgressState::Normal,
+                percent: Some(60),
+            }),
+        };
+        let barely_quiet = ProcessSignal::Running {
+            idle: Duration::from_millis(50),
+        };
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                busy_looking,
+                HookSignal::default(),
+                true
+            ),
+            Status::Run,
+            "baseline: the title alone says this agent is working"
+        );
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                busy_looking,
+                hooked(HookFact::TurnEnded),
+                true
+            ),
+            Status::Review,
+            "a real `Stop` report must beat a spinner the CLI simply hasn't cleared yet"
+        );
+
+        // And the other direction: an attention ping must not hold `Ask` once the agent has
+        // reported it is working again.
+        let pinged = TerminalSignal {
+            attention_pinged: true,
+            ..TerminalSignal::default()
+        };
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                pinged,
+                HookSignal::default(),
+                false
+            ),
+            Status::Ask,
+            "baseline: an unanswered ping alone means Ask"
+        );
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                pinged,
+                hooked(HookFact::Working),
+                false
+            ),
+            Status::Run
+        );
+    }
+
+    #[test]
+    fn a_stale_hook_fact_expires_and_hands_the_decision_back_to_the_other_signals() {
+        // An agent whose hooks silently stopped firing must not pin a stale status forever - see
+        // `HOOK_SIGNAL_TTL`'s own docs for why an expiry exists.
+        let long_quiet = ProcessSignal::Running {
+            idle: AGENT_ASK_IDLE_THRESHOLD * 10,
+        };
+        let stale = HookSignal {
+            fact: Some(HookFact::Working),
+            age: HOOK_SIGNAL_TTL + Duration::from_secs(1),
+        };
+        assert_eq!(
+            super::derive_status(ProcessKind::claude(), long_quiet, quiet(), stale, false),
+            Status::Ask,
+            "past the TTL the quiescence floor takes back over"
+        );
+        // Just inside the TTL it still counts.
+        let fresh_enough = HookSignal {
+            fact: Some(HookFact::Working),
+            age: HOOK_SIGNAL_TTL - Duration::from_secs(1),
+        };
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                long_quiet,
+                quiet(),
+                fresh_enough,
+                false
+            ),
+            Status::Run
+        );
+    }
+
+    #[test]
+    fn a_hook_fact_never_overrides_an_exit_or_a_missing_process() {
+        // An exit is an exact fact. A `Working` hook from just before the process died must not
+        // resurrect it - the same rule `TerminalSignal` already obeys.
+        for fact in [
+            HookFact::Working,
+            HookFact::NeedsInput,
+            HookFact::TurnEnded,
+            HookFact::TurnFailed,
+        ] {
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::claude(),
+                    ProcessSignal::Exited { success: false },
+                    quiet(),
+                    hooked(fact),
+                    false
+                ),
+                Status::Fail,
+                "{fact:?} must not argue with a non-zero exit"
+            );
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::claude(),
+                    ProcessSignal::NoProcess,
+                    quiet(),
+                    hooked(fact),
+                    true
+                ),
+                Status::Idle,
+                "{fact:?} must not invent a process that was never started"
+            );
+        }
+        assert_eq!(
+            super::derive_status(
+                ProcessKind::claude(),
+                ProcessSignal::Exited { success: true },
+                quiet(),
+                hooked(HookFact::Working),
+                true
+            ),
+            Status::Review
+        );
+    }
+
+    #[test]
+    fn a_hook_fact_can_never_change_a_shell_row() {
+        // Defensive, and deliberately so. Hooks are only ever installed for `AgentKind::Claude`
+        // spawns, so a shell should structurally never carry one - but "structurally impossible"
+        // is exactly the kind of claim that quietly stops being true, and a shell that could be
+        // driven to `Ask`/`Review`/`Fail` by an inbox entry would be a real bug. This pins the
+        // gate rather than trusting the surrounding architecture to keep holding.
+        for fact in [
+            HookFact::Working,
+            HookFact::NeedsInput,
+            HookFact::TurnEnded,
+            HookFact::TurnFailed,
+        ] {
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::Shell,
+                    ProcessSignal::Running {
+                        idle: AGENT_ASK_IDLE_THRESHOLD * 2
+                    },
+                    quiet(),
+                    hooked(fact),
+                    true
+                ),
+                Status::Idle,
+                "a quiet shell stays Idle regardless of a {fact:?} hook"
+            );
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::Shell,
+                    ProcessSignal::Running {
+                        idle: Duration::from_millis(50)
+                    },
+                    quiet(),
+                    hooked(fact),
+                    true
+                ),
+                Status::Run,
+                "a freshly-active shell stays Run regardless of a {fact:?} hook"
+            );
+        }
     }
 
     #[test]

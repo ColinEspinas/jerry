@@ -294,6 +294,18 @@ pub struct TerminalSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Extra environment variables set on the spawned child, *on top of* the environment Jerry
+    /// itself inherited (`portable_pty`'s `CommandBuilder::env` adds to the inherited
+    /// environment rather than replacing it, which is what makes this safe to use for a couple
+    /// of variables without having to reconstruct a whole environment).
+    ///
+    /// Empty for every spawn except a Claude agent, where it carries the hook listener's port,
+    /// this launch's token and the pane's own agent id (GitHub issue #239 phase 2 -
+    /// `crate::hooks::HookRuntime::spawn_extras`). Those three are what let the dumb forwarder
+    /// script know where to post and which row an event belongs to, and putting them in the
+    /// environment rather than in the generated settings file is what allows one settings file
+    /// to serve every agent this launch spawns.
+    pub env: Vec<(String, String)>,
 }
 
 impl TerminalSpec {
@@ -318,6 +330,7 @@ impl TerminalSpec {
                 .unwrap_or_else(Self::default_shell_program),
             args: Vec::new(),
             cwd,
+            env: Vec::new(),
         }
     }
 
@@ -359,6 +372,22 @@ impl TerminalSpec {
             program: program.into(),
             args,
             cwd,
+            env: Vec::new(),
+        }
+    }
+
+    /// [`Self::command`] plus extra environment variables for the child - see [`Self::env`].
+    pub fn command_with_env(
+        program: impl Into<PathBuf>,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            cwd,
+            env,
         }
     }
 }
@@ -1124,12 +1153,14 @@ impl TerminalPane {
             let spawn_result: Result<PtySession, PtyError> = cx
                 .background_executor()
                 .spawn(async move {
-                    pty_core::spawn(
-                        SpawnOptions::new(spec.program)
-                            .args(spec.args)
-                            .cwd(spec.cwd)
-                            .size(TERMINAL_ROWS, TERMINAL_COLS),
-                    )
+                    let mut options = SpawnOptions::new(spec.program)
+                        .args(spec.args)
+                        .cwd(spec.cwd)
+                        .size(TERMINAL_ROWS, TERMINAL_COLS);
+                    for (key, value) in spec.env {
+                        options = options.env(key, value);
+                    }
+                    pty_core::spawn(options)
                 })
                 .await;
 

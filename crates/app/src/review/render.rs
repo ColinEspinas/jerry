@@ -1235,6 +1235,9 @@ mod review_flow_tests {
             // An exit is an exact fact; no terminal-title/OSC signal takes part in it (see
             // `crate::rail::status`'s module docs), so the default "said nothing" is right here.
             crate::rail::status::TerminalSignal::default(),
+            // Likewise no hook signal: this pins the *exit* path to `Review`, which is the one
+            // that existed before GitHub issue #239 phase 2 and must keep working unchanged.
+            crate::rail::status::HookSignal::default(),
             has_unreviewed,
         );
         assert_eq!(
@@ -1352,6 +1355,7 @@ mod review_flow_tests {
                 other_a.path().to_path_buf(),
                 12.0,
                 None,
+                None,
                 window,
                 cx,
             );
@@ -1362,6 +1366,7 @@ mod review_flow_tests {
                 ProcessKind::Shell,
                 other_b.path().to_path_buf(),
                 12.0,
+                None,
                 None,
                 window,
                 cx,
@@ -1506,7 +1511,11 @@ mod review_flow_tests {
             "recorded against the real worktree, decodably"
         );
         app.read_with(cx, |app, _| {
-            let agent = app.agents.iter().find(|a| a.id == id).expect("the sole agent");
+            let agent = app
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .expect("the sole agent");
             let ProcessKind::Agent(kind) = agent.kind else {
                 unreachable!("sole_agent always spawns a real agent, never a shell");
             };
