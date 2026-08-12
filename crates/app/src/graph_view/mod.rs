@@ -14,20 +14,24 @@
 //! ## Scope
 //!
 //! Phase (a) shipped read-only. Phase (c) (GitHub issue #1's own "push (force with lease,
-//! force, no force)"/"pull") has since wired the toolbar's Fetch/Pull and the Push `▾` menu's
+//! force, no force)"/"pull") wired the toolbar's Fetch/Pull and the Push `▾` menu's
 //! Push/Force-with-lease/Force rows to real `wt_core::remote` calls
 //! (`AdeApp::request_graph_fetch`/`request_graph_pull`/`request_graph_push`) - see that
 //! module's own docs for the fetch/pull/push implementations and
 //! [`state::GraphTabState::push_force_confirm_armed`] for the real two-click confirmation the
-//! two force variants require. The row `⋯` menu's Branch/Apply/Reset groups remain real,
-//! visible menu rows (per the design spec) but every entry that would perform a *different*
-//! destructive git operation (check out, cherry-pick, revert, rebase, reset, "start an agent
-//! from this commit") is still rendered **disabled** -
-//! `crate::work_surface::render::render_dropdown_menu_row`'s existing `enabled: false`
-//! treatment, with no `.on_click` attached - because none of those specific operations exist in
-//! `wt_core` yet (real, separate follow-up work, not yet started). Only the Copy group's
-//! entries (real clipboard writes of already-loaded data), the toolbar's read-only scope
-//! segment, and now Fetch/Pull/Push are actually wired. Agent-to-commit correlation (which agent
+//! two force variants require. A later pass wired the row `⋯` menu's Apply group (Cherry-pick/
+//! Revert/Rebase onto this commit, `wt_core::rewrite`) and GitHub issue #241 wired its
+//! Branch/Reset groups too (`Check out`/`Create branch here`/Soft-Mixed-Hard reset,
+//! `wt_core::checkout`) - see [`state::GraphTabState::hard_reset_confirm_armed`] for Hard
+//! reset's own two-click confirmation, the same discipline `push_force_confirm_armed` already
+//! established, and [`state::GraphCreateBranchPrompt`] for "Create branch here"'s small,
+//! hand-rolled branch-name input. Only "Interactive rebase from here" (a separate, later issue -
+//! it needs its own commit-selection UI, not just a click) and "Start agent from this commit"
+//! (needs a new-worktree-creation entry point this app deliberately has none of yet - every
+//! "add worktree"/"add repo" entry point stays out until a real design lands, per Revision R12)
+//! are still rendered **disabled** - `crate::work_surface::render::render_dropdown_menu_row`'s
+//! existing `enabled: false` treatment, with no `.on_click` attached. Agent-to-commit correlation
+//! (which agent
 //! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that

@@ -20,6 +20,7 @@
 //! invoking them from a UI main thread.
 
 pub mod blame;
+pub mod checkout;
 pub mod diff;
 mod error;
 pub mod graph;

@@ -43,6 +43,28 @@ pub(crate) struct GraphRowMenu {
     pub origin_y: Pixels,
 }
 
+/// GitHub issue #241: the row menu's "Create branch here" prompt - `Some` only while the small,
+/// hand-rolled branch-name modal (`crate::graph_view::render::AdeApp::
+/// render_graph_create_branch_prompt`) is open. Mirrors `crate::root::new_file::
+/// NewFileInputState`'s own shape - this app's one established "prompt for a name" idiom
+/// (append/backspace-only [`TextField`], Enter to confirm, Escape to cancel) - rather than a
+/// second, competing one.
+///
+/// `sha`/`short_sha`/`subject` are captured once, at open time, from the row that was
+/// right-clicked/`⋯`'d - not re-looked-up from the graph on every render, which a background
+/// reload racing with the still-open prompt could otherwise change out from under it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GraphCreateBranchPrompt {
+    pub sha: String,
+    pub short_sha: String,
+    pub subject: String,
+    /// A real rejection message from the last attempt - only this prompt's own "branch name
+    /// can't be empty" guard (a real collision with an existing branch surfaces through
+    /// [`GraphTabState::status_message`] instead, git's own real error text, exactly like every
+    /// other row-menu mutation) - cleared on the very next keystroke.
+    pub error: Option<String>,
+}
+
 /// The graph tab's own UI state: what's loaded, which scope/panel is selected, and the row `⋯`/
 /// Push `▾` menu popovers' anchors. One instance, owned by [`AdeApp::graph_state`].
 pub(crate) struct GraphTabState {
@@ -108,6 +130,29 @@ pub(crate) struct GraphTabState {
     /// disarms this rather than carrying the arm over onto an operation the user never
     /// confirmed.
     pub push_force_confirm_armed: Option<PushForce>,
+    /// GitHub issue #241: `Some(sha)` for exactly one real click past the two-click confirmation
+    /// on the row menu's "Hard" reset row, naming the commit that click targeted - `None` for
+    /// "Soft"/"Mixed", which never discard uncommitted work and so need no confirmation at all.
+    /// Mirrors [`Self::push_force_confirm_armed`]'s own discipline (see that field's docs): the
+    /// *first* click on a given commit's "Hard" row only arms this field and re-labels the row,
+    /// without resetting anything; only a second click on that *same* commit's "Hard" row - with
+    /// nothing else clicked in between - actually runs [`wt_core::checkout::reset`]. Keyed by
+    /// sha rather than a bare `bool` for the same reason `push_force_confirm_armed` is keyed by
+    /// variant: a "Hard" click on a *different* commit must arm its own confirmation, not
+    /// silently ride on a stale arm left over from a different row. Every other row-menu action
+    /// (Check out, Create branch here, Cherry-pick, Revert, Rebase onto this commit, Soft/Mixed
+    /// reset, Copy) disarms this rather than let it carry over onto an operation the user never
+    /// confirmed - see `crate::graph_view::render::AdeApp::request_graph_reset`'s own docs.
+    pub hard_reset_confirm_armed: Option<String>,
+    /// GitHub issue #241: the row menu's "Create branch here" prompt - see
+    /// [`GraphCreateBranchPrompt`]'s own docs.
+    pub create_branch_prompt: Option<GraphCreateBranchPrompt>,
+    /// The prompt's own real text input - a real undo history (GitHub issue #17), the same shape
+    /// as [`Self::branches_filter`]. Lives independently of [`Self::create_branch_prompt`]
+    /// (rather than nested inside it) only so it can be reset to empty with `TextField::new()`
+    /// each time the prompt opens without reconstructing the whole prompt struct around it.
+    pub create_branch_name: TextField,
+    pub create_branch_focus_handle: FocusHandle,
     /// The currently in-flight remote operation's own real task - held so it isn't dropped (and
     /// therefore cancelled) the instant this function returns, matching
     /// `AdeApp::_worktree_history_task`'s identical one-slot-per-feature pattern. `None` when
@@ -174,6 +219,10 @@ impl GraphTabState {
             status_message: None,
             remote_op_in_flight: false,
             push_force_confirm_armed: None,
+            hard_reset_confirm_armed: None,
+            create_branch_prompt: None,
+            create_branch_name: TextField::new(),
+            create_branch_focus_handle: cx.focus_handle(),
             _remote_op_task: None,
             loaded_cap: wt_core::graph::DEFAULT_MAX_COMMITS,
             load_more_in_flight: false,
