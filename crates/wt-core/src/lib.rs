@@ -24,6 +24,7 @@ pub mod diff;
 mod error;
 pub mod graph;
 pub mod merge;
+pub mod rebase;
 pub mod remote;
 pub mod review;
 pub mod rewrite;
