@@ -32,7 +32,6 @@ use crate::rail::state::{
     self as rail, AgentRow, RepoGroup, RepoWorktrees, WorktreeEntry, WorktreeNote, WorktreeRow,
 };
 use crate::rail::status::Status;
-#[cfg(test)]
 use crate::rail::worktrees::WorktreeItem;
 use crate::root::*;
 use crate::status_bar::process_stats;

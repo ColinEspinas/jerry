@@ -57,19 +57,36 @@ pub struct Repo {
     pub name: String,
     /// Every worktree belonging to this repo, main checkout included (`design_handoff_jerry_ade/
     /// revision 3/REVISION-2026-07-31.md` §2.0: "The repo's main checkout is itself a worktree
-    /// row in its group"). Always empty today - **not** wired to `wt_core::list_worktrees` by
-    /// this phase, which is data-model-and-persistence only (see `crate::root::AdeApp::worktrees`
-    /// for where the single-focused-repo worktree list still lives while that wiring is pending).
-    /// Real per-repo population is a later rail-rendering phase's job; this field exists now so
-    /// that phase has a real place to write into rather than bolting one on afterwards.
+    /// row in its group"). Populated by a real `wt_core::list_worktrees_porcelain` fetch for
+    /// *every* repo, not just the focused one - `crate::root::AdeApp::load_repo_worktrees`
+    /// (a one-shot fetch, run once per newly [`crate::root::AdeApp::add_repo`]-ed repo and once
+    /// per repo restored from `repos.toml` at startup) and `crate::root::AdeApp::
+    /// start_repo_worktrees_polling` (the periodic keep-fresh sweep for every non-focused repo)
+    /// are the only two writers. The currently focused repo is the one exception: its own entry
+    /// is instead mirrored straight from `crate::root::AdeApp::load_worktrees`'s real fetch (see
+    /// that method's own docs) rather than independently fetched a second time, so this repo's
+    /// git is never queried twice in parallel for the same data.
+    ///
+    /// Empty until [`Self::worktrees_loaded`] is `true` - see that field's own docs for why an
+    /// empty `Vec` alone can't be trusted as "this repo really has zero worktrees".
     pub worktrees: Vec<WorktreeItem>,
+    /// Whether [`Self::worktrees`] reflects a real, completed fetch attempt for this repo - not
+    /// merely "non-empty", since a genuinely empty result (an inaccessible path;
+    /// `wt_core::list_worktrees_porcelain`'s own `Err` case) is still a real, definitive answer
+    /// that must be told apart from "never even asked yet" (this repo added a moment ago, its
+    /// first fetch still in flight). `false` only ever means the latter. See
+    /// [`crate::rail::state::RepoWorktrees::rows_loaded`], which this feeds directly, for how the
+    /// rail render side uses the same distinction.
+    pub worktrees_loaded: bool,
 }
 
 impl Repo {
     /// Builds a fresh, worktree-less `Repo` for `path`, deriving its display name the same way
     /// [`super::worktrees::build_worktree_items`] derives a worktree's own label when it has no
     /// branch: the path's basename, falling back to the whole path for a root-only path (`/`) or
-    /// one that ends in `..`/`.`.
+    /// one that ends in `..`/`.`. [`Self::worktrees_loaded`] starts `false` - the caller
+    /// (`crate::root::AdeApp::add_repo`) always follows this with a real
+    /// `crate::root::AdeApp::load_repo_worktrees` call to populate it.
     pub fn new(id: RepoId, path: PathBuf) -> Self {
         let name = display_name(&path);
         Repo {
@@ -77,8 +94,25 @@ impl Repo {
             path,
             name,
             worktrees: Vec::new(),
+            worktrees_loaded: false,
         }
     }
+}
+
+/// Splits `ids` into fixed-size batches of at most `concurrency` each, preserving relative
+/// order - `crate::root::AdeApp::start_repo_worktrees_polling`'s own bound on how many real `git
+/// worktree list` subprocesses its non-focused-repo refresh sweep lets run at once: it fully
+/// awaits one batch's real subprocess calls (spawned concurrently on the background executor)
+/// before moving on to the next, so no more than `concurrency` are ever in flight for that sweep
+/// simultaneously, regardless of how many repos are due for a refresh. A user with dozens of
+/// added repos never causes a single tick to fire dozens of `git` child processes at once.
+///
+/// `concurrency == 0` is treated as `1` - a defensive floor, since `[T]::chunks` itself panics on
+/// a zero chunk size, and the caller's own constant is never expected to be zero anyway.
+pub(crate) fn batch_repos_for_refresh(ids: &[RepoId], concurrency: usize) -> Vec<Vec<RepoId>> {
+    ids.chunks(concurrency.max(1))
+        .map(<[RepoId]>::to_vec)
+        .collect()
 }
 
 fn display_name(path: &Path) -> String {
@@ -645,6 +679,58 @@ mod tests {
             RepoState::load_at(&path).last_focused,
             Some("/repo/b".to_string()),
             "focusing repo B afterwards must really overwrite the previously persisted repo A"
+        );
+    }
+
+    #[test]
+    fn repo_new_starts_with_worktrees_unloaded() {
+        let repo = Repo::new(RepoId(0), PathBuf::from("/home/user/code/jerry-core"));
+        assert!(!repo.worktrees_loaded);
+    }
+
+    /// The concurrency cap's real shape: ten due repos with a cap of four must split into
+    /// `[4, 4, 2]`, never a single batch of ten (which would let all ten real `git worktree list`
+    /// subprocesses fire at once) and never one repo per batch either (which would serialize the
+    /// whole sweep needlessly).
+    #[test]
+    fn batch_repos_for_refresh_splits_into_capped_chunks() {
+        let ids: Vec<RepoId> = (0..10).map(RepoId).collect();
+        let batches = batch_repos_for_refresh(&ids, 4);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![4, 4, 2],
+            "ten ids with a cap of four must split 4/4/2, bounding every single batch's real \
+             concurrent subprocess count to the cap"
+        );
+        // Order is preserved and nothing is dropped or duplicated - every id from the input
+        // appears exactly once, in its original relative order.
+        let flattened: Vec<RepoId> = batches.into_iter().flatten().collect();
+        assert_eq!(flattened, ids);
+    }
+
+    #[test]
+    fn batch_repos_for_refresh_fewer_ids_than_the_cap_is_a_single_batch() {
+        let ids: Vec<RepoId> = (0..3).map(RepoId).collect();
+        let batches = batch_repos_for_refresh(&ids, 4);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+    }
+
+    #[test]
+    fn batch_repos_for_refresh_of_no_ids_is_no_batches() {
+        assert!(batch_repos_for_refresh(&[], 4).is_empty());
+    }
+
+    /// A defensive floor, not a real call site (every real caller uses a real positive constant):
+    /// `concurrency == 0` must not panic (`[T]::chunks` itself panics on a zero chunk size) or
+    /// silently drop every id - it degrades to one id per batch instead.
+    #[test]
+    fn batch_repos_for_refresh_treats_a_zero_concurrency_as_one() {
+        let ids: Vec<RepoId> = (0..3).map(RepoId).collect();
+        let batches = batch_repos_for_refresh(&ids, 0);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 1, 1]
         );
     }
 }
