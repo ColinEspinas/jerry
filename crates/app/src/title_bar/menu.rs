@@ -1297,6 +1297,7 @@ mod title_menu_tests {
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1398,6 +1399,7 @@ mod title_menu_tests {
                 worktree_path.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1530,6 +1532,7 @@ mod title_menu_tests {
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             );
@@ -1538,6 +1541,7 @@ mod title_menu_tests {
                 repo.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             );
@@ -1550,6 +1554,7 @@ mod title_menu_tests {
                 other_wt.path().to_path_buf(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             );

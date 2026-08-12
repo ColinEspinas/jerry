@@ -1018,6 +1018,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1097,6 +1098,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1122,6 +1124,7 @@ mod merge_regression_tests {
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1182,6 +1185,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1294,6 +1298,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1398,6 +1403,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1466,6 +1472,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1552,6 +1559,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1671,6 +1679,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1804,6 +1813,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -1909,6 +1919,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2009,6 +2020,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2174,6 +2186,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2228,6 +2241,7 @@ mod merge_regression_tests {
                 second_feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2337,6 +2351,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2434,6 +2449,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )
@@ -2550,6 +2566,7 @@ mod merge_regression_tests {
                 feature.clone(),
                 app.settings.appearance.terminal_font_size,
                 app.settings.terminal.shell_override(),
+                None,
                 window,
                 cx,
             )

@@ -52,11 +52,17 @@ pub struct AgentRow {
     /// rather than every one of those call sites suddenly needing to supply or ignore an
     /// `activity` payload for a `Run` variant they don't care about.
     ///
-    /// **Always `None` today.** The real PTY-output-to-activity-text heuristic is a separate,
-    /// parallel piece of work (this revision's Phase 0 is data-model-and-persistence only); this
-    /// field exists so that work has a real, already-plumbed-through place to write into -
-    /// [`crate::rail::render::AdeApp::build_agent_rows`] is where a live value would be filled
-    /// in, the same real construction site [`Self::question_preview`] is already filled in from.
+    /// Real as of GitHub issue #239 phase 2, and only ever from a real source: this is a Claude
+    /// Code hook payload's own `tool_name` plus the relevant `tool_input` field (`Bash: cargo
+    /// test`, `Edit: src/auth.rs`), parsed by `crate::hooks::event`. It was deliberately left
+    /// `None` before that, rather than filled from a PTY-output heuristic, because guessing "the
+    /// live tool call" from rendered terminal text is exactly the kind of plausible-but-wrong
+    /// string this field would be worst as.
+    ///
+    /// Still `None` whenever there is no real answer: a Codex agent or a shell (neither has
+    /// hooks), a Claude agent whose hooks haven't fired yet or have gone stale
+    /// (`crate::hooks::event::HOOK_SIGNAL_TTL`), and any row that isn't [`Status::Run`] - a
+    /// finished agent's last tool call describes the past, not what it is doing.
     pub activity: Option<String>,
     /// Wall-clock time since `crate::work_surface::agents::Agent::spawned_at` - the agent
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
@@ -289,6 +295,12 @@ pub struct WorktreeRow {
     /// Every agent currently open in this worktree, in tab-strip order (creation order,
     /// matching `crate::work_surface::agents::Agents::iter_for_cwd`).
     pub agents: Vec<AgentRow>,
+    /// This worktree's real, persisted-but-not-currently-running agents (GitHub issue #227),
+    /// most recently active first - see [`crate::hooks::history::past_agents_for_worktree`] for
+    /// how "currently running" is excluded. Empty for a worktree with no persisted history, which
+    /// the rail renders as no section at all (no empty-state clutter - see
+    /// `crate::rail::render::AdeApp::render_worktree_row`).
+    pub history: Vec<crate::hooks::history::PastAgent>,
 }
 
 impl WorktreeRow {
@@ -370,13 +382,35 @@ impl WorktreeRow {
 /// the old `ProjectChild`-based `build_project_children` had: `agents.iter().find(...)` only
 /// ever surfaced one agent per worktree, silently hiding any additional ones). Every worktree
 /// appears here, including ones with no agent (e.g. `main`, or a merged/prunable leftover).
+///
+/// Thin wrapper over [`build_worktree_rows_with_history`] with an empty history list, for the
+/// many existing call sites (including most of this module's own tests) that predate GitHub issue
+/// #227 and have no persisted history to fold in.
 pub fn build_worktree_rows(worktrees: &[WorktreeEntry], agents: &[AgentRow]) -> Vec<WorktreeRow> {
+    build_worktree_rows_with_history(worktrees, agents, &[])
+}
+
+/// [`build_worktree_rows`], plus GitHub issue #227's history rows: every entry in `history` is
+/// folded into whichever [`WorktreeRow`] its own [`crate::hooks::history::PastAgent::worktree`]
+/// matches, exactly the way `agents` already is. `history` is expected to already be filtered to
+/// "genuinely past" (see [`crate::hooks::history::past_agents_for_worktree`]) - this function only
+/// groups by path, it does not re-derive which records are live.
+pub fn build_worktree_rows_with_history(
+    worktrees: &[WorktreeEntry],
+    agents: &[AgentRow],
+    history: &[crate::hooks::history::PastAgent],
+) -> Vec<WorktreeRow> {
     worktrees
         .iter()
         .map(|worktree| {
             let agents: Vec<AgentRow> = agents
                 .iter()
                 .filter(|agent| agent.cwd == worktree.path)
+                .cloned()
+                .collect();
+            let history: Vec<crate::hooks::history::PastAgent> = history
+                .iter()
+                .filter(|past| past.worktree == worktree.path)
                 .cloned()
                 .collect();
             WorktreeRow {
@@ -386,6 +420,7 @@ pub fn build_worktree_rows(worktrees: &[WorktreeEntry], agents: &[AgentRow]) -> 
                 note: worktree.note.clone(),
                 error: worktree.error.clone(),
                 agents,
+                history,
             }
         })
         .collect()
@@ -1029,6 +1064,45 @@ mod tests {
     }
 
     #[test]
+    fn build_worktree_rows_with_history_folds_past_agents_into_their_own_matching_worktree() {
+        // GitHub issue #227: a worktree with no live agent at all must still be able to carry
+        // real persisted history - grouping is by path, exactly like `agents` already is, and
+        // must not implicitly require a live agent to be present too.
+        let worktrees = vec![
+            worktree_entry("/repo", clean_note(true)),
+            worktree_entry("/repo-wt/bare-with-history", clean_note(false)),
+            worktree_entry("/repo-wt/no-history", clean_note(false)),
+        ];
+        let past = crate::hooks::history::PastAgent {
+            key: "past-1".to_string(),
+            worktree: PathBuf::from("/repo-wt/bare-with-history"),
+            kind: crate::work_surface::agents::AgentKind::Claude,
+            spawned_at_unix: 1,
+            status: Status::Idle,
+            activity: None,
+            question: None,
+            updated_at_unix: 100,
+            session_id: None,
+        };
+
+        let rows = build_worktree_rows_with_history(&worktrees, &[], std::slice::from_ref(&past));
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows[0].history.is_empty(),
+            "the unrelated /repo row must not receive another worktree's history"
+        );
+        assert_eq!(
+            rows[1].history,
+            vec![past],
+            "the matching worktree must receive its own real history entry"
+        );
+        assert!(
+            rows[2].history.is_empty(),
+            "a worktree with no persisted history must show none - no empty-state entry either"
+        );
+    }
+
+    #[test]
     fn aggregate_status_picks_the_most_urgent_contained_agent() {
         let worktrees = vec![worktree_entry("/repo-wt/a", clean_note(false))];
         let agents = vec![
@@ -1309,6 +1383,7 @@ mod tests {
             note: clean_note(false),
             error: None,
             agents: Vec::new(),
+            history: Vec::new(),
         }];
 
         let groups = group_worktrees_by_repo(vec![repo_worktrees_split(
