@@ -208,6 +208,9 @@ fn truncated(text: &str, max_chars: usize) -> Option<String> {
 /// `description`. Anything unrecognised - including every MCP tool, whose input schema is defined
 /// by a third-party server and cannot be enumerated here - falls through to `None`, which renders
 /// as the bare tool name rather than as a wrong-but-plausible field.
+///
+/// `AskUserQuestion` needs the extra arm below because its content is *nested*, and a flat
+/// top-level lookup finds nothing at all for it - see [`first_question`].
 fn tool_input_preview(tool_input: &serde_json::Value) -> Option<&str> {
     const KEYS: [&str; 6] = [
         "command",
@@ -217,8 +220,57 @@ fn tool_input_preview(tool_input: &serde_json::Value) -> Option<&str> {
         "query",
         "description",
     ];
-    KEYS.iter()
+    if let Some(flat) = KEYS
+        .iter()
         .find_map(|key| tool_input.get(key).and_then(serde_json::Value::as_str))
+    {
+        return Some(flat);
+    }
+    // `header` first, then `question`: this feeds the *activity* line, which
+    // [`ACTIVITY_MAX_CHARS`] documents as a label rather than a sentence, and `header` is
+    // precisely that - Claude Code's own schema calls it a "very short label displayed as a
+    // chip/tag", with "Auth method", "Library", "Approach" as its examples.
+    let question = first_question(tool_input)?;
+    ["header", "question"]
+        .iter()
+        .find_map(|key| question.get(key).and_then(serde_json::Value::as_str))
+}
+
+/// The first entry of an `AskUserQuestion` `tool_input.questions` array.
+///
+/// `AskUserQuestion` is the one tool whose interesting text is not a top-level string, so
+/// [`tool_input_preview`]'s flat lookup could never reach it: the real shape is
+/// `{"questions": [{"question": .., "header": .., "options": [..], "multiSelect": bool}]}`, and
+/// none of `command`/`file_path`/`path`/`pattern`/`query`/`description` appears anywhere in it.
+/// The result was the exact failure the module docs above warn about - a bare `AskUserQuestion`
+/// on the rail, with the actual question nowhere, at the one moment the agent is blocked on the
+/// human and the row most needs to say what it is blocked *on*.
+///
+/// Captured, not guessed, to this module's standing rule: a real `claude` 2.1.228 was driven
+/// through a real interactive session (headless `-p` does not expose this tool at all, which is
+/// why it had never turned up in a capture before) with hooks pointed at a capture script. The
+/// shape above is the verbatim `tool_input` it emitted, cross-checked against the tool's input
+/// schema in the shipped binary. Only the first question is previewed: the schema allows 1-4, the
+/// rail renders one line, and the first is the one the dialog opens on.
+fn first_question(tool_input: &serde_json::Value) -> Option<&serde_json::Value> {
+    tool_input
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|questions| questions.first())
+}
+
+/// The full question sentence an `AskUserQuestion` is blocking on, for the rail's *question* slot.
+///
+/// Deliberately not the same extraction as [`tool_input_preview`]. [`QUESTION_MAX_CHARS`] already
+/// documents why the two slots differ - a question is "a real sentence a human has to act on"
+/// where an activity line "is a label" - and Claude Code hands over both fields separately, so
+/// each slot gets the field that was designed for it rather than one string stretched across
+/// both. `header` remains the fallback for a payload that somehow carries only the chip.
+fn asked_question(tool_input: &serde_json::Value) -> Option<&str> {
+    let question = first_question(tool_input)?;
+    ["question", "header"]
+        .iter()
+        .find_map(|key| question.get(key).and_then(serde_json::Value::as_str))
 }
 
 /// Whether a `Notification`'s `notification_type` really means "a human is being waited on".
@@ -312,9 +364,27 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
 
         // A real permission prompt: the agent is blocked until a human answers. The tool and its
         // argument are the question - "Bash: sudo reboot" is what the human is being asked about.
+        //
+        // `AskUserQuestion` is the exception, and not a cosmetic one. It fires a real
+        // `PermissionRequest` (verified against a real 2.1.228 session), but it is not asking to
+        // be *allowed* to do something - the tool's entire purpose is to put a multiple-choice
+        // question to the human, and that question is already a complete sentence written for
+        // them to read. Wrapping it as "AskUserQuestion needs permission: Which date library
+        // should we use?" would be both redundant and wrong about what is being asked. The rail
+        // shows the question itself.
         "PermissionRequest" => {
             let tool = value.get("tool_name").and_then(serde_json::Value::as_str)?;
-            let argument = value.get("tool_input").and_then(tool_input_preview);
+            let tool_input = value.get("tool_input");
+            if let Some(asked) = tool_input.and_then(asked_question) {
+                return Some(HookReport {
+                    kind: EventKind::Transition,
+                    fact: HookFact::NeedsInput,
+                    activity: None,
+                    question: truncated(asked, QUESTION_MAX_CHARS),
+                    session_id: None,
+                });
+            }
+            let argument = tool_input.and_then(tool_input_preview);
             let question = match argument {
                 Some(argument) => truncated(
                     &format!("{tool} needs permission: {argument}"),
@@ -394,6 +464,92 @@ mod tests {
 
     /// The real `Stop` body from the same run.
     const REAL_STOP: &[u8] = br#"{"session_id":"5a4bef04","cwd":"/tmp/capture","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Both done:\n- `echo hello-from-jerry`","background_tasks":[],"session_crons":[]}"#;
+
+    /// The real `PreToolUse` a real `claude` 2.1.228 wrote when it invoked `AskUserQuestion`,
+    /// captured verbatim (only `transcript_path`/`session_id` shortened).
+    ///
+    /// This one needed an *interactive* session to capture at all: in headless `-p` mode the tool
+    /// is not exposed to the model, which is why the shape had never appeared in a capture and why
+    /// the flat key lookup silently produced a bare tool name for it. Captured by driving a real
+    /// `claude` over a real pty with hooks pointed at a capture script.
+    const REAL_PRE_TOOL_USE_ASK: &[u8] = br#"{"session_id":"6ca8b423","cwd":"/tmp/capture","prompt_id":"826cb806","permission_mode":"default","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which date library should we use?","header":"Date lib","options":[{"label":"date-fns","description":"Modular, tree-shakeable pure functions operating on native Date objects. Larger API surface, no wrapper object."},{"label":"dayjs","description":"Tiny (~2KB) immutable wrapper with a Moment-compatible chainable API. Plugin-based for extras like timezones."}],"multiSelect":false}]},"tool_use_id":"toolu_01ACQnZZPUuATtRma6f1iv9e"}"#;
+
+    /// The real `PermissionRequest` that followed it milliseconds later, from the same capture -
+    /// same `tool_name` and same `tool_input`, no `tool_use_id`.
+    const REAL_PERMISSION_REQUEST_ASK: &[u8] = br#"{"session_id":"6ca8b423","cwd":"/tmp/capture","prompt_id":"826cb806","permission_mode":"default","effort":{"level":"high"},"hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which date library should we use?","header":"Date lib","options":[{"label":"date-fns","description":"Modular, tree-shakeable pure functions operating on native Date objects. Larger API surface, no wrapper object."},{"label":"dayjs","description":"Tiny (~2KB) immutable wrapper with a Moment-compatible chainable API. Plugin-based for extras like timezones."}],"multiSelect":false}]}}"#;
+
+    #[test]
+    fn a_real_ask_user_question_says_what_it_is_asking_rather_than_just_its_own_name() {
+        // The regression this exists for: `AskUserQuestion` nests its content under
+        // `questions[0]`, so the flat top-level lookup found nothing and the rail rendered the
+        // bare string "AskUserQuestion" - at exactly the moment the agent is blocked on the human
+        // and the row most needs to say what it is blocked *on*.
+        let pre = parse("PreToolUse", REAL_PRE_TOOL_USE_ASK).expect("real payload must parse");
+        assert_eq!(
+            pre.activity.as_deref(),
+            Some("AskUserQuestion: Date lib"),
+            "the activity line is a label, so it takes the `header` chip"
+        );
+        assert_eq!(pre.fact, HookFact::Working);
+
+        // The blocked row's question is the real sentence the human has to answer - not
+        // "AskUserQuestion needs permission: ...", which is redundant and wrong about what is
+        // being asked. This tool is not requesting permission to act, it *is* the question.
+        let permission = parse("PermissionRequest", REAL_PERMISSION_REQUEST_ASK)
+            .expect("real payload must parse");
+        assert_eq!(permission.fact, HookFact::NeedsInput);
+        assert_eq!(
+            permission.question.as_deref(),
+            Some("Which date library should we use?")
+        );
+        assert!(
+            !permission
+                .question
+                .as_deref()
+                .is_some_and(|q| q.contains("needs permission")),
+            "a question is not a permission request"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_permission_request_still_names_the_tool_and_its_argument() {
+        // The `AskUserQuestion` special case must not have swallowed the general shape: a tool
+        // that really is asking to be allowed to act still reads as one.
+        let payload = br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"sudo reboot"}}"#;
+        let report = parse("PermissionRequest", payload).expect("must parse");
+        assert_eq!(
+            report.question.as_deref(),
+            Some("Bash needs permission: sudo reboot")
+        );
+    }
+
+    #[test]
+    fn a_malformed_questions_array_falls_back_instead_of_panicking() {
+        // `questions` is model-authored, so every shape below is reachable: empty array, wrong
+        // type, missing text. None may panic, and none may invent a preview.
+        for input in [
+            r#"{"questions":[]}"#,
+            r#"{"questions":"not-an-array"}"#,
+            r#"{"questions":[{}]}"#,
+            r#"{"questions":[{"question":42}]}"#,
+            r#"{"questions":[null]}"#,
+        ] {
+            let payload = format!(
+                r#"{{"hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{input}}}"#
+            );
+            let report = parse("PermissionRequest", payload.as_bytes()).expect("must still parse");
+            assert_eq!(
+                report.fact,
+                HookFact::NeedsInput,
+                "the agent is still blocked whatever the payload looks like"
+            );
+            assert_eq!(
+                report.question.as_deref(),
+                Some("AskUserQuestion needs permission"),
+                "an unreadable question must fall back, never guess: {input}"
+            );
+        }
+    }
 
     #[test]
     fn a_real_captured_bash_pre_tool_use_becomes_working_with_the_real_command() {
