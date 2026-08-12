@@ -599,11 +599,13 @@ impl TextHistory {
     }
 }
 
-/// One of the app's five hand-rolled single-line text inputs (the command-palette query, the rail
-/// agent filter, the Settings › Keybindings filter, the New file name prompt, and the file
+/// One of the app's hand-rolled single-line text inputs (the command-palette query, the rail
+/// agent filter, the Settings › Keybindings filter, the New file name prompt, the file
 /// tree's inline New File / New Folder / Rename editor - `crate::sidebar::tree_ops::TreeInlineEdit`,
-/// which became one of these when GitHub issue #19's tree met issue #17's undo work at a merge)
-/// with a real undo history attached. All five are append/backspace-only with no caret of their own - see
+/// which became one of these when GitHub issue #19's tree met issue #17's undo work at a merge -
+/// the git graph tab's Branches filter, and GitHub issue #242 phase B's interactive-rebase plan
+/// rows' own per-row `reword` message field, one instance per row) with a real undo history
+/// attached. All are append/backspace-only with no caret of their own - see
 /// `crate::rail::AdeApp::handle_filter_key_down`'s own docs for that deliberate scope decision -
 /// so every snapshot here is a collapsed caret at the end of the text.
 ///

@@ -156,20 +156,22 @@ pub fn effective_key_bindings(overrides: &[KeybindingOverride]) -> Vec<KeyBindin
 ///
 /// This is the single source of truth for "what contexts really exist", shared by
 /// [`contexts_could_overlap`] and by `crate::undo_scoping_matrix_tests`, so the two can never
-/// disagree about the app they are both reasoning over. Derived by hand from the thirteen
+/// disagree about the app they are both reasoning over. Derived by hand from the fourteen
 /// `.key_context(..)` call sites in the crate - `crate::root::AdeApp::render`'s baseline `"app"`,
 /// `crate::terminal::pane`, `crate::code_surface::render` (one call site, three literals from a
 /// `match`), `crate::merge::editing`, the eight single-line inputs (the rail's agent filter,
 /// Settings' keymap filter, the palette's own query field, `root::new_file`'s inline name editor,
 /// `crate::graph_view::render`'s Branches filter box, the Themes page's "Generate from colour"
 /// seed field, the General page's "Shell" field (GitHub issue #213), and - newest, GitHub issue
-/// #241 - the git graph row menu's "Create branch here" prompt), which all emit the same bare
-/// `"text-input"`, and `crate::sidebar::render::AdeApp::file_tree_shell` (one call site, four
-/// literals from a `match`) - and guarded against drift by this module's own
-/// `every_real_key_context_call_site_is_covered` test, which fails the moment a fourteenth call
+/// #241 - the git graph row menu's "Create branch here" prompt), plus GitHub issue #242 phase B's
+/// own new single-line input (`crate::graph_view::rebase_render`'s interactive-rebase plan row
+/// reword field), which all emit the same bare `"text-input"`, and
+/// `crate::sidebar::render::AdeApp::file_tree_shell` (one call site, four literals from a
+/// `match`) - and guarded against drift by this module's own
+/// `every_real_key_context_call_site_is_covered` test, which fails the moment a fifteenth call
 /// site appears. (That test earned its keep immediately: this comment originally said "six",
 /// counting distinct emitted literals rather than real call sites, and the test caught it on its
-/// first run; it has since caught this comment drifting behind three more real inputs.)
+/// first run; it has since caught this comment drifting behind four more real inputs.)
 ///
 /// The four `file-tree*` stacks arrived with a merge, not with an edit to this file, which is
 /// exactly why they are called out here. GitHub issue #19's file tree and issue #17's text-undo
@@ -718,14 +720,16 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 13,
-            "real_context_stacks() is hand-derived from exactly thirteen .key_context(..) call \
-             sites (eight of which emit the same bare \"text-input\": the palette, the rail \
+            call_sites, 14,
+            "real_context_stacks() is hand-derived from exactly fourteen .key_context(..) call \
+             sites (nine of which emit the same bare \"text-input\": the palette, the rail \
              filter, the new-file prompt, the Branches filter, the Keybindings filter, the \
              Themes page's \"Generate from colour\" seed input, the General page's \"Shell\" \
-             field (GitHub issue #213), and - newest, GitHub issue #241 - the git graph row \
-             menu's \"Create branch here\" prompt) - a new one means that list, and every \
-             disjointness answer built on it, needs updating. Real sites found: {sites:?}"
+             field (GitHub issue #213), GitHub issue #241's git graph row menu's \"Create \
+             branch here\" prompt, and - newest, GitHub issue #242 phase B - the \
+             interactive-rebase plan row's own reword message field) - a new one means that \
+             list, and every disjointness answer built on it, needs updating. Real sites found: \
+             {sites:?}"
         );
 
         // The file tree's own site is named explicitly: it is the one a merge added while this

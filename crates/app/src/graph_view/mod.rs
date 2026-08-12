@@ -10,6 +10,9 @@
 //! - [`render`] - the real GPUI surface: the tab strip entry, the toolbar, the lane canvas and
 //!   row list, the row `⋯` menu, the Push `▾` menu, and the Commit/Branches right panel, plus
 //!   the `impl AdeApp` glue that opens/closes/loads the tab.
+//! - [`rebase`]/[`rebase_render`] - GitHub issue #242 phase B: the graph pane's own interactive-
+//!   rebase mode (state/mutation glue and rendering respectively), entered from the row `⋯`
+//!   menu's "Interactive rebase from here…" row - see [`rebase`]'s own module docs.
 //!
 //! ## Scope
 //!
@@ -20,18 +23,17 @@
 //! module's own docs for the fetch/pull/push implementations and
 //! [`state::GraphTabState::push_force_confirm_armed`] for the real two-click confirmation the
 //! two force variants require. A later pass wired the row `⋯` menu's Apply group (Cherry-pick/
-//! Revert/Rebase onto this commit, `wt_core::rewrite`) and GitHub issue #241 wired its
-//! Branch/Reset groups too (`Check out`/`Create branch here`/Soft-Mixed-Hard reset,
-//! `wt_core::checkout`) - see [`state::GraphTabState::hard_reset_confirm_armed`] for Hard
-//! reset's own two-click confirmation, the same discipline `push_force_confirm_armed` already
-//! established, and [`state::GraphCreateBranchPrompt`] for "Create branch here"'s small,
-//! hand-rolled branch-name input. Only "Interactive rebase from here" (a separate, later issue -
-//! it needs its own commit-selection UI, not just a click) and "Start agent from this commit"
-//! (needs a new-worktree-creation entry point this app deliberately has none of yet - every
-//! "add worktree"/"add repo" entry point stays out until a real design lands, per Revision R12)
-//! are still rendered **disabled** - `crate::work_surface::render::render_dropdown_menu_row`'s
-//! existing `enabled: false` treatment, with no `.on_click` attached. Agent-to-commit correlation
-//! (which agent
+//! Revert/Rebase onto this commit, `wt_core::rewrite`); GitHub issue #241 wired its Branch/Reset
+//! groups too (`Check out`/`Create branch here`/Soft-Mixed-Hard reset, `wt_core::checkout`) - see
+//! [`state::GraphTabState::hard_reset_confirm_armed`] for Hard reset's own two-click
+//! confirmation, the same discipline `push_force_confirm_armed` already established, and
+//! [`state::GraphCreateBranchPrompt`] for "Create branch here"'s small, hand-rolled branch-name
+//! input; and GitHub issue #242 phase B wired "Interactive rebase from here…" to the real
+//! [`rebase`] mode. Only "Start agent from this commit" is still rendered **disabled** - it
+//! needs a new-worktree-creation entry point this app deliberately has none of yet (every "add
+//! worktree"/"add repo" entry point stays out until a real design lands, per Revision R12) -
+//! using `crate::work_surface::render::render_dropdown_menu_row`'s existing `enabled: false`
+//! treatment, with no `.on_click` attached. Agent-to-commit correlation (which agent
 //! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
@@ -41,13 +43,16 @@
 //! also gained a real column header band (§6.1) in that same revision.
 //!
 //! `render` glob-imports [`state`] (`use super::*`), mirroring `crate::sidebar::render`'s own
-//! convention.
+//! convention; `rebase`/`rebase_render` do the same (each also imports the other's public
+//! items directly, since they're siblings rather than parent/child).
 
 use crate::root::*;
 use crate::theme;
 use crate::work_surface::state as work_surface;
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, Window};
 
+pub(crate) mod rebase;
+pub(crate) mod rebase_render;
 pub(crate) mod render;
 pub(crate) mod state;
 

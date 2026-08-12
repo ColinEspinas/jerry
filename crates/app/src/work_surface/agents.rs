@@ -456,6 +456,45 @@ impl Agents {
         }
     }
 
+    /// Real `SIGSTOP`, via `TerminalPane::pause`, against every real agent session (never a bare
+    /// [`ProcessKind::Shell`] - mirrors [`Self::count_for_cwd`]'s own "a shell has no turns and
+    /// nothing to review" convention) currently open in `cwd` - GitHub issue #242 phase B's
+    /// interactive-rebase UI's "Pause now" action, freezing whatever coding agents are running in
+    /// this worktree before a rebase rewrites files out from under them. Returns exactly the ids
+    /// this call really paused (skipping any [`TerminalPane::pause`] that itself failed, e.g. no
+    /// live session yet, or - honestly reported and simply not counted as paused - a platform
+    /// with no `SIGSTOP` at all), so the caller can later [`Self::resume_agents`] precisely that
+    /// set rather than guessing.
+    pub fn pause_agents_for_cwd(&self, cwd: &Path, cx: &mut Context<AdeApp>) -> Vec<AgentId> {
+        self.iter_for_cwd(cwd.to_path_buf())
+            .filter(|agent| agent.kind.is_agent_session())
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|id| {
+                let Some(agent) = self.agents.iter().find(|agent| agent.id == *id) else {
+                    return false;
+                };
+                agent.pane.read(cx).pause().is_ok()
+            })
+            .collect()
+    }
+
+    /// Real `SIGCONT`, via `TerminalPane::resume`, against every id in `ids` still open - the
+    /// counterpart to [`Self::pause_agents_for_cwd`]. Silently skips any id that has since
+    /// closed (its process is already gone; there is nothing left to resume) rather than
+    /// erroring - resuming is always a best-effort "undo the earlier pause", never itself a
+    /// user-facing action that can fail.
+    pub fn resume_agents(&self, ids: &[AgentId], cx: &mut Context<AdeApp>) {
+        for id in ids {
+            if let Some(agent) = self.agents.iter().find(|agent| agent.id == *id) {
+                if let Err(err) = agent.pane.read(cx).resume() {
+                    log::warn!("failed to resume agent {id}: {err}");
+                }
+            }
+        }
+    }
+
     /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
     /// agent's pane is foreground (`TerminalPane::set_foreground`), every other pane is
     /// background. Called at the end of **every** mutator that can change which agent is

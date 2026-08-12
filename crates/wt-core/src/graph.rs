@@ -488,6 +488,67 @@ pub fn ahead_behind_against_upstream(worktree_path: &Path) -> Result<Option<Ahea
     Ok(parse_counts(&text))
 }
 
+/// Which of `commits` (real, full object ids) are already reachable from `HEAD`'s configured
+/// `@{upstream}` - i.e. already pushed there. GitHub issue #242 phase B: the interactive-rebase
+/// UI's remote-tracking warning ("a force-with-lease push will be needed afterward") needs this
+/// per-commit; [`ahead_behind_against_upstream`]'s aggregate counts don't say *which* commits
+/// make up the divergence.
+///
+/// `Ok(None)` when `HEAD` has no configured upstream - mirrors
+/// [`ahead_behind_against_upstream`]'s own "nothing to compare against" convention rather than
+/// fabricating an empty `Vec` (which would be indistinguishable from "checked, and none are
+/// already pushed").
+///
+/// One real `git merge-base --is-ancestor <commit> <upstream>` per commit - that command's exit
+/// code is the real, direct answer ("is `<commit>` an ancestor of `<upstream>`'s tip", i.e.
+/// already merged into its history): `0` means yes, `1` means no, anything else is a genuine
+/// error (e.g. `commit` doesn't exist), surfaced rather than silently treated as "no".
+///
+/// Performs blocking I/O: one `git rev-parse` to resolve the upstream, then one `git merge-base
+/// --is-ancestor` per commit.
+pub fn commits_already_on_upstream(
+    worktree_path: &Path,
+    commits: &[String],
+) -> Result<Option<Vec<String>>, Error> {
+    let upstream_args: Vec<OsString> = vec![
+        "rev-parse".into(),
+        "--abbrev-ref".into(),
+        "--symbolic-full-name".into(),
+        "@{upstream}".into(),
+    ];
+    let upstream_output = run_git(worktree_path, &upstream_args)?;
+    if !upstream_output.status.success() {
+        // No upstream configured - not an error, just nothing to compare against.
+        return Ok(None);
+    }
+    let upstream = String::from_utf8_lossy(&upstream_output.stdout)
+        .trim()
+        .to_string();
+
+    let mut already_on_upstream = Vec::new();
+    for commit in commits {
+        let args: Vec<OsString> = vec![
+            "merge-base".into(),
+            "--is-ancestor".into(),
+            commit.clone().into(),
+            upstream.clone().into(),
+        ];
+        let output = run_git(worktree_path, &args)?;
+        match output.status.code() {
+            Some(0) => already_on_upstream.push(commit.clone()),
+            Some(1) => {}
+            _ => {
+                return Err(Error::GitCommand {
+                    args: crate::format_args(&args),
+                    exit: crate::error::GitExit::from_status(&output.status),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+        }
+    }
+    Ok(Some(already_on_upstream))
+}
+
 fn parse_counts(text: &str) -> Option<AheadBehind> {
     let mut parts = text.split_whitespace();
     let behind = parts.next().and_then(|part| part.parse::<usize>().ok())?;
@@ -1364,6 +1425,58 @@ mod tests {
             .expect("an upstream is configured by clone");
         assert_eq!(result.ahead, 1);
         assert_eq!(result.behind, 0);
+    }
+
+    #[test]
+    fn commits_already_on_upstream_is_none_without_a_configured_upstream() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "1", "base");
+        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let result =
+            commits_already_on_upstream(repo.path(), &[head]).expect("commits_already_on_upstream");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn commits_already_on_upstream_distinguishes_pushed_from_local_only_commits() {
+        let remote = init_repo();
+        commit(remote.path(), "a.txt", "1", "base");
+
+        let local_dir = TempDir::new().expect("tempdir");
+        git(
+            local_dir.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(
+            local_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(local_dir.path(), &["config", "user.name", "Test User"]);
+        let pushed = git_output(local_dir.path(), &["rev-parse", "HEAD"]);
+        commit(local_dir.path(), "b.txt", "1", "local only");
+        let local_only = git_output(local_dir.path(), &["rev-parse", "HEAD"]);
+
+        let result =
+            commits_already_on_upstream(local_dir.path(), &[pushed.clone(), local_only.clone()])
+                .expect("commits_already_on_upstream")
+                .expect("an upstream is configured by clone");
+        assert_eq!(
+            result,
+            vec![pushed],
+            "only the commit that already exists on the remote's tip should be reported - not \
+             the local-only one"
+        );
+        assert!(!result.contains(&local_only));
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
