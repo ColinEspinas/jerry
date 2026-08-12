@@ -1163,7 +1163,10 @@ impl AdeApp {
     pub(in crate::rail) fn worktree_is_expanded(&self, row: &WorktreeRow) -> bool {
         match self.rail_collapse_overrides.get(&row.path) {
             Some(expanded) => *expanded,
-            None => self.active_agent_cwd() == row.path || row.aggregate_status() != Status::Idle,
+            None => {
+                self.active_agent_cwd().as_deref() == Some(row.path.as_path())
+                    || row.aggregate_status() != Status::Idle
+            }
         }
     }
 
@@ -1227,7 +1230,12 @@ impl AdeApp {
                 .into_any_element();
         }
 
-        let is_selected = self.active_agent_cwd() == row.path;
+        // The rail's own "this row is the selected worktree" state, read from the exact same
+        // single source of truth the tab strip scopes itself to - so the two can never disagree.
+        // With `Self::active_agent_cwd`'s repo-root fallback removed, "nothing is selected" now
+        // genuinely draws *no* row as selected, rather than lighting up whichever row happened to
+        // sit at the repo root while the tab strip showed something else entirely.
+        let is_selected = self.active_agent_cwd().as_deref() == Some(row.path.as_path());
         let has_agents = !row.agents.is_empty();
         let has_history = !row.history.is_empty();
         // GitHub issue #227: a worktree with no live agent but real persisted history must still
@@ -2205,7 +2213,7 @@ mod rail_row_tests {
         });
         assert_eq!(
             app.read_with(cx, |app, _| app.active_agent_cwd()),
-            wt.path(),
+            Some(wt.path().to_path_buf()),
             "premise: `wt` really is the currently selected worktree"
         );
 
@@ -3142,7 +3150,7 @@ mod repo_checkout_tests {
             );
             assert_eq!(
                 app.active_agent_cwd(),
-                repo_b_feature,
+                Some(repo_b_feature.clone()),
                 "the whole point of the switch: new work now targets the clicked worktree"
             );
             assert_eq!(
@@ -3418,6 +3426,491 @@ mod repo_checkout_tests {
             repo_b.path(),
             "sanity check: the row is keyed by git's own resolved path"
         );
+    }
+}
+
+/// The reported "at the start of the program you select something and a tab bar has a terminal;
+/// then I select a worktree and this is lost" - and the architectural invariant that replaced the
+/// family of bugs behind it:
+///
+/// **A tab is never shown, never spawnable, and never implicitly attributed to anything except a
+/// real, currently-selected worktree. There is no such thing as "a repo's own tab".**
+///
+/// Every test here drives real, painted rail rows through `cx.simulate_click` on real
+/// `debug_bounds`, against real `git init`-ed repositories and real PTY processes - the same
+/// technique `repo_checkout_tests` above uses - rather than calling selection methods directly,
+/// because the whole class of bugs being fixed was about what the *rendered* rail, tab strip, and
+/// centre pane each independently believed.
+#[cfg(test)]
+mod worktree_tab_attribution_tests {
+    use crate::root::focus::palette_focus_tests;
+    use crate::work_surface::state::TabRef;
+    use gpui::TestAppContext;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A real repository with a real commit - `wt_core::list_worktrees_porcelain` reports nothing
+    /// at all for a bare `tempfile::tempdir()`, so these tests need a genuine main worktree row.
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        path
+    }
+
+    /// Clicks the real, painted rail row for `worktree_path`, exactly as a user would - resolving
+    /// the row's own `debug_selector` from the very `build_repo_groups` output it was rendered
+    /// from, the same idiom `repo_checkout_tests::
+    /// clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it` established.
+    fn click_worktree_row(
+        app: &gpui::Entity<crate::root::AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        worktree_path: &Path,
+    ) {
+        let index = app
+            .update(cx, |app, cx| app.build_repo_groups(cx))
+            .iter()
+            .find_map(|group| group.rows.iter().position(|row| row.path == worktree_path))
+            .expect("the worktree must be a real, rendered rail row");
+        let selector: &'static str =
+            Box::leak(format!("worktree-row-{index}-{}", worktree_path.display()).into_boxed_str());
+        let bounds = cx
+            .debug_bounds(selector)
+            .expect("the worktree row must have painted");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// The startup half of the reported bug. A fresh `jerry <repo>` launch spawns a real shell and
+    /// shows its tab - but it used to leave `AdeApp::selected` at `None`, so *the user never
+    /// selected the worktree that tab belongs to*. The tab rendered only because
+    /// `AdeApp::active_agent_cwd`'s repo-root fallback happened to coincide with the main
+    /// worktree's own path. This asserts the real thing instead: the main worktree is genuinely
+    /// selected, and the startup shell genuinely lives in it.
+    #[gpui::test]
+    fn a_fresh_launch_genuinely_selects_the_repos_own_main_worktree(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let selected = app
+                .selected
+                .and_then(|index| app.worktrees.get(index))
+                .map(|item| item.path.clone());
+            assert_eq!(
+                selected,
+                Some(repo.path().to_path_buf()),
+                "a fresh launch must land on the repo's own main worktree as a real selection - \
+                 `AdeApp::selected` staying `None` here is the reported bug, not a neutral \
+                 starting state"
+            );
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(repo.path().to_path_buf()),
+                "and it must be a real selection, not `active_agent_cwd`'s old repo-root fallback"
+            );
+            let startup_shell_cwds: Vec<PathBuf> =
+                app.agents.iter().map(|agent| agent.cwd.clone()).collect();
+            assert_eq!(
+                startup_shell_cwds,
+                vec![repo.path().to_path_buf()],
+                "the guaranteed startup shell must have been spawned into that same, genuinely \
+                 selected worktree"
+            );
+            assert_eq!(
+                app.combined_tab_order().len(),
+                1,
+                "and its tab must be the one thing the strip shows"
+            );
+        });
+    }
+
+    /// The reported gesture end to end, through real clicks: the startup terminal must not be
+    /// *lost* when the user selects a different worktree - it must be a real, reversible switch
+    /// between two genuinely selected worktrees, with the same live process still there on the
+    /// way back.
+    ///
+    /// Before this revision, step 1 had no selection behind it at all, which is what made step 2
+    /// read as destruction rather than navigation.
+    #[gpui::test]
+    fn the_startup_terminal_is_a_real_worktrees_tab_and_survives_switching_away_and_back(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "feature");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let startup_agent = app.read_with(cx, |app, _| {
+            let agents: Vec<_> = app.agents.iter().map(|agent| agent.id).collect();
+            assert_eq!(agents.len(), 1, "exactly one startup shell");
+            agents[0]
+        });
+
+        // Step 1: the main worktree really is the selected one, and really owns the tab.
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(repo.path().to_path_buf()),
+                "premise: the startup terminal's own worktree must be genuinely selected before \
+                 the user ever clicks anything - that is what makes the switch below a \
+                 reversible navigation rather than an unexplained loss"
+            );
+            assert_eq!(
+                app.combined_tab_order(),
+                vec![TabRef::Agent(startup_agent)],
+                "and the startup shell must be that worktree's own single tab"
+            );
+        });
+
+        // Step 2: a real click on the linked worktree's row - an honest switch to a worktree that
+        // has no tabs of its own yet.
+        click_worktree_row(&app, cx, &feature);
+        app.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(feature.clone()),
+                "the clicked worktree must be the selected one"
+            );
+            assert!(
+                app.combined_tab_order().is_empty(),
+                "and it genuinely has no tabs - an honestly empty strip, not a fabricated one"
+            );
+            let shell = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == startup_agent)
+                .expect("the startup shell must still exist - switching worktrees never kills it");
+            assert!(
+                shell.pane.read(cx).is_running(),
+                "and it must still be a real, live process, merely not the shown one"
+            );
+        });
+
+        // Step 3: clicking back must restore the very same tab, not a respawned lookalike.
+        click_worktree_row(&app, cx, repo.path());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.combined_tab_order(),
+                vec![TabRef::Agent(startup_agent)],
+                "clicking back to the main worktree must restore the exact same startup shell \
+                 tab - the process was never lost, only unshown"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                Some(startup_agent),
+                "and the centre pane must genuinely be showing it again"
+            );
+        });
+    }
+
+    /// The real, permanent-loss half of the bug, live-reproduced before the fix: launching against
+    /// a *subdirectory* of a repo (`jerry ./crates` - an entirely ordinary invocation).
+    ///
+    /// `AdeApp::active_agent_cwd` used to resolve to that bare subdirectory, which
+    /// `git worktree list --porcelain` reports as no worktree at all. The startup shell spawned
+    /// there rendered a real tab in the strip while *every* rail row read as unselected, and the
+    /// moment any worktree row was clicked the tab vanished for good - its `cwd` could never again
+    /// equal any row's path, so the live PTY was orphaned with no reachable way back.
+    #[gpui::test]
+    fn launching_against_a_subdirectory_still_attributes_its_shell_to_a_real_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        std::fs::create_dir_all(repo.path().join("crates")).expect("mkdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().join("crates"));
+        cx.run_until_parked();
+
+        let startup_agent = app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(repo.path().to_path_buf()),
+                "a subdirectory is not a worktree - this must land on the repo's real main \
+                 worktree rather than on the subdirectory itself"
+            );
+            let agents: Vec<_> = app
+                .agents
+                .iter()
+                .map(|agent| (agent.id, agent.cwd.clone()))
+                .collect();
+            assert_eq!(
+                agents.len(),
+                1,
+                "the guaranteed startup shell must still exist"
+            );
+            assert_eq!(
+                agents[0].1,
+                repo.path().to_path_buf(),
+                "and it must have been spawned into the real main worktree, not the \
+                 subdirectory - a shell whose cwd matches no worktree row can never be reached \
+                 from the rail again"
+            );
+            agents[0].0
+        });
+
+        // The row that reads as selected must be a real one, and clicking it must be a no-op that
+        // keeps the tab - the exact click that used to orphan it forever.
+        click_worktree_row(&app, cx, repo.path());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.combined_tab_order(),
+                vec![TabRef::Agent(startup_agent)],
+                "clicking the worktree the startup shell actually belongs to must keep its tab, \
+                 not make it unreachable"
+            );
+        });
+    }
+
+    /// Launching directly inside a linked worktree (`jerry ~/repo-wt/feature`) must land on *that*
+    /// worktree, not silently redirect to the repo's main one.
+    #[gpui::test]
+    fn launching_inside_a_linked_worktree_selects_that_worktree_not_main(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let feature = add_worktree(repo.path(), "feature", "feature");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, feature.clone());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(feature.clone()),
+                "the worktree the user actually pointed at must be the selected one"
+            );
+            assert_eq!(
+                app.agents.iter().map(|a| a.cwd.clone()).collect::<Vec<_>>(),
+                vec![feature.clone()],
+                "and the startup shell must live in it"
+            );
+        });
+    }
+
+    /// GitHub issue #90's "Open Folder…" is the other real opening gesture, and it duplicated the
+    /// constructor's spawn-into-the-bare-repo-path logic almost verbatim. Both now funnel through
+    /// the same `AdeApp::load_worktrees_for_opened_repo`, so they cannot drift apart on which
+    /// worktree the window lands in - this proves the "Open Folder…" half directly.
+    #[gpui::test]
+    fn opening_a_folder_lands_on_a_real_worktree_and_spawns_its_shell_there(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let selected = app
+                .selected
+                .and_then(|index| app.worktrees.get(index))
+                .map(|item| item.path.clone());
+            assert_eq!(
+                selected,
+                Some(repo_b.path().to_path_buf()),
+                "opening a folder must land on that repo's own main worktree as a real selection"
+            );
+            assert_eq!(
+                app.combined_tab_order().len(),
+                1,
+                "and the shell it guarantees must be that worktree's own single tab"
+            );
+            assert!(
+                app.agents
+                    .iter()
+                    .any(|agent| agent.cwd == repo_b.path()
+                        && Some(agent.id) == app.agents.active_id()),
+                "and the active tab must genuinely be an agent in repo B's main worktree"
+            );
+        });
+    }
+
+    /// The real race the opening path has to survive, found reviewing this revision's own diff:
+    /// the worktree-list fetch is asynchronous, so a user can click a worktree row while it is
+    /// still in flight.
+    ///
+    /// That click sets `AdeApp::selected`, which makes `crate::rail::worktrees::recover_selection`
+    /// report `Unchanged` rather than `NoPriorSelection` when the fetch finally lands. An
+    /// `Opening` handler living *inside* that one match arm - which is how this was first written
+    /// - would therefore silently skip the window's guaranteed initial shell altogether, leaving a
+    /// freshly opened repo with no terminal at all. The handler is keyed off `AdeApp::selected`
+    /// after the match instead, so a raced click is simply respected: the worktree the user
+    /// actually chose stays selected, and the shell is spawned into *that*.
+    #[gpui::test]
+    fn a_worktree_click_racing_the_open_fetch_still_gets_its_guaranteed_shell(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let feature = add_worktree(repo_b.path(), "feature", "feature");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+        // Repo B is already a known repo with a real, already-fetched worktree list - which is
+        // what makes the racing click below able to resolve a row at all.
+        app.update(cx, |app, cx| {
+            app.add_repo(repo_b.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+            // Deliberately no `run_until_parked` between these two: this is the whole race - the
+            // click lands while the opening fetch is genuinely still in flight.
+            app.select_worktree_by_path(&feature, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_cwd(),
+                Some(feature.clone()),
+                "the worktree the user actually clicked must win over the one the in-flight open \
+                 fetch would have picked on its own"
+            );
+            assert!(
+                app.agents.iter().any(|agent| agent.cwd == feature),
+                "and the window's guaranteed initial shell must still have been spawned - into \
+                 the raced-to worktree. Skipping it here (because `recover_selection` reported \
+                 `Unchanged` rather than `NoPriorSelection`) would leave a freshly opened repo \
+                 with no terminal at all"
+            );
+            assert!(
+                !app.combined_tab_order().is_empty(),
+                "so the tab strip genuinely shows it"
+            );
+        });
+    }
+
+    /// The invariant's negative half, and the third live-reproduced inconsistency: while nothing
+    /// is genuinely selected, *nothing* may claim to be showing.
+    ///
+    /// Before this revision, `AdeApp::checkout_repo_from_rail` left `AdeApp::selected` at `None`
+    /// while `active_agent_cwd` still resolved to the repo root, producing a real three-way
+    /// disagreement: the rail drew the main-worktree row as selected, the tab strip drew the root
+    /// shell's tab, and the centre pane rendered nothing at all (`Agents::clear_active` having
+    /// genuinely cleared it). All three now agree.
+    ///
+    /// `checkout_repo_from_rail` deliberately still selects nothing of its own - see its own docs,
+    /// and `repo_list_tests::checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own`
+    /// - it is an internal sub-step of a worktree-row click, never a resting state a user can
+    /// reach. This asserts that that transient state is now genuinely self-consistent rather than
+    /// merely looking plausible.
+    #[gpui::test]
+    fn nothing_selected_means_nothing_shown_anywhere(cx: &mut TestAppContext) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Repo B enters through the real "Open Folder…" gesture, so it genuinely has a live shell
+        // in its own main worktree - the precondition that made the old disagreement visible.
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let repo_a_id = app.read_with(cx, |app, _| {
+            app.repos
+                .iter()
+                .find(|repo| repo.path == repo_a.path())
+                .expect("repo A is known")
+                .id
+        });
+        let repo_b_id = app.read_with(cx, |app, _| {
+            app.repos
+                .iter()
+                .find(|repo| repo.path == repo_b.path())
+                .expect("repo B is known")
+                .id
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_a_id, window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            assert_eq!(app.selected, None, "premise: nothing is selected");
+            assert_eq!(
+                app.active_agent_cwd(),
+                None,
+                "so there is genuinely no active worktree - not the repo root standing in for one"
+            );
+            assert!(
+                app.combined_tab_order().is_empty(),
+                "the tab strip must therefore be honestly empty, even though repo B really does \
+                 have a live shell in its own root: that shell belongs to a worktree nobody has \
+                 selected"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                None,
+                "and the centre pane must be showing nothing - the state the tab strip used to \
+                 contradict"
+            );
+            let any_row_selected = app
+                .build_worktree_rows(cx)
+                .iter()
+                .any(|row| app.active_agent_cwd().as_deref() == Some(row.path.as_path()));
+            assert!(
+                !any_row_selected,
+                "and no rail row may read as selected either - the rail used to light up the \
+                 main-worktree row here purely because `active_agent_cwd` fell back to the repo \
+                 root"
+            );
+            assert!(
+                app.agents
+                    .iter()
+                    .any(|agent| agent.cwd == repo_b.path() && agent.pane.read(cx).is_running()),
+                "repo B's own shell must still be a real, live background process throughout - \
+                 cross-repo agent persistence is untouched by any of this"
+            );
+        });
     }
 }
 

@@ -76,7 +76,14 @@ impl AdeApp {
         if self.focused_repo().is_none() {
             return;
         }
-        let cwd = self.active_agent_cwd();
+        // A tab is only ever attributable to a real, currently-selected worktree - there is no
+        // such thing as "a repo's own tab". With no worktree genuinely selected there is nothing
+        // legitimate to spawn into, so this refuses rather than falling back to the repo root as
+        // it used to (see `Self::active_agent_cwd`'s own docs for the family of live-reproduced
+        // bugs that fallback caused).
+        let Some(cwd) = self.active_agent_cwd() else {
+            return;
+        };
         // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
@@ -586,7 +593,14 @@ impl AdeApp {
     /// own tab is *labeled* (`Self::current_worktree_agent_tab_labels`'s bare-shell label), just
     /// not which tabs render at all.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
-        let cwd = self.active_agent_cwd();
+        // No worktree genuinely selected means genuinely no tabs - an honestly empty strip, not
+        // whatever happens to be open in the repo root. This used to fall through to
+        // `Self::active_agent_cwd`'s repo-root fallback, which is how a live terminal could be
+        // drawn in the strip while the centre pane showed nothing and no rail row claimed it (see
+        // that method's own docs for the live repro).
+        let Some(cwd) = self.active_agent_cwd() else {
+            return Vec::new();
+        };
         let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
         let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
         // `Self::tab_order` hasn't been touched for yet *this session* falls back to its real,
@@ -636,7 +650,11 @@ impl AdeApp {
         insert_after: bool,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.active_agent_cwd();
+        // A drag can only ever have started from a tab that was genuinely rendered, which means a
+        // real worktree is selected - this refusal is defensive, not a reachable path.
+        let Some(cwd) = self.active_agent_cwd() else {
+            return;
+        };
         let mut order = self.combined_tab_order();
         work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
         self.tab_order.insert(cwd.clone(), order.clone());
@@ -837,7 +855,7 @@ impl AdeApp {
     /// [`Self::render_agent_context_bar`]'s own branch lookup so both read the same fact the
     /// same way.
     fn current_worktree_branch(&self) -> Option<String> {
-        let cwd = self.active_agent_cwd();
+        let cwd = self.active_agent_cwd()?;
         self.worktrees
             .iter()
             .find(|item| item.path == cwd)
@@ -1596,7 +1614,11 @@ impl AdeApp {
         if self.focused_repo().is_none() {
             return;
         }
-        let cwd = self.active_agent_cwd();
+        // The identical "no worktree selected means nothing legitimate to spawn into" refusal
+        // [`Self::new_agent`] applies - see its own docs.
+        let Some(cwd) = self.active_agent_cwd() else {
+            return;
+        };
         let task = cx.spawn(async move |this, cx| {
             let installed = cx
                 .background_executor()

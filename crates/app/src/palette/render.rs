@@ -157,7 +157,15 @@ impl AdeApp {
             })
             .collect();
 
-        let active_cwd = self.active_agent_cwd();
+        // The three spawn commands below name the real worktree they would spawn into. With no
+        // worktree genuinely selected they would spawn nothing at all (`Self::new_agent`/
+        // `Self::new_agent_pane` both refuse outright), so the honest thing to show is that -
+        // rather than the repo root, which is what `Self::active_agent_cwd` used to hand back and
+        // which was never a place a tab could legitimately belong to. See that method's own docs.
+        let spawn_target = match self.active_agent_cwd() {
+            Some(cwd) => format!("in {}", cwd.display()),
+            None => "- select a worktree first".to_string(),
+        };
         let next_sidebar_view = match self.right_sidebar_view {
             RightSidebarView::Files => "Changes",
             RightSidebarView::Changes => "Files",
@@ -165,15 +173,15 @@ impl AdeApp {
         let mut commands = vec![
             palette::CommandCandidate {
                 command: palette::PaletteCommand::NewShell,
-                secondary: format!("spawn a shell in {}", active_cwd.display()),
+                secondary: format!("spawn a shell {spawn_target}"),
             },
             palette::CommandCandidate {
                 command: palette::PaletteCommand::NewClaudeAgent,
-                secondary: format!("spawn claude in {}", active_cwd.display()),
+                secondary: format!("spawn claude {spawn_target}"),
             },
             palette::CommandCandidate {
                 command: palette::PaletteCommand::NewCodexAgent,
-                secondary: format!("spawn codex in {}", active_cwd.display()),
+                secondary: format!("spawn codex {spawn_target}"),
             },
             palette::CommandCandidate {
                 command: palette::PaletteCommand::ToggleFilesChanges,
