@@ -2528,14 +2528,18 @@ impl AdeApp {
         if self.focused_repo().map(|repo| repo.id) == Some(id) {
             return;
         }
-        let Some(path) = self
-            .repos
-            .iter()
-            .find(|repo| repo.id == id)
-            .map(|repo| repo.path.clone())
-        else {
+        let Some(repo) = self.repos.iter().find(|repo| repo.id == id) else {
             return;
         };
+        let path = repo.path.clone();
+        // Seeded synchronously from this repo's own already-known worktree list, the same
+        // already-fetched data `Self::select_worktree_by_path`'s cross-repo case seeds from (see
+        // its own docs for the identical reasoning) - kept fresh in the background by
+        // `Self::start_repo_worktrees_polling` regardless of which repo is focused, so this is
+        // usually populated by the time a real click lands here. `None` only for a repo that has
+        // never had its own worktree list fetched at all (just added, or `Self::load_worktrees`'s
+        // own upcoming fetch below is this repo's very first).
+        let seeded_worktrees = repo.worktrees_loaded.then(|| repo.worktrees.clone());
 
         self.focus_repo(id, cx);
 
@@ -2550,8 +2554,20 @@ impl AdeApp {
         // the centre pane actually shows, exactly as a fresh `Self::open_repo_in_current_window`
         // switch already does.
         self.agents.activate_for_worktree(&path, cx);
-        self.selected = None;
         self.worktree_selection_notice = None;
+        // A freshly focused repo must land on a real worktree selection immediately, not wait on
+        // `Self::load_worktrees`'s own background fetch to land moments later (that fetch still
+        // runs below regardless, and re-syncs this the identical way any other refresh does) -
+        // see `Self::load_worktrees`'s own `NoPriorSelection` docs for the real bug this closes:
+        // with nothing selected, `Self::active_agent_cwd`'s fallback let a tab strip "+" click
+        // spawn rooted at the repository itself rather than any worktree inside it.
+        match seeded_worktrees {
+            Some(items) => {
+                self.selected = items.iter().position(|item| item.is_main);
+                self.worktrees = items;
+            }
+            None => self.selected = None,
+        }
         self.reset_repo_scoped_state(path, window, cx);
         self.load_worktrees(cx);
         self.start_worktree_watch(cx);
@@ -3300,6 +3316,21 @@ mod repo_list_tests {
     use super::*;
     use crate::rail::repo::RepoState;
     use gpui::TestAppContext;
+
+    /// A real git repository with a real commit - a plain `tempfile::tempdir()` (what most tests
+    /// in this module use) has no worktrees `wt_core::list_worktrees_porcelain` can report at
+    /// all, which is fine for tests about agent persistence but not for one that needs a real
+    /// main-worktree row to select.
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
 
     fn open_test_app_with_real_settings_path(
         cx: &mut TestAppContext,
@@ -4134,6 +4165,108 @@ mod repo_list_tests {
                 app.focused_repo_path(),
                 repo_b.path(),
                 "sanity check: repo B really is the focused repo after checkout"
+            );
+        });
+    }
+
+    /// The reported "we can add a tab to the repo itself" - checking out a repo from the rail
+    /// used to leave `AdeApp::selected` at `None` until the user explicitly clicked a worktree
+    /// row, and `AdeApp::active_agent_cwd`'s fallback to the bare repo path for exactly that
+    /// `None` state let a tab strip "+" click spawn a tab with no worktree behind it at all. A
+    /// freshly checked-out repo must instead land on its own main worktree as a real selection
+    /// immediately - checked *before* `cx.run_until_parked()` runs, so this proves the
+    /// synchronous seed in `AdeApp::checkout_repo_from_rail` itself, not just the fallback
+    /// `AdeApp::load_worktrees` background fetch that lands moments later.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_lands_on_its_main_worktree_not_unselected(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        // Repo B's own worktree list is fetched and mirrored into `Repo::worktrees` here, before
+        // it is ever checked out - the real precondition for `checkout_repo_from_rail`'s own
+        // synchronous seed to have anything to seed from.
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+
+        // Deliberately no `run_until_parked()` between the checkout and this read: the whole
+        // point is that the selection is real *before* `load_worktrees`'s own background fetch
+        // could possibly have resolved.
+        app.read_with(cx, |app, _| {
+            let selected_path = app
+                .selected
+                .and_then(|index| app.worktrees.get(index))
+                .map(|item| item.path.clone());
+            assert_eq!(
+                selected_path,
+                Some(repo_b.path().to_path_buf()),
+                "checking out repo B must immediately select its own main worktree, not leave \
+                 `selected` at `None` until a user clicks a specific row"
+            );
+            assert_eq!(
+                app.active_agent_cwd(),
+                repo_b.path(),
+                "sanity check: a tab spawned right now would still target the right directory"
+            );
+        });
+
+        // And the real background fetch landing moments later must not undo it.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.selected.is_some(),
+                "the real `load_worktrees` fetch that follows must not clobber the seeded \
+                 selection back to `None`"
+            );
+        });
+    }
+
+    /// The reported "weird flicker on the worktrees" when clicking a repo: before the
+    /// synchronous seed above existed, `AdeApp::worktrees` was left completely untouched by
+    /// `checkout_repo_from_rail` - still repo A's own rows - for the entire synchronous portion
+    /// of the click (and so for the very next render), with repo B's header now showing above
+    /// them. Repo A's rows visibly flashed under repo B's name until `load_worktrees`'s
+    /// background fetch replaced them a moment later. Checked *before* `run_until_parked()`, so
+    /// this proves the synchronous seed, not the eventual correct state everything converges to
+    /// anyway.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_never_shows_the_previous_repos_worktrees_even_briefly(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+
+        // No `run_until_parked()`: this is exactly the state the very next render would use.
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.worktrees.iter().all(|item| item.path != repo_a.path()),
+                "repo A's own worktree must never appear in the rendered list once repo B is \
+                 focused, not even for the one frame before the background fetch resolves - got \
+                 {:?}",
+                app.worktrees
+            );
+            assert!(
+                app.worktrees.iter().any(|item| item.path == repo_b.path()),
+                "repo B's own main worktree must be showing immediately, not waiting on the \
+                 background fetch"
             );
         });
     }

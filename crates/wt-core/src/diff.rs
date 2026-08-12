@@ -923,16 +923,84 @@ pub(crate) fn prepare_shadow_index(
         ShadowIndexContent::TrackedOnly => add_args.push("-u".into()),
     }
     add_args.extend([OsString::from("--"), ".".into()]);
-    let output = git_command(worktree_path, &add_args)
-        .env("GIT_INDEX_FILE", shadow.path())
-        .output()
-        .map_err(|source| Error::GitSpawn {
-            args: format_args(&add_args),
-            source,
-        })?;
-    check_success(&add_args, &output)?;
+
+    // Retries only `write new index file` - a real, reported failure (GitHub issue tracker, two
+    // independent real repositories, this app running natively on Windows/NTFS - confirmed
+    // directly, not a WSL cross-mount) that survives even the git-directory placement above:
+    // Windows real-time antivirus (Defender or otherwise) scans every newly created file,
+    // including the `<GIT_INDEX_FILE>.lock` git creates right here, and if that scan holds the
+    // file open at the exact instant git tries to rename it into place, the rename fails and git
+    // reports exactly this - the same well-documented interaction every major git GUI on Windows
+    // (SourceTree, GitKraken, VS Code) has its own issue thread about. That window is
+    // milliseconds wide and gone almost immediately, which is what makes a bounded retry the
+    // correct handling rather than a workaround: the write itself is fully idempotent (this
+    // shadow index has no state a second attempt could corrupt), the failure is a real, external,
+    // transient lock this process does not control and cannot avoid by choosing a different
+    // directory (moving the file does not move the antivirus), and retrying is exactly what git's
+    // own porcelain commands do for other transient-lock classes already. Every *other* `git add`
+    // failure - a genuinely broken repository, a permissions error that will not resolve itself -
+    // still surfaces immediately on the first attempt; retrying those would only delay a real
+    // error the user needs to see.
+    retry_transient_index_write_failure(|| {
+        let output = git_command(worktree_path, &add_args)
+            .env("GIT_INDEX_FILE", shadow.path())
+            .output()
+            .map_err(|source| Error::GitSpawn {
+                args: format_args(&add_args),
+                source,
+            })?;
+        check_success(&add_args, &output)
+    })?;
 
     Ok(shadow)
+}
+
+/// How many total attempts [`retry_transient_index_write_failure`] makes before giving up and
+/// returning the real error - the first attempt plus this many retries.
+const MAX_INDEX_WRITE_ATTEMPTS: u32 = 3;
+
+/// The retry *policy* behind the git-directory placement's own docs above: retries `attempt_git`
+/// only when it fails with [`is_transient_index_write_failure`], up to
+/// [`MAX_INDEX_WRITE_ATTEMPTS`] total tries, with a short growing backoff between them. Every
+/// other failure - a genuinely broken repository, a permissions error that will not resolve
+/// itself - returns immediately on the first attempt; retrying those would only delay a real
+/// error the user needs to see.
+///
+/// A free function taking a closure, rather than inlined into [`prepare_shadow_index`], so this
+/// policy is independently testable: the real failure this exists for is a Windows-only
+/// antivirus/rename race that this Linux dev environment cannot genuinely reproduce (confirmed by
+/// direct testing - see this crate's own investigation notes), so what's verified here is that
+/// the retry *logic itself* is correct (retries transient failures, stops immediately on
+/// anything else, gives up after the bound), independent of ever reproducing the real OS
+/// condition that triggers it.
+fn retry_transient_index_write_failure(
+    mut attempt_git: impl FnMut() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match attempt_git() {
+            Ok(()) => return Ok(()),
+            Err(Error::GitCommand { ref stderr, .. })
+                if attempt < MAX_INDEX_WRITE_ATTEMPTS
+                    && is_transient_index_write_failure(stderr) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `stderr` names the one class of `git add` failure [`retry_transient_index_write_failure`]
+/// retries - see that function's own docs for why only this one. Matched by substring, not the
+/// full message: git's exact wording has varied by case across versions ("Unable"/"unable"), and
+/// a narrower exact-string match would silently stop retrying the very failure this exists for
+/// the moment a git upgrade rewords it.
+fn is_transient_index_write_failure(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("unable to write new index file")
 }
 
 /// Strip a leading `a/` or `b/` diff prefix, and treat `/dev/null` as "no file". Prefixes
@@ -1791,6 +1859,94 @@ mod tests {
     /// every `init_repo` call) throughout, so pointing the whole process's temp directory
     /// somewhere unusable mid-run would corrupt unrelated tests rather than prove anything about
     /// this one. Asserting the real parent directory proves the property directly instead.
+    fn transient_failure() -> Error {
+        Error::GitCommand {
+            args: "add --intent-to-add -A -- .".into(),
+            exit: GitExit::Code(128),
+            stderr: "fatal: Unable to write new index file".into(),
+        }
+    }
+
+    fn permanent_failure() -> Error {
+        Error::GitCommand {
+            args: "add --intent-to-add -A -- .".into(),
+            exit: GitExit::Code(128),
+            stderr: "fatal: not a git repository".into(),
+        }
+    }
+
+    #[test]
+    fn is_transient_index_write_failure_matches_regardless_of_case() {
+        assert!(is_transient_index_write_failure(
+            "fatal: Unable to write new index file"
+        ));
+        assert!(is_transient_index_write_failure(
+            "fatal: unable to write new index file"
+        ));
+        assert!(!is_transient_index_write_failure(
+            "fatal: not a git repository"
+        ));
+    }
+
+    /// The whole reason this retry exists: a transient antivirus-scan-holds-the-lock-file race on
+    /// Windows resolves itself within milliseconds, so a second attempt moments later succeeds
+    /// without the caller ever seeing an error - exactly the "the write is safe to redo" property
+    /// the retry's own docs claim.
+    #[test]
+    fn a_transient_failure_that_clears_on_retry_never_surfaces_to_the_caller() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            if calls < 2 {
+                Err(transient_failure())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            result.is_ok(),
+            "the retry must have absorbed the transient failure"
+        );
+        assert_eq!(calls, 2, "must have retried exactly once before succeeding");
+    }
+
+    /// A failure that never clears (e.g. a genuinely locked file, or antivirus that never lets go)
+    /// must still surface as a real error once the bound is reached - this is a *bounded* retry,
+    /// not an infinite one that could hang the whole diff computation.
+    #[test]
+    fn a_transient_failure_that_never_clears_gives_up_after_the_bound() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            Err(transient_failure())
+        });
+        assert!(
+            result.is_err(),
+            "must give up and return the real error eventually"
+        );
+        assert_eq!(
+            calls, MAX_INDEX_WRITE_ATTEMPTS,
+            "must make exactly the documented number of attempts, no more and no less"
+        );
+    }
+
+    /// The whole point of scoping the retry to one specific failure text: a genuinely broken
+    /// repository (or any other real `git add` failure) must never be retried or delayed - it is
+    /// not going to resolve itself, and the user needs to see it immediately.
+    #[test]
+    fn a_non_transient_failure_is_never_retried() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            Err(permanent_failure())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 1,
+            "a non-transient failure must return on the very first attempt"
+        );
+    }
+
     #[test]
     fn the_shadow_index_lives_in_the_git_directory_not_the_os_temp_directory() {
         let repo = init_repo();
