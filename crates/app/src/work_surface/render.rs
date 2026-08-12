@@ -864,8 +864,9 @@ impl AdeApp {
 
     /// The tab label each of `agent_ids` (already filtered to the currently selected worktree)
     /// should render, in the same order - real `TerminalPane::program_label` facts (the
-    /// bare-worktree shell gets `work_surface::bare_worktree_shell_label` instead of the generic
-    /// `"terminal"`) run through `work_surface::disambiguate_tab_labels`, computed once so
+    /// shell gets `work_surface::bare_worktree_shell_label`, which adds the ` · <branch>` suffix
+    /// only while the worktree is bare) run through `work_surface::disambiguate_tab_labels`,
+    /// computed once so
     /// [`Self::render_tab_strip`] and this method (also used directly by tests) can never
     /// disagree about what's actually rendered. Any id not found in `Self::agents` is skipped
     /// rather than panicking - `render_tab_strip` re-does the same lookup per id and simply
@@ -900,16 +901,20 @@ impl AdeApp {
             .iter()
             .map(|(_, agent)| match work_surface::tab_chip_kind(agent.kind) {
                 work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
-                work_surface::TabChipKind::Term => {
-                    if is_bare {
-                        work_surface::bare_worktree_shell_label(
-                            &agent.pane.read(cx).program_label(),
-                            branch.as_deref(),
-                        )
-                    } else {
-                        "terminal".to_string()
-                    }
-                }
+                // The real program either way - only the ` · <branch>` suffix is conditional.
+                // This used to fall back to the literal `"terminal"` once the worktree had an
+                // agent in it, which threw away the one fact the tab actually knows about itself:
+                // a shell tab that read `zsh · master` was retroactively relabelled `terminal` the
+                // moment an agent was spawned *beside* it, because `is_bare` is a property of the
+                // whole worktree rather than of the tab. Nothing about the terminal had changed.
+                //
+                // `"terminal"` was never the design's label either - it is the tab's *id* in the
+                // reference implementation (`{ id: 'terminal', label: prim ? 'zsh' : 'zsh · ' +
+                // activeWt.branch }`), and the label there is the program in both branches.
+                work_surface::TabChipKind::Term => work_surface::bare_worktree_shell_label(
+                    &agent.pane.read(cx).program_label(),
+                    if is_bare { branch.as_deref() } else { None },
+                ),
             })
             .collect();
         let disambiguated = work_surface::disambiguate_tab_labels(raw);
@@ -4128,9 +4133,9 @@ mod tab_scoping_tests {
     }
 
     /// Revision R12 §3: a bare worktree's `Shell` tab reads `program \u{b7} branch` (via
-    /// `work_surface::bare_worktree_shell_label`), not the generic `"terminal"` every non-bare
-    /// shell tab uses - proven here against a real `TerminalPane`'s own resolved
-    /// `program_label()`, not a hardcoded `"zsh"`.
+    /// `work_surface::bare_worktree_shell_label`) - proven here against a real `TerminalPane`'s
+    /// own resolved `program_label()`, not a hardcoded `"zsh"`. Its twin below pins what happens
+    /// to that label once the worktree stops being bare.
     #[gpui::test]
     fn a_bare_worktrees_shell_tab_label_joins_the_real_program_with_its_branch(
         cx: &mut TestAppContext,
@@ -4178,6 +4183,91 @@ mod tab_scoping_tests {
         assert_ne!(
             label, "terminal",
             "the bare-worktree shell label must never fall back to the generic non-bare label"
+        );
+    }
+
+    /// Spawning an agent *beside* a shell must not rename the shell.
+    ///
+    /// The regression this pins: the label is recomputed from scratch on every render, and the
+    /// `Term` arm used to switch on `current_worktree_is_bare()` - a property of the whole
+    /// worktree, not of the tab - and hand back the literal `"terminal"` whenever it was false. So
+    /// a tab that read `zsh · wt-a` was retroactively relabelled `terminal` the instant an agent
+    /// appeared anywhere in the same worktree, throwing away the one fact the tab knows about
+    /// itself. Nothing about the terminal had changed.
+    ///
+    /// Only the ` · <branch>` suffix is supposed to drop, which is exactly what the design's own
+    /// reference implementation does: `label: prim ? 'zsh' : 'zsh · ' + activeWt.branch`. The
+    /// string `'terminal'` there is the tab's **id**, not its label - which is almost certainly
+    /// where the literal came from.
+    #[gpui::test]
+    fn a_shell_tab_keeps_its_program_name_when_an_agent_joins_the_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let shell_id = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                ProcessKind::Shell,
+                wt_a.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        let (bare_label, program) = app.update(cx, |app, cx| {
+            let label = app
+                .current_worktree_agent_tab_labels(&[shell_id], cx)
+                .remove(0);
+            let program = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == shell_id)
+                .expect("shell agent")
+                .pane
+                .read(cx)
+                .program_label();
+            (label, program)
+        });
+        assert_eq!(
+            bare_label,
+            format!("{program} \u{b7} wt-a"),
+            "precondition: while bare, the shell tab carries its branch"
+        );
+
+        // Now put a real agent in the same worktree, which is what flips `is_bare`.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Agent(AgentKind::Claude),
+                wt_a.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        let after = app.update(cx, |app, cx| {
+            app.current_worktree_agent_tab_labels(&[shell_id], cx)
+                .remove(0)
+        });
+        assert_eq!(
+            after, program,
+            "the shell tab must keep its real program name once the worktree stops being bare - \
+             only the ` \u{b7} <branch>` suffix drops"
+        );
+        assert_ne!(
+            after, "terminal",
+            "the shell tab must never be relabelled to a literal that discards what it is running"
         );
     }
 
