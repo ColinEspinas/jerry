@@ -330,7 +330,7 @@ pub(crate) fn compute_diff(
         worktree_path,
         &args,
         MAX_DIFF_OUTPUT_BYTES,
-        Some(shadow_index.path()),
+        Some(&shadow_index),
     )?;
     let text = String::from_utf8_lossy(&output);
     let (files, files_truncated) = parse_git_diff(&text);
@@ -752,6 +752,44 @@ pub(crate) enum ShadowIndexContent {
     TrackedOnly,
 }
 
+/// Filename prefix every shadow index carries, so a file left behind by a hard-killed process is
+/// recognisable as this app's and not mistaken for something git itself owns. Leading dot for the
+/// same reason git's own transient files use one.
+const SHADOW_INDEX_PREFIX: &str = ".jerry-shadow-index-";
+
+/// Creates the throwaway index file [`prepare_shadow_index`] hands to `GIT_INDEX_FILE`, in the
+/// directory holding `real_index_path` - this worktree's own git directory (`<repo>/.git` for a
+/// main checkout, `<common-dir>/worktrees/<name>` for a linked one, since
+/// `git rev-parse --git-path index` already resolves that distinction for us). See
+/// [`prepare_shadow_index`]'s own "Where the shadow index file lives" docs for why this is not
+/// `std::env::temp_dir()`.
+///
+/// Falls back to the OS temp directory in the two cases where the git directory genuinely can't
+/// host the file: `real_index_path` has no parent at all (not reachable through any real
+/// `rev-parse` output, guarded rather than unwrapped), or creating a file there fails - a
+/// repository checked out on a read-only mount being the real instance of the latter, which still
+/// diffs fine through a temp-dir shadow index because an `--intent-to-add` pass writes nothing
+/// into the repository itself. The fallback is deliberately *not* silent about failing too: if
+/// both locations refuse, the git directory's own error is what propagates, since that's the one
+/// describing the repository the caller actually asked about.
+fn shadow_index_file(real_index_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
+    let builder = || {
+        tempfile::Builder::new()
+            .prefix(SHADOW_INDEX_PREFIX)
+            .tempfile()
+    };
+    let Some(git_dir) = real_index_path.parent() else {
+        return builder().map_err(Error::WorktreeIo);
+    };
+    match tempfile::Builder::new()
+        .prefix(SHADOW_INDEX_PREFIX)
+        .tempfile_in(git_dir)
+    {
+        Ok(file) => Ok(file),
+        Err(git_dir_err) => builder().map_err(|_| Error::WorktreeIo(git_dir_err)),
+    }
+}
+
 /// Builds a temporary, throwaway copy of the worktree's index with untracked files added,
 /// either as "intent to add" stubs or with their real content ([`ShadowIndexContent`]), so
 /// `git diff <merge-base>` - which only ever considers paths already present in the index or in
@@ -777,10 +815,35 @@ pub(crate) enum ShadowIndexContent {
 /// racy-index rule). See the inline comment at the copy itself, and the
 /// `a_same_length_edit_racy_against_the_index_timestamp_is_still_reported` test, for the real
 /// bug (GitHub issue #163) that came of not doing this.
+///
+/// ## Where the shadow index file lives
+///
+/// Next to the **real** index, inside this worktree's own git directory
+/// ([`shadow_index_file`]) - deliberately *not* `std::env::temp_dir()`. `git add` writes an
+/// index by creating `<GIT_INDEX_FILE>.lock` beside the target and renaming it over the top,
+/// so whichever directory this file sits in is the directory git has to be able to create,
+/// write, fsync and rename within. Pointing that at the OS-wide temp directory made every
+/// shadow-index-backed operation in this crate (`compute_diff`,
+/// [`crate::review::snapshot_worktree_tree`], [`crate::review::changed_paths_against_tree`])
+/// silently depend on a directory that has nothing to do with the repository being diffed, and
+/// that a real environment can make unusable in ways the repository itself is not: a `TMPDIR`
+/// pointed at a different (or cross-OS-mounted) filesystem, a sandbox with its own private
+/// `/tmp`, a full or quota-exceeded temp filesystem, or a cleanup daemon deleting files by age
+/// (which this function actively invites, since it back-dates the copy's mtime to the real
+/// index's possibly weeks-old mtime just above). A user running against a real repository hit
+/// exactly this class of failure: `git add --intent-to-add -A -- .` exiting 128 with
+/// `fatal: unable to write new index file`, which is git failing to write/rename the index at
+/// this very path. The git directory is guaranteed to be on the same filesystem as the
+/// repository git is already reading and writing, so if git can operate on the repo at all it
+/// can write here.
+///
+/// The file is still a real [`tempfile::NamedTempFile`] with unchanged drop-based cleanup -
+/// only its parent directory changed - and `.git` is never part of the worktree scan, so the
+/// `git add -A -- .` below cannot see (let alone stage) it.
 pub(crate) fn prepare_shadow_index(
     worktree_path: &Path,
     content: ShadowIndexContent,
-) -> Result<tempfile::NamedTempFile, Error> {
+) -> Result<tempfile::TempPath, Error> {
     let index_path_args: Vec<OsString> =
         vec!["rev-parse".into(), "--git-path".into(), "index".into()];
     let output = run_git(worktree_path, &index_path_args)?;
@@ -795,9 +858,14 @@ pub(crate) fn prepare_shadow_index(
         }
     };
 
-    let shadow = tempfile::NamedTempFile::new().map_err(Error::WorktreeIo)?;
+    let shadow = shadow_index_file(&real_index_path)?;
+    // Whether the real index couldn't be read at all - decided here, acted on only *after* the
+    // handle below is closed. See this function's own "Why the handle must be closed" docs for
+    // why acting on it immediately (as this used to) was itself part of the bug.
+    let real_index_missing;
     match std::fs::read(&real_index_path) {
         Ok(real_index_bytes) => {
+            real_index_missing = false;
             use std::io::Write as _;
             (&shadow)
                 .write_all(&real_index_bytes)
@@ -835,17 +903,40 @@ pub(crate) fn prepare_shadow_index(
             // `git init`, before any commit), or one whose index momentarily can't be read
             // (a real interleaving hazard: an agent CLI's own `git add`/`git commit`
             // rewriting the index at the exact moment this reads it), has no real bytes to
-            // seed the shadow copy with. `NamedTempFile::new()` above already created a
+            // seed the shadow copy with. `shadow_index_file` above already created a
             // real, empty *file* at this path though - and an empty-but-*existing* file is
             // not what git treats as "no index yet": confirmed directly (`GIT_INDEX_FILE`
             // pointed at a 0-byte file makes real `git add` fail outright with `fatal: ...
             // index file smaller than expected`, exit 128), where a path that simply
             // doesn't exist at all is instead treated as a fresh empty index and succeeds.
-            // Delete the placeholder so the path git sees is genuinely missing, not merely
-            // empty - `git add` below then creates a real index there from scratch, exactly
-            // as it would for a brand-new repository's very first `git add`.
-            std::fs::remove_file(shadow.path()).map_err(Error::WorktreeIo)?;
+            // The placeholder is deleted below, once the handle is closed - `git add` then
+            // creates a real index there from scratch, exactly as it would for a brand-new
+            // repository's very first `git add`.
+            real_index_missing = true;
         }
+    }
+
+    // Why the handle must be closed before `git add` ever runs, not just *where the file lives*:
+    // a real, reported failure (`fatal: unable to write new index file`, two unrelated
+    // repositories, this app running natively on Windows) traced to this function itself, not
+    // anything external. `git add` writes an index by creating `<GIT_INDEX_FILE>.lock` and
+    // renaming it over the destination - and on Windows, that rename can fail outright whenever
+    // the destination has *any* open handle, even one opened with `FILE_SHARE_DELETE` (which
+    // `tempfile`'s default sharing mode already is): confirmed against git's own upstream fix,
+    // "compat/mingw: implement POSIX-style atomic renames over open files" (first shipped git
+    // 2.48, Jan 2025) - before that release, on any git version, filesystem, or Windows edition,
+    // this was a deterministic failure, not a transient one, because `shadow` above - a
+    // `NamedTempFile` - was kept alive (and so its handle open) for the *entire* `git add` child
+    // process below. Converting it to a [`tempfile::TempPath`] here closes that handle while
+    // keeping the same drop-based cleanup; every real caller of this function only ever uses the
+    // returned value's path, never its file content, so this is a pure signature narrowing, not
+    // a behavior change for anyone downstream.
+    let shadow = shadow.into_temp_path();
+    if real_index_missing {
+        // Now genuinely safe: with the handle already closed above, this is a real, immediate
+        // delete - not the delete-*pending* state Windows leaves a still-open file in, which
+        // would have left this exact path unusable for the `git add` below to recreate.
+        std::fs::remove_file(&shadow).map_err(Error::WorktreeIo)?;
     }
 
     let mut add_args: Vec<OsString> = vec!["add".into()];
@@ -860,16 +951,73 @@ pub(crate) fn prepare_shadow_index(
         ShadowIndexContent::TrackedOnly => add_args.push("-u".into()),
     }
     add_args.extend([OsString::from("--"), ".".into()]);
-    let output = git_command(worktree_path, &add_args)
-        .env("GIT_INDEX_FILE", shadow.path())
-        .output()
-        .map_err(|source| Error::GitSpawn {
-            args: format_args(&add_args),
-            source,
-        })?;
-    check_success(&add_args, &output)?;
+
+    // A real, bounded retry remains here as defense-in-depth, *not* the fix above: even with our
+    // own handle closed, something else on the user's machine can still transiently hold this
+    // path open for a moment (real-time antivirus, a cloud-sync client watching the `.git`
+    // directory) on a git version/filesystem combination that still takes the handle-sensitive
+    // rename path. Scoped narrowly to that one failure text so a genuinely broken repository or a
+    // real permissions error still surfaces immediately, on the first attempt, with no delay.
+    retry_transient_index_write_failure(|| {
+        let output = git_command(worktree_path, &add_args)
+            .env("GIT_INDEX_FILE", &shadow)
+            .output()
+            .map_err(|source| Error::GitSpawn {
+                args: format_args(&add_args),
+                source,
+            })?;
+        check_success(&add_args, &output)
+    })?;
 
     Ok(shadow)
+}
+
+/// How many total attempts [`retry_transient_index_write_failure`] makes before giving up and
+/// returning the real error - the first attempt plus this many retries.
+const MAX_INDEX_WRITE_ATTEMPTS: u32 = 3;
+
+/// The retry *policy* behind the git-directory placement's own docs above: retries `attempt_git`
+/// only when it fails with [`is_transient_index_write_failure`], up to
+/// [`MAX_INDEX_WRITE_ATTEMPTS`] total tries, with a short growing backoff between them. Every
+/// other failure - a genuinely broken repository, a permissions error that will not resolve
+/// itself - returns immediately on the first attempt; retrying those would only delay a real
+/// error the user needs to see.
+///
+/// A free function taking a closure, rather than inlined into [`prepare_shadow_index`], so this
+/// policy is independently testable: the real failure this exists for is a Windows-only
+/// antivirus/rename race that this Linux dev environment cannot genuinely reproduce (confirmed by
+/// direct testing - see this crate's own investigation notes), so what's verified here is that
+/// the retry *logic itself* is correct (retries transient failures, stops immediately on
+/// anything else, gives up after the bound), independent of ever reproducing the real OS
+/// condition that triggers it.
+fn retry_transient_index_write_failure(
+    mut attempt_git: impl FnMut() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match attempt_git() {
+            Ok(()) => return Ok(()),
+            Err(Error::GitCommand { ref stderr, .. })
+                if attempt < MAX_INDEX_WRITE_ATTEMPTS
+                    && is_transient_index_write_failure(stderr) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `stderr` names the one class of `git add` failure [`retry_transient_index_write_failure`]
+/// retries - see that function's own docs for why only this one. Matched by substring, not the
+/// full message: git's exact wording has varied by case across versions ("Unable"/"unable"), and
+/// a narrower exact-string match would silently stop retrying the very failure this exists for
+/// the moment a git upgrade rewords it.
+fn is_transient_index_write_failure(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("unable to write new index file")
 }
 
 /// Strip a leading `a/` or `b/` diff prefix, and treat `/dev/null` as "no file". Prefixes
@@ -1711,6 +1859,276 @@ mod tests {
                 .any(|f| f.path == Path::new("brand_new.txt")),
             "the diff must still compute (and still see the real untracked file) even when \
              the real index couldn't be read to seed the shadow copy"
+        );
+    }
+
+    /// The shadow index must be created inside the worktree's own git directory, next to the
+    /// real index - never in `std::env::temp_dir()`. See `prepare_shadow_index`'s own "Where the
+    /// shadow index file lives" docs: `git add` creates `<GIT_INDEX_FILE>.lock` beside this file
+    /// and renames it over the top, so this directory is exactly the one git must be able to
+    /// write and rename within, and the OS temp directory is a real, environment-specific
+    /// liability there (a `TMPDIR` on another mount, a sandboxed private `/tmp`, a full temp
+    /// filesystem, an age-based cleanup daemon).
+    ///
+    /// This is a stronger assertion than "diffing still works with a hostile `TMPDIR`", and is
+    /// the reason no test here mutates `TMPDIR`: `std::env::set_var` is process-global, and this
+    /// test binary runs its tests in parallel threads that use `tempfile` (`TempDir::new` in
+    /// every `init_repo` call) throughout, so pointing the whole process's temp directory
+    /// somewhere unusable mid-run would corrupt unrelated tests rather than prove anything about
+    /// this one. Asserting the real parent directory proves the property directly instead.
+    fn transient_failure() -> Error {
+        Error::GitCommand {
+            args: "add --intent-to-add -A -- .".into(),
+            exit: GitExit::Code(128),
+            stderr: "fatal: Unable to write new index file".into(),
+        }
+    }
+
+    fn permanent_failure() -> Error {
+        Error::GitCommand {
+            args: "add --intent-to-add -A -- .".into(),
+            exit: GitExit::Code(128),
+            stderr: "fatal: not a git repository".into(),
+        }
+    }
+
+    #[test]
+    fn is_transient_index_write_failure_matches_regardless_of_case() {
+        assert!(is_transient_index_write_failure(
+            "fatal: Unable to write new index file"
+        ));
+        assert!(is_transient_index_write_failure(
+            "fatal: unable to write new index file"
+        ));
+        assert!(!is_transient_index_write_failure(
+            "fatal: not a git repository"
+        ));
+    }
+
+    /// The whole reason this retry exists: a transient antivirus-scan-holds-the-lock-file race on
+    /// Windows resolves itself within milliseconds, so a second attempt moments later succeeds
+    /// without the caller ever seeing an error - exactly the "the write is safe to redo" property
+    /// the retry's own docs claim.
+    #[test]
+    fn a_transient_failure_that_clears_on_retry_never_surfaces_to_the_caller() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            if calls < 2 {
+                Err(transient_failure())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            result.is_ok(),
+            "the retry must have absorbed the transient failure"
+        );
+        assert_eq!(calls, 2, "must have retried exactly once before succeeding");
+    }
+
+    /// A failure that never clears (e.g. a genuinely locked file, or antivirus that never lets go)
+    /// must still surface as a real error once the bound is reached - this is a *bounded* retry,
+    /// not an infinite one that could hang the whole diff computation.
+    #[test]
+    fn a_transient_failure_that_never_clears_gives_up_after_the_bound() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            Err(transient_failure())
+        });
+        assert!(
+            result.is_err(),
+            "must give up and return the real error eventually"
+        );
+        assert_eq!(
+            calls, MAX_INDEX_WRITE_ATTEMPTS,
+            "must make exactly the documented number of attempts, no more and no less"
+        );
+    }
+
+    /// The whole point of scoping the retry to one specific failure text: a genuinely broken
+    /// repository (or any other real `git add` failure) must never be retried or delayed - it is
+    /// not going to resolve itself, and the user needs to see it immediately.
+    #[test]
+    fn a_non_transient_failure_is_never_retried() {
+        let mut calls = 0;
+        let result = retry_transient_index_write_failure(|| {
+            calls += 1;
+            Err(permanent_failure())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 1,
+            "a non-transient failure must return on the very first attempt"
+        );
+    }
+
+    /// The real, root-cause fix (not the retry, which is defense-in-depth only): `git add` must
+    /// never see an open handle on the shadow index's path when it runs, because Windows can
+    /// refuse to rename a lock file over a destination with any open handle at all (see
+    /// `prepare_shadow_index`'s own "Why the handle must be closed" docs for the exact upstream
+    /// git behavior this traces to, and the two real, unrelated repositories that hit it).
+    /// `/proc/self/fd` is a real, direct way to check this invariant on Linux even though the
+    /// failure mode itself is Windows-only: this process must hold no open file descriptor
+    /// pointing at the shadow index's path by the time [`prepare_shadow_index`] returns - if one
+    /// still exists, this test proves the regression this fix closes, regardless of which
+    /// platform is running it.
+    #[test]
+    fn prepare_shadow_index_closes_its_own_file_handle_before_returning() {
+        let repo = init_repo();
+        fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+        let shadow_path = fs::canonicalize(&*shadow).expect("canonicalize shadow path");
+
+        let fd_dir = Path::new("/proc/self/fd");
+        if !fd_dir.is_dir() {
+            // Not Linux (or no procfs) - the invariant this checks is real everywhere, but this
+            // particular check has no portable equivalent; the git-directory-placement test
+            // above and the retry-policy tests still cover this function on every platform.
+            return;
+        }
+        for entry in fs::read_dir(fd_dir).expect("read /proc/self/fd") {
+            let Ok(entry) = entry else { continue };
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            assert_ne!(
+                target,
+                shadow_path,
+                "this process must hold no open file descriptor on the shadow index's own path \
+                 by the time prepare_shadow_index returns - fd {:?} still points at it",
+                entry.path()
+            );
+        }
+    }
+
+    #[test]
+    fn the_shadow_index_lives_in_the_git_directory_not_the_os_temp_directory() {
+        let repo = init_repo();
+        fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+
+        let git_dir = repo.path().join(".git");
+        let parent = shadow.parent().expect("shadow index has a parent");
+        assert_eq!(
+            fs::canonicalize(parent).expect("canonicalize shadow parent"),
+            fs::canonicalize(&git_dir).expect("canonicalize git dir"),
+            "the shadow index must be created inside the repository's own git directory"
+        );
+        assert_ne!(
+            fs::canonicalize(parent).expect("canonicalize shadow parent"),
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir"),
+            "the shadow index must not depend on the OS-wide temp directory at all"
+        );
+        assert!(
+            shadow
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .starts_with(SHADOW_INDEX_PREFIX),
+            "a shadow index left behind by a killed process must be recognisably ours"
+        );
+
+        // Dropping it really deletes it - the `NamedTempFile` cleanup contract is unchanged by
+        // the new parent directory, so a `.git` directory doesn't slowly fill with these.
+        let path = shadow.to_path_buf();
+        assert!(path.exists());
+        drop(shadow);
+        assert!(
+            !path.exists(),
+            "the shadow index must still be cleaned up on drop now that it lives under .git"
+        );
+    }
+
+    /// A linked worktree has its *own* private git directory
+    /// (`<common-dir>/worktrees/<name>`), which is where its own index lives - the shadow index
+    /// must land there, not in the main checkout's `.git`, so the two never contend and the
+    /// same-filesystem guarantee holds for a worktree created anywhere on disk.
+    #[test]
+    fn a_linked_worktrees_shadow_index_lives_in_that_worktrees_own_git_directory() {
+        let repo = init_repo();
+        let holder = TempDir::new().expect("tempdir");
+        let wt_path = holder.path().join("linked");
+        drop(holder);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt_path.to_str().expect("utf8 path"),
+            ],
+        );
+        fs::write(wt_path.join("untracked.txt"), "nobody staged this\n").expect("write");
+
+        let shadow = prepare_shadow_index(&wt_path, ShadowIndexContent::IntentToAdd)
+            .expect("prepare_shadow_index");
+        let parent = shadow
+            .parent()
+            .expect("shadow index has a parent")
+            .to_path_buf();
+        assert!(
+            parent.ends_with(Path::new("worktrees").join("linked")),
+            "expected the linked worktree's own admin directory, got {}",
+            parent.display()
+        );
+        drop(shadow);
+        let _ = fs::remove_dir_all(&wt_path);
+    }
+
+    /// The real, reported failure's own shape: a repository with a genuine embedded git
+    /// repository (its own `.git` directory, with its own commit) sitting untracked inside the
+    /// worktree - which is exactly this app's own dogfooding checkout, where `vendor/zed` is a
+    /// real vendored clone. `git add -A` prints a loud multi-line "adding embedded git
+    /// repository" warning on stderr for it, and `compute_diff` must still succeed: that warning
+    /// is stderr noise on a *successful* command, not a failure, and nothing in the diff pipeline
+    /// may treat it as one.
+    #[test]
+    fn an_embedded_git_repository_in_the_worktree_does_not_fail_the_diff() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
+
+        // A real nested repository with a real commit of its own - an embedded repo with *no*
+        // commit checked out is a different case entirely (`git add` fails it outright with
+        // "does not have a commit checked out"), and is not what the report showed.
+        let embedded = repo.path().join("vendor").join("inner");
+        fs::create_dir_all(&embedded).expect("create embedded repo dir");
+        git(&embedded, &["init", "-b", "main"]);
+        git(&embedded, &["config", "user.email", "test@example.com"]);
+        git(&embedded, &["config", "user.name", "Test User"]);
+        fs::write(embedded.join("inner.txt"), "inner\n").expect("write");
+        git(&embedded, &["add", "inner.txt"]);
+        git(&embedded, &["commit", "-m", "inner commit"]);
+
+        let result = diff_against_base(repo.path())
+            .expect("an embedded git repository must not fail the whole diff computation");
+        let DiffBase::Diff(diff) = result else {
+            panic!("expected DiffBase::Diff, got {result:?}");
+        };
+        assert!(
+            diff.files
+                .iter()
+                .any(|f| f.path == Path::new("brand_new.txt")),
+            "the real untracked file must still be reported alongside the embedded repository"
+        );
+
+        // And the real index is still untouched - the embedded repo is still untracked.
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_text.contains("?? vendor/"),
+            "the embedded repository must still be untracked afterwards, got: {status_text}"
         );
     }
 

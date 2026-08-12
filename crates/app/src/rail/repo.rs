@@ -137,16 +137,42 @@ pub fn repo_state_path_for(settings_path: &Path) -> PathBuf {
     }
 }
 
-/// The map key for one repo - its real path, canonicalized so the same repo reached through a
-/// symlink (or a `.`-relative invocation) resolves to one entry rather than two. Falls back to
-/// the path as given when it can't be canonicalized (doesn't exist yet, or is a pure in-memory
-/// path in a unit test) - still a stable key for that path. `None` for a path that isn't valid
-/// UTF-8, refused outright for the identical reason `crate::sidebar::fold_state::worktree_key`
-/// refuses one: a lossy `to_string_lossy` key could collide two genuinely different repos onto
-/// one TOML key.
+/// The one real normalization every repo path stored in [`Repo::path`] goes through: fully
+/// resolved (symlinks followed, `.`/`..` and a relative invocation made absolute), falling back to
+/// the path exactly as given when it can't be resolved at all - a directory that doesn't exist
+/// yet, or a pure in-memory path in a unit test, which must still be usable rather than an error.
+///
+/// This is load-bearing, not cosmetic. Every worktree path this app displays comes from
+/// `wt_core::list_worktrees_porcelain`, i.e. from git, which always reports **fully resolved**
+/// paths (git derives them from `getcwd`, which resolves symlinks). Every one of this app's real
+/// per-worktree lookups is an exact `PathBuf` comparison against those - `crate::rail::state::
+/// build_worktree_rows_with_history` folding an agent into its worktree row,
+/// `crate::work_surface::agents::Agents::iter_for_cwd`/`activate_for_worktree`,
+/// `crate::root::AdeApp::diff_cache`/`worktree_notes`/`open_files_by_worktree`/`edit_buffers`.
+/// A [`Repo::path`] kept verbatim from `jerry .`, `jerry ~/link-to-repo`, or any relative
+/// argument therefore never equals git's own answer for the same directory, and
+/// `crate::root::AdeApp::active_agent_cwd`'s repo-root fallback hands exactly that unresolved
+/// path to `Agents::spawn` as an agent's `cwd`. The real, reproduced consequence: an agent
+/// spawned that way matches no worktree row at all, and - because `build_worktree_rows_with_
+/// history` maps over *worktrees* and folds agents into them - is dropped from the rail
+/// silently, with no row of its own and no error anywhere.
+///
+/// Normalizing once, where a repo path enters this app ([`crate::root::AdeApp::add_repo`],
+/// [`crate::root::AdeApp::open_repo_in_current_window`], and startup's own resolved CLI path), is
+/// what keeps that whole family of exact-path comparisons meaningful - as opposed to
+/// canonicalizing at each comparison, which would put a blocking `std::fs::canonicalize` on a
+/// per-row, per-render path and still leave the *spawned process's* real cwd unresolved.
+pub fn canonical_repo_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The map key for one repo - its real path, canonicalized ([`canonical_repo_path`]) so the same
+/// repo reached through a symlink (or a `.`-relative invocation) resolves to one entry rather
+/// than two. `None` for a path that isn't valid UTF-8, refused outright for the identical reason
+/// `crate::sidebar::fold_state::worktree_key` refuses one: a lossy `to_string_lossy` key could
+/// collide two genuinely different repos onto one TOML key.
 pub fn repo_key(path: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canonical.to_str().map(str::to_owned)
+    canonical_repo_path(path).to_str().map(str::to_owned)
 }
 
 /// The whole on-disk repo-list file: every repo this user has ever added, keyed by [`repo_key`].

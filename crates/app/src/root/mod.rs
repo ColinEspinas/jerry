@@ -1832,26 +1832,14 @@ pub struct AdeApp {
     /// pattern as [`Self::body_bounds`]). [`Self::render_plus_menu`] positions the popover
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
-    /// Only the real anchor when [`Self::plus_menu_repo_anchor`] is `None` - see that field's own
-    /// docs for the rail's per-repo `+` case.
+    ///
+    /// The *only* anchor this popover has. A per-repo `plus_menu_repo_anchor`/
+    /// `rail_plus_button_bounds` pair used to exist alongside it, for the rail repo header's own
+    /// `+` opening this same popover; that button is inert now (see
+    /// `crate::rail::render::AdeApp::render_repo_group_new_button`'s own docs for why), so
+    /// nothing outside the tab strip can open the plus menu and both fields went with it rather
+    /// than being left capturing bounds for an anchor no click can ever select.
     pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
-    /// Which control opened [`Self::plus_menu_open`]'s popover: `None` for the tab strip's own
-    /// `+` ([`Self::plus_button_bounds`]), `Some(repo_id)` for that repo's own header `+`
-    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`],
-    /// [`Self::rail_plus_button_bounds`]). GitHub issue #113's per-repo `+` used to always
-    /// position the popover off [`Self::plus_button_bounds`] regardless of which button actually
-    /// opened it - visually anchored to the tab strip even when a rail row's own `+` was clicked.
-    /// Set on every real click of either button (see both render sites), read only by
-    /// [`Self::render_plus_menu`].
-    pub(crate) plus_menu_repo_anchor: Option<RepoId>,
-    /// Each rail repo header's own `+` button's painted bounds, captured every render the same
-    /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses - keyed by [`RepoId`] since, unlike
-    /// the tab strip's single `+`, one such button paints per repo group every frame regardless
-    /// of which one (if any) was actually clicked; a single shared field would silently hold
-    /// whichever repo happened to render last. [`Self::render_plus_menu`] looks up the entry for
-    /// [`Self::plus_menu_repo_anchor`] when it is `Some`. No entry until that repo's header has
-    /// painted at least once.
-    pub(crate) rail_plus_button_bounds: std::collections::HashMap<RepoId, gpui::Bounds<Pixels>>,
     /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
     /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
     /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
@@ -1942,13 +1930,13 @@ pub struct AdeApp {
     pub(crate) next_tab_settle_id: u64,
     /// Each currently-rendered tab's own real painted bounds, captured every render by a
     /// `gpui::canvas` overlay in [`work_surface::render::AdeApp::render_tab_chrome`] - the same
-    /// idiom [`Self::plus_button_bounds`]/[`Self::rail_plus_button_bounds`] already use, keyed by
+    /// idiom [`Self::plus_button_bounds`] already uses, keyed by
     /// [`work_surface::TabRef`] since every tab paints its own each frame. This is the *only*
     /// real source of a tab's on-screen width (GPUI's flex layout means no two tabs are the same
     /// size), which [`Self::drop_dragged_tab`] needs to compute how far a drop's neighbouring
     /// tabs must visually slide (see [`Self::tab_slide`]'s own docs). Never pruned when a tab
-    /// closes - a harmless, bounded leak, the same tradeoff [`Self::rail_plus_button_bounds`]
-    /// already makes.
+    /// closes - a harmless, bounded leak, since a `TabRef` is small and the set of tabs a session
+    /// ever opens is bounded by real user action.
     pub(crate) tab_bounds: std::collections::HashMap<work_surface::TabRef, gpui::Bounds<Pixels>>,
     /// The unified tab strip's real neighbour-slide animation - the "every tab other than the
     /// one actually dropped just teleports to its new slot" gap GitHub issue #16 left open
@@ -2345,6 +2333,14 @@ impl AdeApp {
     /// keystroke path, unlike [`repo::repo_key`]'s hot-path sibling
     /// `crate::sidebar::fold_state::worktree_key`.
     pub(crate) fn add_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) -> RepoId {
+        // The single point a repo path enters [`Self::repos`], and so the single place it gets
+        // normalized - see [`repo::canonical_repo_path`]'s own docs for the real, reproduced bug
+        // an unresolved path here causes (an agent spawned into the repo root vanishing from the
+        // rail entirely, because its `cwd` never equals git's own answer for the same directory).
+        // Callers that also *use* the path they passed for real work of their own
+        // ([`Self::open_repo_in_current_window`], startup) normalize it themselves before calling
+        // here rather than relying on this; both are the same idempotent call.
+        let path = repo::canonical_repo_path(&path);
         let key = repo::repo_key(&path);
         if let Some(key) = key.as_deref() {
             if let Some(existing) = self
@@ -2453,6 +2449,10 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Normalized *before* anything else uses it: `path` is not only stored on the `Repo`
+        // below, it is also this method's own spawn cwd, `Agents::activate_for_worktree` key and
+        // `Self::reset_repo_scoped_state` root. See `repo::canonical_repo_path`'s own docs.
+        let path = repo::canonical_repo_path(&path);
         let id = self.add_repo(path.clone(), cx);
         self.focus_repo(id, cx);
 
@@ -2482,44 +2482,45 @@ impl AdeApp {
         self.start_status_polling(cx);
     }
 
-    /// GitHub issue #113's "click a repo header in the rail, even one with zero open
-    /// worktrees, and it checks out" - the rail-native sibling of
-    /// [`Self::open_repo_in_current_window`]. Shares that method's real repo-switch reload
+    /// The rail's real repo-switch engine - the rail-native sibling of
+    /// [`Self::open_repo_in_current_window`]. It began as GitHub issue #113's "click a repo
+    /// header in the rail and it checks out", but the repo header is deliberately **not
+    /// clickable at all anymore** (explicit user direction, after two subtler header-click
+    /// behaviors were both rejected in review - see
+    /// [`crate::rail::render::AdeApp::render_repo_group`]'s own docs: in the rail, only worktree
+    /// rows and agent rows are click targets). So today this has exactly one real caller:
+    /// [`Self::select_worktree_by_path`]'s cross-repo fallback, reached by clicking a worktree
+    /// row under a non-focused repo's group.
+    ///
+    /// Shares `open_repo_in_current_window`'s real repo-switch reload
     /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
     /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target, and real
     /// cross-repo agent persistence - see that method's own "Cross-repo agent persistence" docs,
     /// which apply here unchanged) but deliberately does **not** call [`Self::add_repo`] or spawn
     /// an initial shell: `id` must already be a known [`Self::repos`] entry (every row the rail
     /// renders came from there), and unlike "Open Folder…" - which always guarantees *some* real
-    /// terminal is running so a freshly opened folder is never inert - this gesture's whole point
-    /// is to make a genuinely empty repo (zero open worktrees/agents) reachable as a real
-    /// "focused, nothing open yet" state, so the user can choose what to open next themselves
-    /// (the tab strip's own `+` menu, or the rail's own per-repo `+` -
-    /// [`crate::rail::render::AdeApp::render_repo_group`]) instead of always landing in an
-    /// unwanted shell.
+    /// terminal is running so a freshly opened folder is never inert - this focuses the repo
+    /// with nothing selected and nothing spawned, leaving the follow-up worktree selection to
+    /// its caller.
     ///
     /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
     /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
-    /// already [`Self::focused_repo`] (a plain re-click of the repo already showing must not
+    /// already [`Self::focused_repo`] (a repeat call for the repo already showing must not
     /// reset any of its live state).
     ///
     /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
-    /// that `id` has never had a real agent open in comes up genuinely empty, exactly the
-    /// "focused, nothing open yet" state this method's own module docs above describe - the user
-    /// opens something next via the tab strip's own `+` or the rail's per-repo `+`
-    /// ([`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
+    /// that `id` has never had a real agent open in comes up genuinely empty, a real "focused,
+    /// nothing open yet" state - the user opens something next via the tab strip's own `+` (the
+    /// rail repo header's own `+` is inert until a real "add worktree" design lands - see
+    /// [`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
     /// *before*, though, may already have real agents left running from that earlier visit (see
     /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
-    /// closed or respawned here, and [`Self::agents`]' `activate_for_worktree` call below makes
-    /// whichever one was last active in `id`'s repo the one the centre pane
-    /// ([`crate::work_surface::render::AdeApp::render_center_pane`]) actually shows again, the
-    /// same real re-activation [`Self::open_repo_in_current_window`] already does on every call.
-    /// Without it, [`Agents::active`](crate::work_surface::agents::Agents::active) would still
-    /// point at whatever was active in the repo just left, and the centre pane would keep
-    /// rendering *that* repo's terminal even though the rail now shows `id` focused - a real,
-    /// adversarial-audit-found gap this fixes rather than a defensive no-op. There is no
-    /// cross-restart persistence of *which tabs were open* for a repo yet - a real, disclosed gap,
-    /// not a silently stubbed one.
+    /// closed or respawned here, and none are *reactivated* either: `Agents::clear_active` below
+    /// leaves the centre pane showing nothing until a worktree row is genuinely selected (see
+    /// the inline comment below and `Agents::clear_active`'s own docs for why clearing, not
+    /// skipping, is the correct half-measure-free behavior). There is no cross-restart
+    /// persistence of *which tabs were open* for a repo yet - a real, disclosed gap, not a
+    /// silently stubbed one.
     pub(crate) fn checkout_repo_from_rail(
         &mut self,
         id: RepoId,
@@ -2529,14 +2530,18 @@ impl AdeApp {
         if self.focused_repo().map(|repo| repo.id) == Some(id) {
             return;
         }
-        let Some(path) = self
-            .repos
-            .iter()
-            .find(|repo| repo.id == id)
-            .map(|repo| repo.path.clone())
-        else {
+        let Some(repo) = self.repos.iter().find(|repo| repo.id == id) else {
             return;
         };
+        let path = repo.path.clone();
+        // Seeded synchronously from this repo's own already-known worktree list, the same
+        // already-fetched data `Self::select_worktree_by_path`'s cross-repo case seeds from (see
+        // its own docs for the identical reasoning) - kept fresh in the background by
+        // `Self::start_repo_worktrees_polling` regardless of which repo is focused, so this is
+        // usually populated by the time a real click lands here. `None` only for a repo that has
+        // never had its own worktree list fetched at all (just added, or `Self::load_worktrees`'s
+        // own upcoming fetch below is this repo's very first).
+        let seeded_worktrees = repo.worktrees_loaded.then(|| repo.worktrees.clone());
 
         self.focus_repo(id, cx);
 
@@ -2546,13 +2551,32 @@ impl AdeApp {
             .forget_target(&self.empty_state_focus_handle);
 
         // See this method's own docs: every agent open before this call, in every repo, stays
-        // alive - none of them are closed here. `id`'s own repo may already have real agents
-        // running from an earlier visit; this makes whichever one was last active there the one
-        // the centre pane actually shows, exactly as a fresh `Self::open_repo_in_current_window`
-        // switch already does.
-        self.agents.activate_for_worktree(&path, cx);
+        // alive - none of them are closed here, and every one of them still shows real live
+        // status in the rail (`crate::rail::render::AdeApp::build_agent_rows` folds in every
+        // repo's agents, not just the focused one's). What changes here is only which repo's
+        // worktree rows the rail shows - explicitly, deliberately, *never* which tab (if any) the
+        // centre pane shows: focusing a repo is a pure navigation gesture, not a worktree
+        // selection, so nothing may spawn from it and nothing may reactivate through it. Two real
+        // gaps closed to make that hold, not one: `Self::selected` staying `None` (below) closes
+        // "checking out a repo can spawn a tab attributed to the repo itself" (the reported bug,
+        // back when the repo header was still clickable); `Agents::clear_active` closes the
+        // other half - reactivating whichever agent was last active in `id`'s repo *looked* like
+        // reasonable cross-repo persistence, but from the user's side it was the exact same "the
+        // repo itself has a tab" behavior, just reached through an existing agent instead of a
+        // freshly spawned one. See `Agents::clear_active`'s own docs for why this can't simply
+        // be *skipped* instead - the centre pane has no repo-scoping of its own, so doing
+        // nothing here would leave whatever was left's terminal rendering right alongside `id`'s
+        // own, unrelated rail rows.
+        self.agents.clear_active(cx);
         self.selected = None;
         self.worktree_selection_notice = None;
+        // Still seeded synchronously from this repo's own already-known worktree list (see the
+        // field's own docs above) - this is purely a display fix (the rail must show repo B's
+        // real rows the instant repo B is focused, not repo A's stale ones for one frame), and
+        // carries no selection with it.
+        if let Some(items) = seeded_worktrees {
+            self.worktrees = items;
+        }
         self.reset_repo_scoped_state(path, window, cx);
         self.load_worktrees(cx);
         self.start_worktree_watch(cx);
@@ -3301,6 +3325,21 @@ mod repo_list_tests {
     use super::*;
     use crate::rail::repo::RepoState;
     use gpui::TestAppContext;
+
+    /// A real git repository with a real commit - a plain `tempfile::tempdir()` (what most tests
+    /// in this module use) has no worktrees `wt_core::list_worktrees_porcelain` can report at
+    /// all, which is fine for tests about agent persistence but not for one that needs a real
+    /// main-worktree row to select.
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
 
     fn open_test_app_with_real_settings_path(
         cx: &mut TestAppContext,
@@ -4135,6 +4174,187 @@ mod repo_list_tests {
                 app.focused_repo_path(),
                 repo_b.path(),
                 "sanity check: repo B really is the focused repo after checkout"
+            );
+        });
+    }
+
+    /// "Repo headers should not be associated to tabs at all" - the user's own words, after two
+    /// earlier attempts at this same bug (auto-selecting the main worktree; blocking every spawn
+    /// while nothing is selected) both turned out wrong for different reasons. The centre pane
+    /// has no repo-scoping of its own (`crate::work_surface::render::AdeApp::render_center_pane`
+    /// reads `Agents::active` directly), so simply *not* reactivating anything on checkout was
+    /// tried and rejected too: repo A's agent stayed the globally active one, and its terminal
+    /// kept rendering right alongside repo B's own, unrelated rail rows. `Agents::clear_active`
+    /// is what actually closes this - checked here directly, not inferred from `Agents::active_id`
+    /// alone, since that alone wouldn't prove the *previous* repo's agent was the thing cleared.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_clears_the_centre_pane_instead_of_reactivating(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        let repo_b = tempfile::tempdir().expect("tempdir");
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        // Give repo B a real agent of its own first, and make it `Agents::active_by_cwd`'s
+        // remembered tab for repo B's path - the exact state `Agents::activate_for_worktree`
+        // would resurrect on a later visit. Then leave repo B (back to A) before the real
+        // assertion below, so what's being tested is a genuine *re*-checkout, not a first visit.
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+        let repo_b_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo_b.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.active_id(),
+                Some(repo_b_agent_id),
+                "sanity check: repo B's freshly spawned agent really is the active one right now"
+            );
+        });
+
+        let repo_a_id = app.read_with(cx, |app, _| {
+            app.repos
+                .iter()
+                .find(|repo| repo.path == repo_a.path())
+                .expect("repo A is a known repo")
+                .id
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_a_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The real assertion: re-checking out repo B, with its own agent still alive and still
+        // `Agents::active_by_cwd`'s remembered tab for its path - exactly what
+        // `Agents::activate_for_worktree` would resurrect - must not reactivate it.
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.agents.active_id(),
+                None,
+                "checking out repo B again must leave nothing globally active, even though it \
+                 has a real, remembered agent of its own - focusing a repo is pure navigation, \
+                 never a worktree selection, so the centre pane must show genuinely nothing \
+                 rather than reactivating it"
+            );
+            let repo_b_agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == repo_b_agent_id)
+                .expect("repo B's agent must still genuinely exist");
+            assert!(
+                repo_b_agent.pane.read(cx).is_running(),
+                "and it must still be a real, live process - only *which* tab is shown changed, \
+                 nothing about repo B's own background persistence"
+            );
+        });
+    }
+
+    /// The reported "we can add a tab to the repo itself" - checking out a repo from the rail
+    /// used to leave `AdeApp::selected` at `None` until the user explicitly clicked a worktree
+    /// row, and `AdeApp::active_agent_cwd`'s fallback to the bare repo path for exactly that
+    /// `None` state let a tab strip "+" click spawn a tab with no worktree behind it at all. A
+    /// freshly checked-out repo must instead land on its own main worktree as a real selection
+    /// immediately - checked *before* `cx.run_until_parked()` runs, so this proves the
+    /// synchronous seed in `AdeApp::checkout_repo_from_rail` itself, not just the fallback
+    /// `AdeApp::load_worktrees` background fetch that lands moments later.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected, None,
+                "checking out a repo must never select a worktree on the user's behalf - only \
+                 a real click on a worktree row does that. An earlier version of this fix \
+                 auto-selected the main worktree here, which just moved the \"repo itself is \
+                 actionable\" bug one level deeper (see `Self::new_agent`'s own docs for where \
+                 the real fix lives instead)"
+            );
+        });
+
+        // And the real background fetch landing moments later must not introduce one either.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected, None,
+                "`Self::load_worktrees`'s own fetch must not auto-select anything either, for \
+                 the identical reason"
+            );
+        });
+    }
+
+    /// The reported "weird flicker on the worktrees" when clicking a repo: before the
+    /// synchronous seed above existed, `AdeApp::worktrees` was left completely untouched by
+    /// `checkout_repo_from_rail` - still repo A's own rows - for the entire synchronous portion
+    /// of the click (and so for the very next render), with repo B's header now showing above
+    /// them. Repo A's rows visibly flashed under repo B's name until `load_worktrees`'s
+    /// background fetch replaced them a moment later. Checked *before* `run_until_parked()`, so
+    /// this proves the synchronous seed, not the eventual correct state everything converges to
+    /// anyway.
+    #[gpui::test]
+    fn checking_out_a_repo_from_the_rail_never_shows_the_previous_repos_worktrees_even_briefly(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = init_repo();
+        let repo_b = init_repo();
+
+        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.checkout_repo_from_rail(repo_b_id, window, cx);
+        });
+
+        // No `run_until_parked()`: this is exactly the state the very next render would use.
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.worktrees.iter().all(|item| item.path != repo_a.path()),
+                "repo A's own worktree must never appear in the rendered list once repo B is \
+                 focused, not even for the one frame before the background fetch resolves - got \
+                 {:?}",
+                app.worktrees
+            );
+            assert!(
+                app.worktrees.iter().any(|item| item.path == repo_b.path()),
+                "repo B's own main worktree must be showing immediately, not waiting on the \
+                 background fetch"
             );
         });
     }
