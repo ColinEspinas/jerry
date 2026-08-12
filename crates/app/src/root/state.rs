@@ -522,6 +522,8 @@ impl AdeApp {
             dragging_tab: None,
             dropped_tab_settle: None,
             next_tab_settle_id: 0,
+            tab_bounds: HashMap::new(),
+            tab_slide: HashMap::new(),
             custom_themes,
             custom_theme_load_errors,
             custom_theme_status: None,
