@@ -89,7 +89,9 @@
 //! `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<path>' <Event>`
 //! parses identically in PowerShell's argument mode and in `bash`, because both treat a
 //! single-quoted token as a wholly literal string. See [`powershell_quote`] for the one character
-//! where the two disagree and why that disagreement is safe.
+//! where the two disagree and why that disagreement is safe - and for the four characters
+//! PowerShell *also* treats as a closing single quote, which is why quoting a path is fallible
+//! rather than total.
 //!
 //! ### Why the Windows forwarder is a `.ps1` invoked through a second `powershell.exe`
 //!
@@ -106,24 +108,47 @@
 //! A `.cmd`/`.bat` forwarder would start faster than PowerShell, and was considered for that
 //! reason, but batch expands `%JERRY_HOOK_TOKEN%` *textually into a command line*: the class of
 //! bug where a value containing `&` or `"` stops being data and becomes another command. The
-//! PowerShell forwarder interpolates the same value into a real argument vector instead, which
-//! cannot do that at all.
+//! PowerShell forwarder puts the same value into a `CreateProcess` command line instead, which no
+//! shell ever sees, so `&` and `|` are inert there by construction rather than by escaping.
 //!
-//! ### Why the Windows forwarder spools stdin to a file instead of piping it
+//! ### How the Windows forwarder gets stdin to curl without PowerShell's text pipeline
 //!
 //! The `sh` forwarder hands its own stdin straight to `curl --data-binary @-`. The PowerShell one
-//! copies stdin to a temporary file in the launch directory and passes `--data-binary @<file>`,
-//! deleting it immediately afterwards. That is not caution about PowerShell's pipeline for its
-//! own sake - it is that every text-shaped route is actively wrong on Windows: `[Console]::In`
-//! decodes stdin using the console code page (OEM 437 on a default English install) and piping a
-//! string into a native command re-encodes it with `$OutputEncoding`, which is ASCII in Windows
-//! PowerShell 5.1. Either one silently mangles every non-ASCII character in the payload. A raw
-//! `Stream.CopyTo` involves no encoding at all, and it also cuts the number of processes that
-//! have to inherit the payload's stdin handle from two to one.
+//! cannot simply pipe, because every *text*-shaped route is actively wrong on Windows:
+//! `[Console]::In` decodes stdin using the console code page (OEM 437 on a default English
+//! install) and piping a string into a native command re-encodes it with `$OutputEncoding`, which
+//! is ASCII in Windows PowerShell 5.1. Either one silently mangles every non-ASCII character in
+//! the payload.
 //!
-//! The spool file holds the same hook payload that is about to be POSTed and never the token; it
-//! is written inside the already-private launch directory and removed in a `finally` block, and
-//! [`HookFiles::drop`]/[`sweep_stale_directories`] remove the whole directory regardless.
+//! So it starts curl itself, through `System.Diagnostics.Process` with `RedirectStandardInput`,
+//! and copies `[Console]::OpenStandardInput()` into `StandardInput.BaseStream` - the raw pipe
+//! *underneath* the `StreamWriter`, so no encoder is involved at any point - with curl reading it
+//! back as `--data-binary @-`. `Stream.CopyTo` between two byte streams cannot mangle anything.
+//!
+//! **This used to spool the payload to a file, and that was a real at-rest exposure.** The
+//! original wrote stdin to `payload-<guid>.json` in the launch directory, passed
+//! `--data-binary @<file>`, and deleted it in a `finally`. A `finally` does not run when the
+//! process is *killed* - a hook that exceeds Claude Code's timeout, a pane closed mid-tool-call,
+//! Jerry quit while a hook is in flight - and all three are routine rather than exotic. What was
+//! left on disk is not innocuous: a `PreToolUse` payload carries the tool's real input, which for
+//! `Write`/`Edit` is file contents and for `Bash` is the whole command line, secrets and all
+//! (`export AWS_SECRET_ACCESS_KEY=...` is exactly the shape of thing an agent runs). It then sat
+//! there for the rest of a running Jerry's session, since [`sweep_stale_directories`] only
+//! collects directories whose pid is *dead*, and indefinitely after a hard-killed one that is
+//! never relaunched. Streaming removes the exposure rather than trying harder to guarantee the
+//! cleanup: there is no file to leak, on any path, including the ones that skip cleanup entirely.
+//!
+//! The one thing the file bought that a pipe does not is that curl could be started with a real
+//! argument *vector* (`& $curl @args`) instead of a command line. `ProcessStartInfo.ArgumentList`
+//! would give that back, but it does not exist on .NET Framework, which is what Windows PowerShell
+//! 5.1 runs on - so the forwarder builds the command line itself, in `ConvertTo-JerryArgument`,
+//! to the `CommandLineToArgvW` rules. That is a materially smaller hazard than the shell quoting
+//! this module worries about elsewhere: a `CreateProcess` command line is parsed by the callee's
+//! C runtime and by nothing else, so `&`, `|`, `;` and `$` have no meaning in it at all and the
+//! worst a hostile value could do is become another *curl option*. It was checked by round-tripping
+//! adversarial values (embedded quotes, trailing backslash runs, an `x" --output ... "` option
+//! injection, the empty string) through the real `CommandLineToArgvW`, and end-to-end against real
+//! curl with a hostile `JERRY_HOOK_TOKEN`, which arrived intact inside its header and wrote no file.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -220,7 +245,33 @@ if (-not $env:JERRY_HOOK_TOKEN) { exit 0 }
 if (-not $env:JERRY_AGENT_ID) { exit 0 }
 if (-not $JerryHookEvent) { exit 0 }
 
-$JerryPayload = $null
+# One element of curl's argument vector, spelled the way CommandLineToArgvW parses it back:
+# wrapped in double quotes, with an embedded quote written \" and every run of backslashes that
+# immediately precedes a quote (the closing one included) doubled. This is a CreateProcess command
+# line and never a shell one - nothing expands & | ; $ or a backtick at any point - so the quote
+# and the backslash run before it are the only characters here with any meaning at all.
+#
+# Spelled out rather than handed over as a real vector because ProcessStartInfo.ArgumentList, which
+# would do exactly this inside the framework, does not exist on .NET Framework - and Windows
+# PowerShell 5.1, the powershell.exe every Windows still ships, runs on .NET Framework.
+function ConvertTo-JerryArgument {
+    param([string] $JerryValue)
+    $JerryEscaped = ''
+    $JerrySlashes = 0
+    foreach ($JerryChar in $JerryValue.ToCharArray()) {
+        if ($JerryChar -eq '\') { $JerrySlashes++; continue }
+        if ($JerryChar -eq '"') {
+            $JerryEscaped += '\' * (2 * $JerrySlashes + 1) + '"'
+            $JerrySlashes = 0
+            continue
+        }
+        if ($JerrySlashes -gt 0) { $JerryEscaped += '\' * $JerrySlashes; $JerrySlashes = 0 }
+        $JerryEscaped += $JerryChar
+    }
+    return '"' + $JerryEscaped + ('\' * (2 * $JerrySlashes)) + '"'
+}
+
+$JerryCurlProcess = $null
 try {
     # curl.exe ships in System32 on Windows 10 1803+ and Windows 11. Prefer that exact path over
     # a PATH lookup, then fall back to PATH, then give up quietly - an older Windows without it
@@ -232,32 +283,51 @@ try {
         $JerryCurl = $JerryFound[0].Source
     }
 
-    # Byte-for-byte, with no text decoding anywhere - see the module docs for why every
-    # string-shaped route through PowerShell corrupts non-ASCII payloads on Windows.
-    $JerryPayload = Join-Path -Path $PSScriptRoot -ChildPath ('payload-' + [System.Guid]::NewGuid().ToString('N') + '.json')
-    $JerryStdin = [Console]::OpenStandardInput()
-    $JerrySpool = [System.IO.File]::Open($JerryPayload, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try { $JerryStdin.CopyTo($JerrySpool) } finally { $JerrySpool.Dispose() }
-
-    # Every one of these is a real element of curl's argument vector, so a value containing a
-    # space, a quote or an ampersand is data and can never become another command.
+    # Every one of these is a separate element of curl's argument vector, so a value containing a
+    # space, a quote or an ampersand is data and can never become another curl option.
     $JerryArgs = @(
         '--silent',
         '--max-time', '5',
         '--request', 'POST',
         '--header', "Authorization: Bearer $($env:JERRY_HOOK_TOKEN)",
         '--header', 'Content-Type: application/json',
-        '--data-binary', "@$JerryPayload",
+        '--data-binary', '@-',
         "http://127.0.0.1:$($env:JERRY_HOOK_PORT)/hook?event=$JerryHookEvent&agent=$($env:JERRY_AGENT_ID)"
     )
-    # Never propagate curl's exit status, and never let its output reach Claude Code: stdout on
-    # some events is fed back to the model as context.
-    & $JerryCurl @JerryArgs 2>$null | Out-Null
+
+    $JerryStart = New-Object System.Diagnostics.ProcessStartInfo
+    $JerryStart.FileName = $JerryCurl
+    $JerryStart.Arguments = (($JerryArgs | ForEach-Object { ConvertTo-JerryArgument $_ }) -join ' ')
+    $JerryStart.UseShellExecute = $false
+    $JerryStart.CreateNoWindow = $true
+    $JerryStart.RedirectStandardInput = $true
+    $JerryStart.RedirectStandardOutput = $true
+    $JerryStart.RedirectStandardError = $true
+    $JerryCurlProcess = [System.Diagnostics.Process]::Start($JerryStart)
+
+    # Drained into the bit bucket, asynchronously and before a single request byte is written, so
+    # neither output pipe can fill and deadlock curl while this script is still feeding it the
+    # body. curl's stdout on some events would otherwise be fed back to the model as context, and
+    # its stderr would be shown to the user as a hook error.
+    [void] $JerryCurlProcess.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+    [void] $JerryCurlProcess.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+
+    # The payload goes from this process's stdin straight into curl's, and is never written to disk
+    # at any point. `.BaseStream` is the raw pipe underneath the StreamWriter, so no encoder ever
+    # sees a byte of it - see the module docs for why every string-shaped route through PowerShell
+    # corrupts a non-ASCII payload on Windows.
+    $JerryStdin = [Console]::OpenStandardInput()
+    try { $JerryStdin.CopyTo($JerryCurlProcess.StandardInput.BaseStream) }
+    finally { $JerryCurlProcess.StandardInput.Close() }
+
+    # curl bounds its own work with --max-time 5; this bounds the whole child, so a curl that
+    # somehow never exits can neither hold the agent's tool call open nor be left as an orphan.
+    if (-not $JerryCurlProcess.WaitForExit(10000)) { $JerryCurlProcess.Kill() }
 } catch {
-    # Deliberately swallowed. A dead listener, a vanished launch directory or a curl that will not
-    # start must all cost exactly nothing.
+    # Deliberately swallowed. A dead listener, a curl that will not start, or a stdin that closes
+    # mid-copy must all cost exactly nothing.
 } finally {
-    if ($JerryPayload) { Remove-Item -LiteralPath $JerryPayload -Force -ErrorAction SilentlyContinue }
+    if ($JerryCurlProcess) { $JerryCurlProcess.Dispose() }
 }
 
 exit 0
@@ -290,12 +360,34 @@ impl HookFiles {
     /// its own: this file must only ever affect sessions Jerry itself spawned with an explicit
     /// `--settings`, so a `claude` the user starts from their own terminal is completely
     /// untouched by Jerry having been installed.
+    ///
+    /// A failure part-way through takes the launch directory back down with it. That matters more
+    /// than it used to: [`settings_json`] became genuinely fallible when [`powershell_quote`]
+    /// started refusing paths it cannot safely quote, so "created the directory, then failed" is a
+    /// reachable state rather than a theoretical one - and nothing would ever clean it up, since
+    /// the directory is only owned (and so only dropped) by a `HookFiles` that was never returned,
+    /// and [`sweep_stale_directories`] deliberately leaves a *live* pid's directories alone.
     pub fn write_in(parent: &Path) -> io::Result<HookFiles> {
         // Tidy away anything a previously crashed Jerry left here. Best-effort and never fatal.
         sweep_stale_directories(parent);
 
         let directory = create_private_dir(parent)?;
+        match Self::fill(&directory) {
+            Ok(settings) => Ok(HookFiles {
+                directory,
+                settings,
+            }),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                Err(err)
+            }
+        }
+    }
 
+    /// Writes both generated files into an already-created launch `directory`, returning the
+    /// settings file's path. Split out of [`Self::write_in`] purely so every failure between the
+    /// two has one place to be cleaned up from.
+    fn fill(directory: &Path) -> io::Result<PathBuf> {
         let forwarder = directory.join(FORWARDER_NAME);
         // Executable, but only by this user. (Windows has no execute bit and does not need one -
         // the script is run as an argument to `powershell.exe -File`, never by exec'ing the file
@@ -305,11 +397,7 @@ impl HookFiles {
         let settings = directory.join(SETTINGS_NAME);
         // Not executable, and readable only by this user.
         write_private_file(&settings, settings_json(&forwarder)?.as_bytes(), 0o600)?;
-
-        Ok(HookFiles {
-            directory,
-            settings,
-        })
+        Ok(settings)
     }
 }
 
@@ -321,9 +409,11 @@ impl Drop for HookFiles {
     ///
     /// Best-effort is load-bearing rather than merely tolerant on Windows, where an open file
     /// blocks the removal of its directory: a hook that is in flight at the moment Jerry quits
-    /// holds its spooled payload open, and this then fails. That is the intended outcome, not a
-    /// leak - the directory is left for [`sweep_stale_directories`] to collect on the next launch,
-    /// by which point this instance's pid is genuinely dead.
+    /// still has the forwarder script itself open, and this then fails. That is the intended
+    /// outcome, not a leak - the directory is left for [`sweep_stale_directories`] to collect on
+    /// the next launch, by which point this instance's pid is genuinely dead. (The payload no
+    /// longer contributes to that: since the forwarder streams stdin into curl, nothing but the
+    /// two generated files is ever in the directory - see the module docs.)
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
@@ -550,9 +640,20 @@ fn process_is_alive(pid: u32) -> bool {
 /// - A successful `OpenProcess` is *not* on its own proof of life. A process that has exited but
 ///   still has an open handle somewhere remains openable by pid, so liveness is decided by
 ///   `WaitForSingleObject(handle, 0)`: the handle is signalled once the process terminates, so
-///   `WAIT_TIMEOUT` means still running and `WAIT_OBJECT_0` means exited. `GetExitCodeProcess` was
-///   the alternative and is subtly broken - it reports `STILL_ACTIVE` (259) for a live process and
-///   for a dead one that genuinely exited with code 259.
+///   `WAIT_OBJECT_0` means exited and anything else means "not confirmed exited".
+///   `GetExitCodeProcess` was the alternative and is subtly broken - it reports `STILL_ACTIVE`
+///   (259) for a live process and for a dead one that genuinely exited with code 259.
+///
+/// **The wait has three outcomes, not two, and the third had this backwards.** This used to read
+/// `state == WAIT_TIMEOUT`, i.e. "alive exactly when the wait timed out". But `WaitForSingleObject`
+/// can also return `WAIT_FAILED` (`0xFFFFFFFF`) - a handle that lost its `SYNCHRONIZE` right, an
+/// out-of-memory kernel, anything Win32 chooses to fail with - and under that test a *failure to
+/// tell* read as "dead", which is the one answer that destroys something: `sweep_stale_directories`
+/// would delete a running Jerry's launch directory, taking the forwarder script and settings file
+/// out from under every agent that instance had spawned, and silently killing their hooks for the
+/// rest of the session. The invariant the `OpenProcess` branch already honours - every failure
+/// reads as alive - now holds here too, by testing for the single value that is real proof of
+/// death.
 ///
 /// The access mask is `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`, and both halves are
 /// needed. `SYNCHRONIZE` is the right `WaitForSingleObject` actually requires - without it the
@@ -570,7 +671,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// live process, which reads as alive and simply leaves the directory for a later sweep.
 #[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -593,7 +694,10 @@ fn process_is_alive(pid: u32) -> bool {
     unsafe {
         let _ = CloseHandle(handle);
     }
-    state == WAIT_TIMEOUT
+    // `WAIT_OBJECT_0` - the handle became signalled - is the only outcome that is proof the process
+    // has exited. `WAIT_TIMEOUT` (still running) and `WAIT_FAILED` (could not tell) both read as
+    // alive; see this function's docs for what a wrong "dead" costs.
+    state != WAIT_OBJECT_0
 }
 
 /// A short random, hex-encoded suffix - see [`create_private_dir`].
@@ -630,13 +734,30 @@ pub const fn is_supported() -> bool {
 /// containing a space would otherwise be split into a wrong program plus stray arguments. Which
 /// shell, and therefore which quoting language, is [`unix_hook_entry`] versus
 /// [`windows_hook_entry`].
+///
+/// Fallible for a second reason as of the quoting fix: [`powershell_quote`] refuses a path it
+/// cannot safely quote, and that refusal has to reach [`crate::hooks::HookRuntime::start`] so hook
+/// injection is skipped altogether rather than a broken settings file being written.
 fn settings_json(forwarder: &Path) -> io::Result<String> {
+    settings_json_with(forwarder, hook_entry)
+}
+
+/// [`settings_json`] with the per-platform entry builder handed in explicitly.
+///
+/// The seam exists for the tests, and for the same reason [`windows_hook_entry`] is compiled
+/// everywhere: the refusal path that [`powershell_quote`] introduces is a *Windows* one, so
+/// without this the only suite that could prove it propagates all the way to a `Result` at
+/// [`HookFiles::write_in`]'s boundary would be a Windows suite nobody routinely runs.
+fn settings_json_with(
+    forwarder: &Path,
+    entry: fn(&str, &str) -> io::Result<serde_json::Value>,
+) -> io::Result<String> {
     let forwarder = forwarder.to_string_lossy();
     let mut hooks = serde_json::Map::new();
     for event in FORWARDED_EVENTS {
         hooks.insert(
             event.to_string(),
-            serde_json::json!([{ "hooks": [hook_entry(&forwarder, event)] }]),
+            serde_json::json!([{ "hooks": [entry(&forwarder, event)?] }]),
         );
     }
     let document = serde_json::json!({ "hooks": serde_json::Value::Object(hooks) });
@@ -646,13 +767,13 @@ fn settings_json(forwarder: &Path) -> io::Result<String> {
 
 /// This platform's hook entry.
 #[cfg(not(windows))]
-fn hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
-    unix_hook_entry(forwarder, event)
+fn hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json::Value> {
+    Ok(unix_hook_entry(forwarder, event))
 }
 
 /// This platform's hook entry.
 #[cfg(windows)]
-fn hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
+fn hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json::Value> {
     windows_hook_entry(forwarder, event)
 }
 
@@ -675,18 +796,23 @@ pub fn unix_hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
 /// the resulting string is deliberately also valid `bash`.
 ///
 /// Compiled on every platform for the same reason as [`unix_hook_entry`].
-pub fn windows_hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
-    serde_json::json!({
+///
+/// `Err` when [`powershell_quote`] refuses the path - see there for the one class of character
+/// that provokes it and why refusing beats escaping. Fallible rather than lossy on purpose: the
+/// caller's only correct response is to skip hook injection entirely, which is what
+/// [`crate::hooks::HookRuntime::start`] does with it.
+pub fn windows_hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json::Value> {
+    let quoted = powershell_quote(forwarder)?;
+    Ok(serde_json::json!({
         "type": "command",
         // Documented Claude Code field, accepting exactly "bash" or "powershell". Without it the
         // shell on Windows is "Git Bash, or PowerShell if Git Bash isn't installed" - two quoting
         // languages, decided by what the user happens to have installed.
         "shell": "powershell",
         "command": format!(
-            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {} {event}",
-            powershell_quote(forwarder)
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {quoted} {event}"
         ),
-    })
+    }))
 }
 
 /// Wraps `value` in POSIX single quotes, escaping any single quote inside it via the standard
@@ -696,38 +822,113 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Wraps `value` in PowerShell single quotes, escaping any single quote inside it by doubling it.
+/// The characters PowerShell's tokenizer will end a single-quoted literal on, *other* than the
+/// ASCII apostrophe that opens it.
 ///
-/// PowerShell's single-quoted string is the exact analogue of `sh`'s: nothing inside it is
-/// expanded, so `$env:PATH`, a backtick, `$(...)`, `;`, `&`, `|` and a Windows path's backslashes
-/// are all literal, and `''` is the language's own way of writing one literal quote. There is no
-/// escape sequence *inside* a single-quoted string that can end it early - the closing quote is
-/// the only thing that ends it, and a doubled quote is by definition not that - so no `value`,
-/// however hostile, can reach the surrounding command line. That is the whole security property,
-/// and it is what [`a_hostile_path_cannot_break_out_of_the_generated_windows_command`] pins.
+/// PowerShell does not have one single-quote character, it has five. Its tokenizer's
+/// `CharTraits.IsSingleQuote` answers true for `'` (U+0027) and for four typographic quotes -
+/// U+2018 `‘`, U+2019 `’`, U+201A `‚`, U+201B `‛` - and `ScanStringLiteral` ends the literal on
+/// *any* of them, symmetrically: a literal opened with an ASCII `'` is closed just as happily by a
+/// `’`. That is the whole vulnerability this list exists to close. It is not folklore: it was
+/// established here by parsing `'X<c>` with the real `System.Management.Automation.Language.Parser`
+/// on Windows PowerShell 5.1 for **every code point in the BMP** and collecting the ones that made
+/// it a complete (rather than unterminated) literal. Exactly these four plus U+0027 came back, and
+/// nothing else did, so the list is exhaustive by construction rather than by reading; a surrogate
+/// half cannot be a member, so no astral code point can be one either.
+const POWERSHELL_QUOTE_DELIMITERS: [char; 4] = ['\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'];
+
+/// Wraps `value` in PowerShell single quotes, escaping any ASCII single quote inside it by doubling
+/// it - and **refusing outright** any `value` containing one of the four typographic quotes
+/// PowerShell also treats as a quote delimiter ([`POWERSHELL_QUOTE_DELIMITERS`]).
+///
+/// PowerShell's single-quoted string is otherwise the exact analogue of `sh`'s: nothing inside it
+/// is expanded, so `$env:PATH`, a backtick, `$(...)`, `;`, `&`, `|` and a Windows path's
+/// backslashes are all literal, and `''` is the language's own way of writing one literal quote.
 ///
 /// This is used in PowerShell's *argument* mode, not expression mode: the generated command starts
 /// with the bare word `powershell.exe`, which puts the parser in command mode for the rest of the
 /// line, where a token beginning with `'` is parsed as a literal string argument.
 ///
-/// **The one divergence from `bash`, and why it is safe.** The module docs explain that the
-/// generated string is also valid `bash`, as insurance against a Claude Code that ignores the
-/// `shell` field. Single quotes behave identically in both - except for the escape: `bash` writes
-/// a literal quote as `'\''` and PowerShell as `''`. A path containing an apostrophe
-/// (`C:\Users\O'Brien\...` - legal, and a real surname) therefore round-trips correctly under
-/// PowerShell and, under a `bash` fallback, collapses to a path with the apostrophe removed. That
-/// is a file that does not exist, so the hook does not fire and the rail falls back to the Phase 1
-/// signals. It is *not* a quoting escape: `bash` also treats the doubled quote as string
-/// concatenation, never as an end to quoting followed by live text. Wrong, visibly, in the safe
-/// direction, only on a Claude Code old enough to ignore a documented field, only for a user whose
-/// temp path contains an apostrophe.
+/// ## Why this refuses rather than escapes, which is the whole point
 ///
-/// Windows filenames cannot contain `"` at all (it is one of the reserved characters, alongside
-/// `<>:|?*`), so the double-quote case a `cmd.exe`-style quoter would have to agonise over cannot
-/// arise from a real path. The single-quoted form is used regardless, rather than relying on that,
-/// because `value` reaching here is a `to_string_lossy` of an arbitrary `PathBuf`.
-pub fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// The version of this function that shipped in the first draft of the Windows work doubled the
+/// ASCII quote and nothing else, on the stated belief that "there is no escape sequence *inside* a
+/// single-quoted string that can end it early". That belief is false, and a security review proved
+/// it by execution: `C:\Temp\x’; Start-Process calc.exe; ‘` quoted by that function parses as
+/// **three statements**, the middle one live PowerShell, run as the user on every single tool call
+/// the agent makes. A temp path is not usually attacker-controlled, but `%TMP%` is a plain
+/// environment variable, and "hostile input can never reach the command line" was the property the
+/// whole design rested on.
+///
+/// Doubling the typographic quotes as well - the obvious repair - is deliberately *not* what this
+/// does, for two reasons, both checked against the real 5.1 tokenizer rather than assumed:
+///
+/// - **The escape is asymmetric and undocumented.** `ScanStringLiteral` ends the literal on any of
+///   the five, then keeps the *second* character of the doubled pair: `’’` yields `’`, but `’'`
+///   yields an ASCII `'`. So the pairing is not a self-inverse escape at all, it is a lookahead
+///   whose result depends on which of five characters follows which. PowerShell's grammar documents
+///   only "use a second consecutive single quotation mark", says nothing about the typographic
+///   four, and gives no compatibility promise about how a mixed pair collapses. Pinning a security
+///   property to that is betting on an implementation detail that differs between hosts - and the
+///   failure mode when it differs is not a quoting error but a *silently different path*, i.e.
+///   hooks that never fire, with nothing anywhere reporting why.
+/// - **It would not survive the `bash` insurance property.** The module docs explain that the
+///   generated string is deliberately also a valid Git Bash command line. `bash` has exactly one
+///   quote character, so a doubled `’’` there is two literal characters, naming a path that does
+///   not exist.
+///
+/// Refusing is the answer this module already has for "hook support cannot be brought up on this
+/// machine". The error propagates through [`settings_json`] and [`HookFiles::write_in`] to
+/// [`crate::hooks::HookRuntime::start`], which logs it and returns `None`, and every agent then
+/// falls back to the Phase 1 title/OSC and quiescence signals - the identical, already-exercised
+/// path an unbindable loopback port or an unwritable temp directory takes. That is strictly better
+/// than the alternative on offer: the pre-refusal code did not merely risk injection, it *broke*
+/// for an ordinary user. `C:\Users\O’Brien\...` is a perfectly legal Windows profile path - the
+/// typographic apostrophe is not a reserved filename character, and word processors, browsers and
+/// chat clients autocorrect a straight quote into one - and it makes the generated command a parse
+/// error, which means a real PowerShell error on stderr on every hook firing, violating this
+/// module's own "a hook must never surface an error to the user" contract.
+///
+/// **How reachable is this in production?** Rare, but real, and it is the *user's* machine that
+/// decides. The path quoted here is `std::env::temp_dir()`, which on Windows is `GetTempPath2W` -
+/// `%TMP%`, then `%TEMP%`, then `%USERPROFILE%`, then `C:\Windows`. The default is
+/// `C:\Users\<account>\AppData\Local\Temp`, and `<account>` is the profile directory name, which
+/// Windows derives from the account name and which may contain a typographic apostrophe. `%TMP%`
+/// itself is an ordinary user-settable environment variable pointing anywhere. So the honest answer
+/// is "almost never, and not never".
+///
+/// **The remaining divergence from `bash`, and why it is safe.** The ASCII escape still differs:
+/// `bash` writes a literal quote as `'\''` and PowerShell as `''`. A path containing an ordinary
+/// apostrophe therefore round-trips correctly under PowerShell and, under a `bash` fallback,
+/// collapses to a path with the apostrophe removed - a file that does not exist, so the hook does
+/// not fire and the rail falls back to the Phase 1 signals. It is *not* a quoting escape: `bash`
+/// also treats the doubled quote as string concatenation, never as an end to quoting followed by
+/// live text. Wrong, visibly, in the safe direction, only on a Claude Code old enough to ignore a
+/// documented field, only for a user whose temp path contains an apostrophe.
+///
+/// **What was checked and found genuinely inert, so as not to over-reject.** The neighbouring
+/// character classes PowerShell's tokenizer also special-cases - the three typographic double
+/// quotes (U+201C/D/E), the en dash, em dash and horizontal bar it accepts in place of a parameter
+/// `-`, and the non-breaking space and NEL it accepts as whitespace - cannot appear in
+/// `IsSingleQuote`, so `ScanStringLiteral` copies them through verbatim; the BMP-wide parser sweep
+/// above confirms none of them terminates a literal. Neither do `"`, backtick, `$`, `&`, `;`, `|`
+/// or a control character, which the tests above already pin.
+pub fn powershell_quote(value: &str) -> io::Result<String> {
+    if let Some(delimiter) = value
+        .chars()
+        .find(|character| POWERSHELL_QUOTE_DELIMITERS.contains(character))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the hook forwarder path contains U+{:04X}, which PowerShell's tokenizer treats as \
+                 a closing single quote just like an ASCII one, so no quoting of this path is safe \
+                 to run: {value}",
+                delimiter as u32
+            ),
+        ));
+    }
+    Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
 #[cfg(test)]
@@ -1223,37 +1424,146 @@ mod tests {
     // routinely runs. Same call `crate::settings::state::windows_shell_suggestions` already makes.
     // ---------------------------------------------------------------------------------------
 
+    /// `powershell_quote` for a value it must accept, panicking with the refusal if it does not.
+    fn quoted(value: &str) -> String {
+        powershell_quote(value).unwrap_or_else(|err| panic!("{value:?} must be quotable: {err}"))
+    }
+
     #[test]
     fn a_windows_path_with_powershell_metacharacters_is_quoted_rather_than_expanded() {
         assert_eq!(
-            powershell_quote(r"C:\Temp\plain"),
+            quoted(r"C:\Temp\plain"),
             r"'C:\Temp\plain'",
             "backslashes are literal inside single quotes in both PowerShell and bash"
         );
         assert_eq!(
-            powershell_quote(r"C:\Program Files (x86)\jerry"),
+            quoted(r"C:\Program Files (x86)\jerry"),
             r"'C:\Program Files (x86)\jerry'",
             "the single most common real Windows path shape: spaces and parentheses"
         );
         assert_eq!(
-            powershell_quote(r"C:\Temp\$(Get-Content secret)"),
+            quoted(r"C:\Temp\$(Get-Content secret)"),
             r"'C:\Temp\$(Get-Content secret)'",
             "a subexpression must stay literal - this is the injection case"
         );
         assert_eq!(
-            powershell_quote("C:\\Temp\\`whoami`"),
+            quoted("C:\\Temp\\`whoami`"),
             "'C:\\Temp\\`whoami`'",
             "a backtick is PowerShell's escape character *outside* single quotes only"
         );
         assert_eq!(
-            powershell_quote(r"C:\Users\O'Brien\jerry"),
+            quoted(r"C:\Users\O'Brien\jerry"),
             r"'C:\Users\O''Brien\jerry'",
             "an apostrophe is doubled - PowerShell's own escape, see `powershell_quote`'s docs"
         );
         assert_eq!(
-            powershell_quote(r"C:\Temp\a&b;c|d"),
+            quoted(r"C:\Temp\a&b;c|d"),
             r"'C:\Temp\a&b;c|d'",
             "command separators must stay literal"
+        );
+    }
+
+    #[test]
+    fn a_path_containing_any_of_powershells_four_other_quote_characters_is_refused_outright() {
+        // The vulnerability this whole `Result` exists for. PowerShell's tokenizer does not have
+        // one single-quote character, it has five: `IsSingleQuote` also answers true for U+2018,
+        // U+2019, U+201A and U+201B, and `ScanStringLiteral` ends the literal on *any* of them,
+        // symmetrically - so a literal opened with an ASCII `'` is closed just as happily by a `’`.
+        //
+        // The old quoter doubled only the ASCII one and was proved exploitable by execution: the
+        // `hostile` path below, quoted by it, parses as three statements under a real Windows
+        // PowerShell 5.1, the middle one live code running as the user on every tool call.
+        //
+        // Deliberately asserted as `is_err`, not as some cleverer escaping. Doubling the
+        // typographic quotes as well "works" on 5.1, but the pairing is a lookahead that keeps the
+        // *second* character (`’'` collapses to an ASCII `'`), is documented nowhere, and would
+        // fail as a silently *different path* rather than as an error - see `powershell_quote`.
+        let hostile = "C:\\Temp\\x\u{2019}; Start-Process calc.exe; \u{2018}";
+        for delimiter in POWERSHELL_QUOTE_DELIMITERS {
+            let path = format!("C:\\Temp\\x{delimiter}; Start-Process calc.exe; {delimiter}");
+            let error = powershell_quote(&path)
+                .expect_err("a path that can close the literal must be refused, never quoted");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("U+{:04X}", delimiter as u32)),
+                "the refusal must name the character, or nobody can diagnose it: {error}"
+            );
+            // And the refusal must reach the caller as a refusal, not as a half-built entry.
+            assert!(
+                windows_hook_entry(&path, "Stop").is_err(),
+                "the hook entry must not be built at all for {delimiter:?}"
+            );
+        }
+        assert!(powershell_quote(hostile).is_err());
+
+        // The realistic, non-adversarial case, which is the reason this is a bug and not merely a
+        // hardening exercise. `O’Brien` with a typographic apostrophe is a legal Windows profile
+        // directory - the character is not reserved, and word processors, browsers and chat
+        // clients autocorrect a straight quote into one. Under the old quoter the generated
+        // command was a *parse error*, so a real PowerShell error reached the user's stderr on
+        // every single hook firing, which is worse than the silent Phase 1 fallback it replaced.
+        let obrien = "C:\\Users\\O\u{2019}Brien\\AppData\\Local\\Temp\\jerry-hook-forwarder.ps1";
+        assert!(
+            powershell_quote(obrien).is_err(),
+            "a merely unlucky path must be refused too, so hooks are skipped rather than broken"
+        );
+
+        // Positive controls: everything that is *not* one of the five must still be quoted, and an
+        // ordinary ASCII apostrophe is still handled by doubling rather than by refusing.
+        assert_eq!(
+            quoted(r"C:\Users\O'Brien\AppData\Local\Temp\jerry-hook-forwarder.ps1"),
+            r"'C:\Users\O''Brien\AppData\Local\Temp\jerry-hook-forwarder.ps1'",
+            "the straight apostrophe is escapable, and must not be caught by the refusal"
+        );
+        // The characters PowerShell's tokenizer special-cases *next door* to the quote class -
+        // the three typographic double quotes, the dashes it accepts for a parameter `-`, and the
+        // whitespace it accepts besides space and tab - are inert inside a literal, so refusing
+        // them would only lose users hooks for nothing.
+        for inert in [
+            '\u{201c}', '\u{201d}', '\u{201e}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{00a0}',
+            '\u{0085}', '"', '`', '$',
+        ] {
+            let path = format!("C:\\Temp\\x{inert}y\\jerry-hook-forwarder.ps1");
+            assert_eq!(
+                quoted(&path),
+                format!("'{path}'"),
+                "{inert:?} cannot end a single-quoted literal and must not be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_to_quote_skips_hook_injection_entirely_rather_than_writing_a_broken_file() {
+        // The whole point of `powershell_quote` returning a `Result`: the refusal has to travel
+        // all the way to `HookFiles::write_in`'s `io::Result`, because that is what
+        // `crate::hooks::HookRuntime::start` already turns into "log it and return `None`", i.e.
+        // into the same graceful Phase 1 fallback an unbindable port or an unwritable temp
+        // directory takes. A refusal that got swallowed anywhere along the way would write a
+        // settings file naming a command PowerShell cannot parse.
+        //
+        // Driven through `settings_json_with(.., windows_hook_entry)` so it runs on Linux too -
+        // the same reason `windows_hook_entry` itself is compiled everywhere. On Windows,
+        // `windows_only::hook_injection_is_skipped_when_the_launch_path_cannot_be_quoted` asserts
+        // the identical property through the real `HookFiles::write_in`.
+        let refused = Path::new("/tmp/O\u{2019}Brien/jerry-hooks-1-ab/jerry-hook-forwarder.ps1");
+        let error = settings_json_with(refused, windows_hook_entry)
+            .expect_err("an unquotable forwarder path must fail the whole settings file");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("U+2019"),
+            "the message reaching HookRuntime::start's log line must say what went wrong: {error}"
+        );
+
+        // And the ordinary path must still build a complete file, so the refusal cannot be a
+        // blanket "Windows settings never generate".
+        let fine = Path::new(r"C:\Temp\jerry-hooks-1-ab\jerry-hook-forwarder.ps1");
+        let json = settings_json_with(fine, windows_hook_entry).expect("must still be generated");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed["hooks"].as_object().map(serde_json::Map::len),
+            Some(FORWARDED_EVENTS.len())
         );
     }
 
@@ -1261,14 +1571,16 @@ mod tests {
     fn a_hostile_path_cannot_break_out_of_the_generated_windows_command() {
         // The adversarial case. If a temp path could end the quoted region early, everything after
         // it becomes live PowerShell running as the user, fired by Claude Code on every tool call.
-        // The property that makes that impossible is that a single-quoted PowerShell string has no
-        // internal escape sequence at all: only an *odd* run of quotes can end it, and doubling
-        // guarantees every run is even.
+        // The property that makes that impossible for an ASCII apostrophe is that a single-quoted
+        // PowerShell string has no internal escape sequence at all: only an *odd* run of quotes
+        // can end it, and doubling guarantees every run is even. (The typographic quotes, which
+        // *can* end it and which doubling does not save, are refused outright instead - see
+        // `a_path_containing_any_of_powershells_four_other_quote_characters_is_refused_outright`.)
         let hostile = r"C:\Temp\x'; Start-Process calc.exe; '";
-        let entry = windows_hook_entry(hostile, "Stop");
+        let entry = windows_hook_entry(hostile, "Stop").expect("an ASCII apostrophe is quotable");
         let command = entry["command"].as_str().expect("a command string");
 
-        let quoted = powershell_quote(hostile);
+        let quoted = quoted(hostile);
         assert!(
             command.contains(&quoted),
             "the whole path must appear as one quoted literal, got {command:?}"
@@ -1303,7 +1615,8 @@ mod tests {
         // than a coin flip.
         for event in FORWARDED_EVENTS {
             let entry =
-                windows_hook_entry(r"C:\Temp\jerry-hooks-1-ab\jerry-hook-forwarder.ps1", event);
+                windows_hook_entry(r"C:\Temp\jerry-hooks-1-ab\jerry-hook-forwarder.ps1", event)
+                    .expect("an ordinary Windows path must be quotable");
             assert_eq!(entry["type"], "command");
             assert_eq!(
                 entry["shell"], "powershell",
@@ -1351,7 +1664,7 @@ mod tests {
         .expect("stand-in interpreter");
 
         let forwarder = r"C:\Program Files (x86)\a b\$HOME\`whoami`\jerry-hook-forwarder.ps1";
-        let entry = windows_hook_entry(forwarder, "PreToolUse");
+        let entry = windows_hook_entry(forwarder, "PreToolUse").expect("quotable");
         let command = entry["command"].as_str().expect("a command");
 
         let output = std::process::Command::new("/bin/sh")
@@ -1435,13 +1748,61 @@ mod tests {
             "nothing in the forwarder may evaluate a string as code"
         );
         assert!(
-            script.contains("--data-binary"),
-            "the payload must be posted verbatim, exactly as the `sh` forwarder does"
+            script.contains("'--data-binary', '@-'"),
+            "the payload must be posted verbatim from stdin, exactly as the `sh` forwarder does"
         );
         assert!(
-            script.contains("Out-Null"),
-            "curl's output must never reach Claude Code - it is fed back to the model as context \
-             on some events"
+            script.contains("$JerryStart.RedirectStandardOutput = $true")
+                && script.contains("$JerryStart.RedirectStandardError = $true")
+                && script
+                    .contains("StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)")
+                && script
+                    .contains("StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)"),
+            "curl's output must never reach Claude Code - stdout is fed back to the model as \
+             context on some events, and stderr is shown to the user as a hook error - and both \
+             must be drained rather than merely redirected, or a full pipe deadlocks the POST"
+        );
+    }
+
+    #[test]
+    fn the_windows_forwarder_never_writes_the_payload_to_disk_at_all() {
+        // This replaces a weaker property. The forwarder used to spool stdin to
+        // `payload-<guid>.json` in the launch directory and delete it in a `finally`, and the test
+        // here asserted only that no such file was *left behind* after a normal run. A `finally`
+        // does not run when the process is killed - a hook timeout, a pane closed mid-tool-call,
+        // Jerry quit while a hook is in flight - and the payload is not innocuous: `PreToolUse`
+        // carries `Write`/`Edit` file contents and whole `Bash` command lines, secrets included.
+        //
+        // "Never created" is both strictly stronger than "always cleaned up" and, unlike it,
+        // checkable on Linux from the script text - which is where this suite actually runs.
+        let script = WINDOWS_FORWARDER_SCRIPT;
+        assert!(
+            !script.contains("payload-"),
+            "no spool file may be named anywhere in the forwarder"
+        );
+        for writer in [
+            "[System.IO.File]::Open",
+            "[System.IO.File]::Create",
+            "[System.IO.File]::Write",
+            "New-Item",
+            "Set-Content",
+            "Add-Content",
+            "Out-File",
+            "Remove-Item",
+            "$PSScriptRoot",
+        ] {
+            assert!(
+                !script.contains(writer),
+                "the forwarder must never touch the filesystem, found {writer:?} - the payload \
+                 goes straight into curl's stdin, so there is nothing to write or to clean up"
+            );
+        }
+        assert!(
+            script.contains("$JerryStart.RedirectStandardInput = $true")
+                && script.contains("$JerryCurlProcess.StandardInput.BaseStream"),
+            "the payload must be streamed into curl's stdin as raw bytes - `.BaseStream` is the \
+             pipe under the StreamWriter, so no encoder ever sees it (see the module docs for why \
+             every text-shaped route on Windows mangles a non-ASCII payload)"
         );
         // `$Event` is a PowerShell automatic variable; shadowing it in `param()` is a real footgun.
         assert!(
@@ -1632,10 +1993,15 @@ mod tests {
         }
 
         #[test]
-        fn the_forwarder_leaves_no_spooled_payload_behind() {
-            // The Windows forwarder writes stdin to a temporary file in the launch directory (see
-            // the module docs). It must delete it - the launch directory is swept only when Jerry
-            // restarts, and a long-lived window would otherwise accumulate one file per hook.
+        fn the_forwarder_never_puts_the_payload_on_disk_even_while_it_is_in_flight() {
+            // The forwarder used to spool stdin to a file in the launch directory and delete it in
+            // a `finally`, and this test used to check only that nothing was left over afterwards.
+            // A `finally` does not run for a killed process, and a `PreToolUse` payload holds real
+            // file contents and whole `Bash` command lines - so the property was strengthened from
+            // "cleaned up" to "never written", which this asserts *while the POST is still in
+            // flight* rather than only after it: the run below points at a real listener that
+            // accepts the connection and then never answers, so curl is still holding the body
+            // when the directory is inspected.
             let temp = tempfile::tempdir().expect("temp dir");
             let files = HookFiles::write_in(temp.path()).expect("must write");
             let directory = files
@@ -1643,28 +2009,92 @@ mod tests {
                 .parent()
                 .expect("parent")
                 .to_path_buf();
-            let dead_port = {
-                let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-                listener.local_addr().expect("addr").port()
-            };
-            let output = generated_stop_command(&files)
-                .env(PORT_ENV, dead_port.to_string())
+
+            // Bound but never accepted, so the POST hangs until curl's own --max-time 5 expires.
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+
+            let mut child = generated_stop_command(&files)
+                .env(PORT_ENV, port.to_string())
                 .env(TOKEN_ENV, "irrelevant")
                 .env(AGENT_ENV, "1")
-                .stdin(std::process::Stdio::null())
-                .output()
-                .expect("the generated command must run");
-            assert!(output.status.success());
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            {
+                use std::io::Write;
+                let mut stdin = child.stdin.take().expect("stdin");
+                stdin
+                    .write_all(br#"{"hook_event_name":"PreToolUse","tool_input":{"command":"export AWS_SECRET_ACCESS_KEY=hunter2"}}"#)
+                    .ok();
+            }
 
-            let leftovers: Vec<_> = std::fs::read_dir(&directory)
-                .expect("read launch dir")
+            // While it is running, and again once it has finished: neither moment may show a file.
+            let mut seen: Vec<String> = Vec::new();
+            for _ in 0..20 {
+                seen.extend(
+                    std::fs::read_dir(&directory)
+                        .expect("read launch dir")
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME),
+                );
+                if !seen.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let output = child.wait_with_output().expect("wait");
+            seen.extend(
+                std::fs::read_dir(&directory)
+                    .expect("read launch dir")
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME),
+            );
+            assert!(
+                seen.is_empty(),
+                "the payload must never reach the filesystem, not even transiently: {seen:?}"
+            );
+            assert!(
+                output.status.success(),
+                "and the hook must still exit 0: {:?} {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty() && output.stderr.is_empty(),
+                "a listener that accepts and never answers must still print nothing at the user"
+            );
+            drop(listener);
+        }
+
+        #[test]
+        fn hook_injection_is_skipped_when_the_launch_path_cannot_be_quoted() {
+            // The Windows end of `a_refusal_to_quote_skips_hook_injection_entirely_rather_than_
+            // writing_a_broken_file`, through the real `HookFiles::write_in` rather than the test
+            // seam: a temp directory whose name contains a typographic apostrophe (legal on
+            // Windows, and the realistic `C:\Users\O’Brien` case) must make the whole thing fail,
+            // so `HookRuntime::start` logs it and falls back, instead of a settings file being
+            // written that names a command PowerShell cannot parse.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let parent = temp.path().join("O\u{2019}Brien");
+            std::fs::create_dir_all(&parent).expect("create");
+            let error = HookFiles::write_in(&parent)
+                .expect_err("an unquotable launch path must not produce a settings file");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+            // And nothing may be left behind: no half-written settings file, and not even the
+            // launch directory, which nothing would ever collect (its pid is this live process's,
+            // and `sweep_stale_directories` deliberately leaves a live pid's directories alone).
+            let leftovers: Vec<_> = std::fs::read_dir(&parent)
+                .expect("read parent")
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("payload-"))
                 .collect();
             assert!(
                 leftovers.is_empty(),
-                "the spooled payload must be removed even when the POST fails: {leftovers:?}"
+                "a refusal must take its half-built launch directory back down: {leftovers:?}"
             );
         }
 
