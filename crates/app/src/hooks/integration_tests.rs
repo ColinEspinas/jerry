@@ -304,9 +304,7 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
         return;
     }
     let Some(binary) = real_claude() else {
-        eprintln!(
-            "skipping: no `claude` binary on PATH - cannot verify --settings merge behaviour"
-        );
+        skip_or_fail("no `claude` binary on PATH - cannot verify --settings merge behaviour");
         return;
     };
 

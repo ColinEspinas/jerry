@@ -238,6 +238,25 @@ fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
     #[cfg(not(unix))]
     let _ = mode;
     let mut file = options.open(path)?;
+
+    // `open`'s mode is masked by the process umask, which can *remove* bits the file genuinely
+    // needs. That is harmless for the 0o600 settings file (umask only ever makes it stricter),
+    // but not for the 0o700 forwarder: a umask with owner bits set - 0o100 and 0o700 are unusual
+    // but entirely legal - creates it non-executable, Claude Code's shell invocation exits 126,
+    // and hooks then silently never fire, with the rail quietly falling back to the Phase 1
+    // heuristics and no error anywhere. Verified: under umask 0o100, `open(.., 0o700)` yields
+    // 0o600, and this `fchmod` restores 0o700.
+    //
+    // Safe to do *after* creation, unlike the chmod-after-`create_dir_all` this module used to
+    // do: `File::set_permissions` is `fchmod` on a descriptor already exclusively owned (the file
+    // was just created with `O_EXCL`), so no path is re-resolved and there is no symlink or
+    // TOCTOU window to reopen - the C2 race came from re-resolving a *path*, not from ordering.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+
     file.write_all(contents)?;
     file.sync_all()
 }
@@ -443,8 +462,13 @@ mod tests {
         // `set_permissions` follows it - so a local attacker got Jerry's forwarder script written
         // into, and 0o700 applied to, a directory of their choosing.
         //
-        // Two properties now block that, and this asserts both: the name is unpredictable, and
-        // creation is exclusive (`mkdir` fails rather than reusing whatever is already there).
+        // Asserted directly against the creation primitives rather than by planting symlinks at
+        // the names the *old* scheme would have picked: under the random suffix those names can
+        // never be chosen, so such a test would pass without exercising anything. What actually
+        // has to hold is that creation is exclusive - an attacker who guesses the name anyway
+        // still gets a hard error instead of a captured directory - and that is what this pins.
+        // Both assertions below fail against the old `create_dir_all`/`fs::write`, which return
+        // `Ok` here and write straight through the symlink.
         if !cfg!(unix) {
             return;
         }
@@ -454,40 +478,6 @@ mod tests {
         std::fs::create_dir_all(&parent).expect("parent");
         std::fs::create_dir_all(&attacker).expect("attacker dir");
 
-        // Plant symlinks over every name the old scheme would have used.
-        #[cfg(unix)]
-        for instance in 0..4 {
-            let planted = parent.join(format!(
-                "{DIRECTORY_PREFIX}{}-{instance}",
-                std::process::id()
-            ));
-            std::os::unix::fs::symlink(&attacker, &planted).expect("plant symlink");
-        }
-
-        let files = HookFiles::write_in(&parent).expect("must still succeed");
-
-        // Nothing may have been written through a symlink into the attacker's directory.
-        let captured: Vec<_> = std::fs::read_dir(&attacker)
-            .expect("read attacker dir")
-            .flatten()
-            .map(|entry| entry.file_name())
-            .collect();
-        assert!(
-            captured.is_empty(),
-            "files were captured by a planted symlink: {captured:?}"
-        );
-
-        // And the real directory must be a genuine directory, not a symlink.
-        let metadata = std::fs::symlink_metadata(&files.directory).expect("stat");
-        assert!(
-            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-            "the launch directory must be a real directory Jerry created itself"
-        );
-
-        // Pin the exclusivity property on its own, independently of the name being unpredictable -
-        // an attacker who guessed the name anyway must still get a hard error rather than a
-        // captured directory. This is the assertion that would fail against the old
-        // `create_dir_all`, which returns `Ok` here.
         #[cfg(unix)]
         {
             let guessed = parent.join("guessed-name");
@@ -496,9 +486,9 @@ mod tests {
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::AlreadyExists,
-                "creation must be exclusive, never reuse-what's-there"
+                "directory creation must be exclusive, never reuse-what's-there"
             );
-            // Same for the files.
+
             let planted_file = parent.join("planted-file");
             std::os::unix::fs::symlink(attacker.join("captured.sh"), &planted_file).expect("plant");
             let error = write_private_file(&planted_file, b"x", 0o600)
@@ -509,6 +499,78 @@ mod tests {
                 "nothing may be written through the planted symlink"
             );
         }
+
+        // A real run alongside that junk must still succeed, and must produce a genuine directory
+        // rather than anything it adopted from the parent.
+        let files = HookFiles::write_in(&parent).expect("must still succeed");
+        let metadata = std::fs::symlink_metadata(&files.directory).expect("stat");
+        assert!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "the launch directory must be a real directory Jerry created itself"
+        );
+        let captured: Vec<_> = std::fs::read_dir(&attacker)
+            .expect("read attacker dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            captured.is_empty(),
+            "nothing may have reached the attacker's directory: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn a_written_file_gets_exactly_the_mode_asked_for_not_the_umask_s_opinion_of_it() {
+        // `open`'s mode argument is masked by the umask, which can *remove* bits the file needs.
+        // For the 0o700 forwarder that is a silent failure with real consequences: under a umask
+        // with owner bits set (0o100 is unusual but entirely legal) it would be created
+        // non-executable, Claude Code's shell invocation would exit 126, and hooks would simply
+        // never fire - the rail falling back to the Phase 1 heuristics with nothing reporting an
+        // error anywhere. `write_private_file` therefore `fchmod`s the descriptor it already owns.
+        //
+        // Deliberately *not* tested by setting the process umask: it is process-wide, `cargo test`
+        // runs these in threads, and an earlier version of this test that did so caused spurious
+        // `PermissionDenied` failures in unrelated tests running concurrently.
+        //
+        // Instead it asks for a mode that any ordinary umask would strip something from (0o022 and
+        // 0o002 are the common defaults, and both strip bits from 0o777) and requires it back
+        // exactly. Without the `fchmod` this yields 0o755 under the usual 0o022 and fails; the
+        // only umask it cannot discriminate under is 0o000, where there is nothing to strip.
+        if !cfg!(unix) {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().expect("temp dir");
+            let path = temp.path().join("mode-probe");
+            write_private_file(&path, b"x", 0o777).expect("write");
+            let mode = path.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o777,
+                "the requested mode must survive the umask, got {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_forwarder_is_directly_executable() {
+        // The property the 0o700 mode exists for, asserted end-to-end rather than as bits: if
+        // this ever regresses, Claude Code's invocation of the hook exits 126 and every hook
+        // silently stops firing.
+        if !cfg!(unix) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = HookFiles::write_in(temp.path()).expect("files");
+        let forwarder = files.settings_path().with_file_name(FORWARDER_NAME);
+        let output = std::process::Command::new(&forwarder)
+            .arg("Stop")
+            .env_remove(PORT_ENV)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the forwarder must be directly executable, not merely readable");
+        assert!(output.status.success());
     }
 
     #[test]

@@ -92,6 +92,24 @@ const MAX_HEADERS: usize = 100;
 
 /// How many connections are handled concurrently. Hook traffic is a trickle (a few events per
 /// agent turn), so this is purely a bound on pathological behaviour, not a throughput knob.
+///
+/// ## Known, accepted limitation: aggregate starvation by reconnect
+///
+/// [`REQUEST_DEADLINE`] bounds any *single* connection, which is what closed the original
+/// slow-drip hole. It does not bound the *aggregate*: a process that holds all `MAX_IN_FLIGHT`
+/// sockets and immediately reconnects as each one expires keeps every slot occupied
+/// indefinitely, and real hook connections are then closed on arrival. Because the forwarder
+/// always exits 0 (deliberately - see [`crate::hooks::settings_file`]), that failure is silent,
+/// and affected agents fall back to the Phase 1 title/quiescence signals.
+///
+/// Accepted rather than fixed, for now, because it sits inside the threat model this feature
+/// already documents: it requires a sustained same-user, same-machine reconnect loop, and such a
+/// process can already read the token straight out of `/proc/<pid>/environ`, which buys it
+/// strictly more than degrading a status glyph. It is also strictly weaker than the bug it
+/// replaced - a one-shot drip is no longer enough.
+///
+/// A future pass should reserve some slots for connections that have already authenticated, so
+/// unauthenticated churn cannot crowd out real hooks.
 const MAX_IN_FLIGHT: usize = 16;
 
 /// The header the forwarder puts the token in.
@@ -106,6 +124,10 @@ const MAX_TRACKED_AGENTS: usize = 512;
 
 /// How long [`HookListener::drop`]'s self-connect may block the dropping thread - see that impl.
 const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Smallest write budget allowed for the reply, used when the read phase already consumed the
+/// whole [`REQUEST_DEADLINE`] - see [`handle_connection`].
+const REPLY_WRITE_FLOOR: Duration = Duration::from_millis(500);
 
 /// One agent's most recent hook fact, as stored for the rail to read.
 #[derive(Debug, Clone)]
@@ -459,10 +481,20 @@ fn handle_connection(mut stream: TcpStream, token: &str, inbox: &Arc<Mutex<HookI
     // `REQUEST_DEADLINE`.
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
 
     let response =
         read_and_record(&mut stream, token, inbox, deadline).unwrap_or(Response::BadRequest);
+
+    // The reply is written *after* the read phase, which may already have consumed the whole
+    // deadline - so a fixed write timeout here simply adds to the worst-case hold rather than
+    // bounding it (5s of reading plus 2s of writing is a 7s hold, not the 5s the deadline
+    // advertises). Bound the write by whatever is actually left instead.
+    //
+    // `REPLY_WRITE_FLOOR` rather than zero for the already-expired case, for two reasons: a
+    // client that timed out still deserves its 400 rather than a bare RST, and
+    // `set_write_timeout(Some(Duration::ZERO))` is an error on Unix, not "don't wait".
+    let write_budget = time_left(deadline).unwrap_or(REPLY_WRITE_FLOOR);
+    let _ = stream.set_write_timeout(Some(write_budget.max(REPLY_WRITE_FLOOR)));
 
     // Always `Connection: close` and always a `Content-Length: 0` body, so a client that speaks
     // HTTP/1.1 keep-alive doesn't sit waiting for a body that isn't coming.
