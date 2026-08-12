@@ -352,14 +352,24 @@ pub fn pty_state_label(is_running: bool, status: Status, exit_code: Option<u32>)
     }
 }
 
-/// A bare worktree's shell tab label (Revision R12 §3): the real resolved shell binary name
-/// (`program`, from `TerminalPane::program_label` - never a hardcoded `"zsh"`, even though
-/// that's the design mockup's literal example) joined with the worktree's branch, e.g.
-/// `zsh \u{b7} feature/x`. Falls back to the bare program name for a detached worktree with no
-/// branch, rather than inventing one.
-pub fn bare_worktree_shell_label(program: &str, branch: Option<&str>) -> String {
-    match branch {
-        Some(branch) => format!("{program} \u{b7} {branch}"),
+/// A tab's label: what the process inside that pane says it is *right now*.
+///
+/// `title` is the live OSC 0/2 window title the child process last set (`TerminalPane::title`,
+/// the same real fact `crate::rail::title_signal` already classifies into a status signal) - a
+/// shell reporting its cwd or the command it's running, an agent CLI reporting what it's doing.
+/// That is the whole label: no branch, no ordinal, no decoration, exactly like every real
+/// terminal emulator's tab. Two panes that genuinely report the same title therefore render the
+/// same label, which is the honest answer - they really are showing the same thing.
+///
+/// `program` (`TerminalPane::program_label`, the resolved binary name) is the fallback for the
+/// one real case where there is no title to show: a process that hasn't set one yet, or ever.
+/// Many shells only set a title from their prompt hook, so a freshly spawned one is silent until
+/// its first prompt - and plenty of setups never set one at all. An *empty* title is treated the
+/// same way: `\u{1b}]0;\u{7}` is a process clearing its title, which leaves nothing to show, not
+/// a reason to render a blank tab.
+pub fn live_tab_label(title: Option<&str>, program: &str) -> String {
+    match title.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => title.to_string(),
         None => program.to_string(),
     }
 }
@@ -373,31 +383,6 @@ pub fn bare_worktree_shell_label(program: &str, branch: Option<&str>) -> String 
 /// two don't invent two different placeholder strings for the same "no branch" fact.
 pub fn new_agent_menu_secondary_text(branch: Option<&str>) -> String {
     format!("runs in {}", branch.unwrap_or("(detached)"))
-}
-
-/// Appends a ` #N` ordinal (1-based, in order of appearance) to every label that repeats within
-/// `labels`, so two agents on the same model in one worktree never render two identical tab
-/// labels (`sonnet-4.5`, `sonnet-4.5` -> `sonnet-4.5 #1`, `sonnet-4.5 #2` - Revision R12 §3). A
-/// label that appears only once is returned unchanged - a lone `claude` tab never grows a
-/// spurious `#1`.
-pub fn disambiguate_tab_labels(labels: Vec<String>) -> Vec<String> {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for label in &labels {
-        *counts.entry(label.clone()).or_insert(0) += 1;
-    }
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    labels
-        .into_iter()
-        .map(|label| {
-            if counts.get(&label).copied().unwrap_or(0) > 1 {
-                let ordinal = seen.entry(label.clone()).or_insert(0);
-                *ordinal += 1;
-                format!("{label} #{ordinal}")
-            } else {
-                label
-            }
-        })
-        .collect()
 }
 
 /// A footer action button's colour treatment, backed by `theme::button::*`.
@@ -824,47 +809,37 @@ mod tests {
         }
     }
 
+    /// A live title is the label, verbatim - no branch, no ordinal, nothing appended.
     #[test]
-    fn a_lone_tab_label_is_never_given_a_spurious_ordinal() {
-        let labels = disambiguate_tab_labels(vec!["claude".to_string(), "codex".to_string()]);
-        assert_eq!(labels, vec!["claude", "codex"]);
-    }
-
-    #[test]
-    fn two_agents_on_the_same_model_get_ordinal_suffixes_never_an_identical_label() {
-        let labels = disambiguate_tab_labels(vec![
-            "sonnet-4.5".to_string(),
-            "sonnet-4.5".to_string(),
-            "codex".to_string(),
-        ]);
-        assert_eq!(labels, vec!["sonnet-4.5 #1", "sonnet-4.5 #2", "codex"]);
-        assert_ne!(
-            labels[0], labels[1],
-            "two tabs must never share an identical label"
-        );
-    }
-
-    #[test]
-    fn three_agents_on_the_same_model_all_get_distinct_ordinals_in_appearance_order() {
-        let labels = disambiguate_tab_labels(vec![
-            "claude".to_string(),
-            "claude".to_string(),
-            "claude".to_string(),
-        ]);
-        assert_eq!(labels, vec!["claude #1", "claude #2", "claude #3"]);
-    }
-
-    #[test]
-    fn a_bare_worktrees_shell_label_joins_the_real_program_name_with_its_branch() {
+    fn a_live_title_is_the_whole_tab_label_with_nothing_appended() {
         assert_eq!(
-            bare_worktree_shell_label("zsh", Some("feature/x")),
-            "zsh \u{b7} feature/x"
+            live_tab_label(Some("\u{2733} Claude Code"), "claude"),
+            "\u{2733} Claude Code"
         );
+        assert_eq!(live_tab_label(Some("~/src/jerry"), "zsh"), "~/src/jerry");
     }
 
+    /// The only fallback: a process that has said nothing yet still gets a real name.
     #[test]
-    fn a_bare_worktrees_shell_label_falls_back_to_the_program_name_when_detached() {
-        assert_eq!(bare_worktree_shell_label("bash", None), "bash");
+    fn a_pane_whose_process_has_set_no_title_falls_back_to_its_program_name() {
+        assert_eq!(live_tab_label(None, "zsh"), "zsh");
+    }
+
+    /// A title cleared (or set empty) by the process is "nothing to show", not a blank tab.
+    #[test]
+    fn an_empty_or_whitespace_title_falls_back_rather_than_rendering_a_blank_tab() {
+        assert_eq!(live_tab_label(Some(""), "bash"), "bash");
+        assert_eq!(live_tab_label(Some("   "), "bash"), "bash");
+    }
+
+    /// Two panes really showing the same thing render the same label - the duplicate is the
+    /// truth, and synthesising a `#1`/`#2` difference between them would be inventing one.
+    #[test]
+    fn two_panes_reporting_the_same_title_get_the_same_label() {
+        assert_eq!(
+            live_tab_label(Some("nvim"), "zsh"),
+            live_tab_label(Some("nvim"), "bash"),
+        );
     }
 
     /// Revision R12 §3's exact spec wording for the `+` menu's "New agent" row.
