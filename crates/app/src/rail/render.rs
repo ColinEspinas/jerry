@@ -106,7 +106,17 @@ impl AdeApp {
     /// (process signal, question preview), the matching worktree's branch name, and the diff
     /// summary from [`Self::diff_cache`] (refreshed by the periodic task started in
     /// `Self::new`). An agent with no diff data yet simply shows `0`/`0` until the next
-    /// status-poll tick fills it in.
+    /// status-poll tick fills it in. Iterates [`Self::agents`] with no repo filter of its own -
+    /// every currently open agent gets a row here regardless of which repo is focused right now,
+    /// which is what lets [`Self::build_repo_groups`] show a background repo's own agents with
+    /// genuinely live status rather than nothing at all.
+    ///
+    /// The branch lookup checks [`Self::worktrees`] (the focused repo's own live list) first,
+    /// then falls back to scanning every added repo's own [`crate::rail::repo::Repo::worktrees`].
+    /// An agent whose own repo isn't focused right now has no entry in [`Self::worktrees`] at
+    /// all - without this fallback its rail row would show a blank branch even though the repo's
+    /// own worktree list (kept live by `crate::root::AdeApp::load_repo_worktrees`/
+    /// `crate::root::AdeApp::start_repo_worktrees_polling`) knows it perfectly well.
     ///
     /// A plain [`crate::work_surface::agents::ProcessKind::Shell`] never gets a row here - the
     /// rail answers "who needs me", and a shell has no turn to finish and nothing to ask. It
@@ -128,6 +138,11 @@ impl AdeApp {
                     .worktrees
                     .iter()
                     .find(|item| item.path == agent.cwd)
+                    .or_else(|| {
+                        self.repos.iter().find_map(|repo| {
+                            repo.worktrees.iter().find(|item| item.path == agent.cwd)
+                        })
+                    })
                     .and_then(|item| item.branch.clone());
 
                 // GitHub issue #239 phase 2: real, structured text straight from this agent's own
@@ -824,16 +839,29 @@ impl AdeApp {
     ///
     /// Every repo in [`Self::repos`] gets its own real `all_rows`/`rows` here, not just
     /// [`Self::focused_repo`] - the focused repo's come from [`Self::build_worktree_rows`] (which
-    /// also folds in every open agent and its GitHub issue #227 history, both still genuinely
-    /// scoped to the focused repo only - see that method's own docs), while every other repo's
-    /// come straight from its own [`crate::rail::repo::Repo::worktrees`] (kept live by
-    /// `crate::root::AdeApp::load_repo_worktrees`/`crate::root::AdeApp::
-    /// start_repo_worktrees_polling`) with no agents folded in, since this app closes every open
-    /// agent on a repo switch (`crate::root::AdeApp::open_repo_in_current_window`'s own docs) -
-    /// by construction, no agent can belong to a repo that isn't focused. [`rail::RepoWorktrees::
-    /// rows_loaded`] mirrors [`crate::rail::repo::Repo::worktrees_loaded`] for a non-focused repo
-    /// (always `true` for the focused one - its own data path is unchanged) so the render side
-    /// can still tell "never fetched yet" apart from "fetched, and really has zero worktrees".
+    /// also folds in its GitHub issue #227 history, still genuinely scoped to the focused repo
+    /// only - persisted history has no meaning for a worktree this window has never selected),
+    /// while every other repo's worktree list comes straight from its own
+    /// [`crate::rail::repo::Repo::worktrees`] (kept live by `crate::root::AdeApp::
+    /// load_repo_worktrees`/`crate::root::AdeApp::start_repo_worktrees_polling`).
+    ///
+    /// Real open agents fold into **every** repo's rows, not just the focused one:
+    /// `crate::root::AdeApp::open_repo_in_current_window`/[`Self::checkout_repo_from_rail`] no
+    /// longer close an agent just because its own repo isn't the one currently focused (see
+    /// those methods' own "cross-repo agent persistence" docs), so [`Self::build_agent_rows`] -
+    /// which already has no repo filter of its own, since [`Self::agents`] never did - is
+    /// computed once below and matched against every repo's own worktree paths the same way
+    /// [`rail::build_worktree_rows`] already matches it against the focused repo's. This is the
+    /// real mechanism behind "the rail shows live status for agents in every repo at all times":
+    /// a background repo's agent row carries its own real [`Status`], diff totals, and
+    /// review-readiness exactly as it would if that repo were focused, because the same
+    /// status-poll tick ([`Self::start_status_polling`]) that refreshes the focused repo's data
+    /// already covers every open agent regardless of which repo it belongs to.
+    ///
+    /// [`rail::RepoWorktrees::rows_loaded`] mirrors [`crate::rail::repo::Repo::worktrees_loaded`]
+    /// for a non-focused repo (always `true` for the focused one - its own data path is
+    /// unchanged) so the render side can still tell "never fetched yet" apart from "fetched, and
+    /// really has zero worktrees".
     pub(in crate::rail) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
@@ -841,6 +869,9 @@ impl AdeApp {
                 .into_iter()
                 .cloned()
                 .collect();
+        // Every open agent, in every repo - see this function's own docs above for why this,
+        // not `&[]`, is what a non-focused repo's rows must be matched against too.
+        let agent_rows = self.build_agent_rows(cx);
 
         let repo_inputs: Vec<RepoWorktrees> = self
             .repos
@@ -852,7 +883,7 @@ impl AdeApp {
                 } else {
                     let entries = self.build_worktree_entries_from(&repo.worktrees);
                     (
-                        rail::build_worktree_rows(&entries, &[]),
+                        rail::build_worktree_rows(&entries, &agent_rows),
                         repo.worktrees_loaded,
                     )
                 };
@@ -2678,6 +2709,8 @@ mod rail_row_tests {
 #[cfg(test)]
 mod repo_checkout_tests {
     use crate::root::focus::palette_focus_tests;
+    use crate::work_surface::agents::ProcessKind;
+    use crate::work_surface::state::TabRef;
     use gpui::TestAppContext;
     use std::path::Path;
     use std::process::Command;
@@ -2854,6 +2887,100 @@ mod repo_checkout_tests {
             "a real git repo always has at least its own main checkout as a worktree - this \
              must read as a real 1, never a false 0 masquerading as \"confirmed empty\""
         );
+    }
+
+    /// Real cross-repo agent persistence (`crate::root::AdeApp::open_repo_in_current_window`'s
+    /// own "cross-repo agent persistence" docs): a real Claude agent spawned into repo B must
+    /// still show up in `Self::build_repo_groups`' output for repo B, with genuinely live status,
+    /// even after focus has moved away to repo A - the rail's own "see at a glance if a
+    /// background repo's agent needs me" promise. Also proves the inverse half of that same
+    /// promise: repo A's own tab strip (`crate::work_surface::render::AdeApp::
+    /// combined_tab_order`) must *not* show repo B's agent while B isn't the active worktree -
+    /// cross-repo visibility lives in the rail alone, never a new tab-strip affordance.
+    #[gpui::test]
+    fn build_repo_groups_folds_a_non_focused_repos_real_agent_into_its_own_row(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_a = tempfile::tempdir().expect("tempdir a");
+        let repo_b = init_repo();
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Focus repo B long enough to spawn a real Claude agent into it, mirroring how a user
+        // would actually get one running there - then switch straight back to repo A.
+        let agent_id = app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_b.path().to_path_buf(), window, cx);
+            app.agents.spawn(
+                ProcessKind::claude(),
+                repo_b.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_a.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo_a.path(),
+                "sanity check: repo A is focused again"
+            );
+            assert!(
+                app.agents.iter().any(|agent| agent.id == agent_id),
+                "repo B's real agent must still genuinely exist - not closed by the switch back \
+                 to repo A"
+            );
+        });
+
+        let groups = app.update(cx, |app, cx| app.build_repo_groups(cx));
+        let repo_b_id = app.read_with(cx, |app, _| {
+            app.repos
+                .iter()
+                .find(|repo| repo.path == repo_b.path())
+                .expect("repo B must still be a known repo")
+                .id
+        });
+        let group_b = groups
+            .iter()
+            .find(|group| group.repo_id == repo_b_id)
+            .expect("repo B's group must still render while unfocused");
+        let worktree_row = group_b
+            .all_rows
+            .iter()
+            .find(|row| row.path == repo_b.path())
+            .expect("repo B's own root worktree must still be a real row");
+        assert_eq!(
+            worktree_row.agents.len(),
+            1,
+            "repo B's real agent must be folded into its own worktree row even while unfocused"
+        );
+        assert_eq!(
+            worktree_row.agents[0].id, agent_id,
+            "the folded-in row must be the exact same agent, not a stand-in"
+        );
+        assert_eq!(
+            worktree_row.agents[0].status,
+            crate::rail::status::Status::Run,
+            "the folded-in row must carry this agent's own genuinely live status, not a \
+             fabricated default"
+        );
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.combined_tab_order().contains(&TabRef::Agent(agent_id)),
+                "repo A's tab strip must not show repo B's agent - cross-repo visibility lives \
+                 in the rail alone"
+            );
+        });
     }
 
     /// A second click on the already-focused repo's own header must be a real no-op (matching
