@@ -1710,6 +1710,7 @@ impl AdeApp {
         div()
             .id(("graph-row", index))
             .debug_selector(move || format!("graph-row-{index}"))
+            .relative()
             .flex()
             .items_center()
             .w_full()
@@ -1717,19 +1718,33 @@ impl AdeApp {
             .border_b_1()
             .border_color(theme::border::ROW)
             .cursor_pointer()
-            // `border_l_2()` is applied unconditionally, reserving the 2px of space whether or
-            // not this row is selected, so selecting a row never shifts its content (lane
-            // canvas, ref chips, subject, everything) 2px to the right - only the border's
-            // *colour* toggles. Mirrors `crate::work_surface::state`'s own `TRANSPARENT`
-            // convention (see its doc comment: "so every button/tab can always call
-            // `.bg()`/`.border_color()` uniformly rather than conditionally skipping the call,
-            // which would also shift the box model by the border's width").
-            .border_l_2()
-            .border_color(if selected {
-                theme::border::SELECTED_EDGE.into()
-            } else {
-                work_surface::TRANSPARENT
-            })
+            // The left selection edge is a real, separate child - not `border_l_2()` - because
+            // GPUI's `Style::border_color` is one shared value for every edge of a single
+            // element (confirmed directly in `gpui`'s own `style.rs`: `border_color:
+            // Option<Hsla>`, not per-edge). `border_l_2()` on this same div would silently
+            // overwrite the `border_b_1()` separator's colour above with whichever colour
+            // selection picks - toggling *both* edges together, so a selected row would flash a
+            // second border along its own bottom, not just gain one on the left. Splitting them
+            // into two real elements is what actually fixes that, on top of the layout-shift fix
+            // this already had: `left_0().top_0().bottom_0()` reserves the same 2px of space
+            // whether or not this row is selected (only its own `bg` colour toggles), the same
+            // "always paint the box, only recolour it" convention the tab strip's own selection
+            // underline already uses (`crate::work_surface::render::AdeApp::render_tab_chrome`'s
+            // `div().flex_none().w_full().h(px(1.0)).bg(colors.underline)`).
+            .child(
+                div()
+                    .debug_selector(move || format!("graph-row-{index}-selection-edge"))
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(if selected {
+                        theme::border::SELECTED_EDGE.into()
+                    } else {
+                        work_surface::TRANSPARENT
+                    }),
+            )
             .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
             .when(!selected, |el| {
                 el.hover(|el| el.bg(theme::surface::ROW_HOVER))
@@ -5574,6 +5589,58 @@ mod graph_selection_render_tests {
             "selecting a row must never resize its own content (unselected: {:?}, selected: \
              {:?})",
             bounds_unselected, bounds_selected
+        );
+    }
+
+    /// The reported "double border left and bottom" - GPUI's `Style::border_color` is one
+    /// shared value for every edge of a single element (confirmed directly in `gpui`'s own
+    /// `style.rs`: `border_color: Option<Hsla>`, not per-edge), so a row using both
+    /// `border_b_1()` (its own permanent separator) and a conditional `border_l_2()` (its
+    /// selection edge) on the *same* div used to have the second `.border_color()` call
+    /// silently overwrite the first - recolouring the bottom separator to the selection colour
+    /// too, on every selected row, everywhere this pattern was used. The fix is a real, separate
+    /// child element for the left edge (`Self::render_graph_row`'s own docs). This proves that
+    /// child exists and is genuinely unconditional - painted with the same bounds whether or not
+    /// the row is selected, only its colour differs (which this test harness has no way to
+    /// inspect directly, but a `debug_bounds` miss on the unselected row would mean the child is
+    /// still conditionally created, i.e. this fix regressed back to the broken pattern).
+    #[gpui::test]
+    fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.selected_row),
+            Some(0),
+            "premise: row 0 is auto-selected on load, so row 1 starts genuinely unselected"
+        );
+
+        let edge_unselected = cx.debug_bounds("graph-row-1-selection-edge").expect(
+            "the selection-edge child must be painted even while row 1 is unselected - if \
+                 it's `None` here, the edge is still only created `.when(selected, ...)`, the \
+                 exact regression this test exists to catch",
+        );
+
+        app.update(cx, |app, cx| {
+            app.select_graph_row(1, cx);
+        });
+        cx.run_until_parked();
+
+        let edge_selected = cx
+            .debug_bounds("graph-row-1-selection-edge")
+            .expect("the selection-edge child must still be painted while row 1 is selected");
+
+        assert_eq!(
+            edge_unselected.origin, edge_selected.origin,
+            "the selection edge's own position must never move - only its colour toggles \
+             (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
+        );
+        assert_eq!(
+            edge_unselected.size, edge_selected.size,
+            "the selection edge's own size must never change (unselected: {:?}, selected: {:?})",
+            edge_unselected, edge_selected
         );
     }
 
