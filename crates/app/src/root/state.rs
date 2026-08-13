@@ -1498,7 +1498,7 @@ impl AdeApp {
         // is normally a no-op that compares an unchanged snapshot and returns - but it means a
         // future mutation path that forgets to record still can't lose a user's tabs, since
         // leaving a worktree is something every such path is eventually followed by. Must run
-        // before `self.selected` moves below, while `Self::active_agent_cwd` still resolves to the
+        // before `self.selected` moves below, while `Self::current_worktree_path` still resolves to the
         // worktree being left.
         self.record_worktree_session(cx);
         self.selected = Some(index);

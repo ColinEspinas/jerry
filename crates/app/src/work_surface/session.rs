@@ -87,7 +87,7 @@ impl AdeApp {
     ///
     /// Refuses, deliberately, in three cases:
     ///
-    /// - No worktree genuinely selected ([`Self::active_agent_cwd`] is `None`). There is no such
+    /// - No worktree genuinely selected ([`Self::current_worktree_path`] is `None`). There is no such
     ///   thing as a session belonging to a repo rather than to a worktree, so there is nothing to
     ///   file it under.
     /// - This worktree's own session hasn't been restored yet
@@ -102,7 +102,7 @@ impl AdeApp {
     ///   would mean inventing a per-worktree existence neither actually has. They simply reopen
     ///   the way they always have, from their own live state.
     pub(crate) fn record_worktree_session(&mut self, cx: &mut Context<Self>) {
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return;
         };
         if !self.session_restored.contains(&cwd) {
@@ -181,7 +181,7 @@ impl AdeApp {
     /// Called from exactly the two places a worktree becomes genuinely, currently selected:
     /// [`Self::select_worktree`] (every rail click, and every programmatic selection that goes
     /// through it) and [`Self::spawn_initial_shell_for_opened_repo`] (a just-opened repo, which
-    /// also covers `active_agent_cwd`'s one documented no-usable-worktree last resort). Ordering
+    /// also covers `current_worktree_path`'s one documented no-usable-worktree last resort). Ordering
     /// matters at the second: this runs *before* that method's guaranteed initial shell, so a
     /// worktree whose session already contains a terminal gets its own remembered one back rather
     /// than that one plus a redundant fresh one - the "already has an agent" check there does the
