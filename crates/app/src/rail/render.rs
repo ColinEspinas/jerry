@@ -1103,7 +1103,7 @@ impl AdeApp {
     /// which made every added repo's header reachable rather than just the focused one's - is
     /// what exposed how wrong it is: a repo header has no *worktree* context for those five
     /// actions to spawn into, so "New terminal"/"New agent" fell through to
-    /// [`Self::active_agent_cwd`]'s repo-root fallback and opened a tab against the repo itself
+    /// [`Self::current_worktree_path`]'s repo-root fallback and opened a tab against the repo itself
     /// rather than any worktree inside it. Tabs belong to worktrees here, not to repos.
     ///
     /// With that handler gone, the whole anchoring apparatus it needed went with it (the
@@ -1149,7 +1149,7 @@ impl AdeApp {
     /// (via [`Self::render_worktree_row`]) when `row.agents` is non-empty.
     ///
     /// GitHub issue #112 (live follow-up report): the worktree currently selected
-    /// ([`Self::active_agent_cwd`] - the same real comparison [`Self::render_worktree_row`]'s own
+    /// ([`Self::current_worktree_path`] - the same real comparison [`Self::render_worktree_row`]'s own
     /// `is_selected` uses) is exempt from the idle-collapse default, absent an explicit override.
     /// Without this, a worktree the user is actively switching terminals within could silently
     /// collapse out from under them the moment its most urgent agent's status crossed into
@@ -1164,7 +1164,7 @@ impl AdeApp {
         match self.rail_collapse_overrides.get(&row.path) {
             Some(expanded) => *expanded,
             None => {
-                self.active_agent_cwd().as_deref() == Some(row.path.as_path())
+                self.current_worktree_path().as_deref() == Some(row.path.as_path())
                     || row.aggregate_status() != Status::Idle
             }
         }
@@ -1232,10 +1232,10 @@ impl AdeApp {
 
         // The rail's own "this row is the selected worktree" state, read from the exact same
         // single source of truth the tab strip scopes itself to - so the two can never disagree.
-        // With `Self::active_agent_cwd`'s repo-root fallback removed, "nothing is selected" now
+        // With `Self::current_worktree_path`'s repo-root fallback removed, "nothing is selected" now
         // genuinely draws *no* row as selected, rather than lighting up whichever row happened to
         // sit at the repo root while the tab strip showed something else entirely.
-        let is_selected = self.active_agent_cwd().as_deref() == Some(row.path.as_path());
+        let is_selected = self.current_worktree_path().as_deref() == Some(row.path.as_path());
         let has_agents = !row.agents.is_empty();
         let has_history = !row.history.is_empty();
         // GitHub issue #227: a worktree with no live agent but real persisted history must still
@@ -2173,7 +2173,7 @@ mod rail_row_tests {
     }
 
     /// GitHub issue #112 (live follow-up report): a worktree the user is actively switching
-    /// terminals within - the one [`crate::root::AdeApp::active_agent_cwd`] currently reports -
+    /// terminals within - the one [`crate::root::AdeApp::current_worktree_path`] currently reports -
     /// must never auto-collapse just because its most urgent agent's status happens to cross into
     /// `Idle` (an ordinary occurrence - a shell sitting at its prompt between commands). Before
     /// this exemption, that real, wall-clock-driven Idle transition would silently collapse the
@@ -2212,7 +2212,7 @@ mod rail_row_tests {
                 .expect("the seeded worktree must produce a row")
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.active_agent_cwd()),
+            app.read_with(cx, |app, _| app.current_worktree_path()),
             Some(wt.path().to_path_buf()),
             "premise: `wt` really is the currently selected worktree"
         );
@@ -3149,7 +3149,7 @@ mod repo_checkout_tests {
                  the repo's main checkout"
             );
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(repo_b_feature.clone()),
                 "the whole point of the switch: new work now targets the clicked worktree"
             );
@@ -3313,7 +3313,7 @@ mod repo_checkout_tests {
 
     /// The real, reproduced root cause behind "I spawned a Claude agent and it never showed up in
     /// the rail": a repo path that isn't fully resolved. `git worktree list --porcelain` always
-    /// reports resolved paths, `crate::root::AdeApp::active_agent_cwd` falls back to
+    /// reports resolved paths, `crate::root::AdeApp::current_worktree_path` falls back to
     /// `Self::focused_repo_path` whenever no worktree is selected (which is exactly the state a
     /// fresh window - and every `Self::checkout_repo_from_rail` - leaves the app in), and
     /// `crate::rail::state::build_worktree_rows_with_history` folds an agent into a worktree row
@@ -3532,7 +3532,7 @@ mod worktree_tab_attribution_tests {
     /// The startup half of the reported bug. A fresh `jerry <repo>` launch spawns a real shell and
     /// shows its tab - but it used to leave `AdeApp::selected` at `None`, so *the user never
     /// selected the worktree that tab belongs to*. The tab rendered only because
-    /// `AdeApp::active_agent_cwd`'s repo-root fallback happened to coincide with the main
+    /// `AdeApp::current_worktree_path`'s repo-root fallback happened to coincide with the main
     /// worktree's own path. This asserts the real thing instead: the main worktree is genuinely
     /// selected, and the startup shell genuinely lives in it.
     #[gpui::test]
@@ -3554,9 +3554,9 @@ mod worktree_tab_attribution_tests {
                  starting state"
             );
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(repo.path().to_path_buf()),
-                "and it must be a real selection, not `active_agent_cwd`'s old repo-root fallback"
+                "and it must be a real selection, not `current_worktree_path`'s old repo-root fallback"
             );
             let startup_shell_cwds: Vec<PathBuf> =
                 app.agents.iter().map(|agent| agent.cwd.clone()).collect();
@@ -3599,7 +3599,7 @@ mod worktree_tab_attribution_tests {
         // Step 1: the main worktree really is the selected one, and really owns the tab.
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(repo.path().to_path_buf()),
                 "premise: the startup terminal's own worktree must be genuinely selected before \
                  the user ever clicks anything - that is what makes the switch below a \
@@ -3617,7 +3617,7 @@ mod worktree_tab_attribution_tests {
         click_worktree_row(&app, cx, &feature);
         app.read_with(cx, |app, cx| {
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(feature.clone()),
                 "the clicked worktree must be the selected one"
             );
@@ -3656,7 +3656,7 @@ mod worktree_tab_attribution_tests {
     /// The real, permanent-loss half of the bug, live-reproduced before the fix: launching against
     /// a *subdirectory* of a repo (`jerry ./crates` - an entirely ordinary invocation).
     ///
-    /// `AdeApp::active_agent_cwd` used to resolve to that bare subdirectory, which
+    /// `AdeApp::current_worktree_path` used to resolve to that bare subdirectory, which
     /// `git worktree list --porcelain` reports as no worktree at all. The startup shell spawned
     /// there rendered a real tab in the strip while *every* rail row read as unselected, and the
     /// moment any worktree row was clicked the tab vanished for good - its `cwd` could never again
@@ -3672,7 +3672,7 @@ mod worktree_tab_attribution_tests {
 
         let startup_agent = app.read_with(cx, |app, _| {
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(repo.path().to_path_buf()),
                 "a subdirectory is not a worktree - this must land on the repo's real main \
                  worktree rather than on the subdirectory itself"
@@ -3721,7 +3721,7 @@ mod worktree_tab_attribution_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(feature.clone()),
                 "the worktree the user actually pointed at must be the selected one"
             );
@@ -3814,7 +3814,7 @@ mod worktree_tab_attribution_tests {
 
         app.read_with(cx, |app, _| {
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 Some(feature.clone()),
                 "the worktree the user actually clicked must win over the one the in-flight open \
                  fetch would have picked on its own"
@@ -3837,7 +3837,7 @@ mod worktree_tab_attribution_tests {
     /// is genuinely selected, *nothing* may claim to be showing.
     ///
     /// Before this revision, `AdeApp::checkout_repo_from_rail` left `AdeApp::selected` at `None`
-    /// while `active_agent_cwd` still resolved to the repo root, producing a real three-way
+    /// while `current_worktree_path` still resolved to the repo root, producing a real three-way
     /// disagreement: the rail drew the main-worktree row as selected, the tab strip drew the root
     /// shell's tab, and the centre pane rendered nothing at all (`Agents::clear_active` having
     /// genuinely cleared it). All three now agree.
@@ -3887,7 +3887,7 @@ mod worktree_tab_attribution_tests {
         app.read_with(cx, |app, cx| {
             assert_eq!(app.selected, None, "premise: nothing is selected");
             assert_eq!(
-                app.active_agent_cwd(),
+                app.current_worktree_path(),
                 None,
                 "so there is genuinely no active worktree - not the repo root standing in for one"
             );
@@ -3906,11 +3906,11 @@ mod worktree_tab_attribution_tests {
             let any_row_selected = app
                 .build_worktree_rows(cx)
                 .iter()
-                .any(|row| app.active_agent_cwd().as_deref() == Some(row.path.as_path()));
+                .any(|row| app.current_worktree_path().as_deref() == Some(row.path.as_path()));
             assert!(
                 !any_row_selected,
                 "and no rail row may read as selected either - the rail used to light up the \
-                 main-worktree row here purely because `active_agent_cwd` fell back to the repo \
+                 main-worktree row here purely because `current_worktree_path` fell back to the repo \
                  root"
             );
             assert!(

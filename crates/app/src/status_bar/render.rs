@@ -121,24 +121,55 @@ impl AdeApp {
         .into_any_element()
     }
 
-    /// The active agent's real branch name (`self.worktrees`, the same lookup
+    /// The current worktree's real branch name (`self.worktrees`, the same lookup
     /// `Self::render_agent_context_bar` already does - not a second copy) plus its real
     /// `↑ahead ↓behind` from [`Self::ahead_behind_cache`] (populated by the same periodic
-    /// `wt_core::diff::ahead_behind_against_base` refresh as [`Self::diff_cache`]). `None` (the
-    /// whole cluster hidden) only when there is no active agent at all - a detached `HEAD`
-    /// still shows real text (`"(detached)"`), matching the agent context bar's own
+    /// `wt_core::diff::ahead_behind_against_base` refresh as [`Self::diff_cache`]). A detached
+    /// `HEAD` still shows real text (`"(detached)"`), matching the agent context bar's own
     /// convention, and a not-yet-computed ahead/behind is honestly omitted rather than shown as
     /// a fabricated `↑0 ↓0`.
     /// The branch text (design spec change 6: "the branch text became a clickable cluster (fork
     /// glyph + `main` + `↑2 ↓0`, hover `#1b1f22`) that opens the graph tab") - a real click target
     /// via `crate::graph_view::render::AdeApp::open_git_graph`, the same entry point the `+` menu
     /// and the palette's "Open git graph" use.
+    ///
+    /// ## Why this is gated on [`Self::focused_repo`], not on an active agent
+    ///
+    /// It used to open with `self.agents.active()?`, and that `?` was **not** a deliberate
+    /// visibility rule - it was how the branch got a `cwd` to look itself up by. When this
+    /// function was written (Revision R6) the app had no `repos` and no [`Self::focused_repo`]
+    /// at all, so the active pane's `cwd` was the only path available, and hiding the row when
+    /// there was no pane was an incidental side effect nobody was designing for. The git graph
+    /// tab then hung its click target, fork glyph and
+    /// `crate::graph_view::render::AdeApp::open_git_graph` call off this same function, which
+    /// silently promoted that leftover `?` into the visibility policy for the graph's primary
+    /// entry point.
+    ///
+    /// The result was a real bug: `open_git_graph` refuses only when
+    /// [`Self::focused_repo`] is `None`, so with a repo focused and simply no agent open (every
+    /// tab closed) the action worked perfectly while its only button was hidden - and the whole
+    /// cluster (fork glyph, branch, `↑ahead ↓behind`) vanished with it. The gate is now the
+    /// action's own precondition, so the button is visible exactly when clicking it does
+    /// something, and the path comes from [`Self::current_worktree_path`] - the app's real current
+    /// git context, which already resolves the selected worktree and falls back to
+    /// [`Self::focused_repo_path`] - rather than from whichever pane happens to be focused.
     fn render_status_branch_cluster(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let agent = self.agents.active()?;
+        // Exactly `open_git_graph`'s own guard: this cluster is that action's button, so the two
+        // must not be able to disagree about when it is available. Unlike the `self.agents
+        // .active()?` this replaces, the value is genuinely unused - the `?` *is* the gate here,
+        // not an incidental by-product of fetching a `cwd`.
+        self.focused_repo()?;
+        // `current_worktree_path` is `None` only in the brief in-flight window before the worktree
+        // fetch lands, or the genuine no-usable-worktree error state - both real, but neither is
+        // a reason to hide this cluster once a repo is focused at all, so this falls back to the
+        // repo root exactly as `Self::checkout_repo_from_rail`'s synchronous seed does.
+        let cwd = self
+            .current_worktree_path()
+            .unwrap_or_else(|| self.focused_repo_path());
         let branch = self
             .worktrees
             .iter()
-            .find(|item| item.path == agent.cwd)
+            .find(|item| item.path == cwd)
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| "(detached)".to_string());
 
@@ -158,7 +189,7 @@ impl AdeApp {
             .child(crate::graph_view::render::render_graph_tab_chip())
             .child(self.render_status_text(branch));
 
-        if let Some(ahead_behind) = self.ahead_behind_cache.get(&agent.cwd) {
+        if let Some(ahead_behind) = self.ahead_behind_cache.get(&cwd) {
             row = row.child(self.render_status_text(format!(
                 "\u{2191}{} \u{2193}{}",
                 ahead_behind.ahead, ahead_behind.behind
@@ -693,6 +724,105 @@ mod status_bar_error_count_tests {
             None,
             "the error count must disappear while Settings is open, not keep showing a frozen \
              snapshot of the file that was open before Settings covered the workspace"
+        );
+    }
+}
+
+/// Regression coverage for the status bar's branch cluster disappearing - and taking the git
+/// graph's primary entry point with it - whenever no agent pane happened to be open.
+///
+/// `render_status_branch_cluster` opened with `self.agents.active()?`, which was never a
+/// visibility decision: at Revision R6 the app had no `repos`/`focused_repo` at all, so the
+/// active pane's `cwd` was simply the only way to look a branch up, and hiding the row when
+/// there was no pane was an accident of that. The git graph tab later hung its click target and
+/// fork glyph off the same function, promoting the leftover `?` into the gate for its own
+/// button - while `AdeApp::open_git_graph` itself refuses only when `focused_repo()` is `None`.
+/// So with a repo focused and every tab closed, the action worked and its only button was gone.
+#[cfg(test)]
+mod status_bar_branch_cluster_visibility_tests {
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A real repo on a real branch, so the cluster has genuine branch text to show rather than
+    /// falling through to `"(detached)"` for want of a git repository at all.
+    fn seeded_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1").expect("write a.txt");
+        git(repo.path(), &["add", "a.txt"]);
+        git(repo.path(), &["commit", "-m", "base"]);
+        repo
+    }
+
+    #[gpui::test]
+    fn the_branch_cluster_and_its_graph_button_survive_closing_every_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = seeded_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Sanity check on the starting state this regression is measured against: opening a repo
+        // spawns a real startup shell, so there genuinely *is* an active agent here, and the
+        // cluster paints. Without this the test could pass by never rendering at all.
+        assert!(
+            app.read_with(cx, |app, _| app.agents.active().is_some()),
+            "sanity check: opening a repo spawns a real startup shell agent"
+        );
+        assert!(
+            cx.debug_bounds("status-bar-branch-cluster").is_some(),
+            "sanity check: the branch cluster paints while an agent is active"
+        );
+
+        // Close every agent through the real close path - the same one the tab's own ✕ uses -
+        // rather than reaching into `Agents` and clearing it, so this reproduces a state the user
+        // can genuinely reach.
+        let ids: Vec<_> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        app.update_in(cx, |app, window, cx| {
+            for id in ids {
+                app.close_agent(id, window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.agents.active().is_none()),
+            "sanity check: closing every tab genuinely leaves no active agent"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.focused_repo().is_some()),
+            "sanity check: the repo is still focused - this is the exact state where \
+             open_git_graph still works but its button used to vanish"
+        );
+
+        // The regression itself.
+        let bounds = cx.debug_bounds("status-bar-branch-cluster").expect(
+            "the branch cluster - and so the git graph's status-bar button - must still render \
+             with a repo focused and no agent open, because AdeApp::open_git_graph still works \
+             in exactly this state",
+        );
+
+        // ...and it must be a genuinely live click target, not merely painted pixels.
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_tab_open),
+            "clicking the branch cluster with no agent open must really open the git graph tab, \
+             through the same AdeApp::open_git_graph the + menu and palette use"
         );
     }
 }

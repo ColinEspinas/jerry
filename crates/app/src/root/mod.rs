@@ -43,7 +43,7 @@
 //! (`crate::work_surface::agents::Agents::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
 //! the active agent must always belong to the selected worktree, or the centre pane would show
 //! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
-//! drives the file tree, and which worktree `active_agent_cwd` resolves to for the *next* "New
+//! drives the file tree, and which worktree `current_worktree_path` resolves to for the *next* "New
 //! terminal"/"New agent pane" click - that part is unchanged. Spawning an agent is still always
 //! its own explicit action, never an implicit side effect of browsing.
 //!
@@ -55,7 +55,7 @@
 //! > **A tab is never shown, never spawnable, and never implicitly attributed to anything except a
 //! > real, currently-selected worktree. There is no such thing as "a repo's own tab".**
 //!
-//! [`AdeApp::active_agent_cwd`] is the single chokepoint that enforces it, and it returns
+//! [`AdeApp::current_worktree_path`] is the single chokepoint that enforces it, and it returns
 //! `Option<PathBuf>` precisely so that "nothing is selected" is a state the app can *say* rather
 //! than paper over. It used to fall back to [`AdeApp::focused_repo_path`] whenever
 //! [`AdeApp::selected`] was `None`, which quietly made a repo root behave like a worktree it is
@@ -2404,7 +2404,7 @@ impl AdeApp {
     /// window has focused, so falling back to its first entry could silently resolve to a
     /// completely different, unopened repo's real path - and every real repo-scoped operation
     /// this app has (spawning an agent, committing, discarding a worktree) reads its target
-    /// through this method or [`Self::active_agent_cwd`]. Every call site that can run with no
+    /// through this method or [`Self::current_worktree_path`]. Every call site that can run with no
     /// repo focused must check [`Self::focused_repo`]/[`Self::focused_repo_path`]'s emptiness
     /// itself instead - see [`crate::work_surface::render::AdeApp::new_agent`]'s own docs for the
     /// concrete exploit this was found through and the real guard that closes it.
@@ -2562,7 +2562,7 @@ impl AdeApp {
         // `Self::selected` ends up as. Cleared here (rather than left holding an index into the
         // repo being *left*) so the interim frames between this call and that fetch landing
         // render an honestly empty tab strip rather than a stale one - with
-        // `Self::active_agent_cwd`'s repo-root fallback gone, "nothing selected" is now a real,
+        // `Self::current_worktree_path`'s repo-root fallback gone, "nothing selected" is now a real,
         // self-consistent state everywhere instead of one that silently resolves to the repo root.
         self.selected = None;
         self.worktree_selection_notice = None;
@@ -2571,7 +2571,7 @@ impl AdeApp {
         // shell there" sequence - see its own docs. This method used to spawn that shell inline,
         // into the bare `path`, and leave `Self::selected` at `None`: the reported bug, since the
         // resulting tab belonged to no worktree at all and only rendered because
-        // `Self::active_agent_cwd` fell back to this same repo path while nothing was selected.
+        // `Self::current_worktree_path` fell back to this same repo path while nothing was selected.
         self.load_worktrees_for_opened_repo(path, cx);
         self.start_worktree_watch(cx);
         self.start_status_polling(cx);
@@ -4443,9 +4443,9 @@ mod repo_list_tests {
     /// The premise is unchanged, but the reason it is now *safe* is different, and worth stating
     /// because it is this revision's whole point. `AdeApp::selected` staying `None` used to be a
     /// limbo state that still rendered a plausible-looking tab, because
-    /// `AdeApp::active_agent_cwd` fell back to the bare repo path for exactly that `None` - so the
+    /// `AdeApp::current_worktree_path` fell back to the bare repo path for exactly that `None` - so the
     /// rail lit up the main-worktree row, the tab strip drew the repo root's shell, and the centre
-    /// pane showed nothing, all at the same time. That fallback is gone (see `active_agent_cwd`'s
+    /// pane showed nothing, all at the same time. That fallback is gone (see `current_worktree_path`'s
     /// own docs), so "nothing selected" is now genuinely inert *everywhere* rather than merely
     /// inert here - proven directly by `crate::rail::render::worktree_tab_attribution_tests::
     /// nothing_selected_means_nothing_shown_anywhere`.
@@ -4589,7 +4589,7 @@ mod repo_list_tests {
 
     /// Critical fix (independent audit): a genuinely empty window has no real repo root to spawn
     /// a new agent into - `Self::focused_repo_path`'s own `Self::repos.first()` fallback (removed)
-    /// used to let `Self::active_agent_cwd` silently resolve to some *other*, unopened repo's real
+    /// used to let `Self::current_worktree_path` silently resolve to some *other*, unopened repo's real
     /// path, so `secondary-n`/`ctrl-shift-T`'s own handlers could spawn a real, invisible PTY
     /// there. `Self::new_agent`/`Self::new_agent_pane` now refuse outright with no focused repo -
     /// this proves both real entry points genuinely spawn nothing.

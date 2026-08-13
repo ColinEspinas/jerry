@@ -160,9 +160,9 @@ impl AdeApp {
         // The three spawn commands below name the real worktree they would spawn into. With no
         // worktree genuinely selected they would spawn nothing at all (`Self::new_agent`/
         // `Self::new_agent_pane` both refuse outright), so the honest thing to show is that -
-        // rather than the repo root, which is what `Self::active_agent_cwd` used to hand back and
+        // rather than the repo root, which is what `Self::current_worktree_path` used to hand back and
         // which was never a place a tab could legitimately belong to. See that method's own docs.
-        let spawn_target = match self.active_agent_cwd() {
+        let spawn_target = match self.current_worktree_path() {
             Some(cwd) => format!("in {}", cwd.display()),
             None => "- select a worktree first".to_string(),
         };

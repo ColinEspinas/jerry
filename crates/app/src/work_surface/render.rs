@@ -52,7 +52,7 @@ pub(crate) struct TabChromeArgs {
 }
 
 impl AdeApp {
-    /// Spawns a new agent tab into [`Self::active_agent_cwd`] - the single real chokepoint every
+    /// Spawns a new agent tab into [`Self::current_worktree_path`] - the single real chokepoint every
     /// "new terminal"/"new shell" entry point in this app funnels through: `secondary-n`/
     /// `ctrl-shift-T`'s own `handle_new_agent_action`/`handle_new_terminal_action`, the `+` menu's
     /// row, the title bar's Agent menu row (`crate::title_bar::menu::AdeApp::agent_menu_rows`),
@@ -60,7 +60,7 @@ impl AdeApp {
     ///
     /// GitHub issue #90: a genuinely empty window (no [`Self::focused_repo`]) has no real repo
     /// root to spawn into at all - a real, live-reproduced bug (independent audit) found that
-    /// without this guard, [`Self::active_agent_cwd`] fell through to [`Self::focused_repo_path`],
+    /// without this guard, [`Self::current_worktree_path`] fell through to [`Self::focused_repo_path`],
     /// which itself used to fall back to *some other, unopened* known repo's real path (`Self::
     /// repos.first()`), silently spawning a real PTY - and, from there, reachable real destructive
     /// git operations (`Keep All Changes`/`Discard Worktree`) - against a repo the user never
@@ -79,9 +79,9 @@ impl AdeApp {
         // A tab is only ever attributable to a real, currently-selected worktree - there is no
         // such thing as "a repo's own tab". With no worktree genuinely selected there is nothing
         // legitimate to spawn into, so this refuses rather than falling back to the repo root as
-        // it used to (see `Self::active_agent_cwd`'s own docs for the family of live-reproduced
+        // it used to (see `Self::current_worktree_path`'s own docs for the family of live-reproduced
         // bugs that fallback caused).
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return;
         };
         // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
@@ -305,7 +305,7 @@ impl AdeApp {
             // at all (the rail's own agent rows fold in every repo's agents, not just the
             // focused repo's - `Self::build_agent_rows`'s own docs) - a real, reported bug:
             // clicking such an agent set it globally active (`Agents::set_active` above) but
-            // never switched repos, so `Self::active_agent_cwd` kept resolving to whatever the
+            // never switched repos, so `Self::current_worktree_path` kept resolving to whatever the
             // *focused* repo's own selection was, `Self::combined_tab_order` built the tab strip
             // from that wrong cwd, and it came up with zero tabs - visibly "the tab bar doesn't
             // appear" - even though the agent genuinely was active underneath.
@@ -606,10 +606,10 @@ impl AdeApp {
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         // No worktree genuinely selected means genuinely no tabs - an honestly empty strip, not
         // whatever happens to be open in the repo root. This used to fall through to
-        // `Self::active_agent_cwd`'s repo-root fallback, which is how a live terminal could be
+        // `Self::current_worktree_path`'s repo-root fallback, which is how a live terminal could be
         // drawn in the strip while the centre pane showed nothing and no rail row claimed it (see
         // that method's own docs for the live repro).
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return Vec::new();
         };
         let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
@@ -660,7 +660,7 @@ impl AdeApp {
     ) {
         // A drag can only ever have started from a tab that was genuinely rendered, which means a
         // real worktree is selected - this refusal is defensive, not a reachable path.
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return;
         };
         let mut order = self.combined_tab_order();
@@ -817,7 +817,7 @@ impl AdeApp {
         cleared_insertion || cleared_dragging
     }
 
-    /// Every agent open in the *currently selected* worktree (`Self::active_agent_cwd`), in
+    /// Every agent open in the *currently selected* worktree (`Self::current_worktree_path`), in
     /// the same order [`Self::combined_tab_order`] renders them - never Agents' own raw
     /// creation order once a real drag has interleaved them differently, and never every agent
     /// across every worktree, per this revision's whole point (see `crate::root::mod`'s "One
@@ -855,7 +855,7 @@ impl AdeApp {
     /// same way. Tab labels deliberately no longer consult it: a branch is a fact about the
     /// worktree, not about what the process in a given tab is doing right now.
     fn current_worktree_branch(&self) -> Option<String> {
-        let cwd = self.active_agent_cwd()?;
+        let cwd = self.current_worktree_path()?;
         self.worktrees
             .iter()
             .find(|item| item.path == cwd)
@@ -1564,7 +1564,7 @@ impl AdeApp {
         }
         // The identical "no worktree selected means nothing legitimate to spawn into" refusal
         // [`Self::new_agent`] applies - see its own docs.
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return;
         };
         let task = cx.spawn(async move |this, cx| {
@@ -5146,7 +5146,7 @@ mod terminal_clipboard_action_tests {
 /// agents, not just the focused one's (`crate::rail::render::AdeApp::build_agent_rows`'s own
 /// docs), so an agent from a non-focused repo was findable and clickable but its own worktree
 /// never was. `Agents::set_active` still ran, so the agent genuinely became active - but nothing
-/// switched repos, so `Self::active_agent_cwd` kept resolving to the *focused* repo's own
+/// switched repos, so `Self::current_worktree_path` kept resolving to the *focused* repo's own
 /// selection, `Self::combined_tab_order` built the strip from that wrong cwd, and it came up
 /// empty: a real agent, active underneath, with no tab visible for it at all.
 #[cfg(test)]

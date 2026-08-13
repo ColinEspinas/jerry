@@ -151,7 +151,7 @@ pub fn repo_state_path_for(settings_path: &Path) -> PathBuf {
 /// `crate::root::AdeApp::diff_cache`/`worktree_notes`/`open_files_by_worktree`/`edit_buffers`.
 /// A [`Repo::path`] kept verbatim from `jerry .`, `jerry ~/link-to-repo`, or any relative
 /// argument therefore never equals git's own answer for the same directory, and
-/// `crate::root::AdeApp::active_agent_cwd`'s repo-root fallback hands exactly that unresolved
+/// `crate::root::AdeApp::current_worktree_path`'s repo-root fallback hands exactly that unresolved
 /// path to `Agents::spawn` as an agent's `cwd`. The real, reproduced consequence: an agent
 /// spawned that way matches no worktree row at all, and - because `build_worktree_rows_with_
 /// history` maps over *worktrees* and folds agents into them - is dropped from the rail
