@@ -589,9 +589,9 @@ impl AdeApp {
     /// agent running - reconciling against an empty file list instead of the real
     /// [`Self::open_files`]. That's gone: every open file tab stays visible regardless of whether
     /// an agent, or even the default shell, is running - opening and working across files was
-    /// never meant to depend on a shell/agent existing. Bareness still affects how the shell's
-    /// own tab is *labeled* (`Self::current_worktree_agent_tab_labels`'s bare-shell label), just
-    /// not which tabs render at all.
+    /// never meant to depend on a shell/agent existing. Bareness no longer affects tab *labels*
+    /// either (those are the pane's own live title now - `Self::agent_tab_label`); it survives
+    /// only in [`Self::render_agent_context_bar`]'s `Start an agent` swap.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         // No worktree genuinely selected means genuinely no tabs - an honestly empty strip, not
         // whatever happens to be open in the repo root. This used to fall through to
@@ -837,13 +837,14 @@ impl AdeApp {
     }
 
     /// Whether the *currently selected* worktree has zero real agents - at most a default
-    /// `Shell` tab (Revision R12 §3: "a bare worktree shows only the shell tab"). One predicate
-    /// shared by [`Self::current_worktree_agent_tab_labels`]'s `zsh \u{b7} <branch>` shell-tab
-    /// label and [`Self::render_agent_context_bar`]'s `Merge`/`Archive` -> `Start an agent`
-    /// swap, so the two can never disagree about what "bare" means. Vacuously `true` when the
-    /// worktree has no agent at all - callers that reach a context bar or a tab strip already
-    /// know at least one agent exists ([`Self::render_center_pane`]'s `None` branch handles the
-    /// empty case separately).
+    /// `Shell` tab (Revision R12 §3: "a bare worktree shows only the shell tab"). Now read by
+    /// exactly one thing, [`Self::render_agent_context_bar`]'s `Merge`/`Archive` ->
+    /// `Start an agent` swap: bareness used to also pick the shell tab's *label*
+    /// (`zsh \u{b7} <branch>` instead of a generic `"terminal"`), which a tab now takes from its
+    /// pane's own live title regardless of what else is open in the worktree
+    /// ([`Self::agent_tab_label`]). Vacuously `true` when the worktree has no agent at all -
+    /// callers that reach a context bar already know at least one agent exists
+    /// ([`Self::render_center_pane`]'s `None` branch handles the empty case separately).
     pub(crate) fn current_worktree_is_bare(&self) -> bool {
         !self
             .current_worktree_agents()
@@ -851,9 +852,10 @@ impl AdeApp {
     }
 
     /// The branch label for the currently selected worktree, if any is recorded for it - shared
-    /// by [`Self::current_worktree_agent_tab_labels`]'s bare-shell label and
+    /// by [`Self::render_plus_menu`]'s `runs in <branch>` row and
     /// [`Self::render_agent_context_bar`]'s own branch lookup so both read the same fact the
-    /// same way.
+    /// same way. Tab labels deliberately no longer consult it: a branch is a fact about the
+    /// worktree, not about what the process in a given tab is doing right now.
     fn current_worktree_branch(&self) -> Option<String> {
         let cwd = self.active_agent_cwd()?;
         self.worktrees
@@ -862,70 +864,28 @@ impl AdeApp {
             .and_then(|item| item.branch.clone())
     }
 
-    /// The tab label each of `agent_ids` (already filtered to the currently selected worktree)
-    /// should render, in the same order - real `TerminalPane::program_label` facts (the
-    /// bare-worktree shell gets `work_surface::bare_worktree_shell_label` instead of the generic
-    /// `"terminal"`) run through `work_surface::disambiguate_tab_labels`, computed once so
-    /// [`Self::render_tab_strip`] and this method (also used directly by tests) can never
-    /// disagree about what's actually rendered. Any id not found in `Self::agents` is skipped
-    /// rather than panicking - `render_tab_strip` re-does the same lookup per id and simply
-    /// omits a tab for it too.
-    pub(crate) fn current_worktree_agent_tab_labels(
-        &self,
-        agent_ids: &[AgentId],
-        cx: &mut Context<Self>,
-    ) -> Vec<String> {
-        let is_bare = self.current_worktree_is_bare();
-        let branch = self.current_worktree_branch();
-
-        // Ordinals must be assigned in a real, stable order - `AgentId`'s own monotonic
-        // assignment at spawn time (`Agents::spawn`'s `next_id`), never `agent_ids`' own input
-        // order. The caller passes `agent_ids` from `Self::combined_tab_order`, which the tab
-        // strip's drag-to-reorder freely rewrites - a `#N` suffix that changes because a tab
-        // moved is not a real identifier, it just relabels whichever agent happens to render
-        // first. Sorting here keeps the numbers pinned to spawn order regardless of what order
-        // the tab strip currently renders in.
-        let mut stable: Vec<(AgentId, &Agent)> = agent_ids
-            .iter()
-            .filter_map(|id| {
-                self.agents
-                    .iter()
-                    .find(|agent| agent.id == *id)
-                    .map(|agent| (*id, agent))
-            })
-            .collect();
-        stable.sort_unstable_by_key(|(id, _)| *id);
-
-        let raw: Vec<String> = stable
-            .iter()
-            .map(|(_, agent)| match work_surface::tab_chip_kind(agent.kind) {
-                work_surface::TabChipKind::Cli => agent.pane.read(cx).program_label(),
-                work_surface::TabChipKind::Term => {
-                    if is_bare {
-                        work_surface::bare_worktree_shell_label(
-                            &agent.pane.read(cx).program_label(),
-                            branch.as_deref(),
-                        )
-                    } else {
-                        "terminal".to_string()
-                    }
-                }
-            })
-            .collect();
-        let disambiguated = work_surface::disambiguate_tab_labels(raw);
-
-        // Re-align to `agent_ids`' own input order (this function's existing contract), which
-        // may differ from `stable`'s spawn order - the numbers themselves stay spawn-order-
-        // derived, only the returned vec's own ordering follows what the caller asked for.
-        let label_by_id: std::collections::HashMap<AgentId, String> = stable
-            .into_iter()
-            .map(|(id, _)| id)
-            .zip(disambiguated)
-            .collect();
-        agent_ids
-            .iter()
-            .filter_map(|id| label_by_id.get(id).cloned())
-            .collect()
+    /// One agent/terminal tab's label: whatever the process inside that pane says it is *right
+    /// now* - its live OSC 0/2 window title (`TerminalPane::title`, the same real fact
+    /// `crate::rail::title_signal` classifies for the status pill), falling back to the resolved
+    /// program name only while it has set no title at all
+    /// (`work_surface::live_tab_label`'s own docs for both halves).
+    ///
+    /// Read fresh on every render, deliberately: the title is live, so a tab whose shell just
+    /// `cd`'d or whose agent just started a task must relabel itself without any further event
+    /// plumbing. GPUI makes that automatic - the `pane.read(cx)` below registers this window as a
+    /// reader of the pane entity, so the pane's own `cx.notify()` (which it fires whenever real
+    /// pty bytes arrive, and a title change *is* pty bytes) invalidates the window and redraws
+    /// this strip.
+    ///
+    /// Applies identically to a shell tab and an agent-CLI tab. Both are just a process in a pty,
+    /// both report through the same mechanism, and an agent's own title is the more informative
+    /// of the two (`\u{2733} Claude Code` while it works) - there is no per-kind naming authority
+    /// that would be regressed by preferring it. The one deliberate exception elsewhere is
+    /// `crate::review::render`'s review-tab label, which answers a different question (*which*
+    /// agent's diff this is) and so must stay a stable identity, not a live status.
+    pub(crate) fn agent_tab_label(&self, agent: &Agent, cx: &App) -> String {
+        let pane = agent.pane.read(cx);
+        work_surface::live_tab_label(pane.title(), &pane.program_label())
     }
 
     /// The tab strip: one tab per entry of [`Self::combined_tab_order`], in that exact order -
@@ -934,10 +894,12 @@ impl AdeApp {
     /// (GitHub issue #16), rather than always "every agent, then every file" - followed by the
     /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned agent-jump keycaps.
     ///
-    /// Agent labels are computed once, for every agent tab in this worktree together
-    /// (`Self::current_worktree_agent_tab_labels`), *before* rendering any individual tab - the
-    /// ordinal-disambiguation pass (Revision R12 §3) needs every label in hand up front to tell
-    /// which ones repeat, so it can't be done tab-by-tab inside the loop below.
+    /// Each agent tab's label is read per tab, inside the loop below
+    /// (`Self::agent_tab_label`): a label is now purely a fact about that one pane's own live
+    /// title, so nothing here needs every label in hand up front. An earlier revision did need
+    /// that - it appended `#1`/`#2` ordinals to labels that repeated, which requires knowing
+    /// which ones repeat - but two tabs genuinely showing the same thing now honestly render the
+    /// same label, exactly as any real terminal emulator's tabs do.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -953,24 +915,12 @@ impl AdeApp {
             .border_color(theme::border::ZONE);
 
         let order = self.combined_tab_order();
-        let agent_ids: Vec<AgentId> = order
-            .iter()
-            .filter_map(|tab_ref| match tab_ref {
-                work_surface::TabRef::Agent(id) => Some(*id),
-                work_surface::TabRef::File(_)
-                | work_surface::TabRef::Graph
-                | work_surface::TabRef::Review(_) => None,
-            })
-            .collect();
-        let labels = self.current_worktree_agent_tab_labels(&agent_ids, cx);
-        let mut label_by_id: std::collections::HashMap<AgentId, String> =
-            agent_ids.into_iter().zip(labels).collect();
 
         for tab_ref in order {
             match tab_ref {
                 work_surface::TabRef::Agent(id) => {
                     if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
-                        let label = label_by_id.remove(&id).unwrap_or_default();
+                        let label = self.agent_tab_label(agent, cx);
                         bar = bar.child(self.render_agent_tab(agent, label, cx));
                     }
                 }
@@ -1778,9 +1728,8 @@ impl AdeApp {
     agent_jump_action_handler!(handle_jump_to_agent_7_action, JumpToAgent7, 7);
     agent_jump_action_handler!(handle_jump_to_agent_8_action, JumpToAgent8, 8);
 
-    /// One tab: a 14×14 kind chip, `label` (already resolved and, if it repeats within this
-    /// worktree, ordinal-disambiguated by the caller - `Self::render_tab_strip`'s own docs on why
-    /// that has to happen before this per-tab call, not inside it), and a `×` that closes it
+    /// One tab: a 14×14 kind chip, `label` (this pane's own live title, resolved by the caller
+    /// through [`Self::agent_tab_label`]), and a `×` that closes it
     /// (`Agents::close`, tearing down the process). Split into a `flex_1` clickable content row
     /// plus a `flex_none` 1px underline bar, rather than a single div with two
     /// differently-coloured borders, because GPUI's `Style::border_color` is one colour for every
@@ -1826,6 +1775,17 @@ impl AdeApp {
         let content: Vec<gpui::AnyElement> = vec![
             render_tab_chip(agent.kind, is_active).into_any_element(),
             div()
+                // The label is now whatever the process inside the pane set as its title
+                // (`Self::agent_tab_label`), i.e. arbitrary-length text this app doesn't
+                // control - a shell reporting a deep absolute path, or an agent echoing a long
+                // task line, would otherwise stretch one tab across the whole strip and push
+                // every other tab out of reach. Capped and ellipsised the same way the pty
+                // header caps its own cwd (`Self::render_pty_header`), rather than shortening
+                // the title itself: the tab shows as much of the real title as fits.
+                .flex_none()
+                .max_w(px(200.0))
+                .overflow_hidden()
+                .truncate()
                 .font(font(if is_mono {
                     theme::font::MONO
                 } else {
@@ -3973,13 +3933,136 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Revision R12 §3, proven end to end: two real `Claude` agents spawned into the same
-    /// worktree both resolve `program_label()` to the same literal `"claude"`, so without
-    /// disambiguation the tab strip would render two identical tabs.
-    /// `current_worktree_agent_tab_labels` must give them distinct ordinals, in the order they
-    /// were spawned.
+    /// What the tab strip will really label agent `id` - the exact per-tab method
+    /// [`AdeApp::render_tab_strip`] itself calls, not a test-local reimplementation of it.
+    fn tab_label(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        id: AgentId,
+    ) -> String {
+        app.read_with(cx, |app, cx| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("a live agent");
+            app.agent_tab_label(agent, cx)
+        })
+    }
+
+    /// Feeds `title` into agent `id`'s pane as a real OSC 0 window-title sequence - byte for
+    /// byte what `printf '\033]0;<title>\007'` puts on a pty - through the pane's own real
+    /// `TerminalGrid` parser, the same one the poll loop hands live pty bytes to. The real-pty
+    /// transport in front of that parser has its own end-to-end proof against a real child
+    /// process in `crate::terminal::pane`
+    /// (`a_real_pty_process_setting_its_title_is_captured_and_classified`); injecting here keeps
+    /// *this* module's subject - what the tab strip does with a title once one exists - free of
+    /// a real process's scheduling.
+    fn set_live_title(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        id: AgentId,
+        title: &str,
+    ) {
+        let pane = app.read_with(cx, |app, _| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("a live agent")
+                .pane
+                .clone()
+        });
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(format!("\x1b]0;{title}\x07").as_bytes(), cx);
+        });
+    }
+
+    /// That agent tab's real, `gpui::canvas`-painted width from the last drawn frame
+    /// (`Self::tab_bounds`) - the same real measurement the drag tests above take.
+    fn painted_tab_width(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        id: AgentId,
+    ) -> gpui::Pixels {
+        app.read_with(cx, |app, _| {
+            app.tab_bounds
+                .get(&work_surface::TabRef::Agent(id))
+                .map(|bounds| bounds.size.width)
+        })
+        .expect("the tab must have really painted at least once before it can be measured")
+    }
+
+    /// The complaint this whole design answers: "when testing I don't see any changes in the
+    /// title of terminal or agents, they just say `terminal #1/#2`". A tab is now labelled with
+    /// whatever the process inside it says it is *right now* - its live OSC 0/2 title - and that
+    /// label really moves when the title does.
+    ///
+    /// Both halves are asserted: the label itself (`Self::agent_tab_label`, the one method the
+    /// strip calls per tab), and that the strip genuinely *repaints* with it. The repaint half
+    /// is measured against the tab's own real painted width (`Self::tab_bounds`): nothing here
+    /// touches `AdeApp` at all between the two frames - only the pane's own `cx.notify()` off
+    /// the injected bytes - so a wider painted tab can only mean that notify really re-drove
+    /// `Self::render_tab_strip` with the new title.
     #[gpui::test]
-    fn two_agents_of_the_same_kind_in_one_worktree_get_distinct_ordinal_tab_labels(
+    fn a_tabs_label_is_its_panes_live_title_and_the_strip_repaints_when_that_title_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let shell_id = app.read_with(cx, |app, _| {
+            app.agents
+                .active_id()
+                .expect("the real startup shell agent")
+        });
+        cx.run_until_parked();
+
+        let program = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == shell_id)
+                .expect("shell agent")
+                .pane
+                .read(cx)
+                .program_label()
+        });
+        assert_eq!(
+            tab_label(&app, cx, shell_id),
+            program,
+            "a shell that hasn't set a title yet must show its real resolved program name"
+        );
+        let width_before = painted_tab_width(&app, cx, shell_id);
+
+        set_live_title(&app, cx, shell_id, "~/src/jerry/crates/app \u{2014} vim");
+        cx.run_until_parked();
+
+        assert_eq!(
+            tab_label(&app, cx, shell_id),
+            "~/src/jerry/crates/app \u{2014} vim",
+            "the tab must show the title the process actually set, verbatim"
+        );
+        assert!(
+            painted_tab_width(&app, cx, shell_id) > width_before,
+            "the strip must have really repainted with the longer live title - only the pane's \
+             own notify happened between the two frames"
+        );
+
+        // And again, to prove this is a live reading rather than a one-shot latch taken the
+        // first time a title ever arrived.
+        set_live_title(&app, cx, shell_id, "cargo test");
+        cx.run_until_parked();
+        assert_eq!(
+            tab_label(&app, cx, shell_id),
+            "cargo test",
+            "a second title change must move the label again"
+        );
+    }
+
+    /// "Why the name at all? Just name the tab what it is and stop, no need to add names or
+    /// numbers." Two panes really showing the same thing get the same label - no `#1`/`#2`, no
+    /// branch suffix, nothing synthesised to tell them apart, exactly like every real terminal
+    /// emulator's tabs. The human tells them apart by position, which is the truth about them.
+    #[gpui::test]
+    fn two_tabs_with_the_same_live_title_render_the_same_label_with_nothing_added(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4011,128 +4094,40 @@ mod tab_scoping_tests {
             );
             (first_id, second_id)
         });
+        cx.run_until_parked();
 
-        let labels = app.update(cx, |app, cx| {
-            app.current_worktree_agent_tab_labels(&[first_id, second_id], cx)
-        });
+        set_live_title(&app, cx, first_id, "\u{2733} Claude Code");
+        set_live_title(&app, cx, second_id, "\u{2733} Claude Code");
+        cx.run_until_parked();
+
+        let first = tab_label(&app, cx, first_id);
+        let second = tab_label(&app, cx, second_id);
         assert_eq!(
-            labels,
-            vec!["claude #1".to_string(), "claude #2".to_string()],
-            "two agents of the same kind must never render two identical tab labels"
+            first, "\u{2733} Claude Code",
+            "the label is the live title and nothing else"
         );
-    }
-
-    /// The bug this guards against: `current_worktree_agent_tab_labels` is called with
-    /// `agent_ids` from `Self::combined_tab_order`, which the tab strip's drag-to-reorder
-    /// freely rewrites - if ordinals were assigned in *that* order, dragging a tab past
-    /// another would relabel both, turning `#N` into a number that means nothing (it wouldn't
-    /// even stay attached to the same agent). Passing the two ids in reverse of spawn order -
-    /// exactly what a drag produces - must still yield the same `#1`/`#2` pinned to spawn
-    /// order, and the returned vec must still align to the *requested* (reversed) order.
-    #[gpui::test]
-    fn dragging_a_tab_past_another_never_changes_either_ordinal(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
-        });
-        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-            let first_id = app.agents.spawn(
-                ProcessKind::claude(),
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            let second_id = app.agents.spawn(
-                ProcessKind::claude(),
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            (first_id, second_id)
-        });
-
-        // Spawn order: [first_id, second_id]. A drag that moves the first tab past the second
-        // would hand this function [second_id, first_id] instead.
-        let labels = app.update(cx, |app, cx| {
-            app.current_worktree_agent_tab_labels(&[second_id, first_id], cx)
-        });
         assert_eq!(
-            labels,
-            vec!["claude #2".to_string(), "claude #1".to_string()],
-            "the requested (post-drag) order must be preserved in the return value, but the \
-             ordinals themselves must stay pinned to real spawn order - `first_id` is always \
-             #1, `second_id` is always #2, regardless of which order they're asked for in"
+            first, second,
+            "two tabs genuinely showing the same thing must render the same label - \
+             synthesising a difference between them would be inventing one"
         );
+        assert!(
+            !first.contains('#') && !first.contains('\u{b7}'),
+            "no ordinal and no branch suffix may be bolted onto a live title: {first}"
+        );
+
+        // The real production strip must build fine with two identically labelled tabs in it.
+        app.update(cx, |app, cx| {
+            let _ = app.render_tab_strip(cx);
+        });
     }
 
-    /// Revision R12 §3: a worktree with only its default `Shell` agent is "bare" -
-    /// `current_worktree_is_bare` must say so - and stops being bare the moment a real agent
-    /// spawns into it, proven through the same live `Agents`/`AdeApp` plumbing every other test
-    /// in this module uses (not just the pure `ProcessKind` match this reads off of).
+    /// The honest fallback, and the only one: a pane whose process has set no title yet (many
+    /// shells only set one from their prompt hook, and plenty of setups never set one at all)
+    /// shows its real resolved program name - never a blank tab, and never the old generic
+    /// `"terminal"` literal that started this whole complaint.
     #[gpui::test]
-    fn a_worktree_with_only_its_default_shell_is_bare_until_a_real_agent_spawns(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-            app.agents.spawn(
-                ProcessKind::Shell,
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-        });
-
-        assert!(
-            app.read_with(cx, |app, _| app.current_worktree_is_bare()),
-            "a worktree with only a Shell agent must be reported bare"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::claude(),
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-        });
-
-        assert!(
-            !app.read_with(cx, |app, _| app.current_worktree_is_bare()),
-            "spawning a real agent must clear bare status - it's not just a snapshot taken once \
-             at worktree creation"
-        );
-    }
-
-    /// Revision R12 §3: a bare worktree's `Shell` tab reads `program \u{b7} branch` (via
-    /// `work_surface::bare_worktree_shell_label`), not the generic `"terminal"` every non-bare
-    /// shell tab uses - proven here against a real `TerminalPane`'s own resolved
-    /// `program_label()`, not a hardcoded `"zsh"`.
-    #[gpui::test]
-    fn a_bare_worktrees_shell_tab_label_joins_the_real_program_with_its_branch(
+    fn a_pane_that_has_reported_no_title_shows_its_real_program_name_not_an_empty_tab(
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4154,30 +4149,95 @@ mod tab_scoping_tests {
                 cx,
             )
         });
+        cx.run_until_parked();
 
-        let (label, program) = app.update(cx, |app, cx| {
-            let label = app
-                .current_worktree_agent_tab_labels(&[shell_id], cx)
-                .remove(0);
-            let program = app
+        let (label, program) = app.read_with(cx, |app, cx| {
+            let agent = app
                 .agents
                 .iter()
                 .find(|agent| agent.id == shell_id)
-                .expect("shell agent")
-                .pane
-                .read(cx)
-                .program_label();
-            (label, program)
+                .expect("shell agent");
+            (
+                app.agent_tab_label(agent, cx),
+                agent.pane.read(cx).program_label(),
+            )
         });
         assert_eq!(
-            label,
-            work_surface::bare_worktree_shell_label(&program, Some("wt-a")),
-            "a bare worktree's shell tab must show its real resolved program joined with its \
-             branch, not the generic \"terminal\" label"
+            label, program,
+            "a titleless pane must fall back to its own real resolved program name"
         );
+        assert!(!label.is_empty(), "a tab must never render an empty label");
         assert_ne!(
             label, "terminal",
-            "the bare-worktree shell label must never fall back to the generic non-bare label"
+            "the generic placeholder label is gone - a tab says what is really in it"
+        );
+        assert!(
+            !label.contains('\u{b7}'),
+            "no branch suffix is appended to a shell tab any more: {label}"
+        );
+
+        // A process clearing its title (`\x1b]0;\x07`) is back to "nothing to show", not a
+        // blank tab.
+        set_live_title(&app, cx, shell_id, "");
+        cx.run_until_parked();
+        assert_eq!(
+            tab_label(&app, cx, shell_id),
+            program,
+            "an emptied title must fall back to the program name, not blank the tab"
+        );
+    }
+
+    /// Uniformity across both tab kinds (`work_surface::TabChipKind::Cli` and `::Term`): an
+    /// agent CLI's tab is titled by the same live mechanism a plain shell's is. An agent's own
+    /// title is the *more* informative of the two - it's what `crate::rail::title_signal`
+    /// already reads to tell whether that agent is working - so there is no per-kind naming
+    /// authority that preferring it would regress.
+    #[gpui::test]
+    fn an_agent_clis_tab_takes_its_live_title_exactly_like_a_shells_does(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
+        });
+        let agent_id = app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            app.agents.spawn(
+                ProcessKind::claude(),
+                wt_a.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| work_surface::tab_chip_kind(
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == agent_id)
+                    .expect("agent")
+                    .kind
+            )),
+            work_surface::TabChipKind::Cli,
+            "sanity check: this is the CLI chip kind, the other half of the uniformity claim"
+        );
+        assert_eq!(
+            tab_label(&app, cx, agent_id),
+            "claude",
+            "before it says anything, an agent tab shows its real binary name"
+        );
+
+        set_live_title(&app, cx, agent_id, "\u{25d0} Claude Code");
+        cx.run_until_parked();
+
+        assert_eq!(
+            tab_label(&app, cx, agent_id),
+            "\u{25d0} Claude Code",
+            "an agent tab must follow its live title just as a shell tab does"
         );
     }
 
@@ -4324,9 +4384,9 @@ mod tab_scoping_tests {
     /// tab") suppressed every open file tab in `Self::combined_tab_order` the moment a worktree
     /// went bare (no real agent, only its default `Shell` tab left). That's gone - a file tab
     /// opened before the worktree went bare must keep rendering, unchanged, exactly as it does
-    /// with a real agent running. Bareness affects the shell's own tab *label* only (`Self::
-    /// current_worktree_agent_tab_labels`'s bare-shell label - see the neighboring test), not
-    /// which tabs render.
+    /// with a real agent running. Bareness no longer affects tab *labels* either - a tab is
+    /// named by its own pane's live title (`Self::agent_tab_label`) whatever else is open in
+    /// the worktree - so this is now the only thing bareness could have touched here.
     #[gpui::test]
     fn a_bare_worktrees_tab_strip_still_shows_every_open_file_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
