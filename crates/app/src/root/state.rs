@@ -183,6 +183,23 @@ impl AdeApp {
             });
             next_repo_id += 1;
         }
+        // The live mirror of every restored repo's own last-selected worktree - see
+        // `Self::selected_worktree_by_repo`'s own docs for why this has to be a whole map rather
+        // than a single value, and `Self::restore_worktree_session` for what a selection then
+        // reopens. Deliberately seeded from the raw records rather than through
+        // `RepoState::remembered_worktree`'s "still exists on disk" filter: this map's job is to
+        // faithfully mirror what is on disk so a save doesn't blank another window's entry, and
+        // the existence check belongs at the two points that actually *act* on a remembered
+        // worktree (the startup selection below, and `selection_for_opened_repo`'s own check that
+        // it is still a real worktree of the repo).
+        let selected_worktree_by_repo: HashMap<String, PathBuf> = loaded_repo_state
+            .repos
+            .iter()
+            .filter_map(|(key, record)| {
+                let worktree = record.selected_worktree.as_ref()?;
+                Some((key.clone(), PathBuf::from(worktree)))
+            })
+            .collect();
 
         // GitHub issue #90: the one real resolution point for "what repo (if any) should this
         // window start focused on" - see `Self::new_with_settings`'s own docs for the full
@@ -201,6 +218,13 @@ impl AdeApp {
         // produce a repo whose agents matched no worktree row at all; see that function's own
         // docs. The remembered-repo branch needs no such call: `RepoState`'s keys are already
         // `repo::repo_key` output, which is canonical by construction.
+        //
+        // `opened_from_memory` is the second half of that same decision, and exists only for the
+        // worktree-level restore below: an explicitly named path (a CLI argument) is a real
+        // statement about *where to work* and is honoured literally, while a repo resolved purely
+        // from memory carries no such statement and can therefore honour the finer-grained memory
+        // of which worktree of it was last worked in. See the `opened_target` note further down.
+        let opened_from_memory = repo_path.is_none() && use_remembered_repo;
         let resolved_repo_path: Option<PathBuf> = match repo_path {
             Some(path) => Some(repo::canonical_repo_path(&path)),
             None if use_remembered_repo => loaded_repo_state.last_focused_existing_path(),
@@ -574,6 +598,9 @@ impl AdeApp {
             tab_order_path,
             tab_order_owned: std::collections::BTreeSet::new(),
             _tab_order_save_task: None,
+            session_restored: HashSet::new(),
+            session_restore_notices: Vec::new(),
+            selected_worktree_by_repo,
             tab_drag_insertion: None,
             dragging_tab: None,
             dropped_tab_settle: None,
@@ -671,7 +698,26 @@ impl AdeApp {
                 // spawn/baseline/focus block almost verbatim; both now funnel through that one
                 // method, so a CLI launch and "Open Folder…" can no longer drift apart on which
                 // worktree the window lands in.
-                this.load_worktrees_for_opened_repo(path.clone(), cx);
+                //
+                // `opened_target` is what that sequence resolves its selection against
+                // (`crate::rail::worktrees::selection_for_opened_repo`: an exact match on this
+                // path, else the main checkout). For a repo resolved purely from memory - the
+                // plain "relaunch Jerry" gesture - that is the remembered worktree, so relaunching
+                // genuinely lands back in the worktree you were last in, and
+                // `Self::restore_worktree_session` then reopens its tabs. For an explicitly named
+                // path it stays the path itself, unchanged: `jerry ~/repo` is a real statement
+                // about where to work, and silently opening some other worktree of that repo
+                // because it was the last one visited would be overriding the user, not helping
+                // them. `selection_for_opened_repo` needs no change either way - a remembered
+                // worktree that has since been removed simply matches nothing and falls back to
+                // the main checkout, exactly as an unrecognised path already does.
+                let opened_target = match opened_from_memory {
+                    true => repo::repo_key(&path)
+                        .and_then(|key| loaded_repo_state.remembered_worktree(&key))
+                        .unwrap_or_else(|| path.clone()),
+                    false => path.clone(),
+                };
+                this.load_worktrees_for_opened_repo(opened_target, cx);
                 // Keyboard focus while that fetch is in flight. Without this the window would
                 // render its first frames with `Window::focus == None` - the dangling-focus bug
                 // class this crate's `OverlayFocus`/`restore_focus` machinery exists to prevent -
@@ -762,6 +808,14 @@ impl AdeApp {
         let Some(cwd) = self.active_agent_cwd() else {
             return;
         };
+        // Deliberately *before* the guaranteed-shell check below, not after: this worktree may
+        // have had a whole tab session last time, terminal included, and reopening it first is
+        // what lets the check below see a worktree that already has its own real agent and decline
+        // to stack a redundant extra shell on top. See
+        // `crate::work_surface::session::AdeApp::restore_worktree_session`'s own docs. A no-op
+        // whenever `Self::select_worktree` already restored this worktree a moment ago (the
+        // ordinary path), and whenever there is nothing recorded at all.
+        self.restore_worktree_session(cwd.clone(), window, cx);
         if self.agents.iter_for_cwd(cwd.clone()).next().is_none() {
             let startup_agent = self.agents.spawn(
                 ProcessKind::Shell,
@@ -779,6 +833,9 @@ impl AdeApp {
             // site rather than inside `Agents` itself. Missing this would leave exactly one agent
             // - the one every window starts with - permanently without a review.
             self.capture_review_baseline(startup_agent, cx);
+            // The guaranteed startup shell is a real tab like any other, so it is part of this
+            // worktree's persisted session too - see `crate::work_surface::session`.
+            self.record_worktree_session(cx);
         }
         // Makes this worktree's own tab the globally active one, whether it was just spawned
         // above or was already running from an earlier visit.
@@ -1436,10 +1493,28 @@ impl AdeApp {
             return;
         }
         let path = item.path.clone();
+        // The safety net for the tab session of whatever is being switched *away* from
+        // (`crate::work_surface::session`): every real tab mutation records as it happens, so this
+        // is normally a no-op that compares an unchanged snapshot and returns - but it means a
+        // future mutation path that forgets to record still can't lose a user's tabs, since
+        // leaving a worktree is something every such path is eventually followed by. Must run
+        // before `self.selected` moves below, while `Self::active_agent_cwd` still resolves to the
+        // worktree being left.
+        self.record_worktree_session(cx);
         self.selected = Some(index);
         // A real, explicit user selection supersedes any stale "fell back to main" notice a
         // previous refresh may have left up - see `Self::worktree_selection_notice`'s own docs.
         self.worktree_selection_notice = None;
+        // "Which worktree of this repo was I last in" - the per-repo memory a later launch reads
+        // back to land here again (`crate::rail::repo::RepoRecord::selected_worktree`, resolved at
+        // startup in `Self::new_with_settings`). Recorded for the *focused* repo only, which is
+        // the only repo `self.worktrees`/`self.selected` ever describe.
+        if let Some(key) = self.focused_repo().and_then(|r| repo::repo_key(&r.path)) {
+            if self.selected_worktree_by_repo.get(&key) != Some(&path) {
+                self.selected_worktree_by_repo.insert(key, path.clone());
+                self.persist_repo_state(cx);
+            }
+        }
         // Makes this worktree's own last-active tab (or its first agent, or none) the
         // globally active one - see `Agents::activate_for_worktree`'s own docs for why this
         // invariant ("the active agent always belongs to the selected worktree") is the real
@@ -1447,7 +1522,13 @@ impl AdeApp {
         // at all, so the centre pane could keep showing a completely different worktree's
         // terminal after a rail click.
         self.agents.activate_for_worktree(&path, cx);
-        self.reset_repo_scoped_state(path, window, cx);
+        self.reset_repo_scoped_state(path.clone(), window, cx);
+        // Last, and deliberately so: `reset_repo_scoped_state` is what re-roots
+        // `Self::file_tree_root` onto this worktree, and restoring file tabs before that would
+        // file them under whichever worktree was just left (`Self::open_files_mut` is keyed by
+        // that root). It also moves focus, which the restore then re-does for whatever it spawned.
+        // A no-op for a worktree already restored in this window, or with nothing recorded.
+        self.restore_worktree_session(path, window, cx);
     }
 
     /// The shared core of "something completely different is now the single-repo-scoped root

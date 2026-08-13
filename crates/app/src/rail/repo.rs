@@ -193,13 +193,28 @@ pub struct RepoState {
     pub last_focused: Option<String>,
 }
 
-/// One repo's persisted record - just its display name today. The map key (a [`repo_key`]) is
-/// the path; nothing about `Repo::worktrees` is persisted here (see that field's own docs for
-/// why - it isn't populated yet at all).
+/// One repo's persisted record. The map key (a [`repo_key`]) is the path; the repo's *worktree
+/// list* is deliberately not persisted at all (see [`Repo::worktrees`]'s own docs - it is always
+/// re-fetched from real git), only which one of them was last worked in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepoRecord {
     pub name: String,
+    /// The real path of the worktree of this repo that `crate::root::AdeApp::select_worktree` most
+    /// recently selected, so relaunching Jerry lands back in it rather than always in the main
+    /// checkout - the per-repo counterpart to [`RepoState::last_focused`], and the half that makes
+    /// "everything reopens" true at launch rather than only after the user clicks the right rail
+    /// row (a worktree's own tabs are restored when it is genuinely selected - see
+    /// `crate::work_surface::session`).
+    ///
+    /// Stored as a plain path string rather than a [`PathBuf`] for the same reason every other
+    /// field in this file is a string: it is a TOML value that must survive a build that has never
+    /// heard of it. `None` for a repo whose worktrees were never selected in, and for a record
+    /// written before this field existed (`#[serde(default)]`). Never trusted blindly on read -
+    /// [`RepoState::remembered_worktree`] checks it still names a real directory, and
+    /// `crate::rail::worktrees::selection_for_opened_repo` independently checks it still names a
+    /// real worktree of the repo, falling back to the main checkout if not.
+    pub selected_worktree: Option<String>,
 }
 
 /// How stale a `*.tmp` sibling must be before [`sweep_orphaned_temp_files`] deletes it - the
@@ -381,6 +396,17 @@ impl RepoState {
         // repo" and failing downstream once something tries to actually read it as one.
         path.is_dir().then_some(path)
     }
+
+    /// [`RepoRecord::selected_worktree`] for `key`, if it still names a real directory on disk -
+    /// [`Self::last_focused_existing_path`]'s own "remembered, and still there" check, applied one
+    /// level down. `None` for an unknown repo, a repo never selected in, or a worktree since
+    /// removed/pruned; every one of those falls back to
+    /// `crate::rail::worktrees::selection_for_opened_repo`'s ordinary main-checkout answer rather
+    /// than to a broken selection.
+    pub fn remembered_worktree(&self, key: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(self.repos.get(key)?.selected_worktree.as_ref()?);
+        path.is_dir().then_some(path)
+    }
 }
 
 #[cfg(test)]
@@ -424,6 +450,44 @@ mod tests {
         assert_eq!(RepoState::load_at(&path), RepoState::default());
     }
 
+    /// The per-repo "land back where I left off" record: remembered, still on disk, and really
+    /// returned - plus the three real ways it must fall back to `None` rather than to a broken
+    /// selection (unknown repo, never selected in, since deleted).
+    #[test]
+    fn a_remembered_worktree_is_returned_only_while_it_still_exists() {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let mut state = RepoState::default();
+        state.repos.insert(
+            "/repo/a".to_string(),
+            RepoRecord {
+                name: "a".to_string(),
+                selected_worktree: Some(worktree.path().to_string_lossy().into_owned()),
+            },
+        );
+        state.repos.insert(
+            "/repo/never-selected".to_string(),
+            RepoRecord {
+                name: "never-selected".to_string(),
+                selected_worktree: None,
+            },
+        );
+
+        assert_eq!(
+            state.remembered_worktree("/repo/a"),
+            Some(worktree.path().to_path_buf())
+        );
+        assert_eq!(state.remembered_worktree("/repo/never-selected"), None);
+        assert_eq!(state.remembered_worktree("/repo/not-a-known-repo"), None);
+
+        drop(worktree);
+        assert_eq!(
+            state.remembered_worktree("/repo/a"),
+            None,
+            "a worktree removed or pruned since it was remembered must fall back, not be \
+             selected into a directory that no longer exists"
+        );
+    }
+
     #[test]
     fn saving_and_loading_round_trips_a_real_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -433,12 +497,14 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         state.repos.insert(
             "/repo/b".to_string(),
             RepoRecord {
                 name: "b".to_string(),
+                selected_worktree: None,
             },
         );
         state.save_at(&path).expect("save");
@@ -456,6 +522,7 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         state.save_at(&path).expect("save");
@@ -486,6 +553,7 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         let owned_a: std::collections::BTreeSet<String> =
@@ -498,6 +566,7 @@ mod tests {
             "/repo/b".to_string(),
             RepoRecord {
                 name: "b".to_string(),
+                selected_worktree: None,
             },
         );
         let owned_b: std::collections::BTreeSet<String> =
@@ -527,6 +596,7 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         state.save_merged_at(&path, &owned).expect("save");
@@ -572,6 +642,7 @@ mod tests {
             key.clone(),
             RepoRecord {
                 name: "deleted-repo".to_string(),
+                selected_worktree: None,
             },
         );
         state.last_focused = Some(key);
@@ -602,6 +673,7 @@ mod tests {
             key.clone(),
             RepoRecord {
                 name: "was-a-repo".to_string(),
+                selected_worktree: None,
             },
         );
         state.last_focused = Some(key);
@@ -634,6 +706,7 @@ mod tests {
             key.clone(),
             RepoRecord {
                 name: "repo".to_string(),
+                selected_worktree: None,
             },
         );
         state.last_focused = Some(key);
@@ -658,6 +731,7 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         state.last_focused = Some("/repo/a".to_string());
@@ -684,12 +758,14 @@ mod tests {
             "/repo/a".to_string(),
             RepoRecord {
                 name: "a".to_string(),
+                selected_worktree: None,
             },
         );
         state.repos.insert(
             "/repo/b".to_string(),
             RepoRecord {
                 name: "b".to_string(),
+                selected_worktree: None,
             },
         );
         state.last_focused = Some("/repo/a".to_string());

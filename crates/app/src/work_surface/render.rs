@@ -106,6 +106,8 @@ impl AdeApp {
         // `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race
         // between the process starting and the snapshot landing.
         self.capture_review_baseline(id, cx);
+        // A new tab changes this worktree's real tab session - see `crate::work_surface::session`.
+        self.record_worktree_session(cx);
         // A second agent in this worktree closes the single-agent gate on every agent already
         // there, so a review tab open for one of them must really close now - see
         // `crate::review::render::AdeApp::close_gated_review_tab` for why this is a real close
@@ -491,6 +493,9 @@ impl AdeApp {
         {
             window.focus(&self.rail_focus_handle, cx);
         }
+        // A closed tab is as real a session change as an opened one: relaunching must not reopen
+        // a tab the user deliberately closed. See `crate::work_surface::session`.
+        self.record_worktree_session(cx);
     }
 
     /// The surface footer's `Interrupt ⌃C` action - sends `Ctrl-C` to the agent's pty via
@@ -535,6 +540,9 @@ impl AdeApp {
             cx,
         );
         self.focus_newly_spawned_agent(window, cx);
+        // The close above and the spawn here are two real session changes; both are recorded, so a
+        // relaunch reopens the retried agent's slot rather than the one it replaced.
+        self.record_worktree_session(cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         cx.notify();
@@ -568,6 +576,9 @@ impl AdeApp {
                     cx,
                 );
                 self.focus_newly_spawned_agent(window, cx);
+                // Only this arm spawned anything - the `Some(id)` arm above just selects a
+                // terminal that is already part of the recorded session.
+                self.record_worktree_session(cx);
                 self.prune_confirm_armed = false;
                 self.discard_confirm_armed = None;
                 cx.notify();
@@ -603,27 +614,24 @@ impl AdeApp {
         };
         let agents_for_cwd: Vec<&Agent> = self.agents.iter_for_cwd(cwd.clone()).collect();
         let agent_ids: Vec<AgentId> = agents_for_cwd.iter().map(|agent| agent.id).collect();
-        // `Self::tab_order` hasn't been touched for yet *this session* falls back to its real,
-        // on-disk order (GitHub issue #16's own "persists... and restores on relaunch") instead
-        // of the empty slice a brand new session would otherwise reconcile against - see
-        // `Self::tab_order`'s own docs. Recomputed fresh each call rather than cached back into
-        // `Self::tab_order`: `crate::work_surface::tab_order_state::TabOrderState` is already
-        // fully loaded in memory (no I/O here), and leaving `Self::tab_order` itself untouched
-        // until a real drag happens is what keeps `Self::tab_order_owned` scoped to worktrees
-        // this instance has actually *changed*, not merely visited.
-        let persisted_fallback;
+        // A worktree with no [`Self::tab_order`] entry reconciles against an empty slice, which is
+        // the old, deliberate two-block default ("every agent, then every file" - see
+        // `work_surface::state::reconcile_tab_order`'s own docs).
+        //
+        // This method used to read a *file-only* persisted order (`TabOrderState::file_order`)
+        // here instead, as GitHub issue #16's own "restores on relaunch". That fallback is gone,
+        // replaced rather than dropped: `crate::work_surface::session::AdeApp::
+        // restore_worktree_session` now seeds `Self::tab_order` with the real remembered order
+        // directly, at the one moment a worktree is genuinely activated - and does it for *every*
+        // tab kind, agents included, which a fallback keyed off persisted file paths structurally
+        // could not. Keeping both would have been actively wrong, not merely redundant: since a
+        // worktree's session is now recorded on every ordinary tab change rather than only after a
+        // drag, this fallback would fire for never-dragged worktrees too and silently reorder
+        // their strip to "files first, then agents" - the exact inversion of the documented
+        // default.
         let stored: &[work_surface::TabRef] = match self.tab_order.get(&cwd) {
             Some(order) => order.as_slice(),
-            None => {
-                persisted_fallback = self
-                    .tab_order_state
-                    .file_order(&cwd)
-                    .into_iter()
-                    .filter_map(|absolute| absolute.strip_prefix(&cwd).ok().map(Path::to_path_buf))
-                    .map(work_surface::TabRef::File)
-                    .collect::<Vec<_>>();
-                &persisted_fallback
-            }
+            None => &[],
         };
         work_surface::reconcile_tab_order(
             stored,
@@ -657,25 +665,15 @@ impl AdeApp {
         };
         let mut order = self.combined_tab_order();
         work_surface::move_tab_order(&mut order, &dragged, &target, insert_after);
-        self.tab_order.insert(cwd.clone(), order.clone());
+        self.tab_order.insert(cwd.clone(), order);
 
-        // The file half of the same order, persisted to disk (GitHub issue #16) - see
-        // `work_surface::tab_order_state`'s own module docs for why agent-tab entries are never
-        // recorded here at all.
-        let files: Vec<PathBuf> = order
-            .iter()
-            .filter_map(|tab_ref| match tab_ref {
-                work_surface::TabRef::File(path) => Some(cwd.join(path)),
-                work_surface::TabRef::Agent(_)
-                | work_surface::TabRef::Graph
-                | work_surface::TabRef::Review(_) => None,
-            })
-            .collect();
-        self.tab_order_state.set_file_order(&cwd, &files);
-        if let Some(key) = crate::work_surface::tab_order_state::worktree_key(&cwd) {
-            self.tab_order_owned.insert(key);
-        }
-        self.persist_tab_order(cx);
+        // The same order, persisted to disk (GitHub issue #16, widened by the tab-session restore
+        // work into "every tab, of every kind, in this order" - see
+        // `crate::work_surface::session`). Deliberately the one shared recorder rather than a
+        // second, drag-specific encoding: a drag is just one more way this worktree's tab session
+        // changes, and having it write the file through a different path than every other change
+        // is exactly how the two would drift.
+        self.record_worktree_session(cx);
         cx.notify();
     }
 
@@ -1593,6 +1591,9 @@ impl AdeApp {
                     cx,
                 );
                 this.focus_newly_spawned_agent(window, cx);
+                // See `Self::new_agent`'s own identical call - this is the same real new tab,
+                // reached through the `+` menu's background `$PATH` search instead.
+                this.record_worktree_session(cx);
                 this.prune_confirm_armed = false;
                 cx.notify();
             });

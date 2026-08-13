@@ -1924,17 +1924,17 @@ pub struct AdeApp {
     /// Each worktree's own real, drag-chosen tab order (GitHub issue #16) - agent and file
     /// tabs interleaved, keyed by that worktree's cwd. Never itself the source of truth for
     /// which tabs exist (`Agents`/[`Self::open_files`] still are - see
-    /// [`Self::combined_tab_order`]'s own docs); only [`Self::reorder_tab`] writes to it. A
-    /// worktree with no entry here yet falls back to [`Self::tab_order_state`]'s real, persisted
-    /// order (`crate::work_surface::tab_order_state::TabOrderState::file_order`) rather than the old
-    /// two-block "agents then files" layout - see [`Self::combined_tab_order`]'s own docs for
-    /// exactly where that fallback happens.
+    /// [`Self::combined_tab_order`]'s own docs). Two writers: [`Self::reorder_tab`] (a real drag)
+    /// and `crate::work_surface::session::AdeApp::restore_worktree_session` (a worktree's
+    /// remembered order, seeded at the moment it is genuinely activated). A worktree with no entry
+    /// here reconciles against an empty slice, i.e. the plain "every agent, then every file"
+    /// default.
     pub(crate) tab_order: HashMap<PathBuf, Vec<work_surface::TabRef>>,
-    /// The tab strip's real, on-disk drag order (GitHub issue #16: "the resulting layout...
-    /// persists per session/worktree and restores on relaunch") - loaded once at startup
-    /// (`Self::new_with_settings`), updated by [`Self::reorder_tab`] alongside [`Self::tab_order`]
-    /// itself, and read by [`Self::combined_tab_order`] as the fallback for a worktree
-    /// [`Self::tab_order`] hasn't touched yet this session.
+    /// The tab strip's real, on-disk session (GitHub issue #16: "the resulting layout... persists
+    /// per session/worktree and restores on relaunch", widened into "which tabs were open at all"
+    /// by `crate::work_surface::session`) - loaded once at startup (`Self::new_with_settings`),
+    /// written by `crate::work_surface::session::AdeApp::record_worktree_session` on every real tab
+    /// change, and read back by that module's own restore to reopen them.
     pub(crate) tab_order_state: crate::work_surface::tab_order_state::TabOrderState,
     /// [`Self::tab_order_state`]'s resolved on-disk path
     /// (`crate::work_surface::tab_order_state::tab_order_path_for`), `None` for the same tests that get
@@ -1950,6 +1950,44 @@ pub struct AdeApp {
     /// [`Self::fold_state_save_pending`]'s coalescing queue, a new reorder simply starts a fresh
     /// save rather than needing one to be pending while another runs.
     pub(crate) _tab_order_save_task: Option<Task<()>>,
+    /// Every worktree whose persisted tab session this window has already dealt with - see
+    /// `crate::work_surface::session::AdeApp::restore_worktree_session`, which is the only writer.
+    ///
+    /// Two jobs, both load-bearing:
+    ///
+    /// 1. **Restore exactly once per worktree per window.** Restoring reopens file tabs and spawns
+    ///    real processes; running it again on the next rail click back into the same worktree would
+    ///    stack a second shell (and a second resumed agent) on top of the first every time.
+    /// 2. **Gate recording on restore having happened.** A worktree whose session hasn't been
+    ///    restored yet still looks empty, and
+    ///    [`crate::work_surface::session::AdeApp::record_worktree_session`] writing that emptiness
+    ///    to disk would erase the very session the next selection was about to reopen. Membership
+    ///    here is what makes "the live tab strip is now the truth for this worktree" a real,
+    ///    checkable fact rather than an assumption.
+    pub(crate) session_restored: HashSet<PathBuf>,
+    /// Every real reason a persisted tab could not be reopened this session - "`src/gone.rs` no
+    /// longer exists", "a Codex agent has no resumable session id". One degraded tab never fails
+    /// the rest of a restore (see
+    /// [`crate::work_surface::session::AdeApp::restore_worktree_session`]), but it must not
+    /// silently vanish either: each entry is logged as it happens and kept here.
+    ///
+    /// Nothing renders these yet - deliberately, and stated plainly rather than implied: this
+    /// carries the same "real data captured, no UI reads it back" contract
+    /// `crate::hooks::store`'s own module docs already established for its first phase. Bounded by
+    /// [`crate::work_surface::session::MAX_SESSION_RESTORE_NOTICES`] so a user who visits many
+    /// worktrees in one long-running window can't grow it without limit.
+    pub(crate) session_restore_notices: Vec<String>,
+    /// Which worktree of each repo (keyed by `crate::rail::repo::repo_key`) was last genuinely
+    /// selected - the live mirror of `crate::rail::repo::RepoRecord::selected_worktree`, seeded
+    /// from `repos.toml` at startup and updated by [`Self::select_worktree`].
+    ///
+    /// A map rather than a single value because [`Self::selected`] only ever describes the
+    /// *focused* repo: [`Self::repo_state_snapshot`] has to write a real remembered worktree for
+    /// every repo it persists, including the ones this window has not looked at since launch, and
+    /// without this it would blank theirs out on the next save (`RepoState::save_merged_at`
+    /// replaces a whole record for every key in [`Self::repo_state_owned`], and startup's own
+    /// `add_repo` puts every restored repo in that set).
+    pub(crate) selected_worktree_by_repo: HashMap<String, PathBuf>,
     /// The unified tab strip's real, precise drop-target indicator (GitHub issue #16's "better
     /// visual feedback" ask): `Some((target, insert_after))` while a tab is being dragged over
     /// `target`'s own tab, where `insert_after` says whether the cursor is over the right half
@@ -2693,10 +2731,20 @@ impl AdeApp {
         let mut state = repo::RepoState::default();
         for r in &self.repos {
             if let Some(key) = repo::repo_key(&r.path) {
+                // Read straight back out of the live mirror rather than from `Self::selected`,
+                // which only ever describes the *focused* repo - see
+                // [`Self::selected_worktree_by_repo`]'s own docs for why blanking every other
+                // repo's remembered worktree on each save would be a real regression, not a
+                // cosmetic one.
+                let selected_worktree = self
+                    .selected_worktree_by_repo
+                    .get(&key)
+                    .map(|path| path.to_string_lossy().into_owned());
                 state.repos.insert(
                     key,
                     repo::RepoRecord {
                         name: r.name.clone(),
+                        selected_worktree,
                     },
                 );
             }
@@ -3619,6 +3667,7 @@ mod repo_list_tests {
             canonical_b.clone(),
             crate::rail::repo::RepoRecord {
                 name: "repo-b".to_string(),
+                selected_worktree: None,
             },
         );
         seed.save_at(&repo_state_path).expect("seed save");
@@ -4560,6 +4609,7 @@ mod repo_list_tests {
             canonical,
             crate::rail::repo::RepoRecord {
                 name: "other-repo".to_string(),
+                selected_worktree: None,
             },
         );
         seed.save_at(&repo_state_path).expect("seed save");
