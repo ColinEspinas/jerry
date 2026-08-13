@@ -293,7 +293,7 @@ impl Agents {
     }
 
     /// Spawns a new agent of `kind` into `cwd` (the caller resolves this - see
-    /// `crate::root::AdeApp::active_agent_cwd`), appends it as a new tab, and makes it
+    /// `crate::root::AdeApp::current_worktree_path`), appends it as a new tab, and makes it
     /// active (both globally, [`Self::active`], and as `cwd`'s own remembered tab,
     /// [`Self::active_by_cwd`]). Returns the new agent's id.
     ///

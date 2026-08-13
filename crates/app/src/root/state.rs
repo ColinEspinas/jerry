@@ -746,11 +746,11 @@ impl AdeApp {
     /// own contract, split out so the "which worktree" decision and the "spawn into it" step are
     /// visibly separate steps rather than one tangled block.
     ///
-    /// Spawns into [`Self::active_agent_cwd`] and refuses outright when that is `None`, which is
+    /// Spawns into [`Self::current_worktree_path`] and refuses outright when that is `None`, which is
     /// the whole point: there is no such thing as a tab attributed to a repo rather than to a
     /// worktree, so if nothing real is selected there is nothing legitimate to spawn. (Today the
     /// caller has already either selected a real worktree or fallen into
-    /// `active_agent_cwd`'s one documented last resort, so `None` here means the repo stopped
+    /// `current_worktree_path`'s one documented last resort, so `None` here means the repo stopped
     /// being focused entirely between the fetch being issued and it landing - a real race, worth
     /// refusing rather than guessing through.)
     ///
@@ -759,7 +759,7 @@ impl AdeApp {
     /// [`crate::root::AdeApp::open_repo_in_current_window`]'s cross-repo persistence docs), so
     /// this must never stack a redundant second shell onto one that is already there.
     fn spawn_initial_shell_for_opened_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cwd) = self.active_agent_cwd() else {
+        let Some(cwd) = self.current_worktree_path() else {
             return;
         };
         if self.agents.iter_for_cwd(cwd.clone()).next().is_none() {
@@ -799,7 +799,7 @@ impl AdeApp {
     ///
     /// Both used to spawn their guaranteed initial shell *immediately*, into the bare repo path,
     /// and leave [`Self::selected`] at `None` - so the tab that shell produced belonged to no
-    /// worktree at all and only rendered because [`Self::active_agent_cwd`]'s old repo-root
+    /// worktree at all and only rendered because [`Self::current_worktree_path`]'s old repo-root
     /// fallback happened to coincide with the main worktree's own path. That is the reported bug
     /// ("at the start of the program you select something and a tab bar has a terminal; then I
     /// select a worktree and this is lost"), and its fix is not to patch the fallback but to make
@@ -897,7 +897,7 @@ impl AdeApp {
                     //   user asking to work somewhere, so none may select on the user's behalf -
                     //   see `crate::root::AdeApp::checkout_repo_from_rail`'s own docs. This is
                     //   now genuinely inert rather than merely *looking* inert: with
-                    //   `Self::active_agent_cwd`'s repo-root fallback gone, an unselected repo
+                    //   `Self::current_worktree_path`'s repo-root fallback gone, an unselected repo
                     //   renders an honestly empty tab strip and no selected rail row, instead of
                     //   the three-way rail/tab-strip/centre-pane disagreement it used to.
                     worktrees::SelectionRecovery::NoPriorSelection => {}
@@ -955,7 +955,7 @@ impl AdeApp {
                     // Runs whether or not a worktree was selectable: a repo with no usable
                     // worktree at all (an unreadable path, or a directory that is not a git
                     // repository) still gets its guaranteed initial shell, via
-                    // `Self::active_agent_cwd`'s one documented last resort. See its own docs.
+                    // `Self::current_worktree_path`'s one documented last resort. See its own docs.
                     this.spawn_initial_shell_for_opened_repo(window, cx);
                 }
 
@@ -1405,7 +1405,7 @@ impl AdeApp {
     /// window *before* the first fetch lands - when [`Self::worktrees`] is empty merely because
     /// nothing has been asked yet - reports the honest `None` instead of briefly reintroducing
     /// the very fallback this removes.
-    pub(crate) fn active_agent_cwd(&self) -> Option<PathBuf> {
+    pub(crate) fn current_worktree_path(&self) -> Option<PathBuf> {
         if let Some(item) = self.selected.and_then(|index| self.worktrees.get(index)) {
             if item.error.is_none() {
                 return Some(item.path.clone());

@@ -150,7 +150,7 @@ impl AdeApp {
     /// tab closed) the action worked perfectly while its only button was hidden - and the whole
     /// cluster (fork glyph, branch, `↑ahead ↓behind`) vanished with it. The gate is now the
     /// action's own precondition, so the button is visible exactly when clicking it does
-    /// something, and the path comes from [`Self::active_agent_cwd`] - the app's real current
+    /// something, and the path comes from [`Self::current_worktree_path`] - the app's real current
     /// git context, which already resolves the selected worktree and falls back to
     /// [`Self::focused_repo_path`] - rather than from whichever pane happens to be focused.
     fn render_status_branch_cluster(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -159,12 +159,12 @@ impl AdeApp {
         // .active()?` this replaces, the value is genuinely unused - the `?` *is* the gate here,
         // not an incidental by-product of fetching a `cwd`.
         self.focused_repo()?;
-        // `active_agent_cwd` is `None` only in the brief in-flight window before the worktree
+        // `current_worktree_path` is `None` only in the brief in-flight window before the worktree
         // fetch lands, or the genuine no-usable-worktree error state - both real, but neither is
         // a reason to hide this cluster once a repo is focused at all, so this falls back to the
         // repo root exactly as `Self::checkout_repo_from_rail`'s synchronous seed does.
         let cwd = self
-            .active_agent_cwd()
+            .current_worktree_path()
             .unwrap_or_else(|| self.focused_repo_path());
         let branch = self
             .worktrees

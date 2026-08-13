@@ -192,7 +192,7 @@ pub fn recover_selection(
 /// `None` only when the repo has no *usable* worktree whatsoever (an empty list, or one whose
 /// every entry is [`WorktreeItem::error`]-bearing) - a real, honest "there is nothing here to
 /// select" state, deliberately distinct from "we forgot to select something that exists". See
-/// `crate::root::AdeApp::active_agent_cwd`'s own docs for the single documented last resort that
+/// `crate::root::AdeApp::current_worktree_path`'s own docs for the single documented last resort that
 /// covers it.
 ///
 /// Unusable ([`WorktreeItem::error`]) entries are skipped by both rules, matching the identical
@@ -451,7 +451,7 @@ mod tests {
 
     /// The real, live-reproduced subdirectory launch (`jerry ./crates`): the opened path is a
     /// genuine directory but not any worktree, so nothing can match it exactly. Before this
-    /// rule existed, `AdeApp::active_agent_cwd` fell back to that bare subdirectory path, and
+    /// rule existed, `AdeApp::current_worktree_path` fell back to that bare subdirectory path, and
     /// the startup shell it spawned there belonged to no rail row at all - a real, live tab
     /// that no worktree claimed, and which became permanently unreachable the moment any
     /// worktree row was clicked.
