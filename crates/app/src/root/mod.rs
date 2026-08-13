@@ -2061,17 +2061,17 @@ pub struct AdeApp {
     /// anchor to whichever one was actually clicked, not whichever rendered last.
     pub(crate) sound_event_button_bounds:
         std::collections::HashMap<crate::sound::SoundEventKind, gpui::Bounds<Pixels>>,
-    /// Every live agent's [`crate::rail::status::Status`] as of the *previous* status-poll tick,
-    /// [`crate::sound::flow::AdeApp::play_agent_status_sounds`]'s own real transition memory. An
-    /// agent id present here but no longer in [`crate::work_surface::agents::Agents`] (closed
-    /// since the last tick) is simply never looked at again, never explicitly pruned - the same
-    /// "a stale entry is harmless, not actively cleaned up" precedent [`Self::tab_slide`]'s own
-    /// docs describe.
-    pub(crate) prev_agent_statuses: std::collections::HashMap<
+    /// Every live agent's [`crate::sound::flow::AgentSoundState`] as of the *previous*
+    /// status-poll tick, [`crate::sound::flow::AdeApp::play_agent_status_sounds`]'s own real
+    /// transition memory. An agent id present here but no longer in
+    /// [`crate::work_surface::agents::Agents`] (closed since the last tick) is simply never
+    /// looked at again, never explicitly pruned - the same "a stale entry is harmless, not
+    /// actively cleaned up" precedent [`Self::tab_slide`]'s own docs describe.
+    pub(crate) prev_agent_sound_states: std::collections::HashMap<
         crate::work_surface::agents::AgentId,
-        crate::rail::status::Status,
+        crate::sound::flow::AgentSoundState,
     >,
-    /// Whether [`Self::prev_agent_statuses`] has been populated at least once yet -
+    /// Whether [`Self::prev_agent_sound_states`] has been populated at least once yet -
     /// `play_agent_status_sounds`'s own "don't treat a fresh app launch's already-open agents as
     /// a burst of transitions" guard. `false` until the very first status-poll tick after
     /// construction runs; every tick after that leaves it `true`, permanently, for the life of

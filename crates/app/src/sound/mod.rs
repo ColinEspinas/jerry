@@ -54,9 +54,11 @@ fn claim_once(flag: &AtomicBool) -> bool {
 pub enum SoundEventKind {
     /// Jerry has just launched - see `crate::root::state`'s startup wiring.
     AppStart,
-    /// An agent's turn ended with real changes ready to review (`rail::status::Status::Review`) -
-    /// see [`flow`]'s own docs for why this, and not every path back to `Status::Idle`, is what
-    /// "finished" means here.
+    /// An agent's turn ended - primarily Claude Code's own `Stop` hook fact
+    /// (`crate::hooks::event::HookFact::TurnEnded`), with a plain process exiting 0 with a real
+    /// diff (`rail::status::Status::Review`) as a fallback for agents with no hook channel. See
+    /// [`flow`]'s own docs for why a hook fact is needed at all, and why neither path ever fires
+    /// for a plain `Status::Idle`.
     AgentFinished,
     /// An agent moved into `rail::status::Status::Ask`.
     AgentNeedsInput,
@@ -92,9 +94,7 @@ impl SoundEventKind {
     pub fn description(self) -> &'static str {
         match self {
             SoundEventKind::AppStart => "Play a sound when Jerry launches.",
-            SoundEventKind::AgentFinished => {
-                "Play a sound when an agent finishes a turn with changes ready to review."
-            }
+            SoundEventKind::AgentFinished => "Play a sound when an agent finishes its turn.",
             SoundEventKind::AgentNeedsInput => {
                 "Play a sound when an agent is waiting for your response."
             }

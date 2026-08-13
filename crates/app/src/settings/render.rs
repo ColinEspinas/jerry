@@ -37,6 +37,16 @@ const SOUND_PICKER_MAX_HEIGHT: gpui::Pixels = px(232.0);
 /// Same role as [`SHELL_SUGGESTIONS_EDGE_MARGIN`], for the sound picker.
 const SOUND_PICKER_EDGE_MARGIN: f32 = 4.0;
 
+/// The opacity a [`SoundEventKind`] row is dimmed to while the master "Sound effects" switch
+/// (`crate::settings::store::SoundSettings::enabled`) is off - `Self::render_sound_event_row`'s
+/// visual half of "this row currently has no effect", paired with
+/// `Self::render_toggle_control_gated`/`Self::render_sound_picker_trigger`'s `interactive: false`
+/// for the behavioural half. `gpui`'s `opacity` dims an element's whole subtree in one call
+/// (`vendor/zed/crates/gpui/src/elements/div.rs`'s `window.with_element_opacity`), so this single
+/// wrapper covers the row's label, hint, sound-choice trigger, and toggle together rather than
+/// needing a disabled variant of each one's own colors.
+const SOUND_ROW_DISABLED_OPACITY: f32 = 0.4;
+
 impl AdeApp {
     pub(crate) fn handle_toggle_settings_action(
         &mut self,
@@ -3356,6 +3366,12 @@ impl AdeApp {
     /// One [`SoundEventKind`] row: label/hint from the event itself, a "choose a sound" trigger
     /// button (opens [`Self::render_sound_picker`], a floating popover - see that method's own
     /// docs for why it can't just be a child of this row), and the event's own on/off toggle.
+    ///
+    /// While the master "Sound effects" switch is off, every event row is genuinely inert - none
+    /// of its own settings has any effect until the master is back on - so both the trigger and
+    /// the toggle are rendered non-interactive (`interactive: false`) and the whole row is dimmed
+    /// to [`SOUND_ROW_DISABLED_OPACITY`], rather than leaving three controls on screen that look
+    /// live but silently do nothing when clicked.
     fn render_sound_event_row(
         &self,
         event: SoundEventKind,
@@ -3366,24 +3382,28 @@ impl AdeApp {
             crate::sound::library::resolve(&event_settings.sound, &self.sound_library)
                 .map(|sound| sound.name.clone())
                 .unwrap_or_else(|| "Choose a sound…".to_string());
+        let interactive = self.settings.sound.enabled;
 
         let control = div()
             .flex()
             .items_center()
             .gap(px(10.0))
-            .child(self.render_sound_picker_trigger(event, &current_name, cx))
-            .child(self.render_toggle_control(
+            .child(self.render_sound_picker_trigger(event, &current_name, interactive, cx))
+            .child(self.render_toggle_control_gated(
                 match event {
                     SoundEventKind::AppStart => "settings-sound-app-start-enabled",
                     SoundEventKind::AgentFinished => "settings-sound-agent-finished-enabled",
                     SoundEventKind::AgentNeedsInput => "settings-sound-agent-needs-input-enabled",
                 },
                 event_settings.enabled,
+                interactive,
                 cx,
                 move |this, cx| this.toggle_sound_event_enabled(event, cx),
             ));
 
-        self.render_settings_row(event.label(), event.description(), control)
+        div()
+            .when(!interactive, |el| el.opacity(SOUND_ROW_DISABLED_OPACITY))
+            .child(self.render_settings_row(event.label(), event.description(), control))
     }
 
     /// The event row's own clickable "which sound" field - deliberately shaped like
@@ -3391,10 +3411,17 @@ impl AdeApp {
     /// [`Self::render_choice_control`]'s segmented control: a segmented control reads fine for
     /// three options and unreadable for a library that can grow past a handful of imports (see
     /// GitHub issue #226's own scoping decision), where a dropdown scales.
+    ///
+    /// `interactive` mirrors `Self::render_toggle_control_gated`'s own flag - `false` while the
+    /// master "Sound effects" switch is off, so this field can't open its popover for a setting
+    /// that currently has no effect. The bounds-capturing canvas below stays regardless: it never
+    /// opens anything on its own, and dropping it would leave `Self::sound_event_button_bounds`
+    /// stale the next time the row does become interactive.
     fn render_sound_picker_trigger(
         &self,
         event: SoundEventKind,
         current_name: &str,
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let current_name = current_name.to_string();
@@ -3406,9 +3433,13 @@ impl AdeApp {
             .debug_selector(move || {
                 format!("settings-sound-picker-trigger-{}", event.settings_key())
             })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                this.open_sound_picker(event, cx);
-            }))
+            .when(interactive, |el| {
+                el.cursor_pointer().on_click(cx.listener(
+                    move |this, _event: &ClickEvent, _window, cx| {
+                        this.open_sound_picker(event, cx);
+                    },
+                ))
+            })
             // The trigger's real, window-space painted bounds, for positioning its popover - same
             // `gpui::canvas` idiom `Self::shell_field_bounds` uses, kept per-event in
             // `Self::sound_event_button_bounds` since all three rows are on screen at once.
@@ -3425,7 +3456,6 @@ impl AdeApp {
                 .absolute()
                 .size_full()
             })
-            .cursor_pointer()
             .flex_none()
             .flex()
             .items_center()
@@ -3745,6 +3775,12 @@ impl AdeApp {
 
     fn toggle_sound_enabled(&mut self, cx: &mut Context<Self>) {
         self.settings.sound.enabled = !self.settings.sound.enabled;
+        // Turning the master off makes every event row non-interactive - an open sound picker
+        // popover would otherwise survive pointing at a trigger that no longer responds to
+        // clicks.
+        if !self.settings.sound.enabled {
+            self.sound_picker_open = None;
+        }
         self.persist_settings(cx);
         cx.notify();
     }
@@ -7926,6 +7962,12 @@ mod sound_settings_page_tests {
         let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
         open_notifications_page(&app, cx);
 
+        // The master switch is off by default, which now makes every event row's own toggle
+        // non-interactive (see `an_event_toggle_does_nothing_while_the_master_switch_is_off`) -
+        // switch it on first so this test still exercises a real, live click on the row itself.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+
         assert!(app.read_with(cx, |app, _| app.settings.sound.app_start.enabled));
         let bounds = cx
             .debug_bounds("settings-sound-app-start-enabled")
@@ -7954,6 +7996,10 @@ mod sound_settings_page_tests {
         let (app, cx) =
             open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
         open_notifications_page(&app, cx);
+        // Same "the master switch is off by default, and the trigger is now gated on it" reason
+        // as `a_single_event_toggle_paints_and_clicking_it_flips_only_that_event`.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
 
         let default_sound = app.read_with(cx, |app, _| app.settings.sound.app_start.sound.clone());
         let library = app.read_with(cx, |app, _| app.sound_library.clone());
@@ -8004,6 +8050,112 @@ mod sound_settings_page_tests {
             reloaded.read_with(cx, |app, _| app.settings.sound.app_start.sound.clone()),
             other_sound,
             "the picked sound must really be persisted to disk"
+        );
+    }
+
+    /// While the master switch is off (the real default - see the sanity check in
+    /// `the_master_switch_paints_off_by_default_and_clicking_it_flips_and_persists`), an event
+    /// row's own toggle must be inert: it still paints (so a real test, and a real user, can find
+    /// it) but clicking it must not flip the setting, since
+    /// `Self::render_toggle_control_gated`'s `interactive: false` path never attaches a click
+    /// handler at all.
+    #[gpui::test]
+    fn an_event_toggle_does_nothing_while_the_master_switch_is_off(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "sanity check: the master switch is off by default"
+        );
+        assert!(app.read_with(cx, |app, _| app.settings.sound.agent_finished.enabled));
+
+        let bounds = cx
+            .debug_bounds("settings-sound-agent-finished-enabled")
+            .expect("the Agent finished row's own toggle must still paint while dimmed");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings.sound.agent_finished.enabled),
+            "clicking a dimmed event toggle must not flip it - the master switch is off"
+        );
+    }
+
+    /// Same "no handler attached" guarantee as the toggle test above, for the sound-choice
+    /// trigger: clicking it while the master switch is off must not open the picker popover.
+    #[gpui::test]
+    fn the_sound_choice_trigger_does_nothing_while_the_master_switch_is_off(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        assert!(!app.read_with(cx, |app, _| app.settings.sound.enabled));
+
+        let trigger_bounds = cx
+            .debug_bounds("settings-sound-picker-trigger-app_start")
+            .expect("the App start row's sound-choice trigger must still paint while dimmed");
+        cx.simulate_click(trigger_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_none()),
+            "clicking a dimmed sound-choice trigger must not open the picker"
+        );
+    }
+
+    /// Turning the master switch off while an event's sound picker is open must close the
+    /// popover - otherwise it would sit open, pointing at a trigger that no longer responds to
+    /// clicks (`Self::toggle_sound_enabled`'s own `sound_picker_open = None` on the off path).
+    ///
+    /// The master switch is flipped by calling `Self::toggle_sound_enabled` directly rather than
+    /// simulating a click on its painted bounds: the picker's own full-page scrim
+    /// (`Self::render_sound_picker`'s `settings-sound-picker-scrim`) sits on top of the whole
+    /// page precisely to catch an outside click and close the popover, so a simulated click
+    /// landing on the master switch while the popover is open would hit that scrim first and
+    /// never reach the switch at all - not a real way to reach this guard, just an artifact of
+    /// coordinates overlapping in a headless test.
+    #[gpui::test]
+    fn switching_the_master_off_closes_an_open_sound_picker(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        // Switch the master on first, so the trigger is interactive and the picker can really
+        // open.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.settings.sound.enabled));
+
+        let trigger_bounds = cx
+            .debug_bounds("settings-sound-picker-trigger-app_start")
+            .expect("the App start row's sound-choice trigger must really paint");
+        cx.simulate_click(trigger_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_some()),
+            "sanity check: the picker really opened"
+        );
+
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "sanity check: the master switch flipped back off"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_none()),
+            "switching the master off must close an open sound picker"
         );
     }
 }

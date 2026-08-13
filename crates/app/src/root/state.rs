@@ -593,7 +593,7 @@ impl AdeApp {
             _sound_import_task: None,
             sound_picker_open: None,
             sound_event_button_bounds: HashMap::new(),
-            prev_agent_statuses: HashMap::new(),
+            prev_agent_sound_states: HashMap::new(),
             agent_sound_seeded: false,
             last_sound_at: None,
             // A window is real and focused the instant its own constructor finishes - see this

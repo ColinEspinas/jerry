@@ -17,10 +17,13 @@
 //!
 //! ## What counts as a transition
 //!
-//! Only two edges matter, both *into* a state, never staying in one:
+//! Three edges matter:
 //!
 //! - anything -> [`Status::Ask`] triggers [`SoundEventKind::AgentNeedsInput`]
-//! - anything -> [`Status::Review`] triggers [`SoundEventKind::AgentFinished`]
+//! - the agent's own [`HookFact::TurnEnded`] fact newly becoming fresh triggers
+//!   [`SoundEventKind::AgentFinished`] - see "Why `AgentFinished` needs its own signal" below
+//! - anything -> [`Status::Review`] (reached some other way than the fact above, e.g. a plain
+//!   process exiting 0 with a real diff) also triggers [`SoundEventKind::AgentFinished`]
 //!
 //! Deliberately not anything -> [`Status::Idle`]: `Idle` is reached both by a real "turn ended,
 //! nothing to review" *and* by the pty-silence heuristic that also produces every other quiescent
@@ -32,12 +35,39 @@
 //! "previous") never sounds - see [`crate::root::AdeApp::play_agent_status_sounds`]'s own
 //! "seeded" flag for why a *whole app launch* with agents already open must not replay every one
 //! of their statuses as a burst of transitions.
+//!
+//! ## Why `AgentFinished` needs its own signal, not just `-> Status::Review`
+//!
+//! `Status::Review` (`crate::rail::status::derive_status`) requires three things at once: a real
+//! `HookFact::TurnEnded` (or a clean process exit), a non-empty *unreviewed* diff against the
+//! agent's own baseline, and - via `crate::review::flow::AdeApp::agent_has_unreviewed_changes` -
+//! that this agent is currently the *only* one open in its worktree
+//! (`crate::work_surface::agents::Agents::is_sole_agent_in_worktree`). Every window starts with a
+//! shell already open in the repo, so spawning a Claude agent into that same worktree makes two
+//! agents there - the single-agent gate then never opens for it, and `AgentFinished` could never
+//! fire at all. `Status::Ask`, by contrast, is reachable by the plain quiescence heuristic alone,
+//! with none of those three conditions - which is why "needs input" sounded correctly while
+//! "finished" silently never did.
+//!
+//! The fix reads a stronger, earlier signal instead: `HookFact::TurnEnded` itself, the moment
+//! Claude Code's own `Stop` hook reports it, on its **rising edge** - a fact that stays fresh
+//! across several ticks (`crate::hooks::event::HOOK_SIGNAL_TTL`) never re-sounds. This is the
+//! agent stating outright "my turn just ended", independent of whether there happens to be a
+//! reviewable diff or a second agent sharing its worktree. It is also gated on
+//! [`crate::work_surface::agents::ProcessKind::is_agent_session`], the same guard
+//! `crate::rail::status::derive_status` applies to every hook-derived fact, so a plain shell
+//! (which never receives hooks) can never trigger it. A Codex agent has no hook channel at all,
+//! so for it `AgentFinished` still only ever arrives via the older `-> Status::Review` path.
+//!
+//! A falling edge (the fact expiring after 30 minutes with nothing else happening) is explicitly
+//! *not* a transition worth sounding for - see [`sound_for_transition`]'s own doc comment.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui::Context;
 
+use crate::hooks::event::HookFact;
 use crate::rail::status::Status;
 use crate::root::AdeApp;
 use crate::sound::SoundEventKind;
@@ -49,13 +79,41 @@ use crate::work_surface::agents::AgentId;
 /// produce one sound, not a burst - see [`pick_one_event`].
 pub(crate) const SOUND_COOLDOWN: Duration = Duration::from_secs(3);
 
-/// Which [`SoundEventKind`] (if any) a single agent's status transition should trigger. `None`
-/// when `prev == next` (no real transition) or the new status isn't one of the two that sound.
-pub(crate) fn sound_for_transition(prev: Status, next: Status) -> Option<SoundEventKind> {
-    if prev == next {
+/// One agent's sound-relevant state as of a single status-poll tick - [`Status`] plus whether a
+/// fresh `HookFact::TurnEnded` is currently reported for it. Two fields rather than folding
+/// `turn_ended` into a sixth [`Status`] variant: the two are genuinely independent (an agent can
+/// be freshly turn-ended *and* sit in [`Status::Idle`] with no reviewable diff, or *and* sit in
+/// [`Status::Review`] with one), and [`Status`] is a wider, non-sound-specific vocabulary that
+/// this module shouldn't be the one to extend - see the module docs' "Why `AgentFinished` needs
+/// its own signal" section for why both are read at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentSoundState {
+    pub status: Status,
+    pub turn_ended: bool,
+}
+
+/// Which [`SoundEventKind`] (if any) a single agent's state change should trigger. `None` when
+/// `prev == next` (nothing changed) or the new state isn't one of the cases the module docs list.
+pub(crate) fn sound_for_transition(
+    prev: AgentSoundState,
+    next: AgentSoundState,
+) -> Option<SoundEventKind> {
+    // The turn-ended fact's rising edge outranks everything else below: it is checked first, and
+    // returns unconditionally, whether or not `status` also changed on this same tick.
+    if !prev.turn_ended && next.turn_ended {
+        return Some(SoundEventKind::AgentFinished);
+    }
+    // The fact merely expiring (falling edge, no new fact arrived) is not itself an event - see
+    // the module docs. Any `status` change riding along on the very same tick this expires is
+    // just the quiescence heuristic resuming, not a transition worth sounding for, so this
+    // returns rather than falling through to the `status` match below.
+    if prev.turn_ended && !next.turn_ended {
         return None;
     }
-    match next {
+    if prev.status == next.status {
+        return None;
+    }
+    match next.status {
         Status::Ask => Some(SoundEventKind::AgentNeedsInput),
         Status::Review => Some(SoundEventKind::AgentFinished),
         _ => None,
@@ -80,14 +138,14 @@ fn priority(event: SoundEventKind) -> u8 {
 /// last tick) never contributes - only agents present in both, whose status actually changed,
 /// count as a real transition.
 pub(crate) fn agents_sound_event(
-    current: &HashMap<AgentId, Status>,
-    prev: &HashMap<AgentId, Status>,
+    current: &HashMap<AgentId, AgentSoundState>,
+    prev: &HashMap<AgentId, AgentSoundState>,
 ) -> Option<SoundEventKind> {
     current
         .iter()
         .filter_map(|(agent_id, &next)| {
-            let &prev_status = prev.get(agent_id)?;
-            sound_for_transition(prev_status, next)
+            let &prev_state = prev.get(agent_id)?;
+            sound_for_transition(prev_state, next)
         })
         .min_by_key(|event| priority(*event))
 }
@@ -99,25 +157,37 @@ impl AdeApp {
     /// reads every agent's live status itself rather than reusing that function's own "changed"
     /// signal, and for exactly which transitions count.
     pub(crate) fn play_agent_status_sounds(&mut self, cx: &mut Context<Self>) {
-        let current_statuses: HashMap<AgentId, Status> = self
+        let current_statuses: HashMap<AgentId, AgentSoundState> = self
             .agents
             .iter()
-            .map(|agent| (agent.id, self.agent_status(agent, cx)))
+            .map(|agent| {
+                let status = self.agent_status(agent, cx);
+                // Mirrors `crate::work_surface::render::AdeApp::agent_status`'s own
+                // `hook_runtime`/`fresh()` read - a shell never has a hook fact to begin with,
+                // but `is_agent_session()` is checked anyway, matching
+                // `crate::rail::status::derive_status`'s identical guard on every other
+                // hook-derived fact.
+                let turn_ended = agent.kind.is_agent_session()
+                    && self.hook_runtime.as_ref().is_some_and(|runtime| {
+                        runtime.signal_for(agent.id).fresh() == Some(HookFact::TurnEnded)
+                    });
+                (agent.id, AgentSoundState { status, turn_ended })
+            })
             .collect();
 
-        // First tick since this window opened: every already-open agent's status is real, but
+        // First tick since this window opened: every already-open agent's state is real, but
         // none of it is a *transition* - there is nothing to compare against yet. Seed
-        // `prev_agent_statuses` and return without ever consulting `agents_sound_event`, so a
-        // window that opens onto three agents already sitting in `Ask` never plays a burst of
-        // three "needs input" sounds it had no part in causing.
+        // `prev_agent_sound_states` and return without ever consulting `agents_sound_event`, so a
+        // window that opens onto three agents already sitting in `Ask` (or already carrying a
+        // fresh `TurnEnded` fact) never plays a burst of sounds it had no part in causing.
         if !self.agent_sound_seeded {
             self.agent_sound_seeded = true;
-            self.prev_agent_statuses = current_statuses;
+            self.prev_agent_sound_states = current_statuses;
             return;
         }
 
-        let event = agents_sound_event(&current_statuses, &self.prev_agent_statuses);
-        self.prev_agent_statuses = current_statuses;
+        let event = agents_sound_event(&current_statuses, &self.prev_agent_sound_states);
+        self.prev_agent_sound_states = current_statuses;
 
         let Some(event) = event else {
             return;
@@ -212,10 +282,28 @@ impl AdeApp {
 mod tests {
     use super::*;
 
+    /// Builds an [`AgentSoundState`] with `turn_ended: false` - what every pre-hook-signal test
+    /// below means, and the state most agents are in most of the time.
+    fn state(status: Status) -> AgentSoundState {
+        AgentSoundState {
+            status,
+            turn_ended: false,
+        }
+    }
+
+    /// Builds an [`AgentSoundState`] with a fresh `turn_ended` fact, for the tests exercising the
+    /// module docs' "Why `AgentFinished` needs its own signal" edge.
+    fn turn_ended_state(status: Status) -> AgentSoundState {
+        AgentSoundState {
+            status,
+            turn_ended: true,
+        }
+    }
+
     #[test]
     fn same_status_is_never_a_transition() {
         for status in Status::ORDER {
-            assert_eq!(sound_for_transition(status, status), None);
+            assert_eq!(sound_for_transition(state(status), state(status)), None);
         }
     }
 
@@ -226,7 +314,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                sound_for_transition(prev, Status::Ask),
+                sound_for_transition(state(prev), state(Status::Ask)),
                 Some(SoundEventKind::AgentNeedsInput),
                 "prev = {prev:?}"
             );
@@ -240,7 +328,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                sound_for_transition(prev, Status::Review),
+                sound_for_transition(state(prev), state(Status::Review)),
                 Some(SoundEventKind::AgentFinished),
                 "prev = {prev:?}"
             );
@@ -256,12 +344,55 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    sound_for_transition(prev, next),
+                    sound_for_transition(state(prev), state(next)),
                     None,
                     "prev = {prev:?}, next = {next:?}"
                 );
             }
         }
+    }
+
+    /// The module docs' central fix: a fresh `TurnEnded` fact triggers `AgentFinished` on its own
+    /// rising edge, even while `status` itself stays put at `Idle` - the exact real-world case
+    /// (a Claude agent sharing its worktree with a shell, so `Status::Review`'s single-agent gate
+    /// never opens) that used to leave this event permanently silent.
+    #[test]
+    fn a_fresh_turn_ended_fact_triggers_agent_finished_even_with_no_status_change() {
+        assert_eq!(
+            sound_for_transition(state(Status::Idle), turn_ended_state(Status::Idle)),
+            Some(SoundEventKind::AgentFinished)
+        );
+    }
+
+    /// The same rising edge also outranks whatever `status` did on the same tick - even a
+    /// coincident move into `Ask` doesn't shadow it, since the fact is checked first and returns
+    /// unconditionally.
+    #[test]
+    fn a_fresh_turn_ended_fact_wins_even_alongside_a_move_into_ask() {
+        assert_eq!(
+            sound_for_transition(state(Status::Run), turn_ended_state(Status::Ask)),
+            Some(SoundEventKind::AgentFinished)
+        );
+    }
+
+    #[test]
+    fn turn_ended_staying_true_across_ticks_does_not_re_sound() {
+        assert_eq!(
+            sound_for_transition(turn_ended_state(Status::Idle), turn_ended_state(Status::Idle)),
+            None
+        );
+    }
+
+    /// The fact's falling edge (it merely expired, `HOOK_SIGNAL_TTL` elapsed with no new fact) is
+    /// not itself an event, even if `status` also moved into `Ask` on the same tick as the
+    /// quiescence heuristic resumes - see the module docs' "A falling edge ... is explicitly not
+    /// a transition" note.
+    #[test]
+    fn turn_ended_expiring_never_sounds_even_alongside_a_move_into_ask() {
+        assert_eq!(
+            sound_for_transition(turn_ended_state(Status::Idle), state(Status::Ask)),
+            None
+        );
     }
 
     fn agent(id: u64) -> AgentId {
@@ -278,7 +409,7 @@ mod tests {
     #[test]
     fn a_brand_new_agent_never_sounds_even_if_it_starts_in_ask() {
         let mut current = HashMap::new();
-        current.insert(agent(1), Status::Ask);
+        current.insert(agent(1), state(Status::Ask));
         let prev = HashMap::new();
         assert_eq!(agents_sound_event(&current, &prev), None);
     }
@@ -286,9 +417,9 @@ mod tests {
     #[test]
     fn a_real_transition_to_ask_sounds() {
         let mut current = HashMap::new();
-        current.insert(agent(1), Status::Ask);
+        current.insert(agent(1), state(Status::Ask));
         let mut prev = HashMap::new();
-        prev.insert(agent(1), Status::Run);
+        prev.insert(agent(1), state(Status::Run));
         assert_eq!(
             agents_sound_event(&current, &prev),
             Some(SoundEventKind::AgentNeedsInput)
@@ -300,8 +431,8 @@ mod tests {
         let mut current = HashMap::new();
         let mut prev = HashMap::new();
         for id in 1..=5u64 {
-            current.insert(agent(id), Status::Review);
-            prev.insert(agent(id), Status::Run);
+            current.insert(agent(id), state(Status::Review));
+            prev.insert(agent(id), state(Status::Run));
         }
         // A single `Option`, never a collection - the caller can only ever play one sound per
         // tick regardless of how many agents transitioned.
@@ -315,10 +446,10 @@ mod tests {
     fn needs_input_wins_over_finished_when_both_happen_on_the_same_tick() {
         let mut current = HashMap::new();
         let mut prev = HashMap::new();
-        current.insert(agent(1), Status::Review);
-        prev.insert(agent(1), Status::Run);
-        current.insert(agent(2), Status::Ask);
-        prev.insert(agent(2), Status::Run);
+        current.insert(agent(1), state(Status::Review));
+        prev.insert(agent(1), state(Status::Run));
+        current.insert(agent(2), state(Status::Ask));
+        prev.insert(agent(2), state(Status::Run));
         assert_eq!(
             agents_sound_event(&current, &prev),
             Some(SoundEventKind::AgentNeedsInput)
@@ -329,16 +460,16 @@ mod tests {
     fn an_agent_that_closed_since_the_last_tick_is_ignored() {
         let current = HashMap::new();
         let mut prev = HashMap::new();
-        prev.insert(agent(1), Status::Run);
+        prev.insert(agent(1), state(Status::Run));
         assert_eq!(agents_sound_event(&current, &prev), None);
     }
 
     #[test]
     fn staying_in_ask_across_ticks_does_not_re_sound() {
         let mut current = HashMap::new();
-        current.insert(agent(1), Status::Ask);
+        current.insert(agent(1), state(Status::Ask));
         let mut prev = HashMap::new();
-        prev.insert(agent(1), Status::Ask);
+        prev.insert(agent(1), state(Status::Ask));
         assert_eq!(agents_sound_event(&current, &prev), None);
     }
 }
@@ -438,7 +569,7 @@ mod adeapp_tests {
             app.window_active = false;
             assert!(
                 !app.agent_sound_seeded,
-                "premise: nothing has seeded prev_agent_statuses yet"
+                "premise: nothing has seeded prev_agent_sound_states yet"
             );
 
             app.play_agent_status_sounds(cx);
@@ -449,7 +580,7 @@ mod adeapp_tests {
                 "the seeding tick must never itself count as a transition"
             );
             assert!(
-                !app.prev_agent_statuses.is_empty(),
+                !app.prev_agent_sound_states.is_empty(),
                 "the real startup shell agent must have been recorded"
             );
         });
