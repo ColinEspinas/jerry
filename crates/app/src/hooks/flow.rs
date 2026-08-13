@@ -109,6 +109,10 @@ impl AdeApp {
         self.capture_review_baseline(id, cx);
         self.close_gated_review_tab(window, cx);
         self.focus_newly_spawned_agent(window, cx);
+        // A resumed agent is a real new tab in this worktree, and one whose whole point is that it
+        // carries a real session id forward - so it belongs in the persisted tab session too, and
+        // will itself be resumable again after the next quit. See `crate::work_surface::session`.
+        self.record_worktree_session(cx);
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         cx.notify();
@@ -280,6 +284,17 @@ impl AdeApp {
 
         if changed {
             self.persist_agent_statuses(cx);
+            // A live agent's `session_id` is learned *here*, from its own hooks, some time after
+            // its tab was created and recorded - so the tab session written when the tab opened
+            // still says "no resumable session" for it. Re-recording on a real change is what
+            // turns that into a genuinely resumable entry before the user ever quits; without it,
+            // relaunching would honestly refuse to restore an agent that was, in fact, resumable
+            // the whole time (`crate::work_surface::session::AdeApp::restore_worktree_session`).
+            //
+            // Cheap despite riding the status poll: the recorder compares against what is already
+            // recorded and returns without touching the disk when nothing changed, which is every
+            // tick after the first one that learns an id.
+            self.record_worktree_session(cx);
         }
     }
 

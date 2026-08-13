@@ -431,6 +431,12 @@ impl AdeApp {
         self.dismiss_completions();
         self.save_active_file(cx);
         self.load_file_tree(self.file_tree_root.clone(), cx);
+        // A just-created file gets a real tab here, without going through
+        // `crate::code_surface::tabs::AdeApp::open_and_focus_file` (this method does that work
+        // itself, plus a seeded empty edit buffer) - so it needs its own recording call, or the
+        // tab a user just made would be the one kind that didn't survive a relaunch. See
+        // `crate::work_surface::session`.
+        self.record_worktree_session(cx);
         cx.notify();
         Ok(())
     }

@@ -228,6 +228,11 @@ impl AdeApp {
         self.dismiss_hover();
         self.dismiss_completions();
         self.close_tab_confirm_armed = None;
+        // A newly opened file tab changes this worktree's real tab session, so it reopens on the
+        // next launch - see `crate::work_surface::session`. A no-op when `push_open_file` above
+        // found the tab already open (an already-open path is reused, never duplicated), since the
+        // recorder compares against what is already on disk before writing.
+        self.record_worktree_session(cx);
         cx.notify();
     }
 
@@ -374,6 +379,9 @@ impl AdeApp {
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         self.close_tab_confirm_armed = None;
+        // `push_open_file` above can genuinely add a tab here (see this method's own docs on why
+        // it calls it at all), so this is a real session change, not just an activation.
+        self.record_worktree_session(cx);
         cx.notify();
     }
 
@@ -476,6 +484,9 @@ impl AdeApp {
         }
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
+        // A closed file tab must stay closed across a relaunch - see
+        // `crate::work_surface::session`.
+        self.record_worktree_session(cx);
         cx.notify();
     }
 
