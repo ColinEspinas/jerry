@@ -159,7 +159,13 @@ impl AdeApp {
         // .active()?` this replaces, the value is genuinely unused - the `?` *is* the gate here,
         // not an incidental by-product of fetching a `cwd`.
         self.focused_repo()?;
-        let cwd = self.active_agent_cwd();
+        // `active_agent_cwd` is `None` only in the brief in-flight window before the worktree
+        // fetch lands, or the genuine no-usable-worktree error state - both real, but neither is
+        // a reason to hide this cluster once a repo is focused at all, so this falls back to the
+        // repo root exactly as `Self::checkout_repo_from_rail`'s synchronous seed does.
+        let cwd = self
+            .active_agent_cwd()
+            .unwrap_or_else(|| self.focused_repo_path());
         let branch = self
             .worktrees
             .iter()
