@@ -247,17 +247,22 @@ sudo apt-get install -y \
   build-essential clang cmake pkg-config \
   libfontconfig-dev \
   libvulkan1 mesa-vulkan-drivers \
-  libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev
+  libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
+  libasound2-dev
 ```
 
 This list is derived from (a trimmed-down subset of) upstream Zed's own
 [`script/linux`](https://github.com/zed-industries/zed/blob/main/script/linux)
 Ubuntu/Debian dependency list — see that script for the authoritative, exhaustive version,
 and the comment above the equivalent CI step in `.github/workflows/ci.yml` for what was
-trimmed and why. `libasound2-dev`/`libssl-dev`/`libsqlite3-dev`/`libzstd-dev` were dropped
-from this list after checking `Cargo.lock`: no `alsa`/`alsa-sys`, `openssl-sys`,
-`libsqlite3-sys`/`rusqlite`, or `zstd-sys`/`libz-sys` appears anywhere in this workspace's
-resolved dependency tree, so none of them are actually needed to build it.
+trimmed and why. `libssl-dev`/`libsqlite3-dev`/`libzstd-dev` were dropped from this list
+after checking `Cargo.lock`: no `openssl-sys`, `libsqlite3-sys`/`rusqlite`, or
+`zstd-sys`/`libz-sys` appears anywhere in this workspace's resolved dependency tree, so
+none of those three are actually needed to build it. `libasound2-dev` was dropped for the
+same reason at the time, but GitHub issue #226's sound design module (`crate::sound`) now
+pulls in `rodio`'s `playback` feature, which depends on `cpal`, which links ALSA on Linux
+(`alsa-sys` now genuinely appears in `Cargo.lock`) — so it's back on this list rather than
+a silent Linux build failure the moment that dependency lands.
 
 `libxkbcommon-x11-dev` and `libx11-xcb-dev` were already on this list before `x11` was
 actually enabled (Revision R1) — they were added preemptively and never trimmed back out.

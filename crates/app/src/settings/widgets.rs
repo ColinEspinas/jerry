@@ -374,11 +374,32 @@ impl AdeApp {
     }
 
     /// The real 26×15 toggle control (`design_handoff_jerry_ade/revision/README.md`'s "Settings
-    /// rows" spec) - `id` must be unique per row (used as the GPUI element id).
+    /// rows" spec) - `id` must be unique per row (used as the GPUI element id). Always
+    /// interactive - see [`Self::render_toggle_control_gated`] for the variant a parent
+    /// switch/setting can disable.
     pub(in crate::settings) fn render_toggle_control(
         &self,
         id: &'static str,
         on: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        self.render_toggle_control_gated(id, on, true, cx, on_click)
+    }
+
+    /// [`Self::render_toggle_control`], but the click handler and pointer cursor are only
+    /// attached while `interactive` is `true` - the same "just don't attach the handler" shape
+    /// [`ChoiceOption::enabled_if`]'s own rendering below uses for a disabled option, rather than
+    /// a separate visual "disabled" track/knob pair. Callers pair this with an opacity wrapper on
+    /// the whole row for the dimmed look (see
+    /// `crate::settings::render::AdeApp::render_sound_event_row`); this method itself only ever
+    /// decides interactivity. `debug_selector` is kept even when `!interactive`, so a test can
+    /// still find the element and assert that clicking it does nothing.
+    pub(in crate::settings) fn render_toggle_control_gated(
+        &self,
+        id: &'static str,
+        on: bool,
+        interactive: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
@@ -392,7 +413,6 @@ impl AdeApp {
             // from `impl Into<ElementId>` to `&'static str` to make it available, which every one
             // of this method's call sites already passed.
             .debug_selector(move || id.to_string())
-            .cursor_pointer()
             .flex_none()
             .w(px(26.0))
             .h(px(15.0))
@@ -412,9 +432,13 @@ impl AdeApp {
             } else {
                 theme::toggle::KNOB_OFF
             }))
-            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                on_click(this, cx);
-            }))
+            .when(interactive, |el| {
+                el.cursor_pointer().on_click(cx.listener(
+                    move |this, _event: &ClickEvent, _window, cx| {
+                        on_click(this, cx);
+                    },
+                ))
+            })
     }
 
     /// The real `− value +` stepper control (`design_handoff_jerry_ade/revision/README.md`'s

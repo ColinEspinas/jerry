@@ -102,6 +102,7 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub icon_pack: IconPackSettings,
     pub lsp: BTreeMap<String, LspServerSettings>,
+    pub sound: SoundSettings,
 }
 
 /// The integrated terminal's own behavioural settings (GitHub issue #213: "Allow to select
@@ -483,6 +484,114 @@ impl Default for BlameSettings {
     }
 }
 
+/// The sound design module's own settings (GitHub issue #226) - real, applied and read at
+/// `crate::sound::flow::AdeApp::play_agent_status_sounds`/`crate::root::AdeApp::new_with_settings`
+/// (the app-start chime), not persisted-only. `enabled` is the master switch every event's own
+/// [`SoundEventSettings::enabled`] is gated behind - see [`Self::default`] for why it starts off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundSettings {
+    /// Off by default (unlike every other field here): GitHub issue #226 asks for sound design
+    /// that a user opts into, not one that plays the first time they launch a build that shipped
+    /// it. Every [`SoundEventSettings::enabled`] below defaults to `true` specifically so turning
+    /// this master switch on gives all three sounds immediately - the user then disables
+    /// individual ones rather than having to opt every one of them in by hand.
+    pub enabled: bool,
+    /// `#[serde(default = "...")]`, not the blanket struct-level default: each event needs its
+    /// *own* built-in sound (see [`SoundEventSettings::default_for`]), which a single shared
+    /// `SoundEventSettings::default()` couldn't express - this is what makes a `settings.toml`
+    /// with a `[sound]` table that simply omits `app_start` still resolve to the real default
+    /// chime rather than an id-less, undecidable row.
+    #[serde(default = "default_app_start_event")]
+    pub app_start: SoundEventSettings,
+    #[serde(default = "default_agent_finished_event")]
+    pub agent_finished: SoundEventSettings,
+    #[serde(default = "default_agent_needs_input_event")]
+    pub agent_needs_input: SoundEventSettings,
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_start: default_app_start_event(),
+            agent_finished: default_agent_finished_event(),
+            agent_needs_input: default_agent_needs_input_event(),
+        }
+    }
+}
+
+fn default_app_start_event() -> SoundEventSettings {
+    SoundEventSettings::default_for(crate::sound::SoundEventKind::AppStart)
+}
+
+fn default_agent_finished_event() -> SoundEventSettings {
+    SoundEventSettings::default_for(crate::sound::SoundEventKind::AgentFinished)
+}
+
+fn default_agent_needs_input_event() -> SoundEventSettings {
+    SoundEventSettings::default_for(crate::sound::SoundEventKind::AgentNeedsInput)
+}
+
+impl SoundSettings {
+    /// Re-trims/re-defaults each event's own [`SoundEventSettings::sound`] - see that method's
+    /// own docs. Deliberately does **not** check that the id still resolves to a real library
+    /// sound (a user-imported sound the file for which has since been deleted, say): that check
+    /// needs the live library, which this module - like every other settings section - has no
+    /// access to and no business loading; `crate::sound::library::resolve`'s own documented
+    /// fallback handles a since-deleted id without ever rewriting this file, so a restored file
+    /// picks the assignment back up.
+    pub fn sanitize(&mut self) {
+        self.app_start
+            .sanitize(crate::sound::SoundEventKind::AppStart);
+        self.agent_finished
+            .sanitize(crate::sound::SoundEventKind::AgentFinished);
+        self.agent_needs_input
+            .sanitize(crate::sound::SoundEventKind::AgentNeedsInput);
+    }
+}
+
+/// One [`crate::sound::SoundEventKind`]'s own toggle and sound choice. `Default` derives to
+/// `{ enabled: false, sound: "" }`, which is never the value actually used in practice - every
+/// real default goes through [`Self::default_for`] instead (see [`SoundSettings::default`]'s and
+/// its per-field `#[serde(default = "...")]`'s own docs for why a single shared default can't say
+/// which built-in sound an event gets). The derive exists only because `#[serde(default)]` on
+/// this struct's own fields needs it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundEventSettings {
+    /// On by default - see [`SoundSettings::enabled`]'s own docs for why: the per-event toggle is
+    /// how the user narrows down from "everything" after opting in, not how they opt in one at a
+    /// time.
+    pub enabled: bool,
+    /// A [`crate::sound::library::LibrarySound`] id (`crate::sound::library::LibrarySound::id`) -
+    /// a filename stem, never a display name. Resolved against the live library at play/preview
+    /// time, not validated here (see [`SoundSettings::sanitize`]'s own docs).
+    pub sound: String,
+}
+
+impl SoundEventSettings {
+    fn default_for(event: crate::sound::SoundEventKind) -> Self {
+        Self {
+            enabled: true,
+            sound: event.default_sound_id().to_string(),
+        }
+    }
+
+    /// A hand-edited blank/whitespace-only `sound` is normalized back to the event's own default
+    /// id rather than left as an empty string a dropdown would have nothing to show as selected -
+    /// the same "hand-edit gets normalized, not rejected" discipline
+    /// [`TerminalSettings::sanitize`] already documents for a blank `shell`.
+    fn sanitize(&mut self, event: crate::sound::SoundEventKind) {
+        let trimmed = self.sound.trim();
+        self.sound = if trimmed.is_empty() {
+            event.default_sound_id().to_string()
+        } else {
+            trimmed.to_string()
+        };
+    }
+}
+
 /// Surface C's minimap - `crate::code_surface::minimap`'s own real, persisted settings
 /// (GitHub issue #30's `editor.minimap.enabled`). This is one of two genuinely-backed fields on
 /// the `Editor` settings page today (see `crate::settings::state`'s own module docs on why the
@@ -632,6 +741,7 @@ impl Settings {
                     settings.appearance.sanitize();
                     settings.editor.sanitize();
                     settings.terminal.sanitize();
+                    settings.sound.sanitize();
                     settings
                 }
                 Err(err) => {
@@ -696,6 +806,7 @@ pub enum ConfigPage {
     Appearance,
     Theme,
     Editor,
+    Notifications,
 }
 
 /// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
@@ -716,6 +827,10 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
         }
         ConfigPage::Editor => "editor.minimap_enabled \u{b7} editor.minimap_scale_percent",
+        ConfigPage::Notifications => {
+            "sound.enabled \u{b7} sound.app_start.sound \u{b7} sound.agent_finished.sound \u{b7} \
+             sound.agent_needs_input.sound"
+        }
     }
 }
 
@@ -765,6 +880,11 @@ struct EditorSnippetDoc<'a> {
     editor: &'a EditorSettings,
 }
 
+#[derive(Serialize)]
+struct NotificationsSnippetDoc<'a> {
+    sound: &'a SoundSettings,
+}
+
 /// Renders `page`'s slice of `settings` (the currently-loaded struct, never mockup fixture text)
 /// as TOML or JSON via the same serializers [`Settings::save_at`]/[`Settings::to_json_string`]
 /// use, so this can't drift from what the file (or its JSON preview) actually contains. Each
@@ -812,6 +932,18 @@ pub fn snippet_lines(settings: &Settings, page: ConfigPage, format: CfgFormat) -
             editor: &settings.editor,
         })
         .unwrap_or_default(),
+        (ConfigPage::Notifications, CfgFormat::Toml) => {
+            toml::to_string_pretty(&NotificationsSnippetDoc {
+                sound: &settings.sound,
+            })
+            .unwrap_or_default()
+        }
+        (ConfigPage::Notifications, CfgFormat::Json) => {
+            serde_json::to_string_pretty(&NotificationsSnippetDoc {
+                sound: &settings.sound,
+            })
+            .unwrap_or_default()
+        }
     };
 
     text.lines()
@@ -1489,5 +1621,58 @@ mod tests {
             config_keys_line(ConfigPage::Appearance).contains("appearance.interface_scale_percent")
         );
         assert!(config_keys_line(ConfigPage::Theme).contains("theme.name"));
+        assert!(config_keys_line(ConfigPage::Notifications).contains("sound.enabled"));
+    }
+
+    #[test]
+    fn sound_settings_default_is_off_with_every_event_pointing_at_a_distinct_builtin() {
+        let sound = Settings::default().sound;
+        assert!(
+            !sound.enabled,
+            "the sound module must be off by default (GitHub issue #226)"
+        );
+        assert!(sound.app_start.enabled);
+        assert!(sound.agent_finished.enabled);
+        assert!(sound.agent_needs_input.enabled);
+        assert_eq!(sound.app_start.sound, "soft-chime");
+        assert_eq!(sound.agent_finished.sound, "marimba-pop");
+        assert_eq!(sound.agent_needs_input.sound, "gentle-ping");
+    }
+
+    #[test]
+    fn sound_settings_round_trip_through_a_real_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let mut settings = Settings::default();
+        settings.sound.enabled = true;
+        settings.sound.agent_needs_input.sound = "warm-bell".to_string();
+        settings.sound.agent_finished.enabled = false;
+        settings.save_at(&path).expect("save");
+
+        let loaded = Settings::load_or_init_at(&path);
+        assert!(loaded.sound.enabled);
+        assert_eq!(loaded.sound.agent_needs_input.sound, "warm-bell");
+        assert!(!loaded.sound.agent_finished.enabled);
+    }
+
+    #[test]
+    fn a_hand_edited_blank_sound_choice_is_sanitized_back_to_the_events_own_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[sound.app_start]\nsound = \"   \"\n").expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert_eq!(loaded.sound.app_start.sound, "soft-chime");
+    }
+
+    /// A `settings.toml` predating this feature has no `[sound]` table at all -
+    /// `#[serde(default)]` must still parse it into the real off-by-default `SoundSettings`,
+    /// matching every other section's "missing means default" contract.
+    #[test]
+    fn a_settings_file_with_no_sound_section_loads_the_real_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[editor]\ntab_width = 2\n").expect("write");
+        let loaded = Settings::load_or_init_at(&path);
+        assert_eq!(loaded.sound, SoundSettings::default());
     }
 }

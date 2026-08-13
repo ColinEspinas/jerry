@@ -3,6 +3,7 @@ use crate::root::widgets::{
     hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
+use crate::sound::SoundEventKind;
 
 /// The Shell suggestion dropdown's width (GitHub issue #213's follow-up). Wider than the 168px
 /// field it hangs under, because a row carries a shell's name *and* its real absolute path
@@ -22,6 +23,29 @@ const SHELL_SUGGESTIONS_MAX_HEIGHT: gpui::Pixels = px(269.0);
 /// right-aligning it against the field would push it off the left edge. Mirrors
 /// `crate::sidebar::context_menu::MENU_EDGE_MARGIN`, whose job is exactly this.
 const SHELL_SUGGESTIONS_EDGE_MARGIN: f32 = 4.0;
+
+/// The sound-event picker dropdown's width (GitHub issue #226) - narrower than the Shell
+/// suggestion dropdown's 288px, since a row here shows only a sound's plain display name, never
+/// a path.
+const SOUND_PICKER_WIDTH: gpui::Pixels = px(220.0);
+
+/// Same "scrolls past this many rows rather than covering the whole page" reasoning as
+/// [`SHELL_SUGGESTIONS_MAX_HEIGHT`] - comfortably more than the built-in library alone, still
+/// bounded once the user has imported several sounds.
+const SOUND_PICKER_MAX_HEIGHT: gpui::Pixels = px(232.0);
+
+/// Same role as [`SHELL_SUGGESTIONS_EDGE_MARGIN`], for the sound picker.
+const SOUND_PICKER_EDGE_MARGIN: f32 = 4.0;
+
+/// The opacity a [`SoundEventKind`] row is dimmed to while the master "Sound effects" switch
+/// (`crate::settings::store::SoundSettings::enabled`) is off - `Self::render_sound_event_row`'s
+/// visual half of "this row currently has no effect", paired with
+/// `Self::render_toggle_control_gated`/`Self::render_sound_picker_trigger`'s `interactive: false`
+/// for the behavioural half. `gpui`'s `opacity` dims an element's whole subtree in one call
+/// (`vendor/zed/crates/gpui/src/elements/div.rs`'s `window.with_element_opacity`), so this single
+/// wrapper covers the row's label, hint, sound-choice trigger, and toggle together rather than
+/// needing a disabled variant of each one's own colors.
+const SOUND_ROW_DISABLED_OPACITY: f32 = 0.4;
 
 impl AdeApp {
     pub(crate) fn handle_toggle_settings_action(
@@ -88,6 +112,13 @@ impl AdeApp {
             // this one page, so leaving it (even to come straight back) must not leave a stale
             // arm ready to fire on whatever card happens to render in the same position.
             self.custom_theme_remove_armed = None;
+        }
+        if page != SettingsPage::Notifications {
+            // Same "leaving the page closes its own scoped popover" discipline as the Theme
+            // remove-arm just above - `Self::render_sound_picker`'s own `.when` already gates on
+            // the current page, so this is about not showing it *re-opened* the moment the user
+            // navigates back, not about anything painting while away.
+            self.sound_picker_open = None;
         }
         self.settings_page = page;
         cx.notify();
@@ -468,6 +499,9 @@ impl AdeApp {
                                         SettingsPage::Editor => {
                                             self.render_settings_editor_page(cx).into_any_element()
                                         }
+                                        SettingsPage::Notifications => self
+                                            .render_settings_notifications_page(cx)
+                                            .into_any_element(),
                                         _ => render_settings_placeholder_page().into_any_element(),
                                     }),
                             ),
@@ -3278,6 +3312,621 @@ impl AdeApp {
             .child(suggest_auto_imports_row)
             .child(auto_import_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Editor))
+    }
+
+    /// *Notifications* (GitHub issue #226): the sound design module. Master switch, one row per
+    /// [`crate::sound::SoundEventKind`] (its own toggle + a dropdown choosing which library sound
+    /// it plays), then the sound library itself (built-in and imported sounds, each with a real
+    /// ▶ preview) with the same import/open-folder actions the Themes page's custom-theme section
+    /// already established (`Self::start_import_custom_theme`/`Self::open_custom_themes_folder`).
+    pub(in crate::settings) fn render_settings_notifications_page(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let sound = &self.settings.sound;
+        let master_row = self.render_settings_row(
+            "Sound effects",
+            "The master switch for every sound below. Off by default - turning this on enables \
+             all three events below at once; disable the ones you don't want individually.",
+            self.render_toggle_control("settings-sound-enabled", sound.enabled, cx, |this, cx| {
+                this.toggle_sound_enabled(cx)
+            }),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .child(self.render_config_banner(settings_store::ConfigPage::Notifications, cx))
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Sounds"),
+            )
+            .child(master_row)
+            .children(SoundEventKind::ALL.map(|event| self.render_sound_event_row(event, cx)))
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Sound library"),
+            )
+            .child(self.render_sound_library_section(cx))
+            .child(self.render_snippet_block(settings_store::ConfigPage::Notifications))
+    }
+
+    /// One [`SoundEventKind`] row: label/hint from the event itself, a "choose a sound" trigger
+    /// button (opens [`Self::render_sound_picker`], a floating popover - see that method's own
+    /// docs for why it can't just be a child of this row), and the event's own on/off toggle.
+    ///
+    /// While the master "Sound effects" switch is off, every event row is genuinely inert - none
+    /// of its own settings has any effect until the master is back on - so both the trigger and
+    /// the toggle are rendered non-interactive (`interactive: false`) and the whole row is dimmed
+    /// to [`SOUND_ROW_DISABLED_OPACITY`], rather than leaving three controls on screen that look
+    /// live but silently do nothing when clicked.
+    fn render_sound_event_row(
+        &self,
+        event: SoundEventKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let event_settings = self.sound_event_settings(event);
+        let current_name =
+            crate::sound::library::resolve(&event_settings.sound, &self.sound_library)
+                .map(|sound| sound.name.clone())
+                .unwrap_or_else(|| "Choose a sound…".to_string());
+        let interactive = self.settings.sound.enabled;
+
+        let control = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(self.render_sound_picker_trigger(event, &current_name, interactive, cx))
+            .child(self.render_toggle_control_gated(
+                match event {
+                    SoundEventKind::AppStart => "settings-sound-app-start-enabled",
+                    SoundEventKind::AgentFinished => "settings-sound-agent-finished-enabled",
+                    SoundEventKind::AgentNeedsInput => "settings-sound-agent-needs-input-enabled",
+                },
+                event_settings.enabled,
+                interactive,
+                cx,
+                move |this, cx| this.toggle_sound_event_enabled(event, cx),
+            ));
+
+        div()
+            .when(!interactive, |el| el.opacity(SOUND_ROW_DISABLED_OPACITY))
+            .child(self.render_settings_row(event.label(), event.description(), control))
+    }
+
+    /// The event row's own clickable "which sound" field - deliberately shaped like
+    /// [`Self::render_settings_shell_control`]'s field rather than
+    /// [`Self::render_choice_control`]'s segmented control: a segmented control reads fine for
+    /// three options and unreadable for a library that can grow past a handful of imports (see
+    /// GitHub issue #226's own scoping decision), where a dropdown scales.
+    ///
+    /// `interactive` mirrors `Self::render_toggle_control_gated`'s own flag - `false` while the
+    /// master "Sound effects" switch is off, so this field can't open its popover for a setting
+    /// that currently has no effect. The bounds-capturing canvas below stays regardless: it never
+    /// opens anything on its own, and dropping it would leave `Self::sound_event_button_bounds`
+    /// stale the next time the row does become interactive.
+    fn render_sound_picker_trigger(
+        &self,
+        event: SoundEventKind,
+        current_name: &str,
+        interactive: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let current_name = current_name.to_string();
+        div()
+            .id(format!(
+                "settings-sound-picker-trigger-{}",
+                event.settings_key()
+            ))
+            .debug_selector(move || {
+                format!("settings-sound-picker-trigger-{}", event.settings_key())
+            })
+            .when(interactive, |el| {
+                el.cursor_pointer().on_click(cx.listener(
+                    move |this, _event: &ClickEvent, _window, cx| {
+                        this.open_sound_picker(event, cx);
+                    },
+                ))
+            })
+            // The trigger's real, window-space painted bounds, for positioning its popover - same
+            // `gpui::canvas` idiom `Self::shell_field_bounds` uses, kept per-event in
+            // `Self::sound_event_button_bounds` since all three rows are on screen at once.
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.sound_event_button_bounds.insert(event, bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(20.0))
+            .px(px(7.0))
+            .w(px(168.0))
+            .rounded(theme::radius::BUTTON)
+            .border_1()
+            .border_color(theme::border::CARD_FIELD)
+            .bg(theme::surface::CARD_SUNK)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(10.5))
+                    .text_color(theme::text::BODY)
+                    .child(current_name),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(8.0))
+                    .text_color(theme::text::FAINTER)
+                    .child("\u{25be}"),
+            )
+    }
+
+    /// The sound library section: one row per [`crate::sound::LibrarySound`] (name, a
+    /// Built-in/Imported badge, a ▶ preview), the real load-error list
+    /// ([`Self::sound_load_errors`]) if any, the most recent import status
+    /// ([`Self::sound_import_status`]), and the two real actions - same shape as the Themes
+    /// page's custom-theme section.
+    fn render_sound_library_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div().flex().flex_col().children(
+                    self.sound_library
+                        .iter()
+                        .enumerate()
+                        .map(|(index, sound)| self.render_sound_library_row(index, sound, cx)),
+                ),
+            )
+            .when(!self.sound_load_errors.is_empty(), |el| {
+                el.child(div().mt(px(8.0)).flex().flex_col().gap(px(2.0)).children(
+                    self.sound_load_errors.iter().map(|error| {
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(10.0))
+                            .text_color(theme::status::FAIL)
+                            .child(error.clone())
+                    }),
+                ))
+            })
+            .when_some(self.sound_import_status.as_ref(), |el, status| {
+                let (text, color) = match status {
+                    Ok(message) => (message.clone(), theme::status::REVIEW),
+                    Err(message) => (message.clone(), theme::status::FAIL),
+                };
+                el.child(
+                    div()
+                        .mt(px(8.0))
+                        .font(font(theme::font::SANS))
+                        .text_size(self.ui_text_size(10.5))
+                        .text_color(color)
+                        .child(text),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("settings-sound-import")
+                            .debug_selector(|| "settings-sound-import".to_string())
+                            .cursor_pointer()
+                            .h(px(22.0))
+                            .px(px(10.0))
+                            .rounded(theme::radius::BUTTON)
+                            .border_1()
+                            .border_color(theme::border::BUTTON)
+                            .flex()
+                            .items_center()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(self.ui_text_size(10.5))
+                            .text_color(theme::text::MUTED)
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                            .child("Import sound\u{2026}")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.start_import_sound(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("settings-sound-open-folder")
+                            .debug_selector(|| "settings-sound-open-folder".to_string())
+                            .cursor_pointer()
+                            .h(px(22.0))
+                            .px(px(10.0))
+                            .rounded(theme::radius::BUTTON)
+                            .border_1()
+                            .border_color(theme::border::BUTTON)
+                            .flex()
+                            .items_center()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(self.ui_text_size(10.5))
+                            .text_color(theme::text::MUTED)
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                            .child("Open sounds folder")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.open_sounds_folder(cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_sound_library_row(
+        &self,
+        index: usize,
+        sound: &crate::sound::LibrarySound,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let sound_id = sound.id.clone();
+        div()
+            .id(("settings-sound-library-row", index))
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .py(px(7.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .id(("settings-sound-preview", index))
+                    .debug_selector(move || format!("settings-sound-preview-{index}"))
+                    .cursor_pointer()
+                    .flex_none()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .rounded(theme::radius::CHIP)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme::surface::CHIP_NEUTRAL)
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(8.0))
+                    .text_color(theme::text::DIM)
+                    .child("\u{25b6}")
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, _cx| {
+                        this.preview_sound(&sound_id, None);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(11.5))
+                    .text_color(theme::text::BODY)
+                    .child(sound.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(6.0))
+                    .h(px(16.0))
+                    .rounded(theme::radius::CHIP)
+                    .flex()
+                    .items_center()
+                    .bg(theme::surface::CHIP_NEUTRAL)
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(8.5))
+                    .text_color(theme::text::DIM)
+                    .child(if sound.is_builtin() {
+                        "Built-in"
+                    } else {
+                        "Imported"
+                    }),
+            )
+    }
+
+    /// The event picker's own floating popover - same reasoning as
+    /// [`Self::render_shell_suggestions`]'s own docs ("why it is a top-level sibling"): the
+    /// settings page is a scrolling column that clips its children, so this can only paint in
+    /// full as a root-level sibling positioned off the clicked trigger's own
+    /// [`Self::sound_event_button_bounds`] entry. Only ever called while
+    /// [`Self::sound_picker_open`] is `Some`.
+    pub(crate) fn render_sound_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let event = self.sound_picker_open.unwrap_or(SoundEventKind::AppStart);
+        let bounds = self
+            .sound_event_button_bounds
+            .get(&event)
+            .copied()
+            .unwrap_or_default();
+        let left = px(f32::max(
+            (bounds.origin.x + bounds.size.width - SOUND_PICKER_WIDTH).as_f32(),
+            SOUND_PICKER_EDGE_MARGIN,
+        ));
+        let top = bounds.origin.y + bounds.size.height + px(4.0) - theme::band::TITLE_BAR;
+
+        div()
+            .id("settings-sound-picker-scrim")
+            .absolute()
+            .top(theme::band::TITLE_BAR)
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .occlude()
+            .bg(work_surface::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                this.sound_picker_open = None;
+                cx.notify();
+            }))
+            .child(
+                menu_popover_chrome(
+                    div()
+                        .id("settings-sound-picker-popover")
+                        .debug_selector(|| "settings-sound-picker-popover".to_string())
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(SOUND_PICKER_WIDTH)
+                        .py(px(4.0))
+                        .max_h(SOUND_PICKER_MAX_HEIGHT)
+                        .overflow_y_scroll(),
+                    theme::shadow::MENU,
+                )
+                .occlude()
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .children(
+                    self.sound_library.iter().enumerate().map(|(index, sound)| {
+                        self.render_sound_picker_row(index, sound, event, cx)
+                    }),
+                ),
+            )
+    }
+
+    fn render_sound_picker_row(
+        &self,
+        index: usize,
+        sound: &crate::sound::LibrarySound,
+        event: SoundEventKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let sound_id = sound.id.clone();
+        let selected = self.sound_event_settings(event).sound == sound.id;
+        div()
+            .id(("settings-sound-picker-row", index))
+            .debug_selector(move || format!("settings-sound-picker-row-{index}"))
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .h(theme::band::PLUS_MENU_ROW)
+            .px(px(10.0))
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_sound_for_event(event, sound_id.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(14.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.0))
+                    .text_color(theme::text::SELECTED)
+                    .child(if selected { "\u{2713}" } else { "" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(10.5))
+                    .text_color(theme::text::BODY)
+                    .child(sound.name.clone()),
+            )
+    }
+
+    /// The live [`settings_store::SoundEventSettings`] for `event` - the one place this file reads
+    /// which of the three `Settings.sound.*` fields an event maps to, so every row/setter above
+    /// stays a plain `match` on [`SoundEventKind`] rather than three near-duplicate call sites.
+    fn sound_event_settings(&self, event: SoundEventKind) -> &settings_store::SoundEventSettings {
+        match event {
+            SoundEventKind::AppStart => &self.settings.sound.app_start,
+            SoundEventKind::AgentFinished => &self.settings.sound.agent_finished,
+            SoundEventKind::AgentNeedsInput => &self.settings.sound.agent_needs_input,
+        }
+    }
+
+    fn sound_event_settings_mut(
+        &mut self,
+        event: SoundEventKind,
+    ) -> &mut settings_store::SoundEventSettings {
+        match event {
+            SoundEventKind::AppStart => &mut self.settings.sound.app_start,
+            SoundEventKind::AgentFinished => &mut self.settings.sound.agent_finished,
+            SoundEventKind::AgentNeedsInput => &mut self.settings.sound.agent_needs_input,
+        }
+    }
+
+    fn toggle_sound_enabled(&mut self, cx: &mut Context<Self>) {
+        self.settings.sound.enabled = !self.settings.sound.enabled;
+        // Turning the master off makes every event row non-interactive - an open sound picker
+        // popover would otherwise survive pointing at a trigger that no longer responds to
+        // clicks.
+        if !self.settings.sound.enabled {
+            self.sound_picker_open = None;
+        }
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Flips one event's own toggle. Switching it *on* plays a preview of whatever sound that
+    /// event is currently configured with - the same "hearing what you just enabled" feedback
+    /// [`Self::select_sound_for_event`] gives when the sound itself changes. Switching it off
+    /// plays nothing.
+    fn toggle_sound_event_enabled(&mut self, event: SoundEventKind, cx: &mut Context<Self>) {
+        let now_enabled = !self.sound_event_settings(event).enabled;
+        self.sound_event_settings_mut(event).enabled = now_enabled;
+        self.persist_settings(cx);
+        if now_enabled {
+            let sound_id = self.sound_event_settings(event).sound.clone();
+            self.preview_sound(&sound_id, Some(event));
+        }
+        cx.notify();
+    }
+
+    /// Opens `event`'s "choose a sound" popover, closing any other open menu surface first
+    /// (GitHub issue #176's shared invariant - see `crate::root::menus::MenuSurface::SoundPicker`).
+    pub(in crate::settings) fn open_sound_picker(
+        &mut self,
+        event: SoundEventKind,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::SoundPicker));
+        self.sound_picker_open = Some(event);
+        cx.notify();
+    }
+
+    /// Assigns `sound_id` to `event`, persists it, closes the popover, and plays a preview of the
+    /// newly chosen sound - the explicit-user-action feedback GitHub issue #226's spec calls for
+    /// ("choosing a sound plays it"), regardless of whether the event's own toggle or the master
+    /// switch happen to be on right now (`Self::preview_sound` is deliberately ungated - see its
+    /// own docs).
+    pub(in crate::settings) fn select_sound_for_event(
+        &mut self,
+        event: SoundEventKind,
+        sound_id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sound_event_settings_mut(event).sound = sound_id.clone();
+        self.persist_settings(cx);
+        self.sound_picker_open = None;
+        self.preview_sound(&sound_id, Some(event));
+        cx.notify();
+    }
+
+    /// "Open sounds folder" - hands the real sounds directory
+    /// ([`crate::sound::library::sounds_dir_for`]) to [`Self::open_path_with_os_handler`], same
+    /// real per-platform default-open handler as
+    /// [`Self::start_open_custom_themes_folder`] (this method's own template). Creates the
+    /// directory first if it doesn't exist yet, on the background executor - a user who has never
+    /// imported a sound has no real directory there otherwise.
+    pub(in crate::settings) fn open_sounds_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_path) = self.settings_path.clone() else {
+            self.sound_import_status = Some(Err(
+                "can't open the sounds folder: no settings file location is known".to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let dest_dir = crate::sound::library::sounds_dir_for(&settings_path);
+        cx.spawn(async move |this, cx| {
+            let mkdir_dir = dest_dir.clone();
+            let mkdir_result = cx
+                .background_executor()
+                .spawn(async move { std::fs::create_dir_all(&mkdir_dir) })
+                .await;
+            if let Err(err) = mkdir_result {
+                log::warn!(
+                    "failed to create the sounds directory {}: {err}",
+                    dest_dir.display()
+                );
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.open_path_with_os_handler(&dest_dir, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// "Import sound…" - a genuine native file-open dialog (`gpui::App::prompt_for_paths`), same
+    /// real API [`Self::start_import_custom_theme`] uses. The user picks any real
+    /// `.wav`/`.mp3`/`.ogg` file on disk; the actual validate-decode-and-copy runs on the
+    /// background executor (`crate::sound::library::import_sound_file`), and the library is then
+    /// **reloaded from disk** rather than the newly imported sound spliced into
+    /// [`Self::sound_library`] in memory - the same discipline
+    /// [`Self::start_import_custom_theme`]'s own docs explain (an id-collision resolution that
+    /// picked a different final filename than the naive guess must never leave the in-memory list
+    /// disagreeing with what is really on disk). A cancelled dialog is a real, silent no-op.
+    pub(in crate::settings) fn start_import_sound(&mut self, cx: &mut Context<Self>) {
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        let settings_path = self.settings_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths_receiver.await else {
+                return;
+            };
+            let Some(source_path) = paths.pop() else {
+                return;
+            };
+            let Some(settings_path) = settings_path else {
+                let _ = this.update(cx, |this, cx| {
+                    this.sound_import_status = Some(Err(
+                        "can't import a sound: no settings file location is known".to_string(),
+                    ));
+                    cx.notify();
+                });
+                return;
+            };
+            let dest_dir = crate::sound::library::sounds_dir_for(&settings_path);
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let imported =
+                        crate::sound::library::import_sound_file(&source_path, &dest_dir)?;
+                    let (user_sounds, errors) =
+                        crate::sound::library::load_user_sounds_from_dir(&dest_dir);
+                    Ok::<_, crate::sound::SoundFileError>((imported, user_sounds, errors))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((imported, user_sounds, errors)) => {
+                        let mut library = crate::sound::library::builtin_sounds();
+                        library.extend(user_sounds);
+                        this.sound_library = library;
+                        this.sound_load_errors = errors;
+                        this.sound_import_status =
+                            Some(Ok(format!("Imported \"{}\".", imported.name)));
+                    }
+                    Err(err) => {
+                        this.sound_import_status = Some(Err(err.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._sound_import_task = Some(task);
     }
 
     fn set_interface_scale_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
@@ -7223,6 +7872,290 @@ mod display_scale_override_settings_tests {
             app.read_with(cx, |app, _| app.settings.appearance.display_scale_override),
             None,
             "and clicking it again must hand detection back to GPUI"
+        );
+    }
+}
+
+/// GitHub issue #226's Notifications page - real paint-and-click coverage for the master switch,
+/// one event's own toggle, and picking a different sound from the real popover, plus the same
+/// "flip, run_until_parked, reopen against the same file" persistence-across-reload shape
+/// `bracket_pair_colorization_settings_tests` already established. `sound::flow`'s own
+/// `adeapp_tests` module covers the gating predicate and the transition/seeding logic that don't
+/// need any of this page's UI at all.
+#[cfg(test)]
+mod sound_settings_page_tests {
+    use super::*;
+    use crate::root::AdeApp;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    /// Same real-load-before-construct shape as
+    /// `bracket_pair_colorization_settings_tests::open_app_with_state_dir` - loading from disk
+    /// first (rather than handing a fresh `Settings::default()` alongside a separate path) is
+    /// what makes reopening this same helper against the same `settings_path` a genuine "does it
+    /// survive a real reload" check.
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let settings = settings_store::Settings::load_or_init_at(&settings_path);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn open_notifications_page(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext) {
+        cx.dispatch_action(crate::settings::ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Notifications, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_master_switch_paints_off_by_default_and_clicking_it_flips_and_persists(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "sanity check: sound design is off by default (GitHub issue #226)"
+        );
+        open_notifications_page(&app, cx);
+
+        let bounds = cx
+            .debug_bounds("settings-sound-enabled")
+            .expect("the master switch must really paint on the Notifications page");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "clicking the real row must flip the real setting"
+        );
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert!(
+            reloaded.read_with(cx, |app, _| app.settings.sound.enabled),
+            "the flip must really be persisted to disk, not just held in memory"
+        );
+    }
+
+    #[gpui::test]
+    fn a_single_event_toggle_paints_and_clicking_it_flips_only_that_event(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        // The master switch is off by default, which now makes every event row's own toggle
+        // non-interactive (see `an_event_toggle_does_nothing_while_the_master_switch_is_off`) -
+        // switch it on first so this test still exercises a real, live click on the row itself.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.settings.sound.app_start.enabled));
+        let bounds = cx
+            .debug_bounds("settings-sound-app-start-enabled")
+            .expect("the App start row's own toggle must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.app_start.enabled),
+            "the clicked event's own toggle must have flipped off"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.settings.sound.agent_finished.enabled),
+            "an unrelated event's toggle must be untouched"
+        );
+    }
+
+    /// Clicking the sound-choice trigger opens the picker, and clicking a row in it both assigns
+    /// that sound to the event and closes the popover - the real end-to-end path
+    /// `Self::open_sound_picker`/`Self::select_sound_for_event` wire together.
+    #[gpui::test]
+    fn picking_a_sound_from_the_popover_assigns_it_and_closes_the_popover(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        open_notifications_page(&app, cx);
+        // Same "the master switch is off by default, and the trigger is now gated on it" reason
+        // as `a_single_event_toggle_paints_and_clicking_it_flips_only_that_event`.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+
+        let default_sound = app.read_with(cx, |app, _| app.settings.sound.app_start.sound.clone());
+        let library = app.read_with(cx, |app, _| app.sound_library.clone());
+        let other_sound = library
+            .iter()
+            .find(|sound| sound.id != default_sound)
+            .expect("the built-in library has more than one sound")
+            .id
+            .clone();
+
+        let trigger_bounds = cx
+            .debug_bounds("settings-sound-picker-trigger-app_start")
+            .expect("the App start row's sound-choice trigger must really paint");
+        cx.simulate_click(trigger_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_some()),
+            "clicking the trigger must really open the picker"
+        );
+
+        let row_index = library
+            .iter()
+            .position(|sound| sound.id == other_sound)
+            .expect("the target sound must be a real row in the popover");
+        // `debug_bounds` wants a `&'static str`; a `Box::leak` is fine in a test - this process
+        // exits at the end of the test binary run anyway, and it's the same trick a handful of
+        // other dynamically-indexed selectors in this file's own test modules already use.
+        let row_selector: &'static str =
+            Box::leak(format!("settings-sound-picker-row-{row_index}").into_boxed_str());
+        let row_bounds = cx
+            .debug_bounds(row_selector)
+            .expect("the target sound's own row must really paint in the popover");
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.sound.app_start.sound.clone()),
+            other_sound,
+            "picking a row must really assign that sound to the event"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_none()),
+            "picking a row must close the popover"
+        );
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert_eq!(
+            reloaded.read_with(cx, |app, _| app.settings.sound.app_start.sound.clone()),
+            other_sound,
+            "the picked sound must really be persisted to disk"
+        );
+    }
+
+    /// While the master switch is off (the real default - see the sanity check in
+    /// `the_master_switch_paints_off_by_default_and_clicking_it_flips_and_persists`), an event
+    /// row's own toggle must be inert: it still paints (so a real test, and a real user, can find
+    /// it) but clicking it must not flip the setting, since
+    /// `Self::render_toggle_control_gated`'s `interactive: false` path never attaches a click
+    /// handler at all.
+    #[gpui::test]
+    fn an_event_toggle_does_nothing_while_the_master_switch_is_off(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "sanity check: the master switch is off by default"
+        );
+        assert!(app.read_with(cx, |app, _| app.settings.sound.agent_finished.enabled));
+
+        let bounds = cx
+            .debug_bounds("settings-sound-agent-finished-enabled")
+            .expect("the Agent finished row's own toggle must still paint while dimmed");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.settings.sound.agent_finished.enabled),
+            "clicking a dimmed event toggle must not flip it - the master switch is off"
+        );
+    }
+
+    /// Same "no handler attached" guarantee as the toggle test above, for the sound-choice
+    /// trigger: clicking it while the master switch is off must not open the picker popover.
+    #[gpui::test]
+    fn the_sound_choice_trigger_does_nothing_while_the_master_switch_is_off(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        assert!(!app.read_with(cx, |app, _| app.settings.sound.enabled));
+
+        let trigger_bounds = cx
+            .debug_bounds("settings-sound-picker-trigger-app_start")
+            .expect("the App start row's sound-choice trigger must still paint while dimmed");
+        cx.simulate_click(trigger_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_none()),
+            "clicking a dimmed sound-choice trigger must not open the picker"
+        );
+    }
+
+    /// Turning the master switch off while an event's sound picker is open must close the
+    /// popover - otherwise it would sit open, pointing at a trigger that no longer responds to
+    /// clicks (`Self::toggle_sound_enabled`'s own `sound_picker_open = None` on the off path).
+    ///
+    /// The master switch is flipped by calling `Self::toggle_sound_enabled` directly rather than
+    /// simulating a click on its painted bounds: the picker's own full-page scrim
+    /// (`Self::render_sound_picker`'s `settings-sound-picker-scrim`) sits on top of the whole
+    /// page precisely to catch an outside click and close the popover, so a simulated click
+    /// landing on the master switch while the popover is open would hit that scrim first and
+    /// never reach the switch at all - not a real way to reach this guard, just an artifact of
+    /// coordinates overlapping in a headless test.
+    #[gpui::test]
+    fn switching_the_master_off_closes_an_open_sound_picker(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        open_notifications_page(&app, cx);
+
+        // Switch the master on first, so the trigger is interactive and the picker can really
+        // open.
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.settings.sound.enabled));
+
+        let trigger_bounds = cx
+            .debug_bounds("settings-sound-picker-trigger-app_start")
+            .expect("the App start row's sound-choice trigger must really paint");
+        cx.simulate_click(trigger_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_some()),
+            "sanity check: the picker really opened"
+        );
+
+        app.update(cx, |app, cx| app.toggle_sound_enabled(cx));
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.sound.enabled),
+            "sanity check: the master switch flipped back off"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.sound_picker_open.is_none()),
+            "switching the master off must close an open sound picker"
         );
     }
 }

@@ -59,6 +59,11 @@ pub(crate) enum MenuSurface {
     /// [`crate::root::widgets::menu_popover_chrome`] like the other six, so it belongs to the
     /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
     ShellSuggestions,
+    /// Settings › Notifications' per-event "choose a sound" dropdown (GitHub issue #226) -
+    /// [`AdeApp::sound_picker_open`]. Same shape as [`Self::ShellSuggestions`] (a Settings-page
+    /// click-away dropdown), keyed by which of the three sound events it's open for rather than a
+    /// plain bool, since there are three independent triggers on one page instead of one.
+    SoundPicker,
 }
 
 impl MenuSurface {
@@ -66,7 +71,7 @@ impl MenuSurface {
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
     /// until it is really wired to real state - that pairing is what stops a seventh menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 7] = [
+    pub(crate) const ALL: [MenuSurface; 8] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
@@ -74,6 +79,7 @@ impl MenuSurface {
         MenuSurface::GraphPush,
         MenuSurface::GraphRow,
         MenuSurface::ShellSuggestions,
+        MenuSurface::SoundPicker,
     ];
 }
 
@@ -89,6 +95,7 @@ impl AdeApp {
             MenuSurface::GraphPush => self.graph_state.push_menu_open,
             MenuSurface::GraphRow => self.graph_state.row_menu_open.is_some(),
             MenuSurface::ShellSuggestions => self.shell_suggestions_open,
+            MenuSurface::SoundPicker => self.sound_picker_open.is_some(),
         }
     }
 
@@ -107,6 +114,7 @@ impl AdeApp {
             MenuSurface::GraphPush => self.graph_state.push_menu_open = false,
             MenuSurface::GraphRow => self.graph_state.row_menu_open = None,
             MenuSurface::ShellSuggestions => self.shell_suggestions_open = false,
+            MenuSurface::SoundPicker => self.sound_picker_open = None,
         }
     }
 
@@ -174,6 +182,7 @@ mod menu_surface_tests {
             origin_y: px(4.0),
         });
         app.shell_suggestions_open = true;
+        app.sound_picker_open = Some(crate::sound::SoundEventKind::AppStart);
     }
 
     #[gpui::test]

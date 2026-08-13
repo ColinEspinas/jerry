@@ -30,6 +30,7 @@ pub mod review;
 pub mod root;
 pub mod settings;
 pub mod sidebar;
+pub mod sound;
 pub mod status_bar;
 pub mod terminal;
 pub mod text_history;
@@ -49,8 +50,8 @@ pub mod worktree_history;
 use std::path::PathBuf;
 
 use gpui::{
-    px, size, App, AppContext, Bounds, Size, TitlebarOptions, WindowBounds, WindowDecorations,
-    WindowOptions,
+    point, px, size, App, AppContext, Bounds, Size, TitlebarOptions, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 
 /// The app's globally-bound keyboard shortcuts - the single list both [`run`] (production
@@ -635,7 +636,19 @@ pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: None,
+            // macOS only (`gpui_macos/src/window.rs`'s own `move_traffic_light` is the only
+            // consumer - every other platform ignores this field outright). Before this, `None`
+            // left AppKit's real traffic lights at their own default position while
+            // `crate::title_bar::render::AdeApp::render_window_controls` painted a second,
+            // custom-drawn set of three gray dots elsewhere in the band - two overlapping,
+            // misaligned window-control clusters on the one platform that draws its own. This
+            // positions the *real* buttons at the design's own left-cluster spot instead
+            // (`crate::title_bar::render`'s 12px band padding + 2px cluster inset = 14px, plus a
+            // further ~1px optical centering nudge measured against a real build), and
+            // `render_window_controls`'s custom dots are skipped on macOS accordingly (see
+            // `crate::title_bar::render::AdeApp::host_draws_native_traffic_lights`) rather than
+            // drawn a second time under buttons that already exist.
+            traffic_light_position: Some(point(px(15.0), px(11.0))),
         }),
         window_decorations: Some(WindowDecorations::Client),
         window_min_size: Some(Size {

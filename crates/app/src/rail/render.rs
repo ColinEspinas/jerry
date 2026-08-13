@@ -403,6 +403,13 @@ impl AdeApp {
                     // rather than adding one, and only touches the disk when something actually
                     // changed - see `AdeApp::record_agent_statuses`.
                     this.record_agent_statuses(cx);
+                    // GitHub issue #226: detect real agent-status transitions (needs input /
+                    // finished with changes to review) and play a sound if the user wants one.
+                    // Deliberately a separate pass from `record_agent_statuses` just above, not
+                    // folded into it - see `crate::sound::flow`'s own module docs for why that
+                    // function's "changed" signal can't be reused here (it only ever sees
+                    // Claude Code agents with a fresh hook fact, never Codex).
+                    this.play_agent_status_sounds(cx);
                     cx.notify();
                 });
                 if updated.is_err() {

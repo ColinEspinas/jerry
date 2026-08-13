@@ -11,10 +11,36 @@ use crate::root::focus::palette_focus_tests;
 /// place the close glyph's two crossing strokes (see [`render_close_glyph`]).
 const CLOSE_GLYPH_HALF_DIAGONAL: f32 = 3.889_87; // 5.5 * cos(45°)
 
+/// The macOS left cluster's reserved width when the real OS traffic lights occupy it - just wide
+/// enough that the trailing divider (`render_macos_title_bar_left`'s own 1×16 bar) lands clear of
+/// AppKit's own three buttons rather than under them. Not derived from
+/// `crate::lib::default_window_options`'s `traffic_light_position` on purpose: that inset is
+/// AppKit's own coordinate space (window-left-edge-relative, consumed by
+/// `gpui_macos::window::PlatformWindow::move_traffic_light`), while this is a GPUI layout width
+/// inside the already-padded title-bar band - the two numbers answer different questions and
+/// keeping them as one shared constant would only coincidentally look related.
+const MACOS_NATIVE_TRAFFIC_LIGHT_CLUSTER_WIDTH: gpui::Pixels = px(58.0);
+
+/// Whether the *real, running* OS paints its own native traffic-light buttons over this window's
+/// title bar - i.e. whether [`crate::default_window_options`]'s `traffic_light_position` is
+/// actually consumed by the platform backend this build is running under
+/// (`gpui_macos::window::PlatformWindow::move_traffic_light` is the only implementation that
+/// reads it; every other platform backend ignores the field). Deliberately keyed to the compiled
+/// `target_os`, not to [`crate::keymap::WindowControlsStyle`]: that setting only changes which
+/// *skin* this title bar renders (a user can pick "macOS style" while running on Linux, in
+/// `crate::keymap::WindowControlsStyle::MacosStyle`'s own tests), and doing that can never make a
+/// real AppKit window appear underneath - so the custom dot cluster this file draws must keep
+/// existing on every host except a real Mac, regardless of which style is selected.
+fn host_draws_native_traffic_lights() -> bool {
+    cfg!(target_os = "macos")
+}
+
 impl AdeApp {
-    /// The three flat-circle window controls in the title bar's left cluster - macOS-only (see
-    /// [`Self::render_macos_title_bar_left`]), wired to real GPUI window-control methods
-    /// (`Window::remove_window`/`minimize_window`, verified against
+    /// The three flat-circle window controls in the title bar's left cluster - painted only when
+    /// [`Self::render_macos_title_bar_left`] is used *and* [`host_draws_native_traffic_lights`]
+    /// is `false` (a non-Mac host running the macOS-style skin; on a real Mac, AppKit's own
+    /// native traffic lights occupy this spot instead - see that function's docs), wired to real
+    /// GPUI window-control methods (`Window::remove_window`/`minimize_window`, verified against
     /// `vendor/zed/crates/gpui/src/window.rs:2016,5520`). Left-to-right order (close, minimize,
     /// maximize) follows the macOS traffic-light convention; the design doesn't colour-code
     /// these dots, so there's no ordering hint from the mockup itself.
@@ -53,14 +79,26 @@ impl AdeApp {
     }
 
     /// The macOS-style left cluster: [`Self::render_window_controls`]'s three dots, plus a
-    /// trailing 1×16 divider.
+    /// trailing 1×16 divider - except on a real Mac, where AppKit already paints its own native
+    /// traffic lights over this same band (`crate::default_window_options`'s
+    /// `traffic_light_position`, see [`host_draws_native_traffic_lights`]). Drawing the custom
+    /// dots there too used to leave two overlapping, differently-positioned window-control
+    /// clusters on screen at once; this reserves their real footprint with a plain spacer instead
+    /// of drawing a second set under buttons that already exist.
     fn render_macos_title_bar_left(&self) -> gpui::AnyElement {
         div()
             .flex()
             .items_center()
             .gap(px(8.0))
             .pl(px(2.0))
-            .child(self.render_window_controls())
+            .child(if host_draws_native_traffic_lights() {
+                div()
+                    .flex_none()
+                    .w(MACOS_NATIVE_TRAFFIC_LIGHT_CLUSTER_WIDTH)
+                    .into_any_element()
+            } else {
+                self.render_window_controls().into_any_element()
+            })
             .child(
                 div()
                     .flex_none()
@@ -636,7 +674,14 @@ mod caption_button_tests {
 /// real implementation (`vendor/zed/crates/gpui/src/platform/test/window.rs`: flips a real
 /// `is_fullscreen` flag, no `unimplemented!()`), so a click here can be asserted against instead
 /// of only verified manually.
-#[cfg(test)]
+///
+/// `#[cfg(not(target_os = "macos"))]`: this test clicks the coordinates the *custom* dot cluster
+/// paints at, which [`host_draws_native_traffic_lights`] now means only exist on a non-Mac host
+/// running the macOS-style skin (`WindowControlsStyle::MacosStyle`, forced below regardless of
+/// the real host) - on a real Mac, that spot is a plain spacer reserving room for AppKit's own
+/// native buttons instead (see [`AdeApp::render_macos_title_bar_left`]), so this test would just
+/// click empty space there.
+#[cfg(all(test, not(target_os = "macos")))]
 mod macos_dot_cluster_tests {
     use super::*;
     use gpui::TestAppContext;

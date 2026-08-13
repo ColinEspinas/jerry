@@ -1,0 +1,18 @@
+Built-in sound library (GitHub issue #226)
+===========================================
+
+soft-chime.wav
+gentle-ping.wav
+marimba-pop.wav
+warm-bell.wav
+rising-blip.wav
+
+All five files are original audio, synthesized specifically for this project (simple
+sine-wave tones with a linear attack/release envelope, generated in Python's stdlib
+`wave`/`math` modules - see the generation script referenced from the sound module's own
+docs). No third-party samples, recordings, or copyrighted material of any kind were used.
+
+Authored by the Jerry project. Released under the same MIT OR Apache-2.0 license as the
+rest of this repository - there is no separate license to track for these files, unlike
+the IBM Plex fonts under `assets/fonts/`, which are third-party and carry their own
+license text alongside them.

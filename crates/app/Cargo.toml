@@ -179,6 +179,30 @@ tree-sitter-md = "0.5.3"
 # `<script>` content into this crate's TypeScript grammar - which is why these two land together.
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
+# GitHub issue #226's sound design module (`crate::sound`) - real audio playback for the app-start
+# chime and the agent-attention sounds, decoding both the bundled built-in library
+# (`assets/sounds/`) and anything the user drops in `~/.config/jerry/sounds/`. `rodio`, not
+# `cpal` directly: `cpal` alone is only the output-stream/device layer, with no decoder and no
+# mixer, and this crate needs both (several agents finishing at once must not require hand-rolled
+# sample mixing). Plain crates.io, unpinned beyond the major version `cargo add` resolved
+# (`0.22.2`) - a generic audio-playback crate with no GPUI/vendor/zed call site to verify against,
+# the same "just a version pin" treatment `regex`/`unicode-segmentation`/`notify` already get
+# above. `default-features = false` because the real default (`symphonia-flac`, `-mp4`, `-aac`,
+# `recording`, `dither`/`noise`, verified against the published `0.22.2` Cargo.toml's own
+# `[features]` table, not assumed) pulls in three container/codec pairs and a whole recording
+# stack this app never uses - every sound here is either a bundled or user-imported short WAV/MP3
+# clip, never a live-recorded or FLAC/MP4 one. Features kept: `playback` (the `cpal` output stream
+# itself), `wav` (`symphonia-wav`+`symphonia-pcm`, the bundled library's own format), `mp3`
+# (`symphonia-mp3`) and `vorbis` (`symphonia-ogg`+`symphonia-vorbis`, together the two demuxer/
+# decoder pairs the settings page's sound-library importer accepts alongside WAV). `cpal` is what
+# actually reintroduces `libasound2-dev` on Linux (see this crate's own README/CI comments next to
+# that package) - `rodio` itself has no system dependency beyond what `cpal` already requires.
+rodio = { version = "0.22.2", default-features = false, features = [
+    "playback",
+    "wav",
+    "mp3",
+    "vorbis",
+] }
 
 # Real per-target `gpui_platform` backend selection (Revision R11, extended in R12 to add
 # real X11 support). `gpui_platform`'s own Cargo.toml
