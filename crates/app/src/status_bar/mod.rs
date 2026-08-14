@@ -4,8 +4,10 @@
 //! logic separate from the `gpui::Div`-building code that draws it:
 //!
 //! - [`process_stats`] - the real per-process CPU%/memory sampling behind the
-//!   `N agents · X% cpu · Y GB` cluster, over `/proc`. No `gpui::Window`, so its parsing
-//!   stays directly `#[test]`-able.
+//!   `N agents · X% cpu · Y GB` cluster: one shared trait with three real OS backends
+//!   (`/proc` on Linux, `proc_pid_rusage` on macOS, `GetProcessTimes`/PSAPI on Windows -
+//!   GitHub issue #283). No `gpui::Window`, so its parsing and its whole delta/aggregation
+//!   pipeline stay directly `#[test]`-able.
 //! - [`render`] - the real GPUI left/right cluster layout and every field in it, as
 //!   `impl AdeApp` methods.
 //!
@@ -21,11 +23,6 @@ use crate::lsp::diagnostics as diagnostics_view;
 use crate::rail::state as rail;
 use crate::root::*;
 use crate::theme;
-// `Agent` itself is only named inside `render::render_status_agents_cluster`'s real
-// `#[cfg(target_os = "linux")]` variant (`Vec<&Agent>`); the non-Linux twin reaches the same
-// agents through `AdeApp` and only calls `ProcessKind::is_agent_session` on them, so a
-// Windows/macOS build genuinely never references `Agent` here.
-#[cfg(target_os = "linux")]
 use crate::work_surface::agents::Agent;
 use gpui::{div, font, prelude::*, px, ClickEvent, Context};
 #[cfg(test)]

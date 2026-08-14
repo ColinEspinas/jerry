@@ -279,11 +279,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 
-# Unix only, and used for exactly one thing: `kill(pid, 0)` as the portable POSIX check for
+# Unix only, and used for two things. First, `kill(pid, 0)` as the portable POSIX check for
 # whether a process still exists, so `crate::hooks::settings_file` can sweep launch directories
 # left behind by a Jerry that was SIGKILLed (where `Drop` never runs) without ever deleting a
 # live instance's working directory - an age-based sweep would eventually do exactly that to a
-# long-running window. Already in the lock file transitively, so no new build surface.
+# long-running window. Second (GitHub issue #283, macOS only), `proc_pid_rusage` +
+# `rusage_info_v0` for `crate::status_bar::process_stats::macos`'s per-process CPU/memory
+# sampling - see that module's own docs for why raw `libc` rather than the `libproc` crate.
+# Already in the lock file transitively, so no new build surface.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -299,6 +302,12 @@ libc = "0.2"
 # to the exact version `Cargo.lock` already resolves, so this promotes an already-locked crate to a
 # direct dependency rather than adding new build surface. Only the feature modules the handful of
 # items actually used live in are enabled.
+#
+# GitHub issue #283 adds the second Windows caller: `crate::status_bar::process_stats::windows`,
+# the native per-process CPU/memory sampling backend (`GetProcessTimes` + PSAPI
+# `GetProcessMemoryInfo`). It shares `Win32_Foundation` (`FILETIME`, `HANDLE`, `CloseHandle`) and
+# `Win32_System_Threading` (`OpenProcess`, `GetProcessTimes`, the process access rights) with the
+# liveness check above, and needs one more feature module of its own for PSAPI.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -306,6 +315,9 @@ windows-sys = { version = "0.61.2", features = [
     # (`WaitForSingleObject` needs it on the process handle) and not a filesystem thing at all -
     # this is just the module the generated bindings put it in.
     "Win32_Storage_FileSystem",
+    # PSAPI: `GetProcessMemoryInfo`/`PROCESS_MEMORY_COUNTERS`, the working-set reading behind the
+    # status bar's `Y GB` field on Windows.
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 

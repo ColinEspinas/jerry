@@ -285,10 +285,15 @@ impl AdeApp {
     /// with a single 0-100%-of-system-capacity scale. `available_parallelism` is a real,
     /// already-available `std` API - no new dependency for this.
     ///
-    /// Linux-only (`#[cfg(target_os = "linux")]`, matching `crate::status_bar::process_stats`'s own scope) -
-    /// see the `#[cfg(not(target_os = "linux"))]` twin below for the non-Linux build, which omits
-    /// the cpu/mem fields entirely rather than showing a `...% cpu` that can never resolve.
-    #[cfg(target_os = "linux")]
+    /// Real on Linux, macOS and Windows alike (GitHub issue #283 - one sampling trait, three real
+    /// per-platform backends, see `crate::status_bar::process_stats`). On a target with no
+    /// backend at all - `process_stats::PLATFORM_SAMPLING_SUPPORTED` is `false`, which today
+    /// means FreeBSD - the cpu/mem fields are omitted entirely and just the real agent count is
+    /// shown, rather than a `...% cpu` placeholder that would sit on screen forever, look broken,
+    /// and never resolve. That is a `const`-gated branch rather than a second `#[cfg]` cascade
+    /// here on purpose: the platform predicate lives in exactly one place, next to the backend
+    /// selection it describes, so adding a platform can never leave this file behind. The unused
+    /// branch is compiled away either way, since the condition is a compile-time constant.
     fn render_status_agents_cluster(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let agents: Vec<&Agent> = self
             .agents
@@ -296,6 +301,11 @@ impl AdeApp {
             .filter(|agent| agent.kind.is_agent_session())
             .collect();
         let agent_count = agents.len();
+
+        if !process_stats::PLATFORM_SAMPLING_SUPPORTED {
+            return self.render_status_text(status_agents_label(agent_count, &[]));
+        }
+
         let agent_pids: Vec<u32> = agents
             .iter()
             .filter_map(|agent| agent.pane.read(cx).pid())
@@ -322,20 +332,6 @@ impl AdeApp {
             agent_count,
             &[cpu_label.as_str(), mem_label.as_str()],
         ))
-    }
-
-    /// Non-Linux build: `crate::status_bar::process_stats` has no real sampling to offer on this platform
-    /// (cross-platform support is Revision R11, a separate, already-tracked phase) - shows just
-    /// the real agent count, omitting the cpu/mem fields entirely rather than a `...% cpu`
-    /// placeholder that would sit on screen forever, looking broken, and never resolve.
-    #[cfg(not(target_os = "linux"))]
-    fn render_status_agents_cluster(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let agent_count = self
-            .agents
-            .iter()
-            .filter(|agent| agent.kind.is_agent_session())
-            .count();
-        self.render_status_text(status_agents_label(agent_count, &[]))
     }
 
     /// `N wt · Y GB` - both real, both already computed elsewhere: worktree count from
