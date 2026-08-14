@@ -2789,6 +2789,16 @@ pub mod graph {
     /// degrades safely either way (it still keeps the menu on-screen, just not pixel-perfectly
     /// flush with the edge), so this has been left as a known imprecision rather than a blocker.
     pub const ROW_MENU_HEIGHT: Pixels = px(425.0);
+    /// The Branches panel's own branch right-click context menu width (GitHub issue #241) - the
+    /// same 330 as [`ROW_MENU_WIDTH`], since it is the same kind of popover with the same kind of
+    /// rows, just anchored off a branch row instead of a commit row.
+    pub const BRANCH_MENU_WIDTH: Pixels = px(330.0);
+    /// The branch context menu's painted height under the test suite's `gpui::TestAppContext` -
+    /// pinned by `crate::graph_view::render::graph_branch_menu_tests::
+    /// the_branch_menu_pins_the_real_height_this_edge_clamp_relies_on` for exactly the reasons
+    /// [`ROW_MENU_HEIGHT`]'s own docs give (fixed content, no analytical formula, same
+    /// synthetic-glyph-metrics caveat, same safe degradation if it ever drifts).
+    pub const BRANCH_MENU_HEIGHT: Pixels = px(338.0);
     /// Behind-count amber threshold (§5: "behind turns `#a3873f` past 4").
     pub const BEHIND_WARN_THRESHOLD: usize = 4;
     pub const BEHIND_WARN: ColorToken = token("graph.behind_warn", 0xa3873f);

@@ -122,6 +122,111 @@ impl AdeApp {
         self._merge_task = Some(task);
     }
 
+    /// The git graph Branches panel's "Merge into current branch…" action (GitHub issue #241) -
+    /// merges `source_branch` into whatever is checked out in the **focused worktree**
+    /// (`wt_core::merge::attempt_merge_into_current`), the opposite direction from
+    /// [`Self::start_merge`]'s own "this agent's branch into the base branch".
+    ///
+    /// **This is not a second merge flow.** It fills the same [`Self::merge_flow`] the context
+    /// bar's `Merge` button does, with the same [`merge::MergeFlowState`] shapes, so a conflict
+    /// lands in the *existing* conflict resolver (`crate::merge::render`) with its existing
+    /// `Take left`/`Take right`/`Take both`/hand-edit surface and its existing `Complete merge`/
+    /// `Abort merge` footer. There is deliberately no second conflict UI, and no second copy of
+    /// the `MergeOutcome` folding ([`run_merge_attempt_into_current`] shares it).
+    ///
+    /// That resolver renders inside an agent's work surface, so this activates the focused
+    /// worktree's agent tab ([`Self::select_agent`]) *before* the merge starts - otherwise a real
+    /// conflict would be resolved into a surface the user is not looking at. Which agent is
+    /// unimportant to the merge itself: unlike [`Self::start_merge`] (which derives the branch it
+    /// merges *from* the agent's own `cwd`), this merge's source is the branch that was clicked
+    /// and its target is the focused worktree, so the agent tab is purely the surface the result
+    /// is shown in - and every agent this picks between shares that one worktree by construction
+    /// (`Agents::iter_for_cwd`).
+    ///
+    /// Two real refusals, both reported honestly through the graph tab's own status line rather
+    /// than silently dropped:
+    /// - a merge flow is already in progress (two concurrent `git merge` invocations would race
+    ///   over the same worktree - the same single-flight rule [`Self::start_merge`] applies);
+    /// - the focused worktree has no agent tab at all, so there is genuinely nowhere to show the
+    ///   resolver. Nothing is started in that case; no merge is left half-run.
+    ///
+    /// Everything else - a detached `HEAD`, a dirty worktree, merging a branch into itself, a
+    /// branch that doesn't exist - is `wt_core::merge`'s own precondition to refuse, and surfaces
+    /// as a real [`merge::MergeFlowState::Error`] in the resolver with git's (or that module's)
+    /// own real message.
+    pub(crate) fn start_merge_from_graph_branch(
+        &mut self,
+        source_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
+        if self.merge_flow.is_some() {
+            self.graph_state.status_message =
+                Some("a merge is already in progress; finish or abort it first".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(agent_id) = self
+            .agents
+            .iter_for_cwd(self.diff_root.clone())
+            .map(|agent| agent.id)
+            .next()
+        else {
+            self.graph_state.status_message = Some(
+                "this worktree has no agent tab to show the merge in; open one first".to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        let target_worktree_path = self.diff_root.clone();
+        // A fresh attempt - see `merge::MergeFlow::generation`'s own docs, and
+        // `Self::start_merge`'s identical bookkeeping.
+        self.merge_generation = self.merge_generation.wrapping_add(1);
+        let generation = self.merge_generation;
+        self.clear_merge_edit_state();
+        self.merge_flow = Some(merge::MergeFlow {
+            agent_id,
+            generation,
+            state: merge::MergeFlowState::Running,
+        });
+        self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
+        self.graph_state.status_message = Some(format!("Merging {source_branch}\u{2026}"));
+        self.select_agent(agent_id, window, cx);
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let state = cx
+                .background_executor()
+                .spawn(async move {
+                    run_merge_attempt_into_current(&target_worktree_path, &source_branch)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
+                    this.merge_flow = Some(merge::MergeFlow {
+                        agent_id,
+                        generation,
+                        state,
+                    });
+                    // See `Self::start_merge`'s own comment: the real state-transition point a
+                    // fresh `Conflicted` state's active hunk needs its highlight cache filled.
+                    this.ensure_active_merge_highlight_cache();
+                    // The graph tab's "Merging <branch>…" line is no longer true the moment this
+                    // lands, and the outcome itself belongs to the resolver that is now showing
+                    // it - leaving the pending message behind would read as still-in-progress the
+                    // next time the user opens the graph tab.
+                    this.graph_state.status_message = None;
+                }
+                cx.notify();
+            });
+        });
+        self._merge_task = Some(task);
+    }
+
     /// Surface D's `Take left`/`Take right`/`Take both` action on the active hunk
     /// (`merge_flow.state`'s `active_file`/`active_hunk`) - mutates the in-memory
     /// [`wt_core::merge::ConflictedFile`] via `wt_core::merge::resolve_hunk`, then advances to
@@ -866,9 +971,56 @@ pub(in crate::merge) fn run_merge_attempt(
     repo_path: &std::path::Path,
     worktree_path: &std::path::Path,
 ) -> merge::MergeFlowState {
-    let (start, outcome) = match wt_core::merge::attempt_merge(repo_path, worktree_path) {
+    fold_merge_result(
+        wt_core::merge::attempt_merge(repo_path, worktree_path),
+        |message| merge_error_state(repo_path, message),
+    )
+}
+
+/// [`run_merge_attempt`]'s twin for the graph Branches panel's "Merge into current branch…"
+/// (GitHub issue #241): runs `wt_core::merge::attempt_merge_into_current` and folds its result
+/// into the very same [`merge::MergeFlowState`] via the very same [`fold_merge_result`], so the
+/// existing conflict resolver cannot tell the two directions apart - which is the whole point of
+/// routing this through the existing flow rather than building a second one.
+///
+/// The one real difference is where an `Abort merge` offer comes from on failure: the base-branch
+/// direction has to *find* the worktree a merge might be in progress in
+/// (`find_in_progress_merge`), while here the worktree is already known, so this asks it directly
+/// (`merge_head_exists`) rather than re-deriving a repository-wide answer that could name a
+/// different worktree entirely.
+pub(in crate::merge) fn run_merge_attempt_into_current(
+    target_worktree_path: &std::path::Path,
+    source_branch: &str,
+) -> merge::MergeFlowState {
+    fold_merge_result(
+        wt_core::merge::attempt_merge_into_current(target_worktree_path, source_branch),
+        |message| {
+            let abortable_worktree = wt_core::merge::merge_head_exists(target_worktree_path)
+                .ok()
+                .and_then(|in_progress| in_progress.then(|| target_worktree_path.to_path_buf()));
+            merge::MergeFlowState::Error {
+                message,
+                abortable_worktree,
+            }
+        },
+    )
+}
+
+/// Folds one already-run `wt_core::merge` attempt's real result into a
+/// [`merge::MergeFlowState`] - shared by both directions ([`run_merge_attempt`] and
+/// [`run_merge_attempt_into_current`]) so the `MergeOutcome` → UI-state mapping, including the
+/// off-thread classification of every conflicted path, exists exactly once.
+///
+/// `error_state` builds the failure state, since the two directions genuinely differ in how they
+/// answer "is there a merge left in progress to offer an `Abort merge` for" - see
+/// [`run_merge_attempt_into_current`]'s own docs.
+fn fold_merge_result(
+    result: Result<(wt_core::merge::MergeStart, wt_core::merge::MergeOutcome), wt_core::Error>,
+    error_state: impl Fn(String) -> merge::MergeFlowState,
+) -> merge::MergeFlowState {
+    let (start, outcome) = match result {
         Ok(result) => result,
-        Err(err) => return merge_error_state(repo_path, err.to_string()),
+        Err(err) => return error_state(err.to_string()),
     };
     match outcome {
         wt_core::merge::MergeOutcome::AlreadyUpToDate => merge::MergeFlowState::AlreadyUpToDate {
@@ -887,7 +1039,7 @@ pub(in crate::merge) fn run_merge_attempt(
             for path in &conflicted_files {
                 match wt_core::merge::classify_conflicted_file(&start.base_worktree_path, path) {
                     Ok(classified) => files.push(classified),
-                    Err(err) => return merge_error_state(repo_path, err.to_string()),
+                    Err(err) => return error_state(err.to_string()),
                 }
             }
             let (active_file, active_hunk) = merge::first_unresolved(&files).unwrap_or((0, 0));

@@ -365,6 +365,62 @@ impl AdeApp {
         self.enter_rebase_mode_inner(onto, onto_short, cx);
     }
 
+    /// The Branches panel's branch menu "Rebase current branch on Branch…" action (GitHub issue
+    /// #241) - the same rebase mode [`Self::enter_rebase_mode`] enters, targeting `branch`'s real
+    /// tip commit.
+    ///
+    /// Resolves the branch to a real commit first (`wt_core::graph::resolve_commit`, a real `git
+    /// log -1` in the focused worktree) rather than handing the branch *name* to the rebase
+    /// engine, for two real reasons: a branch is a moving pointer, so pinning the tip that was
+    /// really there when the user clicked is what makes the plan the banner then shows honest;
+    /// and [`RebaseModeState::onto`] is a commit id everywhere else, which the banner and
+    /// `wt_core::rebase` both already depend on.
+    ///
+    /// That resolution is real blocking I/O, so it runs on the background executor and calls
+    /// [`Self::enter_rebase_mode_inner`] when it lands - never inline on the UI thread. A branch
+    /// that no longer resolves (deleted since the panel last loaded) reports git's own real error
+    /// through the graph tab's status line and enters no mode at all.
+    pub(in crate::graph_view) fn enter_rebase_mode_onto_branch(
+        &mut self,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
+        if self.graph_state.rebase.is_some() {
+            // Checked here as well as in `enter_rebase_mode_inner` (which re-checks after the
+            // await, and is the real guard): no reason to spawn a resolve for a mode that already
+            // cannot be entered.
+            return;
+        }
+        let root = self.diff_root.clone();
+        self.graph_state.status_message = Some(format!("Rebase onto {branch}\u{2026}"));
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let branch_for_bg = branch.clone();
+            let resolved = cx
+                .background_executor()
+                .spawn(async move { wt_core::graph::resolve_commit(&root, &branch_for_bg) })
+                .await;
+            let _ = this.update(cx, |this, cx| match resolved {
+                Ok(commit) => {
+                    // Rebase mode replaces the toolbar this message paints in with its own
+                    // banner, so leaving a stale "Rebase onto x…" behind would only ever be read
+                    // later, after the mode is left, as if something were still pending.
+                    this.graph_state.status_message = None;
+                    this.enter_rebase_mode_inner(commit.id, commit.short_id, cx);
+                }
+                Err(err) => {
+                    this.graph_state.status_message =
+                        Some(format!("Rebase onto {branch} failed: {err}"));
+                    cx.notify();
+                }
+            });
+        });
+        self.graph_state._branch_resolve_task = Some(task);
+    }
+
     /// The body of [`Self::enter_rebase_mode`], taking the real `onto` commit id (and its short
     /// form, for display) rather than a row index - so nothing downstream depends on that commit
     /// still occupying a particular row of the currently loaded graph. A background reload between

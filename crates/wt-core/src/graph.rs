@@ -431,6 +431,59 @@ fn parse_name_status(text: &str) -> Vec<CommitFileChange> {
     out
 }
 
+/// A real commit, resolved from a revision (a branch name, a tag, `HEAD`, ...) - both the full
+/// object id and git's own abbreviated form of it, which is what a UI actually displays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCommit {
+    pub id: String,
+    /// git's own abbreviation of [`Self::id`] (`%h`), honouring the repository's real
+    /// `core.abbrev`/uniqueness rules - never a hand-truncated prefix of `id`.
+    pub short_id: String,
+}
+
+/// Resolve `rev` to the real commit it names, in `worktree_path` - `git log -1 --format=%H %h
+/// <rev> --`, one invocation for both forms so they can never disagree about which commit they
+/// describe.
+///
+/// The Branches panel's "Rebase current branch on Branch…" is what needs this (GitHub issue
+/// #241): the rebase engine and its banner both work in terms of a commit, and a *branch* is a
+/// moving pointer - resolving it once, at click time, pins the rebase to the tip that was really
+/// there when the user clicked, exactly like the row menu's own rebase entry already pins a row's
+/// commit id rather than its row index.
+///
+/// A `rev` that names nothing (a branch deleted since the panel last loaded, a typo) surfaces as
+/// git's own real stderr through [`Error::GitCommand`] - never a fabricated or partially-resolved
+/// answer.
+///
+/// Performs blocking I/O: spawns a real `git` child process.
+pub fn resolve_commit(worktree_path: &Path, rev: &str) -> Result<ResolvedCommit, Error> {
+    let args: Vec<OsString> = vec![
+        "log".into(),
+        "-1".into(),
+        "--format=%H %h".into(),
+        rev.into(),
+        // The pathspec separator: whatever `rev` is, it is parsed as a revision here, never as a
+        // path that happens to exist in the working tree.
+        "--".into(),
+    ];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or_default().trim();
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(id), Some(short_id)) => Ok(ResolvedCommit {
+            id: id.to_string(),
+            short_id: short_id.to_string(),
+        }),
+        // `git log` exited successfully but printed something this can't read - reported rather
+        // than guessed at, the same "no fabricated answer" contract the rest of this module keeps.
+        _ => Err(Error::WorktreeIo(std::io::Error::other(format!(
+            "could not read a commit id out of `git log` output for {rev:?}"
+        )))),
+    }
+}
+
 /// Real ahead/behind counts for the worktree at `worktree_path` against its `HEAD` branch's real
 /// configured upstream (`@{upstream}`) - the graph toolbar's `Pull ↓2` / `Push ↑3` counts. This is
 /// deliberately a *different* comparison than [`crate::diff::ahead_behind_against_base`] (which
@@ -921,6 +974,54 @@ mod tests {
             "git merge failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn resolve_commit_reports_a_branchs_real_tip_in_both_forms() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        commit(repo.path(), "b.txt", "feature", "feature work");
+        let feature_tip = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(repo.path())
+                .args(["rev-parse", "feature"])
+                .output()
+                .expect("git rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        // Resolve from a worktree sitting on a *different* branch, which is exactly how the
+        // Branches panel uses this - the branch being resolved is never the current one.
+        git(repo.path(), &["checkout", "main"]);
+
+        let resolved = resolve_commit(repo.path(), "feature").expect("resolve_commit");
+
+        assert_eq!(
+            resolved.id, feature_tip,
+            "must resolve to the branch's own real tip commit, not HEAD's"
+        );
+        assert!(
+            !resolved.short_id.is_empty() && feature_tip.starts_with(&resolved.short_id),
+            "the short form must be git's own real abbreviation of that same commit: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_commit_surfaces_gits_own_error_for_a_ref_that_does_not_exist() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+
+        let err = resolve_commit(repo.path(), "no-such-branch")
+            .expect_err("a ref that names nothing must be a real error, not a fabricated commit");
+        match err {
+            Error::GitCommand { stderr, .. } => assert!(
+                !stderr.is_empty(),
+                "git's own real error text must be preserved for the caller to show"
+            ),
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
     }
 
     // ---- layout_lanes: pure, gix-independent ----

@@ -27,8 +27,22 @@
 //! Branch/Reset groups too (`Check out`/`Create branch here`/Soft-Mixed-Hard reset, `wt_core::checkout`) - see
 //! [`state::GraphTabState::hard_reset_confirm_armed`] for Hard reset's own two-click
 //! confirmation, the same discipline `push_force_confirm_armed` already established, and
-//! [`state::GraphCreateBranchPrompt`] for "Create branch here"'s small, hand-rolled branch-name
+//! [`state::GraphBranchPrompt`] for "Create branch here"'s small, hand-rolled branch-name
 //! input.
+//!
+//! GitHub issue #241 also gave the **Branches panel's own rows** a real right-click context menu
+//! ([`AdeApp::render_graph_branch_menu`]), matching VSCode's Git Graph extension's local-branch
+//! menu scoped to seven actions: Checkout / Rename / Delete, Merge into current branch / Rebase
+//! current branch on Branch, Push, and Copy Branch Name. It is the row `⋯` menu's structural twin
+//! (same popover chrome, same rows, same scrim/occlude contract) but keyed by branch *name*
+//! rather than a row index - see [`state::GraphBranchMenu`]. Two of its entries deliberately reuse
+//! whole existing subsystems rather than growing second ones: "Merge into current branch" fills
+//! the app's one existing `crate::merge` flow and conflict resolver
+//! (`AdeApp::start_merge_from_graph_branch`), and "Rebase current branch on Branch" enters the
+//! same [`rebase`] mode the row menu does, after resolving the branch to its real tip commit
+//! ([`AdeApp::enter_rebase_mode_onto_branch`]). "Delete Branch" carries the same two-click
+//! confirmation Hard reset does ([`state::GraphTabState::delete_branch_confirm_armed`]), and
+//! "Rename Branch" reuses the very same branch-name prompt "Create branch here" opens.
 //!
 //! GitHub issue #241 folded the row menu's two rebase entries into one. "Rebase onto this commit"
 //! was real but rode on `wt_core::rewrite::rebase_onto`'s plain `git rebase`, which leaves a
@@ -64,4 +78,4 @@ pub(crate) mod state;
 pub(crate) use state::{
     graph_lane_canvas_width, lane_color, lane_x, local_branch_dim_bg, relative_time,
 };
-pub(crate) use state::{GraphLoadState, GraphRightPanel, GraphRowMenu};
+pub(crate) use state::{GraphBranchMenu, GraphLoadState, GraphRightPanel, GraphRowMenu};

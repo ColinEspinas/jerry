@@ -56,6 +56,54 @@ pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Resul
     check_success(&args, &output)
 }
 
+/// Real `git branch -m <old_name> <new_name>` for `worktree_path`: renames an existing local
+/// branch, keeping its tip commit, its reflog and its upstream configuration - the Branches
+/// panel's own branch context menu "Rename Branch…" (GitHub issue #241).
+///
+/// Both names are genuinely user-facing (`old_name` comes from this app's own branch list;
+/// `new_name` is typed into the same hand-rolled prompt [`create_branch_at`] uses), and neither
+/// needs a `--` terminator for the same reason `create_branch_at`'s own `-b` argument doesn't:
+/// `git branch -m`'s two positional arguments are consumed as `-m`'s own operands, so a
+/// flag-shaped value is reported as an invalid branch name rather than re-parsed as an option.
+///
+/// Nothing is pre-validated: a `new_name` that already exists (`fatal: a branch named '<name>'
+/// already exists`) or is not a legal ref name (`fatal: '<name>' is not a valid branch name`)
+/// surfaces as git's own real stderr through [`Error::GitCommand`], exactly like
+/// [`create_branch_at`]'s own collision handling. Renaming the branch that is currently checked
+/// out here is *not* a special case either - git itself moves `HEAD` onto the new name, which is
+/// the correct behaviour and is proven directly by this module's own tests.
+///
+/// Performs blocking I/O.
+pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<(), Error> {
+    let args: Vec<OsString> = vec![
+        "branch".into(),
+        "-m".into(),
+        old_name.into(),
+        new_name.into(),
+    ];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)
+}
+
+/// Real `git branch -d <name>` for `worktree_path`: the **safe** delete - the Branches panel's
+/// own branch context menu "Delete Branch…" (GitHub issue #241).
+///
+/// Deliberately `-d`, never `-D`: git itself refuses to delete a branch whose commits are not
+/// already merged into its upstream or into `HEAD` (`error: the branch '<name>' is not fully
+/// merged`), and refuses to delete a branch that is checked out in *this* or any other worktree
+/// of the repository (`error: cannot delete branch '<name>' used by worktree at '<path>'`). Neither
+/// refusal is pre-checked here - both surface as git's own real stderr via [`Error::GitCommand`],
+/// matching every other mutation in this module. The UI layer's own two-click confirmation (see
+/// `app::graph_view`'s `GraphTabState::delete_branch_confirm_armed`) is about the user's intent,
+/// not about second-guessing git's own safety rules.
+///
+/// Performs blocking I/O.
+pub fn delete_branch(worktree_path: &Path, name: &str) -> Result<(), Error> {
+    let args: Vec<OsString> = vec!["branch".into(), "-d".into(), name.into()];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)
+}
+
 /// The three real `git reset` modes the row menu's "Reset" section offers - see [`reset`]'s own
 /// docs for what each really does to the working tree/index/branch tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +305,155 @@ mod tests {
             }
             other => panic!("expected Error::GitCommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rename_branch_really_moves_the_ref_to_the_new_name_and_leaves_no_old_one() {
+        let repo = init_repo();
+        let base = commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["branch", "old-name"]);
+
+        rename_branch(repo.path(), "old-name", "new-name").expect("rename should succeed");
+
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "new-name"]),
+            base,
+            "the renamed branch must still point at the very same commit"
+        );
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "new-name"),
+            "the new name must really exist in the repository's refs: {branches:?}"
+        );
+        assert!(
+            !branches.lines().any(|line| line == "old-name"),
+            "the old name must genuinely be gone, not merely shadowed: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn rename_branch_onto_an_existing_name_surfaces_gits_own_real_error() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["branch", "old-name"]);
+        git(repo.path(), &["branch", "taken"]);
+
+        let result = rename_branch(repo.path(), "old-name", "taken");
+        assert!(
+            result.is_err(),
+            "renaming onto a name that already exists must fail"
+        );
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("already exists"),
+                    "git's own real collision error must be preserved: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "old-name"),
+            "the refused rename must have left the original branch exactly where it was: \
+             {branches:?}"
+        );
+    }
+
+    #[test]
+    fn renaming_the_currently_checked_out_branch_really_moves_head_onto_the_new_name() {
+        let repo = init_repo();
+        let tip = commit(repo.path(), "a.txt", "base", "base");
+        assert_eq!(
+            current_branch(repo.path()),
+            "main",
+            "premise: main really is the checked-out branch"
+        );
+
+        rename_branch(repo.path(), "main", "renamed-main").expect("rename should succeed");
+
+        assert_eq!(
+            current_branch(repo.path()),
+            "renamed-main",
+            "git's own default behaviour: HEAD must follow the branch it is on to its new name"
+        );
+        assert_eq!(
+            head_sha(repo.path()),
+            tip,
+            "the working tree must still be sitting on the very same commit"
+        );
+    }
+
+    #[test]
+    fn delete_branch_really_removes_a_fully_merged_branch() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        // A branch pointing at the current tip - fully merged by construction, which is exactly
+        // what `git branch -d` is willing to remove.
+        git(repo.path(), &["branch", "merged-branch"]);
+
+        delete_branch(repo.path(), "merged-branch").expect("delete should succeed");
+
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            !branches.lines().any(|line| line == "merged-branch"),
+            "the branch must really be gone from the repository's refs: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn delete_branch_refuses_an_unmerged_branch_with_gits_own_real_refusal() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["checkout", "-b", "unmerged"]);
+        commit(repo.path(), "b.txt", "work", "work only on unmerged");
+        git(repo.path(), &["checkout", "main"]);
+
+        let result = delete_branch(repo.path(), "unmerged");
+        assert!(
+            result.is_err(),
+            "the safe delete must refuse a branch carrying commits nothing else has"
+        );
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("not fully merged"),
+                    "git's own real refusal reason must be preserved verbatim: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "unmerged"),
+            "the refused delete must have left the branch (and its commits) alone: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn delete_branch_refuses_the_branch_checked_out_in_this_worktree() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+
+        let result = delete_branch(repo.path(), "main");
+        assert!(
+            result.is_err(),
+            "git itself refuses to delete the branch currently checked out here"
+        );
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("cannot delete branch 'main'"),
+                    "git's own real refusal reason must be preserved verbatim: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        assert_eq!(
+            current_branch(repo.path()),
+            "main",
+            "the refused delete must leave the worktree exactly where it was"
+        );
     }
 
     #[test]

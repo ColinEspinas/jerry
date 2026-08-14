@@ -71,14 +71,9 @@ pub enum PushForce {
 /// Performs blocking I/O.
 pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
     let branch = current_branch_name(worktree_path)?;
-    let has_upstream = has_configured_upstream(worktree_path)?;
+    let has_upstream = has_configured_upstream(worktree_path, None)?;
 
-    let mut args: Vec<OsString> = vec!["push".into()];
-    match force {
-        PushForce::None => {}
-        PushForce::WithLease => args.push("--force-with-lease".into()),
-        PushForce::Force => args.push("--force".into()),
-    }
+    let mut args = push_args(force);
     if !has_upstream {
         args.push("--set-upstream".into());
         args.push("origin".into());
@@ -86,6 +81,59 @@ pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
     }
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
+}
+
+/// Real `git push` of an **explicit** `branch` from `worktree_path`, per `force` - the Branches
+/// panel's own branch context menu "Push Branch…" (GitHub issue #241), which pushes whichever
+/// branch was right-clicked rather than whatever happens to be checked out.
+///
+/// The only differences from [`push`] are that the branch is named rather than derived from
+/// `HEAD`, and that both the upstream check and the push itself are therefore scoped to *that*
+/// branch (`<branch>@{upstream}` and an explicit `origin <branch>` refspec) - a plain `git push`
+/// would otherwise push `HEAD`'s branch instead, silently pushing something the user never
+/// clicked. The `--set-upstream origin <branch>` fallback for a branch with no upstream yet is
+/// identical, for the identical reason (see [`push`]'s own docs).
+///
+/// The remote is always `origin`, whether or not an upstream is already configured - unlike
+/// [`push`], which (having no refspec at all when an upstream exists) lets git route the push to
+/// whatever remote that branch's upstream names. Pushing a branch that is *not* checked out
+/// requires naming a remote and a branch explicitly, so there is no "let git decide" form
+/// available here, and `origin` is this module's own already-documented single-remote assumption
+/// (see [`push`]'s docs). In a repository with exactly one remote - which is what
+/// `crate::graph::ahead_behind_against_upstream` already assumes across this crate - the two are
+/// the same push.
+///
+/// A non-fast-forward, a missing remote, or a branch name that doesn't exist all surface as git's
+/// own real stderr via [`Error::GitCommand`] - nothing is pre-checked. Still accepts the full
+/// [`PushForce`] even though the branch context menu only ever passes [`PushForce::None`]: the
+/// posture is git's own, and there is no reason for this function to be able to do less than
+/// [`push`] already can.
+///
+/// Performs blocking I/O.
+pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Result<(), Error> {
+    let has_upstream = has_configured_upstream(worktree_path, Some(branch))?;
+
+    let mut args = push_args(force);
+    if !has_upstream {
+        args.push("--set-upstream".into());
+    }
+    args.push("origin".into());
+    args.push(branch.into());
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)
+}
+
+/// The `git push` argument prefix both [`push`] and [`push_branch`] start from - `push` plus
+/// whatever flag `force` really means. Shared so the two can never drift into disagreeing about
+/// what a given [`PushForce`] does.
+fn push_args(force: PushForce) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["push".into()];
+    match force {
+        PushForce::None => {}
+        PushForce::WithLease => args.push("--force-with-lease".into()),
+        PushForce::Force => args.push("--force".into()),
+    }
+    args
 }
 
 /// The real, current branch's short name (`git rev-parse --abbrev-ref HEAD`) - used only for
@@ -97,17 +145,22 @@ fn current_branch_name(worktree_path: &Path) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Whether `HEAD` already has a configured upstream - the exact same real `git rev-parse
+/// Whether a branch already has a configured upstream - the exact same real `git rev-parse
 /// --abbrev-ref @{upstream}` resolution
 /// [`crate::graph::ahead_behind_against_upstream`] already uses for the identical question, so
 /// the two never independently disagree about what counts as "has an upstream". A non-zero exit
 /// here is the expected, honest "no upstream configured" signal, not a real error to propagate.
-fn has_configured_upstream(worktree_path: &Path) -> Result<bool, Error> {
-    let args: Vec<OsString> = vec![
-        "rev-parse".into(),
-        "--abbrev-ref".into(),
-        "@{upstream}".into(),
-    ];
+///
+/// `branch` is `None` for `HEAD`'s own branch (the bare `@{upstream}` [`push`] has always used,
+/// unchanged) and `Some(name)` for an explicit branch ([`push_branch`]), which needs
+/// `<name>@{upstream}` instead - the bare form would answer for whatever is checked out, not for
+/// the branch actually being pushed.
+fn has_configured_upstream(worktree_path: &Path, branch: Option<&str>) -> Result<bool, Error> {
+    let upstream = match branch {
+        Some(branch) => format!("{branch}@{{upstream}}"),
+        None => "@{upstream}".to_string(),
+    };
+    let args: Vec<OsString> = vec!["rev-parse".into(), "--abbrev-ref".into(), upstream.into()];
     let output = run_git(worktree_path, &args)?;
     Ok(output.status.success())
 }
@@ -435,18 +488,132 @@ mod tests {
         commit(local.path(), "a.txt", "1", "first commit, no upstream yet");
 
         assert!(
-            !has_configured_upstream(local.path()).expect("has_configured_upstream"),
+            !has_configured_upstream(local.path(), None).expect("has_configured_upstream"),
             "premise: a freshly `remote add`-ed repo has no upstream configured yet"
         );
 
         push(local.path(), PushForce::None).expect("push");
 
         assert!(
-            has_configured_upstream(local.path()).expect("has_configured_upstream"),
+            has_configured_upstream(local.path(), None).expect("has_configured_upstream"),
             "push must have configured a real upstream via --set-upstream, not merely \
              succeeded without one"
         );
         let remote_subject = git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
         assert_eq!(remote_subject, "first commit, no upstream yet");
+    }
+
+    #[test]
+    fn push_branch_with_no_upstream_pushes_that_branch_and_configures_one_for_it() {
+        let remote = init_bare_remote();
+        let seed = TempDir::new().expect("tempdir");
+        git(
+            seed.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test User"]);
+        commit(seed.path(), "a.txt", "1", "base");
+        git(seed.path(), &["push", "origin", "main"]);
+
+        let local = clone_of(remote.path());
+        // A second, never-pushed branch - and, critically, `main` is what stays checked out, so a
+        // push that silently used `HEAD` instead of the named branch would be visible here.
+        git(local.path(), &["checkout", "-b", "side-branch"]);
+        commit(local.path(), "b.txt", "1", "side work");
+        git(local.path(), &["checkout", "main"]);
+
+        assert!(
+            !has_configured_upstream(local.path(), Some("side-branch"))
+                .expect("has_configured_upstream"),
+            "premise: the new branch has no upstream configured yet"
+        );
+
+        push_branch(local.path(), "side-branch", PushForce::None).expect("push_branch");
+
+        assert!(
+            has_configured_upstream(local.path(), Some("side-branch"))
+                .expect("has_configured_upstream"),
+            "pushing a branch with no upstream must configure a real one via --set-upstream \
+             origin <branch>"
+        );
+        let remote_subject =
+            git_output(remote.path(), &["log", "-1", "--format=%s", "side-branch"]);
+        assert_eq!(
+            remote_subject, "side work",
+            "the named branch must really exist on the real remote now"
+        );
+        assert_eq!(
+            git_output(local.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "pushing an explicit branch must never switch what is checked out here"
+        );
+    }
+
+    #[test]
+    fn push_branch_that_is_already_up_to_date_succeeds_as_a_real_no_op() {
+        let remote = init_bare_remote();
+        let seed = TempDir::new().expect("tempdir");
+        git(
+            seed.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test User"]);
+        commit(seed.path(), "a.txt", "1", "base");
+        git(seed.path(), &["push", "origin", "main"]);
+
+        let local = clone_of(remote.path());
+        let remote_sha_before = git_output(remote.path(), &["rev-parse", "main"]);
+
+        push_branch(local.path(), "main", PushForce::None)
+            .expect("pushing an already-up-to-date branch must succeed, not error");
+
+        assert_eq!(
+            git_output(remote.path(), &["rev-parse", "main"]),
+            remote_sha_before,
+            "an up-to-date push must leave the real remote branch exactly where it was"
+        );
+    }
+
+    #[test]
+    fn push_branch_refuses_a_real_non_fast_forward_without_force() {
+        let remote = init_bare_remote();
+        let seed = TempDir::new().expect("tempdir");
+        git(
+            seed.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test User"]);
+        commit(seed.path(), "a.txt", "1", "base");
+        git(seed.path(), &["push", "origin", "main"]);
+
+        let local = clone_of(remote.path());
+        // The remote moves on, and the local branch rewrites its own history - a genuine
+        // divergence a plain push must refuse.
+        commit(seed.path(), "c.txt", "1", "diverged upstream work");
+        git(seed.path(), &["push", "origin", "main"]);
+        commit(local.path(), "b.txt", "1", "local work");
+        // Push the *named* branch from a worktree sitting on a different branch entirely, so the
+        // refusal proves it really targeted `main` rather than `HEAD`.
+        git(local.path(), &["checkout", "-b", "elsewhere"]);
+
+        let result = push_branch(local.path(), "main", PushForce::None);
+        let err = result.expect_err("a real non-fast-forward must be refused, never forced");
+        match err {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("rejected") || stderr.contains("non-fast-forward"),
+                    "git's own real non-fast-forward refusal must be preserved: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        let remote_subject = git_output(remote.path(), &["log", "-1", "--format=%s", "main"]);
+        assert_eq!(
+            remote_subject, "diverged upstream work",
+            "the real remote branch must be completely untouched by the refused push"
+        );
     }
 }
