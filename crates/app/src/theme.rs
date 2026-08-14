@@ -2776,7 +2776,7 @@ pub mod graph {
     /// The row `⋯` context menu's width (§4: "a 330-wide context menu").
     pub const ROW_MENU_WIDTH: Pixels = px(330.0);
     /// The row `⋯` context menu's painted height under the test suite's `gpui::TestAppContext` -
-    /// its content is fixed (four headers, twelve action rows, one footer line; never varies with
+    /// its content is fixed (four headers, ten action rows, one footer line; never varies with
     /// which row opened it), so unlike `crate::sidebar::context_menu::menu_height` (which has to
     /// measure a variable row count) this is a plain constant rather than a formula, pinned by
     /// `crate::graph_view::render::graph_row_menu_tests::
@@ -2788,7 +2788,7 @@ pub mod graph {
     /// of height from a real build's actual paint near the very edge of the clamp - the clamp
     /// degrades safely either way (it still keeps the menu on-screen, just not pixel-perfectly
     /// flush with the edge), so this has been left as a known imprecision rather than a blocker.
-    pub const ROW_MENU_HEIGHT: Pixels = px(483.0);
+    pub const ROW_MENU_HEIGHT: Pixels = px(425.0);
     /// Behind-count amber threshold (§5: "behind turns `#a3873f` past 4").
     pub const BEHIND_WARN_THRESHOLD: usize = 4;
     pub const BEHIND_WARN: ColorToken = token("graph.behind_warn", 0xa3873f);

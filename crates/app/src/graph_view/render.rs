@@ -3,15 +3,12 @@
 //! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
 
 use super::*;
-use crate::graph_view::state::graph_merge_gate;
 use crate::root::widgets::{
     menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_tag_pill,
 };
-use crate::settings::state::AGENT_KINDS;
 use crate::settings::widgets;
 use crate::sidebar::changes;
 use crate::text_history::TextField;
-use crate::work_surface::agents::AgentKind;
 use crate::work_surface::render::{render_dropdown_menu_row, DraggedTab, TabChromeArgs};
 use gpui::{uniform_list, KeyDownEvent, Pixels};
 use std::ops::Range;
@@ -661,153 +658,6 @@ impl AdeApp {
         });
     }
 
-    /// The row menu's "Rebase onto this commit" action - GitHub issue #1's own "rebase branch
-    /// (interactive or not)", the non-interactive half: replays the focused worktree's own branch
-    /// on top of `sha`.
-    ///
-    /// GitHub issue #241 moved this onto GitHub issue #242's own `wt_core::rebase` engine, via
-    /// [`Self::enter_rebase_mode_inner`]'s `auto_start` path (see its docs). It previously called
-    /// `wt_core::rewrite::rebase_onto`, a plain `git rebase <onto>`. That was never a stub - it
-    /// really did replay the branch, and its own tests really did prove it - but it had a real
-    /// dead end at the far side of a conflict: `git rebase` stops mid-replay with `REBASE_HEAD`
-    /// on disk, and nothing in this app could then continue, skip or abort it. The status message
-    /// carried git's own refusal text and that was the end of the road, short of a terminal.
-    ///
-    /// Running the same replay through the engine fixes exactly that, and nothing else changes
-    /// about what it does: an all-`pick` plan over `commits_to_rebase(root, sha)` is precisely
-    /// what `git rebase <onto>` performs. A clean rebase still completes, reloads the graph and
-    /// leaves no mode behind ([`Self::apply_rebase_outcome`]'s `Completed` arm); a real conflict
-    /// now lands in [`RebasePhase::Stopped`] with the existing `Continue`/`Skip`/`Abort` and
-    /// `Resolve in the diff view` banner - the same one the interactive path has always used, not
-    /// a second one.
-    ///
-    /// Identifies the target by commit id, never by row index: a background graph reload between
-    /// opening the row menu and clicking genuinely renumbers rows, and this action's whole target
-    /// is the commit. The short form is taken from the loaded graph when that commit is still on
-    /// screen and derived from the id itself when it is not, so the banner always has something
-    /// real to display without the lookup being able to fail the action.
-    pub(crate) fn request_graph_rebase_onto(&mut self, sha: String, cx: &mut Context<Self>) {
-        // GitHub issue #241: see [`Self::request_graph_cherry_pick`]'s own comment above.
-        self.graph_state.hard_reset_confirm_armed = None;
-        let short = match &self.graph_state.load {
-            GraphLoadState::Loaded(graph) => graph
-                .rows
-                .iter()
-                .find(|row| row.commit.id == sha)
-                .map(|row| row.commit.short_id.clone()),
-            _ => None,
-        }
-        .unwrap_or_else(|| sha.chars().take(7).collect());
-        self.enter_rebase_mode_inner(sha, short, true, cx);
-    }
-
-    /// Everything [`graph_merge_gate`] needs, read off real app state for the **focused
-    /// worktree** - never the repository's main checkout (the row menu's own footer rule; see
-    /// [`Self::run_graph_remote_op`] for the same `diff_root` discipline every other graph
-    /// mutation already follows).
-    ///
-    /// Every field is a fact this app has already loaded for that worktree, so this performs no
-    /// blocking I/O and is safe to call from a render path: the branch comes from
-    /// [`AdeApp::worktrees`] (`wt_core::list_worktrees`), the base branch from
-    /// [`AdeApp::diff_state`] (`wt_core::diff::diff_against_base`), the uncommitted count from
-    /// [`AdeApp::dirty_files`] (`wt_core::stage::dirty_paths`), and the agent counts from the
-    /// live [`AdeApp::agents`] plus [`Self::agent_status`] - the single status source the rail
-    /// and the work surface already share, so this can never disagree with them about which
-    /// agents are working.
-    pub(in crate::graph_view) fn graph_merge_facts(&self, cx: &gpui::App) -> GraphMergeFacts {
-        let head_branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.path == self.diff_root)
-            .and_then(|item| item.branch.clone());
-        let base_branch = match &self.diff_state {
-            crate::code_surface::state::DiffLoadState::Loaded(wt_core::diff::DiffBase::Diff(
-                diff,
-            )) => Some(diff.base_branch.clone()),
-            _ => None,
-        };
-        let uncommitted_files = self
-            .dirty_files
-            .as_ref()
-            .map(|files| files.len())
-            .unwrap_or(0);
-        let worktree_agents: Vec<&crate::work_surface::agents::Agent> =
-            self.agents.iter_for_cwd(self.diff_root.clone()).collect();
-        let live_agents = worktree_agents
-            .iter()
-            .filter(|agent| agent.kind.is_agent_session())
-            .filter(|agent| {
-                matches!(
-                    self.agent_status(agent, cx),
-                    crate::rail::status::Status::Run | crate::rail::status::Status::Ask
-                )
-            })
-            .count();
-        GraphMergeFacts {
-            head_branch,
-            base_branch,
-            uncommitted_files,
-            live_agents,
-            has_agent_tab: !worktree_agents.is_empty(),
-            merge_already_running: self.merge_flow.is_some(),
-        }
-    }
-
-    /// The Branches panel's "Merge into `<base>`" action (GitHub issue #241) - merges the focused
-    /// worktree's own branch into the repository's detected base branch.
-    ///
-    /// **This starts no merge of its own.** It calls the app's one existing merge entry point,
-    /// [`Self::start_merge`], which is the same call the agent context bar's `Merge` button
-    /// makes - so a conflicted merge lands in the *existing* conflict resolver
-    /// (`crate::merge::render::AdeApp::render_merge_flow_surface`, reached from
-    /// `crate::work_surface::render`'s active-agent branch) with its existing `Take left`/`Take
-    /// right`/`Take both`/hand-edit surface and its existing `Complete merge`/`Abort merge`
-    /// footer. There is deliberately no second conflict UI here, and no second copy of
-    /// `wt_core::merge::attempt_merge`'s own preconditions.
-    ///
-    /// That resolver renders inside an agent's work surface, so this activates the focused
-    /// worktree's agent tab ([`Self::select_agent`]) *before* starting the merge - otherwise a
-    /// real conflict would be resolved into a surface the user is not looking at. Which agent is
-    /// deliberately unimportant to the merge itself: [`Self::start_merge`] derives the branch it
-    /// merges from the agent's `cwd`, and every agent this picks between shares the one focused
-    /// worktree by construction ([`Agents::iter_for_cwd`]).
-    ///
-    /// Re-checks [`graph_merge_gate`] rather than trusting the caller's own render-time gate: the
-    /// render that drew an enabled control and the click that lands on it are separate frames,
-    /// and a background `load_diff` (or an agent waking up) between them can genuinely invalidate
-    /// it - the same "re-check git's own ground truth rather than a UI-level belief" discipline
-    /// `wt_core::merge::complete_merge` already applies one layer down.
-    pub(crate) fn request_graph_merge_into_base(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let gate = graph_merge_gate(&self.graph_merge_facts(cx));
-        let GraphMergeGate::Ready { base_branch, .. } = gate else {
-            // Not silently dropped: the reason the gate refuses is the same string the control
-            // itself is showing, so this reports it rather than looking like a dead click.
-            self.graph_state.status_message = gate.reason().map(|reason| reason.to_string());
-            cx.notify();
-            return;
-        };
-        let Some(agent_id) = self
-            .agents
-            .iter_for_cwd(self.diff_root.clone())
-            .map(|agent| agent.id)
-            .next()
-        else {
-            // Unreachable while the gate above returned `Ready` (`has_agent_tab` is derived from
-            // this same iterator), handled rather than `expect`ed - never a panic for a state
-            // that a background agent-close could genuinely change out from under this.
-            return;
-        };
-        self.graph_state.row_menu_open = None;
-        self.graph_state.hard_reset_confirm_armed = None;
-        self.graph_state.status_message = Some(format!("Merging into {base_branch}\u{2026}"));
-        self.select_agent(agent_id, window, cx);
-        self.start_merge(agent_id, cx);
-    }
-
     /// The row menu's "Check out" action (GitHub issue #241). Moves `HEAD` (detached) onto `sha`
     /// in the focused worktree (`wt_core::checkout::checkout`) - never the repository's main
     /// checkout, the same "current worktree" resolution [`Self::request_graph_cherry_pick`] and
@@ -836,74 +686,12 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_graph_branch_prompt(
-            state::GraphBranchPromptKind::CreateBranch,
-            sha,
-            short_sha,
-            subject,
-            window,
-            cx,
-        );
-    }
-
-    /// The row menu's "Start agent from this commit" action (GitHub issue #241) - opens the same
-    /// name prompt [`Self::start_graph_create_branch`] does, in
-    /// [`state::GraphBranchPromptKind::StartAgent`] mode.
-    ///
-    /// It asks for a branch name because `git worktree add -b <branch> -- <path> <sha>` genuinely
-    /// needs one and there is no honest way to invent it: a name derived from the commit would
-    /// collide the second time the same commit is used, and silently disambiguating it would put
-    /// the user's agent on a branch they never named. Asking also gives the one place to show the
-    /// real destination directory before anything is created - see
-    /// [`graph_new_worktree_parent`]'s own docs on why that matters here.
-    pub(crate) fn start_graph_agent_from_commit(
-        &mut self,
-        sha: String,
-        short_sha: String,
-        subject: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_graph_branch_prompt(
-            state::GraphBranchPromptKind::StartAgent,
-            sha,
-            short_sha,
-            subject,
-            window,
-            cx,
-        );
-    }
-
-    /// Shared opening for both [`state::GraphBranchPromptKind`]s - one prompt, one focus/reset
-    /// path, so the two actions can never drift apart in how they open.
-    fn open_graph_branch_prompt(
-        &mut self,
-        kind: state::GraphBranchPromptKind,
-        sha: String,
-        short_sha: String,
-        subject: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         self.graph_state.hard_reset_confirm_armed = None;
         self.graph_state.row_menu_open = None;
-        // Resolved once, at open time, from the worktree list this app has already loaded - not
-        // recomputed per render, and not re-read after the user starts typing.
-        let worktree_parent = matches!(kind, state::GraphBranchPromptKind::StartAgent).then(|| {
-            let linked: Vec<std::path::PathBuf> = self
-                .worktrees
-                .iter()
-                .filter(|item| !item.is_main && !item.is_bare)
-                .map(|item| item.path.clone())
-                .collect();
-            graph_new_worktree_parent(&self.focused_repo_path(), &linked)
-        });
         self.graph_state.create_branch_prompt = Some(state::GraphCreateBranchPrompt {
-            kind,
             sha,
             short_sha,
             subject,
-            worktree_parent: worktree_parent.flatten(),
             error: None,
         });
         self.graph_state.create_branch_name = TextField::new();
@@ -954,163 +742,7 @@ impl AdeApp {
         }
         self.graph_state.create_branch_prompt = None;
         window.focus(&self.graph_focus_handle, cx);
-        match prompt.kind {
-            state::GraphBranchPromptKind::CreateBranch => {
-                self.request_graph_create_branch(prompt.sha, name, cx);
-            }
-            state::GraphBranchPromptKind::StartAgent => {
-                self.request_graph_start_agent_from_commit(
-                    prompt.sha,
-                    name,
-                    prompt.worktree_parent,
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// The real work behind "Start agent from this commit" (GitHub issue #241): a real
-    /// `git worktree add -b <name> -- <parent>/<dir> <sha>` (`wt_core::add_worktree`, which takes
-    /// the base commit-ish directly), then a real agent spawned in the result.
-    ///
-    /// The worktree creation is the only part that needs the background executor - it spawns a
-    /// real `git worktree add` child process, which checks out a whole tree. Everything after it
-    /// is the *existing* new-agent path, reached through the same four post-spawn bookkeeping
-    /// calls `crate::hooks::flow::AdeApp::resume_past_agent` already makes (that method is this
-    /// app's one other "put an agent in a specific worktree, programmatically" flow, and this
-    /// deliberately mirrors it rather than inventing a second spawn sequence):
-    /// [`Self::load_worktrees`] so the new worktree is really in the rail before anything selects
-    /// it, [`Self::select_worktree_by_path`], [`Agents::spawn`], then
-    /// [`Self::capture_review_baseline`]/[`Self::close_gated_review_tab`]/
-    /// [`Self::focus_newly_spawned_agent`]/[`Self::record_worktree_session`].
-    ///
-    /// A real failure (a branch name that already exists, a destination directory that is already
-    /// there, an unwritable parent) surfaces as git's own real error text through
-    /// [`GraphTabState::status_message`], exactly like every other row-menu mutation - nothing is
-    /// pre-checked and second-guessed here, and no worktree is left half-created: `git worktree
-    /// add` is itself atomic about that.
-    pub(crate) fn request_graph_start_agent_from_commit(
-        &mut self,
-        sha: String,
-        branch: String,
-        worktree_parent: Option<std::path::PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
-        self.graph_state.hard_reset_confirm_armed = None;
-        if self.graph_state.remote_op_in_flight {
-            return;
-        }
-        let repo_path = self.focused_repo_path();
-        if repo_path.as_os_str().is_empty() {
-            // GitHub issue #90's genuinely empty window - `focused_repo_path` returns an empty
-            // path there, and `git worktree add` against it would be a nonsense invocation. Every
-            // repo-scoped action in this app checks this itself; see that method's own docs.
-            self.graph_state.status_message =
-                Some("Start agent failed: no repository focused".to_string());
-            cx.notify();
-            return;
-        }
-        let Some(parent) = worktree_parent else {
-            self.graph_state.status_message =
-                Some("Start agent failed: no directory to create the worktree in".to_string());
-            cx.notify();
-            return;
-        };
-        let worktree_path = parent.join(graph_new_worktree_dir_name(&repo_path, &branch));
-
-        self.graph_state.remote_op_in_flight = true;
-        self.graph_state.row_menu_open = None;
-        self.graph_state.status_message = Some("Start agent\u{2026}".to_string());
-        cx.notify();
-
-        let created_path = worktree_path.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let add_repo_path = repo_path.clone();
-            let add_worktree_path = worktree_path.clone();
-            // Both real blocking steps share one background hop: creating the worktree
-            // (`git worktree add`, a real child process checking out a whole tree) and the
-            // `$PATH` search for an installed agent binary that
-            // `crate::work_surface::render::AdeApp::new_agent_pane` also has to do off the UI
-            // thread. Neither may ever run on the GPUI foreground thread.
-            let (result, installed) = cx
-                .background_executor()
-                .spawn(async move {
-                    let result = wt_core::add_worktree(
-                        &add_repo_path,
-                        &add_worktree_path,
-                        Some(&branch),
-                        Some(&sha),
-                    );
-                    let installed = AGENT_KINDS
-                        .into_iter()
-                        .find(|kind| pty_core::resolve_on_path(kind.binary_name()).is_some());
-                    (result, installed)
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.graph_state.remote_op_in_flight = false;
-                match result {
-                    Ok(()) => {
-                        let kind = installed.unwrap_or(AGENT_KINDS[0]);
-                        this.finish_graph_start_agent_from_commit(created_path, kind, window, cx);
-                    }
-                    Err(err) => {
-                        this.graph_state.status_message =
-                            Some(format!("Start agent failed: {err}"));
-                        cx.notify();
-                        this.load_graph(cx);
-                    }
-                }
-            });
-        });
-        self.graph_state._remote_op_task = Some(task);
-    }
-
-    /// The foreground half of [`Self::request_graph_start_agent_from_commit`], after the real
-    /// `git worktree add` has genuinely succeeded - split out so it is reachable from a test
-    /// without going through the background task, matching [`Self::request_graph_create_branch`]'s
-    /// own "split so tests can drive it directly" shape.
-    pub(crate) fn finish_graph_start_agent_from_commit(
-        &mut self,
-        worktree_path: std::path::PathBuf,
-        agent_kind: AgentKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // The rail's own worktree list is what `select_worktree_by_path` searches, so it has to
-        // know about the new worktree before that call, not after it. The filesystem watcher
-        // (`crate::rail::worktree_watch`) would get there on its own eventually; this makes the
-        // ordering real rather than a race.
-        self.load_worktrees(cx);
-        self.select_worktree_by_path(&worktree_path, window, cx);
-
-        // The same agent kind, injection, font size and shell override a `+` menu "New agent"
-        // spawn into this worktree would get - `crate::work_surface::render::AdeApp::
-        // new_agent_pane`'s own choices, read through the same settings fields rather than a
-        // second, parallel notion of "which agent do we start".
-        let kind = crate::work_surface::agents::ProcessKind::Agent(agent_kind);
-        let hook_injection = self.hook_injection_for(kind);
-        let font_size = self.settings.appearance.terminal_font_size;
-        let shell_override = self.settings.terminal.shell_override();
-        let id = self.agents.spawn(
-            kind,
-            worktree_path.clone(),
-            font_size,
-            shell_override,
-            hook_injection.as_ref(),
-            window,
-            cx,
-        );
-        self.capture_review_baseline(id, cx);
-        self.close_gated_review_tab(window, cx);
-        self.focus_newly_spawned_agent(window, cx);
-        self.record_worktree_session(cx);
-        // Leaves the graph tab the same way selecting any agent tab does - the agent just
-        // spawned is what the user asked to see, and `select_agent`'s own teardown is the one
-        // path that gets focus right (see `Self::leave_graph_tab`'s docs).
-        self.select_agent(id, window, cx);
-        self.graph_state.status_message = Some("Start agent".to_string());
-        cx.notify();
+        self.request_graph_create_branch(prompt.sha, name, cx);
     }
 
     /// The real `wt_core::checkout::create_branch_at` call behind
@@ -1363,29 +995,6 @@ impl AdeApp {
         let prompt = self.graph_state.create_branch_prompt.clone();
         let name = self.graph_state.create_branch_name.as_str().to_string();
         let has_name = !name.is_empty();
-        // GitHub issue #241: one prompt, two actions - see `state::GraphBranchPromptKind`.
-        let start_agent = prompt
-            .as_ref()
-            .is_some_and(|prompt| matches!(prompt.kind, state::GraphBranchPromptKind::StartAgent));
-        let heading = if start_agent {
-            "Start agent from this commit"
-        } else {
-            "Create branch here"
-        };
-        // The real destination, resolved at open time - shown before anything is created, so the
-        // directory a new worktree lands in is never something the user only finds out about
-        // afterwards (see `graph_new_worktree_parent`'s own docs).
-        let destination = prompt.as_ref().and_then(|prompt| {
-            let parent = prompt.worktree_parent.as_ref()?;
-            let repo_path = self.focused_repo_path();
-            let dir = if has_name {
-                graph_new_worktree_dir_name(&repo_path, &name)
-            } else {
-                graph_new_worktree_dir_name(&repo_path, "branch-name")
-            };
-            Some(parent.join(dir).display().to_string())
-        });
-
         div()
             .id("graph-create-branch-scrim")
             .absolute()
@@ -1427,7 +1036,7 @@ impl AdeApp {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(px(11.5))
                             .text_color(theme::text::HEADING)
-                            .child(heading),
+                            .child("Create branch here"),
                     )
                     .child(
                         div()
@@ -1471,16 +1080,6 @@ impl AdeApp {
                                 ))
                             }),
                     )
-                    .when_some(destination, |el, destination| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::MONO))
-                                .text_size(px(9.5))
-                                .text_color(theme::text::GHOST)
-                                .debug_selector(|| "graph-start-agent-destination".to_string())
-                                .child(format!("new worktree at {destination}")),
-                        )
-                    })
                     .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
                         el.child(
                             div()
@@ -1495,12 +1094,7 @@ impl AdeApp {
                             .font(font(theme::font::SANS))
                             .text_size(px(10.0))
                             .text_color(theme::text::GHOST)
-                            .child(if start_agent {
-                                "enter to create the worktree and start the agent \u{b7} esc to \
-                                 cancel"
-                            } else {
-                                "enter to create \u{b7} esc to cancel"
-                            }),
+                            .child("enter to create \u{b7} esc to cancel"),
                     ),
             )
     }
@@ -2387,37 +1981,6 @@ impl AdeApp {
                         }
                     })),
                 )
-                .child(
-                    // GitHub issue #241: real since revision 6's own row-menu spec landed the
-                    // design this needed (`gMenuGroups`' `Start session from this commit`, sub
-                    // `new worktree`) - see `super`'s module docs. The subtitle is that spec's
-                    // own, and is the honest one: this action's whole difference from "Create
-                    // branch here" is that it makes a *new worktree* rather than moving the
-                    // focused one.
-                    render_dropdown_menu_row(
-                        "\u{25b8}",
-                        theme::button::BLUE_FG.into(),
-                        theme::surface::CHIP_NEUTRAL.into(),
-                        "Start agent from this commit",
-                        "new worktree".to_string(),
-                        Vec::new(),
-                        true,
-                    )
-                    .on_click(cx.listener({
-                        let sha = sha.clone();
-                        let short_sha = short_sha.clone();
-                        let subject = subject.clone();
-                        move |this, _event: &ClickEvent, window, cx| {
-                            this.start_graph_agent_from_commit(
-                                sha.clone(),
-                                short_sha.clone(),
-                                subject.clone(),
-                                window,
-                                cx,
-                            );
-                        }
-                    })),
-                )
                 .child(render_graph_row_menu_header("Apply"))
                 .child(
                     render_dropdown_menu_row(
@@ -2454,28 +2017,15 @@ impl AdeApp {
                     })),
                 )
                 .child(
+                    // GitHub issue #241: one rebase entry, not two. This opens the interactive
+                    // Planning banner (`AdeApp::enter_rebase_mode`), whose own one-click
+                    // `Start rebase` covers the "just replay it, don't edit anything" case that
+                    // used to have a separate, immediately-running row of its own.
                     render_dropdown_menu_row(
                         "\u{2191}",
                         theme::button::BLUE_FG.into(),
                         theme::surface::CHIP_NEUTRAL.into(),
                         "Rebase onto this commit",
-                        String::new(),
-                        Vec::new(),
-                        true,
-                    )
-                    .on_click(cx.listener({
-                        let sha = sha.clone();
-                        move |this, _event: &ClickEvent, _window, cx| {
-                            this.request_graph_rebase_onto(sha.clone(), cx);
-                        }
-                    })),
-                )
-                .child(
-                    render_dropdown_menu_row(
-                        "\u{2191}",
-                        theme::button::BLUE_FG.into(),
-                        theme::surface::CHIP_NEUTRAL.into(),
-                        "Interactive rebase from here",
                         String::new(),
                         Vec::new(),
                         true,
@@ -2597,11 +2147,6 @@ impl AdeApp {
                         .text_size(px(9.5))
                         .text_color(theme::text::GHOSTER)
                         .child(
-                            // GitHub issue #241: "Start agent from this commit" is deliberately
-                            // *not* in this list. The rule this footer states is about which
-                            // existing checkout a verb mutates, and that action mutates none -
-                            // it creates a new worktree of its own and leaves both the focused
-                            // worktree and the main checkout exactly where they were.
                             "check out, branch, rebase, and reset all run in the focused \
                              worktree, never the main checkout",
                         ),
@@ -2838,18 +2383,6 @@ impl AdeApp {
         });
         branches.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // GitHub issue #241: which branch (if any) the *focused worktree* has checked out, read
-        // from `wt_core::list_worktrees` rather than from the graph's own `is_head` chips alone.
-        // Both are needed and neither is sufficient: a ref chip's `is_head` says "`HEAD` points
-        // here" for the repository the graph was walked from, while this says which branch the
-        // worktree every graph action actually runs in is on. Requiring both to agree is what
-        // keeps the merge control off a row that merely *looks* like `HEAD`.
-        let merge_head_branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.path == self.diff_root)
-            .and_then(|item| item.branch.clone());
-
         div()
             .id("graph-branches-panel")
             .flex()
@@ -2873,21 +2406,7 @@ impl AdeApp {
                             .overflow_y_scroll()
                             .track_scroll(&self.graph_state.branches_scroll_handle)
                             .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
-                                // GitHub issue #241: the merge control rides on the focused
-                                // worktree's own `HEAD` branch row and nowhere else - that is
-                                // the one branch `wt_core::merge::attempt_merge` can actually
-                                // merge (it derives its source branch from the worktree's
-                                // `HEAD`, never from a branch name a caller picked), so
-                                // offering it on any other row would be an affordance that
-                                // cannot do what its label says.
-                                let merge = (is_head
-                                    && merge_head_branch.as_deref() == Some(name.as_str()))
-                                .then(|| self.render_graph_merge_control(cx));
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(render_graph_branch_row(name, kind, is_head, lane))
-                                    .children(merge)
+                                render_graph_branch_row(name, kind, is_head, lane)
                             })),
                     )
                     // GitHub issue #142.
@@ -2898,85 +2417,6 @@ impl AdeApp {
                         cx,
                     )),
             )
-            .into_any_element()
-    }
-
-    /// GitHub issue #241's "Merge into `<base>`" control, rendered directly beneath the focused
-    /// worktree's own `HEAD` branch row in the Branches panel.
-    ///
-    /// A strip rather than an inline chip on the row itself, because the design's whole reason
-    /// for putting this action in branch scope is that "the base, the commit count and the reason
-    /// it is blocked are all in view at once" (`Jerry.dc.html`) - a blocked reason like
-    /// `13 files still uncommitted` does not fit beside a branch name in a panel this narrow, and
-    /// truncating it would defeat the point of showing it at all.
-    ///
-    /// Disabled state follows `crate::work_surface::render::render_dropdown_menu_row`'s own
-    /// contract, which this project's discipline treats as binding everywhere: a disabled control
-    /// loses `cursor_pointer`, loses its hover, **and genuinely has no `.on_click` attached**, so
-    /// a gate this render path got wrong cannot degrade into a control that looks actionable and
-    /// silently does nothing.
-    fn render_graph_merge_control(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let facts = self.graph_merge_facts(cx);
-        let gate = graph_merge_gate(&facts);
-        // The design's own `mergeLabel`: `'Merge into ' + wtBase.ref` when a base is known, a
-        // bare `Merge` when it is not (the `no base branch detected` gate is what explains the
-        // bare form, so the label itself stays honest rather than naming a branch that was never
-        // detected).
-        let label = match &facts.base_branch {
-            Some(base_branch) => format!("Merge into {base_branch}"),
-            None => "Merge".to_string(),
-        };
-        let enabled = gate.is_ready();
-
-        let mut button = div()
-            .id("graph-branch-merge")
-            .debug_selector(|| "graph-branch-merge".to_string())
-            .flex_none()
-            .h(px(21.0))
-            .px(px(9.0))
-            .rounded(theme::radius::BUTTON)
-            .border_1()
-            .flex()
-            .items_center()
-            .font(font(theme::font::SANS))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(10.5))
-            .child(label);
-        button = if enabled {
-            button
-                .cursor_pointer()
-                .border_color(theme::button::GREEN_KEYCAP)
-                .bg(theme::button::GREEN_BG)
-                .text_color(theme::button::GREEN_FG)
-                .hover(|el| el.bg(theme::button::GREEN_BG_HOVER))
-                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.request_graph_merge_into_base(window, cx);
-                }))
-        } else {
-            button
-                .cursor_default()
-                .border_color(theme::border::BUTTON_DISABLED)
-                .text_color(theme::text::GHOSTER)
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(3.0))
-            .px(px(10.0))
-            .py(px(7.0))
-            .border_b_1()
-            .border_color(theme::border::ROW)
-            .child(button)
-            .children(gate.reason().map(|reason| {
-                div()
-                    .font(font(theme::font::SANS))
-                    .text_size(px(9.5))
-                    .text_color(theme::text::GHOST)
-                    .debug_selector(|| "graph-branch-merge-reason".to_string())
-                    .child(reason.to_string())
-            }))
             .into_any_element()
     }
 
@@ -3067,75 +2507,6 @@ impl AdeApp {
             GraphLoadState::Loaded(graph) => Some(graph),
             _ => None,
         }
-    }
-}
-
-/// Where a new worktree created by "Start agent from this commit" should live (GitHub issue
-/// #241).
-///
-/// This app persists no "worktree root" setting - `Jerry.dc.html`'s Settings mock shows such a
-/// field but nothing behind it was ever built (`crate::settings::state`'s own module docs say so
-/// outright), so there is no configured answer to read. Rather than inventing a layout, this
-/// **observes the one the repository already uses**: the common parent directory of its existing
-/// linked worktrees, which is a real fact about this repository, not a guess about it.
-///
-/// `linked_worktree_paths` is every non-main, non-bare worktree's path. The rule:
-///
-/// - If they all already share one parent directory, new worktrees join them there. This is the
-///   case for every repository that has ever had a worktree made in it, however it was made.
-/// - Otherwise (no linked worktrees at all yet, or several scattered parents with no single
-///   answer), fall back to the main worktree's own parent directory - git's own most common
-///   layout, and the one place guaranteed to exist and be writable if the repository itself is.
-///
-/// The resolved directory is shown to the user in the prompt before anything is created (see
-/// [`state::GraphCreateBranchPrompt::worktree_parent`]), so even the fallback is never a silent
-/// choice made on their behalf.
-pub(in crate::graph_view) fn graph_new_worktree_parent(
-    repo_path: &std::path::Path,
-    linked_worktree_paths: &[std::path::PathBuf],
-) -> Option<std::path::PathBuf> {
-    let mut parents: Vec<&std::path::Path> = linked_worktree_paths
-        .iter()
-        .filter_map(|path| path.parent())
-        .collect();
-    parents.sort();
-    parents.dedup();
-    if let [only] = parents.as_slice() {
-        return Some(only.to_path_buf());
-    }
-    repo_path.parent().map(|parent| parent.to_path_buf())
-}
-
-/// The directory name a new worktree for `branch` gets inside
-/// [`graph_new_worktree_parent`]'s answer.
-///
-/// A branch name is not a directory name: `feat/multipart-upload` would otherwise create a
-/// *nested* `feat/` directory (and `..` components would escape the parent entirely), so every
-/// separator is flattened to `-` and any component that could traverse is dropped. The result is
-/// prefixed with the repository's own directory name so several repositories sharing one parent
-/// directory cannot collide on a common branch name like `fix`.
-pub(in crate::graph_view) fn graph_new_worktree_dir_name(
-    repo_path: &std::path::Path,
-    branch: &str,
-) -> String {
-    let flattened: String = branch
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | ' ' => '-',
-            other => other,
-        })
-        .collect();
-    // A leading `.` would make the worktree directory hidden, and a bare `.`/`..` is a real
-    // traversal - neither is a name a user asked for by typing a branch name.
-    let cleaned = flattened.trim_matches(['.', '-'].as_slice()).to_string();
-    let repo_name = repo_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".to_string());
-    if cleaned.is_empty() {
-        repo_name
-    } else {
-        format!("{repo_name}-{cleaned}")
     }
 }
 
@@ -7158,6 +6529,31 @@ mod graph_remote_action_tests {
         );
     }
 
+    /// Opens the graph tab and resolves `sha`'s own loaded row index - exactly what a real click
+    /// on that row's "Rebase onto this commit" entry hands `AdeApp::enter_rebase_mode`, so these
+    /// tests drive the same entry point the row menu does rather than a test-only shortcut.
+    fn graph_row_index_of(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        sha: &str,
+    ) -> usize {
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| match &app.graph_state.load {
+            crate::graph_view::GraphLoadState::Loaded(graph) => graph
+                .rows
+                .iter()
+                .position(|row| row.commit.id == sha)
+                .unwrap_or_else(|| panic!("commit {sha} must be a real loaded graph row")),
+            other => panic!("the graph must be loaded to click a row, got {other:?}"),
+        })
+    }
+
+    /// GitHub issue #241 folded the row menu's two rebase entries into one: "Rebase onto this
+    /// commit" now opens the Planning banner, whose own `Start rebase` runs the replay. The
+    /// replay itself is what this proves - the same history a plain `git rebase <onto>` produces.
     #[gpui::test]
     async fn rebase_onto_really_replays_the_branch_and_reports_success(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
@@ -7168,8 +6564,13 @@ mod graph_remote_action_tests {
         git(local.path(), &["checkout", "main"]);
         commit(local.path(), "c.txt", "own content", "own work");
 
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(target_sha, cx);
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
         });
         cx.run_until_parked();
 
@@ -7179,13 +6580,11 @@ mod graph_remote_action_tests {
             "the real click must have run a real git rebase replaying this worktree's own \
              commit on top of the target branch's tip"
         );
-        // GitHub issue #241 moved this action onto GitHub issue #242's own `wt_core::rebase`
-        // engine (see `AdeApp::request_graph_rebase_onto`'s docs). A real `Completed` outcome
-        // leaves rebase mode entirely, exactly as the interactive path's own completion does -
-        // there is deliberately no leftover mode or banner to dismiss after a clean rebase.
+        // A real `Completed` outcome leaves rebase mode entirely - there is deliberately no
+        // leftover mode or banner to dismiss after a clean rebase.
         assert!(
             app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
-            "a cleanly completed non-interactive rebase must leave no rebase mode behind"
+            "a cleanly completed rebase must leave no rebase mode behind"
         );
         assert!(
             !local.path().join(".git/rebase-merge").exists(),
@@ -7194,10 +6593,10 @@ mod graph_remote_action_tests {
     }
 
     /// GitHub issue #241's real fix for this action, and the reason it moved onto the engine at
-    /// all: a conflicting non-interactive rebase used to report `Rebase failed: …` and stop
-    /// there, leaving `.git/rebase-merge/` on disk with **nothing in this app able to continue,
-    /// skip or abort it**. It now stops in the same [`RebasePhase::Stopped`] the interactive path
-    /// uses, whose banner carries real `Continue`/`Skip`/`Abort` and `Resolve in the diff view`.
+    /// all: rebasing onto a commit used to report `Rebase failed: …` and stop there, leaving
+    /// `.git/rebase-merge/` on disk with **nothing in this app able to continue, skip or abort
+    /// it**. It now stops in [`RebasePhase::Stopped`], whose banner carries real
+    /// `Continue`/`Skip`/`Abort` and `Resolve in the diff view`.
     #[gpui::test]
     async fn rebase_onto_a_real_conflict_stops_in_the_recoverable_rebase_mode_not_a_dead_end(
         cx: &mut TestAppContext,
@@ -7209,8 +6608,13 @@ mod graph_remote_action_tests {
         git(local.path(), &["checkout", "main"]);
         commit(local.path(), "a.txt", "conflicting own change", "own work");
 
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(target_sha, cx);
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
         });
         cx.run_until_parked();
 
@@ -7260,8 +6664,9 @@ mod graph_remote_action_tests {
         );
     }
 
-    /// The non-interactive action must never start a second rebase over a live one - the first
-    /// one's banner is the only surface that can recover it.
+    /// Entering rebase mode must never start a second one over a live one - the first one's
+    /// banner is the only surface that can recover it. The row menu itself is unreachable while
+    /// rebase mode is showing, so this covers `enter_rebase_mode_inner`'s own backstop guard.
     #[gpui::test]
     async fn rebase_onto_refuses_while_a_rebase_mode_is_already_live(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
@@ -7270,9 +6675,19 @@ mod graph_remote_action_tests {
         let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
         git(local.path(), &["checkout", "main"]);
         commit(local.path(), "a.txt", "conflicting own change", "own work");
+        let other_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        // Both row indices resolved up front, off the same loaded graph - the stopped rebase
+        // below can genuinely reload and renumber rows underneath them.
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
+        let other_row = graph_row_index_of(&app, cx, &other_sha);
 
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(target_sha.clone(), cx);
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
         });
         cx.run_until_parked();
         let onto_before = app.read_with(cx, |app, _| {
@@ -7283,10 +6698,9 @@ mod graph_remote_action_tests {
                 .expect("stopped rebase mode is live")
         });
 
-        // A second click on a different commit while the first is still stopped.
-        let other_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        // A second entry on a different commit while the first is still stopped.
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(other_sha, cx);
+            app.enter_rebase_mode(other_row, cx);
         });
         cx.run_until_parked();
 
@@ -8141,608 +7555,6 @@ mod graph_virtualization_tests {
             delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
             modifiers: gpui::Modifiers::default(),
             touch_phase: gpui::TouchPhase::Moved,
-        });
-    }
-}
-
-/// GitHub issue #241's two new graph actions: "Merge into `<base>`" (the Branches panel) and
-/// "Start agent from this commit" (the row menu).
-///
-/// The merge tests exist to prove one specific thing above all: this action does **not** own any
-/// merge or conflict machinery of its own. Every assertion about a conflict below is an assertion
-/// about `AdeApp::merge_flow` - the app's one pre-existing merge flow, whose `Conflicted` state is
-/// what `crate::merge::render::AdeApp::render_merge_flow_surface` (the existing conflict
-/// resolver) renders from. If this action ever grew a second conflict surface, these tests would
-/// still pass while the resolver sat empty, so they also assert the flow is filed under the real
-/// agent whose work surface actually draws it.
-#[cfg(test)]
-mod graph_merge_and_start_agent_tests {
-    use crate::graph_view::state::{graph_merge_gate, GraphMergeGate};
-    use crate::merge::state::MergeFlowState;
-    use crate::root::focus::palette_focus_tests;
-    use crate::work_surface::agents::ProcessKind;
-    use gpui::TestAppContext;
-    use std::path::{Path, PathBuf};
-    use tempfile::TempDir;
-
-    use super::{graph_new_worktree_dir_name, graph_new_worktree_parent};
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
-    /// A real linked worktree on its own new branch - the same idiom `wt_core::merge` and
-    /// `crate::merge::flow`'s own test modules use.
-    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
-        let container = TempDir::new().expect("tempdir");
-        let path = container.path().join(name);
-        drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
-        path
-    }
-
-    // ------------------------------------------------------------------ pure placement helpers
-
-    /// A repository that already has linked worktrees has already answered "where do worktrees
-    /// go" - that observed answer is used rather than a guess.
-    #[test]
-    fn new_worktree_parent_follows_the_layout_the_repository_already_uses() {
-        let repo = PathBuf::from("/home/u/code/jerry");
-        let existing = vec![
-            PathBuf::from("/home/u/worktrees/jerry-a"),
-            PathBuf::from("/home/u/worktrees/jerry-b"),
-        ];
-        assert_eq!(
-            graph_new_worktree_parent(&repo, &existing),
-            Some(PathBuf::from("/home/u/worktrees")),
-            "a repository whose worktrees all already live in one directory must keep putting \
-             them there, not somewhere this code picked"
-        );
-    }
-
-    #[test]
-    fn new_worktree_parent_falls_back_to_the_repo_parent_when_there_is_no_layout_to_follow() {
-        let repo = PathBuf::from("/home/u/code/jerry");
-        assert_eq!(
-            graph_new_worktree_parent(&repo, &[]),
-            Some(PathBuf::from("/home/u/code")),
-            "with no existing linked worktree there is nothing to observe - git's own most \
-             common layout is the honest fallback, and the prompt shows it before creating \
-             anything"
-        );
-    }
-
-    /// Scattered parents have no single observed answer, so the fallback applies rather than an
-    /// arbitrary pick among them.
-    #[test]
-    fn new_worktree_parent_does_not_pick_arbitrarily_between_several_layouts() {
-        let repo = PathBuf::from("/home/u/code/jerry");
-        let scattered = vec![
-            PathBuf::from("/home/u/worktrees/jerry-a"),
-            PathBuf::from("/tmp/elsewhere/jerry-b"),
-        ];
-        assert_eq!(
-            graph_new_worktree_parent(&repo, &scattered),
-            Some(PathBuf::from("/home/u/code"))
-        );
-    }
-
-    /// A branch name is not a directory name. `feat/x` must not create a nested `feat/`
-    /// directory, and nothing in a branch name may traverse out of the parent directory.
-    #[test]
-    fn new_worktree_dir_name_flattens_a_branch_name_into_one_safe_component() {
-        let repo = PathBuf::from("/home/u/code/jerry");
-        let name = graph_new_worktree_dir_name(&repo, "feat/multipart-upload");
-        assert_eq!(name, "jerry-feat-multipart-upload");
-        assert_eq!(
-            Path::new(&name).components().count(),
-            1,
-            "the result must be exactly one path component: {name}"
-        );
-
-        for hostile in [
-            "../../etc",
-            "a/../../b",
-            "..",
-            ".",
-            "with space",
-            "c:weird",
-            ".hidden",
-        ] {
-            let name = graph_new_worktree_dir_name(&repo, hostile);
-            let path = Path::new(&name);
-            assert_eq!(
-                path.components().count(),
-                1,
-                "branch name {hostile:?} produced a multi-component directory name {name:?}"
-            );
-            assert!(
-                !name.contains('/') && !name.contains('\\'),
-                "branch name {hostile:?} produced a separator in {name:?}"
-            );
-            assert!(
-                !name.starts_with('.'),
-                "branch name {hostile:?} produced a hidden directory {name:?}"
-            );
-            assert!(
-                !PathBuf::from("/home/u/worktrees")
-                    .join(&name)
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir)),
-                "branch name {hostile:?} escaped its parent directory via {name:?}"
-            );
-        }
-    }
-
-    /// Two repositories sharing one worktree parent directory must not collide on a common
-    /// branch name.
-    #[test]
-    fn new_worktree_dir_name_is_scoped_by_the_repository_it_belongs_to() {
-        assert_ne!(
-            graph_new_worktree_dir_name(Path::new("/a/jerry"), "fix"),
-            graph_new_worktree_dir_name(Path::new("/a/other"), "fix"),
-        );
-    }
-
-    // ------------------------------------------------------------------------ merge into base
-
-    /// Sets up a repo whose `main` is the base branch, plus a linked `feature` worktree with one
-    /// commit on it and a real agent tab, and points the app at that worktree the way selecting
-    /// it in the rail does.
-    #[allow(clippy::type_complexity)]
-    fn app_focused_on_a_feature_worktree(
-        cx: &mut TestAppContext,
-    ) -> (
-        TempDir,
-        PathBuf,
-        gpui::Entity<crate::root::AdeApp>,
-        &mut gpui::VisualTestContext,
-        crate::work_surface::agents::AgentId,
-    ) {
-        let repo = init_repo();
-        let feature = add_worktree(repo.path(), "feature", "feature-wt");
-        std::fs::write(feature.join("new.txt"), "from feature\n").expect("write");
-        git(&feature, &["add", "new.txt"]);
-        git(&feature, &["commit", "-m", "feature commit"]);
-
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let agent_id = app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                feature.clone(),
-                app.settings.appearance.terminal_font_size,
-                app.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree_by_path(&feature, window, cx);
-        });
-        cx.run_until_parked();
-        (repo, feature, app, cx, agent_id)
-    }
-
-    #[gpui::test]
-    async fn merge_into_base_really_merges_the_focused_worktrees_branch(cx: &mut TestAppContext) {
-        let (repo, _feature, app, cx, agent_id) = app_focused_on_a_feature_worktree(cx);
-
-        app.read_with(cx, |app, cx| {
-            assert!(
-                graph_merge_gate(&app.graph_merge_facts(cx)).is_ready(),
-                "a clean feature worktree with an idle shell tab must satisfy every precondition"
-            );
-        });
-
-        app.update_in(cx, |app, window, cx| {
-            app.request_graph_merge_into_base(window, cx);
-        });
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            let flow = app
-                .merge_flow
-                .as_ref()
-                .expect("the graph action must have started the app's own merge flow");
-            assert_eq!(
-                flow.agent_id, agent_id,
-                "the flow must be filed under the real agent whose work surface renders the \
-                 resolver, or a conflict would be invisible"
-            );
-            match &flow.state {
-                MergeFlowState::Clean { base_branch, .. } => {
-                    assert_eq!(base_branch, "main")
-                }
-                _ => panic!(
-                    "expected a real clean merge - the graph action must produce the app's own \
-                     merge flow state, not a state of its own"
-                ),
-            }
-        });
-
-        // Real, not staged-in-name-only: the merge is genuinely in progress in the base worktree.
-        assert!(
-            wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
-            "a real `git merge --no-commit` must have run in the base worktree"
-        );
-
-        // The merged content is genuinely staged in the base worktree, waiting for the existing
-        // footer's own `Complete merge` - this action deliberately owns no completion path of its
-        // own (`crate::merge::flow`'s `complete_merge_flow` is `pub(in crate::merge)`, and stays
-        // that way: the graph must not be able to finish a merge behind the resolver's back).
-        assert!(
-            repo.path().join("new.txt").is_file(),
-            "the merged content must genuinely be present on disk in the base worktree"
-        );
-    }
-
-    /// **The load-bearing test for "conflicts route to the existing resolver".**
-    ///
-    /// `MergeFlowState::Conflicted` is precisely the state
-    /// `crate::merge::render::AdeApp::render_merge_flow_surface` draws the conflict resolver
-    /// from, and `crate::work_surface::render` only draws it for the agent whose id the flow
-    /// carries - so asserting both is asserting the handoff, not just that a conflict happened.
-    #[gpui::test]
-    async fn a_conflicted_merge_hands_off_to_the_existing_conflict_resolver(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = init_repo();
-        let feature = add_worktree(repo.path(), "feature", "feature-wt");
-        // Both branches edit the same file, in different ways - a real content conflict.
-        std::fs::write(feature.join("base.txt"), "feature side\n").expect("write");
-        git(&feature, &["add", "base.txt"]);
-        git(&feature, &["commit", "-m", "feature edit"]);
-        std::fs::write(repo.path().join("base.txt"), "main side\n").expect("write");
-        git(repo.path(), &["add", "base.txt"]);
-        git(repo.path(), &["commit", "-m", "main edit"]);
-
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let agent_id = app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                feature.clone(),
-                app.settings.appearance.terminal_font_size,
-                app.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree_by_path(&feature, window, cx);
-        });
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| {
-            app.request_graph_merge_into_base(window, cx);
-        });
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            let flow = app.merge_flow.as_ref().expect("merge flow");
-            assert_eq!(
-                flow.agent_id, agent_id,
-                "the resolver only renders for the agent the flow names - a conflict filed under \
-                 anything else would be unreachable"
-            );
-            match &flow.state {
-                MergeFlowState::Conflicted {
-                    base_branch, files, ..
-                } => {
-                    assert_eq!(base_branch, "main");
-                    assert_eq!(
-                        files.len(),
-                        1,
-                        "the resolver must be handed the real conflicted file set"
-                    );
-                    match &files[0] {
-                        wt_core::merge::ConflictedPath::Text(file) => {
-                            assert!(
-                                file.remaining_conflicts() > 0,
-                                "the resolver must receive a real, parsed, still-unresolved \
-                                 conflict to work on"
-                            );
-                        }
-                        other => panic!("expected a real text conflict, got {other:?}"),
-                    }
-                }
-                _ => panic!(
-                    "expected a real conflicted merge in the app's own merge flow - anything \
-                     else means the conflict did not reach the existing resolver"
-                ),
-            }
-        });
-
-        // The repository really is in the mid-merge state the existing resolver operates on -
-        // `MERGE_HEAD` present, real conflict markers on disk - which is what makes its own
-        // `Take left`/`Take right`/`Take both`/`Complete merge`/`Abort merge` applicable here
-        // without a single line of new conflict handling.
-        assert!(
-            wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
-            "the base worktree must genuinely be mid-merge for the resolver to work in"
-        );
-        let on_disk = std::fs::read_to_string(repo.path().join("base.txt")).expect("read");
-        assert!(
-            on_disk.contains("<<<<<<<") && on_disk.contains(">>>>>>>"),
-            "the resolver reads real conflict markers off disk - got {on_disk:?}"
-        );
-    }
-
-    /// A blocked precondition must never start a merge, and must say why rather than looking like
-    /// a dead click - the design's own "with the reason on the button itself" rule.
-    #[gpui::test]
-    async fn uncommitted_files_block_the_merge_and_report_the_real_reason(cx: &mut TestAppContext) {
-        let (_repo, feature, app, cx, _agent_id) = app_focused_on_a_feature_worktree(cx);
-        std::fs::write(feature.join("dirty.txt"), "uncommitted\n").expect("write");
-        // Re-read the focused worktree's own diff/dirty set, exactly as the file watcher does
-        // when something changes on disk - `diff_root`, not the repo root: the merge acts on the
-        // focused worktree, so those are the uncommitted files that matter.
-        app.update(cx, |app, cx| {
-            let root = app.diff_root.clone();
-            app.load_diff(root, cx);
-        });
-        cx.run_until_parked();
-
-        let reason = app.read_with(cx, |app, cx| {
-            graph_merge_gate(&app.graph_merge_facts(cx))
-                .reason()
-                .map(str::to_string)
-        });
-        assert_eq!(
-            reason.as_deref(),
-            Some("1 file still uncommitted"),
-            "the gate must name the real uncommitted count, through the pluralisation helper"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.request_graph_merge_into_base(window, cx);
-        });
-        cx.run_until_parked();
-
-        assert!(
-            app.read_with(cx, |app, _| app.merge_flow.is_none()),
-            "a blocked precondition must start no merge at all"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("1 file still uncommitted".to_string()),
-            "a refused click must report the same real reason the control shows, never nothing"
-        );
-    }
-
-    /// The action's target is the *focused worktree's* branch, so it must refuse outright while
-    /// the base branch itself is what is focused - `wt_core::merge::attempt_merge` would only
-    /// return `MergeSourceIsBaseBranch` after the fact.
-    #[gpui::test]
-    async fn merging_the_base_branch_into_itself_is_refused_before_anything_runs(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                app.settings.appearance.terminal_font_size,
-                app.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        app.update_in(cx, |app, window, cx| {
-            app.request_graph_merge_into_base(window, cx);
-        });
-        cx.run_until_parked();
-
-        assert!(
-            app.read_with(cx, |app, _| app.merge_flow.is_none()),
-            "no merge may start while the focused worktree is on the base branch"
-        );
-        assert!(
-            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
-            "nothing may have touched the repository"
-        );
-    }
-
-    // -------------------------------------------------------------- start agent from a commit
-
-    /// The whole action, end to end: a real `git worktree add -b <name> -- <path> <sha>` rooted
-    /// at the clicked commit, with a real agent tab in the result.
-    #[gpui::test]
-    async fn start_agent_from_this_commit_really_creates_a_worktree_at_that_commit(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = init_repo();
-        let root_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        // History moves on past the commit the user will click, so "rooted at that commit" is a
-        // claim with real content: the new worktree must not simply be at `HEAD`.
-        std::fs::write(repo.path().join("later.txt"), "later\n").expect("write");
-        git(repo.path(), &["add", "later.txt"]);
-        git(repo.path(), &["commit", "-m", "a later commit"]);
-
-        let parent = TempDir::new().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        app.update(cx, |app, cx| {
-            app.request_graph_start_agent_from_commit(
-                root_sha.clone(),
-                "spike/from-root".to_string(),
-                Some(parent.path().to_path_buf()),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        let expected = parent
-            .path()
-            .join(graph_new_worktree_dir_name(repo.path(), "spike/from-root"));
-        assert!(
-            expected.is_dir(),
-            "a real worktree directory must exist at the resolved destination: {expected:?}"
-        );
-        assert_eq!(
-            git_output(&expected, &["rev-parse", "HEAD"]),
-            root_sha,
-            "the new worktree must be rooted at the clicked commit, not at HEAD"
-        );
-        assert_eq!(
-            git_output(&expected, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "spike/from-root",
-            "the new worktree must be on the branch the user named"
-        );
-        assert!(
-            !expected.join("later.txt").exists(),
-            "a worktree rooted at the earlier commit must not contain the later commit's file"
-        );
-
-        app.read_with(cx, |app, _| {
-            let canonical = std::fs::canonicalize(&expected).unwrap_or_else(|_| expected.clone());
-            assert!(
-                app.agents
-                    .iter()
-                    .any(|agent| agent.cwd == expected || agent.cwd == canonical),
-                "a real agent tab must have been spawned in the new worktree - the affordance \
-                 ships with the behaviour or not at all"
-            );
-            assert_eq!(
-                app.graph_state.status_message.as_deref(),
-                Some("Start agent"),
-                "a success must be reported as a real success"
-            );
-        });
-    }
-
-    /// A real failure (here: a branch name that already exists) must surface git's own error and
-    /// leave nothing half-created - the same honesty every other row-menu mutation has.
-    #[gpui::test]
-    async fn start_agent_from_this_commit_surfaces_a_real_git_failure(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let root_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        git(repo.path(), &["branch", "taken"]);
-
-        let parent = TempDir::new().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
-        app.update(cx, |app, cx| {
-            app.request_graph_start_agent_from_commit(
-                root_sha,
-                "taken".to_string(),
-                Some(parent.path().to_path_buf()),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
-        assert!(
-            status
-                .as_deref()
-                .is_some_and(|text| text.starts_with("Start agent failed:")),
-            "a real git failure must be reported, never a fabricated success - got {status:?}"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.agents.iter().count()),
-            agents_before,
-            "a failed worktree creation must spawn no agent"
-        );
-        assert!(
-            !app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
-            "the in-flight guard must clear even on a real failure"
-        );
-    }
-
-    /// The prompt is what supplies the destination; with none resolvable the action must refuse
-    /// and say so rather than inventing a directory.
-    #[gpui::test]
-    async fn start_agent_from_this_commit_refuses_without_a_resolved_destination(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = init_repo();
-        let root_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        app.update(cx, |app, cx| {
-            app.request_graph_start_agent_from_commit(root_sha, "b".to_string(), None, cx);
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("Start agent failed: no directory to create the worktree in".to_string()),
-        );
-    }
-
-    /// The facts the render-time gate reads must be the real ones, so the control and the action
-    /// can never disagree about whether a merge may run.
-    #[gpui::test]
-    async fn the_merge_control_is_gated_by_the_same_facts_the_action_re_checks(
-        cx: &mut TestAppContext,
-    ) {
-        let (_repo, _feature, app, cx, _agent_id) = app_focused_on_a_feature_worktree(cx);
-        app.read_with(cx, |app, cx| {
-            let facts = app.graph_merge_facts(cx);
-            assert_eq!(facts.head_branch.as_deref(), Some("feature"));
-            assert_eq!(facts.base_branch.as_deref(), Some("main"));
-            assert_eq!(facts.uncommitted_files, 0);
-            assert_eq!(facts.live_agents, 0);
-            assert!(facts.has_agent_tab);
-            assert!(!facts.merge_already_running);
-            assert!(matches!(
-                graph_merge_gate(&facts),
-                GraphMergeGate::Ready { .. }
-            ));
         });
     }
 }
