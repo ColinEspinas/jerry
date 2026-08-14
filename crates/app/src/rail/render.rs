@@ -773,6 +773,10 @@ impl AdeApp {
                     .child(
                         div()
                             .id("agent-rail-list")
+                            // Lets a real test measure the scroller's own painted box - the rail
+                            // menus' "rendered outside the scrolling list" guarantee (GitHub
+                            // issue #290) is only checkable against it.
+                            .debug_selector(|| "agent-rail-list".to_string())
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -858,6 +862,12 @@ impl AdeApp {
     /// section-title label - this used to say `AGENTS` (a leftover from the pre-R12 flat rail,
     /// carried through a rename to fix its vocabulary without checking it against this
     /// requirement) but the spec is explicit that the header has nothing but the button itself.
+    ///
+    /// It now also carries the `⋯` overflow (GitHub issue #290). That control's designed home is
+    /// the sidebar strip GitHub issue #291 builds, which this app does not have yet; the rail
+    /// header is the one existing piece of rail chrome that already holds a control, so it is
+    /// where the button lives until #291 moves it. Nothing but this one `.child` has to change
+    /// when it does - the menu itself is anchored off the button's own captured rect.
     pub(in crate::rail) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("rail-header")
@@ -865,11 +875,13 @@ impl AdeApp {
             .flex_none()
             .items_center()
             .justify_end()
+            .gap(px(6.0))
             .px(px(10.0))
             .h(theme::band::CHROME_HEADER)
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
             .child(self.render_new_agent_button(cx))
+            .child(self.render_rail_overflow_button(cx))
     }
 
     /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
@@ -1586,9 +1598,31 @@ impl AdeApp {
             .when(!is_selected, |el| {
                 el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
             })
-            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.select_worktree_by_path(&path, window, cx);
+            .on_click(cx.listener({
+                let path = path.clone();
+                move |this, _event: &ClickEvent, window, cx| {
+                    this.select_worktree_by_path(&path, window, cx);
+                }
             }))
+            // The worktree row's context menu (GitHub issue #290) - anchored to the pointer, not
+            // to the row (`STAGE-A-CHANGELOG.md` §4u: "Rows are 27px and the pointer is what the
+            // user aimed with"), and painted at the root, outside this scroller (§4).
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener({
+                    let path = path.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_rail_row_menu(
+                            crate::rail::menu::RailMenuTarget::Worktree(path.clone()),
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .child(caret)
             .child(branch_div)
             .when(!has_agents, |el| {
@@ -1705,7 +1739,13 @@ impl AdeApp {
 
         div()
             .id(("agent-row", id))
-            .debug_selector(move || format!("agent-row-{id:?}"))
+            // Lets a real test click this exact row at its real painted position
+            // (`gpui::VisualTestContext::debug_bounds`), the same hook the worktree row above it
+            // carries - used both by the agent row's own context menu (GitHub issue #290), which
+            // has no other honest way of being driven from a test, and by the indent geometry
+            // test below. `crate::rail::menu_render` builds the same string for its own
+            // anchoring, so the two must stay one format.
+            .debug_selector(move || format!("agent-row-{id}"))
             .cursor_pointer()
             .flex()
             .pl(px(13.0))
@@ -1722,10 +1762,29 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_agent(id, window, cx);
             }))
+            // The agent row's context menu (GitHub issue #290). It sits on this outer wrapper -
+            // the same element `Jerry.dc.html` hangs its own `onContextMenu="{{ a.ctx }}"` on -
+            // so the whole row, indent and connector included, is a right-click target rather
+            // than just the content box. `stop_propagation` keeps the event from also reaching an
+            // ancestor's handler and replacing this menu with a worktree one - the same guard the
+            // file tree's nested rows use.
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_rail_row_menu(
+                        crate::rail::menu::RailMenuTarget::Agent(id),
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .child(div().flex_none().w(px(1.0)).bg(theme::border::ZONE))
             .child(
                 div()
-                    .debug_selector(move || format!("agent-row-content-{id:?}"))
+                    .debug_selector(move || format!("agent-row-content-{id}"))
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -4934,8 +4993,8 @@ mod rail_rev6_render_tests {
                 .expect("the real failed agent this helper seeds, in its own worktree")
                 .id
         });
-        let row_selector = selector(format!("agent-row-{agent_id:?}"));
-        let content_selector = selector(format!("agent-row-content-{agent_id:?}"));
+        let row_selector = selector(format!("agent-row-{agent_id}"));
+        let content_selector = selector(format!("agent-row-content-{agent_id}"));
 
         let row = cx
             .debug_bounds(row_selector)

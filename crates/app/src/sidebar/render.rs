@@ -3,8 +3,8 @@ use crate::keymap;
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
-    hover_bg, menu_popover_chrome, render_committed_tag, render_keycap_row,
-    render_menu_group_divider, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_committed_tag, render_keycap_row, render_sidebar_message,
+    render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -2547,34 +2547,19 @@ enum TreeRow {
 }
 
 impl AdeApp {
-    /// The file tree's right-click context menu popover (GitHub issue #19 §1).
+    /// The file tree's right-click context menu popover (GitHub issue #19 §1) - the app's one
+    /// shared menu ([`AdeApp::render_menu_overlay`]), given the file tree's own rows.
     ///
-    /// The same real overlay shape `crate::work_surface::render::AdeApp::render_plus_menu`
-    /// established for this app's other floating popover - a full-window transparent scrim whose
-    /// `on_click` dismisses ("click-away dismisses"), plus an absolutely-positioned panel that
-    /// stops that click from bubbling. Zed's own `ui::ContextMenu` is not reachable here: it
-    /// lives in Zed's `ui` crate, which this workspace deliberately doesn't depend on (only
-    /// `gpui`/`gpui_platform`).
+    /// Everything about *how* it paints, dismisses, occludes and flips lives there since GitHub
+    /// issue #290 promoted this menu into the component the rail's row menus and the `⋯` overflow
+    /// draw through too; what is left here is this surface's own three answers: which rows, where
+    /// they came from, and what a click runs.
     ///
     /// The panel's origin is [`AdeApp::tree_context_menu`]'s already-clamped one, resolved at
     /// open time from the real click and the real `Window::bounds()` - so the menu near a window
     /// edge is repositioned once, not re-solved (and possibly moved) on every frame it's open.
-    ///
-    /// ## The scrim genuinely blocks what is behind it
-    ///
-    /// `.occlude()` (`gpui::InteractiveElement::occlude`, which sets
-    /// `HitboxBehavior::BlockMouse` - `vendor/zed/crates/gpui/src/window.rs`'s `hit_test` stops
-    /// walking hitboxes at the first one carrying it) is what makes this a real modal layer
-    /// rather than a decorative one. Without it the scrim's `on_click` fired *and* the file-tree
-    /// row underneath it took the same click - so dismissing the menu also opened whatever file
-    /// happened to be under the cursor - and every row under the pointer still painted its
-    /// `:hover` fill and its tooltip, because those read `Hitbox::is_hovered` directly and never
-    /// consulted the click handlers at all. A `cx.stop_propagation()` in the scrim's own handler
-    /// could only ever have fixed the click half; hover styling is not an event. This app already
-    /// used the identical mechanism for the pane resize handles (`crate::root::resize`).
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
-        let macos = self.window_controls_style().is_macos();
         let rows = menu
             .as_ref()
             .map(|menu| context_menu::menu_rows(&menu.target, self.tree_clipboard.is_some()))
@@ -2582,150 +2567,17 @@ impl AdeApp {
         let origin_x = menu.as_ref().map(|menu| menu.origin_x).unwrap_or(0.0);
         let origin_y = menu.as_ref().map(|menu| menu.origin_y).unwrap_or(0.0);
 
-        div()
-            .id("tree-context-menu-scrim")
-            .absolute()
-            // Starts *below* the title bar, exactly like `crate::palette::render`'s own scrim
-            // does and for the same reason - now a real one, since this layer `.occlude()`s.
-            // A full-window occluding scrim swallows the window's own close/minimise/maximise
-            // caption buttons and the title bar's drag region, so the window could not be closed
-            // or moved while it was up. Reproduced against the real caption button by this
-            // change's own adversarial audit.
-            .top(theme::band::TITLE_BAR)
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0))
-            .occlude()
-            .bg(work_surface::TRANSPARENT)
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.close_tree_context_menu(cx);
-            }))
-            // A right-click on the scrim must dismiss too - otherwise the next right-click
-            // anywhere would land on the scrim and do nothing at all, which reads as a frozen
-            // app rather than as a menu that is still open.
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
-                    this.close_tree_context_menu(cx);
-                }),
-            )
-            .child(
-                menu_popover_chrome(
-                    div()
-                        .id("tree-context-menu")
-                        .debug_selector(|| "tree-context-menu".to_string())
-                        .absolute()
-                        .left(px(origin_x))
-                        // `origin_y` is window-space (it is clamped against `Window::bounds()`,
-                        // from a window-space `MouseDownEvent::position`), but this panel is
-                        // positioned relative to the scrim - which starts at
-                        // `theme::band::TITLE_BAR`, not at the window top. Without this
-                        // subtraction the menu paints a whole title bar too low.
-                        // `context_menu_paints_at_its_clamped_window_space_origin` is the
-                        // assertion that keeps the two in step.
-                        .top(px(origin_y) - theme::band::TITLE_BAR)
-                        .w(px(context_menu::MENU_WIDTH))
-                        .py(px(context_menu::MENU_VERTICAL_PADDING / 2.0)),
-                    theme::shadow::MENU,
-                )
-                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                }))
-                .children(rows.into_iter().map(|row| match row {
-                    context_menu::MenuRow::Item(item) => {
-                        self.render_tree_context_menu_row(item, macos, cx)
-                    }
-                    context_menu::MenuRow::Separator => render_menu_group_divider(),
-                })),
-            )
-    }
-
-    /// One context-menu row. A disabled row is still drawn (so the menu's shape doesn't jump
-    /// between right-clicks) but carries no click handler at all - not a handler that returns
-    /// early, which would be a row that looks clickable and silently isn't.
-    ///
-    /// Speaks this app's own established dropdown-row language rather than one invented here.
-    /// Every value below is `crate::work_surface::render::render_dropdown_menu_row`'s - the row
-    /// shared by the tab strip's `+` menu and the title bar's File/Edit/View/Agent/Help menus,
-    /// and the closest thing this app has to a specified menu row (the design handoff's
-    /// `revision/CHANGELOG.md` specifies that popover; it has no context-menu spec of its own).
-    /// That function is deliberately *not* reused: its row is a fixed chip + label + sub-label +
-    /// keycap quad, and a file-tree context menu has no honest chip glyph or secondary text for
-    /// two of those four slots.
-    ///
-    /// Four values were off that language, and the first of them was the reported "the context
-    /// menu has no hover state" bug outright:
-    ///
-    /// - **hover fill** was `theme::surface::ROW_HOVER` (`#15181b`) - the *exact* hex of
-    ///   `theme::surface::PALETTE`, this panel's own background - so hovering a row painted
-    ///   nothing at all. `theme::surface::MENU_ROW_HOVER` (`#1d2226`) is the token that
-    ///   exists for this; `theme::palette::ROW_HOVER`'s own docs record the identical trap for
-    ///   the palette's rows.
-    /// - **label colour and size** were `theme::text::BODY` at 11.0px, against the dropdown row's
-    ///   `theme::text::HEADING` at 11.5px medium.
-    /// - **gap** was 8px, against 9.
-    /// - **disabled rows** were `theme::text::GHOST` and kept `cursor_pointer`'s absence but not
-    ///   the explicit `cursor_default()`; the dropdown row uses `theme::text::GHOSTER` and sets
-    ///   the cursor, so a row that cannot be run does not advertise itself as clickable.
-    ///
-    /// The destructive tint stays `theme::status::FAIL`, unchanged - `theme::button::DANGER_FG`
-    /// is this app's destructive *button* pair (the rail's prune control, and now the delete
-    /// confirmation's own confirm button), not its menu-row accent.
-    fn render_tree_context_menu_row(
-        &self,
-        item: context_menu::MenuItem,
-        macos: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let action = item.action;
-        let keycaps = action
-            .keystroke_spec()
-            .map(|spec| keymap::resolve_combo(spec, macos))
-            .unwrap_or_default();
-        let color = if !item.enabled {
-            theme::text::GHOSTER
-        } else if action.is_destructive() {
-            theme::status::FAIL
-        } else {
-            theme::text::HEADING
-        };
-
-        let mut row = div()
-            .id(gpui::SharedString::from(format!(
-                "tree-context-menu-{}",
-                action.label()
-            )))
-            .debug_selector(move || format!("tree-context-menu-{}", action.label()))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(9.0))
-            .w_full()
-            .h(px(context_menu::MENU_ROW_HEIGHT))
-            .px(px(10.0))
-            .font(font(theme::font::SANS))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(self.ui_text_size(11.5))
-            .text_color(color)
-            .child(div().flex_1().min_w_0().truncate().child(action.label()))
-            .child(render_keycap_row(&keycaps, KeycapSize::Hint));
-
-        if item.enabled {
-            row = row
-                .cursor_pointer()
-                .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.run_tree_menu_action(action, window, cx);
-                }));
-        } else {
-            row = row.cursor_default();
-            if let Some(reason) = item.disabled_reason {
-                row = row.tooltip(text_tooltip(reason));
-            }
-        }
-
-        row.into_any_element()
+        self.render_menu_overlay(
+            crate::menu::render::MenuOverlay {
+                id: "tree-context-menu",
+                origin_x,
+                origin_y,
+                rows,
+                on_pick: |this, action, window, cx| this.run_tree_menu_action(action, window, cx),
+                on_dismiss: |this, cx| this.close_tree_context_menu(cx),
+            },
+            cx,
+        )
     }
 }
 

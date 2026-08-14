@@ -528,7 +528,7 @@ impl AdeApp {
     ///
     /// Two things `open_tree_context_menu` also does that a first draft of this method missed
     /// (an adversarial audit of this exact change caught both):
-    /// - **Clamped inside the window**, via the same `context_menu::clamp_menu_origin` the tree
+    /// - **Clamped inside the window**, via the same `crate::menu::model::clamp_menu_origin` the tree
     ///   menu uses, rather than painting off-screen for any row in the lower half of a
     ///   reasonably tall list - `theme::graph::ROW_MENU_WIDTH`/`ROW_MENU_HEIGHT` are this menu's
     ///   own real, fixed painted size (its content never varies).
@@ -548,7 +548,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let viewport = window.bounds().size;
-        let (clamped_x, clamped_y) = crate::sidebar::context_menu::clamp_menu_origin(
+        let (clamped_x, clamped_y) = crate::menu::model::clamp_menu_origin(
             f32::from(origin_x),
             f32::from(origin_y),
             f32::from(theme::graph::ROW_MENU_WIDTH),
@@ -585,7 +585,7 @@ impl AdeApp {
     /// the real `event.position` of the right-click that opened it (GitHub issue #241). Mirrors
     /// [`Self::open_graph_row_menu_at`] point for point, including its two
     /// adversarial-audit-found requirements:
-    /// - **Clamped inside the window**, via the same `context_menu::clamp_menu_origin`, against
+    /// - **Clamped inside the window**, via the same `crate::menu::model::clamp_menu_origin`, against
     ///   this menu's own real painted size (`theme::graph::BRANCH_MENU_WIDTH`/`BRANCH_MENU_HEIGHT`,
     ///   pinned by a test); the Branches panel sits at the window's right edge, so an unclamped
     ///   popover would run straight off it for *every* row.
@@ -610,7 +610,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let viewport = window.bounds().size;
-        let (clamped_x, clamped_y) = crate::sidebar::context_menu::clamp_menu_origin(
+        let (clamped_x, clamped_y) = crate::menu::model::clamp_menu_origin(
             f32::from(origin_x),
             f32::from(origin_y),
             f32::from(theme::graph::BRANCH_MENU_WIDTH),
@@ -4033,7 +4033,7 @@ mod graph_row_menu_tests {
     }
 
     /// `theme::graph::ROW_MENU_HEIGHT` is a hand-measured constant (this menu's content is fixed,
-    /// so unlike `crate::sidebar::context_menu::menu_height` it has no analytical formula to
+    /// so unlike `crate::menu::model::menu_height` it has no analytical formula to
     /// compute it from - see that constant's own docs) that `AdeApp::open_graph_row_menu_at`'s
     /// edge clamp relies on being accurate. If the menu's real content ever changes (a row added
     /// or removed, a header renamed to wrap onto two lines), this is what catches the constant
@@ -4215,7 +4215,7 @@ mod graph_row_menu_tests {
         let unclamped_x =
             scrolled_bounds.origin.x + scrolled_bounds.size.width - theme::graph::ROW_MENU_WIDTH;
         let unclamped_y = scrolled_bounds.origin.y + scrolled_bounds.size.height + px(2.0);
-        let (expected_x, expected_y) = crate::sidebar::context_menu::clamp_menu_origin(
+        let (expected_x, expected_y) = crate::menu::model::clamp_menu_origin(
             f32::from(unclamped_x),
             f32::from(unclamped_y),
             f32::from(theme::graph::ROW_MENU_WIDTH),

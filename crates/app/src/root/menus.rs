@@ -23,7 +23,7 @@
 
 use super::*;
 
-/// Every real floating menu/dropdown surface in the app - the nine built on
+/// Every real floating menu/dropdown surface in the app - the eleven built on
 /// [`crate::root::widgets::menu_popover_chrome`].
 ///
 /// Deliberately *not* including the command palette, the "New file" prompt, or the Settings
@@ -65,6 +65,16 @@ pub(crate) enum MenuSurface {
     /// [`crate::root::widgets::menu_popover_chrome`] like all the others, so it belongs to the
     /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
     ShellSuggestions,
+    /// The rail's worktree/agent row right-click menu (GitHub issue #290) -
+    /// [`AdeApp::rail_row_menu`]. The first menu in the rail at all; it joins the invariant here
+    /// rather than owning a dismissal rule of its own, exactly like every surface above it.
+    RailRow,
+    /// The rail's `⋯` overflow menu (GitHub issue #290) - [`AdeApp::rail_overflow_menu`]. A
+    /// separate surface from [`Self::RailRow`] for the same reason [`Self::GraphBranch`] is
+    /// separate from [`Self::GraphRow`]: the two are anchored differently (a button's rect vs the
+    /// pointer), open from different things, and must close each other exactly the way any other
+    /// two menus do.
+    RailOverflow,
     /// Settings › Notifications' per-event "choose a sound" dropdown (GitHub issue #226) -
     /// [`AdeApp::sound_picker_open`]. Same shape as [`Self::ShellSuggestions`] (a Settings-page
     /// click-away dropdown), keyed by which of the three sound events it's open for rather than a
@@ -77,7 +87,7 @@ impl MenuSurface {
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
     /// until it is really wired to real state - that pairing is what stops a new menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 9] = [
+    pub(crate) const ALL: [MenuSurface; 11] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
@@ -87,6 +97,8 @@ impl MenuSurface {
         MenuSurface::GraphBranch,
         MenuSurface::ShellSuggestions,
         MenuSurface::SoundPicker,
+        MenuSurface::RailRow,
+        MenuSurface::RailOverflow,
     ];
 }
 
@@ -104,6 +116,8 @@ impl AdeApp {
             MenuSurface::GraphBranch => self.graph_state.branch_menu_open.is_some(),
             MenuSurface::ShellSuggestions => self.shell_suggestions_open,
             MenuSurface::SoundPicker => self.sound_picker_open.is_some(),
+            MenuSurface::RailRow => self.rail_row_menu.is_some(),
+            MenuSurface::RailOverflow => self.rail_overflow_menu.is_some(),
         }
     }
 
@@ -132,6 +146,16 @@ impl AdeApp {
             }
             MenuSurface::ShellSuggestions => self.shell_suggestions_open = false,
             MenuSurface::SoundPicker => self.sound_picker_open = None,
+            // The two-click `Remove worktree…` confirmation belongs to *this* open menu instance
+            // and nothing else - a menu closed by any means at all (a click away, another menu
+            // opening, the window losing focus) must never leave a worktree armed for a one-click
+            // removal the next time it opens. `open_rail_row_menu` disarms on open too, for the
+            // paths that never route through here.
+            MenuSurface::RailRow => {
+                self.rail_row_menu = None;
+                self.remove_worktree_confirm_armed = None;
+            }
+            MenuSurface::RailOverflow => self.rail_overflow_menu = None,
         }
     }
 
@@ -206,6 +230,15 @@ mod menu_surface_tests {
         });
         app.shell_suggestions_open = true;
         app.sound_picker_open = Some(crate::sound::SoundEventKind::AppStart);
+        app.rail_row_menu = Some(crate::rail::menu::RailRowMenu {
+            target: crate::rail::menu::RailMenuTarget::Worktree(std::path::PathBuf::from("/wt")),
+            origin_x: 4.0,
+            origin_y: 4.0,
+        });
+        app.rail_overflow_menu = Some(crate::rail::menu::RailOverflowMenu {
+            origin_x: 4.0,
+            origin_y: 4.0,
+        });
     }
 
     #[gpui::test]

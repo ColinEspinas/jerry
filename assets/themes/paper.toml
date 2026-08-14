@@ -28,32 +28,33 @@ preview = ["#f4f1ea", "#e4e0d6", "#3f7a52", "#a8752a", "#3d6c9c"]
 # Backgrounds - every solid fill in the app, from the window itself down to popovers, hover
 # states and keycaps.
 [surface]
-window                = "#f0f1f4"  # window body
-window_border         = "#cfd4d8"
-title_bar             = "#eceef0"
-rail                  = "#edeff1"  # left rail + right panel
-center                = "#e8eaee"  # work surface
-pty                   = "#eff2f4"  # agent CLI + terminal
-header                = "#e9ecef"  # context bar, panel headers
-footer                = "#eaedf0"  # surface footers, status strips
-card                  = "#e1e6e9"  # composer, settings cards
-card_sunk             = "#e6eaed"  # card footers
-popover               = "#dee3e7"  # completion popup, hover card
-palette               = "#e4e7eb"
-scrim                 = "#fbfcfe"  # at 62% alpha behind the palette
-row_hover             = "#e4e7eb"
-row_hover_alt         = "#dbe0e3"  # hover on chrome buttons
-row_selected          = "#dce1e4"
-segment_track         = "#e1e5e8"
-segment_active        = "#ced4d9"
-keycap                = "#dfe3e7"
-keycap_hint           = "#e4e8ea"  # The hint-size keycap's own background
-chip_neutral          = "#d2d7db"
-current_line          = "#dee3e7"
-title_bar_close_hover = "#e04a4a"
-menu_row_hover        = "#d7dde1"
-tab_close_hover       = "#d1d6da"  # A file tab's close-affordance hover fill
-lsp_popover_footer    = "#e5e9eb"
+window                     = "#f0f1f4"  # window body
+window_border              = "#cfd4d8"
+title_bar                  = "#eceef0"
+rail                       = "#edeff1"  # left rail + right panel
+center                     = "#e8eaee"  # work surface
+pty                        = "#eff2f4"  # agent CLI + terminal
+header                     = "#e9ecef"  # context bar, panel headers
+footer                     = "#eaedf0"  # surface footers, status strips
+card                       = "#e1e6e9"  # composer, settings cards
+card_sunk                  = "#e6eaed"  # card footers
+popover                    = "#dee3e7"  # completion popup, hover card
+palette                    = "#e4e7eb"
+scrim                      = "#fbfcfe"  # at 62% alpha behind the palette
+row_hover                  = "#e4e7eb"
+row_hover_alt              = "#dbe0e3"  # hover on chrome buttons
+row_selected               = "#dce1e4"
+segment_track              = "#e1e5e8"
+segment_active             = "#ced4d9"
+keycap                     = "#dfe3e7"
+keycap_hint                = "#e4e8ea"  # The hint-size keycap's own background
+chip_neutral               = "#d2d7db"
+current_line               = "#dee3e7"
+title_bar_close_hover      = "#e04a4a"
+menu_row_hover             = "#d7dde1"
+menu_row_hover_destructive = "#f0dadc"
+tab_close_hover            = "#d1d6da"  # A file tab's close-affordance hover fill
+lsp_popover_footer         = "#e5e9eb"
 
 # The 1px rules that separate things - zone edges, card and popover outlines, and the
 # selected-row edge.

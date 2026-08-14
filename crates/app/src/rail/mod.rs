@@ -20,6 +20,10 @@
 //! - [`title_signal`] - the pure classifier turning an agent CLI's own terminal title into the
 //!   coarse busy/idle/needs-you signal [`status`] refines its quiescence heuristic with
 //!   (GitHub issue #239). No `gpui`, and no terminal types either.
+//! - [`menu`] - the pure row sets for the rail's worktree/agent context menus and the overflow
+//!   menu (GitHub issue #290), drawn through the app's one shared menu (`crate::menu`).
+//! - [`menu_render`] - the `impl AdeApp` half of those menus: opening one off a real
+//!   right-click, and running what its rows promise.
 //! - [`render`] - the real GPUI rail, its rows, hover affordances and click handlers, as
 //!   `impl AdeApp` methods.
 //!
@@ -42,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
+pub mod menu;
 pub mod repo;
 pub mod state;
 pub mod status;
@@ -49,4 +54,5 @@ pub mod title_signal;
 pub mod worktree_watch;
 pub mod worktrees;
 
+pub(crate) mod menu_render;
 pub(crate) mod render;

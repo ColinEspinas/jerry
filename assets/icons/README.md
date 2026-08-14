@@ -15,7 +15,7 @@ the upstream project's own `assets/bold/` tree.
 
 ## Weight
 
-All eleven files are the **bold** weight. `design_handoff_jerry_ade/revision 5/`'s
+All twelve files are the **bold** weight. `design_handoff_jerry_ade/revision 5/`'s
 `REVISION-2026-08-14.md` §8 states the rule verbatim:
 
 > **Weight:** `bold` at 15–17px (`regular`'s 1.5px stroke reads thin against `#5e646a`);
@@ -32,9 +32,10 @@ weight is a property of *this whole directory*, not of an individual file, and t
 icons up by the design handoff's own names (`tree-structure`, `caret-down`, ...). The file
 *contents* are untouched.
 
-## The eleven files, and the slot each one serves
+## The twelve files, and the slot each one serves
 
-Straight from `REVISION-2026-08-14.md` §8's mapping table:
+Straight from `REVISION-2026-08-14.md` §8's mapping table, plus the one glyph §4u names outside
+it (the overflow menu's Settings row):
 
 | Slot | File |
 |---|---|
@@ -49,6 +50,7 @@ Straight from `REVISION-2026-08-14.md` §8's mapping table:
 | count row: fold-all | `caret-down.svg` |
 | rail footer: prune | `trash.svg` |
 | tab strip: terminal | `terminal-window.svg` |
+| overflow menu: Settings (§4u, issue #290) | `sliders-horizontal.svg` |
 
 `crates/app/src/icons.rs` embeds these with `include_bytes!` and serves them through
 `crate::fonts::Assets`, so the built binary carries them and does not read this directory at

@@ -564,6 +564,30 @@ pub struct AdeApp {
     /// entry cap, so "the walk stopped early because it ran out of budget" is no longer a state
     /// this app can be in.
     pub(crate) file_tree_complete: bool,
+    /// The rail's open worktree/agent row menu (GitHub issue #290), `None` when closed - see
+    /// `crate::rail::menu::RailRowMenu`. Its origin is window-space and already clamped, and it
+    /// is rendered from [`Render::render`] rather than from the rail, because the rail's row list
+    /// is a real scroller and a menu inside it would be clipped by it and would scroll away from
+    /// the pointer it was anchored to (`REVISION-2026-08-14.md` §4).
+    pub(crate) rail_row_menu: Option<crate::rail::menu::RailRowMenu>,
+    /// The rail's open overflow menu (GitHub issue #290), `None` when closed. A separate surface
+    /// from [`Self::rail_row_menu`] because it is anchored off the button's own rect rather than
+    /// the pointer, and opens from a control rather than from a row - see
+    /// `crate::rail::menu::RailOverflowMenu`.
+    pub(crate) rail_overflow_menu: Option<crate::rail::menu::RailOverflowMenu>,
+    /// The overflow button's real, `gpui::canvas`-captured window-space rect - what §4w's "the
+    /// overflow menu off the ⋯ button's own rect with right edges aligned" is measured from. The
+    /// same capture `Self::commit_composer_bounds` uses, and for the same reason: the menu is a
+    /// root-level sibling, so it cannot read its opener's layout any other way.
+    pub(crate) rail_overflow_button_bounds: gpui::Bounds<Pixels>,
+    /// Which worktree's `Remove worktree…` row has had its *first* click (GitHub issue #290),
+    /// `None` when nothing is armed - the same in-menu two-click confirmation
+    /// `Self::graph_state.delete_branch_confirm_armed` gives the git graph's `Delete branch` row,
+    /// keyed by worktree path because that is what the removal really acts on. Cleared by every
+    /// path that closes the rail row menu (`crate::root::menus::AdeApp::close_menu_surface`), so
+    /// a menu dismissed by any means at all can never leave a worktree armed for a one-click
+    /// removal the next time it opens.
+    pub(crate) remove_worktree_confirm_armed: Option<PathBuf>,
     /// The file tree's open right-click context menu (GitHub issue #19 §1), `None` when closed -
     /// see `crate::sidebar::tree_ops::TreeContextMenu`.
     pub(crate) tree_context_menu: Option<tree_ops::TreeContextMenu>,
@@ -3097,6 +3121,26 @@ impl Render for AdeApp {
                     && self.right_sidebar_view == RightSidebarView::Files
                     && self.tree_context_menu.is_some(),
                 |el| el.child(self.render_tree_context_menu(cx)),
+            )
+            // The rail's row menus and its `⋯` overflow (GitHub issue #290) - root-level
+            // siblings, never children of the rail. `REVISION-2026-08-14.md` §4, verbatim: "All
+            // menus render outside the scrolling list. Inside it they are clipped by the scroller
+            // and scroll away from their anchor." The rail list is a real `overflow_y_scroll`
+            // container, so both of those would happen; §4w's generalisation ("an overlay
+            // anchored in viewport coordinates must live at the root. If it is nested in a panel,
+            // every property of that panel - its scroll, its clip, its mount condition - becomes
+            // a bug in the overlay") is why they sit here beside every other popover instead.
+            //
+            // Gated on `!settings_open` for the same real reason the file tree's menu below is:
+            // Settings *replaces* the workspace body one child up, so an ungated menu would paint
+            // a full-window occluding scrim over Settings, swallowing every click on the page
+            // underneath.
+            .when(!self.settings_open && self.rail_row_menu.is_some(), |el| {
+                el.child(self.render_rail_row_menu(cx))
+            })
+            .when(
+                !self.settings_open && self.rail_overflow_menu.is_some(),
+                |el| el.child(self.render_rail_overflow_menu(cx)),
             )
             // Settings › General's Shell field suggestion dropdown (GitHub issue #213's
             // follow-up) - a window-positioned overlay for the same reason the `+` menu is one,

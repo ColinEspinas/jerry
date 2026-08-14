@@ -910,6 +910,18 @@ pub mod surface {
     /// mouse-hover styled at all - a real, mockup-verified design difference, not drift; see
     /// `crate::lsp::completion_popup`'s own module docs).
     pub const MENU_ROW_HOVER: ColorToken = token("surface.menu_row_hover", 0x1d2226);
+    /// The same row hover, for a **destructive** menu row (GitHub issue #290).
+    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t specifies the shared menu's
+    /// rows as "destructive rows in `#c4726d` on a `#2a1719` hover" - so the destructive tint is
+    /// carried on the hover fill too, not on the resting label alone. Without it, `Delete` and
+    /// `Copy Path` are visually identical the moment the pointer is on either of them, which is
+    /// exactly when the click is about to happen.
+    ///
+    /// Deliberately its own token rather than a reuse of `theme::changes::DISCARD_BG` (the same
+    /// literal): that one names the Changes panel's armed `Discard?` pill, and a menu row hover
+    /// re-tinted with it would silently follow a theme's edit to a different control.
+    pub const MENU_ROW_HOVER_DESTRUCTIVE: ColorToken =
+        token("surface.menu_row_hover_destructive", 0x2a1719);
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
     /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: ColorToken = token("surface.tab_close_hover", 0x23282c);
@@ -950,6 +962,7 @@ pub mod surface {
         ("CURRENT_LINE", CURRENT_LINE),
         ("TITLE_BAR_CLOSE_HOVER", TITLE_BAR_CLOSE_HOVER),
         ("MENU_ROW_HOVER", MENU_ROW_HOVER),
+        ("MENU_ROW_HOVER_DESTRUCTIVE", MENU_ROW_HOVER_DESTRUCTIVE),
         ("TAB_CLOSE_HOVER", TAB_CLOSE_HOVER),
         ("LSP_POPOVER_FOOTER", LSP_POPOVER_FOOTER),
     ];
@@ -2821,7 +2834,7 @@ pub mod graph {
     pub const ROW_MENU_WIDTH: Pixels = px(330.0);
     /// The row `⋯` context menu's painted height under the test suite's `gpui::TestAppContext` -
     /// its content is fixed (four headers, ten action rows, one footer line; never varies with
-    /// which row opened it), so unlike `crate::sidebar::context_menu::menu_height` (which has to
+    /// which row opened it), so unlike `crate::menu::model::menu_height` (which has to
     /// measure a variable row count) this is a plain constant rather than a formula, pinned by
     /// `crate::graph_view::render::graph_row_menu_tests::
     /// the_row_menu_pins_the_real_height_this_edge_clamp_relies_on` - if that test ever fails, the

@@ -14,8 +14,9 @@
 //! - [`changes`] - the pure mapping from `wt_core::diff` data to the Changes tab's row
 //!   labels/colours/counts and the fold-marker treatment.
 //! - [`context_menu`] - the pure model of the right-click menu (GitHub issue #19 §1): which
-//!   actions each target offers, how they group, and the edge-aware geometry that keeps the
-//!   popover - dividers and all - on screen.
+//!   actions each target offers and how they group. The popover itself, its row shape and the
+//!   edge-aware geometry that keeps it on screen are `crate::menu`'s since GitHub issue #290
+//!   promoted this menu into the app's one shared component.
 //! - [`file_ops`] - the pure filesystem primitives behind those actions (issue #19 §2/§3): name
 //!   validation, collision-free naming, recursive copy/move/delete, and the real OS-trash
 //!   decision.

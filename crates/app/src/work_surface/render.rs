@@ -500,7 +500,7 @@ impl AdeApp {
 
     /// The surface footer's `Interrupt ⌃C` action - sends `Ctrl-C` to the agent's pty via
     /// `TerminalPane::interrupt`.
-    pub(in crate::work_surface) fn interrupt_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+    pub(crate) fn interrupt_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
@@ -514,7 +514,7 @@ impl AdeApp {
     /// tab, then spawn a fresh agent of the same kind into the same worktree - not literally
     /// "resume where it left off" (`crate::work_surface::state::ActionKind::Respawn`'s docs name this
     /// trade-off).
-    pub(in crate::work_surface) fn respawn_agent(
+    pub(crate) fn respawn_agent(
         &mut self,
         id: AgentId,
         window: &mut Window,
@@ -1556,7 +1556,7 @@ impl AdeApp {
     /// agent toolbar's `+ claude`/`+ codex` buttons when that binary isn't on `$PATH`: the
     /// process fails to spawn and a non-panicking spawn error shows in the new tab
     /// (`TerminalPane::spawn_error`).
-    pub(in crate::work_surface) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
         // GitHub issue #90: the same real "nothing to spawn into yet" guard [`Self::new_agent`]'s
         // own docs explain - see those for the concrete bug this closes.
         if self.focused_repo().is_none() {
