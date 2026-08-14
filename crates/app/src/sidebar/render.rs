@@ -7,7 +7,9 @@ use crate::root::widgets::{
     render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
+use crate::text_history;
 use crate::worktree_history::flow as worktree_history;
+use std::time::Instant;
 
 /// How much extra the Changes panel's `gpui::list` measures above and below the viewport.
 ///
@@ -434,16 +436,90 @@ impl AdeApp {
         Some(staged.iter().map(|file| file.path.clone()).collect())
     }
 
-    /// The message every commit path in this composer writes - derived once, from the staged set,
-    /// so the primary button and the `▾` menu can never write two different messages for the same
-    /// staged files.
+    /// The message every commit path in this composer writes - the user's own edited text once
+    /// [`Self::commit_message`] has any (real typing outranks the draft unconditionally, even a
+    /// single backspace back to `""` - see [`Self::render_commit_composer`]'s own docs on why
+    /// emptiness alone can't tell a fresh field from a deliberately-cleared one), otherwise the
+    /// live draft for whatever is staged right now. Derived once so the primary button and the
+    /// `▾` menu can never write two different messages for the same staged files.
     pub(in crate::sidebar) fn staged_commit_message(&self) -> String {
+        if self.commit_message.can_undo() {
+            return self.commit_message.as_str().to_string();
+        }
         match self.uncommitted_diff.loaded() {
             Some(diff) => changes::draft_commit_message(&changes::staged_subset(
                 &diff.files,
                 &self.staged_files,
             )),
             None => String::new(),
+        }
+    }
+
+    /// Click-to-focus for the commit message field (GitHub issue #285 follow-up: the box painted
+    /// the live draft but had no real way to edit it at all - a click and a keystroke changed
+    /// nothing). Seeds [`Self::commit_message`] with the current draft on the *first* focus only,
+    /// via [`text_history::TextField::seeded`] rather than `new()` then `set()`: that would record
+    /// the pre-fill as a real undoable step, so the very first `Ctrl+Z` after clicking in would
+    /// blank a message the user never typed. Every later click just refocuses the field the user
+    /// is already editing, real text and all.
+    pub(in crate::sidebar) fn focus_commit_message(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.commit_message.can_undo() && self.commit_message.is_empty() {
+            self.commit_message = text_history::TextField::seeded(&self.staged_commit_message());
+        }
+        window.focus(&self.commit_message_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Mirrors [`crate::rail::render::AdeApp::handle_filter_key_down`] exactly - see that
+    /// function's own docs for the modifier guard and the real undo/redo wiring this shares.
+    pub(in crate::sidebar) fn handle_commit_message_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.commit_message.pop(Instant::now()),
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    self.commit_message.push_str(text, Instant::now())
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    pub(in crate::sidebar) fn handle_commit_message_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_message.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::sidebar) fn handle_commit_message_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_message.redo() {
+            cx.notify();
         }
     }
 
@@ -2082,6 +2158,7 @@ impl AdeApp {
                 },
             ),
         )
+        .w_full()
         .flex_1()
         .min_h_0();
 
@@ -2807,11 +2884,11 @@ impl AdeApp {
         let (chip_fg, chip_bg) = work_surface::agent_tint(chip_kind);
         let chip_initial = work_surface::agent_initial(chip_kind);
 
-        let message = if staged.is_empty() {
-            String::new()
-        } else {
-            changes::draft_commit_message(&staged)
-        };
+        // The single source of truth every commit path writes - see this method's own docs on
+        // why this can't just recompute `draft_commit_message` here: once the user has really
+        // edited the field, their text outranks the draft even if it goes back to "" or the
+        // staged set changes under it.
+        let message = self.staged_commit_message();
 
         let busy = self.worktree_history_op_in_flight.is_some();
         let committing = self.worktree_history_op_in_flight
@@ -3006,25 +3083,43 @@ impl AdeApp {
                             ),
                     )
                     .child(
-                        div().flex().items_start().child(
-                            div()
-                                .debug_selector(move || message_selector)
-                                .flex_1()
-                                .min_w_0()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(11.5))
-                                .line_height(px(17.0))
-                                .text_color(if message.is_empty() {
-                                    theme::text::FAINT
-                                } else {
-                                    theme::text::STRONG
-                                })
-                                .child(if message.is_empty() {
-                                    "no files staged yet".to_string()
-                                } else {
-                                    message
-                                }),
-                        ),
+                        div()
+                            .id("commit-composer-message")
+                            .debug_selector(|| "commit-composer-message-field".to_string())
+                            .track_focus(&self.commit_message_focus_handle)
+                            .key_context("text-input")
+                            .on_action(cx.listener(Self::handle_commit_message_text_undo))
+                            .on_action(cx.listener(Self::handle_commit_message_text_redo))
+                            .on_key_down(cx.listener(Self::handle_commit_message_key_down))
+                            .cursor_text()
+                            .flex()
+                            .items_start()
+                            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                                this.focus_commit_message(window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .debug_selector(move || message_selector)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(px(11.5))
+                                    .line_height(px(17.0))
+                                    .text_color(if message.is_empty() {
+                                        theme::text::FAINT
+                                    } else {
+                                        theme::text::STRONG
+                                    })
+                                    .child(if message.is_empty() {
+                                        "no files staged yet".to_string()
+                                    } else {
+                                        message
+                                    }),
+                            )
+                            .child(self.render_simple_input_caret(
+                                "commit-composer-message-caret",
+                                &self.commit_message_focus_handle,
+                            )),
                     ),
             )
             .child(
@@ -5451,6 +5546,133 @@ mod commit_composer_tests {
             app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
             "a disabled click must never even set the real \"committing…\" status - proof the \
              operation truly never started, not just that it already finished"
+        );
+    }
+
+    /// GitHub issue #285 follow-up (live report): the message box painted a real draft but had
+    /// no way to edit it at all - a click and a keystroke changed nothing. Driven through a real
+    /// click on the real painted field, then real simulated keystrokes, exactly the way
+    /// `rail::render::rail_filter_caret_tests::caret_sits_before_the_placeholder_when_empty_and_\
+    /// after_the_text_once_typed` proves the rail filter's own field is real.
+    #[gpui::test]
+    fn clicking_the_message_box_and_typing_really_edits_it(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("commit-composer-message-Update a.txt")
+                .is_some(),
+            "sanity check: the box starts on the real draft for the one staged file"
+        );
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let (focused, message_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.commit_message_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&message_handle),
+            "a real click on the field must really focus it"
+        );
+
+        cx.simulate_input(", closes #1");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "Update a.txt, closes #1",
+            "the real keystrokes must append onto the seeded draft, not vanish"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "Update a.txt, closes #1",
+            "the edited text must be what the composer would actually commit - the same single \
+             source of truth the primary button and the ▾ menu both read"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-message-Update a.txt, closes #1")
+                .is_some(),
+            "the box must really repaint the user's own edited text, not the stale draft"
+        );
+    }
+
+    /// The edited message must be what a real commit actually writes, not just what the box
+    /// displays - the whole point of wiring the field into `staged_commit_message` rather than a
+    /// parallel piece of state the primary button never reads.
+    #[gpui::test]
+    fn a_real_commit_writes_the_users_own_edited_message(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_input(" REWRITTEN");
+        cx.run_until_parked();
+
+        let primary = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint with something staged");
+        cx.simulate_click(primary.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let log = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(repo.path())
+            .output()
+            .expect("real git log");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "Update a.txt REWRITTEN",
+            "the real commit on disk must carry the user's own edited message, not the \
+             unedited draft the box happened to start with"
+        );
+    }
+
+    /// A field seeded from the live draft (never `new()` then `set()` - see
+    /// `Self::focus_commit_message`'s own docs) must open with an empty history: the very first
+    /// `Ctrl+Z` after clicking in must not blank a message the user never typed.
+    #[gpui::test]
+    fn the_seeded_draft_is_not_itself_an_undoable_step(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| !app.commit_message.can_undo()),
+            "seeding with the live draft must not itself be a real, undoable edit"
+        );
+
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_message.can_undo()),
+            "sanity check: a real keystroke after seeding must be undoable"
         );
     }
 

@@ -720,16 +720,16 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 14,
-            "real_context_stacks() is hand-derived from exactly fourteen .key_context(..) call \
-             sites (nine of which emit the same bare \"text-input\": the palette, the rail \
+            call_sites, 15,
+            "real_context_stacks() is hand-derived from exactly fifteen .key_context(..) call \
+             sites (ten of which emit the same bare \"text-input\": the palette, the rail \
              filter, the new-file prompt, the Branches filter, the Keybindings filter, the \
              Themes page's \"Generate from colour\" seed input, the General page's \"Shell\" \
              field (GitHub issue #213), GitHub issue #241's git graph row menu's \"Create \
-             branch here\" prompt, and - newest, GitHub issue #242 phase B - the \
-             interactive-rebase plan row's own reword message field) - a new one means that \
-             list, and every disjointness answer built on it, needs updating. Real sites found: \
-             {sites:?}"
+             branch here\" prompt, GitHub issue #242 phase B's interactive-rebase plan row's own \
+             reword message field, and - newest, GitHub issue #285's Changes panel commit \
+             message field) - a new one means that list, and every disjointness answer built on \
+             it, needs updating. Real sites found: {sites:?}"
         );
 
         // The file tree's own site is named explicitly: it is the one a merge added while this

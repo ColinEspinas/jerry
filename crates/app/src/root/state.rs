@@ -483,6 +483,8 @@ impl AdeApp {
             filter_query: text_history::TextField::new(),
             rail_collapse_overrides: HashMap::new(),
             filter_focus_handle,
+            commit_message: text_history::TextField::new(),
+            commit_message_focus_handle: cx.focus_handle(),
             rail_focus_handle: cx.focus_handle(),
             empty_state_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
