@@ -893,6 +893,10 @@ pub mod surface {
     pub const KEYCAP_HINT: ColorToken = token("surface.keycap_hint", 0x15181a);
     pub const CHIP_NEUTRAL: ColorToken = token("surface.chip_neutral", 0x23272b);
     pub const CURRENT_LINE: ColorToken = token("surface.current_line", 0x181c20);
+    /// The Changes panel's Runs section - pinned to the panel's own bottom in its own capped,
+    /// independently-scrolled well, distinct from the lighter [`HEADER`] the other three sections'
+    /// shared scroller sits on (`Jerry.dc.html` line 1433: `background:#0f1113`).
+    pub const RUNS_WELL: ColorToken = token("surface.runs_well", 0x0f1113);
     /// The Windows/Linux title bar's close caption button's hover fill. The design handoff
     /// (`Jerry.dc.html`: `style-hover="background:#8c3a38"`, unchanged through revision 3) spec'd
     /// a muted maroon; Colin asked for this to be the real Windows Fluent Design close-hover red
@@ -965,6 +969,7 @@ pub mod surface {
         ("MENU_ROW_HOVER_DESTRUCTIVE", MENU_ROW_HOVER_DESTRUCTIVE),
         ("TAB_CLOSE_HOVER", TAB_CLOSE_HOVER),
         ("LSP_POPOVER_FOOTER", LSP_POPOVER_FOOTER),
+        ("RUNS_WELL", RUNS_WELL),
     ];
 }
 

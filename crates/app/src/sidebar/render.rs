@@ -1807,10 +1807,13 @@ impl AdeApp {
                     self.window_controls_style().is_macos(),
                     self.tree_inline_edit.is_none(),
                 )),
-            // GitHub issue #285: four collapsible sections in one scroller, with the commit
-            // composer pinned **above** them rather than at the panel's foot. The composer is a
-            // git control and the sections are what it acts on, so it reads first; that ordering
-            // is `REVISION-2026-08-14.md` §1's own sketch.
+            // GitHub issue #285: four collapsible sections, with the commit composer pinned
+            // **above** them rather than at the panel's foot. The composer is a git control and
+            // the sections are what it acts on, so it reads first; that ordering is
+            // `REVISION-2026-08-14.md` §1's own sketch. Of the four, only Runs is pinned to the
+            // panel's own *bottom*, in its own capped well below the other three's shared
+            // scroller (`Self::render_changes_runs_section`) - `Jerry.dc.html` line 1433's own
+            // separate `max-height:170px` wrapper, not a fourth entry in the shared one.
             RightSidebarView::Changes => container
                 .child(self.render_commit_composer(cx))
                 .children(self.render_staging_error(cx))
@@ -1825,6 +1828,7 @@ impl AdeApp {
                         .min_h_0()
                         .child(self.render_changes_sections(cx)),
                 )
+                .child(self.render_changes_runs_section(cx))
                 .child(render_changes_footer(self.ui_text_size(10.0))),
         }
         .into_any_element()
@@ -1888,7 +1892,10 @@ impl AdeApp {
         sections::run_rows(&sources, &self.uncommitted_change_set)
     }
 
-    /// The whole panel, flattened into one virtualized list's items (GitHub issue #285).
+    /// The whole panel, flattened into one row list (GitHub issue #285) - split by
+    /// [`sections::SectionRow::section`] into [`Self::render_changes_sections`]' shared scroller
+    /// (Uncommitted, Commits, Against main) and [`Self::render_changes_runs_section`]'s own
+    /// pinned-bottom well (Runs), rather than rendered as one flat list itself.
     ///
     /// Every section's body is built whether or not the section is open, so its header can state a
     /// true count while collapsed; only an **open** section's body is actually pushed. That is
@@ -2115,22 +2122,29 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The Changes panel's one scroller: four sections' worth of rows in a single
-    /// `gpui::list`, with the same shared overlay scrollbar every other scrollable region in this
-    /// app draws (`crate::root::scrollbar`).
+    /// The Changes panel's main scroller: **three** of its four sections' worth of rows
+    /// (Uncommitted, Commits, Against main) in a single `gpui::list`, with the same shared overlay
+    /// scrollbar every other scrollable region in this app draws (`crate::root::scrollbar`). Runs
+    /// is deliberately excluded - it renders in its own pinned-bottom well,
+    /// [`Self::render_changes_runs_section`], matching `Jerry.dc.html` line 1433's own separate
+    /// `max-height:170px;overflow-y:auto` wrapper rather than sharing this scroller.
     ///
-    /// `gpui::list`, not the `uniform_list` this panel used to use, for one structural reason: the
-    /// four sections put a 24px header, a 27px file row and a 48px two-line run row in the same
-    /// scroller, and `uniform_list` sizes **every** slot from item 0's measured height - a 48px
-    /// run row in a 27px slot is a clipped row, not a tall one. `gpui::list` is GPUI's own
-    /// variable-height virtualized list and is still genuinely virtualized: it builds only the
-    /// items its viewport (plus [`Self::CHANGES_LIST_OVERDRAW`]) actually covers, which
-    /// `virtualization_tests` asserts against a live render exactly as it did before.
+    /// `gpui::list`, not the `uniform_list` this panel used to use, for one structural reason: even
+    /// with Runs split out, these three sections still put a 24px header and a 27px file row in the
+    /// same scroller, and `uniform_list` sizes **every** slot from item 0's measured height. `gpui::
+    /// list` is GPUI's own variable-height virtualized list and is still genuinely virtualized: it
+    /// builds only the items its viewport (plus [`Self::CHANGES_LIST_OVERDRAW`]) actually covers,
+    /// which `virtualization_tests` asserts against a live render exactly as it did before.
     pub(in crate::sidebar) fn render_changes_sections(
         &self,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let rows = std::rc::Rc::new(self.changes_section_rows(cx));
+        let rows: std::rc::Rc<Vec<sections::SectionRow>> = std::rc::Rc::new(
+            self.changes_section_rows(cx)
+                .into_iter()
+                .filter(|row| row.section() != sections::ChangesSection::Runs)
+                .collect(),
+        );
         // `ListState` owns a measured height per item, so it has to be told when the item set
         // changes size. Reset only on a real change: a reset drops the scroll position, and doing
         // it every frame would pin the panel to the top. `ListState::reset` takes `&self` (its
@@ -2177,6 +2191,52 @@ impl AdeApp {
                 &[],
                 cx,
             ))
+            .into_any_element()
+    }
+
+    /// The Runs section, pinned to the Changes panel's own bottom in its own capped,
+    /// independently-scrolled well - `Jerry.dc.html` line 1433's `flex:none;max-height:170px;
+    /// overflow-y:auto` wrapper, which sits *outside* the shared scroller the other three
+    /// sections share rather than as a fourth entry inside it (the user: "run row should be
+    /// pinned to the bottom and not to the top look at the design").
+    ///
+    /// Plain `.overflow_y_scroll()`, not `gpui::list`: Runs holds one row per agent open in this
+    /// worktree - genuinely few, unlike the shared scroller's many file rows across three
+    /// sections - so it needs no virtualization, the same reasoning the status bar's own
+    /// capped-and-scrollable resources tree already uses.
+    pub(in crate::sidebar) fn render_changes_runs_section(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use sections::{ChangesSection, SectionRow};
+        let rows: Vec<SectionRow> = self
+            .changes_section_rows(cx)
+            .into_iter()
+            .filter(|row| row.section() == ChangesSection::Runs)
+            .collect();
+        div()
+            .id("changes-runs-section")
+            .flex_none()
+            .max_h(px(170.0))
+            .overflow_y_scroll()
+            .bg(theme::surface::RUNS_WELL)
+            .children(rows.iter().map(|row| {
+                match row {
+                    SectionRow::Header(header) => {
+                        self.render_section_header(header, cx).into_any_element()
+                    }
+                    SectionRow::Run(run) => self.render_run_row(run, cx).into_any_element(),
+                    SectionRow::Note {
+                        section,
+                        text,
+                        emphasis,
+                    } => self
+                        .render_section_note(*section, text, *emphasis)
+                        .into_any_element(),
+                    // Runs never produces any other `SectionRow` kind - see `changes_section_body`.
+                    _ => div().into_any_element(),
+                }
+            }))
             .into_any_element()
     }
 
@@ -2256,6 +2316,7 @@ impl AdeApp {
             )))
             .debug_selector(move || selector)
             .flex_none()
+            .w_full()
             .flex()
             .items_center()
             .gap(px(7.0))
@@ -2358,6 +2419,11 @@ impl AdeApp {
     ///
     /// Clicking focuses that agent's tab - a real, existing action
     /// ([`Self::activate_agent_tab`]), not a new surface.
+    ///
+    /// No row tooltip, though `Jerry.dc.html`'s own markup carries one (`title="{{ r.tip }}"`,
+    /// stating the live/frozen consequence `STAGE-A-CHANGELOG.md` §4l moved off the row's visible
+    /// text) - a deliberate, requested deviation from both the mock and that citation, not an
+    /// oversight.
     fn render_run_row(&self, run: &sections::RunRow, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_id = run.agent_id;
         let selector = format!("changes-run-{}", run.agent_id);
@@ -2372,6 +2438,7 @@ impl AdeApp {
             )))
             .debug_selector(move || selector)
             .flex_none()
+            .w_full()
             .flex()
             .items_start()
             .gap(px(8.0))
@@ -2384,7 +2451,6 @@ impl AdeApp {
             .border_color(run.tint_fg)
             .cursor_pointer()
             .hover(|el| el.bg(theme::surface::ROW_HOVER))
-            .tooltip(text_tooltip(run.tooltip))
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_agent(agent_id, window, cx);
             }))
@@ -2477,6 +2543,7 @@ impl AdeApp {
         div()
             .debug_selector(move || selector)
             .flex_none()
+            .w_full()
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -2528,6 +2595,7 @@ impl AdeApp {
         div()
             .debug_selector(move || selector)
             .flex_none()
+            .w_full()
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -2563,6 +2631,7 @@ impl AdeApp {
         div()
             .debug_selector(move || selector)
             .flex_none()
+            .w_full()
             .py(px(7.0))
             .pl(px(10.0))
             .pr(px(scrollbar::CONTENT_CLEARANCE))
@@ -3097,6 +3166,19 @@ impl AdeApp {
                             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                                 this.focus_commit_message(window, cx);
                             }))
+                            // Mirrors `Self::render_rail_filter_row`'s own fix exactly (GitHub
+                            // issue #45 / live report): a caret pinned unconditionally *after*
+                            // this child sits glued to the end of "no files staged yet" when the
+                            // field is empty, instead of at the real cursor position (0, before
+                            // any text at all). It belongs before the placeholder when empty and
+                            // after the real message once there is any - never appended past
+                            // whatever placeholder string happens to render.
+                            .when(message.is_empty(), |el| {
+                                el.child(self.render_simple_input_caret(
+                                    "commit-composer-message-caret",
+                                    &self.commit_message_focus_handle,
+                                ))
+                            })
                             .child(
                                 div()
                                     .debug_selector(move || message_selector)
@@ -3113,13 +3195,15 @@ impl AdeApp {
                                     .child(if message.is_empty() {
                                         "no files staged yet".to_string()
                                     } else {
-                                        message
+                                        message.clone()
                                     }),
                             )
-                            .child(self.render_simple_input_caret(
-                                "commit-composer-message-caret",
-                                &self.commit_message_focus_handle,
-                            )),
+                            .when(!message.is_empty(), |el| {
+                                el.child(self.render_simple_input_caret(
+                                    "commit-composer-message-caret",
+                                    &self.commit_message_focus_handle,
+                                ))
+                            }),
                     ),
             )
             .child(
@@ -7142,13 +7226,8 @@ mod changes_sections_tests {
         );
         assert!(
             rows.iter().all(|row| row.meta.contains("running")),
-            "a live run's meta line reads `running`, and its tooltip is the one that says the \
-             diff is not final: {:?}",
+            "a live run's meta line reads `running`: {:?}",
             rows.iter().map(|row| row.meta.clone()).collect::<Vec<_>>()
-        );
-        assert!(
-            rows.iter().all(|row| row.tooltip.contains("not final")),
-            "a live run's tooltip explains that its diff is not final"
         );
 
         // Switching which agent is focused must move neither count nor row set.
@@ -7268,8 +7347,6 @@ mod changes_sections_tests {
             "warm while it is still moving, neutral once it has ended - that colour split is the \
              only thing carrying the state on the row itself (STAGE-A-CHANGELOG.md §4l)"
         );
-        assert!(live_row.tooltip.contains("not final"));
-        assert!(ended_row.tooltip.contains("frozen"));
         assert!(
             cx.debug_bounds("changes-section-runs-2-open").is_some(),
             "and both rows are on one screen, under one header stating two"

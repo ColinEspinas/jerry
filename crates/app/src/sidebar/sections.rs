@@ -266,10 +266,6 @@ pub struct RunRow {
     /// The row's own left edge - this run's agent tint, always painted.
     pub live: bool,
     pub stat: DiffStat,
-    /// The row tooltip. `STAGE-A-CHANGELOG.md` §4l dropped the `live`/`frozen` words from the row
-    /// itself ("it restated `running`/`ended` one line below"); the tooltip is where the
-    /// *consequence* still gets said.
-    pub tooltip: &'static str,
 }
 
 impl RunRow {
@@ -283,11 +279,6 @@ impl RunRow {
         }
     }
 }
-
-/// A live run's diff is not final; an ended run's is not going to grow.
-const LIVE_RUN_TOOLTIP: &str = "Still running - this run's diff is not final yet";
-const ENDED_RUN_TOOLTIP: &str =
-    "This run has ended - nothing further will be attributed to it, so its diff is frozen";
 
 /// Builds the Runs section's rows from the **uncommitted** change set's own per-author partition.
 ///
@@ -312,11 +303,6 @@ pub fn run_rows(sources: &[RunSource], change_set: &ChangeSet) -> Vec<RunRow> {
                 tint_bg: source.tint.1,
                 live: source.live,
                 stat,
-                tooltip: if source.live {
-                    LIVE_RUN_TOOLTIP
-                } else {
-                    ENDED_RUN_TOOLTIP
-                },
             }
         })
         .collect()
@@ -506,6 +492,23 @@ impl SectionRow {
                 | SectionRow::Commit(_)
                 | SectionRow::AgainstMainFile(_)
         )
+    }
+
+    /// Which of the four sections this row belongs to - what
+    /// `Self::render_changes_sections`/`Self::render_changes_runs_section` (in `sidebar::render`)
+    /// split the flattened `changes_section_rows` list on to give Runs its own pinned-bottom
+    /// scroller (`Jerry.dc.html` line 1433) instead of sharing the other three's.
+    pub fn section(&self) -> ChangesSection {
+        match self {
+            SectionRow::Header(header) => header.section,
+            SectionRow::Run(_) => ChangesSection::Runs,
+            SectionRow::UncommittedFile(_) => ChangesSection::Uncommitted,
+            SectionRow::Commit(_) => ChangesSection::Commits,
+            SectionRow::AgainstMainFile(_) | SectionRow::AgainstMainContext { .. } => {
+                ChangesSection::AgainstMain
+            }
+            SectionRow::Note { section, .. } => *section,
+        }
     }
 }
 
@@ -857,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_run_and_an_ended_run_render_side_by_side_with_their_own_meta_and_tooltip() {
+    fn a_live_run_and_an_ended_run_render_side_by_side_with_their_own_meta() {
         // The mock's sad path (`STAGE-A-SELFCHECK.md`): a live run and a frozen run in the Runs
         // section at once, both readable in one screen.
         let fixture = Fixture::two_agents_wrote_everything();
@@ -867,7 +870,6 @@ mod tests {
         assert!(!rows[0].live);
         assert_eq!(rows[0].meta, "Claude \u{b7} ended 2m");
         assert_eq!(rows[0].meta_color(), theme::changes::RUN_META_ENDED.into());
-        assert!(rows[0].tooltip.contains("frozen"));
 
         assert!(rows[1].live);
         assert_eq!(rows[1].meta, "Claude \u{b7} running \u{b7} 40s");
@@ -876,7 +878,6 @@ mod tests {
             theme::changes::RUN_META_LIVE.into(),
             "a live run's meta renders warm"
         );
-        assert!(rows[1].tooltip.contains("not final"));
         assert_ne!(
             rows[0].meta_color(),
             rows[1].meta_color(),
