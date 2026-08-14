@@ -26,7 +26,7 @@
 //!
 //!   rail render
 //!     └── AdeApp::agent_status ──▶ rail::status::derive_status(.., HookSignal, ..)
-//!     └── AdeApp::build_agent_rows ──▶ AgentRow::activity / question_preview
+//!     └── AdeApp::build_agent_rows ──▶ AgentRow::activity
 //!                                       └── AgentStatusState (agent-status.toml)  [store]
 //!
 //!   agent closes / app restarts, later reopened (GitHub issue #227)

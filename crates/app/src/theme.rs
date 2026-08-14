@@ -1152,26 +1152,63 @@ pub mod status {
 pub mod rail {
     use super::{token, ColorToken};
 
-    /// Repo group header's uppercase name (§2.1: "name in 9.5px uppercase Plex Sans `#787f86`").
-    pub const REPO_HEADER_NAME: ColorToken = token("rail.repo_header_name", 0x787f86);
+    /// Repo group header's uppercase name.
+    ///
+    /// Revision 6 (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4s) retargeted this
+    /// from the rail-only `#787f86` to the app-wide section-label value: "It was `#787f86` at
+    /// `.08em` while every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
+    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`. It now uses that token."
+    /// `Jerry.dc.html`'s rail band and all four Changes-panel section labels really do paint the
+    /// same `#9aa1a8`, which is why [`super::changes::SECTION_LABEL`] carries the identical value:
+    /// a repo band is a section header, not a rail-specific ornament.
+    ///
+    /// Kept under its own `rail.` key rather than folded into one shared constant because the key
+    /// is a *themable* name a user's `.toml` may already set - renaming it would silently drop
+    /// their override. The two constants are the same colour by intent, and both cite §4s.
+    pub const REPO_HEADER_NAME: ColorToken = token("rail.repo_header_name", 0x9aa1a8);
     /// Active worktree row header background (§2.2: "Active worktree header background
     /// `#181c1f`").
     pub const WORKTREE_ACTIVE_BG: ColorToken = token("rail.worktree_active_bg", 0x181c1f);
     /// Worktree row hover background (§2.2: "hover `#16191c`").
     pub const WORKTREE_HOVER_BG: ColorToken = token("rail.worktree_hover_bg", 0x16191c);
-    /// A prunable (merged, clean, agent-less) worktree's 2px left edge (§2.2: "prunable
-    /// `#2f353a`"). A bare-but-not-prunable worktree reuses [`super::status::IDLE_BG`]
-    /// (`#22262a`), an exact match for the spec's "Bare worktrees `#22262a`".
-    pub const PRUNABLE_EDGE: ColorToken = token("rail.prunable_edge", 0x2f353a);
+    /// An agent row's title, one level below its parent worktree's branch name
+    /// (`STAGE-A-CHANGELOG.md` §4n: agent title `450 11.5px/16px` `#c2c7cc` -> `450 11px/15px`
+    /// **`#a3a9b0`**). Deliberately dimmer than [`super::text::STRONG`] (`#c2c7cc`), which the
+    /// branch above it uses: "Fix hierarchy by shrinking the child, never by growing the parent."
+    /// A `crate::rail::Status::Idle` agent drops further still, to [`super::text::DIMMER`]
+    /// (`#7d848b`), exactly as `Jerry.dc.html`'s own `titleFg` does.
+    pub const AGENT_TITLE: ColorToken = token("rail.agent_title", 0xa3a9b0);
+    /// The repo header's amber urgency **count** - the number beside the [`super::status::ASK`]
+    /// dot (`REVISION-2026-08-14.md` §4: "`● 2` amber (`#e2a336` dot, `#c99b4e` text, needs
+    /// input)").
+    ///
+    /// Its own key rather than a reach into `status.ask_card_fg`, which happens to hold the same
+    /// hex: a header count and an ask card's text are unrelated concepts that would drift the
+    /// moment a theme moved one of them. Same reasoning, and same shape, as
+    /// [`super::changes::EDGE_UNCOMMITTED`] carrying its own key beside
+    /// [`super::border::SELECTED_EDGE`].
+    pub const REPO_ASK_COUNT: ColorToken = token("rail.repo_ask_count", 0xc99b4e);
+    /// The repo header's red urgency **count** - the number beside the [`super::status::FAIL`]
+    /// dot (§4: "`● 1` red (`#e0625c` dot, `#c4726d` text, failed)"). Its own key, for the reason
+    /// [`Self::REPO_ASK_COUNT`]'s docs give.
+    pub const REPO_FAIL_COUNT: ColorToken = token("rail.repo_fail_count", 0xc4726d);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
     /// own docs for what walks this and why every token has to appear here.
+    ///
+    /// `rail.prunable_edge` (`#2f353a`) was removed here in revision 6: §4m deleted the whole
+    /// status/prunable/bare left-edge channel from worktree rows ("A channel with one meaning has
+    /// exactly two states - on and off"), leaving that token with nothing to colour. It went in
+    /// the same edit as the edge itself, and out of the bundled theme files with it, rather than
+    /// being left as a themable name for a thing this app no longer draws.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("REPO_HEADER_NAME", REPO_HEADER_NAME),
         ("WORKTREE_ACTIVE_BG", WORKTREE_ACTIVE_BG),
         ("WORKTREE_HOVER_BG", WORKTREE_HOVER_BG),
-        ("PRUNABLE_EDGE", PRUNABLE_EDGE),
+        ("AGENT_TITLE", AGENT_TITLE),
+        ("REPO_ASK_COUNT", REPO_ASK_COUNT),
+        ("REPO_FAIL_COUNT", REPO_FAIL_COUNT),
     ];
 }
 
@@ -2588,8 +2625,15 @@ pub mod changes {
     /// positions (see this module's own docs).
     pub const EDGE_AGAINST_MAIN: ColorToken = token("changes.edge_against_main", 0xc98fbf);
 
-    /// Section header label - 9.5px/600 uppercase, `.08em` tracking.
-    pub const SECTION_LABEL: ColorToken = token("changes.section_label", 0x787f86);
+    /// Section header label - 9.5px/600 uppercase, `.09em` tracking.
+    ///
+    /// `#9aa1a8`, not §1's transcribed `#787f86`: `STAGE-A-CHANGELOG.md` §4s is the later word on
+    /// the same value ("every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
+    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`") and `Jerry.dc.html` - which
+    /// outranks both prose files - really does paint all four of these labels `#9aa1a8`. Same
+    /// value, same citation, as [`super::rail::REPO_HEADER_NAME`]: a repo band and a Changes
+    /// section are the same kind of header.
+    pub const SECTION_LABEL: ColorToken = token("changes.section_label", 0x9aa1a8);
     /// Section header count - 9.5px mono, immediately after the label.
     pub const SECTION_COUNT: ColorToken = token("changes.section_count", 0x4a5057);
     /// The section header's own disclosure caret (`▾`/`▸`).
