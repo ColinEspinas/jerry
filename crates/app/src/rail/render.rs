@@ -1276,8 +1276,7 @@ impl AdeApp {
                 repo_id,
                 UrgencyCount::Failed,
                 group.failed_count(),
-            ))
-            .child(self.render_repo_group_new_button(repo_id));
+            ));
 
         let mut group_div = div()
             .id(("repo-group", repo_id.0))
@@ -1326,66 +1325,6 @@ impl AdeApp {
             );
         }
         group_div
-    }
-
-    /// The repo header's own `+` - **deliberately inert**, and rendered in this file's own
-    /// disabled-control treatment (dimmed to `theme::text::GHOSTER`, `cursor_default()`, no
-    /// hover, and - per `crate::work_surface::render::render_dropdown_menu_row`'s own
-    /// `enabled: false` contract, which this mirrors - genuinely **no `.on_click` at all**, so
-    /// it can never be a control that looks actionable and silently does nothing).
-    ///
-    /// This button's real, intended meaning at the *repo* level is "add a new worktree to this
-    /// repo", and this app deliberately has no UI for that yet: `wt_core` has real
-    /// worktree-creation backend methods, but there is a standing decision in this project that
-    /// no "add worktree"/"add repo" entry point ships until a real design lands, so nothing here
-    /// may trigger that flow. Inventing one is out of scope; so is silently deleting the button,
-    /// which would leave an unexplained gap in the header's own layout where the affordance is
-    /// going to live.
-    ///
-    /// It previously did something else entirely, which was the actual bug: check `repo_id` out
-    /// ([`Self::checkout_repo_from_rail`]) and then open the *tab strip's* "add agent/terminal
-    /// tab" popover ([`crate::work_surface::render::AdeApp::render_plus_menu`]) anchored to this
-    /// button. That predates the multi-repo rail (GitHub issue #113), and the multi-repo work -
-    /// which made every added repo's header reachable rather than just the focused one's - is
-    /// what exposed how wrong it is: a repo header has no *worktree* context for those five
-    /// actions to spawn into, so "New terminal"/"New agent" fell through to
-    /// [`Self::current_worktree_path`]'s repo-root fallback and opened a tab against the repo itself
-    /// rather than any worktree inside it. Tabs belong to worktrees here, not to repos.
-    ///
-    /// With that handler gone, the whole anchoring apparatus it needed went with it (the
-    /// `gpui::canvas` bounds capture, `AdeApp::rail_plus_button_bounds`, and
-    /// `AdeApp::plus_menu_repo_anchor`): nothing in the app opens the plus menu from the rail
-    /// anymore, so keeping a per-render bounds capture feeding a popover that can never anchor
-    /// here would be machinery bound to nothing. The tab strip's own `+`
-    /// (`crate::work_surface::render::AdeApp::render_tab_strip_plus`) is unchanged and is still
-    /// the one real way to open the plus menu - anchored, as it always was, to its own bounds.
-    ///
-    /// A bare `cx.stop_propagation()` click-through blocker used to be attached here too, back
-    /// when this button painted inside a header whose own `on_click` checked the repo out - a
-    /// click landing on a disabled `+` must not fall through and switch repos. The header's
-    /// `on_click` is gone now (a repo header is not a click target at all - see
-    /// [`Self::render_repo_group`]'s own docs), so there is nothing left to block and this
-    /// control follows `render_dropdown_menu_row`'s `enabled: false` contract exactly:
-    /// genuinely no `.on_click` at all.
-    pub(in crate::rail) fn render_repo_group_new_button(
-        &self,
-        repo_id: repo::RepoId,
-    ) -> impl IntoElement {
-        div()
-            .id(("repo-group-new", repo_id.0))
-            .debug_selector(move || format!("repo-group-new-{}", repo_id.0))
-            .flex_none()
-            .w(px(14.0))
-            .h(px(14.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_default()
-            .rounded(theme::radius::CHIP)
-            .text_color(theme::text::GHOSTER)
-            .text_size(self.ui_text_size(11.0))
-            .child("+")
-            .tooltip(text_tooltip("Add worktree - not available yet"))
     }
 
     /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
@@ -1621,7 +1560,7 @@ impl AdeApp {
         let header = div()
             .id(id.clone())
             // Test-only bounds lookup, the same real `gpui::VisualTestContext::debug_bounds`
-            // hook this file's `repo-group-header-N`/`repo-group-new-N` already carry - so a
+            // hook this file's `repo-group-header-N` already carries - so a
             // test can simulate a real mouse click at this row's painted position rather than
             // reaching past the render side and calling its handler directly. Added for the
             // cross-repo worktree click (`repo_checkout_tests::
@@ -3736,62 +3675,6 @@ mod repo_checkout_tests {
             );
             assert_eq!(app.file_tree_root, repo_a.path());
         });
-    }
-
-    /// The repo header's own `+` is deliberately inert until a real "add worktree" design lands -
-    /// see `Self::render_repo_group_new_button`'s own docs. It used to check the repo out and open
-    /// the *tab strip's* add-a-tab popover anchored to itself, which was simply the wrong action
-    /// at the repo level: tabs belong to worktrees here, so those rows had no worktree context to
-    /// spawn into and fell through to the repo root.
-    ///
-    /// Driven through a real click on the real painted button, not by reading the render code: it
-    /// must still paint (the affordance stays where it's going to live), and clicking it must
-    /// change nothing at all - no menu, no repo switch, no spawn.
-    #[gpui::test]
-    fn the_repo_headers_plus_button_is_inert(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = tempfile::tempdir().expect("tempdir b");
-
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
-        cx.run_until_parked();
-
-        let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
-        cx.run_until_parked();
-
-        let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
-
-        let new_button_selector: &'static str =
-            Box::leak(format!("repo-group-new-{}", repo_b_id.0).into_boxed_str());
-        let new_button_bounds = cx.debug_bounds(new_button_selector).expect(
-            "repo B's own + must still paint - a silently removed button would leave an \
-             unexplained gap in the header's layout",
-        );
-        cx.simulate_click(new_button_bounds.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            assert!(
-                !app.plus_menu_open,
-                "the repo header's + must no longer open the tab strip's add-a-tab menu - a repo \
-                 has no worktree context for those actions to spawn into"
-            );
-            assert_eq!(
-                app.focused_repo_path(),
-                repo_a.path(),
-                "and it must not check the repo out either - nothing in a repo group's header \
-                 (the header itself included) is a click target anymore"
-            );
-            assert_eq!(
-                app.agents.iter().count(),
-                agents_before,
-                "nothing may be spawned by a click on an inert control"
-            );
-        });
-
-        assert!(
-            cx.debug_bounds("dropdown-menu-row-New terminal").is_none(),
-            "no plus-menu row may have painted at all"
-        );
     }
 
     /// The real, reproduced root cause behind "I spawned a Claude agent and it never showed up in
