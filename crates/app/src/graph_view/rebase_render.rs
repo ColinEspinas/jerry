@@ -1191,6 +1191,269 @@ mod rebase_flow_tests {
         );
     }
 
+    // --- The derived Result list is checked against what real git actually produces -------------
+
+    /// Design spec §1.6 / GitHub issue #242's own checklist: `N -> M commits` and the whole
+    /// Result list are "derived by walking the plan (drop skips, squash/fixup fold into the
+    /// previous entry, everything else appends) - never authored".
+    ///
+    /// `super::rebase`'s own unit tests already prove that derivation is *internally* consistent.
+    /// They cannot prove it is *true*, because they never run git: a derivation that drifted from
+    /// git's real interactive-rebase semantics would still agree with itself. This test closes
+    /// that gap by checking the derived blocks against the real history a real `git rebase`
+    /// actually produces from the very same plan - every one of the six actions exercised at
+    /// once, both fold verbs included.
+    #[gpui::test]
+    fn the_derived_result_blocks_match_the_real_history_a_real_rebase_produces(
+        cx: &mut TestAppContext,
+    ) {
+        // Independent files throughout: this test is comparing a derivation against real git
+        // output, so a conflict getting in the way would only obscure what it is measuring.
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        commit(repo.path(), "base.txt", "base", "base");
+        commit(repo.path(), "a.txt", "1", "one");
+        commit(repo.path(), "b.txt", "1", "two");
+        commit(repo.path(), "c.txt", "1", "three");
+        commit(repo.path(), "d.txt", "1", "four");
+        commit(repo.path(), "e.txt", "1", "five");
+        commit(repo.path(), "f.txt", "1", "six");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+
+        // The graph walks newest first, so row 6 is `base` - the real `onto` this plan bases on.
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(6, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let plan = &app
+                .graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan;
+            let subjects: Vec<&str> = plan
+                .iter()
+                .map(|row| row.original_subject.as_str())
+                .collect();
+            assert_eq!(
+                subjects,
+                vec!["one", "two", "three", "four", "five", "six"],
+                "the plan must be oldest-first, excluding the onto row (`base`) itself"
+            );
+        });
+
+        for (index, action) in [
+            (0, super::rebase::RebaseActionKind::Pick),
+            (1, super::rebase::RebaseActionKind::Squash),
+            (2, super::rebase::RebaseActionKind::Fixup),
+            (3, super::rebase::RebaseActionKind::Reword),
+            (4, super::rebase::RebaseActionKind::Drop),
+            (5, super::rebase::RebaseActionKind::Pick),
+        ] {
+            app.update_in(cx, |app, _window, cx| {
+                app.set_rebase_row_action(index, action, cx);
+            });
+        }
+        cx.run_until_parked();
+
+        // The reword message is supplied through the real, focused field with real keystrokes -
+        // the same path a user takes, not fabricated state.
+        let focus_handle = app.read_with(cx, |app, _| {
+            app.graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan[3]
+                .reword_focus_handle
+                .clone()
+        });
+        app.update_in(cx, |_app, window, cx| {
+            window.focus(&focus_handle, cx);
+        });
+        cx.simulate_input(" reworded");
+        cx.run_until_parked();
+
+        let derived = app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect("in rebase mode");
+            let blocks = super::rebase::derive_result_blocks(&rebase_state.plan);
+            assert_eq!(
+                super::rebase::derive_result_commit_count(&rebase_state.plan),
+                blocks.len(),
+                "the banner's own N -> M number must be exactly the Result list's length"
+            );
+            assert_eq!(rebase_state.plan.len(), 6);
+            blocks
+                .iter()
+                .map(|block| (block.subject.clone(), block.folded_count, block.status))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            derived,
+            vec![
+                (
+                    "one".to_string(),
+                    2,
+                    super::rebase::ResultBlockStatus::Normal
+                ),
+                (
+                    "four reworded".to_string(),
+                    0,
+                    super::rebase::ResultBlockStatus::Reworded
+                ),
+                (
+                    "six".to_string(),
+                    0,
+                    super::rebase::ResultBlockStatus::Normal
+                ),
+            ],
+            "the derivation must fold `two`/`three` into `one`, skip the dropped `five`, and \
+             carry the live reworded text"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.rebase.is_none(),
+                "a plan with no `edit` row and a message-supplied `reword` must run straight \
+                 through to a real Completed outcome"
+            );
+        });
+
+        // The real, on-disk history the real rebase produced - the ground truth the derivation
+        // above is being judged against.
+        let real_log = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
+        let real_subjects: Vec<&str> = real_log.lines().collect();
+        assert_eq!(
+            real_subjects,
+            vec!["base", "one", "four reworded", "six"],
+            "the real rebase must genuinely produce the history the Result panel predicted"
+        );
+        let derived_subjects: Vec<&str> = derived
+            .iter()
+            .map(|(subject, _, _)| subject.as_str())
+            .collect();
+        assert_eq!(
+            real_subjects[1..],
+            derived_subjects[..],
+            "every derived Result block must correspond, in order, to a real resulting commit - \
+             the Result list is a prediction of real git output, not an authored one"
+        );
+
+        // The derived `folded_count: 2` must be real too: `squash` keeps the folded commit's own
+        // message, so `two` must genuinely be in the resulting commit's body.
+        let folded_body = git_output(repo.path(), &["log", "-1", "--format=%B", "HEAD~2"]);
+        assert!(
+            folded_body.contains("two"),
+            "the squashed commit's message must really carry the folded commit's own message, \
+             got {folded_body:?}"
+        );
+        assert!(
+            !folded_body.contains("three"),
+            "`fixup` must really discard its own message, unlike `squash` - got {folded_body:?}"
+        );
+    }
+
+    // --- A reword message supplied up front removes the pause for real --------------------------
+
+    /// Design spec §1.5's central claim, and GitHub issue #242's own checklist item: "supplying a
+    /// reword message removes that pause from the plan, the mark, and the count". The existing
+    /// coverage supplies a message only *after* a real stop has already happened; this proves the
+    /// up-front case the design actually argues for - "the whole plan, messages included, can be
+    /// settled before anything runs" - all the way through to real git never handing control back
+    /// at all.
+    #[gpui::test]
+    fn a_reword_message_supplied_before_start_runs_straight_through_with_no_stop(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        // Row 1 (`third`) - the plan's newest row, so it lands as the real final `HEAD`.
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(1, super::rebase::RebaseActionKind::Reword, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect("in rebase mode");
+            assert!(
+                rebase_state.plan[1].is_planned_pause(),
+                "before a message is supplied, the reword row is a planned pause - the mark"
+            );
+            assert_eq!(
+                super::rebase::derive_stop_count(&rebase_state.plan),
+                1,
+                "...and it counts toward `Stops N times` - the count"
+            );
+        });
+
+        let focus_handle = app.read_with(cx, |app, _| {
+            app.graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan[1]
+                .reword_focus_handle
+                .clone()
+        });
+        app.update_in(cx, |_app, window, cx| {
+            window.focus(&focus_handle, cx);
+        });
+        cx.simulate_input(" supplied up front");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect("in rebase mode");
+            assert!(
+                !rebase_state.plan[1].is_planned_pause(),
+                "supplying the message must remove the row's own planned-pause mark"
+            );
+            assert_eq!(
+                super::rebase::derive_stop_count(&rebase_state.plan),
+                0,
+                "...and remove it from the `Stops N times` count, which at zero renders nothing"
+            );
+            assert_eq!(
+                rebase_state.plan[1].to_plan_entry().action,
+                wt_core::rebase::RebaseAction::Reword(Some("third supplied up front".to_string())),
+                "the real plan entry handed to wt_core must carry the supplied message, so the \
+                 real rebase never has to stop for it"
+            );
+        });
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.rebase.is_none(),
+                "a reword whose message was supplied before Start must never hand control back - \
+                 the real rebase runs straight through to Completed"
+            );
+        });
+        let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
+        assert_eq!(
+            subjects, "base\nsecond\nthird supplied up front",
+            "the real history must carry the message supplied up front, with no stop in between"
+        );
+    }
+
     // --- Starting a plan that stops for edit ----------------------------------------------------
 
     #[gpui::test]
