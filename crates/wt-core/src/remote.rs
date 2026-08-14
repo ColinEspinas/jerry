@@ -109,6 +109,14 @@ pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
 /// posture is git's own, and there is no reason for this function to be able to do less than
 /// [`push`] already can.
 ///
+/// `branch` gets the same mandatory `--` terminator [`checkout_branch`](crate::checkout::
+/// checkout_branch) documents, for the identical reason: it is an ordinary positional here (the
+/// refspec, after the `origin` repository argument), not one of `-b`'s/`--branch`'s own
+/// option-values, and `git push` really does still scan a later positional for flag-shaped text -
+/// live-reproduced: `git push origin --evil` (no `--`) fails with `error: unknown option
+/// 'evil'`, not a refspec-not-found refusal. With `--` in front the same string is refused
+/// honestly instead (`error: src refspec --evil does not match any`).
+///
 /// Performs blocking I/O.
 pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Result<(), Error> {
     let has_upstream = has_configured_upstream(worktree_path, Some(branch))?;
@@ -118,6 +126,7 @@ pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Resu
         args.push("--set-upstream".into());
     }
     args.push("origin".into());
+    args.push("--".into());
     args.push(branch.into());
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)

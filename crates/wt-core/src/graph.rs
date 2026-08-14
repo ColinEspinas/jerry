@@ -441,9 +441,8 @@ pub struct ResolvedCommit {
     pub short_id: String,
 }
 
-/// Resolve `rev` to the real commit it names, in `worktree_path` - `git log -1 --format=%H %h
-/// <rev> --`, one invocation for both forms so they can never disagree about which commit they
-/// describe.
+/// Resolve `branch` (a local branch name) to its real tip commit, in `worktree_path` - both the
+/// full object id and git's own abbreviated form of it.
 ///
 /// The Branches panel's "Rebase current branch on Branch…" is what needs this (GitHub issue
 /// #241): the rebase engine and its banner both work in terms of a commit, and a *branch* is a
@@ -451,37 +450,65 @@ pub struct ResolvedCommit {
 /// there when the user clicked, exactly like the row menu's own rebase entry already pins a row's
 /// commit id rather than its row index.
 ///
-/// A `rev` that names nothing (a branch deleted since the panel last loaded, a typo) surfaces as
-/// git's own real stderr through [`Error::GitCommand`] - never a fabricated or partially-resolved
-/// answer.
+/// ## Why this resolves through `gix` rather than shelling out to `git log`/`git rev-parse`
 ///
-/// Performs blocking I/O: spawns a real `git` child process.
-pub fn resolve_commit(worktree_path: &Path, rev: &str) -> Result<ResolvedCommit, Error> {
+/// `branch` is a real branch name, sourced from the Branches panel's own list rather than this
+/// app's graph - the same provenance as [`crate::checkout::checkout_branch`]/
+/// [`crate::remote::push_branch`], which both guard their own branch-name positional with a
+/// leading `--` for exactly this reason. That guard does not have an equivalent here: `git log`
+/// and `git rev-parse` both overload a trailing `--` to mean "everything after this is a
+/// pathspec, not a revision" (unlike `git branch -m --`/`git push origin --`, where `--` simply
+/// means "end of options, positionals follow"), so protecting the revision positional the same
+/// way silently breaks revision resolution instead of merely refusing a hostile one -
+/// live-reproduced: `git log -1 --format=... -- feature` (a real, existing branch) exits `0`
+/// with **no output at all**, because `--` makes git treat `feature` purely as a pathspec (no
+/// file named that exists), never as the branch. Putting `rev`/`branch` *before* the `--` doesn't
+/// help either: `git log -1 --format=... --evil --` still fails with `fatal: unrecognized
+/// argument: --evil`, i.e. git's option parser already consumed it as a flag before the trailing
+/// `--` is ever reached - `git log`'s flag surface (`--format`, `--output` among them) makes that
+/// a real risk, not just an ugly error. `gix::Repository::find_reference` takes `branch` as an
+/// ordinary Rust string used to build a ref-database lookup key - there is no subprocess command
+/// line for it to be misparsed as a flag of, the same reasoning `crate::diff::detect_default_base`
+/// (this crate's own established pattern for exactly this kind of branch-name-to-commit
+/// resolution) already relies on.
+///
+/// A `branch` that names nothing (deleted since the panel last loaded, a typo) is reported
+/// honestly via [`Error::WorktreeIo`] - never a fabricated or partially-resolved answer.
+///
+/// Performs blocking I/O: opens the repository via `gix`, then spawns a real `git rev-parse
+/// --short` child process to abbreviate the id `gix` already resolved (safe without a `--` guard,
+/// by [`crate::checkout::checkout`]'s own established reasoning - a real object id `gix` itself
+/// produced is never user-typed or flag-shaped).
+pub fn resolve_commit(worktree_path: &Path, branch: &str) -> Result<ResolvedCommit, Error> {
+    let repo = crate::open_repo(worktree_path)?;
+    let full_ref_name = format!("refs/heads/{branch}");
+    let mut reference = repo.find_reference(full_ref_name.as_str()).map_err(|_| {
+        Error::WorktreeIo(std::io::Error::other(format!("no such branch: {branch:?}")))
+    })?;
+    let id = reference
+        .peel_to_id_in_place()
+        .map_err(|source| Error::PeelReference(Box::new(source)))?
+        .detach();
+    let full_hex = id.to_string();
+
     let args: Vec<OsString> = vec![
-        "log".into(),
-        "-1".into(),
-        "--format=%H %h".into(),
-        rev.into(),
-        // The pathspec separator: whatever `rev` is, it is parsed as a revision here, never as a
-        // path that happens to exist in the working tree.
-        "--".into(),
+        "rev-parse".into(),
+        "--short".into(),
+        full_hex.clone().into(),
     ];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().next().unwrap_or_default().trim();
-    let mut parts = line.split_whitespace();
-    match (parts.next(), parts.next()) {
-        (Some(id), Some(short_id)) => Ok(ResolvedCommit {
-            id: id.to_string(),
-            short_id: short_id.to_string(),
-        }),
-        // `git log` exited successfully but printed something this can't read - reported rather
-        // than guessed at, the same "no fabricated answer" contract the rest of this module keeps.
-        _ => Err(Error::WorktreeIo(std::io::Error::other(format!(
-            "could not read a commit id out of `git log` output for {rev:?}"
-        )))),
+    let short_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if short_id.is_empty() {
+        return Err(Error::WorktreeIo(std::io::Error::other(format!(
+            "could not read a short id for {full_hex} out of `git rev-parse --short` output"
+        ))));
     }
+
+    Ok(ResolvedCommit {
+        id: full_hex,
+        short_id,
+    })
 }
 
 /// Real ahead/behind counts for the worktree at `worktree_path` against its `HEAD` branch's real
@@ -1009,19 +1036,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_commit_surfaces_gits_own_error_for_a_ref_that_does_not_exist() {
+    fn resolve_commit_refuses_to_fabricate_a_commit_for_a_branch_that_does_not_exist() {
         let repo = init_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
-        let err = resolve_commit(repo.path(), "no-such-branch")
-            .expect_err("a ref that names nothing must be a real error, not a fabricated commit");
+        let err = resolve_commit(repo.path(), "no-such-branch").expect_err(
+            "a branch that names nothing must be a real error, not a fabricated commit",
+        );
         match err {
-            Error::GitCommand { stderr, .. } => assert!(
-                stderr.contains("bad revision") || stderr.contains("unknown revision"),
-                "git's own real \"that ref names nothing\" text must be preserved for the caller \
-                 to show, not some other failure: {stderr}"
+            Error::WorktreeIo(io_err) => assert!(
+                io_err.to_string().contains("no-such-branch"),
+                "the error must name the unresolved branch so the caller can show it: {io_err}"
             ),
-            other => panic!("expected Error::GitCommand, got {other:?}"),
+            other => panic!("expected Error::WorktreeIo, got {other:?}"),
+        }
+    }
+
+    /// The whole reason [`resolve_commit`] resolves through `gix::Repository::find_reference`
+    /// rather than shelling out to `git log`/`git rev-parse`: there is no subprocess command line
+    /// here at all for a flag-shaped branch name to be misparsed as an option of. No branch can
+    /// actually be named `--evil` (git itself refuses to create one), so this proves the refusal
+    /// is the ordinary "no such branch" one - the same as any other nonexistent name - never
+    /// anything that touched a `git` argument parser.
+    #[test]
+    fn resolve_commit_treats_a_flag_shaped_branch_name_as_an_ordinary_ref_lookup() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+
+        let err = resolve_commit(repo.path(), "--evil").expect_err(
+            "a flag-shaped name must still be refused as unresolved, not act as a flag",
+        );
+        match err {
+            Error::WorktreeIo(io_err) => assert!(
+                io_err.to_string().contains("--evil"),
+                "must be the ordinary \"no such branch\" refusal naming it, not anything that \
+                 implies a subprocess argument was involved: {io_err}"
+            ),
+            other => panic!("expected Error::WorktreeIo, got {other:?}"),
         }
     }
 

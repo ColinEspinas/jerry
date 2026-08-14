@@ -917,10 +917,16 @@ impl AdeApp {
         });
     }
 
-    /// The branch menu's "Checkout Branch" action (GitHub issue #241) - `git checkout <branch>`
-    /// in the focused worktree (`wt_core::checkout::checkout`, which takes any commit-ish, a
-    /// branch name included). Unlike the row menu's "Check out" this lands on the *branch*, not a
-    /// detached `HEAD`.
+    /// The branch menu's "Checkout Branch" action (GitHub issue #241) - `git switch -- <branch>`
+    /// in the focused worktree (`wt_core::checkout::checkout_branch`), landing on the *branch*
+    /// with `HEAD` attached, not a detached commit.
+    ///
+    /// Deliberately not `wt_core::checkout::checkout` (the row menu's own "Check out"): that
+    /// function is safe only because every one of *its* callers passes a commit id resolved from
+    /// this app's own graph, never user-typed or taken from a branch listing - see its own docs.
+    /// This action's `branch` comes from the Branches panel's own list instead, so it needs
+    /// `checkout_branch`'s `--`-guarded implementation; see that function's docs for the real,
+    /// live-reproduced flag-injection failure mode reusing plain `checkout` here would reopen.
     ///
     /// A branch already checked out in another worktree, or uncommitted changes that would be
     /// overwritten, are git's own refusals to make - surfaced verbatim through
@@ -928,7 +934,7 @@ impl AdeApp {
     pub(crate) fn request_graph_branch_checkout(&mut self, branch: String, cx: &mut Context<Self>) {
         self.graph_state.delete_branch_confirm_armed = None;
         self.run_graph_remote_op("Check out", cx, move |root| {
-            wt_core::checkout::checkout(&root, &branch)
+            wt_core::checkout::checkout_branch(&root, &branch)
         });
     }
 

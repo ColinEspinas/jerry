@@ -56,6 +56,35 @@ pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Resul
     check_success(&args, &output)
 }
 
+/// Real `git switch -- <branch>` for `worktree_path`: switches to an existing local branch with
+/// `HEAD` attached to it - the Branches panel's own branch context menu "Checkout Branch"
+/// (GitHub issue #241). Deliberately not [`checkout`]: that function's own docs establish it is
+/// safe *only* because every existing caller passes a commit id resolved from this app's own
+/// graph, never user-typed or taken from a branch listing - a guarantee this new caller (a real
+/// branch name, sourced from the Branches panel's own list, not this app's graph) does not share.
+///
+/// The `--` here is not decorative, and plain `git checkout <branch>` (what [`checkout`] runs)
+/// is not a substitute - live-reproduced: `git checkout --orphan` (no branch of that name exists
+/// or ever could, since git itself refuses to create one starting with `-`) is parsed as the
+/// real `--orphan` *flag*, not refused as an unknown branch, because `checkout`'s argument
+/// parser inspects a leading positional for flag-shaped text before it is ever resolved as a
+/// ref. `git switch` has no pathspec overload the way `checkout` does, so `--` here keeps its
+/// ordinary "end of options" meaning without changing what gets checked out (unlike `checkout --
+/// <ref>`, which would instead try to check out `<ref>` as a *file path*): `git switch --
+/// --orphan` is refused honestly (`fatal: invalid reference: --orphan`), and `git switch --
+/// <real-branch>` switches to it exactly like a bare `git switch <real-branch>` would.
+///
+/// A branch that doesn't exist, or a real failure switching (uncommitted changes that would be
+/// overwritten), surfaces as git's own real stderr through [`Error::GitCommand`] - the same
+/// no-pre-checking discipline every mutation in this module follows.
+///
+/// Performs blocking I/O.
+pub fn checkout_branch(worktree_path: &Path, branch: &str) -> Result<(), Error> {
+    let args: Vec<OsString> = vec!["switch".into(), "--".into(), branch.into()];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)
+}
+
 /// Real `git branch -m <old_name> <new_name>` for `worktree_path`: renames an existing local
 /// branch, keeping its tip commit, its reflog and its upstream configuration - the Branches
 /// panel's own branch context menu "Rename Branch…" (GitHub issue #241).
@@ -311,6 +340,73 @@ mod tests {
                 assert!(
                     stderr.contains("already exists"),
                     "git's own real collision error must be preserved: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkout_branch_really_switches_with_head_attached_not_detached() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        commit(repo.path(), "a.txt", "on feature", "feature commit");
+        git(repo.path(), &["checkout", "main"]);
+        assert_eq!(current_branch(repo.path()), "main");
+
+        checkout_branch(repo.path(), "feature").expect("checkout_branch should succeed");
+
+        assert_eq!(
+            current_branch(repo.path()),
+            "feature",
+            "HEAD must really be attached to the target branch, not detached"
+        );
+    }
+
+    #[test]
+    fn checkout_branch_refuses_a_nonexistent_branch_with_gits_own_real_error() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+
+        let result = checkout_branch(repo.path(), "no-such-branch");
+        assert!(result.is_err(), "a nonexistent branch must fail");
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.to_lowercase().contains("no-such-branch")
+                        || stderr.to_lowercase().contains("invalid reference"),
+                    "git's own real refusal must be preserved: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+    }
+
+    /// The whole reason [`checkout_branch`] exists rather than reusing [`checkout`]: a
+    /// flag-shaped string in this positional slot must be refused as an invalid reference, never
+    /// silently parsed as an option to `git switch` itself. No branch actually named `--orphan`
+    /// can exist (git refuses to create one), so this proves the refusal is the *safe* one
+    /// (`fatal: invalid reference`) rather than [`checkout`]'s own real failure mode reproduced in
+    /// this module's docs (`--orphan` consumed as a flag, `error: option 'orphan' requires a
+    /// value`).
+    #[test]
+    fn checkout_branch_refuses_a_flag_shaped_name_instead_of_parsing_it_as_an_option() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+
+        let result = checkout_branch(repo.path(), "--orphan");
+        assert!(
+            result.is_err(),
+            "a flag-shaped name must be refused, not parsed as an option"
+        );
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("invalid reference") || stderr.contains("not found"),
+                    "must be refused as an invalid ref, not misparsed as a flag \
+                     (a real flag-parse failure reads like \"option 'orphan' requires a \
+                     value\" instead): {stderr}"
                 );
             }
             other => panic!("expected Error::GitCommand, got {other:?}"),

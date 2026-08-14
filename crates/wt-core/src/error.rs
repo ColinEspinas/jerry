@@ -65,6 +65,12 @@ pub enum Error {
     #[error("failed to resolve HEAD to a commit: {0}")]
     PeelHead(#[source] Box<gix::head::peel::Error>),
 
+    /// Failed to resolve a real, already-found branch reference to a commit id -
+    /// [`crate::graph::resolve_commit`]'s own peel step, distinct from [`Self::PeelHead`] because
+    /// the reference being peeled here is an ordinary branch, never `HEAD` itself.
+    #[error("failed to resolve branch to a commit: {0}")]
+    PeelReference(#[source] Box<gix::reference::peel::Error>),
+
     /// Failed to compute the merge-base between a worktree's `HEAD` and the detected
     /// default branch.
     #[error("failed to compute merge-base: {0}")]
