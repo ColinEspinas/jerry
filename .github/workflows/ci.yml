@@ -113,7 +113,7 @@ jobs:
   # needs no `--features` flag on either platform: per-target dependency/feature
   # selection is Cargo's job, resolved automatically from the actual build target.
   macos:
-    name: macOS (build only)
+    name: macOS (build + sampling tests)
     runs-on: macos-latest
     # A real, platform-specific build-script requirement found by reading
     # `vendor/zed/crates/gpui_macos/build.rs` directly (not assumed): it unconditionally
@@ -138,8 +138,28 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace
 
+      # GitHub issue #283: the macOS per-process CPU/memory sampling backend
+      # (`crate::status_bar::process_stats::macos`) is real `proc_pid_rusage` FFI that nobody
+      # working on this repo can run locally - this project's dev environment is Linux/WSL2-only
+      # (see this file's own comments above). `cargo build` above does not help: it does not
+      # compile `#[cfg(test)]` modules at all, so without this step not one line of that
+      # backend's tests would ever execute on any macOS machine.
+      #
+      # This is deliberately a *narrow* filter, not the fuller `cargo test` this job's own
+      # comments explain is out of scope: `status_bar::process_stats` needs no language servers,
+      # no git fixtures and no filesystem watchers, so it is free of every environment gap that
+      # keeps the rest of the suite off these runners.
+      #
+      # It earns its keep concretely. `ri_user_time`/`ri_system_time` are mach *timebase* units,
+      # not nanoseconds, and reading them as nanoseconds under-reports CPU by ~41.7x on Apple
+      # Silicon while being exactly right on Intel - a defect this backend genuinely shipped with
+      # for one commit. `macos-latest` is Apple Silicon, and that backend's busy-child test
+      # asserts a real lower bound against wall-clock time, so this step is what would catch it.
+      - name: cargo test (per-process sampling backend)
+        run: cargo test -p app --lib status_bar::process_stats
+
   windows:
-    name: Windows (build only)
+    name: Windows (build + sampling tests)
     runs-on: windows-latest
     # A real, platform-specific build-script quirk found by reading
     # `vendor/zed/crates/gpui_windows/build.rs` directly (not assumed): its
@@ -165,3 +185,12 @@ jobs:
 
       - name: cargo build --workspace
         run: cargo build --workspace
+
+      # GitHub issue #283, the Windows twin of the macOS job's step above - same reasoning,
+      # same narrow filter. `crate::status_bar::process_stats::windows` is real `GetProcessTimes`
+      # + PSAPI FFI written on a Linux machine and cross-compile-checked only; `cargo build`
+      # above does not compile `#[cfg(test)]` modules, so this step is the one thing that ever
+      # executes it on a real Windows machine. Without it, the backend's own "CI covers this"
+      # claim would be empty.
+      - name: cargo test (per-process sampling backend)
+        run: cargo test -p app --lib status_bar::process_stats
