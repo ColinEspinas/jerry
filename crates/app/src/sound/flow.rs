@@ -378,7 +378,10 @@ mod tests {
     #[test]
     fn turn_ended_staying_true_across_ticks_does_not_re_sound() {
         assert_eq!(
-            sound_for_transition(turn_ended_state(Status::Idle), turn_ended_state(Status::Idle)),
+            sound_for_transition(
+                turn_ended_state(Status::Idle),
+                turn_ended_state(Status::Idle)
+            ),
             None
         );
     }

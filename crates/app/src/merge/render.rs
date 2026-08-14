@@ -1,5 +1,6 @@
 use super::*;
 use crate::code_surface::zoom::zoom_scoped;
+use crate::root::plural;
 
 impl AdeApp {
     /// Surface D - the merge-conflict resolution surface, replacing the pty/diff body below the
@@ -108,7 +109,10 @@ impl AdeApp {
                                 .child(if files.is_empty() {
                                     "No files changed.".to_string()
                                 } else {
-                                    format!("{} file(s) staged, not yet committed.", files.len())
+                                    format!(
+                                        "{} staged, not yet committed.",
+                                        plural::count(files.len(), "file", None)
+                                    )
                                 }),
                         )
                         .children(files.iter().map(|path| {
@@ -173,7 +177,10 @@ impl AdeApp {
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_size(px(11.0))
                                 .text_color(theme::status::REVIEW)
-                                .child(format!("Jerry auto-resolved {auto} of {total} files")),
+                                .child(format!(
+                                    "Jerry auto-resolved {auto} of {}",
+                                    plural::count(total, "file", None)
+                                )),
                         )
                         .child(
                             div()
@@ -183,7 +190,11 @@ impl AdeApp {
                                 .child(if remaining == 0 {
                                     "every conflict is resolved.".to_string()
                                 } else {
-                                    format!("{remaining} file(s) still need you.")
+                                    format!(
+                                        "{} still {} you.",
+                                        plural::count(remaining, "file", None),
+                                        plural::form(remaining, "needs", "need")
+                                    )
                                 }),
                         ),
                 );

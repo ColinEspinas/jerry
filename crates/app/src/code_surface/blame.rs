@@ -25,6 +25,7 @@
 //! rewrite could restore byte-identical content with a new mtime, or vice versa, so both must
 //! agree.
 
+use crate::root::plural;
 use wt_core::blame::BlameLine;
 
 /// The all-zero sha `git blame` uses for a line whose content hasn't been committed yet -
@@ -120,9 +121,10 @@ pub fn format_relative_date(then_unix: i64, now_unix: i64) -> String {
     }
     for (threshold, unit) in RELATIVE_DATE_BUCKETS {
         if elapsed >= *threshold {
-            let count = elapsed / threshold;
-            let plural = if count == 1 { "" } else { "s" };
-            return format!("{count} {unit}{plural} ago");
+            // `elapsed >= *threshold > 0`, so this is a genuine, non-negative count and the
+            // `as usize` cast cannot wrap.
+            let count = (elapsed / threshold) as usize;
+            return format!("{} ago", plural::count(count, unit, None));
         }
     }
     // Unreachable in practice (60s is `RELATIVE_DATE_BUCKETS`'s own smallest threshold, and

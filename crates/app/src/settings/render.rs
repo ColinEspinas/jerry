@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::plural;
 use crate::root::widgets::{
     hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
 };
@@ -751,8 +752,9 @@ impl AdeApp {
                                     .font(font(theme::font::MONO))
                                     .text_size(px(10.5))
                                     .text_color(theme::text::FAINTER)
-                                    .child(format!(
-                                        "{worktree_count} worktrees \u{b7} {disk_label}"
+                                    .child(crate::rail::state::worktree_disk_label(
+                                        worktree_count,
+                                        &disk_label,
                                     )),
                             )
                             .child(
@@ -2658,7 +2660,7 @@ impl AdeApp {
                             .child(if has_query {
                                 self.settings_keymap_filter.as_str().to_string()
                             } else {
-                                format!("filter {total} bindings")
+                                format!("filter {}", plural::count(total, "binding", None))
                             })
                             .debug_selector(|| "settings-keymap-filter-text".to_string()),
                     )

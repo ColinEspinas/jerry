@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::plural;
 use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
 use crate::settings::widgets::ChoiceOption;
 use crate::sidebar::render::RightSidebarView;
@@ -190,8 +191,8 @@ impl AdeApp {
             palette::CommandCandidate {
                 command: palette::PaletteCommand::PruneWorktrees,
                 secondary: format!(
-                    "{} prunable worktree(s)",
-                    self.prunable_worktree_paths().len()
+                    "{} prunable",
+                    plural::count(self.prunable_worktree_paths().len(), "worktree", None)
                 ),
             },
             palette::CommandCandidate {
@@ -1172,10 +1173,7 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::HINT)
-                    .child(format!(
-                        "{total} result{}",
-                        if total == 1 { "" } else { "s" }
-                    )),
+                    .child(plural::count(total, "result", None)),
             )
     }
 }

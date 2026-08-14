@@ -1,7 +1,31 @@
 use super::*;
+use crate::root::plural;
 use crate::root::widgets::{
     hover_keycap_row, render_env_chip, render_keycap_row, text_tooltip, KeycapSize,
 };
+
+/// The agents cluster's text: `"1 agent · 4% cpu · 30 MB"` on Linux, `"1 agent"` elsewhere
+/// (`extras` empty). Pure, so the conjugation is testable without a live process sampler -
+/// which matters here because the single-agent case this used to render as `"1 agents"` is the
+/// *ordinary* one: every window starts with exactly one agent.
+fn status_agents_label(agent_count: usize, extras: &[&str]) -> String {
+    let agents = plural::count(agent_count, "agent", None);
+    if extras.is_empty() {
+        return agents;
+    }
+    format!("{agents} \u{b7} {}", extras.join(" \u{b7} "))
+}
+
+/// The LSP cluster's text: `"1 server"`, `"2 servers · 3 errors"`. `errors` is `None` whenever
+/// no real file's File view is on screen (see [`AdeApp::status_bar_active_parsed_file`]), in
+/// which case the error half is omitted entirely rather than shown as a stale zero.
+fn status_servers_errors_label(server_count: usize, errors: Option<usize>) -> String {
+    let servers = plural::count(server_count, "server", None);
+    match errors {
+        Some(errors) => format!("{servers} \u{b7} {}", plural::count(errors, "error", None)),
+        None => servers,
+    }
+}
 
 /// The 28px status bar (`CHANGELOG.md`'s change 7 - height 26 -> 28, gap 12 -> 9, every value
 /// 10px mono), rebuilt from the old single `8 agents · 2 waiting · …` summary string into a
@@ -294,8 +318,9 @@ impl AdeApp {
             None => "...".to_string(),
         };
 
-        self.render_status_text(format!(
-            "{agent_count} agents \u{b7} {cpu_label} \u{b7} {mem_label}"
+        self.render_status_text(status_agents_label(
+            agent_count,
+            &[cpu_label.as_str(), mem_label.as_str()],
         ))
     }
 
@@ -310,7 +335,7 @@ impl AdeApp {
             .iter()
             .filter(|agent| agent.kind.is_agent_session())
             .count();
-        self.render_status_text(format!("{agent_count} agents"))
+        self.render_status_text(status_agents_label(agent_count, &[]))
     }
 
     /// `N wt · Y GB` - both real, both already computed elsewhere: worktree count from
@@ -339,10 +364,7 @@ impl AdeApp {
             .filter(|state| matches!(state, LspClientState::Ready(_)))
             .count();
 
-        let label = match self.status_bar_error_count() {
-            Some(errors) => format!("{server_count} servers \u{b7} {errors} errors"),
-            None => format!("{server_count} servers"),
-        };
+        let label = status_servers_errors_label(server_count, self.status_bar_error_count());
         self.render_status_text(label)
     }
 
@@ -420,7 +442,7 @@ impl AdeApp {
                 row = row.child(self.render_status_text(format!("ln {line}")));
             }
             if let Some(width) = code_view::detect_indent_width(&parsed.lines) {
-                row = row.child(self.render_status_text(format!("{width} spaces")));
+                row = row.child(self.render_status_text(plural::count(width, "space", None)));
             }
             row = row.child(self.render_status_text(parsed.line_ending.label().to_string()));
             // A real, checked value (`code_view::ParsedFile::is_valid_utf8`), not a hardcoded
@@ -552,6 +574,63 @@ fn render_status_divider() -> impl IntoElement {
 /// resets zoom through [`AdeApp::reset_zoom`] - the exact same real mechanism the code toolbar's
 /// own zoom control (`code_surface::zoom::render_zoom_control`) uses, never a second, copied
 /// implementation.
+/// The two status-bar clusters that used to hardcode their plural noun and so read `1 agents`
+/// / `1 servers · 1 errors` for the single-agent, single-server case that is in fact the
+/// ordinary one (GitHub issue #281).
+#[cfg(test)]
+mod status_bar_count_conjugation_tests {
+    use super::*;
+
+    #[test]
+    fn agents_cluster_conjugates_at_zero_one_and_two() {
+        assert_eq!(status_agents_label(0, &[]), "0 agents");
+        assert_eq!(status_agents_label(1, &[]), "1 agent");
+        assert_eq!(status_agents_label(2, &[]), "2 agents");
+    }
+
+    /// The Linux build appends the real cpu/mem fields; the conjugation must not change.
+    #[test]
+    fn agents_cluster_conjugates_with_the_cpu_and_memory_fields_attached() {
+        assert_eq!(
+            status_agents_label(1, &["4% cpu", "30 MB"]),
+            "1 agent \u{b7} 4% cpu \u{b7} 30 MB"
+        );
+        assert_eq!(
+            status_agents_label(2, &["4% cpu", "30 MB"]),
+            "2 agents \u{b7} 4% cpu \u{b7} 30 MB"
+        );
+    }
+
+    #[test]
+    fn servers_cluster_conjugates_at_zero_one_and_two() {
+        assert_eq!(status_servers_errors_label(0, None), "0 servers");
+        assert_eq!(status_servers_errors_label(1, None), "1 server");
+        assert_eq!(status_servers_errors_label(2, None), "2 servers");
+    }
+
+    /// Both counts in the two-count string conjugate independently - the old label got *both*
+    /// wrong at one, and a fix that only handled the server half would still read `1 errors`.
+    #[test]
+    fn servers_and_errors_conjugate_independently() {
+        assert_eq!(
+            status_servers_errors_label(1, Some(1)),
+            "1 server \u{b7} 1 error"
+        );
+        assert_eq!(
+            status_servers_errors_label(1, Some(2)),
+            "1 server \u{b7} 2 errors"
+        );
+        assert_eq!(
+            status_servers_errors_label(2, Some(1)),
+            "2 servers \u{b7} 1 error"
+        );
+        assert_eq!(
+            status_servers_errors_label(2, Some(0)),
+            "2 servers \u{b7} 0 errors"
+        );
+    }
+}
+
 #[cfg(test)]
 mod status_bar_zoom_click_tests {
     use super::*;

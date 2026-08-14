@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::rail::repo::RepoId;
 use crate::rail::status::Status;
+use crate::root::plural;
 use crate::work_surface::agents::ProcessKind;
 use wt_core::diff::{AheadBehind, DiffLineKind, WorktreeDiff, WorktreeMergeStatus};
 
@@ -536,12 +537,51 @@ impl RepoGroup {
 /// case, but the rest of this codebase already conjugates every other counter correctly (see
 /// that same title-bar function's `"1 agent needs input"` vs `"2 agents need input"`), so this
 /// one must too.
+///
+/// The conjugation itself is [`crate::root::plural`]'s, not a hand-written match arm per count:
+/// hiding at zero is this function's own decision (a content choice), agreeing at one versus
+/// many is not.
 pub fn waiting_count_label(count: usize) -> Option<String> {
-    match count {
-        0 => None,
-        1 => Some("1 worktree waiting".to_string()),
-        n => Some(format!("{n} worktrees waiting")),
+    if count == 0 {
+        return None;
     }
+    Some(format!(
+        "{} waiting",
+        plural::count(count, "worktree", None)
+    ))
+}
+
+/// The rail footer's and Settings → Disk's shared idle line: `"3 worktrees · 1.2 GB"`.
+///
+/// One function rather than the two independently-formatted copies these two surfaces used to
+/// carry (both of which read `1 worktrees` for a fresh single-checkout repo, which is the very
+/// first thing a new user sees).
+pub fn worktree_disk_label(worktree_count: usize, disk_label: &str) -> String {
+    format!(
+        "{} \u{b7} {disk_label}",
+        plural::count(worktree_count, "worktree", None)
+    )
+}
+
+/// The prune button's arming prompt: `"click prune again to remove 2 worktrees"`.
+pub fn prune_confirm_label(candidate_count: usize) -> String {
+    format!(
+        "click prune again to remove {}",
+        plural::count(candidate_count, "worktree", None)
+    )
+}
+
+/// The in-flight prune status: `"pruning 2 worktrees…"`.
+pub fn pruning_label(candidate_count: usize) -> String {
+    format!(
+        "pruning {}\u{2026}",
+        plural::count(candidate_count, "worktree", None)
+    )
+}
+
+/// The finished-prune status: `"pruned 1 worktree"`.
+pub fn pruned_label(removed_count: usize) -> String {
+    format!("pruned {}", plural::count(removed_count, "worktree", None))
 }
 
 /// Builds the rail's repo groups: each [`RepoWorktrees`]' rows sorted by
@@ -1469,6 +1509,56 @@ mod tests {
             waiting_count_label(7).as_deref(),
             Some("7 worktrees waiting")
         );
+    }
+
+    /// The rail footer and Settings → Disk share this one line, and it used to read
+    /// `"1 worktrees · 4.2 GB"` in both places for a fresh single-checkout repo.
+    #[test]
+    fn worktree_disk_label_conjugates_at_zero_one_and_two() {
+        assert_eq!(worktree_disk_label(0, "0 B"), "0 worktrees \u{b7} 0 B");
+        assert_eq!(worktree_disk_label(1, "4.2 GB"), "1 worktree \u{b7} 4.2 GB");
+        assert_eq!(
+            worktree_disk_label(2, "4.2 GB"),
+            "2 worktrees \u{b7} 4.2 GB"
+        );
+    }
+
+    #[test]
+    fn prune_labels_conjugate_at_zero_one_and_two() {
+        assert_eq!(
+            prune_confirm_label(0),
+            "click prune again to remove 0 worktrees"
+        );
+        assert_eq!(
+            prune_confirm_label(1),
+            "click prune again to remove 1 worktree"
+        );
+        assert_eq!(
+            prune_confirm_label(2),
+            "click prune again to remove 2 worktrees"
+        );
+
+        assert_eq!(pruning_label(0), "pruning 0 worktrees\u{2026}");
+        assert_eq!(pruning_label(1), "pruning 1 worktree\u{2026}");
+        assert_eq!(pruning_label(2), "pruning 2 worktrees\u{2026}");
+
+        assert_eq!(pruned_label(0), "pruned 0 worktrees");
+        assert_eq!(pruned_label(1), "pruned 1 worktree");
+        assert_eq!(pruned_label(2), "pruned 2 worktrees");
+    }
+
+    /// None of the prune/disk labels may fall back to the `worktree(s)` escape hatch these
+    /// three replaced - that spelling dodges the conjugation instead of doing it.
+    #[test]
+    fn no_prune_label_uses_the_parenthesised_plural_escape_hatch() {
+        for n in 0..4 {
+            for label in [prune_confirm_label(n), pruning_label(n), pruned_label(n)] {
+                assert!(
+                    !label.contains("(s)"),
+                    "prune label must conjugate, not dodge: {label}"
+                );
+            }
+        }
     }
 
     #[test]
