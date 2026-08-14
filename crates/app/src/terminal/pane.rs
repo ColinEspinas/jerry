@@ -2307,7 +2307,7 @@ impl Render for TerminalPane {
             let message = format!("failed to start process: {error}");
             pane = pane.child(render_plain_line_with_links(
                 &message,
-                rgb(0xff6b6b),
+                theme::terminal::SPAWN_ERROR.resolve(),
                 &cwd,
                 cx,
             ));
@@ -2318,7 +2318,11 @@ impl Render for TerminalPane {
         }
 
         if self.grid.ended {
-            pane = pane.child(div().text_color(rgb(0xffcc66)).child("[process exited]"));
+            pane = pane.child(
+                div()
+                    .text_color(theme::terminal::PROCESS_EXITED)
+                    .child("[process exited]"),
+            );
         }
 
         pane

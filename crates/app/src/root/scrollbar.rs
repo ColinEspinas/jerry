@@ -105,9 +105,32 @@ use super::*;
 use crate::root::scrollbar_geometry as geometry;
 
 /// The scrollbar's own thickness (track + thumb width/height) - the hit target as well as the
-/// visual width, kept slim to match this UI's generally compact chrome (`theme::band::TREE_ROW`
-/// is 22px; a 12px `list_example.rs`-style scrollbar would visually dominate a row that short).
-const SCROLLBAR_SIZE: f32 = 8.0;
+/// visual width.
+///
+/// This used to be a local `8.0` chosen to match this UI's compact chrome, because the mockup had
+/// no scrollbar spec at all. Rev 6 supplies one (`design_handoff_jerry_ade/revision 5/
+/// STAGE-A-CHANGELOG.md` §4p, whose own note is that "for the Rust build this is a spec, not
+/// CSS"), so the number now tracks [`theme::scrollbar::WIDTH`] along with the rest of §4p's table:
+/// [`theme::scrollbar::THUMB_RADIUS`], [`theme::scrollbar::THUMB_INSET`], and a *transparent*
+/// track. The thumb is inset on each side, so what is actually painted is `10 - 2*2 = 6px` wide,
+/// visually slimmer than the old flush 8px bar, on a larger hit target.
+///
+/// This is a plain `f32` rather than the [`gpui::Pixels`] token itself only because
+/// [`CONTENT_CLEARANCE`] below has to be a `const` and `Pixels`' inner field is crate-private to
+/// GPUI, so it cannot be unwrapped in a const context.
+/// `scrollbar_spec_tests::the_local_size_constants_match_the_design_tokens` asserts the two are
+/// the same number, so they cannot drift.
+const SCROLLBAR_SIZE: f32 = 10.0;
+
+/// How far clear of the track's edges the painted thumb floats - STAGE-A-CHANGELOG.md §4p's "2px
+/// transparent border". A plain `f32` mirror of [`theme::scrollbar::THUMB_INSET`], for the same
+/// const-context reason [`SCROLLBAR_SIZE`] is, and pinned to it by the same test.
+const THUMB_INSET: f32 = 2.0;
+
+/// The inset only means anything if it leaves a thumb to paint. Both operands are `const`, so this
+/// is a genuine compile-time guard rather than a test - retuning §4p's numbers into a combination
+/// that paints nothing fails to build, in every profile, not just under `cargo test`.
+const _: () = assert!(SCROLLBAR_SIZE - 2.0 * THUMB_INSET > 0.0);
 
 /// How much real right-side clearance row/header content next to this scrollbar needs, in
 /// addition to `SCROLLBAR_SIZE` itself - GitHub issue #123 ("Add padding to the file tree right
@@ -250,13 +273,23 @@ impl AdeApp {
                     div()
                         .id(format!("{id}-thumb"))
                         .absolute()
-                        .top(px(thumb_top))
-                        .right_0()
-                        .w(px(SCROLLBAR_SIZE))
-                        .h(px(thumb_len))
-                        .rounded(px(SCROLLBAR_SIZE / 2.0))
-                        .bg(theme::scrollbar::THUMB.resolve().opacity(0.55))
-                        .hover(|el| el.bg(theme::scrollbar::THUMB_HOVER.resolve().opacity(0.75)))
+                        .top(px(thumb_top + THUMB_INSET))
+                        // STAGE-A-CHANGELOG.md §4p: the thumb carries "a 2px transparent border
+                        // and `background-clip:content-box` so it floats 2px clear of the edge".
+                        // Drawn directly rather than in CSS, that transparent border is simply an
+                        // inset on every edge - so the thumb is `WIDTH - 2 * INSET` wide and sits
+                        // `INSET` in from the track's own edges. The track keeps its full
+                        // `SCROLLBAR_SIZE` width and its own click-to-jump handler, so the region
+                        // the pointer can act on is unchanged; only the painted bar is slimmer.
+                        .right(theme::scrollbar::THUMB_INSET)
+                        .w(px(SCROLLBAR_SIZE - 2.0 * THUMB_INSET))
+                        .h(px(thumb_len - 2.0 * THUMB_INSET))
+                        .rounded(theme::scrollbar::THUMB_RADIUS)
+                        // Painted at full strength: §4p's `#2b3137` is already quieter than the
+                        // greys these values replaced, so the old opacity multiplier would land
+                        // somewhere the spec did not ask for.
+                        .bg(theme::scrollbar::THUMB)
+                        .hover(|el| el.bg(theme::scrollbar::THUMB_HOVER))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
@@ -294,5 +327,33 @@ impl AdeApp {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// Pins this module's plain-`f32` geometry constants to the design tokens they mirror.
+///
+/// [`SCROLLBAR_SIZE`] and [`THUMB_INSET`] exist as bare `f32`s only because [`CONTENT_CLEARANCE`]
+/// must be a `const` and `gpui::Pixels`' inner field is crate-private to GPUI, so the token cannot
+/// be unwrapped in a const context. That is a real duplication, and the point of these assertions
+/// is that it can never become a real *divergence*: `theme::scrollbar` stays the single authority
+/// for STAGE-A-CHANGELOG.md §4p's numbers, and editing it there without editing it here fails.
+#[cfg(test)]
+mod scrollbar_spec_tests {
+    use super::*;
+
+    #[test]
+    fn the_local_size_constants_match_the_design_tokens() {
+        assert_eq!(
+            px(SCROLLBAR_SIZE),
+            theme::scrollbar::WIDTH,
+            "SCROLLBAR_SIZE has drifted from theme::scrollbar::WIDTH - §4p's scrollbar width is \
+             defined once, in the theme layer"
+        );
+        assert_eq!(
+            px(THUMB_INSET),
+            theme::scrollbar::THUMB_INSET,
+            "THUMB_INSET has drifted from theme::scrollbar::THUMB_INSET - §4p's 2px content-box \
+             float is defined once, in the theme layer"
+        );
     }
 }

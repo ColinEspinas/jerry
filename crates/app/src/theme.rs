@@ -283,6 +283,9 @@ pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("scrollbar", scrollbar::TOKENS),
     ("graph", graph::TOKENS),
     ("palette", palette::TOKENS),
+    ("changes", changes::TOKENS),
+    ("budget", budget::TOKENS),
+    ("status_bar", status_bar::TOKENS),
 ];
 
 /// Every real registered [`ColorToken`], flattened across [`TOKEN_GROUPS`] - registry order
@@ -1887,6 +1890,18 @@ pub mod terminal {
     /// so the two can't drift into looking like unrelated features.
     pub const SELECTION: ColorToken = token("terminal.selection", 0x273a4d);
 
+    /// `failed to start process: ...`, the line the pane paints when a spawn never happened.
+    ///
+    /// This and [`PROCESS_EXITED`] are here because until rev 6 they were the app's only two
+    /// genuinely hard-coded colours - `rgb(0xff6b6b)` and `rgb(0xffcc66)`, inline in
+    /// `crate::terminal::pane`'s render, unthemeable and invisible to every theme file. Now that
+    /// `super::stray_hex_tests` makes an inline colour a build failure they had to become real
+    /// tokens, and their defaults are the exact values they were already painting, so no theme
+    /// and no pixel changes - only the ability to retint them at all.
+    pub const SPAWN_ERROR: ColorToken = token("terminal.spawn_error", 0xff6b6b);
+    /// The `[process exited]` label, once the child is gone.
+    pub const PROCESS_EXITED: ColorToken = token("terminal.process_exited", 0xffcc66);
+
     /// The standard ANSI 16-colour palette, indexed `0..=15` by `NamedColor`'s own discriminants
     /// and by `Color::Indexed(0..=15)`, in the conventional order: black, red, green, yellow, blue,
     /// magenta, cyan, white, then the eight bright variants in the same order.
@@ -1948,6 +1963,8 @@ pub mod terminal {
         ("FOREGROUND", FOREGROUND),
         ("CURSOR", CURSOR),
         ("SELECTION", SELECTION),
+        ("SPAWN_ERROR", SPAWN_ERROR),
+        ("PROCESS_EXITED", PROCESS_EXITED),
         ("ANSI.0", ANSI[0]),
         ("ANSI.1", ANSI[1]),
         ("ANSI.2", ANSI[2]),
@@ -1994,27 +2011,98 @@ pub mod env {
     ];
 }
 
-/// One tint per agent. Used on the rail badge, the CLI tab chip and the
-/// conflict side headers, so a colour always means the same agent.
+/// One tint per agent - the **agent tint pool**. Used on the rail badge, the CLI tab chip, the
+/// Changes panel's per-run left edge and the conflict side headers, so a colour always means the
+/// same agent.
+///
+/// # The reserved-hue allocation rule
+///
+/// Quoted verbatim from the rev-6 design bundle, `design_handoff_jerry_ade/revision 5/
+/// STAGE-A-CHANGELOG.md` §4a ("Colour allocation rule", added after review):
+///
+/// > **Five hue families are structural and reserved. Agent identity is allocated only outside
+/// > them.**
+/// >
+/// > | Family | Reserved for |
+/// > |---|---|
+/// > | amber `#e2a336` / `#d8a94a` | attention - needs input, warnings, planned pauses |
+/// > | violet `#c98fbf` | branch and graph scope (the graph pane, rebase, `Against main`) |
+/// > | green `#5cb87f` / `#7fc79a` | additions and staged state |
+/// > | red `#e0625c` / `#d1706a` | failure and deletions |
+/// > | blue `#3f5b74` / `#5a9ad4` | selection and focus |
+/// >
+/// > Adding an agent to `sessions` / `agentDefs` means picking a tint outside all five. The
+/// > current pool: copper `#cf8a5c`, teal `#4fb3a5`, periwinkle `#9d8fd4`, steel blue `#7f9ad4`.
+///
+/// **This is not a style note, it is a correctness rule**, and it is enforced by a real test
+/// ([`agent_tint_allocation_tests`]) rather than left to review. Review caught the failure it
+/// exists to prevent: `haiku-4.5`'s tint *was* `#c98fbf`, byte-identical to the violet §3.2
+/// assigns to branch scope, so inside one panel that colour meant both "haiku-4.5" and "branch" -
+/// and the two met on the same property (a 2px left edge) on the very worktree built to
+/// demonstrate per-agent attribution. Violet lines in the gutter read as "branch", not "haiku".
+///
+/// # Adding an agent
+///
+/// Pick a tint whose hue sits outside all five families, add it here as a `(fg, bg)` pair, list it
+/// in [`TOKENS`] **and** in [`TINT_POOL`], and map the agent to it in
+/// `crate::work_surface::agent_tint`. [`agent_tint_allocation_tests`] walks [`TINT_POOL`], so a
+/// tint that reintroduces the collision fails the build rather than shipping.
+///
+/// The reallocation §4a's own table specifies, applied here in full:
+///
+/// | Agent | Was | Now | Why |
+/// |---|---|---|---|
+/// | `sonnet-4.5` | `#d8a94a` / `#33280f` | copper `#cf8a5c` / `#31210f` | amber was one step from the needs-input amber it sits beside in the rail |
+/// | `haiku-4.5` | `#c98fbf` / `#332030` | periwinkle `#9d8fd4` / `#241f33` | the reported collision with branch violet |
+/// | `gpt-5-codex` | `#6ab97f` / `#1e3327` | teal `#4fb3a5` / `#12302c` | green is the additions colour and would have collided in the same gutter |
+/// | `qwen-local` | `#7f9ad4` / `#1f2941` | steel blue, unchanged | already outside all five families |
+///
+/// The token **keys** deliberately stay per-agent (`agent.sonnet.fg`, ...) rather than becoming
+/// hue names: a theme author retints "the agent that is Sonnet", and an existing hand-written
+/// theme file keeps naming the same keys. The hue names above are what the pool member *is*, and
+/// are carried as real labels in [`TINT_POOL`] so the rule's own table can be checked against it.
 pub mod agent {
     use super::{token, ColorToken};
 
+    /// Copper - `sonnet-4.5`. Was amber `#d8a94a`, one step from the needs-input amber it sits
+    /// beside in the rail (see the module docs' reallocation table).
     pub const SONNET: (ColorToken, ColorToken) = (
-        token("agent.sonnet.fg", 0xd8a94a),
-        token("agent.sonnet.bg", 0x33280f),
+        token("agent.sonnet.fg", 0xcf8a5c),
+        token("agent.sonnet.bg", 0x31210f),
     ); // (fg, bg)
+    /// Teal - `gpt-5-codex`. Was green `#6ab97f`, which is the additions colour; this also unifies
+    /// the two different greens the same agent used in `sessions` vs `histDefs`.
     pub const CODEX: (ColorToken, ColorToken) = (
-        token("agent.codex.fg", 0x6ab97f),
-        token("agent.codex.bg", 0x1e3327),
+        token("agent.codex.fg", 0x4fb3a5),
+        token("agent.codex.bg", 0x12302c),
     );
+    /// Periwinkle - `haiku-4.5`. Was `#c98fbf`, the exact branch-scope violet: the collision
+    /// review caught and the reason the allocation rule exists at all.
     pub const HAIKU: (ColorToken, ColorToken) = (
-        token("agent.haiku.fg", 0xc98fbf),
-        token("agent.haiku.bg", 0x332030),
+        token("agent.haiku.fg", 0x9d8fd4),
+        token("agent.haiku.bg", 0x241f33),
     );
+    /// Steel blue - `qwen-local`. Unchanged by §4a: already outside all five families.
     pub const LOCAL: (ColorToken, ColorToken) = (
         token("agent.local.fg", 0x7f9ad4),
         token("agent.local.bg", 0x1f2941),
     );
+
+    /// The real, enumerable agent tint pool - `(hue name, (fg, bg))` - and the list
+    /// [`super::agent_tint_allocation_tests`] walks to enforce the module docs' reserved-hue rule.
+    ///
+    /// Every tint an agent can wear must appear here. This is deliberately a separate listing
+    /// rather than a `[ColorToken; N]`: the registry's own source parser reads
+    /// `[ColorToken; N]` declarations as N *new* keys to register (see [`super::TOKEN_GROUPS`]),
+    /// so a pool built out of the already-registered tokens above has to wear a shape the parser
+    /// does not treat as a declaration. It carries no colours of its own - only references to the
+    /// four pairs above - so it cannot drift from what a theme actually resolves.
+    pub const TINT_POOL: &[(&str, (ColorToken, ColorToken))] = &[
+        ("copper", SONNET),
+        ("teal", CODEX),
+        ("periwinkle", HAIKU),
+        ("steel blue", LOCAL),
+    ];
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -2340,25 +2428,249 @@ pub mod settings {
     ];
 }
 
-/// The overlay scrollbar's own colours (GitHub issue #30) - not from `design_handoff_jerry_ade`
-/// (that mockup has no scrollbar spec at all: every scrollable region there relies on raw,
-/// invisible browser/OS scrolling), so these are a deliberate, judgment-call derivation from
-/// existing neutral tokens rather than a transcription. `THUMB` defaults to [`text::GUTTER`]'s
-/// value (the line-number gutter's own muted grey - already the UI's "quiet structural chrome"
-/// colour) and `THUMB_HOVER` to [`status::IDLE`]'s (an agent's resting-state grey, one step
-/// brighter) so the two states read as "the same neutral family, one step apart" rather than
-/// inventing a third hex pair. Both are painted at reduced opacity (see `crate::root::scrollbar`) rather than full
-/// strength, matching the "overlay, not a solid rail" requirement.
+/// The overlay scrollbar (GitHub issue #30).
+///
+/// Rev 5 of the mockup had no scrollbar spec at all - every scrollable region there relied on raw
+/// browser/OS scrolling - so these values used to be a judgment-call derivation from neighbouring
+/// neutral tokens. **Rev 6 supersedes that with a real spec**, `design_handoff_jerry_ade/
+/// revision 5/STAGE-A-CHANGELOG.md` §4p, whose own note is explicit that it governs this build:
+///
+/// > | Part | Value |
+/// > |---|---|
+/// > | width / height | 10px |
+/// > | track | transparent |
+/// > | thumb | `#2b3137`, radius 5, with a 2px transparent border and `background-clip:content-box` so it floats 2px clear of the edge |
+/// > | thumb hover | `#3d444b` |
+/// > | stepper buttons, corner | removed |
+/// >
+/// > **For the Rust build this is a spec, not CSS** - GPUI draws its own scrollbars, so the
+/// > numbers above are what to draw.
+///
+/// So the numbers are transcribed here rather than derived, and `crate::root::scrollbar` draws
+/// them directly. Two consequences worth stating, because both replace an older convention:
+///
+/// - **The track has no token, deliberately.** "Transparent" is not a colour a theme should be
+///   able to fill in - a scroll affordance that paints a rail is the loud platform default §4p
+///   removed. The track is simply not painted, the same honesty
+///   [`ColorToken::literal`]'s docs describe for `crate::work_surface::TRANSPARENT`.
+/// - **The thumb is painted at full strength**, not at the reduced opacity the derived values
+///   needed. `#2b3137` is already quieter than the greys it replaced; compositing it further would
+///   land somewhere the spec did not ask for.
 pub mod scrollbar {
-    use super::{token, ColorToken};
+    use super::{px, token, ColorToken, Pixels};
 
-    pub const THUMB: ColorToken = token("scrollbar.thumb", 0x3a3f44);
-    pub const THUMB_HOVER: ColorToken = token("scrollbar.thumb_hover", 0x565d64);
+    pub const THUMB: ColorToken = token("scrollbar.thumb", 0x2b3137);
+    pub const THUMB_HOVER: ColorToken = token("scrollbar.thumb_hover", 0x3d444b);
+
+    /// The track's full width (a vertical bar) or height (a horizontal one) - §4p's `width /
+    /// height`. The thumb is [`THUMB_INSET`] narrower on each side, so what is actually painted is
+    /// `WIDTH - 2 * THUMB_INSET` wide.
+    pub const WIDTH: Pixels = px(10.0);
+    /// The thumb's corner radius - §4p's `radius 5`.
+    pub const THUMB_RADIUS: Pixels = px(5.0);
+    /// How far clear of the track's edges the thumb floats - §4p's "2px transparent border and
+    /// `background-clip:content-box`". In CSS that is a transparent border; drawn directly, it is
+    /// an inset.
+    pub const THUMB_INSET: Pixels = px(2.0);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
     /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[("THUMB", THUMB), ("THUMB_HOVER", THUMB_HOVER)];
+}
+
+/// Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §2).
+///
+/// Rev 6 moved budget from a single global footer readout to **one meter per agent**, because a
+/// budget is per-provider and a provider belongs to an agent. The meter fills to the tighter of
+/// the two windows (`5h` / `7d`), and its fill hue is the one place in the readout where colour
+/// carries meaning:
+///
+/// > Hue `#7fc79a` above 40%, `#c99b4e` 15-40%, `#c4726d` below.
+///
+/// The three hues are thresholds on *remaining* budget, not on consumption - [`OK`] is the
+/// healthy end. They sit inside the reserved green/amber/red families on purpose: this is
+/// attention and failure signalling, exactly what those families are reserved *for*
+/// ([`agent`]'s own docs), and deliberately not agent identity.
+///
+/// §2's other rule is a negative one worth carrying next to these: **no aggregate `⚠ N` anywhere**.
+/// A provider you do not use failing to poll is telemetry about telemetry. A connected provider
+/// that goes stale shows `last read <age>` in [`STALE`] in place of its own numbers, so the signal
+/// attaches to the thing that is actually broken.
+pub mod budget {
+    use super::{token, ColorToken};
+
+    /// Above 40% remaining.
+    pub const OK: ColorToken = token("budget.ok", 0x7fc79a);
+    /// 15-40% remaining.
+    pub const WARN: ColorToken = token("budget.warn", 0xc99b4e);
+    /// Below 15% remaining.
+    pub const CRITICAL: ColorToken = token("budget.critical", 0xc4726d);
+    /// The unfilled remainder of the meter - the same neutral the diffstat bar's own empty segment
+    /// uses ([`diff::STAT_EMPTY`]'s value), given its own key so a theme can move the meter's
+    /// track without moving the diffstat's.
+    pub const TRACK: ColorToken = token("budget.track", 0x22262a);
+    /// A provider that is connected but whose last poll is stale (`last read 3m ago`), and the
+    /// `not connected` row.
+    ///
+    /// **A derivation, not a transcription** - §2 specifies this state's *behaviour* (it replaces
+    /// that provider's own numbers) but names no colour for it, so this takes [`text::FAINT`]'s
+    /// value: recessive, because §2 is explicit that a provider failing to poll must not read as
+    /// an alert when nothing about it is actionable from the bar. The three hues above are the
+    /// real transcribed ones.
+    pub const STALE: ColorToken = token("budget.stale", 0x6b7178);
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
+    /// own docs for what walks this and why every token has to appear here.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("OK", OK),
+        ("WARN", WARN),
+        ("CRITICAL", CRITICAL),
+        ("TRACK", TRACK),
+        ("STALE", STALE),
+    ];
+}
+
+/// The Changes panel - four stacked, collapsible sections in one scroller
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1), plus the file row's own
+/// seen/unseen and discard states (`STAGE-A-CHANGELOG.md` §4i).
+///
+/// # The four sections and their left edges
+///
+/// §1's table, for the column this module owns:
+///
+/// | | **Runs** | **Uncommitted** | **Commits** | **Against main** |
+/// |---|---|---|---|---|
+/// | Answers | what *this agent* did in *this run* | what is dirty in the checkout | what is written down | what would land |
+/// | Left edge | agent tint | `#3f5b74` | neutral | `#c98fbf` |
+///
+/// The **Runs** edge has no token here on purpose: it is the agent's own tint, resolved per row
+/// from [`agent`]'s pool, which is the entire point of per-agent attribution. The other three are
+/// [`EDGE_UNCOMMITTED`], [`EDGE_NEUTRAL`] and [`EDGE_AGAINST_MAIN`].
+///
+/// `EDGE_AGAINST_MAIN` is the branch-scope violet, and this is one of its **structural**
+/// positions - see [`agent`]'s reserved-hue rule. Against-main is branch scope (what would land on
+/// `main`), so it wears the same violet the graph pane and rebase do. That is the rule working as
+/// intended, not a violation of it: the rule forbids that violet as *agent identity*, and requires
+/// it here.
+///
+/// # Seen and unseen
+///
+/// §4i moved "seen" off a separate mark and onto the filename itself, after two rounds:
+///
+/// | State | Filename |
+/// |---|---|
+/// | not seen | `#dde2e7` / 500 - reads forward |
+/// | seen | `#767d84` / 450 - recedes |
+///
+/// > when a row already contains the thing a state is *about*, style that thing. A separate
+/// > indicator is a second element to place, decode and keep from colliding with its neighbours.
+///
+/// The state these encode is **"seen since the agent last changed it"**, not "opened once": a file
+/// you read and the agent then edits again reverts to unseen. Note also that the checkbox owns
+/// *staged* and the name owns *seen* - one fact per channel. Do not reintroduce a colour for
+/// staged on the filename.
+pub mod changes {
+    use super::{token, ColorToken};
+
+    /// `UNCOMMITTED`'s 2px left edge - what is dirty in the checkout. Shares its value with
+    /// [`border::SELECTED_EDGE`] (this palette's "structural blue") but carries its own key.
+    pub const EDGE_UNCOMMITTED: ColorToken = token("changes.edge_uncommitted", 0x3f5b74);
+    /// `COMMITS`' 2px left edge.
+    ///
+    /// **A derivation, not a transcription** - §1's table says only "neutral" here, naming no
+    /// colour, so this takes [`border::DIVIDER`]'s value: what is already written down carries no
+    /// scope, so its edge is the same grey every other plain 1px rule in the app uses.
+    pub const EDGE_NEUTRAL: ColorToken = token("changes.edge_neutral", 0x22262a);
+    /// `AGAINST MAIN`'s 2px left edge - the branch-scope violet, in one of its reserved structural
+    /// positions (see this module's own docs).
+    pub const EDGE_AGAINST_MAIN: ColorToken = token("changes.edge_against_main", 0xc98fbf);
+
+    /// Section header label - 9.5px/600 uppercase, `.08em` tracking.
+    pub const SECTION_LABEL: ColorToken = token("changes.section_label", 0x787f86);
+    /// Section header count - 9.5px mono, immediately after the label.
+    pub const SECTION_COUNT: ColorToken = token("changes.section_count", 0x4a5057);
+    /// The section header's own disclosure caret (`▾`/`▸`).
+    pub const SECTION_CARET: ColorToken = token("changes.section_caret", 0x5e646a);
+    /// The right-aligned per-section diffstat's `+N`, 10px mono.
+    pub const SECTION_STAT_ADD: ColorToken = token("changes.section_stat_add", 0x7fc79a);
+    /// The right-aligned per-section diffstat's `−N`, 10px mono.
+    pub const SECTION_STAT_DEL: ColorToken = token("changes.section_stat_del", 0xc4726d);
+
+    /// A filename not seen since the agent last changed it - reads forward (§4i).
+    pub const FILENAME_UNSEEN: ColorToken = token("changes.filename_unseen", 0xdde2e7);
+    /// A filename seen since the agent last changed it - recedes (§4i).
+    pub const FILENAME_SEEN: ColorToken = token("changes.filename_seen", 0x767d84);
+
+    /// The armed `Discard?` pill's fill. Discard is the one irreversible action in the panel - it
+    /// destroys an agent's work with no git object behind it - so §4i gives it two clicks: the
+    /// first swaps the hover icon for this pill, the second commits, and leaving the row cancels.
+    pub const DISCARD_BG: ColorToken = token("changes.discard_bg", 0x2a1719);
+    /// The armed `Discard?` pill's 1px border.
+    pub const DISCARD_BORDER: ColorToken = token("changes.discard_border", 0x4a2422);
+    /// The armed `Discard?` pill's label.
+    pub const DISCARD_FG: ColorToken = token("changes.discard_fg", 0xe0847e);
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
+    /// own docs for what walks this and why every token has to appear here.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("EDGE_UNCOMMITTED", EDGE_UNCOMMITTED),
+        ("EDGE_NEUTRAL", EDGE_NEUTRAL),
+        ("EDGE_AGAINST_MAIN", EDGE_AGAINST_MAIN),
+        ("SECTION_LABEL", SECTION_LABEL),
+        ("SECTION_COUNT", SECTION_COUNT),
+        ("SECTION_CARET", SECTION_CARET),
+        ("SECTION_STAT_ADD", SECTION_STAT_ADD),
+        ("SECTION_STAT_DEL", SECTION_STAT_DEL),
+        ("FILENAME_UNSEEN", FILENAME_UNSEEN),
+        ("FILENAME_SEEN", FILENAME_SEEN),
+        ("DISCARD_BG", DISCARD_BG),
+        ("DISCARD_BORDER", DISCARD_BORDER),
+        ("DISCARD_FG", DISCARD_FG),
+    ];
+}
+
+/// The status bar's three type tiers
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3).
+///
+/// > Three tiers instead of one flat 10px smear - the problem was never density, it was that five
+/// > readouts at `#4a5057` all read at once, so you had to read all of it to find any of it.
+///
+/// | Tier | Content | Type |
+/// |---|---|---|
+/// | Primary | `main ↑2 ↓0`, `4 agents running` | 10.5px/450 `#a9b0b7` |
+/// | Secondary | provider budgets | 10.5px mono, hue per state |
+/// | Recessive | `41% cpu · 3.4 GB` | 10px `#4a5057` |
+///
+/// **The secondary tier has no colour token of its own, and that is the spec, not a gap**: its
+/// hue *is* the budget state, so it resolves to [`budget::OK`] / [`budget::WARN`] /
+/// [`budget::CRITICAL`] (or [`budget::STALE`]) per provider. Giving it a fourth flat grey here
+/// would recreate exactly the "five readouts that all read at once" §3 removed. A tier is a
+/// weight, and only two of the three are a fixed colour.
+///
+/// §3 also fixes what must *not* go here: no worktree or agent counts, because the rail footer
+/// already carries them 30px away.
+pub mod status_bar {
+    use super::{token, ColorToken};
+
+    /// Tier 1 - the readouts you are meant to find first (`main ↑2 ↓0`, `4 agents running`).
+    pub const PRIMARY: ColorToken = token("status_bar.primary", 0xa9b0b7);
+    /// Tier 3 - resource readouts, present but never competing (`41% cpu · 3.4 GB`).
+    pub const RECESSIVE: ColorToken = token("status_bar.recessive", 0x4a5057);
+    /// The 1px, 13-high rules between tiers.
+    pub const DIVIDER: ColorToken = token("status_bar.divider", 0x2b3137);
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
+    /// own docs for what walks this and why every token has to appear here.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("PRIMARY", PRIMARY),
+        ("RECESSIVE", RECESSIVE),
+        ("DIVIDER", DIVIDER),
+    ];
 }
 
 /// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
@@ -2967,6 +3279,313 @@ mod token_registry_tests {
     }
 }
 
+/// Enforces the reserved-hue allocation rule from `design_handoff_jerry_ade/revision 5/
+/// STAGE-A-CHANGELOG.md` §4a - quoted in full in [`agent`]'s own docs, which is the rule these
+/// tests exist to make unbreakable.
+///
+/// # Why this is a test and not a review note
+///
+/// The rule was *written* because review caught a shipped collision: `haiku-4.5`'s tint was
+/// `#c98fbf`, byte-identical to the branch-scope violet, so one colour meant two things on the
+/// same property in the same panel. A convention in a changelog would not have caught it and did
+/// not - a second agent added months later, by someone who never read §4a, reintroduces it just as
+/// easily. So the rule is checked against **real perceptual colour maths** over the real,
+/// enumerable [`agent::TINT_POOL`], and adding a colliding tint fails the build.
+///
+/// # Why OKLCH hue, and not "is this hex in a list"
+///
+/// A hardcoded list of forbidden hexes would pass vacuously for any collision that is not
+/// byte-identical - `#c88fbe` would sail through while looking exactly like branch violet. Hue is
+/// the property the rule is actually about ("five hue *families*"), so hue is what gets measured,
+/// in the same OKLCH space this module already authors palettes in (see the [`oklch`] module for
+/// why not HSL) and through the same [`hue_distance`] the rest of the file uses.
+#[cfg(test)]
+mod agent_tint_allocation_tests {
+    use super::*;
+
+    /// The five structural hue families, exactly as §4a's table names them - family label and
+    /// every hex the table lists for it.
+    ///
+    /// These are deliberately spelled as literal hexes rather than read out of the token registry.
+    /// The rule is about the *design's* five families; wiring it to whatever `status::ASK`
+    /// currently happens to be would mean a theme or a retune silently moving the boundary the
+    /// rule is supposed to hold still. If one of these ever genuinely changes, §4a changed, and
+    /// editing this table should be a deliberate act with the changelog open.
+    const RESERVED_FAMILIES: &[(&str, &[u32])] = &[
+        (
+            "amber (attention, warnings, planned pauses)",
+            &[0xe2a336, 0xd8a94a],
+        ),
+        ("violet (branch and graph scope)", &[0xc98fbf]),
+        ("green (additions and staged state)", &[0x5cb87f, 0x7fc79a]),
+        ("red (failure and deletions)", &[0xe0625c, 0xd1706a]),
+        ("blue (selection and focus)", &[0x3f5b74, 0x5a9ad4]),
+    ];
+
+    /// How far, in degrees of OKLCH hue, an agent tint has to sit from every reserved family
+    /// before it reads as its own colour rather than as a shade of that family's meaning.
+    ///
+    /// Not an arbitrary round number. The tightest real clearance in the pool §4a specifies is
+    /// steel blue at **17.4°** from the blue family - §4a's own judgment that `#7f9ad4` is
+    /// "already outside all five families" is what sets the floor, and 15° sits just under it.
+    /// The three tints §4a *reallocated* measure 0.0°, 0.0° and 3.4°, so the gap between "what the
+    /// design accepts" and "what the design rejected" is wide and this threshold is inside it -
+    /// which is the property [`the_rule_actually_rejects_the_collision_review_caught`] pins.
+    const MIN_SEPARATION_DEGREES: f32 = 15.0;
+
+    /// The smallest OKLCH hue distance from `color` to any hex in any reserved family, with the
+    /// family that was closest.
+    fn nearest_reserved_family(color: Rgba) -> (&'static str, f32) {
+        let (_, _, hue) = oklch_of(color);
+        RESERVED_FAMILIES
+            .iter()
+            .flat_map(|(family, hexes)| {
+                hexes.iter().map(move |hex| {
+                    let (_, _, reserved_hue) = oklch_of(hex_rgba(*hex));
+                    (*family, hue_distance(hue, reserved_hue))
+                })
+            })
+            .fold(("", f32::MAX), |nearest, candidate| {
+                if candidate.1 < nearest.1 {
+                    candidate
+                } else {
+                    nearest
+                }
+            })
+    }
+
+    /// The rule itself: no agent may wear a hue that belongs to a structural family.
+    #[test]
+    fn every_agent_tint_sits_outside_all_five_reserved_hue_families() {
+        for (name, (foreground, _)) in agent::TINT_POOL {
+            let (family, separation) = nearest_reserved_family(foreground.default);
+            assert!(
+                separation >= MIN_SEPARATION_DEGREES,
+                "agent tint `{name}` ({:?}) is only {separation:.1}° of OKLCH hue from the \
+                 reserved {family} family - under the {MIN_SEPARATION_DEGREES}° floor, so this \
+                 colour would read as that family's *meaning* rather than as an agent's identity. \
+                 This is the failure STAGE-A-CHANGELOG.md §4a exists to prevent (haiku-4.5's tint \
+                 was the branch violet exactly, and the two met on the same 2px left edge). Pick a \
+                 hue outside all five families - see `theme::agent`'s own docs for the table.",
+                foreground.key
+            );
+        }
+    }
+
+    /// **The discrimination check**: the rule is only worth having if it genuinely rejects the
+    /// colours the design rejected. Each of these three is a real tint that really shipped and
+    /// that §4a really reallocated, so if the maths above ever degrades into something that
+    /// accepts everything, this fails first and says so.
+    #[test]
+    fn the_rule_actually_rejects_the_collision_review_caught() {
+        // (what it was, which agent wore it, the family it collided with)
+        let reallocated = [
+            (0xc98fbf, "haiku-4.5", "violet"),
+            (0xd8a94a, "sonnet-4.5", "amber"),
+            (0x6ab97f, "gpt-5-codex", "green"),
+        ];
+        for (hex, agent_name, expected_family) in reallocated {
+            let (family, separation) = nearest_reserved_family(hex_rgba(hex));
+            assert!(
+                separation < MIN_SEPARATION_DEGREES,
+                "#{hex:06x} ({agent_name}'s tint before §4a) measures {separation:.1}° from the \
+                 nearest reserved family, which the {MIN_SEPARATION_DEGREES}° floor would ACCEPT - \
+                 but this is a collision the design review actually caught and reallocated. A rule \
+                 that admits it is not enforcing anything."
+            );
+            assert!(
+                family.starts_with(expected_family),
+                "#{hex:06x} ({agent_name}) collided with {expected_family} per §4a, but the \
+                 nearest family measured here is {family}"
+            );
+        }
+    }
+
+    /// Guards the pool listing itself. [`the rule`](every_agent_tint_sits_outside_all_five_reserved_hue_families)
+    /// walks [`agent::TINT_POOL`], so a tint that exists as a token but never made it into the
+    /// pool would be unchecked - exactly the silent gap that let the original collision through.
+    #[test]
+    fn every_registered_agent_tint_is_listed_in_the_pool() {
+        for (name, token) in agent::TOKENS {
+            let Some(stripped) = name.strip_suffix(".fg") else {
+                continue;
+            };
+            assert!(
+                agent::TINT_POOL
+                    .iter()
+                    .any(|(_, (foreground, _))| foreground.key == token.key),
+                "agent::{stripped} is a registered agent tint but is missing from \
+                 agent::TINT_POOL, so the reserved-hue rule never checks it - add it to the pool \
+                 (see `theme::agent`'s \"Adding an agent\" docs)"
+            );
+        }
+        assert_eq!(
+            agent::TINT_POOL.len(),
+            agent::TOKENS.len() / 2,
+            "every agent tint is a (fg, bg) pair, so the pool should list exactly half as many \
+             entries as the module registers keys"
+        );
+    }
+
+    /// A guard on the *maths*, not the palette: if `oklch_of`/`hue_distance` ever degenerated
+    /// (returning a constant, say), every assertion above would pass or fail for the wrong reason.
+    /// The five families are five genuinely different hues, so they must measure far apart from
+    /// each other - and each family's own members must measure close together, which is what makes
+    /// them a family at all.
+    #[test]
+    fn the_reserved_families_are_themselves_distinct_and_internally_coherent() {
+        for (family, hexes) in RESERVED_FAMILIES {
+            for hex in *hexes {
+                let (_, _, hue) = oklch_of(hex_rgba(*hex));
+                for other_hex in *hexes {
+                    let (_, _, other_hue) = oklch_of(hex_rgba(*other_hex));
+                    assert!(
+                        hue_distance(hue, other_hue) < MIN_SEPARATION_DEGREES,
+                        "{family}'s own members #{hex:06x} and #{other_hex:06x} are further apart \
+                         than the collision floor - they are not one hue family"
+                    );
+                }
+            }
+        }
+        for (family, hexes) in RESERVED_FAMILIES {
+            for (other_family, other_hexes) in RESERVED_FAMILIES {
+                if family == other_family {
+                    continue;
+                }
+                for hex in *hexes {
+                    let (_, _, hue) = oklch_of(hex_rgba(*hex));
+                    for other_hex in *other_hexes {
+                        let (_, _, other_hue) = oklch_of(hex_rgba(*other_hex));
+                        assert!(
+                            hue_distance(hue, other_hue) >= MIN_SEPARATION_DEGREES,
+                            "{family} and {other_family} measure as the same hue - the OKLCH \
+                             maths behind every assertion in this module is not discriminating"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Proves the claim the whole rev-6 campaign is built on: **this file is the only place a colour
+/// literal lives**.
+///
+/// Every rev-6 issue after the token one references tokens by name, so a hex value inlined at a
+/// render call site is not a style problem - it is a colour no theme file can reach, invisible to
+/// [`TOKEN_GROUPS`], absent from every generated theme, and silently wrong in five of the six
+/// bundled themes. That is precisely the failure mode that had already happened twice here before
+/// this test existed (`crate::terminal::pane`'s spawn-error and process-exited lines, now
+/// [`terminal::SPAWN_ERROR`] and [`terminal::PROCESS_EXITED`]).
+#[cfg(test)]
+mod stray_hex_tests {
+    /// The real theme layer - the only files allowed to name a colour literally.
+    ///
+    /// `theme.rs` declares the tokens. `settings/builtin_themes.rs` carries each bundled theme's
+    /// five preview swatches, which are that theme's own identity rather than any surface's
+    /// colour, and which it writes into the `preview` key of the file it generates. Nothing else
+    /// in the app has any business spelling a colour.
+    const THEME_LAYER: &[&str] = &["app/src/theme.rs", "app/src/settings/builtin_themes.rs"];
+
+    /// Every `.rs` file under `crates/`, as `(path relative to crates/, contents)`.
+    fn workspace_sources() -> Vec<(String, String)> {
+        fn walk(
+            directory: &std::path::Path,
+            root: &std::path::Path,
+            out: &mut Vec<(String, String)>,
+        ) {
+            let entries = std::fs::read_dir(directory)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()));
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("every walked path starts at the root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((
+                        relative,
+                        std::fs::read_to_string(&path).expect("valid utf-8"),
+                    ));
+                }
+            }
+        }
+        // `CARGO_MANIFEST_DIR` is `<repo>/crates/app`, so its parent is the whole `crates/` tree -
+        // every workspace member, not just this one.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/app always has a parent")
+            .to_path_buf();
+        let mut sources = Vec::new();
+        walk(&root, &root, &mut sources);
+        sources.sort();
+        sources
+    }
+
+    /// Does this line contain a `0x` followed by exactly six hex digits - the shape a colour
+    /// wears, and the shape a bitmask or a codepoint essentially never does?
+    fn names_a_colour_literal(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices("0x").any(|(index, _)| {
+            let digits = bytes[index + 2..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_hexdigit())
+                .count();
+            // Exactly six, and not the leading six of a longer literal.
+            digits == 6
+        })
+    }
+
+    #[test]
+    fn no_production_code_outside_the_theme_layer_names_a_colour_literally() {
+        let mut violations = Vec::new();
+        let mut scanned = 0usize;
+        for (path, source) in workspace_sources() {
+            if THEME_LAYER.iter().any(|allowed| path.ends_with(allowed)) {
+                continue;
+            }
+            scanned += 1;
+            // Test code may name colours freely - an exact-hex assertion is how several suites in
+            // this file pin a token's real value. Only shipped code is under the rule. A
+            // `#[cfg(test)] mod ... { }` is written at column 0 throughout this workspace, so its
+            // closing brace is the one line that is exactly `}`.
+            let mut in_test_module = false;
+            for (number, line) in source.lines().enumerate() {
+                if line.starts_with("#[cfg(test)]") {
+                    in_test_module = true;
+                    continue;
+                }
+                if in_test_module {
+                    if line == "}" {
+                        in_test_module = false;
+                    }
+                    continue;
+                }
+                if names_a_colour_literal(line) {
+                    violations.push(format!("  {path}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            scanned > 50,
+            "only scanned {scanned} source files - the walk is not finding the workspace, so this \
+             test would pass vacuously"
+        );
+        assert!(
+            violations.is_empty(),
+            "{} colour literal(s) outside the theme layer:\n{}\n\nA hex value here is a colour no \
+             theme file can reach and no generated theme mentions. Declare a real token in \
+             `crate::theme` (see its module docs for the naming rule) and reference it by name - \
+             `crate::theme` is the one place in this codebase colour literals belong.",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+}
+
 /// GitHub issue #208's own coverage inside this module: the shape of the new [`terminal`] group,
 /// and the one real special case it adds to [`derived_palette`].
 ///
@@ -2984,8 +3603,9 @@ mod terminal_palette_tests {
         let terminal_keys: Vec<&str> = terminal::TOKENS.iter().map(|(_, t)| t.key).collect();
         assert_eq!(
             terminal_keys.len(),
-            20,
-            "background, foreground, cursor, selection and the ANSI sixteen"
+            22,
+            "background, foreground, cursor, selection, the ANSI sixteen, and the two pane status \
+             lines (spawn error, process exited) rev 6 turned from inline hex into real tokens"
         );
         for key in &terminal_keys {
             assert!(
