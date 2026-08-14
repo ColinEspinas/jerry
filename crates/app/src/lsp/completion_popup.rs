@@ -1395,14 +1395,12 @@ mod completions_scroll_tests {
     }
 
     fn scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> gpui::Pixels {
-        app.read_with(cx, |app, _| {
-            app.completions_scroll_handle.base_handle().offset().y
-        })
+        app.read_with(cx, |app, _| app.completions_scroll_handle.scroll_offset().y)
     }
 
     fn max_scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> gpui::Pixels {
         app.read_with(cx, |app, _| {
-            app.completions_scroll_handle.base_handle().max_offset().y
+            app.completions_scroll_handle.max_scroll_offset().y
         })
     }
 

@@ -41,11 +41,18 @@ impl AdeApp {
         // Cleared with the diff it was derived from: a change set outliving its diff would keep
         // rows' diffstats alive for a worktree that is no longer being shown.
         self.change_set = crate::provenance::change_set::ChangeSet::default();
+        // GitHub issue #285: the Changes panel's other two git scopes reload with this one, from
+        // this one call, so its four sections can never describe two different moments in git's
+        // history. Reset to `Loading` synchronously here for the same reason `dirty_files` is
+        // reset to `None` below - a stale answer must never outlive the diff it described.
+        self.uncommitted_diff = crate::sidebar::sections::ScopeLoad::Loading;
+        self.uncommitted_change_set = crate::provenance::change_set::ChangeSet::default();
+        self.branch_commits = crate::sidebar::sections::ScopeLoad::Loading;
         self.diff_totals = None;
         self.dirty_files = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let (diff_result, staged_result, dirty_result) = cx
+            let (diff_result, staged_result, dirty_result, uncommitted_result, commits_result) = cx
                 .background_executor()
                 .spawn({
                     let root = root.clone();
@@ -63,7 +70,20 @@ impl AdeApp {
                         });
                         let staged_result = wt_core::stage::staged_paths(&root);
                         let dirty_result = wt_core::stage::dirty_paths(&root);
-                        (diff_result, staged_result, dirty_result)
+                        // GitHub issue #285's two new scopes, on the same background hop: the
+                        // Changes panel's Uncommitted and Commits sections. Both are separate
+                        // `git` calls because they are separate questions - see
+                        // `wt_core::diff::diff_against_head`'s and
+                        // `wt_core::diff::commits_since_base`' own docs.
+                        let uncommitted_result = wt_core::diff::diff_against_head(&root);
+                        let commits_result = wt_core::diff::commits_since_base(&root);
+                        (
+                            diff_result,
+                            staged_result,
+                            dirty_result,
+                            uncommitted_result,
+                            commits_result,
+                        )
                     }
                 })
                 .await;
@@ -93,6 +113,21 @@ impl AdeApp {
                 if let Ok(dirty) = dirty_result {
                     this.dirty_files = Some(dirty);
                 }
+                // An unborn `HEAD` has no working-tree-against-`HEAD` answer at all
+                // (`Ok(None)`), which is a real, distinct state from a clean checkout
+                // (`Ok(Some(<empty diff>))`) - so it is surfaced as its own message rather than
+                // rendered as "no uncommitted changes", which would be a claim git never made.
+                this.uncommitted_diff = match uncommitted_result {
+                    Ok(Some(diff)) => crate::sidebar::sections::ScopeLoad::Loaded(diff),
+                    Ok(None) => crate::sidebar::sections::ScopeLoad::Error(
+                        "no commit to compare the working tree against yet".to_string(),
+                    ),
+                    Err(err) => crate::sidebar::sections::ScopeLoad::Error(err.to_string()),
+                };
+                this.branch_commits = match commits_result {
+                    Ok(commits) => crate::sidebar::sections::ScopeLoad::Loaded(commits),
+                    Err(err) => crate::sidebar::sections::ScopeLoad::Error(err.to_string()),
+                };
                 // The reloaded diff may have changed whether `open_change`'s path has a
                 // `DiffFile`, so refresh the cache immediately rather than leaving it stale.
                 this.refresh_open_diff_file_cache();
@@ -263,6 +298,15 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #285 / `REVISION-2026-08-14.md` §1 rule 2: opening a file marks it **seen**
+        // and does not, cannot, stage it - `seen_files` and `staged_files` are separate fields of
+        // separate types, and this is the only writer of the first. The mark records the diffstat
+        // the file has right now, so an agent that writes to it again puts it straight back to
+        // unseen (see `crate::sidebar::sections::SeenFiles`' own docs).
+        if let Some(entry) = self.uncommitted_change_set.entry(&path) {
+            let stat = entry.stat();
+            self.seen_files.mark_seen(&self.diff_root, &path, stat);
+        }
         let absolute = self.diff_root.join(&path);
         self.open_and_focus_file(path, absolute, code_view::CodeView::Diff, true, window, cx);
     }

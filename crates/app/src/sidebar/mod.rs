@@ -13,6 +13,10 @@
 //!   record of which folders are expanded, and its atomic write path.
 //! - [`changes`] - the pure mapping from `wt_core::diff` data to the Changes tab's row
 //!   labels/colours/counts and the fold-marker treatment.
+//! - [`sections`] - the pure model of the Changes tab's four stacked sections (GitHub issue
+//!   #285): which scope each answers, its collapse state, its header's counts and diffstat, the
+//!   run rows derived from the provenance union, and the `seen` marks that are deliberately not
+//!   the staged set.
 //! - [`context_menu`] - the pure model of the right-click menu (GitHub issue #19 §1): which
 //!   actions each target offers and how they group. The popover itself, its row shape and the
 //!   edge-aware geometry that keeps it on screen are `crate::menu`'s since GitHub issue #290
@@ -47,6 +51,7 @@ pub mod file_ops;
 pub mod file_tree;
 pub mod file_tree_watch;
 pub mod fold_state;
+pub mod sections;
 
 pub(crate) mod render;
 pub(crate) mod tree_ops;

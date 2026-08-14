@@ -383,9 +383,13 @@ impl AdeApp {
         let panel_height = self.minimap_panel_bounds.size.height.as_f32();
         let line_height = effective_line_height(panel_height, total_lines, scale_percent);
 
-        let base = self.file_view_scroll_handle.base_handle();
-        let scrolled_px = (-base.offset().y.as_f32()).max(0.0);
-        let viewport_height_px = base.bounds().size.height.as_f32();
+        let scrolled_px = (-self.file_view_scroll_handle.scroll_offset().y.as_f32()).max(0.0);
+        let viewport_height_px = self
+            .file_view_scroll_handle
+            .viewport_bounds()
+            .size
+            .height
+            .as_f32();
         let (first_visible_line, visible_line_count) = visible_line_range_through_folds(
             viewport_height_px,
             scrolled_px,

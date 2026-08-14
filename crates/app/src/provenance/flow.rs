@@ -172,10 +172,26 @@ impl AdeApp {
         build_change_set(diff, self.line_provenance.worktree(&self.diff_root))
     }
 
-    /// Refreshes [`crate::root::AdeApp::change_set`] - the single chokepoint, so the cached set
-    /// and the two things it is derived from cannot drift.
+    /// The current worktree's **uncommitted** change set - the same join as
+    /// [`Self::current_change_set`], over `wt_core::diff::diff_against_head`'s scope rather than
+    /// the merge-base one (GitHub issue #285).
+    ///
+    /// This is the one the Runs section reads: a run's share has to be a share of *what is dirty*,
+    /// not of what the branch differs from `main` by, or an agent would be credited with lines
+    /// that are already committed and Runs could never sum to Uncommitted.
+    pub(crate) fn current_uncommitted_change_set(&self) -> ChangeSet {
+        let Some(diff) = self.uncommitted_diff.loaded() else {
+            return ChangeSet::default();
+        };
+        build_change_set(diff, self.line_provenance.worktree(&self.diff_root))
+    }
+
+    /// Refreshes both of [`crate::root::AdeApp`]'s cached change sets - the single chokepoint, so
+    /// they and the things they are derived from cannot drift, and so the panel's Runs and
+    /// Uncommitted sections are always two views of one join rather than two joins.
     pub(crate) fn rebuild_change_set(&mut self) {
         self.change_set = self.current_change_set();
+        self.uncommitted_change_set = self.current_uncommitted_change_set();
     }
 
     /// Reads back what a previous run recorded, dropping any record whose file no longer matches

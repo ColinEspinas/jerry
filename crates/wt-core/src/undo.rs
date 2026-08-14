@@ -294,6 +294,110 @@ pub fn commit_paths(
     })
 }
 
+/// Amend `worktree_path`'s tip commit with exactly `paths`, keeping the tip's existing message -
+/// the Changes composer's `Amend last commit` menu row (GitHub issue #285).
+///
+/// Runs `git add -- <paths>` then `git commit --amend --no-edit --only -- <paths>`.
+///
+/// **`--only` is load-bearing, not decoration.** A bare `git commit --amend` amends the *entire*
+/// index into the tip, so anything else already staged - an agent CLI running its own `git add` in
+/// this same worktree, the exact interleaving hazard [`commit_paths`]' own docs call out - would
+/// silently ride along into a commit this function promises is limited to `paths`. `--only`
+/// restricts the amend to the named pathspec and leaves everything else staged exactly where it
+/// was. Verified against a real repository by
+/// `amend_head_with_paths_leaves_an_unrelated_staged_path_out_of_the_amended_tip`.
+///
+/// **`--no-edit` is what makes this an amend rather than a reword.** The row's own hint says
+/// "rewrites the tip"; changing the message as well would be a second, unannounced edit, and there
+/// is nowhere in the composer for a user to have typed a replacement message for a commit that
+/// already exists.
+///
+/// Refuses with [`Error::NothingToCommit`] if `paths` is empty, the same "check first, structured
+/// error" convention [`commit_paths`] follows.
+///
+/// Returns the amended tip's [`CommitAllChangesOutcome`] - the amended commit is a **new object**
+/// with a new id, and `parent` is the same parent the pre-amend tip had. There is deliberately no
+/// undo counterpart: the pre-amend commit is unreachable from any ref afterwards, so a real undo
+/// would have to have recorded its id *before* the amend, and this module does not fake one.
+///
+/// Performs blocking I/O.
+pub fn amend_head_with_paths(
+    worktree_path: &Path,
+    paths: &[std::path::PathBuf],
+) -> Result<CommitAllChangesOutcome, Error> {
+    if paths.is_empty() {
+        return Err(Error::NothingToCommit {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    let mut add_args: Vec<OsString> = vec!["add".into(), "--".into()];
+    add_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let add_output = run_git(worktree_path, &add_args)?;
+    check_success(&add_args, &add_output)?;
+
+    let mut amend_args: Vec<OsString> = vec![
+        "commit".into(),
+        "--amend".into(),
+        "--no-edit".into(),
+        "--only".into(),
+        "--".into(),
+    ];
+    amend_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    let amend_output = run_git(worktree_path, &amend_args)?;
+    check_success(&amend_args, &amend_output)?;
+
+    let commit = rev_parse_head(worktree_path)?;
+    let parent = rev_parse_parent_of(worktree_path, &commit)?;
+    let branch = current_branch(worktree_path)?;
+
+    Ok(CommitAllChangesOutcome {
+        branch,
+        commit,
+        parent,
+    })
+}
+
+/// Stash exactly what is currently staged in `worktree_path` (`git stash push --staged`), leaving
+/// unstaged work in place - the Changes composer's `Stash staged files` menu row (GitHub issue
+/// #285), whose own hint is "keeps the worktree clean".
+///
+/// `--staged` (git 2.35+) is what makes the row's hint true: a plain `git stash push` would take
+/// the unstaged edits with it, which is not what a control sitting under a *staged* count means.
+/// A git too old to know the flag fails loudly through [`check_success`] rather than silently
+/// stashing more than was asked for.
+///
+/// Returns the real stash commit id `refs/stash` now points at, read back after the push - the
+/// same way [`discard_worktree`] reads its own. `Ok(None)` would be a stash that git declined to
+/// create; instead this refuses up front with [`Error::NothingToCommit`] when nothing is staged,
+/// so a `None` return is not a state a caller has to interpret.
+///
+/// Performs blocking I/O.
+pub fn stash_staged(worktree_path: &Path, message: &str) -> Result<String, Error> {
+    if crate::stage::staged_paths(worktree_path)?.is_empty() {
+        return Err(Error::NothingToCommit {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    let args: Vec<OsString> = vec![
+        "stash".into(),
+        "push".into(),
+        "--staged".into(),
+        "-m".into(),
+        message.into(),
+    ];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)?;
+
+    let rev_args: Vec<OsString> = vec!["rev-parse".into(), "refs/stash".into()];
+    let rev_output = run_git(worktree_path, &rev_args)?;
+    check_success(&rev_args, &rev_output)?;
+    Ok(String::from_utf8_lossy(&rev_output.stdout)
+        .trim()
+        .to_string())
+}
+
 /// Undo a [`commit_all_changes`] call: real `git reset --soft <parent>`, returning the worktree
 /// to exactly the uncommitted state it was in right before that commit - see this module's own
 /// docs for why `reset --soft`, not `revert`.
@@ -1641,5 +1745,140 @@ mod tests {
             fs::read_to_string(repo.path().join("scratch.txt")).expect("read recovered content"),
             "real work in progress\n"
         );
+    }
+    /// A branch whose tip commit is amendable, with a second path staged alongside - the exact
+    /// interleaving `amend_head_with_paths`' `--only` exists to keep out of the amend.
+    fn repo_with_an_amendable_tip() -> TempDir {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("a.txt"), "a1\n").expect("write a");
+        fs::write(repo.path().join("b.txt"), "b1\n").expect("write b");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "the tip's own message"]);
+        repo
+    }
+
+    #[test]
+    fn amend_head_with_paths_folds_the_named_path_into_the_tip_and_keeps_its_message() {
+        let repo = repo_with_an_amendable_tip();
+        let before = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let commits_before = git_output(repo.path(), &["rev-list", "--count", "HEAD"]);
+        fs::write(repo.path().join("a.txt"), "a1\na2\n").expect("edit a");
+
+        let outcome = amend_head_with_paths(repo.path(), &[PathBuf::from("a.txt")])
+            .expect("amend_head_with_paths");
+
+        assert_ne!(
+            outcome.commit, before,
+            "an amend really rewrites the tip object"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["rev-list", "--count", "HEAD"]),
+            commits_before,
+            "an amend must not add a commit - that would be a plain commit wearing the wrong name"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["log", "-1", "--format=%s"]),
+            "the tip's own message",
+            "`--no-edit`: an amend is not a reword, and there is nowhere for a new message to \
+             have come from"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["show", "HEAD:a.txt"]),
+            "a1\na2",
+            "the edit is now inside the tip"
+        );
+        assert!(
+            git_output(repo.path(), &["status", "--porcelain"]).is_empty(),
+            "and it is no longer uncommitted"
+        );
+        assert_eq!(outcome.branch, Some("feature".to_string()));
+    }
+
+    #[test]
+    fn amend_head_with_paths_leaves_an_unrelated_staged_path_out_of_the_amended_tip() {
+        // `--only` is what makes this true. Without it, `git commit --amend` amends the *entire*
+        // index, so an agent CLI's own `git add` in this same worktree would silently ride along.
+        let repo = repo_with_an_amendable_tip();
+        fs::write(repo.path().join("a.txt"), "a1\na2\n").expect("edit a");
+        fs::write(repo.path().join("b.txt"), "b1\nsomething else staged\n").expect("edit b");
+        git(repo.path(), &["add", "b.txt"]);
+
+        amend_head_with_paths(repo.path(), &[PathBuf::from("a.txt")]).expect("amend");
+
+        assert_eq!(
+            git_output(repo.path(), &["show", "HEAD:b.txt"]),
+            "b1",
+            "the other path's staged edit must not have been folded into this amend"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["diff", "--cached", "--name-only"]),
+            "b.txt",
+            "and it must still be staged exactly where it was"
+        );
+    }
+
+    #[test]
+    fn amend_head_with_paths_refuses_an_empty_path_list_rather_than_amending_the_whole_index() {
+        let repo = repo_with_an_amendable_tip();
+        let before = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let err = amend_head_with_paths(repo.path(), &[]).expect_err("must refuse");
+        assert!(matches!(err, Error::NothingToCommit { .. }), "got {err:?}");
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "HEAD"]),
+            before,
+            "and nothing may have been rewritten on the way to refusing"
+        );
+    }
+
+    #[test]
+    fn stash_staged_takes_the_staged_edit_and_leaves_the_unstaged_one_in_the_worktree() {
+        // The menu row's own hint is "keeps the worktree clean"; a plain `git stash push` would
+        // take the unstaged work with it, which is not what a control under a *staged* count means.
+        let repo = repo_with_an_amendable_tip();
+        fs::write(repo.path().join("a.txt"), "a1\nstaged edit\n").expect("edit a");
+        git(repo.path(), &["add", "a.txt"]);
+        fs::write(repo.path().join("b.txt"), "b1\nunstaged edit\n").expect("edit b");
+
+        let stash = stash_staged(repo.path(), "jerry: stash staged files").expect("stash_staged");
+
+        assert_eq!(
+            stash.len(),
+            40,
+            "a real stash commit id, read back off refs/stash"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("a.txt")).expect("read a"),
+            "a1\n",
+            "the staged edit is gone from the working tree"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("b.txt")).expect("read b"),
+            "b1\nunstaged edit\n",
+            "and the unstaged edit is untouched"
+        );
+        assert!(
+            git_output(repo.path(), &["stash", "list"]).contains("jerry: stash staged files"),
+            "the stash carries the message it was given, so it is findable later"
+        );
+        assert!(
+            git_output(repo.path(), &["diff", "--cached", "--name-only"]).is_empty(),
+            "nothing is left staged"
+        );
+    }
+
+    #[test]
+    fn stash_staged_refuses_when_nothing_is_staged_rather_than_stashing_the_whole_worktree() {
+        let repo = repo_with_an_amendable_tip();
+        fs::write(repo.path().join("b.txt"), "b1\nunstaged only\n").expect("edit b");
+
+        let err = stash_staged(repo.path(), "jerry").expect_err("must refuse");
+        assert!(matches!(err, Error::NothingToCommit { .. }), "got {err:?}");
+        assert_eq!(
+            fs::read_to_string(repo.path().join("b.txt")).expect("read b"),
+            "b1\nunstaged only\n",
+            "the unstaged work must still be right where it was"
+        );
+        assert!(git_output(repo.path(), &["stash", "list"]).is_empty());
     }
 }
