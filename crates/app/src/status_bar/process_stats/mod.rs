@@ -125,6 +125,18 @@ pub const PLATFORM_SAMPLER: PlatformSampler = PlatformSampler;
 /// Performs real, blocking OS calls (`/proc` reads on Linux, `proc_pid_rusage` on macOS,
 /// `OpenProcess` + PSAPI on Windows); callers must offload this to a background executor, per
 /// this crate's usual convention.
+///
+/// ## Two methods, not one combined reading
+///
+/// The two are separate calls even though macOS could return both from a single
+/// `proc_pid_rusage` (and Windows could reuse one `OpenProcess` handle for both), so a full
+/// sample costs one extra OS call per pid on those two platforms. That is a deliberate trade:
+/// the split is what lets the "CPU time is required, memory is optional" rule live in the shared
+/// [`sample_processes_with`] rather than being restated inside each backend's return type, and
+/// the cost is a syscall or two per agent per *multi-second* status poll, on a background
+/// executor - genuinely negligible against the clarity. The two readings are therefore taken
+/// microseconds apart rather than atomically, which no consumer of a status-bar summary can
+/// observe.
 pub trait ProcessSampler {
     /// A short name for the backend, for tests and diagnostics - `"linux"`, `"macos"`,
     /// `"windows"`, `"unsupported"`.
