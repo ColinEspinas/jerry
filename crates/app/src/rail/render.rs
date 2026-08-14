@@ -929,7 +929,8 @@ impl AdeApp {
             .flex_none()
             .items_center()
             .gap(px(6.0))
-            .px(px(10.0))
+            // `Jerry.dc.html:109` - `padding:0 12px`, not 10px.
+            .px(px(12.0))
             .h(theme::band::FILTER_ROW)
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
@@ -1886,80 +1887,96 @@ impl AdeApp {
         div()
             .id(format!("history-row-{key}"))
             .flex()
-            .flex_col()
             .pl(px(13.0))
-            .pr(px(10.0))
-            .py(px(4.0))
-            .gap(px(2.0))
-            .border_l(px(1.0))
-            .border_color(theme::border::ZONE)
+            // Same real indent under its worktree the live agent row uses (and the same bug this
+            // row had until now: padding-left and border-left folded onto one div put the edge
+            // flush at x=0 instead of indented under it). `Jerry.dc.html`'s own history row
+            // (`g.rows`/`h.*`) is the identical shape: outer `padding-left:13px`, a separate 1px
+            // `#1e2225` connector, then a content box with its own `border-left:2px`.
+            .child(div().flex_none().w(px(1.0)).bg(theme::border::ZONE))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(chip_icon)
+                    .flex_col()
+                    .pl(px(7.0))
+                    .pr(px(10.0))
+                    .pt(px(6.0))
+                    .pb(px(7.0))
+                    .gap(px(2.0))
+                    .border_l(px(2.0))
+                    .border_color(status.color())
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(11.5))
-                            .text_color(theme::text::DIM)
-                            .child(summary),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(chip_icon)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(11.5))
+                                    .text_color(theme::text::DIM)
+                                    .child(summary),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font(font(theme::font::MONO))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(theme::text::GHOST)
+                                    .child(last_active),
+                            ),
                     )
                     .child(
                         div()
-                            .flex_none()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::GHOST)
-                            .child(last_active),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .pl(px(21.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded_full()
-                            .bg(status.color()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::FAINT)
-                            .child(format!("was {}", agent_state_word(status))),
-                    )
-                    .child(
-                        div()
-                            .id(format!("history-resume-{resume_key}"))
-                            .flex_none()
-                            .cursor_pointer()
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .rounded(theme::radius::CHIP)
-                            .bg(theme::button::BLUE_BG)
-                            .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::button::BLUE_FG)
-                            .child(resume_label)
-                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.resume_past_agent(&resume_key, window, cx);
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pl(px(21.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(4.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(status.color()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(theme::text::FAINT)
+                                    .child(format!("was {}", agent_state_word(status))),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("history-resume-{resume_key}"))
+                                    .flex_none()
+                                    .cursor_pointer()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(theme::radius::CHIP)
+                                    .bg(theme::button::BLUE_BG)
+                                    .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(theme::button::BLUE_FG)
+                                    .child(resume_label)
+                                    .on_click(cx.listener(
+                                        move |this, _event: &ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.resume_past_agent(&resume_key, window, cx);
+                                        },
+                                    )),
+                            ),
                     ),
             )
     }
