@@ -14,6 +14,7 @@ pub mod fonts;
 pub mod graph_view;
 pub mod hooks;
 pub mod icon_pack;
+pub mod icons;
 pub mod keymap;
 pub mod keymap_overrides;
 pub mod language;

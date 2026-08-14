@@ -1,6 +1,9 @@
 //! Bundles the two font families the design requires (IBM Plex Sans, IBM Plex Mono; both OFL)
 //! and registers them with GPUI's text system.
 //!
+//! [`Assets`], this app's single `gpui::AssetSource`, also serves the shipped Phosphor icon files
+//! that `crate::icons` owns - see that module and [`Assets`]' own docs.
+//!
 //! ## Source
 //!
 //! The `.ttf` files under `assets/fonts/` are IBM's own unmodified static weights
@@ -96,8 +99,15 @@ const FONT_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The only [`gpui::AssetSource`] this app needs - it has no other assets (per the design
-/// handoff's "Assets: None ... every icon is composed from rects and text glyphs").
+/// This app's one [`gpui::AssetSource`], covering both bundled asset families: the fonts above
+/// (`fonts/...`) and the shipped Phosphor icons (`icons/...`, GitHub issue #282 -
+/// `crate::icons::ICON_FILES` owns that list, this only routes to it).
+///
+/// Icons load through here rather than through some second source because that is what GPUI
+/// itself reads: `gpui::svg().path(..)` ends up in `Window::paint_svg` ->
+/// `SvgRenderer::render_alpha_mask` -> `asset_source.load(&params.path)`
+/// (`vendor/zed/crates/gpui/src/svg_renderer.rs:223`), and `crate::run` registers exactly one
+/// source via `Application::with_assets`.
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -107,17 +117,21 @@ impl AssetSource for Assets {
                 return Ok(Some(Cow::Borrowed(*bytes)));
             }
         }
-        Ok(None)
+        Ok(crate::icons::load_asset(path))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        if path != "fonts" {
-            return Ok(Vec::new());
+        match path {
+            "fonts" => Ok(FONT_FILES
+                .iter()
+                .map(|(name, _)| SharedString::from(*name))
+                .collect()),
+            "icons" => Ok(crate::icons::ICON_FILES
+                .iter()
+                .map(|(name, _)| SharedString::from(*name))
+                .collect()),
+            _ => Ok(Vec::new()),
         }
-        Ok(FONT_FILES
-            .iter()
-            .map(|(name, _)| SharedString::from(*name))
-            .collect())
     }
 }
 
@@ -157,8 +171,37 @@ mod tests {
     #[test]
     fn lists_nothing_for_an_unrelated_path() {
         let assets = Assets;
-        let listed = assets.list("icons").expect("list should not fail");
+        let listed = assets.list("themes").expect("list should not fail");
         assert!(listed.is_empty());
+    }
+
+    /// The second bundled family this source serves - see [`Assets`]' own docs. The icon-side
+    /// assertions (every `Icon` reachable, real Phosphor bytes) live in `crate::icons`; this only
+    /// checks the routing here really happens, so a font-only implementation can't quietly come
+    /// back.
+    #[test]
+    fn also_serves_the_shipped_icons_alongside_the_fonts() {
+        let assets = Assets;
+        let listed = assets.list("icons").expect("list should not fail");
+        assert_eq!(listed.len(), crate::icons::ICON_FILES.len());
+        assert!(!listed.is_empty(), "sanity check: icons really are bundled");
+
+        for (name, _) in crate::icons::ICON_FILES {
+            let bytes = assets
+                .load(name)
+                .expect("load should not fail")
+                .unwrap_or_else(|| panic!("expected {name} to be served"));
+            assert!(bytes.starts_with(b"<svg"), "{name} is not an SVG");
+        }
+    }
+
+    #[test]
+    fn returns_none_for_an_icon_path_not_in_the_bundle() {
+        let assets = Assets;
+        assert!(assets
+            .load("icons/does-not-exist.svg")
+            .expect("load should not fail")
+            .is_none());
     }
 
     #[test]
