@@ -6597,10 +6597,10 @@ mod changes_sections_tests {
         assert_eq!(
             labels,
             vec![
-                "RUNS".to_string(),
                 "UNCOMMITTED".to_string(),
                 "COMMITS".to_string(),
                 "AGAINST MAIN".to_string(),
+                "RUNS".to_string(),
             ],
             "one panel, four sections, and `Uncommitted` is one of them - never the name of the \
              whole panel"
@@ -6748,6 +6748,7 @@ mod changes_sections_tests {
             .iter()
             .skip_while(|row| !matches!(row, SectionRow::Header(header) if header.section == ChangesSection::AgainstMain))
             .skip(1)
+            .take_while(|row| !matches!(row, SectionRow::Header(_)))
             .collect();
         assert!(
             !against_main.is_empty(),

@@ -92,19 +92,28 @@ impl<T> ScopeLoad<T> {
 /// The variant order is the render order, and [`Self::ORDER`] is the one place it is written down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ChangesSection {
-    Runs,
     Uncommitted,
     Commits,
     AgainstMain,
+    Runs,
 }
 
 impl ChangesSection {
-    /// Top to bottom, exactly as `REVISION-2026-08-14.md` §1's own sketch lists them.
+    /// Top to bottom, exactly as `Jerry.dc.html` both paints them (`onSecUnc` at line 1314,
+    /// `onSecCommits` at 1370, `onSecBase` at 1390, `onSecRuns` last at 1434) and says so in its own
+    /// comment: "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
+    /// The first three are one ladder of git state, narrowing to widening. Runs is not on that
+    /// ladder — it indexes the same changes by author — so it sits after it rather than inside it,
+    /// which also keeps Uncommitted's top edge fixed however many agents have run."
+    ///
+    /// `REVISION-2026-08-14.md` §1's own sketch lists Runs first; the mock is the more authoritative
+    /// of the two design sources and is unambiguous (comment and paint order agree), so this follows
+    /// the mock.
     pub const ORDER: [ChangesSection; 4] = [
-        ChangesSection::Runs,
         ChangesSection::Uncommitted,
         ChangesSection::Commits,
         ChangesSection::AgainstMain,
+        ChangesSection::Runs,
     ];
 
     /// The stable identifier this section's collapse state is filed under, and the prefix its
@@ -738,6 +747,24 @@ mod tests {
         assert_eq!(
             rows[1].files_label, "2 files",
             "s10 wrote in the shared file and its own"
+        );
+    }
+
+    #[test]
+    fn the_order_matches_the_mock_not_the_issue_sketch() {
+        // `Jerry.dc.html` paints `onSecUnc`, `onSecCommits`, `onSecBase`, then `onSecRuns` last,
+        // and says so in its own comment - "Runs is not on [the git-state] ladder ... so it sits
+        // after it rather than inside it, which also keeps Uncommitted's top edge fixed however
+        // many agents have run." `REVISION-2026-08-14.md` §1's sketch lists Runs first; the mock
+        // wins the disagreement.
+        assert_eq!(
+            ChangesSection::ORDER,
+            [
+                ChangesSection::Uncommitted,
+                ChangesSection::Commits,
+                ChangesSection::AgainstMain,
+                ChangesSection::Runs,
+            ]
         );
     }
 
