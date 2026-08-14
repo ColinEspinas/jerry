@@ -405,6 +405,17 @@ impl AdeApp {
                 .await;
             let _ = this.update(cx, |this, cx| match resolved {
                 Ok(commit) => {
+                    if this.graph_state.rebase.is_some() {
+                        // A rebase mode appeared while this resolve was in flight;
+                        // `enter_rebase_mode_inner` would refuse silently, so the refusal is
+                        // reported here instead of leaving a pending "Rebase onto x…" line that
+                        // nothing will ever resolve.
+                        this.graph_state.status_message = Some(format!(
+                            "Rebase onto {branch} failed: a rebase is already in progress"
+                        ));
+                        cx.notify();
+                        return;
+                    }
                     // Rebase mode replaces the toolbar this message paints in with its own
                     // banner, so leaving a stale "Rebase onto x…" behind would only ever be read
                     // later, after the mode is left, as if something were still pending.

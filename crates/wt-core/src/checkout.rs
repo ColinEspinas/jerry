@@ -60,24 +60,29 @@ pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Resul
 /// branch, keeping its tip commit, its reflog and its upstream configuration - the Branches
 /// panel's own branch context menu "Rename Branch…" (GitHub issue #241).
 ///
-/// Both names are genuinely user-facing (`old_name` comes from this app's own branch list;
-/// `new_name` is typed into the same hand-rolled prompt [`create_branch_at`] uses), and neither
-/// needs a `--` terminator for the same reason `create_branch_at`'s own `-b` argument doesn't:
-/// `git branch -m`'s two positional arguments are consumed as `-m`'s own operands, so a
-/// flag-shaped value is reported as an invalid branch name rather than re-parsed as an option.
+/// `new_name` is genuinely user-typed (the same hand-rolled prompt [`create_branch_at`] uses), so
+/// the `--` terminator here is **mandatory**, not decorative - unlike [`create_branch_at`], whose
+/// name lands in `-b`'s own option-value slot and so can never be re-parsed as a flag. `git branch
+/// -m`'s arguments are ordinary positionals, and git's `parse-options` really does consume a
+/// flag-shaped one as an option: live-reproduced on git 2.43 against a real repository, `git
+/// branch -m feature --force` exits **0** having parsed `--force` as `-M`, renaming the
+/// *currently checked-out* branch on top of `feature` and destroying both refs - reported to the
+/// caller as a successful rename. With `--` in front, that same invocation is refused honestly
+/// (`fatal: '--force' is not a valid branch name`, exit 128).
 ///
-/// Nothing is pre-validated: a `new_name` that already exists (`fatal: a branch named '<name>'
-/// already exists`) or is not a legal ref name (`fatal: '<name>' is not a valid branch name`)
-/// surfaces as git's own real stderr through [`Error::GitCommand`], exactly like
-/// [`create_branch_at`]'s own collision handling. Renaming the branch that is currently checked
-/// out here is *not* a special case either - git itself moves `HEAD` onto the new name, which is
-/// the correct behaviour and is proven directly by this module's own tests.
+/// Nothing else is pre-validated: a `new_name` that already exists (`fatal: a branch named
+/// '<name>' already exists`) or is not a legal ref name surfaces as git's own real stderr through
+/// [`Error::GitCommand`], exactly like [`create_branch_at`]'s own collision handling. Renaming the
+/// branch that is currently checked out is *not* a special case either - git itself moves `HEAD`
+/// onto the new name, which is the correct behaviour and is proven directly by this module's own
+/// tests.
 ///
 /// Performs blocking I/O.
 pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec![
         "branch".into(),
         "-m".into(),
+        "--".into(),
         old_name.into(),
         new_name.into(),
     ];
@@ -97,9 +102,14 @@ pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Re
 /// `app::graph_view`'s `GraphTabState::delete_branch_confirm_armed`) is about the user's intent,
 /// not about second-guessing git's own safety rules.
 ///
+/// Carries the same mandatory `--` terminator [`rename_branch`] documents: `name` reaches here
+/// from this app's own branch list rather than a text field, but it is the same ordinary
+/// positional slot, and one `--` is cheaper than depending on that provenance never changing
+/// (`git branch -d -- --evil` reports `error: branch '--evil' not found`, never an option parse).
+///
 /// Performs blocking I/O.
 pub fn delete_branch(worktree_path: &Path, name: &str) -> Result<(), Error> {
-    let args: Vec<OsString> = vec!["branch".into(), "-d".into(), name.into()];
+    let args: Vec<OsString> = vec!["branch".into(), "-d".into(), "--".into(), name.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
@@ -381,6 +391,76 @@ mod tests {
             head_sha(repo.path()),
             tip,
             "the working tree must still be sitting on the very same commit"
+        );
+    }
+
+    /// A live-reproduced data-loss path this function's `--` terminator exists to close, not a
+    /// hypothetical: on git 2.43, `git branch -m feature --force` (no terminator) exits **0**,
+    /// having parsed `--force` as `-M` and renamed the *currently checked-out* branch on top of
+    /// `feature` - destroying both refs while reporting success. The rename prompt's name is
+    /// genuinely user-typed, so this is reachable by typing it.
+    #[test]
+    fn rename_branch_refuses_a_flag_shaped_name_instead_of_destroying_two_refs() {
+        let repo = init_repo();
+        let main_tip = commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["branch", "feature"]);
+
+        let result = rename_branch(repo.path(), "feature", "--force");
+        assert!(
+            result.is_err(),
+            "a flag-shaped branch name must be refused, never parsed as an option"
+        );
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("not a valid branch name"),
+                    "git's own real refusal must be what surfaces: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "main")
+                && branches.lines().any(|line| line == "feature"),
+            "both refs must survive untouched - the unguarded invocation destroyed both: \
+             {branches:?}"
+        );
+        assert_eq!(
+            current_branch(repo.path()),
+            "main",
+            "and the checked-out branch must not have been renamed out from under the worktree"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "feature"]),
+            main_tip,
+            "feature must still point where it did, not have been force-overwritten"
+        );
+    }
+
+    /// The same terminator, on the delete side - `name` comes from this app's own branch list
+    /// today, so this pins the guard rather than a live bug.
+    #[test]
+    fn delete_branch_treats_a_flag_shaped_name_as_a_branch_name_not_an_option() {
+        let repo = init_repo();
+        commit(repo.path(), "a.txt", "base", "base");
+        git(repo.path(), &["branch", "keepme"]);
+
+        let result = delete_branch(repo.path(), "--force");
+        assert!(result.is_err(), "there is no branch called `--force`");
+        match result.unwrap_err() {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.contains("not found"),
+                    "git must have looked for a *branch* by that name: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "keepme"),
+            "no other branch may be deleted as a side effect: {branches:?}"
         );
     }
 

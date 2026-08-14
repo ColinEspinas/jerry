@@ -1017,8 +1017,9 @@ mod tests {
             .expect_err("a ref that names nothing must be a real error, not a fabricated commit");
         match err {
             Error::GitCommand { stderr, .. } => assert!(
-                !stderr.is_empty(),
-                "git's own real error text must be preserved for the caller to show"
+                stderr.contains("bad revision") || stderr.contains("unknown revision"),
+                "git's own real \"that ref names nothing\" text must be preserved for the caller \
+                 to show, not some other failure: {stderr}"
             ),
             other => panic!("expected Error::GitCommand, got {other:?}"),
         }

@@ -12,7 +12,7 @@
 //!
 //! [`MenuSurface`] is the fix's shape: a payload-free name for each surface, an `ALL` array, and
 //! two exhaustive `match`es ([`AdeApp::menu_surface_is_open`]/[`AdeApp::close_menu_surface`]).
-//! Adding a seventh popover without teaching it the invariant is a compile error, not a silent
+//! Adding another popover without teaching it the invariant is a compile error, not a silent
 //! drift - the same reason `crate::root::widgets::menu_popover_chrome` is a shared *function*
 //! rather than a shared set of style constants.
 //!
@@ -60,9 +60,9 @@ pub(crate) enum MenuSurface {
     /// other exactly the way any other two menus do.
     GraphBranch,
     /// Settings › General's "Shell" field suggestion dropdown (GitHub issue #213's follow-up) -
-    /// [`AdeApp::shell_suggestions_open`]. The seventh surface, and the first one that lives on
-    /// the Settings page rather than the workspace; it is a click-away dropdown built on
-    /// [`crate::root::widgets::menu_popover_chrome`] like the other six, so it belongs to the
+    /// [`AdeApp::shell_suggestions_open`]. The first surface that lives on the Settings page
+    /// rather than the workspace; it is a click-away dropdown built on
+    /// [`crate::root::widgets::menu_popover_chrome`] like all the others, so it belongs to the
     /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
     ShellSuggestions,
     /// Settings › Notifications' per-event "choose a sound" dropdown (GitHub issue #226) -
@@ -75,7 +75,7 @@ pub(crate) enum MenuSurface {
 impl MenuSurface {
     /// Every variant. The `match`es in [`AdeApp::menu_surface_is_open`] and
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
-    /// until it is really wired to real state - that pairing is what stops a seventh menu from
+    /// until it is really wired to real state - that pairing is what stops a new menu from
     /// quietly opting out of the invariant.
     pub(crate) const ALL: [MenuSurface; 9] = [
         MenuSurface::Plus,

@@ -469,6 +469,14 @@ impl AdeApp {
 
     pub(crate) fn set_graph_right_panel(&mut self, panel: GraphRightPanel, cx: &mut Context<Self>) {
         self.graph_state.right_panel = panel;
+        // GitHub issue #241: switching to the Commit panel unrenders the very branch rows the
+        // branch menu is anchored over, so a still-open popover would be pointing at nothing.
+        // Not reachable by clicking today (the menu's own full-window scrim eats the click that
+        // would hit the panel toggle first), which is exactly why it is worth closing here rather
+        // than relying on that scrim staying full-window forever - the same "the surface this
+        // menu belongs to went away" rule `leave_graph_tab` applies.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         cx.notify();
     }
 
@@ -554,7 +562,7 @@ impl AdeApp {
         // was open left both painted at once (and this menu's own scrim, which *does*
         // `stop_propagation` on a left-click, then ate the next click meant to dismiss the Push
         // menu). GitHub issue #176 generalised that one hand-added pair into the real shared
-        // invariant `AdeApp::close_menu_surfaces_except` now enforces across all six menus - this
+        // invariant `AdeApp::close_menu_surfaces_except` now enforces across every menu surface - this
         // call replaces the single `push_menu_open = false` that used to live here, and runs
         // *before* the assignment below so the sweep can't clear what it just set.
         let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphRow));
@@ -950,7 +958,18 @@ impl AdeApp {
     /// Nothing about the branch is pre-validated: git itself refuses an unmerged branch and a
     /// branch checked out in any worktree, and its own refusal text is what the status line shows
     /// (see `wt_core::checkout::delete_branch`'s docs).
+    ///
+    /// The single-flight guard is checked **here**, before the confirmation is touched, rather
+    /// than being left to [`Self::run_graph_remote_op`]'s own identical check at the far end (an
+    /// adversarial audit's finding): that later check returns without running anything, but by
+    /// then this method has already disarmed - so a confirmed second click landing while some
+    /// other graph operation was still in flight silently deleted nothing, cleared the
+    /// confirmation, and left the menu open with a stale status line, i.e. a dead click. Refusing
+    /// up front keeps the arm intact, so the click the user is about to repeat still counts.
     pub(crate) fn request_graph_delete_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if self.graph_state.remote_op_in_flight {
+            return;
+        }
         if self.graph_state.delete_branch_confirm_armed.as_deref() != Some(branch.as_str()) {
             self.graph_state.status_message =
                 Some(format!("click Delete again to really delete {branch}"));
@@ -985,6 +1004,13 @@ impl AdeApp {
     ) {
         use wt_core::checkout::ResetMode;
 
+        // Same up-front single-flight guard, for the same reason, as
+        // [`Self::request_graph_delete_branch`]'s own - see that method's docs for the dead-click
+        // this ordering closes. Soft/Mixed behave exactly as before either way (they arm nothing,
+        // and `run_graph_remote_op` would have refused them at the far end regardless).
+        if self.graph_state.remote_op_in_flight {
+            return;
+        }
         if mode == ResetMode::Hard
             && self.graph_state.hard_reset_confirm_armed.as_deref() != Some(sha.as_str())
         {
@@ -8294,13 +8320,29 @@ mod graph_branch_menu_tests {
         let row_b = cx
             .debug_bounds("graph-branch-row-feature-b")
             .expect("feature-b row painted");
+        // Inside both boxes: a few pixels into feature-b's own row, which the popover's painted
+        // width really does cover at that point. (The popover's *centre* sits left of the panel
+        // entirely, so centring on it would test nothing - the click would have missed the row
+        // even without `.occlude()`.)
         let inside = gpui::Point {
-            x: popover.origin.x + popover.size.width / 2.0,
+            x: row_b.origin.x + px(4.0),
             y: row_b.center().y,
         };
         assert!(
-            inside.y > popover.origin.y && inside.y < popover.origin.y + popover.size.height,
-            "premise: the point must really be inside the popover's own painted bounds"
+            inside.y > popover.origin.y
+                && inside.y < popover.origin.y + popover.size.height
+                && inside.x > popover.origin.x
+                && inside.x < popover.origin.x + popover.size.width,
+            "premise: the point must really be inside the popover's own painted bounds: point \
+             {inside:?} vs popover {popover:?}"
+        );
+        assert!(
+            inside.x >= row_b.origin.x
+                && inside.x <= row_b.origin.x + row_b.size.width
+                && inside.y >= row_b.origin.y
+                && inside.y <= row_b.origin.y + row_b.size.height,
+            "premise: and genuinely over feature-b's own row, so without `.occlude()` it really \
+             would have fallen through to it: point {inside:?} vs row {row_b:?}"
         );
         right_click(cx, inside);
 
@@ -8467,6 +8509,11 @@ mod graph_branch_menu_tests {
                 "the prompt must open pre-filled with the branch's real current name"
             );
         });
+        assert!(
+            cx.debug_bounds("graph-branch-prompt-subtitle").is_some(),
+            "the shared prompt's subtitle line must really paint for the rename kind too - it is \
+             where the branch being renamed is named"
+        );
 
         cx.simulate_input("2");
         cx.simulate_keystrokes("enter");
@@ -8487,6 +8534,116 @@ mod graph_branch_menu_tests {
                 "the prompt must close once Enter really dispatched the rename"
             );
         });
+    }
+
+    /// Every remaining row, driven by a real click on the real painted row - so each label is
+    /// pinned to the action actually behind it. Without this, a row wired to the wrong handler (or
+    /// to the right handler with the wrong argument) would still pass every handler-level test,
+    /// because those call the handlers directly.
+    #[gpui::test]
+    fn each_menu_row_is_really_wired_to_its_own_action(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+
+        // Copy Branch Name - the clipboard must get the *branch name*, not a sha or a subject
+        // (the row shares `copy_graph_text` with the commit menu's own Copy rows, so nothing else
+        // pins which string it hands over).
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Copy Branch Name to Clipboard");
+        assert_eq!(
+            cx.update(|_window, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text()),
+            Some("feature-a".to_string()),
+            "the Copy row must copy the branch it was opened for"
+        );
+
+        // Delete Branch - a first click arms *that* branch and deletes nothing.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Delete Branch\u{2026}");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.delete_branch_confirm_armed.clone(),
+                Some("feature-a".to_string()),
+                "the Delete row must arm the branch it was opened for"
+            );
+        });
+        assert!(
+            git_output(repo.path(), &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|line| line == "feature-a"),
+            "and must not have deleted anything on a first click"
+        );
+
+        // Push Branch - no remote is configured in this fixture, so what this pins is that the
+        // row really reaches `push_branch` (its own action name) rather than some other action.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Push Branch\u{2026}");
+        cx.run_until_parked();
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Push branch failed:")),
+            "the Push row must really run a push and report git's own failure for a repository \
+             with no remote - got {status:?}"
+        );
+
+        // Rebase current branch on Branch - enters the shared rebase mode, pinned to that
+        // branch's own real tip commit.
+        let feature_a_tip = git_output(repo.path(), &["rev-parse", "feature-a"]);
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(
+            cx,
+            "dropdown-menu-row-Rebase current branch on Branch\u{2026}",
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .map(|rebase| rebase.onto.clone()),
+                Some(feature_a_tip.clone()),
+                "the Rebase row must enter rebase mode onto the clicked branch's real tip"
+            );
+        });
+        app.update_in(cx, |app, _window, cx| {
+            app.leave_rebase_mode(cx);
+            // `leave_rebase_mode` itself does not notify (its real callers do), and the Branches
+            // list is only painted again once a frame is drawn without the rebase Result panel
+            // over it.
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Merge into current branch - fills the app's one existing merge flow.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.merge_flow.is_some(),
+                "the Merge row must really start the existing merge flow"
+            );
+        });
+    }
+
+    /// Right-clicks the branch row painted under `row_selector` and returns once its menu is
+    /// really open. Takes the selector rather than the branch name because `debug_bounds` needs a
+    /// `&'static str`.
+    fn open_menu_at(cx: &mut gpui::VisualTestContext, row_selector: &'static str) {
+        let row = cx
+            .debug_bounds(row_selector)
+            .unwrap_or_else(|| panic!("{row_selector} must really be painted"));
+        right_click(cx, row.center());
+    }
+
+    /// Clicks the open menu's row painted under `row_selector`, for real.
+    fn click_menu_row(cx: &mut gpui::VisualTestContext, row_selector: &'static str) {
+        let row = cx
+            .debug_bounds(row_selector)
+            .unwrap_or_else(|| panic!("the menu's {row_selector} row must really paint"));
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
     }
 
     /// Why the menu is keyed by branch **name** and not by the branch row's index: the panel's
@@ -8891,6 +9048,74 @@ mod graph_branch_action_tests {
         );
     }
 
+    /// An adversarial audit's finding: a Delete click that lands while some other graph operation
+    /// is still in flight must not arm a confirmation at all. Before the guard moved to the top of
+    /// `request_graph_delete_branch`, that click armed silently (`run_graph_remote_op`'s own
+    /// single-flight check sits at the far end, well past the arming), so the *next* click - the
+    /// first one the user makes after the lane clears, and to them a first click - ran a real
+    /// delete with no confirmation of its own.
+    #[gpui::test]
+    async fn a_delete_click_while_another_op_is_in_flight_arms_nothing(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        git(
+            local.path(),
+            &["merge", "--no-ff", "feature", "-m", "merge feature"],
+        );
+
+        // A real, genuinely in-flight graph operation: `run_graph_remote_op` sets the flag
+        // synchronously and only clears it when its background task lands, which is deliberately
+        // not given a chance to run before the click below.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_fetch(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "premise: an unrelated graph operation really is in flight"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+
+        // Read *before* letting the fetch finish: this is the exact moment the old ordering armed
+        // a confirmation the app had no intention of honouring.
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .clone()),
+            None,
+            "a click the app cannot act on must arm nothing at all"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Fetch\u{2026}".to_string()),
+            "and must not overwrite the in-flight operation's own status line with a \
+             confirmation prompt it will not honour"
+        );
+        cx.run_until_parked();
+
+        // The user's next click is, to them, a first click - so it must arm, not delete.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "the first click after the lane clears must only arm - deleting here is the real bug: \
+             it takes one visible click instead of two"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !branches(local.path()).iter().any(|b| b == "feature"),
+            "and the real second click still deletes"
+        );
+    }
+
     #[gpui::test]
     async fn deleting_an_unmerged_branch_surfaces_gits_own_real_refusal(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
@@ -9065,6 +9290,31 @@ mod graph_branch_action_tests {
                 .next()
                 .expect("the test app opens a real agent in the focused worktree")
         });
+        // A second agent, in a genuinely different directory, left *active* - so the
+        // "activate the worktree's own agent tab first" assertion below has something real to
+        // measure. Without this the worktree's only agent is already active and the assertion
+        // would hold with `select_agent` deleted entirely.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let other_agent = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                elsewhere.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(other_agent, window, cx);
+        });
+        cx.run_until_parked();
+        assert_ne!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(agent_id),
+            "premise: a different agent really is the active tab before the merge starts"
+        );
 
         app.update_in(cx, |app, window, cx| {
             app.start_merge_from_graph_branch("feature".to_string(), window, cx);
@@ -9248,7 +9498,12 @@ mod graph_branch_action_tests {
             app.start_merge_from_graph_branch("feature".to_string(), window, cx);
         });
         cx.run_until_parked();
-        let head_after_first = git_output(local.path(), &["rev-parse", "HEAD"]);
+        let generation_after_first = app.read_with(cx, |app, _| {
+            app.merge_flow
+                .as_ref()
+                .map(|flow| flow.generation)
+                .expect("premise: the first merge really is live")
+        });
 
         app.update_in(cx, |app, window, cx| {
             app.start_merge_from_graph_branch("feature".to_string(), window, cx);
@@ -9263,9 +9518,17 @@ mod graph_branch_action_tests {
             "a second merge while one is live must be refused with a real reason - got {status:?}"
         );
         assert_eq!(
-            git_output(local.path(), &["rev-parse", "HEAD"]),
-            head_after_first,
-            "and must not have run a second real git merge over the first"
+            app.read_with(cx, |app, _| app
+                .merge_flow
+                .as_ref()
+                .map(|flow| flow.generation)),
+            Some(generation_after_first),
+            "and must not have started a second attempt over the first - a fresh attempt always \
+             bumps the generation stamp (`MergeFlow::generation`)"
+        );
+        assert!(
+            wt_core::merge::merge_head_exists(local.path()).expect("merge_head_exists"),
+            "the first merge must still be the one in progress"
         );
     }
 }

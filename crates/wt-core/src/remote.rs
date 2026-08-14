@@ -564,15 +564,35 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        let remote_sha_before = git_output(remote.path(), &["rev-parse", "main"]);
+        // A second local branch at the very same commit the remote already has, with no upstream
+        // of its own - so this push has genuinely nothing to transfer, and yet a real invocation
+        // still leaves an observable trace (`--set-upstream`). Without that, "succeeded as a
+        // no-op" would be indistinguishable from "did nothing at all".
+        git(local.path(), &["branch", "already-there", "main"]);
+        let remote_main_before = git_output(remote.path(), &["rev-parse", "main"]);
+        assert!(
+            !has_configured_upstream(local.path(), Some("already-there"))
+                .expect("has_configured_upstream"),
+            "premise: the branch has no upstream yet"
+        );
 
-        push_branch(local.path(), "main", PushForce::None)
-            .expect("pushing an already-up-to-date branch must succeed, not error");
+        push_branch(local.path(), "already-there", PushForce::None)
+            .expect("pushing a branch whose commits the remote already has must succeed");
 
+        assert!(
+            has_configured_upstream(local.path(), Some("already-there"))
+                .expect("has_configured_upstream"),
+            "a real push really ran: it configured the upstream, even with nothing to transfer"
+        );
+        assert_eq!(
+            git_output(remote.path(), &["rev-parse", "already-there"]),
+            remote_main_before,
+            "and the branch really is on the remote, at the commit it already had"
+        );
         assert_eq!(
             git_output(remote.path(), &["rev-parse", "main"]),
-            remote_sha_before,
-            "an up-to-date push must leave the real remote branch exactly where it was"
+            remote_main_before,
+            "without disturbing any other branch there"
         );
     }
 
