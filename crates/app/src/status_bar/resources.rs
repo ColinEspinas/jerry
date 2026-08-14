@@ -312,6 +312,24 @@ pub fn prunable_label(count: usize) -> String {
     format!("{} prunable", plural::count(count, "worktree", None))
 }
 
+/// The disk line's right half, in bytes: the sum of `known_sizes` for however many candidates
+/// there really are.
+///
+/// Zero candidates is a real, known `Some(0)` - there is nothing to sum, which is not the same
+/// state as "some candidates exist but their sizes haven't come back from disk yet"
+/// ([`memory_label`]'s own `None` -> `"..."`). Collapsing the two would show that same "still
+/// loading" ellipsis for the ordinary, permanent case of nothing to prune - the ellipsis is
+/// then indistinguishable from a real disk scan that is still running.
+pub fn prunable_total_bytes(candidate_count: usize, known_sizes: &[u64]) -> Option<u64> {
+    if candidate_count == 0 {
+        return Some(0);
+    }
+    if known_sizes.is_empty() {
+        return None;
+    }
+    Some(known_sizes.iter().sum())
+}
+
 #[cfg(test)]
 mod resources_readout_tests {
     use super::*;
@@ -558,6 +576,26 @@ mod resources_readout_tests {
         assert_eq!(prunable_label(0), "0 worktrees prunable");
         assert_eq!(prunable_label(1), "1 worktree prunable");
         assert_eq!(prunable_label(2), "2 worktrees prunable");
+    }
+
+    /// Zero candidates is a real, known zero (`"0 B"`), never the `"..."` ellipsis that means
+    /// "a real candidate's size hasn't come back from disk yet" - the ordinary, permanent state
+    /// of nothing to prune must not look like a scan that is still running.
+    #[test]
+    fn zero_candidates_is_a_real_zero_not_an_unread_ellipsis() {
+        assert_eq!(prunable_total_bytes(0, &[]), Some(0));
+        assert_eq!(memory_label(prunable_total_bytes(0, &[])), "0 B");
+    }
+
+    #[test]
+    fn a_candidate_whose_size_has_not_come_back_yet_is_genuinely_unknown() {
+        assert_eq!(prunable_total_bytes(2, &[]), None);
+        assert_eq!(memory_label(prunable_total_bytes(2, &[])), "...");
+    }
+
+    #[test]
+    fn known_candidate_sizes_sum() {
+        assert_eq!(prunable_total_bytes(2, &[1_000, 2_000]), Some(3_000));
     }
 
     /// A genuinely small but non-zero agent must not render as `0%` and read as "costs nothing".

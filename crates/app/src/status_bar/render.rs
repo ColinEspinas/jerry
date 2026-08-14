@@ -964,17 +964,12 @@ impl AdeApp {
     /// destructive action.
     fn render_resources_disk_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let candidates = self.prunable_worktree_paths();
-        let prunable_bytes: Option<u64> = {
-            let mut total = 0u64;
-            let mut known = false;
-            for path in &candidates {
-                if let Some((bytes, _truncated)) = self.worktree_disk_usage.get(path) {
-                    total = total.saturating_add(*bytes);
-                    known = true;
-                }
-            }
-            known.then_some(total)
-        };
+        let known_sizes: Vec<u64> = candidates
+            .iter()
+            .filter_map(|path| self.worktree_disk_usage.get(path))
+            .map(|(bytes, _truncated)| *bytes)
+            .collect();
+        let prunable_bytes = resources::prunable_total_bytes(candidates.len(), &known_sizes);
         let armed = self.prune_confirm_armed;
         let enabled = !candidates.is_empty() && !self.prune_in_flight;
 
