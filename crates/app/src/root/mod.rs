@@ -1290,6 +1290,22 @@ pub struct AdeApp {
     /// same timer rather than a second, independent polling loop. Keyed by OS pid; an entry is
     /// absent for a pid not yet sampled (or already exited).
     pub(crate) process_stats: HashMap<u32, process_stats::ProcessSample>,
+    /// The real instant [`Self::process_stats`] was last written by the background poll - the
+    /// Resources popover's `Updated Ns ago` line (GitHub issue #293). `None` until the very first
+    /// sample lands, which that line renders as an honest `not sampled yet` rather than as
+    /// "0s ago".
+    ///
+    /// A stored instant rather than a render-time `Instant::now()`: the whole point of the line
+    /// is to say how stale the numbers above it are, and a value computed while drawing them
+    /// would always read "just now".
+    pub(crate) process_stats_sampled_at: Option<std::time::Instant>,
+    /// Whether the status bar's Resources popover is open (GitHub issue #293) - one of the
+    /// [`menus::MenuSurface`]s, so it obeys the app's one-menu-at-a-time invariant.
+    pub(crate) resources_popover_open: bool,
+    /// The status bar's `X% cpu · Y GB` readout's real painted bounds, captured through the same
+    /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses, so the Resources popover can be
+    /// positioned off the control that opens it.
+    pub(crate) resources_readout_bounds: gpui::Bounds<Pixels>,
     /// Real, bounded disk-usage total across every listed worktree (see
     /// `crate::rail::state::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
     /// recomputed whenever the worktree list reloads. `None` while the very first
@@ -3084,6 +3100,18 @@ impl Render for AdeApp {
             .child(self.render_status_bar(cx))
             .when(self.plus_menu_open, |el| {
                 el.child(self.render_plus_menu(cx))
+            })
+            // The status bar's Resources popover (GitHub issue #293) - a window-positioned
+            // overlay for exactly the reason `render_plus_menu` is one: it is placed off the
+            // readout's `gpui::canvas`-captured window-space bounds, so `.absolute()` positioning
+            // built from them is only correct as a direct child of this root element.
+            //
+            // Unlike the graph menus below it, this is *not* gated on `!self.settings_open`: the
+            // status bar is an unconditional sibling of the Settings swap and keeps rendering its
+            // own readout while Settings covers the workspace, so the popover that readout opens
+            // must stay reachable there too.
+            .when(self.resources_popover_open, |el| {
+                el.child(self.render_resources_popover(cx))
             })
             // The git graph tab's Push `▾` menu and row `⋯` menu (GitHub issue #1, phase (a)) -
             // window-positioned overlays for the same reason `render_plus_menu` is a sibling here

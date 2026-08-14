@@ -487,6 +487,12 @@ local_border = "#292c30"  # Defaults to border::DIVIDER's own value.
 # The status bar's three type tiers (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md
 # §3).
 [status_bar]
-primary   = "#9ba1a7"  # Tier 1
-recessive = "#4b5056"  # Tier 3
-divider   = "#31353b"  # The 1px, 13-high rules between tiers.
+primary       = "#9ba1a7"  # Tier 1
+secondary     = "#767c82"  # Tier 2
+recessive     = "#4b5056"  # Tier 3
+divider       = "#31353b"  # The 1px, 13-high rules between tiers.
+section_label = "#5a5e64"
+meter_track   = "#292e32"
+load_neutral  = "#5c6166"
+load_elevated = "#b3914a"  # 60% < load <= 85%.
+load_critical = "#b46d61"  # load > 85%.

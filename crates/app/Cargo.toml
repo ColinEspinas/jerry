@@ -338,6 +338,9 @@ windows-sys = { version = "0.61.2", features = [
     # PSAPI: `GetProcessMemoryInfo`/`PROCESS_MEMORY_COUNTERS`, the working-set reading behind the
     # status bar's `Y GB` field on Windows.
     "Win32_System_ProcessStatus",
+    # `GlobalMemoryStatusEx`/`MEMORYSTATUSEX`: this machine's real total physical memory, the
+    # denominator of the Resources popover's memory meter (GitHub issue #293).
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

@@ -380,14 +380,16 @@ impl AdeApp {
         Some(
             div()
                 .id("title-bar-agent-state-chips")
+                .debug_selector(|| "title-bar-agent-state-chips".to_string())
                 .flex()
                 .items_center()
-                .gap(px(6.0))
-                .children(
-                    chips
-                        .into_iter()
-                        .map(|(status, text)| render_title_bar_agent_state_chip(status, text)),
-                )
+                // 9px, the mock's own gap for the compact chips - wider than the 6 the old
+                // plated pills used, because without their backgrounds two chips 6px apart read
+                // as one four-part cluster.
+                .gap(px(9.0))
+                .children(chips.into_iter().map(|(status, count, sentence)| {
+                    render_title_bar_agent_state_chip(status, count, sentence)
+                }))
                 .into_any_element(),
         )
     }
@@ -400,11 +402,11 @@ impl AdeApp {
 /// the same way `crate::rail::state`'s own `urgency_counts` tests do - not a second,
 /// independent count, just a filter/format pass over the one real
 /// [`rail::urgency_counts`] already computed from [`AgentRow::status`].
-fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, String)> {
+fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, usize, String)> {
     rail::urgency_counts(rows)
         .into_iter()
         .filter_map(|(status, count)| {
-            title_bar_agent_state_chip_text(status, count).map(|text| (status, text))
+            title_bar_agent_state_chip_text(status, count).map(|text| (status, count, text))
         })
         .collect()
 }
@@ -445,38 +447,57 @@ fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<Strin
     }
 }
 
-/// One title-bar agent-state chip: the same dot-plus-label pill formula
-/// [`crate::work_surface::render::render_status_pill`] uses for the agent context bar's status
-/// pill (identical 19px height, 7px/5px padding, [`theme::radius::CHIP`], `status.pill_bg()`/
-/// `status.color()`) - a visual twin, not a shared function, since that one renders the bare
-/// [`Status::label`] and this one renders this row's own derived count text instead.
-fn render_title_bar_agent_state_chip(status: Status, text: String) -> impl IntoElement {
+/// One title-bar agent-state chip, rebuilt for rev 6 as a **compact dot + count**
+/// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b's table: "agent status counts |
+/// title-bar text badges · footer dot cluster | **title bar, compact dots**, words in the
+/// tooltip").
+///
+/// The sentence is not deleted, it *moves*: `sentence` - still
+/// [`title_bar_agent_state_chip_text`]'s fully conjugated `"2 agents need input"` - becomes this
+/// chip's real tooltip, so nothing is lost, only demoted from a permanent claim on the window's
+/// centre line to something you point at. The pill background goes with the words: a 5×5 square
+/// and a bare number need no plate behind them, and the plate was most of what made three of
+/// these read as a banner.
+///
+/// `count` is passed in rather than parsed back out of `sentence`: the two must be the same
+/// number by construction, not by string surgery, so [`title_bar_agent_state_chips`] hands over
+/// both halves of one derivation.
+///
+/// The count's own colour follows the mock's `titleCounts`: `ask`/`fail` keep their state hue
+/// (those are the two you are meant to see across the room), `run` drops to a neutral tone -
+/// running agents are the ordinary condition and spending the attention colour on them devalues
+/// it everywhere else, the same rule §4c applies to the load meter and §4b to the platform pill.
+fn render_title_bar_agent_state_chip(
+    status: Status,
+    count: usize,
+    sentence: String,
+) -> impl IntoElement {
+    let count_color: gpui::Rgba = match status {
+        Status::Run => theme::text::DIMMER.into(),
+        _ => status.color(),
+    };
     div()
         .id(("title-bar-agent-state-chip", status as usize))
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(5.0))
-        .h(px(19.0))
-        .px(px(7.0))
-        .rounded(theme::radius::CHIP)
-        .bg(status.pill_bg())
+        .gap(px(4.0))
+        .tooltip(crate::root::widgets::text_tooltip(sentence))
         .child(
             div()
                 .flex_none()
                 .w(px(5.0))
                 .h(px(5.0))
-                .rounded(px(2.5))
+                .rounded(px(1.0))
                 .bg(status.color()),
         )
         .child(
             div()
                 .flex_none()
-                .font(font(theme::font::SANS))
-                .font_weight(gpui::FontWeight::MEDIUM)
+                .font(font(theme::font::MONO))
                 .text_size(px(10.0))
-                .text_color(status.color())
-                .child(text),
+                .text_color(count_color)
+                .child(count.to_string()),
         )
 }
 
@@ -857,6 +878,86 @@ mod agent_state_chip_text_tests {
         );
     }
 
+    /// Rev 6 §7 rule 4, quoted verbatim: "Two states distinguished anywhere in the app are never
+    /// summed anywhere in it."
+    ///
+    /// The title bar is where `ask`/`fail`/`run` are distinguished, so no agent may contribute to
+    /// more than one chip, and no chip may carry a count larger than the number of agents really
+    /// in that state. Proved by construction over a mixed row set: the chip counts must partition
+    /// the rows exactly, never overlap.
+    #[test]
+    fn no_agent_is_ever_counted_in_two_chips_at_once() {
+        let rows = vec![
+            row(1, Status::Ask),
+            row(2, Status::Ask),
+            row(3, Status::Fail),
+            row(4, Status::Run),
+            row(5, Status::Review),
+            row(6, Status::Idle),
+        ];
+        let chips = title_bar_agent_state_chips(&rows);
+
+        for (status, count, _) in &chips {
+            let really_in_that_state = rows.iter().filter(|r| r.status == *status).count();
+            assert_eq!(
+                *count, really_in_that_state,
+                "{status:?}'s chip must count exactly the agents really in that state - a chip \
+                 that summed two states would report more"
+            );
+        }
+        let charged: usize = chips.iter().map(|(_, count, _)| count).sum();
+        let chip_eligible = rows
+            .iter()
+            .filter(|r| matches!(r.status, Status::Ask | Status::Fail | Status::Run))
+            .count();
+        assert_eq!(
+            charged,
+            chip_eligible,
+            "the chips together must charge each eligible agent exactly once - {charged} charged \
+             across {} chips for {chip_eligible} eligible agents",
+            chips.len()
+        );
+    }
+
+    /// A single agent can only ever be in one state, so exactly one chip can ever exist for a
+    /// one-agent window - the degenerate case of the rule above, and the one a "count it in both"
+    /// bug would show up in first.
+    #[test]
+    fn one_agent_produces_exactly_one_chip_whatever_its_state() {
+        for status in [Status::Ask, Status::Fail, Status::Run] {
+            let chips = title_bar_agent_state_chips(&[row(1, status)]);
+            assert_eq!(
+                chips.len(),
+                1,
+                "one agent in {status:?} must produce exactly one chip"
+            );
+            assert_eq!(chips[0].1, 1);
+        }
+    }
+
+    /// §4b's compaction: the chip shows a bare count, and the fully conjugated sentence is what
+    /// the tooltip carries - so the two halves must come out of the same call, and the number
+    /// shown must be the number the sentence names.
+    #[test]
+    fn each_chip_carries_both_its_compact_count_and_its_full_sentence() {
+        let rows = vec![
+            row(1, Status::Ask),
+            row(2, Status::Ask),
+            row(3, Status::Run),
+        ];
+        for (_, count, sentence) in title_bar_agent_state_chips(&rows) {
+            assert!(
+                sentence.starts_with(&format!("{count} ")),
+                "the tooltip sentence must name the same number the chip shows - {count} vs \
+                 {sentence:?}"
+            );
+            assert!(
+                sentence.contains("agent"),
+                "the unit noun moves into the tooltip rather than disappearing: {sentence:?}"
+            );
+        }
+    }
+
     #[test]
     fn zero_agents_anywhere_produces_an_entirely_empty_chip_list() {
         assert_eq!(title_bar_agent_state_chips(&[]), Vec::new());
@@ -871,7 +972,7 @@ mod agent_state_chip_text_tests {
         ];
         assert_eq!(
             title_bar_agent_state_chips(&rows),
-            vec![(Status::Ask, "1 agent needs input".to_string())],
+            vec![(Status::Ask, 1, "1 agent needs input".to_string())],
             "only the one non-empty Ask/Fail/Run state should produce a chip - Review and Idle \
              must stay silent even though they are the majority of the rows"
         );
@@ -891,9 +992,9 @@ mod agent_state_chip_text_tests {
         assert_eq!(
             title_bar_agent_state_chips(&rows),
             vec![
-                (Status::Ask, "2 agents need input".to_string()),
-                (Status::Fail, "1 agent failed".to_string()),
-                (Status::Run, "4 agents running".to_string()),
+                (Status::Ask, 2, "2 agents need input".to_string()),
+                (Status::Fail, 1, "1 agent failed".to_string()),
+                (Status::Run, 4, "4 agents running".to_string()),
             ],
             "must match the design doc's own worked example (§4) both in wording and order"
         );
@@ -907,14 +1008,14 @@ mod agent_state_chip_text_tests {
         let before = vec![row(1, Status::Run)];
         assert_eq!(
             title_bar_agent_state_chips(&before),
-            vec![(Status::Run, "1 agent running".to_string())]
+            vec![(Status::Run, 1, "1 agent running".to_string())]
         );
 
         let mut after = before;
         after[0].status = Status::Fail;
         assert_eq!(
             title_bar_agent_state_chips(&after),
-            vec![(Status::Fail, "1 agent failed".to_string())],
+            vec![(Status::Fail, 1, "1 agent failed".to_string())],
             "the chip list must track a changed row's status, not the row set's identity"
         );
     }
@@ -1063,7 +1164,7 @@ mod agent_state_chip_live_tests {
         );
         assert_eq!(
             title_bar_agent_state_chips(&rows_at_startup),
-            vec![(Status::Run, "1 agent running".to_string())],
+            vec![(Status::Run, 1, "1 agent running".to_string())],
             "one real running agent must read as the singular form"
         );
         let first_agent_id = startup_agent_id;
@@ -1159,7 +1260,7 @@ mod agent_state_chip_live_tests {
         );
         assert_eq!(
             title_bar_agent_state_chips(&rows_after_second_spawn),
-            vec![(Status::Run, "2 agents running".to_string())],
+            vec![(Status::Run, 2, "2 agents running".to_string())],
             "the chip text must flip from singular to plural on this real second spawn, not \
              stay frozen at \"1 agent running\""
         );

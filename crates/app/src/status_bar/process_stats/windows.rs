@@ -55,6 +55,7 @@ use super::ProcessSampler;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -121,6 +122,45 @@ impl ProcessSampler for Sampler {
 
         Some(counters.WorkingSetSize as u64)
     }
+}
+
+/// See [`super::system_memory_bytes`] - this machine's real total physical memory, from one
+/// `GlobalMemoryStatusEx` call's `ullTotalPhys`.
+///
+/// `GlobalMemoryStatusEx` rather than the older `GlobalMemoryStatus`: the older call's fields are
+/// `SIZE_T`, so on a machine with more memory than fits the type it reports a clamped value
+/// instead of failing - Microsoft's own documentation says to use the `Ex` form for exactly that
+/// reason. `ullTotalPhys` is a `u64` and is the installed physical memory, which is the
+/// denominator the Resources popover's memory meter needs.
+///
+/// Read once and cached, for the same reason the macOS backend caches its `hw.memsize`: installed
+/// memory cannot change while the process runs, and this is a per-frame call site.
+pub fn system_memory_bytes() -> Option<u64> {
+    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(read_total_memory_bytes)
+}
+
+/// The uncached `GlobalMemoryStatusEx` reading behind [`system_memory_bytes`], separate so the
+/// test below exercises the real call rather than a cached first result.
+fn read_total_memory_bytes() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        // Unlike `PROCESS_MEMORY_COUNTERS::cb` above, this length field is a genuine *input*:
+        // `GlobalMemoryStatusEx` fails outright unless `dwLength` is pre-set to the struct's own
+        // size, which is how it validates the caller's struct version. Taken from the type
+        // itself rather than written as a literal.
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+
+    // SAFETY: the out-pointer addresses a live, uniquely borrowed stack `MEMORYSTATUSEX` whose
+    // `dwLength` has been set to its own real size, which is the whole contract this call has;
+    // it writes only within that struct and does not retain the pointer. The struct is not read
+    // unless the call reports success.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some(status.ullTotalPhys)
 }
 
 /// Recombines a `FILETIME`'s two 32-bit halves into the single 64-bit count of 100-nanosecond
@@ -237,5 +277,28 @@ mod tests {
     fn a_nonexistent_pid_is_an_honest_none() {
         assert_eq!(Sampler.cpu_time(u32::MAX), None);
         assert_eq!(Sampler.resident_bytes(u32::MAX), None);
+    }
+
+    /// A real `GlobalMemoryStatusEx` read on the runner itself: every real Windows machine has
+    /// some physical memory, and it is always at least as large as this process's own working
+    /// set - which is what makes it a usable meter denominator rather than a number that could
+    /// put the numerator past 100%.
+    #[test]
+    fn reads_this_real_machines_total_memory() {
+        let total =
+            read_total_memory_bytes().expect("GlobalMemoryStatusEx must succeed on real Windows");
+        let own_rss = Sampler
+            .resident_bytes(std::process::id())
+            .expect("own working set");
+        assert!(
+            total >= own_rss,
+            "total physical memory ({total}) must be at least this process's own working set \
+             ({own_rss})"
+        );
+        assert_eq!(
+            system_memory_bytes(),
+            Some(total),
+            "the cached accessor must return the same real reading, not a separate guess"
+        );
     }
 }

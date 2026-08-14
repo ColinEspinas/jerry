@@ -161,6 +161,24 @@ pub trait ProcessSampler {
     fn resident_bytes(&self, pid: u32) -> Option<u64>;
 }
 
+/// This machine's real total physical memory in bytes, or `None` on a build with no real backend
+/// ([`unsupported`]) or if the platform reading genuinely failed.
+///
+/// Deliberately a free function rather than a [`ProcessSampler`] method: installed memory is a
+/// property of the *machine*, not of any pid, and the trait's whole contract ("reads exactly the
+/// pid it is given") would be broken by a method that ignores its argument. It still rides the
+/// same single `use ... as backend` selection above, so there is exactly one place a platform is
+/// chosen.
+///
+/// This is only ever a *denominator*: the Resources popover's `MEMORY` meter fills to the agents'
+/// real summed resident bytes over this total. `None` therefore means "draw the value, draw no
+/// fill" - never a fallback constant, since a real numerator over a guessed total is precisely the
+/// fabricated fraction `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4d calls the
+/// defect this panel would otherwise ship with.
+pub fn system_memory_bytes() -> Option<u64> {
+    backend::system_memory_bytes()
+}
+
 /// Normalizes a raw, per-process-ticks-summed CPU percentage to a real 0-100%-of-total-system-
 /// capacity scale, by dividing by `cores` (the real core count -
 /// `std::thread::available_parallelism()` at the call site). Without this, both

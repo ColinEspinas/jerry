@@ -101,9 +101,41 @@ pub fn read_rss_bytes(pid: u32) -> Option<u64> {
     None
 }
 
+/// This machine's real total physical memory, from `/proc/meminfo`'s `MemTotal` line (reported in
+/// kB). `None` if the file is unreadable or has no parseable `MemTotal` - never a fabricated
+/// default, since this is the *denominator* of the Resources popover's memory meter and a guessed
+/// total would make a real numerator read as a fabricated fraction.
+pub fn read_total_memory_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// See [`super::system_memory_bytes`].
+pub fn system_memory_bytes() -> Option<u64> {
+    read_total_memory_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real read of this real machine's `/proc/meminfo` - a Linux box always has some physical
+    /// memory, and it is always at least as large as this process's own resident set.
+    #[test]
+    fn reads_this_real_machines_total_memory() {
+        let total = read_total_memory_bytes().expect("/proc/meminfo MemTotal must be readable");
+        let own_rss = read_rss_bytes(std::process::id()).expect("own VmRSS");
+        assert!(
+            total >= own_rss,
+            "total physical memory ({total}) must be at least this process's own RSS ({own_rss})"
+        );
+    }
 
     /// Real `/proc/self` reads: this test process's own pid always exists and always has a
     /// readable `stat`/`status`, so both readers should return `Some` with a sane (non-zero for
