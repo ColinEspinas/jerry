@@ -1987,14 +1987,14 @@ keyword = "#ff79c6"
         // A table the template itself doesn't already declare - redeclaring one would be a real
         // TOML error, not a user edit.
         let edited_toml =
-            format!("{CUSTOM_THEME_TEMPLATE_TOML}\n[rail]\nprunable_edge = \"#123456\"\n");
+            format!("{CUSTOM_THEME_TEMPLATE_TOML}\n[rail]\nagent_title = \"#123456\"\n");
         std::fs::write(&dest_path, &edited_toml).expect("simulate a user edit");
 
         let second = write_template_theme(dest_dir.path()).expect("second write");
 
         assert_eq!(second.source_path, first.source_path);
         assert_eq!(
-            second.overrides["rail.prunable_edge"],
+            second.overrides["rail.agent_title"],
             rgba(0x123456),
             "the user's edited colour must be preserved, not overwritten with the pristine template"
         );

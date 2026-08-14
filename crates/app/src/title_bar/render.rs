@@ -767,7 +767,6 @@ mod agent_state_chip_text_tests {
             branch: Some("feature-x".to_string()),
             add: 0,
             del: 0,
-            question_preview: None,
             exit_code: None,
             activity: None,
             elapsed: Duration::ZERO,

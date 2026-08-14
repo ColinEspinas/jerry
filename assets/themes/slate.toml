@@ -170,10 +170,12 @@ tree_modified = "#746019"  # "M" mark
 # spine/selection edges) already has one, reused directly at the call site rather than
 # duplicated here under a second name.
 [rail]
-repo_header_name   = "#555b61"
+repo_header_name   = "#6b7177"  # Repo group header's uppercase name.
 worktree_active_bg = "#161a1d"
 worktree_hover_bg  = "#15181b"  # Worktree row hover background (§2.2: "hover #16191c").
-prunable_edge      = "#262a2f"
+agent_title        = "#71767c"
+repo_ask_count     = "#8f6c1d"  # The repo header's amber urgency **count**
+repo_fail_count    = "#934c43"  # The repo header's red urgency **count**
 
 # One tint per agent - the **agent tint pool**.
 [agent]
@@ -193,7 +195,7 @@ prunable_edge      = "#262a2f"
 edge_uncommitted  = "#2d435b"  # UNCOMMITTED's 2px left edge - what is dirty in the checkout.
 edge_neutral      = "#1d2024"  # COMMITS' 2px left edge.
 edge_against_main = "#955f86"  # AGAINST MAIN's 2px left edge
-section_label     = "#555b61"  # Section header label - 9.5px/600 uppercase, .08em tracking.
+section_label     = "#6b7177"  # Section header label - 9.5px/600 uppercase, .09em tracking.
 section_count     = "#383c43"  # Section header count
 section_caret     = "#45494f"  # The section header's own disclosure caret (▾/▸).
 section_stat_add  = "#468e6b"  # The right-aligned per-section diffstat's +N, 10px mono.
