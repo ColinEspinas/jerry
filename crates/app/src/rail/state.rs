@@ -69,9 +69,9 @@ pub struct AgentRow {
     /// how this becomes the rendered `4m`/`1h` text.
     pub elapsed: Duration,
     /// How many files **this agent** has changed since its own review baseline, for a
-    /// [`Status::Review`] row only - §2.3's "review ready" trailing text (`12 files`). `None` for
-    /// every other status (§2.3: "Do not put a per-agent file count here" - review-ready is the
-    /// one documented exception).
+    /// [`Status::Review`] row only - §2.3's trailing text for that state (`12 files`, rendered
+    /// beside the `finished` state word). `None` for every other status (§2.3: "Do not put a
+    /// per-agent file count here" - this one state is the documented exception).
     ///
     /// GitHub issue #225 made this a genuinely per-agent number: it comes from
     /// `crate::review::flow::AdeApp::agent_review_file_count`, a real
@@ -324,7 +324,7 @@ impl WorktreeRow {
     /// Lower sorts first (more urgent).
     ///
     /// The first five steps are exactly [`Status::urgency_rank`] (§2.3's own agent state words -
-    /// `needs input`/`failed`/`review ready`/`running`/`paused` - map one-to-one onto
+    /// `needs input`/`failed`/`finished`/`running`/`paused` - map one-to-one onto
     /// [`Status::Ask`]/[`Status::Fail`]/[`Status::Review`]/[`Status::Run`]/[`Status::Idle`], see
     /// that enum's own docs), reused rather than re-derived. The last two only apply to a
     /// agent-less row, which [`Self::aggregate_status`] alone can't distinguish from a row

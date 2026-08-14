@@ -6,14 +6,21 @@ use std::sync::Arc;
 /// The agent row's line-2 state word (§2.3) - deliberately distinct from [`Status::label`]
 /// (`"Idle"`, used everywhere else this enum shows text, e.g. the work-surface context bar):
 /// only the rail agent row uses `"paused"` for [`Status::Idle`], since that's the one place the
-/// design gives it a different word ("needs input / failed / running / review ready / paused" -
-/// no "idle" appears in that list at all). Changing [`Status::label`] itself to match would have
+/// design gives it a different word ("needs input / failed / running / finished / paused" - no
+/// "idle" appears in that list at all). Changing [`Status::label`] itself to match would have
 /// renamed it everywhere else in the app too.
+///
+/// [`Status::Review`]'s word is `"finished"` (the lowercase form of [`Status::label`]'s own
+/// `Finished`) as of revision 6 / GitHub issue #280 - never `"review ready"`, which stated a
+/// judgement the agent cannot make and collided with the user's own review progress. The
+/// trailing file count beside it ([`agent_trailing_text`]) carries what there is to look at,
+/// and an agent that finished with no measured files reads as a bare `finished` rather than
+/// being mislabelled as ready for review.
 fn agent_state_word(status: Status) -> &'static str {
     match status {
         Status::Ask => "needs input",
         Status::Fail => "failed",
-        Status::Review => "review ready",
+        Status::Review => "finished",
         Status::Run => "running",
         Status::Idle => "paused",
     }
@@ -21,7 +28,7 @@ fn agent_state_word(status: Status) -> &'static str {
 
 /// The agent row's line-2 trailing text (§2.3's exact per-status table): empty for `needs
 /// input` (the dot and state word are the whole message), the live activity for `running`, the
-/// exit code for `failed`, the review's file count for `review ready`, and `resumable · Nh` for
+/// exit code for `failed`, the review's file count for `finished`, and `resumable · Nh` for
 /// `paused`.
 fn agent_trailing_text(agent: &AgentRow) -> String {
     match agent.status {
@@ -4149,6 +4156,125 @@ mod agent_chip_icon_pack_tests {
             cx.debug_bounds("agent-chip-icon-default").is_none(),
             "the default letter chip must not also paint once the pack icon takes over - \
              exactly one of the two must be showing, never both at once"
+        );
+    }
+}
+
+/// Revision 6's status rename (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4g,
+/// GitHub issue #280): [`Status::Review`] renders as `Finished`/`finished`, and the old
+/// `Review ready` wording must never come back to any rendered surface.
+///
+/// Pure, GPUI-window-free coverage over the real production functions every status-derived
+/// string in the window comes out of - the same "collect every rendered string, then assert one
+/// forbidden word is in none of them" idiom `crate::review::state`'s own
+/// `no_review_wording_anywhere_says_a_bare_diff` test already uses for the review surface's
+/// "diff" ban. Hand-built [`AgentRow`]s, the same idiom `crate::rail::state`'s `urgency_counts`
+/// tests use.
+///
+/// The title bar's own chip texts are swept by the twin test in `crate::title_bar::render`'s
+/// `agent_state_chip_text_tests`, since that formatter is private to that module.
+#[cfg(test)]
+mod status_wording_tests {
+    use super::*;
+    use crate::sound::SoundEventKind;
+    use crate::work_surface::state::{footer_actions, pty_state_label};
+    use std::time::Duration;
+
+    fn row(status: Status, review_file_count: Option<usize>) -> AgentRow {
+        AgentRow {
+            id: 1,
+            kind: ProcessKind::claude(),
+            title: "agent-1".to_string(),
+            cwd: PathBuf::from("/wt-1"),
+            status,
+            branch: Some("feature-x".to_string()),
+            add: 0,
+            del: 0,
+            question_preview: None,
+            exit_code: Some(0),
+            activity: None,
+            elapsed: Duration::from_secs(90),
+            review_file_count,
+        }
+    }
+
+    /// Every user-visible string this app derives from a [`Status`], gathered from the real
+    /// functions that produce them: the shared [`Status::label`] (work-surface context-bar
+    /// status pill), the rail agent row's own state word and trailing text, the rail history
+    /// row's `was <state>` line, the agent context bar's footer action labels, the terminal
+    /// pane header's pty-state text, and the Sounds settings page's row label/hint for the
+    /// event this status raises.
+    fn every_rendered_status_string() -> Vec<String> {
+        let mut wording: Vec<String> = Vec::new();
+        for status in Status::ORDER {
+            wording.push(status.label().to_string());
+            wording.push(agent_state_word(status).to_string());
+            // `Self::render_past_agent_row`'s history line.
+            wording.push(format!("was {}", agent_state_word(status)));
+            for count in [None, Some(0), Some(1), Some(12)] {
+                wording.push(agent_trailing_text(&row(status, count)));
+            }
+            for action in footer_actions(status) {
+                wording.push(action.label.to_string());
+            }
+            for is_running in [true, false] {
+                for exit_code in [None, Some(0), Some(1)] {
+                    wording.push(pty_state_label(is_running, status, exit_code));
+                }
+            }
+        }
+        for event in SoundEventKind::ALL {
+            wording.push(event.label().to_string());
+            wording.push(event.description().to_string());
+        }
+        wording
+    }
+
+    #[test]
+    fn no_rendered_status_string_anywhere_says_review_ready() {
+        for text in every_rendered_status_string() {
+            assert!(
+                !text.to_lowercase().contains("review ready"),
+                "revision 6 renamed this status to 'Finished' - no rendered label, state word \
+                 or tooltip may say 'review ready' again, got {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_finished_status_renders_the_rev6_words_in_both_cases() {
+        assert_eq!(
+            Status::Review.label(),
+            "Finished",
+            "the shared status label (work-surface context bar, and everywhere else \
+             `Status::label` is rendered) must be the rev-6 word"
+        );
+        assert_eq!(
+            agent_state_word(Status::Review),
+            "finished",
+            "the rail agent row's state word is the lowercase form, per §2.3's state-word \
+             convention"
+        );
+    }
+
+    /// §4g: "an agent that finished with **no** files reads `finished` with no count - legible
+    /// rather than mislabelled as ready for review", and a real count renders beside the word
+    /// as `finished · N files` (the row's two elements, dot-separated by layout).
+    #[test]
+    fn a_finished_agent_shows_its_file_count_beside_the_word_and_nothing_when_unmeasured() {
+        assert_eq!(
+            agent_trailing_text(&row(Status::Review, None)),
+            "",
+            "an unmeasured file count must render nothing at all, never a fabricated 0"
+        );
+        assert_eq!(
+            agent_trailing_text(&row(Status::Review, Some(0))),
+            "0 files"
+        );
+        assert_eq!(agent_trailing_text(&row(Status::Review, Some(1))), "1 file");
+        assert_eq!(
+            agent_trailing_text(&row(Status::Review, Some(12))),
+            "12 files"
         );
     }
 }

@@ -415,7 +415,7 @@ fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, String)> {
 /// `design_handoff_jerry_ade/revision 3/CHANGELOG.md`'s own "Counts" section). `None` for a
 /// zero count - hidden entirely, never an empty chip - and for [`Status::Review`]/
 /// [`Status::Idle`]: the design's own title-bar example names exactly three states
-/// (`Status::Ask`/`Status::Fail`/`Status::Run`), and review-ready/idle counts already have a
+/// (`Status::Ask`/`Status::Fail`/`Status::Run`), and finished/idle counts already have a
 /// real home - the rail's own agent rows, and the status bar's five-way dot row - so repeating
 /// them a third time here would just restate the same number in a fourth place.
 ///
@@ -782,11 +782,32 @@ mod agent_state_chip_text_tests {
 
     #[test]
     fn review_and_idle_never_get_a_title_bar_chip_even_with_a_real_nonzero_count() {
-        // The design's own title-bar example names exactly three states (§4) - review-ready
-        // and idle counts already have a real home in the rail's own agent rows and the status
+        // The design's own title-bar example names exactly three states (§4) - finished and
+        // idle counts already have a real home in the rail's own agent rows and the status
         // bar's five-way dot row, so they must stay silent here even when genuinely non-zero.
         assert_eq!(title_bar_agent_state_chip_text(Status::Review, 3), None);
         assert_eq!(title_bar_agent_state_chip_text(Status::Idle, 5), None);
+    }
+
+    /// The title bar's half of revision 6's `Review ready` → `Finished` rename (GitHub issue
+    /// #280) - twin of `crate::rail::render`'s `status_wording_tests`, which sweeps every other
+    /// status-derived string in the window. Kept here because this formatter is private to this
+    /// module. Today [`Status::Review`] produces no chip at all, so this passes vacuously for
+    /// that status; the point is that it keeps passing if a future revision gives it one.
+    #[test]
+    fn no_title_bar_chip_text_ever_says_review_ready() {
+        for status in Status::ORDER {
+            for count in [0, 1, 2, 12] {
+                let Some(text) = title_bar_agent_state_chip_text(status, count) else {
+                    continue;
+                };
+                assert!(
+                    !text.to_lowercase().contains("review ready"),
+                    "revision 6 renamed this status to 'Finished' - no title-bar chip may say \
+                     'review ready' again, got {text:?} for {status:?}"
+                );
+            }
+        }
     }
 
     #[test]
