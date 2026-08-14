@@ -56,6 +56,16 @@ use crate::{check_success, format_args, git_command, is_dirty, list_worktrees, o
 /// Where a merge attempt happened, and against what - returned alongside [`MergeOutcome`]
 /// so a caller never has to re-derive "which worktree did this run in" or "what was the
 /// base branch" from scratch.
+///
+/// Both entry points fill this in, with the same meaning in each: `base_branch` is always the
+/// branch that was merged **into**, `session_branch` always the branch that was merged **from**,
+/// and `base_worktree_path` always the worktree the real `git merge` ran in. For
+/// [`attempt_merge`] those are the repository's detected base branch, the session worktree's own
+/// branch, and whichever worktree has the base branch checked out; for
+/// [`attempt_merge_into_current`] they are the target worktree's own currently-checked-out
+/// branch, the caller-supplied source branch, and the target worktree itself. The field names
+/// keep [`attempt_merge`]'s original vocabulary rather than being renamed, so every existing
+/// caller reads unchanged - see each function's own docs for which is which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeStart {
     pub base_branch: String,
@@ -99,14 +109,7 @@ pub fn attempt_merge(
     repo_path: &Path,
     session_worktree_path: &Path,
 ) -> Result<(MergeStart, MergeOutcome), Error> {
-    let session_repo = open_repo(session_worktree_path)?;
-    let session_head = session_repo
-        .head()
-        .map_err(|source| Error::Head(Box::new(source)))?;
-    let session_branch = session_head
-        .referent_name()
-        .map(|name| name.shorten().to_string());
-    let Some(session_branch) = session_branch else {
+    let Some(session_branch) = checked_out_branch(session_worktree_path)? else {
         return Err(Error::MergeSourceDetached {
             path: session_worktree_path.to_path_buf(),
         });
@@ -136,12 +139,88 @@ pub fn attempt_merge(
         });
     }
 
+    let outcome = run_merge(&base_worktree_path, &session_branch)?;
     let start = MergeStart {
         base_branch,
-        base_worktree_path: base_worktree_path.clone(),
-        session_branch: session_branch.clone(),
+        base_worktree_path,
+        session_branch,
+    };
+    Ok((start, outcome))
+}
+
+/// Attempt a real merge of `source_branch` into whatever branch is **currently checked out** in
+/// `target_worktree_path` - the Branches panel's own branch context menu "Merge into current
+/// branch…" (GitHub issue #241), the opposite direction from [`attempt_merge`].
+///
+/// Simpler than [`attempt_merge`] in exactly one way: the worktree the merge runs in is given
+/// directly rather than searched for, so there is no base-branch detection and no
+/// [`Error::MergeBaseBranchNotCheckedOut`] case at all - the caller already knows which worktree
+/// it means. Everything else is identical, and deliberately shares the same code:
+/// [`run_merge`] runs the very same `git -c merge.conflictStyle=merge merge --no-commit --no-ff`
+/// invocation and derives the same [`MergeOutcome`], so the two directions can never drift into
+/// classifying a merge differently.
+///
+/// The returned [`MergeStart`] names what was really merged into what: `base_branch` is the
+/// branch that was genuinely checked out in `target_worktree_path` at the moment the merge ran
+/// (read from `HEAD`, never assumed by the caller), `session_branch` is `source_branch`, and
+/// `base_worktree_path` is `target_worktree_path`.
+///
+/// Three real preconditions are refused before `git merge` ever runs, each mirroring
+/// [`attempt_merge`]'s own for this direction:
+/// - a detached `HEAD` in the target ([`Error::MergeTargetDetached`]) - there is no branch to
+///   merge into, and git would silently merge onto a detached `HEAD` instead;
+/// - a dirty target worktree ([`Error::MergeTargetDirty`]) - see [`attempt_merge`]'s docs for why
+///   this is checked here rather than left to `git merge`'s own inconsistent refusals;
+/// - merging a branch into itself ([`Error::MergeSourceIsCurrentBranch`]) - a guaranteed
+///   "already up to date" no-op that reads as a real answer rather than a mistake.
+///
+/// A `source_branch` that doesn't exist is deliberately *not* pre-checked: git's own
+/// `merge: <name> - not something we can merge` surfaces through [`Error::GitCommand`], exactly
+/// like every other real failure in this module.
+///
+/// Performs blocking I/O: opens the repository via `gix`, spawns a `git status` dirty-check, and
+/// spawns the real `git merge` child process.
+pub fn attempt_merge_into_current(
+    target_worktree_path: &Path,
+    source_branch: &str,
+) -> Result<(MergeStart, MergeOutcome), Error> {
+    let Some(target_branch) = checked_out_branch(target_worktree_path)? else {
+        return Err(Error::MergeTargetDetached {
+            path: target_worktree_path.to_path_buf(),
+        });
     };
 
+    if target_branch == source_branch {
+        return Err(Error::MergeSourceIsCurrentBranch {
+            branch: target_branch,
+        });
+    }
+
+    if is_dirty(target_worktree_path)? {
+        return Err(Error::MergeTargetDirty {
+            path: target_worktree_path.to_path_buf(),
+        });
+    }
+
+    let outcome = run_merge(target_worktree_path, source_branch)?;
+    let start = MergeStart {
+        base_branch: target_branch,
+        base_worktree_path: target_worktree_path.to_path_buf(),
+        session_branch: source_branch.to_string(),
+    };
+    Ok((start, outcome))
+}
+
+/// The one real `git merge` invocation both [`attempt_merge`] and
+/// [`attempt_merge_into_current`] run, plus the classification of its result into a
+/// [`MergeOutcome`] - shared rather than duplicated so the `--no-commit --no-ff`/
+/// `merge.conflictStyle=merge` reasoning in this module's own docs holds for both directions,
+/// and so a change to how an outcome is derived can never apply to only one of them.
+///
+/// `worktree_path` must already have the branch being merged *into* checked out, be clean, and
+/// not be `source_branch`'s own branch - each caller checks its own preconditions before
+/// reaching here (they differ in what they can even check; see each one's docs).
+fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
         "merge.conflictStyle=merge".into(),
@@ -149,23 +228,23 @@ pub fn attempt_merge(
         "--no-commit".into(),
         "--no-ff".into(),
         "--".into(),
-        session_branch.into(),
+        source_branch.into(),
     ];
-    let mut command = git_command(&base_worktree_path, &args);
+    let mut command = git_command(worktree_path, &args);
     let output = command.output().map_err(|source| Error::GitSpawn {
         args: format_args(&args),
         source,
     })?;
 
     if output.status.success() {
-        if !merge_head_exists(&base_worktree_path)? {
-            return Ok((start, MergeOutcome::AlreadyUpToDate));
+        if !merge_head_exists(worktree_path)? {
+            return Ok(MergeOutcome::AlreadyUpToDate);
         }
-        let files = touched_files(&base_worktree_path)?;
-        return Ok((start, MergeOutcome::Clean { files }));
+        let files = touched_files(worktree_path)?;
+        return Ok(MergeOutcome::Clean { files });
     }
 
-    let conflicted_files = conflicted_files(&base_worktree_path)?;
+    let conflicted_files = conflicted_files(worktree_path)?;
     if conflicted_files.is_empty() {
         // A real, non-conflict failure (e.g. a merge was already in progress, or something
         // else genuinely went wrong) - surface git's own stderr rather than misreporting an
@@ -176,19 +255,28 @@ pub fn attempt_merge(
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    let touched = touched_files(&base_worktree_path)?;
+    let touched = touched_files(worktree_path)?;
     let clean_files = touched
         .into_iter()
         .filter(|f| !conflicted_files.contains(f))
         .collect();
 
-    Ok((
-        start,
-        MergeOutcome::Conflicted {
-            conflicted_files,
-            clean_files,
-        },
-    ))
+    Ok(MergeOutcome::Conflicted {
+        conflicted_files,
+        clean_files,
+    })
+}
+
+/// The real short name of the branch checked out in `worktree_path`, or `None` if its `HEAD` is
+/// genuinely detached - read from the worktree's own `HEAD` reference via `gix`, never inferred
+/// from a caller's belief about what should be checked out there. Shared by both merge entry
+/// points, each of which turns `None` into its own direction-appropriate refusal.
+fn checked_out_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
+    let repo = open_repo(worktree_path)?;
+    let head = repo
+        .head()
+        .map_err(|source| Error::Head(Box::new(source)))?;
+    Ok(head.referent_name().map(|name| name.shorten().to_string()))
 }
 
 /// Abort an in-progress merge (real `git merge --abort`) in `base_worktree_path`, restoring
@@ -1318,6 +1406,282 @@ mod tests {
             head_after_first_merge,
             "an already-up-to-date merge must not move HEAD or create a commit"
         );
+    }
+
+    // --- `attempt_merge_into_current` ------------------------------------------------------
+    //
+    // The opposite direction from `attempt_merge`'s own suite above, covered one-for-one: the
+    // target worktree is handed in directly (here always the repository's own main worktree, on
+    // `main`) and the *source* is a branch name. Every fixture below leaves the source branch
+    // checked out nowhere, which is the real shape the Branches panel's own menu produces - the
+    // branch being right-clicked is some other branch in the list, not the one you are on.
+
+    /// Creates `branch` off the current `HEAD`, commits `file`/`contents` on it, and switches
+    /// back - leaving a real, diverged branch that is checked out nowhere.
+    fn branch_with_commit(dir: &Path, branch: &str, file: &str, contents: &str, message: &str) {
+        let previous = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .expect("git rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        git(dir, &["checkout", "-b", branch]);
+        fs::write(dir.join(file), contents).expect("write");
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-m", message]);
+        git(dir, &["checkout", &previous]);
+    }
+
+    #[test]
+    fn merging_a_branch_into_the_current_one_stays_uncommitted_until_complete_merge() {
+        let repo = init_repo();
+        branch_with_commit(
+            repo.path(),
+            "feature",
+            "new.txt",
+            "from feature\n",
+            "feature commit",
+        );
+
+        let (start, outcome) = attempt_merge_into_current(repo.path(), "feature")
+            .expect("attempt_merge_into_current should succeed");
+        assert_eq!(
+            start.base_branch, "main",
+            "the branch merged into must be read from the target worktree's real HEAD"
+        );
+        assert_eq!(start.session_branch, "feature");
+        assert_eq!(
+            fs::canonicalize(&start.base_worktree_path).expect("canonicalize"),
+            fs::canonicalize(repo.path()).expect("canonicalize")
+        );
+        let MergeOutcome::Clean { files } = outcome else {
+            panic!("expected a clean merge, got {outcome:?}");
+        };
+        assert_eq!(files, vec![PathBuf::from("new.txt")]);
+
+        assert!(
+            merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "MERGE_HEAD must exist while the merge is uncommitted"
+        );
+        complete_merge(repo.path()).expect("complete_merge");
+        assert_eq!(
+            status(repo.path()),
+            "",
+            "working tree must be clean after completing"
+        );
+        // `--no-ff` forces a real merge commit even though this was fast-forwardable.
+        assert_eq!(parent_count(repo.path(), "HEAD"), 2);
+    }
+
+    #[test]
+    fn merging_a_diverged_branch_into_the_current_one_produces_a_real_three_way_merge_commit() {
+        let repo = init_repo();
+        branch_with_commit(
+            repo.path(),
+            "feature",
+            "feature_only.txt",
+            "feature work\n",
+            "feature commit",
+        );
+        // The target branch moves on too, so this is a genuine three-way merge.
+        fs::write(repo.path().join("base_only.txt"), "base work\n").expect("write");
+        git(repo.path(), &["add", "base_only.txt"]);
+        git(repo.path(), &["commit", "-m", "base commit"]);
+
+        let (_start, outcome) =
+            attempt_merge_into_current(repo.path(), "feature").expect("attempt_merge_into_current");
+        let MergeOutcome::Clean { files } = outcome else {
+            panic!("expected a clean merge, got {outcome:?}");
+        };
+        assert!(files.contains(&PathBuf::from("feature_only.txt")));
+
+        complete_merge(repo.path()).expect("complete_merge");
+        assert_eq!(status(repo.path()), "");
+        assert_eq!(parent_count(repo.path(), "HEAD"), 2);
+        assert!(repo.path().join("base_only.txt").is_file());
+        assert!(repo.path().join("feature_only.txt").is_file());
+        assert!(log_subjects(repo.path()).contains(&"Merge branch 'feature'".to_string()));
+    }
+
+    #[test]
+    fn merging_a_conflicting_branch_into_the_current_one_reports_real_conflict_markers() {
+        let repo = init_repo();
+        fs::write(repo.path().join("shared.txt"), "line1\nline2\nline3\n").expect("write");
+        fs::write(repo.path().join("clean.txt"), "clean1\nclean2\n").expect("write");
+        git(repo.path(), &["add", "shared.txt", "clean.txt"]);
+        git(repo.path(), &["commit", "-m", "seed shared/clean files"]);
+
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(
+            repo.path().join("shared.txt"),
+            "line1\nFEATURE CHANGED\nline3\n",
+        )
+        .expect("write");
+        fs::write(
+            repo.path().join("clean.txt"),
+            "clean1\nclean2 changed by feature\n",
+        )
+        .expect("write");
+        git(
+            repo.path(),
+            &["commit", "-am", "feature changes shared.txt and clean.txt"],
+        );
+        git(repo.path(), &["checkout", "main"]);
+        fs::write(
+            repo.path().join("shared.txt"),
+            "line1\nBASE CHANGED\nline3\n",
+        )
+        .expect("write");
+        git(repo.path(), &["commit", "-am", "main changes shared.txt"]);
+
+        let (_start, outcome) =
+            attempt_merge_into_current(repo.path(), "feature").expect("attempt_merge_into_current");
+        let MergeOutcome::Conflicted {
+            conflicted_files,
+            clean_files,
+        } = outcome
+        else {
+            panic!("expected a conflicted merge, got {outcome:?}");
+        };
+        assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
+        assert_eq!(clean_files, vec![PathBuf::from("clean.txt")]);
+
+        // The real conflict markers are genuinely on disk, in the two-way style this module's
+        // own parser understands.
+        let on_disk = fs::read_to_string(repo.path().join("shared.txt")).expect("read");
+        assert!(on_disk.contains("<<<<<<< HEAD"));
+        assert!(on_disk.contains("======="));
+        assert!(on_disk.contains(">>>>>>> feature"));
+        let clean_on_disk = fs::read_to_string(repo.path().join("clean.txt")).expect("read");
+        assert_eq!(clean_on_disk, "clean1\nclean2 changed by feature\n");
+    }
+
+    #[test]
+    fn merging_an_already_merged_branch_into_the_current_one_reports_a_real_no_op() {
+        let repo = init_repo();
+        branch_with_commit(
+            repo.path(),
+            "feature",
+            "new.txt",
+            "from feature\n",
+            "feature commit",
+        );
+
+        let (_start, outcome) =
+            attempt_merge_into_current(repo.path(), "feature").expect("attempt_merge_into_current");
+        assert!(matches!(outcome, MergeOutcome::Clean { .. }));
+        complete_merge(repo.path()).expect("complete_merge");
+        let head_after_first_merge = rev_parse(repo.path(), "HEAD");
+
+        let (_start, outcome) = attempt_merge_into_current(repo.path(), "feature")
+            .expect("merging an already-merged branch again should not error");
+        assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
+        assert!(!merge_head_exists(repo.path()).expect("merge_head_exists"));
+        assert_eq!(
+            rev_parse(repo.path(), "HEAD"),
+            head_after_first_merge,
+            "an already-up-to-date merge must not move HEAD or create a commit"
+        );
+    }
+
+    #[test]
+    fn merging_the_current_branch_into_itself_is_refused() {
+        let repo = init_repo();
+        let err = attempt_merge_into_current(repo.path(), "main")
+            .expect_err("merging the current branch into itself must be refused");
+        match err {
+            Error::MergeSourceIsCurrentBranch { branch } => assert_eq!(branch, "main"),
+            other => panic!("expected Error::MergeSourceIsCurrentBranch, got {other:?}"),
+        }
+        assert!(
+            !merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "no merge must have been started"
+        );
+    }
+
+    #[test]
+    fn merging_into_a_dirty_target_worktree_is_refused_before_touching_anything() {
+        let repo = init_repo();
+        branch_with_commit(
+            repo.path(),
+            "feature",
+            "new.txt",
+            "from feature\n",
+            "feature commit",
+        );
+        fs::write(repo.path().join("base.txt"), "uncommitted change\n").expect("write");
+
+        let err = attempt_merge_into_current(repo.path(), "feature")
+            .expect_err("a dirty target worktree must be refused");
+        match err {
+            Error::MergeTargetDirty { path } => {
+                assert_eq!(
+                    fs::canonicalize(&path).expect("canonicalize"),
+                    fs::canonicalize(repo.path()).expect("canonicalize")
+                );
+            }
+            other => panic!("expected Error::MergeTargetDirty, got {other:?}"),
+        }
+        assert!(
+            !merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "no merge must have been started"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("base.txt")).expect("read"),
+            "uncommitted change\n",
+            "the real dirty content must be untouched"
+        );
+        assert!(
+            !repo.path().join("new.txt").exists(),
+            "the refused merge must not have brought the source branch's file across"
+        );
+    }
+
+    #[test]
+    fn merging_into_a_detached_target_worktree_is_refused() {
+        let repo = init_repo();
+        branch_with_commit(
+            repo.path(),
+            "feature",
+            "new.txt",
+            "from feature\n",
+            "feature commit",
+        );
+        let detached = add_worktree_detached(repo.path(), "detached-wt");
+
+        let err = attempt_merge_into_current(&detached, "feature")
+            .expect_err("a detached target worktree must be refused");
+        match err {
+            Error::MergeTargetDetached { path } => assert_eq!(path, detached),
+            other => panic!("expected Error::MergeTargetDetached, got {other:?}"),
+        }
+        assert!(
+            !merge_head_exists(&detached).expect("merge_head_exists"),
+            "no merge must have been started"
+        );
+    }
+
+    /// A real linked worktree on a detached `HEAD` - the same throwaway-`TempDir` path-minting
+    /// idiom [`add_worktree`] uses, without a branch.
+    fn add_worktree_detached(repo_path: &Path, name: &str) -> PathBuf {
+        let container = TempDir::new().expect("tempdir");
+        let path = container.path().join(name);
+        drop(container);
+        git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().expect("utf8 path"),
+                "main",
+            ],
+        );
+        path
     }
 
     #[test]

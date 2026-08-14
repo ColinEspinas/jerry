@@ -1,6 +1,7 @@
 //! The real GPUI surface for the git graph tab - tab strip entry, toolbar, lane canvas + row
-//! list, row `⋯` menu, Push `▾` menu, and the Commit/Branches right panel - plus the `impl
-//! AdeApp` glue that opens/closes/loads it. See `super`'s module docs for scope.
+//! list, row `⋯` menu, Push `▾` menu, the Commit/Branches right panel and that panel's own branch
+//! right-click menu - plus the `impl AdeApp` glue that opens/closes/loads it. See `super`'s module
+//! docs for scope.
 
 use super::*;
 use crate::root::widgets::{
@@ -160,6 +161,10 @@ impl AdeApp {
         self.graph_state.load = GraphLoadState::NotLoaded;
         self.graph_state.row_menu_open = None;
         self.graph_state.push_menu_open = false;
+        // GitHub issue #241: the Branches panel's own branch menu is a `graph_tab_active`-gated
+        // overlay exactly like the two above, so it is torn down with them.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         self.graph_state.commit_files_cache = None;
         // GitHub issue #221: a reopened tab loads from scratch (see this function's own docs), so
         // the incremental walk cap has to start over with it - and dropping the task cancels any
@@ -237,8 +242,12 @@ impl AdeApp {
         // click at all" gap the comment above fixes for the row/push menus applies identically
         // to the "Create branch here" prompt (also gated on `graph_tab_active` in
         // `crate::root::AdeApp::render`) and to a stale armed Hard-reset confirmation.
-        self.graph_state.create_branch_prompt = None;
+        self.graph_state.branch_prompt = None;
         self.graph_state.hard_reset_confirm_armed = None;
+        // GitHub issue #241: and identically to the branch menu and its own armed Delete
+        // confirmation, for exactly the same "switch tabs and back" reason.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
     }
 
     /// Loads (or reloads) the graph and its upstream ahead/behind counts, off the UI thread -
@@ -252,6 +261,12 @@ impl AdeApp {
         // just outdated.
         self.graph_state.row_menu_open = None;
         self.graph_state.row_menu_bounds.clear();
+        // The Branches panel's list is rebuilt from the very graph being reloaded, and the branch
+        // the menu targets may not even survive the reload (it can have been renamed or deleted -
+        // by this app's own menu, or by anything else touching the repository). Dismissing is the
+        // honest answer, the same call `row_menu_open` above makes for the same reason.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         // GitHub issue #221: a fresh load starts the incremental "load more" sequence over from
         // the default cap. Dropping the in-flight task cancels any load-more still walking against
         // the *previous* scope, whose result would be a graph for a scope the user has already
@@ -454,6 +469,14 @@ impl AdeApp {
 
     pub(crate) fn set_graph_right_panel(&mut self, panel: GraphRightPanel, cx: &mut Context<Self>) {
         self.graph_state.right_panel = panel;
+        // GitHub issue #241: switching to the Commit panel unrenders the very branch rows the
+        // branch menu is anchored over, so a still-open popover would be pointing at nothing.
+        // Not reachable by clicking today (the menu's own full-window scrim eats the click that
+        // would hit the panel toggle first), which is exactly why it is worth closing here rather
+        // than relying on that scrim staying full-window forever - the same "the surface this
+        // menu belongs to went away" rule `leave_graph_tab` applies.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         cx.notify();
     }
 
@@ -539,7 +562,7 @@ impl AdeApp {
         // was open left both painted at once (and this menu's own scrim, which *does*
         // `stop_propagation` on a left-click, then ate the next click meant to dismiss the Push
         // menu). GitHub issue #176 generalised that one hand-added pair into the real shared
-        // invariant `AdeApp::close_menu_surfaces_except` now enforces across all six menus - this
+        // invariant `AdeApp::close_menu_surfaces_except` now enforces across every menu surface - this
         // call replaces the single `push_menu_open = false` that used to live here, and runs
         // *before* the assignment below so the sweep can't clear what it just set.
         let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphRow));
@@ -558,6 +581,58 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// Opens the Branches panel's own branch context menu for `branch` at `origin_x`/`origin_y` -
+    /// the real `event.position` of the right-click that opened it (GitHub issue #241). Mirrors
+    /// [`Self::open_graph_row_menu_at`] point for point, including its two
+    /// adversarial-audit-found requirements:
+    /// - **Clamped inside the window**, via the same `context_menu::clamp_menu_origin`, against
+    ///   this menu's own real painted size (`theme::graph::BRANCH_MENU_WIDTH`/`BRANCH_MENU_HEIGHT`,
+    ///   pinned by a test); the Branches panel sits at the window's right edge, so an unclamped
+    ///   popover would run straight off it for *every* row.
+    /// - **Always (re)opens** at the given position, even if a menu for this or another branch was
+    ///   already open, so a second right-click never leaves a stale popover at the old position.
+    ///
+    /// Two deliberate differences from the row menu, both because this menu belongs to the right
+    /// sidebar rather than the centre pane:
+    /// - it does **not** move keyboard focus. The row menu focuses the graph view because a
+    ///   right-click's own `stop_propagation` preempts the graph container's click-to-focus and
+    ///   would otherwise leave the menu open with focus nowhere useful; here the equivalent move
+    ///   would be to yank focus out of the panel's own filter box (the only focusable thing in
+    ///   this panel) and into a different pane entirely, for a menu that is driven purely by
+    ///   clicks. Leaving focus alone is the honest behaviour, and nothing here depends on it.
+    /// - it is keyed by branch name rather than a row index - see [`GraphBranchMenu`]'s docs.
+    pub(crate) fn open_graph_branch_menu_at(
+        &mut self,
+        branch: String,
+        origin_x: gpui::Pixels,
+        origin_y: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.bounds().size;
+        let (clamped_x, clamped_y) = crate::sidebar::context_menu::clamp_menu_origin(
+            f32::from(origin_x),
+            f32::from(origin_y),
+            f32::from(theme::graph::BRANCH_MENU_WIDTH),
+            f32::from(theme::graph::BRANCH_MENU_HEIGHT),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+        // GitHub issue #176's shared one-menu-at-a-time invariant - see
+        // `Self::open_graph_row_menu_at`'s own call to this for the real bug it closes. Runs
+        // *before* the assignment below so the sweep can't clear what it just set.
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::GraphBranch));
+        // A freshly (re)opened menu instance never inherits an armed Delete confirmation from a
+        // previous one - see `GraphTabState::delete_branch_confirm_armed`'s own docs.
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.graph_state.branch_menu_open = Some(GraphBranchMenu {
+            branch,
+            origin_x: px(clamped_x),
+            origin_y: px(clamped_y),
+        });
+        cx.notify();
+    }
+
     pub(crate) fn toggle_graph_push_menu(&mut self, cx: &mut Context<Self>) {
         let opening = !self.graph_state.push_menu_open;
         // GitHub issue #176 - replaces this method's own hand-added "also close the row menu"
@@ -572,8 +647,12 @@ impl AdeApp {
     pub(crate) fn copy_graph_text(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.graph_state.row_menu_open = None;
-        // GitHub issue #241: see `GraphTabState::hard_reset_confirm_armed`'s own docs.
+        // GitHub issue #241: see `GraphTabState::hard_reset_confirm_armed`'s own docs. Shared by
+        // the row menu's Copy SHA/subject rows and the branch menu's Copy Branch Name row, so
+        // both menus (and both armed confirmations) are dismissed here.
         self.graph_state.hard_reset_confirm_armed = None;
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         cx.notify();
     }
 
@@ -658,20 +737,6 @@ impl AdeApp {
         });
     }
 
-    /// The row menu's "Rebase onto this commit" action - GitHub issue #1's own "rebase branch
-    /// (interactive or not)", the non-interactive half. Replays the current worktree's own
-    /// branch on top of `sha` (`wt_core::rewrite::rebase_onto`); see
-    /// [`Self::request_graph_cherry_pick`]'s own docs on real-conflict handling, which applies
-    /// identically here. Interactive rebase (commit reordering/squash/edit) is a real, stated
-    /// follow-up - it needs its own commit-selection UI, not just a single click.
-    pub(crate) fn request_graph_rebase_onto(&mut self, sha: String, cx: &mut Context<Self>) {
-        // GitHub issue #241: see [`Self::request_graph_cherry_pick`]'s own comment above.
-        self.graph_state.hard_reset_confirm_armed = None;
-        self.run_graph_remote_op("Rebase", cx, move |root| {
-            wt_core::rewrite::rebase_onto(&root, &sha)
-        });
-    }
-
     /// The row menu's "Check out" action (GitHub issue #241). Moves `HEAD` (detached) onto `sha`
     /// in the focused worktree (`wt_core::checkout::checkout`) - never the repository's main
     /// checkout, the same "current worktree" resolution [`Self::request_graph_cherry_pick`] and
@@ -688,7 +753,7 @@ impl AdeApp {
 
     /// Opens the row menu's "Create branch here" prompt (GitHub issue #241) - a small, hand-
     /// rolled inline text input (mirrors `crate::root::new_file::AdeApp::start_new_file`'s own
-    /// shape; see [`state::GraphCreateBranchPrompt`]'s own docs for why there's no separate
+    /// shape; see [`state::GraphBranchPrompt`]'s own docs for why there's no separate
     /// modal-dialog subsystem behind it). Closes the row `⋯` menu it was clicked from - the
     /// prompt replaces it as a focus-owning overlay, the same relationship the "New file" prompt
     /// has with whatever it was opened from.
@@ -702,65 +767,121 @@ impl AdeApp {
     ) {
         self.graph_state.hard_reset_confirm_armed = None;
         self.graph_state.row_menu_open = None;
-        self.graph_state.create_branch_prompt = Some(state::GraphCreateBranchPrompt {
-            sha,
-            short_sha,
-            subject,
-            error: None,
-        });
-        self.graph_state.create_branch_name = TextField::new();
-        window.focus(&self.graph_state.create_branch_focus_handle, cx);
+        self.open_graph_branch_prompt(
+            state::GraphBranchPromptKind::CreateAt {
+                sha,
+                short_sha,
+                subject,
+            },
+            TextField::new(),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the branch menu's "Rename Branch…" prompt (GitHub issue #241) - the *same* prompt
+    /// [`Self::start_graph_create_branch`] opens, in [`state::GraphBranchPromptKind::Rename`]
+    /// mode (see [`state::GraphBranchPrompt`]'s own docs on why there is deliberately only one).
+    ///
+    /// Pre-filled with the branch's real current name via `TextField::seeded`, so a rename starts
+    /// from what the branch is actually called rather than an empty box - the one real difference
+    /// from the create case beyond which `wt_core::checkout` call Enter ends up making.
+    pub(crate) fn start_graph_rename_branch(
+        &mut self,
+        old_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.graph_state.branch_menu_open = None;
+        let seeded = TextField::seeded(&old_name);
+        self.open_graph_branch_prompt(
+            state::GraphBranchPromptKind::Rename { old_name },
+            seeded,
+            window,
+            cx,
+        );
+    }
+
+    /// Shared open path for both prompt kinds: replaces the text field wholesale (empty for a
+    /// create, seeded for a rename) and moves real keyboard focus onto the prompt, which owns it
+    /// until Enter or Escape.
+    fn open_graph_branch_prompt(
+        &mut self,
+        kind: state::GraphBranchPromptKind,
+        name: TextField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.branch_prompt = Some(state::GraphBranchPrompt { kind, error: None });
+        self.graph_state.branch_prompt_name = name;
+        window.focus(&self.graph_state.branch_prompt_focus_handle, cx);
         cx.notify();
     }
 
-    /// Closes the "Create branch here" prompt without creating anything - Escape, or a click on
-    /// its own scrim. Mirrors `crate::root::new_file::AdeApp::cancel_new_file`'s own shape,
+    /// Closes the branch-name prompt without creating or renaming anything - Escape, or a click
+    /// on its own scrim. Mirrors `crate::root::new_file::AdeApp::cancel_new_file`'s own shape,
     /// simpler here since the prompt only ever opens while the graph tab is focused: focus always
     /// returns to [`AdeApp::graph_focus_handle`].
-    pub(crate) fn cancel_graph_create_branch(
+    pub(crate) fn cancel_graph_branch_prompt(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.graph_state.create_branch_prompt.take().is_some() {
+        if self.graph_state.branch_prompt.take().is_some() {
             window.focus(&self.graph_focus_handle, cx);
             cx.notify();
         }
     }
 
-    /// Enter on the "Create branch here" prompt. The only hand-rolled validation here is "not
-    /// empty" - just enough to avoid a clearly-broken `git checkout -b '' <sha>` invocation; a
-    /// name colliding with an existing branch is deliberately *not* pre-checked here and instead
-    /// surfaces as git's own real error through [`Self::run_graph_remote_op`]'s status-message
-    /// path, exactly like every other row-menu mutation's real-conflict handling.
-    pub(crate) fn commit_graph_create_branch(
+    /// Enter on the branch-name prompt - runs whichever real `wt_core::checkout` mutation this
+    /// prompt was opened for ([`state::GraphBranchPromptKind`]).
+    ///
+    /// The only hand-rolled validation here is "not empty" - just enough to avoid a
+    /// clearly-broken `git checkout -b '' <sha>` / `git branch -m <old> ''` invocation. A name
+    /// colliding with an existing branch, or one git rejects as invalid, is deliberately *not*
+    /// pre-checked here and instead surfaces as git's own real error through
+    /// [`Self::run_graph_remote_op`]'s status-message path, exactly like every other menu
+    /// mutation's real-conflict handling.
+    ///
+    /// A rename whose "new" name is byte-for-byte the branch's current name is also left to git:
+    /// `git branch -m <name> <name>` really does succeed as a no-op, which is an honest outcome
+    /// for a user who confirmed a rename without changing anything.
+    pub(crate) fn commit_graph_branch_prompt(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(prompt) = self.graph_state.create_branch_prompt.clone() else {
+        let Some(prompt) = self.graph_state.branch_prompt.clone() else {
             return;
         };
         let name = self
             .graph_state
-            .create_branch_name
+            .branch_prompt_name
             .as_str()
             .trim()
             .to_string();
         if name.is_empty() {
-            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+            if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                 open.error = Some("branch name can't be empty".to_string());
             }
             cx.notify();
             return;
         }
-        self.graph_state.create_branch_prompt = None;
+        self.graph_state.branch_prompt = None;
         window.focus(&self.graph_focus_handle, cx);
-        self.request_graph_create_branch(prompt.sha, name, cx);
+        match prompt.kind {
+            state::GraphBranchPromptKind::CreateAt { sha, .. } => {
+                self.request_graph_create_branch(sha, name, cx)
+            }
+            state::GraphBranchPromptKind::Rename { old_name } => {
+                self.request_graph_rename_branch(old_name, name, cx)
+            }
+        }
     }
 
     /// The real `wt_core::checkout::create_branch_at` call behind
-    /// [`Self::commit_graph_create_branch`] - split out so tests can drive it directly without
+    /// [`Self::commit_graph_branch_prompt`] - split out so tests can drive it directly without
     /// going through the prompt's own focus/window plumbing, matching
     /// [`Self::request_graph_cherry_pick`] and friends.
     pub(crate) fn request_graph_create_branch(
@@ -772,6 +893,99 @@ impl AdeApp {
         self.graph_state.hard_reset_confirm_armed = None;
         self.run_graph_remote_op("Create branch", cx, move |root| {
             wt_core::checkout::create_branch_at(&root, &name, &sha)
+        });
+    }
+
+    /// The real `wt_core::checkout::rename_branch` call behind
+    /// [`Self::commit_graph_branch_prompt`]'s rename path (GitHub issue #241) - split out for the
+    /// same reason [`Self::request_graph_create_branch`] is, and running in the focused worktree
+    /// like every other graph mutation (a branch rename is repository-wide either way, but the
+    /// invocation still has to happen *somewhere*, and that somewhere is never the main checkout
+    /// unless it happens to be the focused one).
+    ///
+    /// A collision with an existing name, or a name git rejects outright, surfaces through
+    /// [`Self::run_graph_remote_op`]'s status-message path with git's own real error text.
+    pub(crate) fn request_graph_rename_branch(
+        &mut self,
+        old_name: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.run_graph_remote_op("Rename branch", cx, move |root| {
+            wt_core::checkout::rename_branch(&root, &old_name, &new_name)
+        });
+    }
+
+    /// The branch menu's "Checkout Branch" action (GitHub issue #241) - `git switch -- <branch>`
+    /// in the focused worktree (`wt_core::checkout::checkout_branch`), landing on the *branch*
+    /// with `HEAD` attached, not a detached commit.
+    ///
+    /// Deliberately not `wt_core::checkout::checkout` (the row menu's own "Check out"): that
+    /// function is safe only because every one of *its* callers passes a commit id resolved from
+    /// this app's own graph, never user-typed or taken from a branch listing - see its own docs.
+    /// This action's `branch` comes from the Branches panel's own list instead, so it needs
+    /// `checkout_branch`'s `--`-guarded implementation; see that function's docs for the real,
+    /// live-reproduced flag-injection failure mode reusing plain `checkout` here would reopen.
+    ///
+    /// A branch already checked out in another worktree, or uncommitted changes that would be
+    /// overwritten, are git's own refusals to make - surfaced verbatim through
+    /// [`Self::run_graph_remote_op`], never pre-checked here.
+    pub(crate) fn request_graph_branch_checkout(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.run_graph_remote_op("Check out", cx, move |root| {
+            wt_core::checkout::checkout_branch(&root, &branch)
+        });
+    }
+
+    /// The branch menu's "Push Branch…" action (GitHub issue #241) - a plain, never-forced push
+    /// of that specific branch (`wt_core::remote::push_branch`), regardless of what is checked
+    /// out in the focused worktree.
+    ///
+    /// Deliberately no force variant on this menu at all: the toolbar's own `Push ▾` menu is
+    /// where the two remote-history-losing postures live, behind the two-click confirmation
+    /// [`GraphTabState::push_force_confirm_armed`] documents. A plain push can only ever
+    /// fast-forward the remote, so like that menu's own "Push" row it runs on a single click.
+    pub(crate) fn request_graph_push_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.run_graph_remote_op("Push branch", cx, move |root| {
+            wt_core::remote::push_branch(&root, &branch, wt_core::remote::PushForce::None)
+        });
+    }
+
+    /// The branch menu's "Delete Branch…" action (GitHub issue #241) - real `git branch -d`
+    /// (`wt_core::checkout::delete_branch`), behind the same two-click confirmation
+    /// [`Self::request_graph_reset`]'s own "Hard" row uses: the first click on a given branch's
+    /// Delete row only arms [`GraphTabState::delete_branch_confirm_armed`] and re-labels the row,
+    /// without deleting anything; a second click on that *same* branch's Delete row is what
+    /// actually runs the delete. Clicking Delete on a *different* branch arms that branch instead
+    /// of inheriting the previous arm.
+    ///
+    /// Nothing about the branch is pre-validated: git itself refuses an unmerged branch and a
+    /// branch checked out in any worktree, and its own refusal text is what the status line shows
+    /// (see `wt_core::checkout::delete_branch`'s docs).
+    ///
+    /// The single-flight guard is checked **here**, before the confirmation is touched, rather
+    /// than being left to [`Self::run_graph_remote_op`]'s own identical check at the far end (an
+    /// adversarial audit's finding): that later check returns without running anything, but by
+    /// then this method has already disarmed - so a confirmed second click landing while some
+    /// other graph operation was still in flight silently deleted nothing, cleared the
+    /// confirmation, and left the menu open with a stale status line, i.e. a dead click. Refusing
+    /// up front keeps the arm intact, so the click the user is about to repeat still counts.
+    pub(crate) fn request_graph_delete_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if self.graph_state.remote_op_in_flight {
+            return;
+        }
+        if self.graph_state.delete_branch_confirm_armed.as_deref() != Some(branch.as_str()) {
+            self.graph_state.status_message =
+                Some(format!("click Delete again to really delete {branch}"));
+            self.graph_state.delete_branch_confirm_armed = Some(branch);
+            cx.notify();
+            return;
+        }
+        self.graph_state.delete_branch_confirm_armed = None;
+        self.run_graph_remote_op("Delete branch", cx, move |root| {
+            wt_core::checkout::delete_branch(&root, &branch)
         });
     }
 
@@ -796,6 +1010,13 @@ impl AdeApp {
     ) {
         use wt_core::checkout::ResetMode;
 
+        // Same up-front single-flight guard, for the same reason, as
+        // [`Self::request_graph_delete_branch`]'s own - see that method's docs for the dead-click
+        // this ordering closes. Soft/Mixed behave exactly as before either way (they arm nothing,
+        // and `run_graph_remote_op` would have refused them at the far end regardless).
+        if self.graph_state.remote_op_in_flight {
+            return;
+        }
         if mode == ResetMode::Hard
             && self.graph_state.hard_reset_confirm_armed.as_deref() != Some(sha.as_str())
         {
@@ -836,6 +1057,11 @@ impl AdeApp {
         self.graph_state.remote_op_in_flight = true;
         self.graph_state.push_menu_open = false;
         self.graph_state.row_menu_open = None;
+        // GitHub issue #241: the Branches panel's own branch menu is dismissed by acting on it,
+        // exactly like the row menu above - one place, so every branch action gets it (and its
+        // armed-Delete disarm) for free rather than each remembering to.
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
         self.graph_state.status_message = Some(format!("{action}\u{2026}"));
         cx.notify();
 
@@ -912,7 +1138,7 @@ impl AdeApp {
     /// The "Create branch here" prompt's key handler - append/backspace/Enter (create)/Escape
     /// (cancel), mirroring `crate::root::new_file::AdeApp::handle_new_file_key_down`'s own
     /// minimal shape (GitHub issue #241).
-    pub(in crate::graph_view) fn handle_graph_create_branch_key_down(
+    pub(in crate::graph_view) fn handle_graph_branch_prompt_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
@@ -924,17 +1150,17 @@ impl AdeApp {
         }
         match keystroke.key.as_str() {
             "escape" => {
-                self.cancel_graph_create_branch(window, cx);
+                self.cancel_graph_branch_prompt(window, cx);
                 cx.stop_propagation();
             }
             "enter" => {
-                self.commit_graph_create_branch(window, cx);
+                self.commit_graph_branch_prompt(window, cx);
                 cx.stop_propagation();
             }
             "backspace" => {
-                if self.graph_state.create_branch_prompt.is_some() {
-                    self.graph_state.create_branch_name.pop(Instant::now());
-                    if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                if self.graph_state.branch_prompt.is_some() {
+                    self.graph_state.branch_prompt_name.pop(Instant::now());
+                    if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                         open.error = None;
                     }
                     self.reset_caret_blink(cx);
@@ -948,11 +1174,11 @@ impl AdeApp {
                     .as_deref()
                     .filter(|text| !text.is_empty())
                 {
-                    if self.graph_state.create_branch_prompt.is_some() {
+                    if self.graph_state.branch_prompt.is_some() {
                         self.graph_state
-                            .create_branch_name
+                            .branch_prompt_name
                             .push_str(text, Instant::now());
-                        if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+                        if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                             open.error = None;
                         }
                         self.reset_caret_blink(cx);
@@ -966,14 +1192,14 @@ impl AdeApp {
 
     /// `Ctrl/Cmd+Z` inside the "Create branch here" prompt (GitHub issue #17's per-widget text
     /// undo, GitHub issue #241).
-    pub(in crate::graph_view) fn handle_graph_create_branch_text_undo(
+    pub(in crate::graph_view) fn handle_graph_branch_prompt_text_undo(
         &mut self,
         _: &crate::root::TextUndo,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.graph_state.create_branch_name.undo() {
-            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+        if self.graph_state.branch_prompt_name.undo() {
+            if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                 open.error = None;
             }
             cx.notify();
@@ -981,37 +1207,59 @@ impl AdeApp {
     }
 
     /// `Ctrl/Cmd+Shift+Z` / `Ctrl+Y` inside the "Create branch here" prompt - the mirror of
-    /// [`Self::handle_graph_create_branch_text_undo`].
-    pub(in crate::graph_view) fn handle_graph_create_branch_text_redo(
+    /// [`Self::handle_graph_branch_prompt_text_undo`].
+    pub(in crate::graph_view) fn handle_graph_branch_prompt_text_redo(
         &mut self,
         _: &crate::root::TextRedo,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.graph_state.create_branch_name.redo() {
-            if let Some(open) = self.graph_state.create_branch_prompt.as_mut() {
+        if self.graph_state.branch_prompt_name.redo() {
+            if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                 open.error = None;
             }
             cx.notify();
         }
     }
 
-    /// The "Create branch here" prompt: a scrim + small centered panel (GitHub issue #241),
-    /// exactly the shape `crate::root::new_file::AdeApp::render_new_file_prompt` already
-    /// established for this app's one other hand-rolled "prompt for a name" - transparent-to-
-    /// nothing modal scrim, `.occlude()`d panel that stops its own click from bubbling up and
-    /// dismissing it. Assumes `Self::graph_state.create_branch_prompt` is `Some` - the caller
-    /// (`crate::root::AdeApp::render`) only renders this when it is.
-    pub(crate) fn render_graph_create_branch_prompt(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let prompt = self.graph_state.create_branch_prompt.clone();
-        let name = self.graph_state.create_branch_name.as_str().to_string();
+    /// The branch-name prompt: a scrim + small centered panel (GitHub issue #241), exactly the
+    /// shape `crate::root::new_file::AdeApp::render_new_file_prompt` already established for this
+    /// app's one other hand-rolled "prompt for a name" - transparent-to-nothing modal scrim,
+    /// `.occlude()`d panel that stops its own click from bubbling up and dismissing it. Assumes
+    /// `Self::graph_state.branch_prompt` is `Some` - the caller (`crate::root::AdeApp::render`)
+    /// only renders this when it is.
+    ///
+    /// One panel for both kinds ([`state::GraphBranchPrompt`]): only the title, the subtitle line
+    /// (the target commit for a create, the branch's current name for a rename) and the footer
+    /// hint differ - everything else, including the real text field and its caret, is literally
+    /// the same element tree.
+    pub(crate) fn render_graph_branch_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let prompt = self.graph_state.branch_prompt.clone();
+        let name = self.graph_state.branch_prompt_name.as_str().to_string();
         let has_name = !name.is_empty();
-
+        let is_rename = matches!(
+            prompt.as_ref().map(|prompt| &prompt.kind),
+            Some(state::GraphBranchPromptKind::Rename { .. })
+        );
+        let title = if is_rename {
+            "Rename branch"
+        } else {
+            "Create branch here"
+        };
+        let subtitle = match prompt.as_ref().map(|prompt| &prompt.kind) {
+            Some(state::GraphBranchPromptKind::CreateAt {
+                short_sha, subject, ..
+            }) => format!("{short_sha} \u{b7} {subject}"),
+            Some(state::GraphBranchPromptKind::Rename { old_name }) => old_name.clone(),
+            None => String::new(),
+        };
+        let footer = if is_rename {
+            "enter to rename \u{b7} esc to cancel"
+        } else {
+            "enter to create \u{b7} esc to cancel"
+        };
         div()
-            .id("graph-create-branch-scrim")
+            .id("graph-branch-prompt-scrim")
             .absolute()
             .top(theme::band::TITLE_BAR)
             .left(px(0.0))
@@ -1023,16 +1271,16 @@ impl AdeApp {
             .occlude()
             .bg(modal_scrim_bg())
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.cancel_graph_create_branch(window, cx);
+                this.cancel_graph_branch_prompt(window, cx);
             }))
             .child(
                 div()
-                    .id("graph-create-branch-panel")
-                    .track_focus(&self.graph_state.create_branch_focus_handle)
+                    .id("graph-branch-prompt-panel")
+                    .track_focus(&self.graph_state.branch_prompt_focus_handle)
                     .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_graph_create_branch_text_undo))
-                    .on_action(cx.listener(Self::handle_graph_create_branch_text_redo))
-                    .on_key_down(cx.listener(Self::handle_graph_create_branch_key_down))
+                    .on_action(cx.listener(Self::handle_graph_branch_prompt_text_undo))
+                    .on_action(cx.listener(Self::handle_graph_branch_prompt_text_redo))
+                    .on_key_down(cx.listener(Self::handle_graph_branch_prompt_key_down))
                     .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                     }))
@@ -1051,19 +1299,15 @@ impl AdeApp {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(px(11.5))
                             .text_color(theme::text::HEADING)
-                            .child("Create branch here"),
+                            .child(title),
                     )
                     .child(
                         div()
+                            .debug_selector(|| "graph-branch-prompt-subtitle".to_string())
                             .font(font(theme::font::MONO))
                             .text_size(px(9.5))
                             .text_color(theme::text::FAINTER)
-                            .child(match &prompt {
-                                Some(prompt) => {
-                                    format!("{} \u{b7} {}", prompt.short_sha, prompt.subject)
-                                }
-                                None => String::new(),
-                            }),
+                            .child(subtitle),
                     )
                     .child(
                         div()
@@ -1079,8 +1323,8 @@ impl AdeApp {
                             .text_color(theme::text::BODY)
                             .when(!has_name, |el| {
                                 el.child(self.render_simple_input_caret(
-                                    "graph-create-branch-caret",
-                                    &self.graph_state.create_branch_focus_handle,
+                                    "graph-branch-prompt-caret",
+                                    &self.graph_state.branch_prompt_focus_handle,
                                 ))
                             })
                             .child(if has_name {
@@ -1090,8 +1334,8 @@ impl AdeApp {
                             })
                             .when(has_name, |el| {
                                 el.child(self.render_simple_input_caret(
-                                    "graph-create-branch-caret",
-                                    &self.graph_state.create_branch_focus_handle,
+                                    "graph-branch-prompt-caret",
+                                    &self.graph_state.branch_prompt_focus_handle,
                                 ))
                             }),
                     )
@@ -1109,7 +1353,7 @@ impl AdeApp {
                             .font(font(theme::font::SANS))
                             .text_size(px(10.0))
                             .text_color(theme::text::GHOST)
-                            .child("enter to create \u{b7} esc to cancel"),
+                            .child(footer),
                     ),
             )
     }
@@ -1996,15 +2240,6 @@ impl AdeApp {
                         }
                     })),
                 )
-                .child(render_dropdown_menu_row(
-                    "\u{25b8}",
-                    theme::button::BLUE_FG.into(),
-                    theme::surface::CHIP_NEUTRAL.into(),
-                    "Start agent from this commit",
-                    "not implemented yet".to_string(),
-                    Vec::new(),
-                    false,
-                ))
                 .child(render_graph_row_menu_header("Apply"))
                 .child(
                     render_dropdown_menu_row(
@@ -2041,28 +2276,15 @@ impl AdeApp {
                     })),
                 )
                 .child(
+                    // GitHub issue #241: one rebase entry, not two. This opens the interactive
+                    // Planning banner (`AdeApp::enter_rebase_mode`), whose own one-click
+                    // `Start rebase` covers the "just replay it, don't edit anything" case that
+                    // used to have a separate, immediately-running row of its own.
                     render_dropdown_menu_row(
                         "\u{2191}",
                         theme::button::BLUE_FG.into(),
                         theme::surface::CHIP_NEUTRAL.into(),
                         "Rebase onto this commit",
-                        String::new(),
-                        Vec::new(),
-                        true,
-                    )
-                    .on_click(cx.listener({
-                        let sha = sha.clone();
-                        move |this, _event: &ClickEvent, _window, cx| {
-                            this.request_graph_rebase_onto(sha.clone(), cx);
-                        }
-                    })),
-                )
-                .child(
-                    render_dropdown_menu_row(
-                        "\u{2191}",
-                        theme::button::BLUE_FG.into(),
-                        theme::surface::CHIP_NEUTRAL.into(),
-                        "Interactive rebase from here",
                         String::new(),
                         Vec::new(),
                         true,
@@ -2185,6 +2407,223 @@ impl AdeApp {
                         .text_color(theme::text::GHOSTER)
                         .child(
                             "check out, branch, rebase, and reset all run in the focused \
+                             worktree, never the main checkout",
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The Branches panel's own branch right-click context menu (GitHub issue #241) - the seven
+    /// real actions VSCode's Git Graph extension offers on a local branch, scoped to exactly
+    /// those: Checkout / Rename / Delete, then Merge / Rebase, then Push, then Copy.
+    ///
+    /// Structurally the row `⋯` menu's twin ([`Self::render_graph_row_menu`]) and deliberately
+    /// so: the same `menu_popover_chrome` panel, the same [`render_dropdown_menu_row`] rows and
+    /// group headers, and the same scrim contract, including both of that menu's own
+    /// adversarial-audit-found fixes:
+    /// - the scrim's left-click dismiss `cx.stop_propagation()`s, so a click that dismisses this
+    ///   menu can never *also* re-trigger whatever sits underneath it in the same `MouseUpEvent`;
+    /// - the popover itself `.occlude()`s, so a right-click inside its own bounds can never fall
+    ///   through to the branch row it is painted over and retarget the menu to that branch.
+    ///
+    /// A right-click on the scrim (outside the popover) deliberately does *not* stop propagation,
+    /// so it dismisses and then still reaches whichever branch row it landed on, opening fresh
+    /// there in the same click - see the row menu's own matching comment.
+    ///
+    /// Anchored to the position captured once at open time
+    /// ([`GraphBranchMenu::origin_x`]/`origin_y`), never recomputed here, and keyed by branch
+    /// *name*: the panel's list is rebuilt and re-filtered constantly, so a row index would go
+    /// stale while an index-keyed menu stayed open.
+    pub(crate) fn render_graph_branch_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(menu) = self.graph_state.branch_menu_open.clone() else {
+            return gpui::Empty.into_any_element();
+        };
+        let branch = menu.branch.clone();
+        let delete_armed =
+            self.graph_state.delete_branch_confirm_armed.as_deref() == Some(branch.as_str());
+        // The branch the merge would land in, read off the same real `wt_core::list_worktrees`
+        // data the rest of the app uses for the focused worktree - never a guess, and honestly
+        // absent (no sub-label at all) when the worktree is on a detached `HEAD`.
+        let current_branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone());
+
+        div()
+            .id("graph-branch-menu-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                this.graph_state.branch_menu_open = None;
+                this.graph_state.delete_branch_confirm_armed = None;
+                cx.notify();
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                    this.graph_state.branch_menu_open = None;
+                    this.graph_state.delete_branch_confirm_armed = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                menu_popover_chrome(
+                    div()
+                        .id("graph-branch-menu-popover")
+                        .debug_selector(|| "graph-branch-menu-popover".to_string())
+                        .absolute()
+                        .left(menu.origin_x)
+                        .top(menu.origin_y)
+                        .w(theme::graph::BRANCH_MENU_WIDTH)
+                        .py(px(4.0)),
+                    theme::shadow::MENU,
+                )
+                .occlude()
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(render_graph_row_menu_header("Branch"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2713}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Checkout Branch",
+                        branch.clone(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_branch_checkout(branch.clone(), cx);
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{270e}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Rename Branch\u{2026}",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, window, cx| {
+                            this.start_graph_rename_branch(branch.clone(), window, cx);
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2715}",
+                        theme::button::DANGER_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Delete Branch\u{2026}",
+                        if delete_armed {
+                            "click again to really delete".to_string()
+                        } else {
+                            "refused if it has unmerged commits".to_string()
+                        },
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_delete_branch(branch.clone(), cx);
+                        }
+                    })),
+                )
+                .child(render_graph_row_menu_header("Integrate"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2193}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Merge into current branch\u{2026}",
+                        current_branch.clone().unwrap_or_default(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, window, cx| {
+                            this.start_merge_from_graph_branch(branch.clone(), window, cx);
+                        }
+                    })),
+                )
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Rebase current branch on Branch\u{2026}",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.enter_rebase_mode_onto_branch(branch.clone(), cx);
+                        }
+                    })),
+                )
+                .child(render_graph_row_menu_header("Remote"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{2191}",
+                        theme::button::BLUE_FG.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Push Branch\u{2026}",
+                        "fast-forwards the remote branch".to_string(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.request_graph_push_branch(branch.clone(), cx);
+                        }
+                    })),
+                )
+                .child(render_graph_row_menu_header("Copy"))
+                .child(
+                    render_dropdown_menu_row(
+                        "\u{ab}",
+                        theme::text::SECONDARY.into(),
+                        theme::surface::CHIP_NEUTRAL.into(),
+                        "Copy Branch Name to Clipboard",
+                        String::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .on_click(cx.listener({
+                        let branch = branch.clone();
+                        move |this, _event: &ClickEvent, _window, cx| {
+                            this.copy_graph_text(branch.clone(), cx);
+                        }
+                    })),
+                )
+                .child(
+                    div()
+                        .px(px(11.0))
+                        .pt(px(4.0))
+                        .font(font(theme::font::SANS))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::GHOSTER)
+                        .child(
+                            "check out, merge, rebase, push and delete all run in the focused \
                              worktree, never the main checkout",
                         ),
                 ),
@@ -2443,7 +2882,7 @@ impl AdeApp {
                             .overflow_y_scroll()
                             .track_scroll(&self.graph_state.branches_scroll_handle)
                             .children(branches.into_iter().map(|(name, kind, is_head, lane)| {
-                                render_graph_branch_row(name, kind, is_head, lane)
+                                render_graph_branch_row(name, kind, is_head, lane, cx)
                             })),
                     )
                     // GitHub issue #142.
@@ -2663,11 +3102,21 @@ fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoEle
         .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
 }
 
+/// One Branches-panel row (design spec §5): a lane-coloured dot, the branch name, and a `HEAD`
+/// badge when it is the checked-out one.
+///
+/// Right-clicking it opens the branch context menu (GitHub issue #241), mirroring
+/// `AdeApp::render_graph_row`'s own right-click handler exactly: `cx.stop_propagation()` so the
+/// click reaches no ancestor handler, and the anchor resolved once from the real
+/// `event.position`. The menu itself is a single window-level overlay
+/// ([`AdeApp::render_graph_branch_menu`]) keyed by branch name, not a per-row child - a per-row
+/// popover would be clipped by the panel's own scroll container and would repaint with the row.
 fn render_graph_branch_row(
     name: String,
     kind: RefKind,
     is_head: bool,
     lane: usize,
+    cx: &mut Context<AdeApp>,
 ) -> impl IntoElement {
     let dot_color: gpui::Rgba = if matches!(kind, RefKind::LocalBranch) {
         lane_color(lane)
@@ -2676,6 +3125,35 @@ fn render_graph_branch_row(
     };
     div()
         .id(format!("graph-branch-row-{name}"))
+        .debug_selector({
+            let name = name.clone();
+            move || format!("graph-branch-row-{name}")
+        })
+        // Gated on the row really being a *local* branch, the same way the commit row's own
+        // right-click is gated on not being the synthetic working-tree row: every action this
+        // menu offers (checkout, rename, delete, merge, rebase, push) is a local-branch
+        // operation. The panel only ever lists local branches today
+        // (`Self::render_graph_branches_panel` filters on `RefKind::LocalBranch`), so this is a
+        // guard against that changing, not a live case - a remote branch row would silently get
+        // a menu of operations that make no sense for it.
+        .when(matches!(kind, RefKind::LocalBranch), |el| {
+            el.on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener({
+                    let name = name.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_graph_branch_menu_at(
+                            name.clone(),
+                            event.position.x,
+                            event.position.y,
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
+        })
         .flex()
         .items_center()
         .gap(px(8.0))
@@ -6566,6 +7044,31 @@ mod graph_remote_action_tests {
         );
     }
 
+    /// Opens the graph tab and resolves `sha`'s own loaded row index - exactly what a real click
+    /// on that row's "Rebase onto this commit" entry hands `AdeApp::enter_rebase_mode`, so these
+    /// tests drive the same entry point the row menu does rather than a test-only shortcut.
+    fn graph_row_index_of(
+        app: &Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        sha: &str,
+    ) -> usize {
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| match &app.graph_state.load {
+            crate::graph_view::GraphLoadState::Loaded(graph) => graph
+                .rows
+                .iter()
+                .position(|row| row.commit.id == sha)
+                .unwrap_or_else(|| panic!("commit {sha} must be a real loaded graph row")),
+            other => panic!("the graph must be loaded to click a row, got {other:?}"),
+        })
+    }
+
+    /// GitHub issue #241 folded the row menu's two rebase entries into one: "Rebase onto this
+    /// commit" now opens the Planning banner, whose own `Start rebase` runs the replay. The
+    /// replay itself is what this proves - the same history a plain `git rebase <onto>` produces.
     #[gpui::test]
     async fn rebase_onto_really_replays_the_branch_and_reports_success(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
@@ -6576,8 +7079,13 @@ mod graph_remote_action_tests {
         git(local.path(), &["checkout", "main"]);
         commit(local.path(), "c.txt", "own content", "own work");
 
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(target_sha, cx);
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
         });
         cx.run_until_parked();
 
@@ -6587,16 +7095,25 @@ mod graph_remote_action_tests {
             "the real click must have run a real git rebase replaying this worktree's own \
              commit on top of the target branch's tip"
         );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("Rebase".to_string()),
-            "a successful rebase must report real success, not the old 'not implemented yet' \
-             stub text"
+        // A real `Completed` outcome leaves rebase mode entirely - there is deliberately no
+        // leftover mode or banner to dismiss after a clean rebase.
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
+            "a cleanly completed rebase must leave no rebase mode behind"
+        );
+        assert!(
+            !local.path().join(".git/rebase-merge").exists(),
+            "a cleanly completed rebase must leave no in-progress rebase state on disk"
         );
     }
 
+    /// GitHub issue #241's real fix for this action, and the reason it moved onto the engine at
+    /// all: rebasing onto a commit used to report `Rebase failed: …` and stop there, leaving
+    /// `.git/rebase-merge/` on disk with **nothing in this app able to continue, skip or abort
+    /// it**. It now stops in [`RebasePhase::Stopped`], whose banner carries real
+    /// `Continue`/`Skip`/`Abort` and `Resolve in the diff view`.
     #[gpui::test]
-    async fn rebase_onto_a_real_conflict_surfaces_as_a_real_status_message_not_a_crash(
+    async fn rebase_onto_a_real_conflict_stops_in_the_recoverable_rebase_mode_not_a_dead_end(
         cx: &mut TestAppContext,
     ) {
         let (local, app, cx) = open_seeded_local_repo(cx);
@@ -6606,19 +7123,117 @@ mod graph_remote_action_tests {
         git(local.path(), &["checkout", "main"]);
         commit(local.path(), "a.txt", "conflicting own change", "own work");
 
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
         app.update_in(cx, |app, _window, cx| {
-            app.request_graph_rebase_onto(target_sha, cx);
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
         });
         cx.run_until_parked();
 
-        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
-        assert!(
-            status
-                .as_deref()
-                .is_some_and(|text| text.starts_with("Rebase failed:")),
-            "a real conflicting rebase must surface as a real, visible failure message, not a \
-             silent success or a panic - got {status:?}"
+        let conflicted_files = app.read_with(cx, |app, _| {
+            match app.graph_state.rebase.as_ref().map(|rs| &rs.phase) {
+                Some(crate::graph_view::rebase::RebasePhase::Stopped {
+                    outcome:
+                        wt_core::rebase::RebaseOutcome::StoppedForConflict {
+                            conflicted_files, ..
+                        },
+                }) => Some(conflicted_files.clone()),
+                other => panic!(
+                    "a real conflicting rebase must stop in the recoverable rebase mode with a \
+                     real StoppedForConflict outcome - got {other:?}"
+                ),
+            }
+        });
+        assert_eq!(
+            conflicted_files,
+            Some(vec![std::path::PathBuf::from("a.txt")]),
+            "the stop must name the real conflicted file, so `Resolve in the diff view` has \
+             something real to open"
         );
+        assert!(
+            local.path().join(".git/rebase-merge").exists(),
+            "the worktree must genuinely still be mid-rebase - the recovery banner is what makes \
+             that state actionable rather than a dead end"
+        );
+
+        // And the recovery really works: the banner's own `Abort` restores the branch.
+        app.update_in(cx, |app, _window, cx| {
+            app.abort_rebase(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !local.path().join(".git/rebase-merge").exists(),
+            "aborting from the stopped banner must genuinely end the in-progress rebase"
+        );
+        assert_eq!(
+            git_output(local.path(), &["log", "--format=%s"]),
+            "own work\nbase",
+            "an abort must restore the branch exactly as it was before the rebase started"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
+            "aborting must leave rebase mode"
+        );
+    }
+
+    /// Entering rebase mode must never start a second one over a live one - the first one's
+    /// banner is the only surface that can recover it. The row menu itself is unreachable while
+    /// rebase mode is showing, so this covers `enter_rebase_mode_inner`'s own backstop guard.
+    #[gpui::test]
+    async fn rebase_onto_refuses_while_a_rebase_mode_is_already_live(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "target-branch"]);
+        commit(local.path(), "a.txt", "target change", "target advances");
+        let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+        commit(local.path(), "a.txt", "conflicting own change", "own work");
+        let other_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+
+        // Both row indices resolved up front, off the same loaded graph - the stopped rebase
+        // below can genuinely reload and renumber rows underneath them.
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
+        let other_row = graph_row_index_of(&app, cx, &other_sha);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+        let onto_before = app.read_with(cx, |app, _| {
+            app.graph_state
+                .rebase
+                .as_ref()
+                .map(|rs| rs.onto.clone())
+                .expect("stopped rebase mode is live")
+        });
+
+        // A second entry on a different commit while the first is still stopped.
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(other_row, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .rebase
+                .as_ref()
+                .map(|rs| rs.onto.clone())),
+            Some(onto_before),
+            "the live rebase mode must be left exactly as it was, never replaced by a second one"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.abort_rebase(cx);
+        });
+        cx.run_until_parked();
+        assert!(!local.path().join(".git/rebase-merge").exists());
     }
 
     // GitHub issue #241: "Check out" / "Create branch here" / Soft-Mixed-Hard reset.
@@ -6710,9 +7325,9 @@ mod graph_remote_action_tests {
                 window,
                 cx,
             );
-            app.graph_state.create_branch_name =
+            app.graph_state.branch_prompt_name =
                 crate::text_history::TextField::seeded("feature-x");
-            app.commit_graph_create_branch(window, cx);
+            app.commit_graph_branch_prompt(window, cx);
         });
         cx.run_until_parked();
 
@@ -6733,15 +7348,13 @@ mod graph_remote_action_tests {
              yet' stub text"
         );
         assert!(
-            app.read_with(cx, |app, _| app.graph_state.create_branch_prompt.is_none()),
+            app.read_with(cx, |app, _| app.graph_state.branch_prompt.is_none()),
             "the prompt must close once the branch has really been created"
         );
     }
 
     #[gpui::test]
-    async fn create_branch_prompt_rejects_an_empty_name_without_touching_git(
-        cx: &mut TestAppContext,
-    ) {
+    async fn branch_prompt_rejects_an_empty_name_without_touching_git(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
         let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
 
@@ -6755,14 +7368,14 @@ mod graph_remote_action_tests {
             );
             // The field starts genuinely empty - commit without typing anything, the same real
             // "just hit enter" case a hand-rolled empty-name guard exists for.
-            app.commit_graph_create_branch(window, cx);
+            app.commit_graph_branch_prompt(window, cx);
         });
         cx.run_until_parked();
 
         assert_eq!(
             app.read_with(cx, |app, _| app
                 .graph_state
-                .create_branch_prompt
+                .branch_prompt
                 .as_ref()
                 .and_then(|prompt| prompt.error.clone())),
             Some("branch name can't be empty".to_string()),
@@ -6794,9 +7407,9 @@ mod graph_remote_action_tests {
                 window,
                 cx,
             );
-            app.graph_state.create_branch_name =
+            app.graph_state.branch_prompt_name =
                 crate::text_history::TextField::seeded("existing-branch");
-            app.commit_graph_create_branch(window, cx);
+            app.commit_graph_branch_prompt(window, cx);
         });
         cx.run_until_parked();
 
@@ -7456,5 +8069,1472 @@ mod graph_virtualization_tests {
             modifiers: gpui::Modifiers::default(),
             touch_phase: gpui::TouchPhase::Moved,
         });
+    }
+}
+
+/// GitHub issue #241: the Branches panel's own branch right-click context menu, driven through
+/// **real** simulated mouse events (`cx.simulate_event`) against real painted rows rather than by
+/// calling the open/close methods directly - the same discipline `graph_row_menu_tests` above
+/// established, and for the same reason: the scrim/popover/row interactions are exactly where
+/// this class of menu has historically gone wrong (a right-click on the popover falling through
+/// to the row underneath, a dismiss click also re-triggering what it landed on).
+#[cfg(test)]
+mod graph_branch_menu_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::{Entity, Pixels, TestAppContext};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A real repository with three real local branches - `main` (checked out), `feature-a` and
+    /// `feature-b` - all reachable from the default `GraphScope::All` walk, so all three really
+    /// appear as rows in the Branches panel.
+    fn seed_three_branches(dir: &std::path::Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "first"]);
+        git(dir, &["checkout", "-b", "feature-a"]);
+        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
+        git(dir, &["commit", "-am", "feature a work"]);
+        git(dir, &["checkout", "main"]);
+        git(dir, &["checkout", "-b", "feature-b"]);
+        std::fs::write(dir.join("b.txt"), "1\n").expect("write b.txt");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "feature b work"]);
+        git(dir, &["checkout", "main"]);
+    }
+
+    /// Opens the graph tab with the Branches panel showing - the real surface these rows live on.
+    fn open_seeded_branches_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_three_branches(repo.path());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        });
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    fn right_click(cx: &mut gpui::VisualTestContext, position: gpui::Point<Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_branch_row_opens_its_menu_for_that_branch(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("feature-a's branch row must really be painted in the Branches panel");
+        right_click(cx, row.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app
+                .graph_state
+                .branch_menu_open
+                .clone()
+                .expect("a real right-click on a branch row must open its menu");
+            assert_eq!(
+                menu.branch, "feature-a",
+                "the menu must name the branch under the cursor, not some other row's"
+            );
+        });
+        let painted = cx
+            .debug_bounds("graph-branch-menu-popover")
+            .expect("and the popover must genuinely paint");
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.branch_menu_open.clone().expect("menu");
+            assert_eq!(
+                (painted.origin.x, painted.origin.y),
+                (menu.origin_x, menu.origin_y),
+                "the popover must paint at exactly the position captured when it opened"
+            );
+        });
+    }
+
+    /// The Branches panel sits hard against the window's right edge, so *every* branch row's
+    /// right-click would open a popover running off-screen without the same
+    /// `clamp_menu_origin` the row menu uses. That makes this the one menu in the app where the
+    /// clamp is not an edge case at all.
+    #[gpui::test]
+    fn the_branch_menu_is_clamped_fully_inside_the_window(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+
+        let painted = cx
+            .debug_bounds("graph-branch-menu-popover")
+            .expect("popover painted");
+        let viewport = cx.update(|window, _cx| window.bounds().size);
+        assert!(
+            painted.origin.x >= px(0.0) && painted.origin.x + painted.size.width <= viewport.width,
+            "the popover must be clamped inside the window horizontally: painted {painted:?} in \
+             {viewport:?}"
+        );
+        assert!(
+            painted.origin.y >= px(0.0)
+                && painted.origin.y + painted.size.height <= viewport.height,
+            "the popover must be clamped inside the window vertically: painted {painted:?} in \
+             {viewport:?}"
+        );
+        assert!(
+            row.center().x > painted.origin.x,
+            "premise: the click really was far enough right that an unclamped popover would have \
+             run off the edge"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(app.graph_state.branch_menu_open.is_some());
+        });
+    }
+
+    /// `theme::graph::BRANCH_MENU_HEIGHT` is a hand-measured constant the edge clamp above relies
+    /// on - see [`theme::graph::ROW_MENU_HEIGHT`]'s own docs for why it can't be a formula, and
+    /// what to do when this fails (re-measure, don't guess).
+    #[gpui::test]
+    fn the_branch_menu_pins_the_real_height_this_edge_clamp_relies_on(cx: &mut TestAppContext) {
+        let (_repo, _app, cx) = open_seeded_branches_panel(cx);
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        let painted = cx
+            .debug_bounds("graph-branch-menu-popover")
+            .expect("the popover must genuinely paint");
+
+        assert_eq!(
+            (painted.size.width, painted.size.height),
+            (
+                theme::graph::BRANCH_MENU_WIDTH,
+                theme::graph::BRANCH_MENU_HEIGHT
+            ),
+            "the real painted size must match the constants the edge clamp uses - re-measure and \
+             update BRANCH_MENU_HEIGHT if this menu's content genuinely changed"
+        );
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_different_branch_row_retargets_the_open_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row_b = cx
+            .debug_bounds("graph-branch-row-feature-b")
+            .expect("feature-b row painted");
+        right_click(cx, row_b.center());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .branch_menu_open
+                    .as_ref()
+                    .map(|menu| menu.branch.clone()),
+                Some("feature-b".to_string()),
+                "premise: feature-b's menu really is open first"
+            );
+        });
+
+        // `feature-a` sorts above `feature-b`, so its row sits above the open popover rather than
+        // underneath it - the "different, unobscured row" case (a right-click *through* the
+        // popover is a separate, deliberately different scenario, covered below).
+        let row_a = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("feature-a row painted");
+        assert!(
+            row_a.center().y < row_b.center().y,
+            "premise: feature-a's row sits above feature-b's, so feature-b's downward-opening \
+             popover cannot cover it"
+        );
+        right_click(cx, row_a.center());
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .branch_menu_open
+                    .as_ref()
+                    .map(|menu| menu.branch.clone()),
+                Some("feature-a".to_string()),
+                "the newly right-clicked branch must win - not still the stale one"
+            );
+        });
+    }
+
+    /// The exact adversarial-audit-found bug the popover's own `.occlude()` exists for, ported to
+    /// this menu: the popover paints *over* the branch list, so without it a right-click on the
+    /// panel itself retargeted the menu to whichever branch row happened to be underneath.
+    #[gpui::test]
+    fn right_clicking_inside_the_open_branch_popover_does_not_retarget_to_the_row_underneath(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row_a = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("feature-a row painted");
+        right_click(cx, row_a.center());
+        let popover = cx
+            .debug_bounds("graph-branch-menu-popover")
+            .expect("popover painted");
+
+        // A point genuinely inside the popover, and genuinely over a *different* branch row.
+        let row_b = cx
+            .debug_bounds("graph-branch-row-feature-b")
+            .expect("feature-b row painted");
+        // Inside both boxes: a few pixels into feature-b's own row, which the popover's painted
+        // width really does cover at that point. (The popover's *centre* sits left of the panel
+        // entirely, so centring on it would test nothing - the click would have missed the row
+        // even without `.occlude()`.)
+        let inside = gpui::Point {
+            x: row_b.origin.x + px(4.0),
+            y: row_b.center().y,
+        };
+        assert!(
+            inside.y > popover.origin.y
+                && inside.y < popover.origin.y + popover.size.height
+                && inside.x > popover.origin.x
+                && inside.x < popover.origin.x + popover.size.width,
+            "premise: the point must really be inside the popover's own painted bounds: point \
+             {inside:?} vs popover {popover:?}"
+        );
+        assert!(
+            inside.x >= row_b.origin.x
+                && inside.x <= row_b.origin.x + row_b.size.width
+                && inside.y >= row_b.origin.y
+                && inside.y <= row_b.origin.y + row_b.size.height,
+            "premise: and genuinely over feature-b's own row, so without `.occlude()` it really \
+             would have fallen through to it: point {inside:?} vs row {row_b:?}"
+        );
+        right_click(cx, inside);
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .branch_menu_open
+                    .as_ref()
+                    .map(|menu| menu.branch.clone()),
+                Some("feature-a".to_string()),
+                "a right-click on the popover itself must never fall through and retarget the \
+                 menu to the row painted underneath it"
+            );
+        });
+    }
+
+    /// GitHub issue #176's shared one-menu-at-a-time invariant, at this menu's own real trigger.
+    #[gpui::test]
+    fn opening_the_branch_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+        app.update_in(cx, |app, window, cx| {
+            app.open_graph_row_menu_at(0, px(20.0), px(120.0), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.row_menu_open.is_some()),
+            "premise: the row menu really is open first"
+        );
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "opening the branch menu must close the row menu - two popovers at once is the \
+                 reported bug"
+            );
+            assert!(app.graph_state.branch_menu_open.is_some());
+        });
+    }
+
+    /// The mirror direction: the row menu's own opener sweeps this one closed too, which is what
+    /// registering `MenuSurface::GraphBranch` buys.
+    #[gpui::test]
+    fn opening_the_row_menu_closes_an_open_branch_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.branch_menu_open.is_some()),
+            "premise: the branch menu really is open first"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_graph_row_menu_at(0, px(20.0), px(120.0), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.branch_menu_open.is_none(),
+                "opening the row menu must close the branch menu"
+            );
+            assert!(app.graph_state.row_menu_open.is_some());
+        });
+    }
+
+    /// A left-click anywhere off the popover dismisses it, and - the second
+    /// adversarial-audit-found fix this menu inherits - that same click must not also reach
+    /// whatever it landed on and re-open something.
+    #[gpui::test]
+    fn a_left_click_away_dismisses_the_branch_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.branch_menu_open.is_some()),
+            "premise: the menu really is open"
+        );
+
+        cx.simulate_click(
+            gpui::Point {
+                x: px(30.0),
+                y: px(400.0),
+            },
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.branch_menu_open.is_none(),
+                "a real click away must dismiss the branch menu"
+            );
+        });
+    }
+
+    /// The menu's rows are really wired to the real actions - driven by a genuine click on the
+    /// painted row rather than by calling the handler, so this covers the row → handler → git
+    /// path the user actually takes.
+    #[gpui::test]
+    fn clicking_the_checkout_row_really_checks_that_branch_out(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "premise: the worktree starts on main"
+        );
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        let checkout_row = cx
+            .debug_bounds("dropdown-menu-row-Checkout Branch")
+            .expect("the menu's Checkout row must really paint");
+        cx.simulate_click(checkout_row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feature-a",
+            "a real click on the real menu row must have run a real git checkout"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.branch_menu_open.is_none(),
+                "acting on a row dismisses the menu"
+            );
+        });
+    }
+
+    /// The Rename row through its whole real path: a real click opens the shared branch-name
+    /// prompt, real keystrokes edit it, and a real Enter runs the real `git branch -m` - so the
+    /// prompt's own key handler and focus wiring are covered for the rename kind too, not just
+    /// for the create kind it was originally built for.
+    #[gpui::test]
+    fn renaming_through_the_real_prompt_keystrokes_really_renames_the_branch(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        let rename_row = cx
+            .debug_bounds("dropdown-menu-row-Rename Branch\u{2026}")
+            .expect("the menu's Rename row must really paint");
+        cx.simulate_click(rename_row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.branch_prompt_name.as_str(),
+                "feature-a",
+                "the prompt must open pre-filled with the branch's real current name"
+            );
+        });
+        assert!(
+            cx.debug_bounds("graph-branch-prompt-subtitle").is_some(),
+            "the shared prompt's subtitle line must really paint for the rename kind too - it is \
+             where the branch being renamed is named"
+        );
+
+        cx.simulate_input("2");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let branches = git_output(repo.path(), &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.lines().any(|line| line == "feature-a2"),
+            "real keystrokes plus a real Enter must have run a real git branch -m: {branches:?}"
+        );
+        assert!(
+            !branches.lines().any(|line| line == "feature-a"),
+            "and the old name must genuinely be gone: {branches:?}"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.branch_prompt.is_none(),
+                "the prompt must close once Enter really dispatched the rename"
+            );
+        });
+    }
+
+    /// Every remaining row, driven by a real click on the real painted row - so each label is
+    /// pinned to the action actually behind it. Without this, a row wired to the wrong handler (or
+    /// to the right handler with the wrong argument) would still pass every handler-level test,
+    /// because those call the handlers directly.
+    #[gpui::test]
+    fn each_menu_row_is_really_wired_to_its_own_action(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+
+        // Copy Branch Name - the clipboard must get the *branch name*, not a sha or a subject
+        // (the row shares `copy_graph_text` with the commit menu's own Copy rows, so nothing else
+        // pins which string it hands over).
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Copy Branch Name to Clipboard");
+        assert_eq!(
+            cx.update(|_window, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text()),
+            Some("feature-a".to_string()),
+            "the Copy row must copy the branch it was opened for"
+        );
+
+        // Delete Branch - a first click arms *that* branch and deletes nothing.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Delete Branch\u{2026}");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.delete_branch_confirm_armed.clone(),
+                Some("feature-a".to_string()),
+                "the Delete row must arm the branch it was opened for"
+            );
+        });
+        assert!(
+            git_output(repo.path(), &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|line| line == "feature-a"),
+            "and must not have deleted anything on a first click"
+        );
+
+        // Push Branch - no remote is configured in this fixture, so what this pins is that the
+        // row really reaches `push_branch` (its own action name) rather than some other action.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Push Branch\u{2026}");
+        cx.run_until_parked();
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Push branch failed:")),
+            "the Push row must really run a push and report git's own failure for a repository \
+             with no remote - got {status:?}"
+        );
+
+        // Rebase current branch on Branch - enters the shared rebase mode, pinned to that
+        // branch's own real tip commit.
+        let feature_a_tip = git_output(repo.path(), &["rev-parse", "feature-a"]);
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(
+            cx,
+            "dropdown-menu-row-Rebase current branch on Branch\u{2026}",
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .map(|rebase| rebase.onto.clone()),
+                Some(feature_a_tip.clone()),
+                "the Rebase row must enter rebase mode onto the clicked branch's real tip"
+            );
+        });
+        app.update_in(cx, |app, _window, cx| {
+            app.leave_rebase_mode(cx);
+            // `leave_rebase_mode` itself does not notify (its real callers do), and the Branches
+            // list is only painted again once a frame is drawn without the rebase Result panel
+            // over it.
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Merge into current branch - fills the app's one existing merge flow.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.merge_flow.is_some(),
+                "the Merge row must really start the existing merge flow"
+            );
+        });
+    }
+
+    /// Right-clicks the branch row painted under `row_selector` and returns once its menu is
+    /// really open. Takes the selector rather than the branch name because `debug_bounds` needs a
+    /// `&'static str`.
+    fn open_menu_at(cx: &mut gpui::VisualTestContext, row_selector: &'static str) {
+        let row = cx
+            .debug_bounds(row_selector)
+            .unwrap_or_else(|| panic!("{row_selector} must really be painted"));
+        right_click(cx, row.center());
+    }
+
+    /// Clicks the open menu's row painted under `row_selector`, for real.
+    fn click_menu_row(cx: &mut gpui::VisualTestContext, row_selector: &'static str) {
+        let row = cx
+            .debug_bounds(row_selector)
+            .unwrap_or_else(|| panic!("the menu's {row_selector} row must really paint"));
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    /// Why the menu is keyed by branch **name** and not by the branch row's index: the panel's
+    /// list is re-filtered live, so the row a menu was opened over genuinely moves (or vanishes)
+    /// while that menu stays open. An index-keyed menu would then act on whatever branch now sits
+    /// at that index - or on nothing at all.
+    #[gpui::test]
+    fn the_open_menu_keeps_targeting_its_branch_when_the_filtered_list_reorders(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+
+        let row_b = cx
+            .debug_bounds("graph-branch-row-feature-b")
+            .expect("feature-b row painted");
+        right_click(cx, row_b.center());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .branch_menu_open
+                    .as_ref()
+                    .map(|menu| menu.branch.clone()),
+                Some("feature-b".to_string())
+            );
+        });
+
+        // A real filter that leaves feature-b as the *only* row, moving it from the third
+        // position to the first while its own menu is still open.
+        app.update_in(cx, |app, _window, cx| {
+            app.graph_state.branches_filter = crate::text_history::TextField::seeded("b");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("graph-branch-row-feature-a").is_none(),
+            "premise: the filter really did drop the row that used to sit above it"
+        );
+
+        let checkout_row = cx
+            .debug_bounds("dropdown-menu-row-Checkout Branch")
+            .expect("the still-open menu must still paint");
+        cx.simulate_click(checkout_row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feature-b",
+            "the menu must still act on the branch it was opened for, not on whatever branch the \
+             re-filtered list now holds at that position"
+        );
+    }
+
+    /// Switching away from the graph tab and back must never resurrect a stale popover with no
+    /// click at all - the exact gap `leave_graph_tab` documents for the row/push menus, mirrored.
+    #[gpui::test]
+    fn leaving_the_graph_tab_dismisses_the_branch_menu(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_branches_panel(cx);
+        let row = cx
+            .debug_bounds("graph-branch-row-feature-a")
+            .expect("branch row painted");
+        right_click(cx, row.center());
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature-a".to_string(), cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .is_some()),
+            "premise: the Delete confirmation really is armed"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.leave_graph_tab(window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.graph_state.branch_menu_open.is_none(),
+                "leaving the tab must dismiss the branch menu"
+            );
+            assert!(
+                app.graph_state.delete_branch_confirm_armed.is_none(),
+                "and must never leave a branch armed for a one-click delete on the way back"
+            );
+        });
+    }
+}
+
+/// GitHub issue #241: what each of the branch context menu's seven actions really does, end to
+/// end, against a real git repository through a real `AdeApp` - the same "prove the real git
+/// effect, not just the state field" discipline `graph_remote_action_tests` above applies to the
+/// toolbar and row-menu actions.
+#[cfg(test)]
+mod graph_branch_action_tests {
+    use crate::merge::state as merge;
+    use crate::root::focus::palette_focus_tests;
+    use crate::root::AdeApp;
+    use crate::text_history::TextField;
+    use crate::work_surface::agents::ProcessKind;
+    use gpui::{Entity, TestAppContext};
+    use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(file), contents).expect("write file");
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-m", message]);
+    }
+
+    fn branches(dir: &Path) -> Vec<String> {
+        git_output(dir, &["branch", "--format=%(refname:short)"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn current_branch(dir: &Path) -> String {
+        git_output(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+    }
+
+    /// `MergeFlowState` is deliberately not `Debug` (it carries whole parsed file contents), so
+    /// an unexpected variant is reported by name rather than by dumping it.
+    fn merge_state_name(state: &merge::MergeFlowState) -> String {
+        match state {
+            merge::MergeFlowState::Running => "Running".to_string(),
+            merge::MergeFlowState::AlreadyUpToDate { .. } => "AlreadyUpToDate".to_string(),
+            merge::MergeFlowState::Clean { .. } => "Clean".to_string(),
+            merge::MergeFlowState::Conflicted { .. } => "Conflicted".to_string(),
+            // The real error text matters far more than the variant name here.
+            merge::MergeFlowState::Error { message, .. } => format!("Error({message})"),
+        }
+    }
+
+    /// A real local repo on `main`, with a real `feature` branch that is checked out nowhere -
+    /// the real shape a branch row in the panel has.
+    fn open_seeded_with_feature_branch(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let local = tempfile::tempdir().expect("tempdir");
+        git(local.path(), &["init", "-b", "main"]);
+        git(local.path(), &["config", "user.email", "test@example.com"]);
+        git(local.path(), &["config", "user.name", "Test User"]);
+        commit(local.path(), "a.txt", "base", "base");
+        git(local.path(), &["checkout", "-b", "feature"]);
+        commit(local.path(), "b.txt", "feature", "feature work");
+        git(local.path(), &["checkout", "main"]);
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        (local, app, cx)
+    }
+
+    #[gpui::test]
+    async fn checkout_branch_really_switches_the_worktree_onto_that_branch(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        assert_eq!(
+            current_branch(local.path()),
+            "main",
+            "premise: the worktree starts on main"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_branch_checkout("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            current_branch(local.path()),
+            "feature",
+            "the real click must have run a real git checkout landing on the branch itself, not \
+             a detached HEAD"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Check out".to_string()),
+            "a successful checkout must report real success"
+        );
+    }
+
+    #[gpui::test]
+    async fn rename_branch_prefills_the_current_name_and_really_renames_the_ref(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_graph_rename_branch("feature".to_string(), window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state.branch_prompt_name.as_str(),
+                "feature",
+                "a rename must start from the branch's real current name, not an empty box"
+            );
+            assert!(
+                matches!(
+                    app.graph_state.branch_prompt.as_ref().map(|p| &p.kind),
+                    Some(crate::graph_view::state::GraphBranchPromptKind::Rename { old_name })
+                        if old_name == "feature"
+                ),
+                "the prompt must be open in rename mode for the branch that was clicked"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.graph_state.branch_prompt_name = TextField::seeded("renamed-feature");
+            app.commit_graph_branch_prompt(window, cx);
+        });
+        cx.run_until_parked();
+
+        let branches = branches(local.path());
+        assert!(
+            branches.iter().any(|b| b == "renamed-feature"),
+            "the real Enter must have run a real git branch -m: {branches:?}"
+        );
+        assert!(
+            !branches.iter().any(|b| b == "feature"),
+            "and the old name must genuinely be gone: {branches:?}"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Rename branch".to_string())
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.branch_prompt.is_none()),
+            "the prompt must close once the rename is really dispatched"
+        );
+    }
+
+    #[gpui::test]
+    async fn rename_onto_a_name_that_already_exists_surfaces_gits_own_real_error(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        git(local.path(), &["branch", "taken"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_rename_branch("feature".to_string(), "taken".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Rename branch failed:")
+                    && text.contains("already exists")),
+            "a real collision must surface git's own real refusal, not a hand-rolled \
+             pre-validation - got {status:?}"
+        );
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "the refused rename must have left the branch exactly where it was"
+        );
+    }
+
+    #[gpui::test]
+    async fn rename_prompt_rejects_an_empty_name_without_touching_git(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_graph_rename_branch("feature".to_string(), window, cx);
+            app.graph_state.branch_prompt_name = TextField::seeded("   ");
+            app.commit_graph_branch_prompt(window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let prompt = app
+                .graph_state
+                .branch_prompt
+                .as_ref()
+                .expect("an empty name must keep the prompt open, not close it");
+            assert_eq!(
+                prompt.error.as_deref(),
+                Some("branch name can't be empty"),
+                "and must say why"
+            );
+            assert_eq!(
+                app.graph_state.status_message, None,
+                "nothing must have been dispatched to git at all"
+            );
+        });
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "the branch must be untouched"
+        );
+    }
+
+    #[gpui::test]
+    async fn delete_branch_needs_a_real_second_click_on_the_same_branch(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        // Merge `feature` into `main` first, so `git branch -d`'s own safety rule is satisfied
+        // and what this test measures is the *confirmation*, not git's refusal.
+        git(
+            local.path(),
+            &["merge", "--no-ff", "feature", "-m", "merge feature"],
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "the first click must only arm the confirmation, never delete anything"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .clone()),
+            Some("feature".to_string()),
+            "the first click must arm exactly the branch that was clicked"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !branches(local.path()).iter().any(|b| b == "feature"),
+            "the second click on the same branch must really run git branch -d"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .clone()),
+            None,
+            "the confirmation must disarm once the real delete has actually run"
+        );
+    }
+
+    /// The confirmation is keyed by branch name for exactly this reason: one branch's armed
+    /// confirmation must never authorize a *different* branch's delete.
+    #[gpui::test]
+    async fn arming_delete_on_one_branch_never_deletes_another(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        git(local.path(), &["branch", "other"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("other".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let branches = branches(local.path());
+        assert!(
+            branches.iter().any(|b| b == "other"),
+            "the click on a different branch must only arm it, never delete it on the strength \
+             of the first branch's confirmation: {branches:?}"
+        );
+        assert!(
+            branches.iter().any(|b| b == "feature"),
+            "and the originally-armed branch must be untouched too: {branches:?}"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .clone()),
+            Some("other".to_string()),
+            "the newly-clicked branch is what ends up armed"
+        );
+    }
+
+    /// An adversarial audit's finding: a Delete click that lands while some other graph operation
+    /// is still in flight must not arm a confirmation at all. Before the guard moved to the top of
+    /// `request_graph_delete_branch`, that click armed silently (`run_graph_remote_op`'s own
+    /// single-flight check sits at the far end, well past the arming), so the *next* click - the
+    /// first one the user makes after the lane clears, and to them a first click - ran a real
+    /// delete with no confirmation of its own.
+    #[gpui::test]
+    async fn a_delete_click_while_another_op_is_in_flight_arms_nothing(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        git(
+            local.path(),
+            &["merge", "--no-ff", "feature", "-m", "merge feature"],
+        );
+
+        // A real, genuinely in-flight graph operation: `run_graph_remote_op` sets the flag
+        // synchronously and only clears it when its background task lands, which is deliberately
+        // not given a chance to run before the click below.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_fetch(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.remote_op_in_flight),
+            "premise: an unrelated graph operation really is in flight"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+
+        // Read *before* letting the fetch finish: this is the exact moment the old ordering armed
+        // a confirmation the app had no intention of honouring.
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .graph_state
+                .delete_branch_confirm_armed
+                .clone()),
+            None,
+            "a click the app cannot act on must arm nothing at all"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Fetch\u{2026}".to_string()),
+            "and must not overwrite the in-flight operation's own status line with a \
+             confirmation prompt it will not honour"
+        );
+        cx.run_until_parked();
+
+        // The user's next click is, to them, a first click - so it must arm, not delete.
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "the first click after the lane clears must only arm - deleting here is the real bug: \
+             it takes one visible click instead of two"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_delete_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !branches(local.path()).iter().any(|b| b == "feature"),
+            "and the real second click still deletes"
+        );
+    }
+
+    #[gpui::test]
+    async fn deleting_an_unmerged_branch_surfaces_gits_own_real_refusal(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+
+        // Two real clicks, past the confirmation - the refusal under test is git's, not the UI's.
+        for _ in 0..2 {
+            app.update_in(cx, |app, _window, cx| {
+                app.request_graph_delete_branch("feature".to_string(), cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Delete branch failed:")
+                    && text.contains("not fully merged")),
+            "the safe delete's real refusal must reach the user verbatim - got {status:?}"
+        );
+        assert!(
+            branches(local.path()).iter().any(|b| b == "feature"),
+            "and the branch (with its unmerged commits) must still be there"
+        );
+    }
+
+    #[gpui::test]
+    async fn push_branch_really_pushes_that_branch_not_the_checked_out_one(
+        cx: &mut TestAppContext,
+    ) {
+        let remote = tempfile::tempdir().expect("tempdir");
+        git(remote.path(), &["init", "--bare", "-b", "main"]);
+        let local = tempfile::tempdir().expect("tempdir");
+        git(
+            local.path(),
+            &["clone", remote.path().to_str().expect("utf8"), "."],
+        );
+        git(local.path(), &["config", "user.email", "test@example.com"]);
+        git(local.path(), &["config", "user.name", "Test User"]);
+        commit(local.path(), "a.txt", "base", "base");
+        git(local.path(), &["push", "origin", "main"]);
+        git(local.path(), &["checkout", "-b", "feature"]);
+        commit(local.path(), "b.txt", "feature", "feature work");
+        git(local.path(), &["checkout", "main"]);
+        // A commit on `main` that must *not* be pushed - proof the push really targeted the
+        // named branch rather than whatever is checked out.
+        commit(local.path(), "c.txt", "main only", "main only work");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        app.update_in(cx, |app, _window, cx| {
+            app.request_graph_push_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(remote.path(), &["log", "-1", "--format=%s", "feature"]),
+            "feature work",
+            "the named branch must really exist on the real remote now"
+        );
+        assert_eq!(
+            git_output(remote.path(), &["log", "-1", "--format=%s", "main"]),
+            "base",
+            "and the checked-out branch's own newer commit must not have been pushed with it"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            Some("Push branch".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn copy_branch_name_really_writes_the_branch_name_to_the_clipboard(
+        cx: &mut TestAppContext,
+    ) {
+        let (_local, app, cx) = open_seeded_with_feature_branch(cx);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.copy_graph_text("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let clipboard = cx.update(|_window, cx| cx.read_from_clipboard());
+        assert_eq!(
+            clipboard.and_then(|item| item.text()),
+            Some("feature".to_string()),
+            "the real click must have written the real branch name to the real clipboard"
+        );
+    }
+
+    #[gpui::test]
+    async fn rebase_on_branch_resolves_its_real_tip_and_enters_the_shared_rebase_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        // `main` has its own commit that `feature` doesn't - so there is something real to replay.
+        commit(local.path(), "c.txt", "own", "own work");
+        let feature_tip = git_output(local.path(), &["rev-parse", "feature"]);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode_onto_branch("feature".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase = app
+                .graph_state
+                .rebase
+                .as_ref()
+                .expect("the branch's own menu row must enter the shared rebase mode");
+            assert_eq!(
+                rebase.onto, feature_tip,
+                "the mode must be pinned to the branch's real tip commit, not its moving name"
+            );
+            assert!(
+                feature_tip.starts_with(&rebase.onto_short),
+                "and the banner's short form must be git's own abbreviation of that same commit: \
+                 {:?}",
+                rebase.onto_short
+            );
+        });
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            git_output(local.path(), &["log", "--format=%s"]),
+            "own work\nfeature work\nbase",
+            "and the real replay must land this worktree's own commit on top of that branch"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
+            "a cleanly completed rebase must leave no rebase mode behind"
+        );
+    }
+
+    #[gpui::test]
+    async fn rebase_on_a_branch_that_no_longer_exists_reports_gits_own_error_and_enters_no_mode(
+        cx: &mut TestAppContext,
+    ) {
+        let (_local, app, cx) = open_seeded_with_feature_branch(cx);
+
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode_onto_branch("no-such-branch".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Rebase onto no-such-branch failed:")),
+            "an unresolvable branch must report a real failure - got {status:?}"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
+            "and must enter no rebase mode at all"
+        );
+    }
+
+    #[gpui::test]
+    async fn merge_into_current_branch_lands_in_the_existing_merge_flow(cx: &mut TestAppContext) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        // The worktree's own agent tab - the surface the existing resolver renders inside. A test
+        // app already opens one for the focused repo, which is exactly the real situation this
+        // action expects to find.
+        let agent_id = app.read_with(cx, |app, _| {
+            app.agents
+                .iter_for_cwd(local.path().to_path_buf())
+                .map(|agent| agent.id)
+                .next()
+                .expect("the test app opens a real agent in the focused worktree")
+        });
+        // A second agent, in a genuinely different directory, left *active* - so the
+        // "activate the worktree's own agent tab first" assertion below has something real to
+        // measure. Without this the worktree's only agent is already active and the assertion
+        // would hold with `select_agent` deleted entirely.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let other_agent = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                elsewhere.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(other_agent, window, cx);
+        });
+        cx.run_until_parked();
+        assert_ne!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(agent_id),
+            "premise: a different agent really is the active tab before the merge starts"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("the merge must land in the app's one existing merge flow");
+            assert_eq!(
+                flow.agent_id, agent_id,
+                "and must be shown in the focused worktree's own agent tab"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                Some(agent_id),
+                "that tab must really have been activated first - the resolver renders inside it,                  so a conflict must never land in a surface the user is not looking at"
+            );
+            match &flow.state {
+                merge::MergeFlowState::Clean {
+                    base_branch, files, ..
+                } => {
+                    assert_eq!(
+                        base_branch, "main",
+                        "the branch merged into must be the one really checked out here"
+                    );
+                    assert_eq!(files, &vec![std::path::PathBuf::from("b.txt")]);
+                }
+                other => panic!(
+                    "expected a real clean merge state, got {}",
+                    merge_state_name(other)
+                ),
+            }
+        });
+        assert!(
+            wt_core::merge::merge_head_exists(local.path()).expect("merge_head_exists"),
+            "the real merge must genuinely be in progress and uncommitted, waiting for the \
+             existing resolver's own Complete merge"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+            None,
+            "the graph tab's own \"Merging …\" line must not outlive the merge it described - \
+             the resolver owns the outcome from here"
+        );
+    }
+
+    #[gpui::test]
+    async fn merge_into_current_branch_conflicting_lands_in_the_existing_conflict_resolver(
+        cx: &mut TestAppContext,
+    ) {
+        let local = tempfile::tempdir().expect("tempdir");
+        git(local.path(), &["init", "-b", "main"]);
+        git(local.path(), &["config", "user.email", "test@example.com"]);
+        git(local.path(), &["config", "user.name", "Test User"]);
+        commit(local.path(), "shared.txt", "line1\nline2\nline3\n", "base");
+        git(local.path(), &["checkout", "-b", "feature"]);
+        commit(
+            local.path(),
+            "shared.txt",
+            "line1\nFEATURE\nline3\n",
+            "feature changes shared",
+        );
+        git(local.path(), &["checkout", "main"]);
+        commit(
+            local.path(),
+            "shared.txt",
+            "line1\nMAIN\nline3\n",
+            "main changes shared",
+        );
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                local.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            match &app.merge_flow.as_ref().expect("merge flow").state {
+                merge::MergeFlowState::Conflicted { files, .. } => {
+                    assert_eq!(
+                        files.len(),
+                        1,
+                        "the one really conflicted file must be loaded into the existing \
+                         resolver's own file list"
+                    );
+                    assert_eq!(files[0].relative_path(), std::path::Path::new("shared.txt"));
+                }
+                other => panic!(
+                    "expected a real conflicted merge state, got {}",
+                    merge_state_name(other)
+                ),
+            }
+        });
+        let on_disk =
+            std::fs::read_to_string(local.path().join("shared.txt")).expect("read shared.txt");
+        assert!(
+            on_disk.contains("<<<<<<< HEAD") && on_disk.contains(">>>>>>> feature"),
+            "and the real conflict markers must genuinely be on disk for it to resolve: \
+             {on_disk:?}"
+        );
+    }
+
+    /// The resolver renders inside an agent's work surface, so with no agent tab there is
+    /// genuinely nowhere to show it. Refused honestly, with nothing started - never a merge run
+    /// into a surface the user can't see.
+    #[gpui::test]
+    async fn merge_into_current_branch_refuses_with_no_agent_tab_in_the_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        // Close every agent in the focused worktree, so there is genuinely no surface left to
+        // show the resolver in - the real state this refusal exists for.
+        let existing: Vec<_> = app.read_with(cx, |app, _| {
+            app.agents
+                .iter_for_cwd(local.path().to_path_buf())
+                .map(|agent| agent.id)
+                .collect()
+        });
+        for id in existing {
+            app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
+        }
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.merge_flow.is_none(),
+                "no merge flow must have been started at all"
+            );
+            let status = app.graph_state.status_message.clone();
+            assert!(
+                status
+                    .as_deref()
+                    .is_some_and(|text| text.contains("no agent tab")),
+                "and the refusal must say why, rather than looking like a dead click - got \
+                 {status:?}"
+            );
+        });
+        assert!(
+            !wt_core::merge::merge_head_exists(local.path()).expect("merge_head_exists"),
+            "and no real git merge must have been run"
+        );
+    }
+
+    #[gpui::test]
+    async fn merge_into_current_branch_refuses_while_another_merge_is_in_flight(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_with_feature_branch(cx);
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                local.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+        let generation_after_first = app.read_with(cx, |app, _| {
+            app.merge_flow
+                .as_ref()
+                .map(|flow| flow.generation)
+                .expect("premise: the first merge really is live")
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|text| text.contains("already in progress")),
+            "a second merge while one is live must be refused with a real reason - got {status:?}"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .merge_flow
+                .as_ref()
+                .map(|flow| flow.generation)),
+            Some(generation_after_first),
+            "and must not have started a second attempt over the first - a fresh attempt always \
+             bumps the generation stamp (`MergeFlow::generation`)"
+        );
+        assert!(
+            wt_core::merge::merge_head_exists(local.path()).expect("merge_head_exists"),
+            "the first merge must still be the one in progress"
+        );
     }
 }

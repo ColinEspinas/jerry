@@ -150,10 +150,11 @@ impl AdeApp {
         // lists that each covered a different subset (GitHub issue #176).
         let _ = self.close_menu_surfaces_except(None);
         self.new_file_input = None;
-        // GitHub issue #241: the row menu's "Create branch here" prompt is the same kind of
+        // GitHub issue #241: the graph tab's branch-name prompt (the row menu's "Create branch
+        // here" and the branch menu's "Rename Branch…" share one) is the same kind of
         // focus-owning modal overlay `new_file_input` is (not a `MenuSurface`, for the identical
         // reason documented on that enum), so it needs the same explicit clear here.
-        self.graph_state.create_branch_prompt = None;
+        self.graph_state.branch_prompt = None;
         // Not a `MenuSurface`: a half-typed inline name would keep the tree's `"tree-editing"` key
         // context alive on a node that is no longer rendered (GitHub issue #19). The armed
         // *delete confirmation* is deliberately left alone: it is a real, window-level modal the

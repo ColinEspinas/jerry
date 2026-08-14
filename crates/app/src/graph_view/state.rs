@@ -44,25 +44,65 @@ pub(crate) struct GraphRowMenu {
     pub origin_y: Pixels,
 }
 
-/// GitHub issue #241: the row menu's "Create branch here" prompt - `Some` only while the small,
-/// hand-rolled branch-name modal (`crate::graph_view::render::AdeApp::
-/// render_graph_create_branch_prompt`) is open. Mirrors `crate::root::new_file::
-/// NewFileInputState`'s own shape - this app's one established "prompt for a name" idiom
-/// (append/backspace-only [`TextField`], Enter to confirm, Escape to cancel) - rather than a
-/// second, competing one.
+/// An open branch-row right-click context menu in the Branches panel (GitHub issue #241): which
+/// branch it targets, and the already-resolved window-space origin its popover paints at.
 ///
-/// `sha`/`short_sha`/`subject` are captured once, at open time, from the row that was
-/// right-clicked/`⋯`'d - not re-looked-up from the graph on every render, which a background
-/// reload racing with the still-open prompt could otherwise change out from under it.
+/// Keyed by **branch name**, not by the row's index in the panel's own list, unlike
+/// [`GraphRowMenu`]: that list is rebuilt from the loaded graph on every render and re-filtered
+/// live by [`GraphTabState::branches_filter`], so a background reload (or a keystroke in the
+/// filter box) genuinely reorders and re-lengthens it while a menu is open. A name still names
+/// the same branch afterwards; an index does not. Every action the menu offers is therefore
+/// expressed in terms of that name, which is also exactly what the real `git` invocations behind
+/// them take.
+///
+/// Anchor resolved once at open time from the real click position, never recomputed per render -
+/// the same "resolve once, at open time" shape [`GraphRowMenu`] and
+/// `crate::sidebar::tree_ops::TreeContextMenu` both have.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GraphCreateBranchPrompt {
-    pub sha: String,
-    pub short_sha: String,
-    pub subject: String,
+pub(crate) struct GraphBranchMenu {
+    pub branch: String,
+    pub origin_x: Pixels,
+    pub origin_y: Pixels,
+}
+
+/// Which branch-name prompt is open, and what it will really do on Enter - see
+/// [`GraphBranchPrompt`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GraphBranchPromptKind {
+    /// The row menu's "Create branch here": `git checkout -b <typed name> <sha>`.
+    ///
+    /// `sha`/`short_sha`/`subject` are captured once, at open time, from the row that was
+    /// right-clicked/`⋯`'d - not re-looked-up from the graph on every render, which a background
+    /// reload racing with the still-open prompt could otherwise change out from under it.
+    CreateAt {
+        sha: String,
+        short_sha: String,
+        subject: String,
+    },
+    /// The Branches panel's branch menu "Rename Branch…": `git branch -m <old_name> <typed
+    /// name>`. `old_name` is captured at open time for the same reason the commit fields above
+    /// are, and the field is pre-filled with it so a rename starts from the real current name.
+    Rename { old_name: String },
+}
+
+/// GitHub issue #241: the graph tab's one branch-name prompt - `Some` only while the small,
+/// hand-rolled modal (`crate::graph_view::render::AdeApp::render_graph_branch_prompt`) is open.
+/// Mirrors `crate::root::new_file::NewFileInputState`'s own shape - this app's one established
+/// "prompt for a name" idiom (append/backspace-only [`TextField`], Enter to confirm, Escape to
+/// cancel) - rather than a second, competing one.
+///
+/// Deliberately **one** prompt serving both "Create branch here" and "Rename Branch…"
+/// ([`GraphBranchPromptKind`]) rather than a second, near-identical modal with its own focus
+/// handle, key handler and text field: the two differ only in their title, their pre-filled text
+/// and the one `wt_core::checkout` call Enter makes. Building a second one would be exactly the
+/// "one hand-rolled prompt idiom, not a second competing one" this prompt's own docs warn about.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GraphBranchPrompt {
+    pub kind: GraphBranchPromptKind,
     /// A real rejection message from the last attempt - only this prompt's own "branch name
     /// can't be empty" guard (a real collision with an existing branch surfaces through
     /// [`GraphTabState::status_message`] instead, git's own real error text, exactly like every
-    /// other row-menu mutation) - cleared on the very next keystroke.
+    /// other menu mutation) - cleared on the very next keystroke.
     pub error: Option<String>,
 }
 
@@ -96,6 +136,10 @@ pub(crate) struct GraphTabState {
     /// when the menu is opened from the `⋯` button itself; a right-click instead anchors off the
     /// real click position (`GraphRowMenu::origin_x`/`origin_y`), which needs no bounds lookup.
     pub row_menu_bounds: HashMap<usize, Bounds<Pixels>>,
+    /// GitHub issue #241: which Branches-panel branch row's right-click context menu is open, if
+    /// any, and the real position it was opened at - see [`GraphBranchMenu`]'s own docs for why
+    /// this is keyed by branch name rather than by row index.
+    pub branch_menu_open: Option<GraphBranchMenu>,
     pub push_menu_open: bool,
     pub push_button_bounds: Bounds<Pixels>,
     /// The Branches panel's real filter box - a genuine text-input surface, so it carries the
@@ -145,20 +189,42 @@ pub(crate) struct GraphTabState {
     /// reset, Copy) disarms this rather than let it carry over onto an operation the user never
     /// confirmed - see `crate::graph_view::render::AdeApp::request_graph_reset`'s own docs.
     pub hard_reset_confirm_armed: Option<String>,
-    /// GitHub issue #241: the row menu's "Create branch here" prompt - see
-    /// [`GraphCreateBranchPrompt`]'s own docs.
-    pub create_branch_prompt: Option<GraphCreateBranchPrompt>,
+    /// GitHub issue #241: `Some(branch)` for exactly one real click past the two-click
+    /// confirmation on the branch menu's "Delete Branch…" row, naming the branch that click
+    /// targeted. The exact twin of [`Self::hard_reset_confirm_armed`] (see that field's own docs
+    /// for the discipline): the *first* click on a given branch's Delete row only arms this and
+    /// re-labels the row, without deleting anything; only a second click on that *same* branch's
+    /// Delete row - with nothing else clicked in between - actually runs
+    /// [`wt_core::checkout::delete_branch`]. Keyed by branch name rather than a bare `bool` for
+    /// the identical reason: a Delete click on a *different* branch must arm its own
+    /// confirmation, never ride on a stale arm left over from another row.
+    ///
+    /// Deleting is not the same kind of destructive as a hard reset - `git branch -d` is the safe
+    /// delete and git itself refuses an unmerged branch - but it is still a real, one-click ref
+    /// removal, and the confirmation costs one click.
+    pub delete_branch_confirm_armed: Option<String>,
+    /// GitHub issue #241: the graph tab's one branch-name prompt, shared by the row menu's
+    /// "Create branch here" and the branch menu's "Rename Branch…" - see [`GraphBranchPrompt`]'s
+    /// own docs.
+    pub branch_prompt: Option<GraphBranchPrompt>,
     /// The prompt's own real text input - a real undo history (GitHub issue #17), the same shape
-    /// as [`Self::branches_filter`]. Lives independently of [`Self::create_branch_prompt`]
-    /// (rather than nested inside it) only so it can be reset to empty with `TextField::new()`
-    /// each time the prompt opens without reconstructing the whole prompt struct around it.
-    pub create_branch_name: TextField,
-    pub create_branch_focus_handle: FocusHandle,
+    /// as [`Self::branches_filter`]. Lives independently of [`Self::branch_prompt`] (rather than
+    /// nested inside it) only so it can be replaced wholesale (empty for a create, seeded with
+    /// the current name for a rename) each time the prompt opens without reconstructing the whole
+    /// prompt struct around it.
+    pub branch_prompt_name: TextField,
+    pub branch_prompt_focus_handle: FocusHandle,
     /// The currently in-flight remote operation's own real task - held so it isn't dropped (and
     /// therefore cancelled) the instant this function returns, matching
     /// `AdeApp::_worktree_history_task`'s identical one-slot-per-feature pattern. `None` when
     /// [`Self::remote_op_in_flight`] is `false`.
     pub _remote_op_task: Option<Task<()>>,
+    /// GitHub issue #241: the branch menu's "Rebase current branch on Branch…" resolves that
+    /// branch's real tip commit on the background executor before entering rebase mode
+    /// (`crate::graph_view::rebase::AdeApp::enter_rebase_mode_onto_branch`) - held in its own slot
+    /// rather than sharing [`Self::_remote_op_task`], since dropping that field's task would
+    /// cancel a Fetch/Pull/Push genuinely still running, a completely unrelated operation.
+    pub _branch_resolve_task: Option<Task<()>>,
     /// GitHub issue #221 ("Git graph only displays 500 commits"). The `max_commits` cap the
     /// currently loaded [`Graph`] was really walked with - `wt_core::graph::DEFAULT_MAX_COMMITS`
     /// after a fresh [`AdeApp::load_graph`], then one
@@ -216,6 +282,7 @@ impl GraphTabState {
             commit_files_cache: None,
             row_menu_open: None,
             row_menu_bounds: HashMap::new(),
+            branch_menu_open: None,
             push_menu_open: false,
             push_button_bounds: Bounds::default(),
             branches_filter: TextField::new(),
@@ -225,10 +292,12 @@ impl GraphTabState {
             remote_op_in_flight: false,
             push_force_confirm_armed: None,
             hard_reset_confirm_armed: None,
-            create_branch_prompt: None,
-            create_branch_name: TextField::new(),
-            create_branch_focus_handle: cx.focus_handle(),
+            delete_branch_confirm_armed: None,
+            branch_prompt: None,
+            branch_prompt_name: TextField::new(),
+            branch_prompt_focus_handle: cx.focus_handle(),
             _remote_op_task: None,
+            _branch_resolve_task: None,
             loaded_cap: wt_core::graph::DEFAULT_MAX_COMMITS,
             load_more_in_flight: false,
             load_more_failed: false,

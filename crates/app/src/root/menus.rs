@@ -12,7 +12,7 @@
 //!
 //! [`MenuSurface`] is the fix's shape: a payload-free name for each surface, an `ALL` array, and
 //! two exhaustive `match`es ([`AdeApp::menu_surface_is_open`]/[`AdeApp::close_menu_surface`]).
-//! Adding a seventh popover without teaching it the invariant is a compile error, not a silent
+//! Adding another popover without teaching it the invariant is a compile error, not a silent
 //! drift - the same reason `crate::root::widgets::menu_popover_chrome` is a shared *function*
 //! rather than a shared set of style constants.
 //!
@@ -23,7 +23,7 @@
 
 use super::*;
 
-/// Every real floating menu/dropdown surface in the app - the seven built on
+/// Every real floating menu/dropdown surface in the app - the nine built on
 /// [`crate::root::widgets::menu_popover_chrome`].
 ///
 /// Deliberately *not* including the command palette, the "New file" prompt, or the Settings
@@ -53,10 +53,16 @@ pub(crate) enum MenuSurface {
     GraphPush,
     /// A git graph row's `⋯`/right-click menu - `graph_state.row_menu_open`.
     GraphRow,
+    /// A git graph Branches-panel branch row's right-click menu (GitHub issue #241) -
+    /// `graph_state.branch_menu_open`. A separate surface from [`Self::GraphRow`] rather than a
+    /// second shape of the same field: the two target genuinely different things (a commit vs a
+    /// branch), can be open over completely different parts of the window, and must close each
+    /// other exactly the way any other two menus do.
+    GraphBranch,
     /// Settings › General's "Shell" field suggestion dropdown (GitHub issue #213's follow-up) -
-    /// [`AdeApp::shell_suggestions_open`]. The seventh surface, and the first one that lives on
-    /// the Settings page rather than the workspace; it is a click-away dropdown built on
-    /// [`crate::root::widgets::menu_popover_chrome`] like the other six, so it belongs to the
+    /// [`AdeApp::shell_suggestions_open`]. The first surface that lives on the Settings page
+    /// rather than the workspace; it is a click-away dropdown built on
+    /// [`crate::root::widgets::menu_popover_chrome`] like all the others, so it belongs to the
     /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
     ShellSuggestions,
     /// Settings › Notifications' per-event "choose a sound" dropdown (GitHub issue #226) -
@@ -69,15 +75,16 @@ pub(crate) enum MenuSurface {
 impl MenuSurface {
     /// Every variant. The `match`es in [`AdeApp::menu_surface_is_open`] and
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
-    /// until it is really wired to real state - that pairing is what stops a seventh menu from
+    /// until it is really wired to real state - that pairing is what stops a new menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 8] = [
+    pub(crate) const ALL: [MenuSurface; 9] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
         MenuSurface::Commit,
         MenuSurface::GraphPush,
         MenuSurface::GraphRow,
+        MenuSurface::GraphBranch,
         MenuSurface::ShellSuggestions,
         MenuSurface::SoundPicker,
     ];
@@ -94,6 +101,7 @@ impl AdeApp {
             MenuSurface::Commit => self.commit_menu_open,
             MenuSurface::GraphPush => self.graph_state.push_menu_open,
             MenuSurface::GraphRow => self.graph_state.row_menu_open.is_some(),
+            MenuSurface::GraphBranch => self.graph_state.branch_menu_open.is_some(),
             MenuSurface::ShellSuggestions => self.shell_suggestions_open,
             MenuSurface::SoundPicker => self.sound_picker_open.is_some(),
         }
@@ -113,6 +121,15 @@ impl AdeApp {
             MenuSurface::Commit => self.commit_menu_open = false,
             MenuSurface::GraphPush => self.graph_state.push_menu_open = false,
             MenuSurface::GraphRow => self.graph_state.row_menu_open = None,
+            // The two-click Delete confirmation belongs to *this* open menu instance and nothing
+            // else - a menu closed by any means at all (a click away, another menu opening, the
+            // window losing focus) must never leave a branch armed for a one-click delete the
+            // next time it opens. `open_graph_branch_menu_at` disarms on open too, for the paths
+            // that never route through here.
+            MenuSurface::GraphBranch => {
+                self.graph_state.branch_menu_open = None;
+                self.graph_state.delete_branch_confirm_armed = None;
+            }
             MenuSurface::ShellSuggestions => self.shell_suggestions_open = false,
             MenuSurface::SoundPicker => self.sound_picker_open = None,
         }
@@ -126,7 +143,8 @@ impl AdeApp {
     /// *opens* one of them calls it with its own surface as `keep` immediately before setting
     /// its own state - so the invariant holds no matter which of the (many) entry points was used:
     /// a click on the tab strip `+`, a title bar label, a right-click in the file tree, the commit
-    /// composer's `▾`, the graph's `Push ▾`, a graph row's `⋯`, or a right-click on a graph row.
+    /// composer's `▾`, the graph's `Push ▾`, a graph row's `⋯`, a right-click on a graph row, or a
+    /// right-click on a Branches-panel branch row.
     #[must_use]
     pub(crate) fn close_menu_surfaces_except(&mut self, keep: Option<MenuSurface>) -> bool {
         let mut closed_any = false;
@@ -181,6 +199,11 @@ mod menu_surface_tests {
             origin_x: px(4.0),
             origin_y: px(4.0),
         });
+        app.graph_state.branch_menu_open = Some(crate::graph_view::state::GraphBranchMenu {
+            branch: "main".to_string(),
+            origin_x: px(4.0),
+            origin_y: px(4.0),
+        });
         app.shell_suggestions_open = true;
         app.sound_picker_open = Some(crate::sound::SoundEventKind::AppStart);
     }
@@ -230,7 +253,7 @@ mod menu_surface_tests {
                 open_every_menu(app);
                 assert!(
                     app.close_menu_surfaces_except(Some(keep)),
-                    "with all six open, keeping {keep:?} must really close the other five"
+                    "with every surface open, keeping {keep:?} must really close all the others"
                 );
                 assert!(
                     app.menu_surface_is_open(keep),

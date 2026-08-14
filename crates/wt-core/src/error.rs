@@ -65,6 +65,12 @@ pub enum Error {
     #[error("failed to resolve HEAD to a commit: {0}")]
     PeelHead(#[source] Box<gix::head::peel::Error>),
 
+    /// Failed to resolve a real, already-found branch reference to a commit id -
+    /// [`crate::graph::resolve_commit`]'s own peel step, distinct from [`Self::PeelHead`] because
+    /// the reference being peeled here is an ordinary branch, never `HEAD` itself.
+    #[error("failed to resolve branch to a commit: {0}")]
+    PeelReference(#[source] Box<gix::reference::peel::Error>),
+
     /// Failed to compute the merge-base between a worktree's `HEAD` and the detected
     /// default branch.
     #[error("failed to compute merge-base: {0}")]
@@ -147,6 +153,19 @@ pub enum Error {
     #[error("worktree at {path} has no branch checked out (detached HEAD); nothing to merge")]
     MergeSourceDetached { path: PathBuf },
 
+    /// [`crate::merge::attempt_merge_into_current`]'s mirror of [`Error::MergeSourceDetached`]
+    /// for the opposite direction: the *target* worktree's `HEAD` is detached, so there is no
+    /// branch to merge into - `git merge` would move a detached `HEAD` instead, leaving the
+    /// merge commit on no branch at all.
+    #[error("worktree at {path} has no branch checked out (detached HEAD); nothing to merge into")]
+    MergeTargetDetached { path: PathBuf },
+
+    /// [`crate::merge::attempt_merge_into_current`]'s mirror of
+    /// [`Error::MergeSourceIsBaseBranch`]: the branch asked for *is* the one already checked out
+    /// in the target worktree, so there is nothing meaningful to merge.
+    #[error("branch {branch:?} is already the branch checked out here; nothing to merge")]
+    MergeSourceIsCurrentBranch { branch: String },
+
     /// The detected base branch is not checked out in *any* worktree of this repository, so
     /// there is nowhere to run `git merge` from - see `crate::merge`'s module docs for why a
     /// worktree already checked out on the base branch is required (a branch checked out in
@@ -157,13 +176,13 @@ pub enum Error {
     )]
     MergeBaseBranchNotCheckedOut { branch: String },
 
-    /// Refused to attempt a merge because the worktree the merge would run in (the one with
-    /// the base branch checked out) has uncommitted changes: `git merge` would either refuse
-    /// outright or risk overwriting real, unrelated work in progress there.
-    #[error(
-        "worktree at {path} (base branch) has uncommitted changes; commit or discard them \
-         before merging"
-    )]
+    /// Refused to attempt a merge because the worktree the merge would run in has uncommitted
+    /// changes: `git merge` would either refuse outright or risk overwriting real, unrelated work
+    /// in progress there. Shared by both directions - the worktree with the detected base branch
+    /// checked out for [`crate::merge::attempt_merge`], the caller-supplied target worktree for
+    /// [`crate::merge::attempt_merge_into_current`] - since `path` already names exactly which
+    /// worktree is dirty either way.
+    #[error("worktree at {path} has uncommitted changes; commit or discard them before merging")]
     MergeTargetDirty { path: PathBuf },
 
     /// A conflicted file's real on-disk content was not valid UTF-8, so its conflict markers

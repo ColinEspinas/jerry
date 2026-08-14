@@ -661,7 +661,7 @@ impl AdeApp {
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
         // Revision R12's git graph tab), `new_file_focus_handle`, and (GitHub issue #241)
-        // `graph_state.create_branch_focus_handle` are three more genuine caret-bearing
+        // `graph_state.branch_prompt_focus_handle` are three more genuine caret-bearing
         // `FocusHandle`s - real, hand-rolled `text_history::TextField` inputs, the same shape as
         // the six wired above - that never got threaded through `Self::wire_caret_blink`. They
         // can't join that earlier call: it runs before `this` exists, and every one of these
@@ -677,7 +677,7 @@ impl AdeApp {
                 // hand-rolled `TextField` input built after this same `graph_state` literal, so
                 // it joins this later call for the same reason `branches_filter_focus_handle`
                 // does - see this call's own docs just above.
-                &this.graph_state.create_branch_focus_handle,
+                &this.graph_state.branch_prompt_focus_handle,
             ],
             window,
             cx,

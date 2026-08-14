@@ -178,7 +178,7 @@ pub(crate) struct RebaseModeState {
     pub worktree_root: PathBuf,
     pub branch: String,
     /// The real commit-ish `wt_core::rebase::start_interactive_rebase` bases the plan onto - the
-    /// row the user opened "Interactive rebase from here…" on. Never itself a row in
+    /// row the user opened "Rebase onto this commit" on. Never itself a row in
     /// [`Self::plan`] (exactly `git rebase -i <onto>`'s own semantics: `onto` becomes the new
     /// parent, not a picked commit).
     pub onto: String,
@@ -345,21 +345,122 @@ pub(crate) fn outcome_stopped_commit(outcome: &RebaseOutcome) -> Option<&str> {
 }
 
 impl AdeApp {
-    /// The row menu's "Interactive rebase from here…" action (design spec §1) - enters rebase
-    /// mode with `from_row_index`'s own commit as the real `onto` target
+    /// The row menu's "Rebase onto this commit" action (design spec §1) - enters rebase mode with
+    /// `from_row_index`'s own commit as the real `onto` target
     /// (`wt_core::rebase::commits_to_rebase`'s own contract: every commit `HEAD` has that isn't
-    /// reachable from `onto`, oldest first - exactly `git rebase -i <onto>`'s default todo,
-    /// mirroring [`Self::request_graph_rebase_onto`]'s own non-interactive sibling, which already
-    /// uses this same row's commit as `onto`). A no-op for the synthetic "Uncommitted changes"
-    /// row (`row.commit.id` is empty there - never a real rebase target).
+    /// reachable from `onto`, oldest first - exactly `git rebase -i <onto>`'s default todo). A
+    /// no-op for the synthetic "Uncommitted changes" row (`row.commit.id` is empty there - never a
+    /// real rebase target).
+    ///
+    /// GitHub issue #241 made this the row menu's *only* rebase entry: a second, separate
+    /// "rebase onto this commit, immediately, with no plan shown" row ran the same replay while
+    /// skipping the Planning banner entirely, which is exactly the review step the banner's own
+    /// one-click `Start rebase` already makes cheap. One entry, one banner, no capability lost.
     pub(crate) fn enter_rebase_mode(&mut self, from_row_index: usize, cx: &mut Context<Self>) {
-        self.graph_state.row_menu_open = None;
         let Some(row) = self.current_graph_row(from_row_index) else {
             return;
         };
         let onto = row.commit.id.clone();
         let onto_short = row.commit.short_id.clone();
+        self.enter_rebase_mode_inner(onto, onto_short, cx);
+    }
+
+    /// The Branches panel's branch menu "Rebase current branch on Branch…" action (GitHub issue
+    /// #241) - the same rebase mode [`Self::enter_rebase_mode`] enters, targeting `branch`'s real
+    /// tip commit.
+    ///
+    /// Resolves the branch to a real commit first (`wt_core::graph::resolve_commit`, a real `git
+    /// log -1` in the focused worktree) rather than handing the branch *name* to the rebase
+    /// engine, for two real reasons: a branch is a moving pointer, so pinning the tip that was
+    /// really there when the user clicked is what makes the plan the banner then shows honest;
+    /// and [`RebaseModeState::onto`] is a commit id everywhere else, which the banner and
+    /// `wt_core::rebase` both already depend on.
+    ///
+    /// That resolution is real blocking I/O, so it runs on the background executor and calls
+    /// [`Self::enter_rebase_mode_inner`] when it lands - never inline on the UI thread. A branch
+    /// that no longer resolves (deleted since the panel last loaded) reports git's own real error
+    /// through the graph tab's status line and enters no mode at all.
+    pub(in crate::graph_view) fn enter_rebase_mode_onto_branch(
+        &mut self,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.branch_menu_open = None;
+        self.graph_state.delete_branch_confirm_armed = None;
+        if self.graph_state.rebase.is_some() {
+            // Checked here as well as in `enter_rebase_mode_inner` (which re-checks after the
+            // await, and is the real guard): no reason to spawn a resolve for a mode that already
+            // cannot be entered.
+            return;
+        }
+        let root = self.diff_root.clone();
+        self.graph_state.status_message = Some(format!("Rebase onto {branch}\u{2026}"));
+        cx.notify();
+
+        let task = cx.spawn(async move |this, cx| {
+            let branch_for_bg = branch.clone();
+            let resolved = cx
+                .background_executor()
+                .spawn(async move { wt_core::graph::resolve_commit(&root, &branch_for_bg) })
+                .await;
+            let _ = this.update(cx, |this, cx| match resolved {
+                Ok(commit) => {
+                    if this.graph_state.rebase.is_some() {
+                        // A rebase mode appeared while this resolve was in flight;
+                        // `enter_rebase_mode_inner` would refuse silently, so the refusal is
+                        // reported here instead of leaving a pending "Rebase onto x…" line that
+                        // nothing will ever resolve.
+                        this.graph_state.status_message = Some(format!(
+                            "Rebase onto {branch} failed: a rebase is already in progress"
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                    // Rebase mode replaces the toolbar this message paints in with its own
+                    // banner, so leaving a stale "Rebase onto x…" behind would only ever be read
+                    // later, after the mode is left, as if something were still pending.
+                    this.graph_state.status_message = None;
+                    this.enter_rebase_mode_inner(commit.id, commit.short_id, cx);
+                }
+                Err(err) => {
+                    this.graph_state.status_message =
+                        Some(format!("Rebase onto {branch} failed: {err}"));
+                    cx.notify();
+                }
+            });
+        });
+        self.graph_state._branch_resolve_task = Some(task);
+    }
+
+    /// The body of [`Self::enter_rebase_mode`], taking the real `onto` commit id (and its short
+    /// form, for display) rather than a row index - so nothing downstream depends on that commit
+    /// still occupying a particular row of the currently loaded graph. A background reload between
+    /// opening the row menu and clicking genuinely renumbers rows, while a commit id does not move.
+    ///
+    /// GitHub issue #242 is what this rides on, and the reason the row menu's rebase entry stopped
+    /// calling `wt_core::rewrite::rebase_onto` (a plain `git rebase <onto>`) at all: a conflict
+    /// stops in [`RebasePhase::Stopped`], where the existing banner offers real
+    /// `Continue`/`Skip`/`Abort` and `Resolve in the diff view`. The plain `git rebase` left the
+    /// worktree genuinely mid-rebase with nothing in this app able to continue, skip or abort it -
+    /// a real dead end, recoverable only from a terminal.
+    pub(in crate::graph_view) fn enter_rebase_mode_inner(
+        &mut self,
+        onto: String,
+        onto_short: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.row_menu_open = None;
+        self.graph_state.hard_reset_confirm_armed = None;
+        // The synthetic "Uncommitted changes" row carries an empty commit id - never a real
+        // rebase target.
         if onto.is_empty() {
+            return;
+        }
+        if self.graph_state.rebase.is_some() {
+            // A rebase mode is already live (its own banner owns the recovery surface for it) -
+            // starting a second one over the top would strand the first. The row menu itself
+            // cannot reach this (it is unreachable while rebase mode is showing); this is the
+            // backstop for any other caller.
             return;
         }
         let branch = self

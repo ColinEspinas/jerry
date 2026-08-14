@@ -1000,7 +1000,7 @@ mod rebase_flow_tests {
         right_click(cx, row.center());
 
         let option = cx
-            .debug_bounds("dropdown-menu-row-Interactive rebase from here")
+            .debug_bounds("dropdown-menu-row-Rebase onto this commit")
             .expect("the real, now-enabled row must paint a clickable option");
         cx.simulate_click(option.center(), gpui::Modifiers::default());
         cx.run_until_parked();

@@ -3025,16 +3025,26 @@ impl Render for AdeApp {
                     && self.graph_state.row_menu_open.is_some(),
                 |el| el.child(self.render_graph_row_menu(cx)),
             )
+            // The Branches panel's own branch right-click menu (GitHub issue #241) - a
+            // window-positioned overlay for exactly the reasons the two above are, plus one of its
+            // own: it is anchored off a row inside the right sidebar's own scrolling panel, so
+            // rendering it as a child of that panel would clip it to the panel's bounds.
+            .when(
+                self.graph_tab_active
+                    && !self.settings_open
+                    && self.graph_state.branch_menu_open.is_some(),
+                |el| el.child(self.render_graph_branch_menu(cx)),
+            )
             // The row menu's "Create branch here" prompt (GitHub issue #241) - a focus-owning
             // modal overlay, not a click-away menu (`crate::graph_view::state::
-            // GraphCreateBranchPrompt`'s own docs), so it lives beside the "New file" prompt
+            // GraphBranchPrompt`'s own docs), so it lives beside the "New file" prompt
             // below rather than inside `crate::root::menus::MenuSurface` - mirrors that enum's
             // own doc comment on why "New file" is excluded from it too.
             .when(
                 self.graph_tab_active
                     && !self.settings_open
-                    && self.graph_state.create_branch_prompt.is_some(),
-                |el| el.child(self.render_graph_create_branch_prompt(cx)),
+                    && self.graph_state.branch_prompt.is_some(),
+                |el| el.child(self.render_graph_branch_prompt(cx)),
             )
             .when_some(self.title_menu_open, |el, menu| {
                 el.child(self.render_title_menu(menu, cx))
