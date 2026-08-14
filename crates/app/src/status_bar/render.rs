@@ -8,6 +8,24 @@ use crate::root::widgets::{
 /// (`extras` empty). Pure, so the conjugation is testable without a live process sampler -
 /// which matters here because the single-agent case this used to render as `"1 agents"` is the
 /// *ordinary* one: every window starts with exactly one agent.
+/// This machine's real core count, read once and cached.
+///
+/// `std::thread::available_parallelism` is not the cheap `sched_getaffinity` call it looks like:
+/// on Linux it also performs the cgroup quota lookup, opening and reading `/proc/self/cgroup`,
+/// `/proc/self/mountinfo` and the cgroup's `cpu.max`/`cpu.cfs_quota_us` files. Calling it from
+/// [`AdeApp::render_status_agents_cluster`] meant real blocking filesystem I/O on the UI thread
+/// on *every frame*, for a value that cannot change while the process is running. This is one
+/// `OnceLock` instead - and deliberately not a field on `AdeApp`, since it is a property of the
+/// machine rather than of any window.
+fn available_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
+
 fn status_agents_label(agent_count: usize, extras: &[&str]) -> String {
     let agents = plural::count(agent_count, "agent", None);
     if extras.is_empty() {
@@ -315,10 +333,7 @@ impl AdeApp {
             process_stats::aggregate_process_stats(&agent_pids, &self.process_stats);
         let cpu_label = match cpu_total {
             Some(percent) => {
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1);
-                let normalized = process_stats::normalize_cpu_percent(percent, cores);
+                let normalized = process_stats::normalize_cpu_percent(percent, available_cores());
                 format!("{}% cpu", normalized.round() as i64)
             }
             None => "...% cpu".to_string(),

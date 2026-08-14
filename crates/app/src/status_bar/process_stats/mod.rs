@@ -7,7 +7,7 @@
 //! | platform | CPU time | resident memory | module |
 //! |---|---|---|---|
 //! | Linux/WSL2 | `/proc/<pid>/stat` `utime`+`stime` (clock ticks) | `/proc/<pid>/status` `VmRSS` | [`linux`] |
-//! | macOS | `proc_pid_rusage` `ri_user_time`+`ri_system_time` (ns) | `ri_resident_size` | [`macos`] |
+//! | macOS | `proc_pid_rusage` `ri_user_time`+`ri_system_time` (mach timebase units) | `ri_resident_size` | [`macos`] |
 //! | Windows | `GetProcessTimes` kernel+user (100ns `FILETIME`) | PSAPI `GetProcessMemoryInfo` `WorkingSetSize` | [`windows`] |
 //! | anything else | - | - | [`unsupported`] |
 //!
@@ -302,8 +302,19 @@ pub fn aggregate_process_stats(
     let mut cpu_known_any = false;
     let mut rss_total = 0u64;
     let mut rss_known_any = false;
+    // A pid is counted at most once even if `pids` lists it twice. `sample_processes` is
+    // structurally immune to this (it keys a `HashMap`), but this function walks the caller's
+    // slice, so a duplicate would add the same process's CPU and memory to the totals twice and
+    // silently inflate the whole cluster. Today's caller collects one pid per open agent, so this
+    // is a guard rather than a live bug - but "the bar readout is the sum of the tree" (issue
+    // #283's acceptance criterion) has to survive two views of the same process, which is exactly
+    // what the Resources popover this feeds will introduce.
+    let mut counted = std::collections::HashSet::with_capacity(pids.len());
 
     for pid in pids {
+        if !counted.insert(*pid) {
+            continue;
+        }
         let Some(sample) = stats.get(pid) else {
             continue;
         };
@@ -621,7 +632,7 @@ mod tests {
         let pid = child.id();
 
         let (_first, raw) = sample_processes(&[pid], HashMap::new());
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(500));
         let (second, _raw) = sample_processes(&[pid], raw);
 
         let _ = child.kill();
@@ -633,9 +644,15 @@ mod tests {
         let cpu = sample
             .cpu_percent
             .expect("a second sample against a live pid must report a real cpu_percent");
+        // A real *rate* floor, not just `> 0.0`. `yes` pins one core, so the honest answer is
+        // near 100% of one core; 25% is loose enough for a contended CI runner but still fails
+        // decisively against a unit-conversion bug, which is precisely how the macOS backend's
+        // mach-timebase defect (see `macos`'s module docs) once passed a `> 0.0` assertion while
+        // under-reporting by ~41.7x.
         assert!(
-            cpu > 0.0,
-            "a genuinely CPU-busy child should show non-zero usage, got {cpu}"
+            cpu > 25.0,
+            "a core-pinning child should report close to 100% of one core, got {cpu}% - a value \
+             just above zero is what a CPU-time unit bug looks like"
         );
         assert!(
             sample.resident_bytes.is_some_and(|rss| rss > 0),
@@ -741,6 +758,31 @@ mod tests {
             Some(1000),
             "the zombie's unknown memory must not blank pid 1's real, known memory - it simply \
              contributes nothing to the total"
+        );
+    }
+
+    /// The same pid listed twice contributes once, not twice - otherwise one process seen through
+    /// two views would silently double the whole cluster's reported cpu and memory.
+    #[test]
+    fn aggregate_process_stats_counts_a_duplicated_pid_only_once() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            1,
+            ProcessSample {
+                cpu_percent: Some(10.0),
+                resident_bytes: Some(1000),
+            },
+        );
+        let (cpu, rss) = aggregate_process_stats(&[1, 1, 1], &stats);
+        assert_eq!(
+            cpu,
+            Some(10.0),
+            "pid 1's cpu must not be counted three times"
+        );
+        assert_eq!(
+            rss,
+            Some(1000),
+            "pid 1's memory must not be counted three times"
         );
     }
 

@@ -13,12 +13,13 @@
 //!   a wall-clock date: for the kernel/user fields it is a duration in 100-nanosecond units,
 //!   which is why the two halves are recombined into a `u64` and multiplied by 100 rather than
 //!   run through any date conversion.
-//! - `GetProcessMemoryInfo` is documented as needing `PROCESS_QUERY_INFORMATION` (or
-//!   `PROCESS_QUERY_LIMITED_INFORMATION`) *and* `PROCESS_VM_READ`. In practice the export in
-//!   `psapi.dll` forwards to `K32GetProcessMemoryInfo` in `kernel32.dll` on Windows 7 and later,
-//!   which is satisfied by the limited right alone - so [`Sampler::resident_bytes`] asks for the
-//!   documented pair first and falls back to the limited right by itself if that open is denied,
-//!   rather than reporting an honest-but-avoidable `None` for a process it could in fact read.
+//! - `GetProcessMemoryInfo` needs the same right, and *only* that right. Checked against the
+//!   current Microsoft documentation rather than assumed: "The handle must have the
+//!   **PROCESS_QUERY_INFORMATION** or **PROCESS_QUERY_LIMITED_INFORMATION** access right", with
+//!   `PROCESS_VM_READ` additionally required only on "Windows Server 2003 and Windows XP" -
+//!   platforms this app does not target and could not run on. So both readings open the process
+//!   exactly once, with exactly one access right, rather than trying a wider mask first and
+//!   falling back.
 //!
 //! `WorkingSetSize` is the field read, not `PagefileUsage`/`PrivateUsage`: the working set is the
 //! physical memory currently resident for the process, which is what Linux's `VmRSS` and macOS's
@@ -39,10 +40,16 @@
 //!
 //! ## Verification status
 //!
-//! This file has never been executed: it was written on a Linux machine. What *was* verified
-//! locally is that it type-checks against the real `windows-sys` bindings, by
-//! `cargo check --target x86_64-pc-windows-gnu` over this module - see the PR for issue #283.
-//! Its first real execution is CI's `windows-latest` job (`.github/workflows/release.yml`).
+//! This file was written on a Linux machine, so nothing in it was executed locally. What *was*
+//! verified locally is that it type-checks against the real `windows-sys` bindings, by
+//! cross-compiling this module for `x86_64-pc-windows-gnu` - see the PR for issue #283.
+//!
+//! Its real execution happens in CI. Note that `cargo build` does *not* compile `#[cfg(test)]`
+//! modules at all, so the `windows-latest` build job alone would never have run a line of this
+//! file's tests - `.github/workflows/ci.yml`'s Windows job therefore has a dedicated
+//! `cargo test -p app --lib status_bar::process_stats` step, added with this backend, which is
+//! what actually exercises the code below on a real Windows runner. Without it, "CI covers this"
+//! would have been an empty claim.
 
 use super::ProcessSampler;
 use std::time::Duration;
@@ -50,7 +57,6 @@ use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ,
 };
 
 /// The Windows Win32/PSAPI backend - a stateless unit struct, per [`ProcessSampler`]'s docs.
@@ -90,10 +96,7 @@ impl ProcessSampler for Sampler {
     }
 
     fn resident_bytes(&self, pid: u32) -> Option<u64> {
-        // The documented access pair first; the limited right alone as the real-world fallback -
-        // see the module docs.
-        let handle = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
-            .or_else(|| ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION))?;
+        let handle = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
 
         // The struct's own `cb` field is deliberately left at its `default()` zero rather than
         // pre-set to the struct size. That is the classic suspicion with this call, so it was
