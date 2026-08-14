@@ -1697,98 +1697,116 @@ impl AdeApp {
 
         div()
             .id(("agent-row", id))
+            .debug_selector(move || format!("agent-row-{id:?}"))
             .cursor_pointer()
             .flex()
-            .flex_col()
             .pl(px(13.0))
-            .pr(px(10.0))
-            // §4n's tighter agent block: `5 10 6 7` -> `4 10 5 7`. The leading 13 here is this
-            // row's *indent* under its worktree rather than padding (the connector/status edge
-            // sits on it), so only the vertical pair moves.
-            .pt(px(4.0))
-            .pb(px(5.0))
-            .gap(px(2.0))
-            .border_l(if is_selected { px(2.0) } else { px(1.0) })
-            .border_color(if is_selected {
-                status.color()
-            } else {
-                theme::border::ZONE.into()
-            })
-            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
-            .when(!is_selected, |el| {
-                el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
-            })
+            // The row's real indent under its worktree: 13px of empty space (padding, not a
+            // sized column - the connector doesn't sit centered *within* the 13px, it comes
+            // after it), carrying the 1px `#1e2225` connector line, then the agent's own content
+            // box - never padding *on* that content box, which would draw its border-left (the
+            // status edge) flush with the worktree row's own left edge instead of indented under
+            // it. `Jerry.dc.html`'s own agent row is exactly this shape (an outer
+            // `padding-left:13px` flex wrapper holding the connector `div`, then the content
+            // `div` with its own `border-left`) - GPUI's border draws at a box's outer edge same
+            // as CSS, so folding padding-left and border-left onto one div here reproduced the
+            // bug the opposite way.
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_agent(id, window, cx);
             }))
+            .child(div().flex_none().w(px(1.0)).bg(theme::border::ZONE))
             .child(
-                // Line 1: chip · task title · elapsed.
                 div()
+                    .debug_selector(move || format!("agent-row-content-{id:?}"))
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(chip_icon)
+                    .flex_col()
+                    .pl(px(7.0))
+                    .pr(px(10.0))
+                    // §4n's tighter agent block: `5 10 6 7` -> `4 10 5 7`.
+                    .pt(px(4.0))
+                    .pb(px(5.0))
+                    .gap(px(2.0))
+                    .border_l(if is_selected { px(2.0) } else { px(1.0) })
+                    .border_color(if is_selected {
+                        status.color()
+                    } else {
+                        theme::border::ZONE.into()
+                    })
+                    .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+                    .when(!is_selected, |el| {
+                        el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
+                    })
                     .child(
+                        // Line 1: chip · task title · elapsed.
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(11.0))
-                            .text_color(agent_title_color(status, is_selected))
-                            .child(agent.title.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(chip_icon)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(11.0))
+                                    .text_color(agent_title_color(status, is_selected))
+                                    .child(agent.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    // §4k: always the neutral time token, whatever the status.
+                                    .font(font(theme::font::MONO))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(theme::text::GHOST)
+                                    .child(rail::format_elapsed(agent.elapsed)),
+                            ),
                     )
                     .child(
+                        // Line 2, indented 21 to the text column (chip width 15 + gap 6): status
+                        // dot · state word · trailing text · model.
                         div()
-                            .flex_none()
-                            // §4k: always the neutral time token, whatever the status.
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::GHOST)
-                            .child(rail::format_elapsed(agent.elapsed)),
-                    ),
-            )
-            .child(
-                // Line 2, indented 21 to the text column (chip width 15 + gap 6): status dot ·
-                // state word · trailing text · model.
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .pl(px(21.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded_full()
-                            .bg(status.color()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(state_color)
-                            .child(agent_state_word(status)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(trailing_color)
-                            .child(trailing_text),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::PATH)
-                            .child(agent.kind.label()),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pl(px(21.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(4.0))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(status.color()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(state_color)
+                                    .child(agent_state_word(status)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font(font(theme::font::SANS))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(trailing_color)
+                                    .child(trailing_text),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font(font(theme::font::MONO))
+                                    .text_size(self.ui_text_size(9.5))
+                                    .text_color(theme::text::PATH)
+                                    .child(agent.kind.label()),
+                            ),
                     ),
             )
     }
@@ -4846,6 +4864,51 @@ mod rail_rev6_render_tests {
             px(27.0),
             "and the row's full 27px height - a caret you can only hit in an 11px square is the \
              defect §4o names"
+        );
+    }
+
+    /// `Jerry.dc.html`'s own agent row indents under its worktree by a real 13px, holding the 1px
+    /// `#1e2225` connector the design's own §4n text calls out ("the connector... was already
+    /// there and does its job once the groups are separated") - so the agent's own status edge
+    /// sits *inset* under the worktree row, not flush with its left edge. A real, measured
+    /// regression: an earlier cut folded the 13px indent and the status-edge border onto the same
+    /// element, which (GPUI draws a border at a box's own outer edge, same as CSS) put the edge
+    /// at the worktree row's own x, not indented under it - the hierarchy the row is supposed to
+    /// show collapsed into the same left rail every other row in the tree already uses.
+    #[gpui::test]
+    fn the_agent_row_is_really_indented_under_its_worktree_not_flush_with_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, wt, app, cx) = open_with_a_failed_agent(cx);
+
+        // `open_with_a_failed_agent` opens the app (which spawns its own default shell in the
+        // *repo's* own path) and then explicitly spawns the real failed agent this test cares
+        // about in `wt`'s own path - the two are real, distinct tempdirs, so filtering on cwd
+        // finds the right one regardless of spawn order.
+        let wt_path = wt.path().to_path_buf();
+        let agent_id = app.update(cx, |app, _cx| {
+            app.agents
+                .iter()
+                .find(|a| a.cwd == wt_path)
+                .expect("the real failed agent this helper seeds, in its own worktree")
+                .id
+        });
+        let row_selector = selector(format!("agent-row-{agent_id:?}"));
+        let content_selector = selector(format!("agent-row-content-{agent_id:?}"));
+
+        let row = cx
+            .debug_bounds(row_selector)
+            .expect("a real agent row must paint under its worktree");
+        let content = cx
+            .debug_bounds(content_selector)
+            .expect("the agent row's own content box must paint inside it");
+
+        assert_eq!(
+            content.origin.x - row.origin.x,
+            px(14.0),
+            "the content box (and the status-edge border painted on it) must start 14px in from \
+             the row's own left edge - 13px of indent plus the 1px connector line - never flush \
+             with x=0, which is what the worktree row's own edge uses"
         );
     }
 
