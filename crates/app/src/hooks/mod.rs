@@ -151,6 +151,13 @@ impl HookRuntime {
         self.listener.session_id_for(id)
     }
 
+    /// Every file write reported since the last call, in arrival order - the signal
+    /// `crate::provenance` turns into per-line attribution (GitHub issue #284). Returns
+    /// `(edits, dropped)`; see [`server::HookListener::drain_edits`].
+    pub fn drain_edits(&self) -> (Vec<server::AgentEdit>, usize) {
+        self.listener.drain_edits()
+    }
+
     /// Drops an agent's recorded facts, so a future [`AgentId`] can't inherit them.
     pub fn forget(&self, id: AgentId) {
         self.listener.forget(id);

@@ -562,6 +562,13 @@ impl AdeApp {
                     // rather than adding one, and only touches the disk when something actually
                     // changed - see `AdeApp::record_agent_statuses`.
                     this.record_agent_statuses(cx);
+                    // GitHub issue #284: drain the file writes the hook layer has reported since
+                    // the last tick and turn them into per-line attribution. A third pass on the
+                    // same timer, for the same reason as the two around it - and deliberately a
+                    // pass of its own rather than folded into `record_agent_statuses`, whose
+                    // "changed" signal is about a *status* and says nothing about whether a file
+                    // was written (see `crate::provenance::flow`).
+                    this.apply_agent_edits(cx);
                     // GitHub issue #226: detect real agent-status transitions (needs input /
                     // finished with changes to review) and play a sound if the user wants one.
                     // Deliberately a separate pass from `record_agent_statuses` just above, not

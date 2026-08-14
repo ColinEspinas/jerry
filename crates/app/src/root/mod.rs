@@ -512,6 +512,25 @@ pub struct AdeApp {
     /// Which persisted agent-status keys *this* instance owns, for the merge-not-clobber write
     /// path - mirrors [`Self::review_baselines_owned`].
     pub(crate) agent_status_owned: std::collections::BTreeSet<String>,
+    /// Who wrote each line of each file, per worktree (GitHub issue #284) - see
+    /// `crate::provenance` for the model and `crate::provenance::flow` for the three wires that
+    /// feed and read it.
+    pub(crate) line_provenance: crate::provenance::store::ProvenanceStore,
+    /// Where [`Self::line_provenance`] is persisted - a sibling of the real `settings.toml`, or
+    /// `None` for a test that hasn't opted into real persistence, mirroring
+    /// [`Self::agent_status_path`].
+    pub(crate) line_provenance_path: Option<PathBuf>,
+    /// Which persisted worktree keys *this* instance owns, for the merge-not-clobber write path -
+    /// mirrors [`Self::agent_status_owned`].
+    pub(crate) line_provenance_owned: std::collections::BTreeSet<String>,
+    /// [`Self::diff_state`]'s file list joined with [`Self::line_provenance`] - one row per path,
+    /// each carrying its authors and the per-author `split` (GitHub issue #284).
+    ///
+    /// Cached rather than derived per frame because the Changes rows are virtualized and would
+    /// otherwise rebuild it on every scroll tick. It is rebuilt through exactly one function
+    /// (`crate::provenance::flow::AdeApp::rebuild_change_set`), called from the two writes that
+    /// can invalidate it - `Self::load_diff` finishing, and provenance changing.
+    pub(crate) change_set: crate::provenance::change_set::ChangeSet,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
@@ -915,6 +934,10 @@ pub struct AdeApp {
     /// `crate::hooks::flow::AdeApp::record_agent_statuses`. A `Task` cancels on drop, so this
     /// must be stored for the write to actually land.
     pub(crate) _agent_status_persist_task: Option<Task<()>>,
+    /// Holds the in-flight write of [`Self::line_provenance`] - see
+    /// `crate::provenance::flow::AdeApp::persist_line_provenance`. One slot, newest wins: the
+    /// state is captured whole at spawn time, so a newer write genuinely supersedes an older one.
+    pub(crate) _line_provenance_persist_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,

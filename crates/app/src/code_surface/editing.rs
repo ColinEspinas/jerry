@@ -1165,6 +1165,14 @@ impl AdeApp {
                     let _ = this.update(cx, |this, cx| {
                         match write_result {
                             Ok((mtime, len, written_content)) => {
+                                // GitHub issue #284, Orca's first hard-won rule: a hand edit flips
+                                // exactly the lines it changed back to `you`. This is the only
+                                // place in this crate that writes editor content into a worktree,
+                                // so it is the only place that rule has to be wired - and it is
+                                // handed the bytes just written rather than re-reading the file,
+                                // which a second save landing in between could already have
+                                // replaced. Runs before `mark_saved` moves the content.
+                                this.record_hand_edit(&cwd, &path, &written_content, cx);
                                 if let Some(buffer) = this.edit_buffer_at_mut(&cwd, &path) {
                                     buffer.mark_saved(written_content, mtime, len);
                                 }

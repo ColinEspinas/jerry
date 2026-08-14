@@ -27,6 +27,7 @@ pub mod palette;
 // the real intra-process concurrent-writer hazard (GitHub issue #90's "New Window") this exists
 // to close. Nothing outside this crate has any business calling it directly.
 pub(crate) mod persisted_state_lock;
+pub mod provenance;
 pub mod rail;
 pub mod review;
 pub mod root;

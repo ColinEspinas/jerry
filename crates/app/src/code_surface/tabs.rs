@@ -38,6 +38,9 @@ impl AdeApp {
     pub(crate) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
+        // Cleared with the diff it was derived from: a change set outliving its diff would keep
+        // rows' diffstats alive for a worktree that is no longer being shown.
+        self.change_set = crate::provenance::change_set::ChangeSet::default();
         self.diff_totals = None;
         self.dirty_files = None;
         cx.notify();
@@ -95,6 +98,10 @@ impl AdeApp {
                 this.refresh_open_diff_file_cache();
                 // The palette's file-candidate list also carries diff marks; rebuild it too.
                 this.rebuild_palette_file_candidates();
+                // GitHub issue #284: the Changes rows read their diffstat off the change set, so
+                // it has to be rebuilt from the same write that replaced the diff it is derived
+                // from - see `crate::provenance::flow::AdeApp::rebuild_change_set`.
+                this.rebuild_change_set();
                 cx.notify();
             });
         });
