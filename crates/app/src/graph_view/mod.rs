@@ -29,11 +29,38 @@
 //! confirmation, the same discipline `push_force_confirm_armed` already established, and
 //! [`state::GraphCreateBranchPrompt`] for "Create branch here"'s small, hand-rolled branch-name
 //! input; and GitHub issue #242 phase B wired "Interactive rebase from here…" to the real
-//! [`rebase`] mode. Only "Start agent from this commit" is still rendered **disabled** - it
-//! needs a new-worktree-creation entry point this app deliberately has none of yet (every "add
-//! worktree"/"add repo" entry point stays out until a real design lands, per Revision R12) -
-//! using `crate::work_surface::render::render_dropdown_menu_row`'s existing `enabled: false`
-//! treatment, with no `.on_click` attached. Agent-to-commit correlation (which agent
+//! [`rebase`] mode.
+//!
+//! GitHub issue #241 closed the last three gaps in that action set:
+//!
+//! - **"Start agent from this commit"** was, until then, rendered **disabled** ("not implemented
+//!   yet") because it needs a real new-worktree-creation entry point, which this app deliberately
+//!   had none of (every "add worktree"/"add repo" entry point stayed out until a real design
+//!   landed, per Revision R12). Revision 6's own graph row-menu spec
+//!   (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`, `gMenuGroups`) is that design: it
+//!   lists `Start session from this commit` with the subtitle **`new worktree`**, so the action
+//!   now really runs `wt_core::add_worktree` rooted at the clicked commit and spawns an agent in
+//!   the result - see `render::AdeApp::request_graph_start_agent_from_commit`. Per
+//!   `REVISION-2026-08-14.md` §7 rule 1 ("ship the affordance with the behaviour, or ship
+//!   neither") the row is no longer rendered inert.
+//! - **"Merge into `<base>`"** is new: the graph owns merging a branch into its base since
+//!   GitHub issue #285 made the Changes panel's Against-main section read-only. It lives in the
+//!   **Branches** right panel, on the focused worktree's own `HEAD` branch row - the design's own
+//!   placement rule (`STAGE-A-CHANGELOG.md` §4e: "worktree and branch verbs go where the worktree
+//!   and branch state is visible") and its own rationale for this action specifically ("merge is
+//!   a branch operation with preconditions; it lives in branch scope so the base, the commit
+//!   count and the reason it is blocked are all in view at once"). It reuses the app's *existing*
+//!   merge flow end to end (`crate::merge::flow::AdeApp::start_merge`), so a conflicted merge
+//!   lands in the existing conflict resolver rather than a second one. See
+//!   [`state::graph_merge_gate`] for the preconditions and their wording.
+//! - **"Rebase onto this commit"** was real but rode on `wt_core::rewrite::rebase_onto`'s plain
+//!   `git rebase`, which leaves a conflicted worktree mid-rebase with nothing in this app able to
+//!   continue, skip or abort it. It now runs on the same `wt_core::rebase` engine GitHub issue
+//!   #242 verified - an all-`pick` plan is exactly what a non-interactive rebase *is* - so a real
+//!   stop lands in [`rebase`] mode's existing Stopped strip. See
+//!   `render::AdeApp::request_graph_rebase_onto`.
+//!
+//! Agent-to-commit correlation (which agent
 //! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
 //! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
@@ -60,3 +87,4 @@ pub(crate) use state::{
     graph_lane_canvas_width, lane_color, lane_x, local_branch_dim_bg, relative_time,
 };
 pub(crate) use state::{GraphLoadState, GraphRightPanel, GraphRowMenu};
+pub(crate) use state::{GraphMergeFacts, GraphMergeGate};

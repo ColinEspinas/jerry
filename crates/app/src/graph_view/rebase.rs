@@ -353,13 +353,54 @@ impl AdeApp {
     /// uses this same row's commit as `onto`). A no-op for the synthetic "Uncommitted changes"
     /// row (`row.commit.id` is empty there - never a real rebase target).
     pub(crate) fn enter_rebase_mode(&mut self, from_row_index: usize, cx: &mut Context<Self>) {
-        self.graph_state.row_menu_open = None;
         let Some(row) = self.current_graph_row(from_row_index) else {
             return;
         };
         let onto = row.commit.id.clone();
         let onto_short = row.commit.short_id.clone();
+        self.enter_rebase_mode_inner(onto, onto_short, false, cx);
+    }
+
+    /// The shared body of [`Self::enter_rebase_mode`] and the row menu's *non*-interactive
+    /// "Rebase onto this commit" (`crate::graph_view::render::AdeApp::request_graph_rebase_onto`,
+    /// GitHub issue #241).
+    ///
+    /// `auto_start` is the only difference between the two. With it set, a successfully loaded
+    /// plan - which is all-`pick` by construction, since that is exactly what
+    /// [`RebaseActionKind::Pick`] every row starts as means - runs [`Self::start_rebase`]
+    /// immediately instead of waiting on the Planning banner's own `Start rebase` click. That is
+    /// precisely what a non-interactive `git rebase <onto>` *is*: the same replay, with nobody
+    /// editing the todo list in between.
+    ///
+    /// Routing the non-interactive action through here rather than through its own
+    /// `wt_core::rewrite::rebase_onto` call is what gives it GitHub issue #242's real outcome
+    /// handling: a conflict stops in [`RebasePhase::Stopped`], where the existing banner offers
+    /// real `Continue`/`Skip`/`Abort` and `Resolve in the diff view`. Its previous plain
+    /// `git rebase` left the worktree genuinely mid-rebase with nothing in this app able to
+    /// continue, skip or abort it - a real dead end, recoverable only from a terminal.
+    /// Takes the real `onto` commit id (and its short form, for display) rather than a row index,
+    /// so the non-interactive caller does not have to depend on that commit still occupying a
+    /// particular row of the currently loaded graph - a background reload between opening the menu
+    /// and clicking genuinely renumbers rows, while a commit id does not move.
+    pub(in crate::graph_view) fn enter_rebase_mode_inner(
+        &mut self,
+        onto: String,
+        onto_short: String,
+        auto_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_state.row_menu_open = None;
+        self.graph_state.hard_reset_confirm_armed = None;
+        // The synthetic "Uncommitted changes" row carries an empty commit id - never a real
+        // rebase target.
         if onto.is_empty() {
+            return;
+        }
+        if self.graph_state.rebase.is_some() {
+            // A rebase mode is already live (its own banner owns the recovery surface for it) -
+            // starting a second one over the top would strand the first. The interactive entry
+            // point cannot reach this (its row menu is unreachable while rebase mode is showing),
+            // but the non-interactive one is callable from anywhere.
             return;
         }
         let branch = self
@@ -452,6 +493,15 @@ impl AdeApp {
                             .collect();
                         rebase_state.already_on_upstream = already_on_upstream;
                         rebase_state.op_in_flight = false;
+                        // GitHub issue #241: the non-interactive entry point never shows the
+                        // Planning banner at all - the plan just built is all-`pick`, which is
+                        // exactly `git rebase <onto>`, so it runs straight away. Deliberately
+                        // *after* the `rebase_state` borrow above has ended, and after
+                        // `op_in_flight = false`, since `start_rebase` refuses while an op is
+                        // still in flight (its own real double-click guard).
+                        if auto_start {
+                            this.start_rebase(cx);
+                        }
                     }
                     Err(err) => {
                         this.graph_state.status_message =
