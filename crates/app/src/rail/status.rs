@@ -154,8 +154,10 @@ pub enum Status {
 
 impl Status {
     /// Rank used to sort the "by urgency" group order from
-    /// `design_handoff_jerry_ade/README.md`: `Needs input → Failed → Review ready → Running →
-    /// Idle`. Lower sorts first.
+    /// `design_handoff_jerry_ade/README.md`: `Needs input → Failed → Finished → Running →
+    /// Idle`. Lower sorts first. (The README spells that third group `Review ready`; revision 6
+    /// renamed the rendered word to `Finished` - see [`Self::label`] - without touching the
+    /// order itself.)
     pub fn urgency_rank(self) -> u8 {
         match self {
             Status::Ask => 0,
@@ -166,12 +168,19 @@ impl Status {
         }
     }
 
-    /// The label text from the README's status table.
+    /// The label text from the README's status table, with revision 6's one rename applied:
+    /// [`Status::Review`] renders as `Finished`, never `Review ready`
+    /// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4g, GitHub issue #280). The
+    /// old label "states a judgement the agent cannot make", collides with the user's own review
+    /// progress, and contradicts the file's own vocabulary; `Finished` states the fact, and the
+    /// file count rendered beside it (see `crate::rail::render`'s `agent_trailing_text`) carries
+    /// what there is to look at. The *variant* deliberately keeps its `Review` name - the enum is
+    /// an internal identifier, this is only about the rendered string.
     pub fn label(self) -> &'static str {
         match self {
             Status::Ask => "Needs input",
             Status::Fail => "Failed",
-            Status::Review => "Review ready",
+            Status::Review => "Finished",
             Status::Run => "Running",
             Status::Idle => "Idle",
         }
