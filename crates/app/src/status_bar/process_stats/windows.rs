@@ -95,6 +95,14 @@ impl ProcessSampler for Sampler {
         let handle = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
             .or_else(|| ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION))?;
 
+        // The struct's own `cb` field is deliberately left at its `default()` zero rather than
+        // pre-set to the struct size. That is the classic suspicion with this call, so it was
+        // checked rather than assumed: `cb` is an *output* here - the size the callee needs is
+        // the `size` argument below, and `GetProcessMemoryInfo` fills `cb` in on success. The
+        // reference implementation this was checked against is the `sysinfo` crate
+        // (`sysinfo-0.37.2/src/windows/process.rs`), which is exercised on real Windows at
+        // enormous scale and likewise passes a `::default()`-zeroed struct plus the size
+        // argument alone, reading `WorkingSetSize` back out exactly as this does.
         let mut counters = PROCESS_MEMORY_COUNTERS::default();
         let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
 

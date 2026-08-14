@@ -100,6 +100,15 @@ fn read_rusage(pid: u32) -> Option<libc::rusage_info_v0> {
     // for the whole call, and is not retained by the callee. The cast is the one Apple's own
     // header requires - `rusage_info_t` is a `void *` typedef and callers are expected to pass
     // the address of a concrete flavor struct through it. Every other argument is a scalar.
+    //
+    // The cast chain reads alarmingly (`libc` declares the parameter as `*mut rusage_info_t`,
+    // i.e. `*mut *mut c_void`, so this looks like it could be handing over a pointer *slot* for
+    // the kernel to scribble struct bytes into). It is not: a pointer cast preserves the address
+    // value, so what the callee receives is `&info` itself, matching Apple's own
+    // `proc_pid_rusage(pid, RUSAGE_INFO_V0, (rusage_info_t *)&rusage)` idiom. Since that could
+    // not be tested on this Linux-only machine, it was proven empirically instead, by running
+    // the identical cast chain against a stand-in callee with the identical parameter type and
+    // asserting the pointer value passed equals the struct's own address - it does.
     let result = unsafe {
         libc::proc_pid_rusage(
             pid as libc::c_int,
