@@ -216,13 +216,28 @@ pub const TRANSPARENT: Rgba = Rgba {
     a: 0.0,
 };
 
-/// The agent tint `(fg, bg)` for an agent's badge/chip. [`ProcessKind::Shell`] isn't an agent,
-/// so it gets a neutral chip instead of an invented tint.
+/// The agent tint `(fg, bg)` for an agent's badge/chip - the one place an agent is turned into a
+/// colour, so the same agent is the same colour on its rail badge, its CLI tab chip, its Changes
+/// panel run rows and the conflict side headers.
+///
+/// Every tint returned here comes from [`theme::agent`]'s pool, which rev 6 reallocated to satisfy
+/// the reserved-hue rule in `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4a: agent
+/// identity is allocated only *outside* the five structural hue families (amber, violet, green,
+/// red, blue). Claude is copper and Codex is teal; both used to sit inside a reserved family
+/// (amber and green respectively), which is exactly what §4a fixed. See [`theme::agent`]'s own
+/// docs for the full rule and table, and `theme::agent_tint_allocation_tests` for the test that
+/// keeps it true - **map a new agent to a pool tint here rather than inventing a colour**, or that
+/// test will fail.
+///
+/// [`ProcessKind::Shell`] isn't an agent, so it gets a neutral chip rather than an invented tint -
+/// and, deliberately, is not a pool member: a shell has no identity to encode.
 pub fn agent_tint(kind: ProcessKind) -> (Rgba, Rgba) {
     match kind {
+        // copper - `sonnet-4.5` in the mock's own `sessions`.
         ProcessKind::Agent(AgentKind::Claude) => {
             (theme::agent::SONNET.0.into(), theme::agent::SONNET.1.into())
         }
+        // teal - `gpt-5-codex`.
         ProcessKind::Agent(AgentKind::Codex) => {
             (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into())
         }

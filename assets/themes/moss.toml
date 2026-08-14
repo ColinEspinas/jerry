@@ -80,13 +80,10 @@ diagnostic_card_footer = "#292224"  # The Diagnostic popover's own footer band's
 indent_guide        = "#232528"
 indent_guide_active = "#3f5264"  # The guide for a level in the selected file's ancestor chain
 
-# The overlay scrollbar's own colours (GitHub issue #30) - not from design_handoff_jerry_ade
-# (that mockup has no scrollbar spec at all: every scrollable region there relies on raw,
-# invisible browser/OS scrolling), so these are a deliberate, judgment-call derivation from
-# existing neutral tokens rather than a transcription.
+# The overlay scrollbar (GitHub issue #30).
 [scrollbar]
-thumb       = "#373a3e"
-thumb_hover = "#4f5459"
+thumb       = "#2b2f33"
+thumb_hover = "#3a3f44"
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -178,16 +175,43 @@ worktree_active_bg = "#1a1d1f"
 worktree_hover_bg  = "#181a1d"  # Worktree row hover background (§2.2: "hover #16191c").
 prunable_edge      = "#2e3236"
 
-# One tint per agent.
+# One tint per agent - the **agent tint pool**.
 [agent]
-"sonnet.fg" = "#b49555"
-"sonnet.bg" = "#2f2816"
-"codex.fg"  = "#669e77"
-"codex.bg"  = "#213028"
-"haiku.fg"  = "#ab80a1"
-"haiku.bg"  = "#30212d"
-"local.fg"  = "#7586b0"
-"local.bg"  = "#22283a"
+"sonnet.fg" = "#ac7c5b"  # Copper - sonnet-4.5.
+"sonnet.bg" = "#2d2215"  # Copper - sonnet-4.5.
+"codex.fg"  = "#569990"  # Teal - gpt-5-codex.
+"codex.bg"  = "#192d2b"  # Teal - gpt-5-codex.
+"haiku.fg"  = "#8a7faf"  # Periwinkle - haiku-4.5.
+"haiku.bg"  = "#24202e"  # Periwinkle - haiku-4.5.
+"local.fg"  = "#7586b0"  # Steel blue - qwen-local.
+"local.bg"  = "#22283a"  # Steel blue - qwen-local.
+
+# The Changes panel - four stacked, collapsible sections in one scroller
+# (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §1), plus the file row's own
+# seen/unseen and discard states (STAGE-A-CHANGELOG.md §4i).
+[changes]
+edge_uncommitted  = "#3f5264"  # UNCOMMITTED's 2px left edge - what is dirty in the checkout.
+edge_neutral      = "#232528"  # COMMITS' 2px left edge.
+edge_against_main = "#ab80a1"  # AGAINST MAIN's 2px left edge
+section_label     = "#6b7075"  # Section header label - 9.5px/600 uppercase, .08em tracking.
+section_count     = "#45494e"  # Section header count
+section_caret     = "#55595e"  # The section header's own disclosure caret (▾/▸).
+section_stat_add  = "#76aa8b"  # The right-aligned per-section diffstat's +N, 10px mono.
+section_stat_del  = "#a46963"  # The right-aligned per-section diffstat's −N, 10px mono.
+filename_unseen   = "#bec2c6"  # A filename not seen since the agent last changed it
+filename_seen     = "#696e73"  # A filename seen since the agent last changed it
+discard_bg        = "#281a1b"  # The armed Discard? pill's fill.
+discard_border    = "#422623"  # The armed Discard? pill's 1px border.
+discard_fg        = "#ba7972"  # The armed Discard? pill's label.
+
+# Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
+# (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §2).
+[budget]
+ok       = "#76aa8b"  # Above 40% remaining.
+warn     = "#a88954"  # 15-40% remaining.
+critical = "#a46963"  # Below 15% remaining.
+track    = "#232528"  # The unfilled remainder of the meter
+stale    = "#606469"
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -291,26 +315,28 @@ link_underline_hover = "#7191ae"
 # The integrated terminal's own rendered-content palette - the colours a program running inside
 # a terminal pane actually paints its characters with.
 [terminal]
-background = "#101213"  # The terminal pane's own fill
-foreground = "#92969b"  # Unstyled output
-cursor     = "#5c86b0"  # What NamedColor::Cursor resolves to
-selection  = "#293644"  # The fill painted behind a selected cell
-"ansi.0"   = "#000000"
-"ansi.1"   = "#cd3131"
-"ansi.2"   = "#0dbc79"
-"ansi.3"   = "#e5e510"
-"ansi.4"   = "#2472c8"
-"ansi.5"   = "#bc3fbc"
-"ansi.6"   = "#11a8cd"
-"ansi.7"   = "#e5e5e5"
-"ansi.8"   = "#666666"
-"ansi.9"   = "#f14c4c"
-"ansi.10"  = "#23d18b"
-"ansi.11"  = "#f5f543"
-"ansi.12"  = "#3b8eea"
-"ansi.13"  = "#d670d6"
-"ansi.14"  = "#29b8db"
-"ansi.15"  = "#ffffff"
+background     = "#101213"  # The terminal pane's own fill
+foreground     = "#92969b"  # Unstyled output
+cursor         = "#5c86b0"  # What NamedColor::Cursor resolves to
+selection      = "#293644"  # The fill painted behind a selected cell
+spawn_error    = "#d16a63"
+process_exited = "#d3b26c"  # The process exited label, once the child is gone.
+"ansi.0"       = "#000000"
+"ansi.1"       = "#cd3131"
+"ansi.2"       = "#0dbc79"
+"ansi.3"       = "#e5e510"
+"ansi.4"       = "#2472c8"
+"ansi.5"       = "#bc3fbc"
+"ansi.6"       = "#11a8cd"
+"ansi.7"       = "#e5e5e5"
+"ansi.8"       = "#666666"
+"ansi.9"       = "#f14c4c"
+"ansi.10"      = "#23d18b"
+"ansi.11"      = "#f5f543"
+"ansi.12"      = "#3b8eea"
+"ansi.13"      = "#d670d6"
+"ansi.14"      = "#29b8db"
+"ansi.15"      = "#ffffff"
 
 # Exact colours for Surface C's real Completions popup item rows - read directly from
 # design_handoff_jerry_ade/revision/Jerry.dc.html's own completions/KBG/KFG data (the sel ? ...
@@ -451,3 +477,10 @@ local_border = "#232528"  # Defaults to border::DIVIDER's own value.
 "css.bg"     = "#2a1f27"  # "css"
 "unknown.fg" = "#606469"
 "unknown.bg" = "#232629"
+
+# The status bar's three type tiers (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md
+# §3).
+[status_bar]
+primary   = "#94989e"  # Tier 1
+recessive = "#45494e"  # Tier 3
+divider   = "#2b2f33"  # The 1px, 13-high rules between tiers.

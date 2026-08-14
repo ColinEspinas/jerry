@@ -49,7 +49,9 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ("Text", &["text"]),
     (
         "Meaning and state (colour carries information here)",
-        &["status", "diff", "tag", "rail", "agent"],
+        &[
+            "status", "diff", "tag", "rail", "agent", "changes", "budget",
+        ],
     ),
     (
         "The code surface",
@@ -58,7 +60,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Chrome and widgets",
         &[
-            "button", "toggle", "settings", "palette", "graph", "env", "lang",
+            "button",
+            "toggle",
+            "settings",
+            "palette",
+            "graph",
+            "env",
+            "lang",
+            "status_bar",
         ],
     ),
 ];
@@ -503,10 +512,20 @@ mod tests {
         assert!(is_uninformative("fg"));
         assert!(!is_uninformative("window body"));
         assert!(!is_uninformative("needs input"));
-        assert_eq!(
-            key_note("agent.sonnet.fg"),
-            None,
-            "`(fg, bg)` tells a theme author nothing the key doesn't already say"
+        // `agent::SONNET` still carries the trailing `// (fg, bg)` this filter exists to reject.
+        // It used to be that token's only comment, so the key came out bare; rev 6 gave the agent
+        // tints real doc comments, so the note now falls through to the doc instead. Both halves
+        // matter: the useless trailing comment must not win, and the useful doc must.
+        let note =
+            key_note("agent.sonnet.fg").expect("agent::SONNET's doc comment is the fallback");
+        assert!(
+            !is_uninformative(note),
+            "`(fg, bg)` tells a theme author nothing the key doesn't already say, but it won \
+             anyway - the filter is no longer being applied to trailing comments"
+        );
+        assert!(
+            note.contains("Copper"),
+            "expected agent::SONNET's own doc comment to supply the note, got {note:?}"
         );
     }
 
