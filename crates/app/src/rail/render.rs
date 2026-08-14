@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::plural;
 use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,7 +41,7 @@ fn agent_trailing_text(agent: &AgentRow) -> String {
             .unwrap_or_default(),
         Status::Review => agent
             .review_file_count
-            .map(|count| format!("{count} file{}", if count == 1 { "" } else { "s" }))
+            .map(|count| plural::count(count, "file", None))
             .unwrap_or_default(),
         Status::Idle => format!("resumable \u{b7} {}", rail::format_elapsed(agent.elapsed)),
     }
@@ -515,10 +516,7 @@ impl AdeApp {
 
         if !self.prune_confirm_armed {
             self.prune_confirm_armed = true;
-            self.prune_status = Some(format!(
-                "click prune again to remove {} worktree(s)",
-                candidates.len()
-            ));
+            self.prune_status = Some(rail::prune_confirm_label(candidates.len()));
             cx.notify();
             return;
         }
@@ -550,7 +548,7 @@ impl AdeApp {
         }
         let repo_path = self.focused_repo_path();
         self.prune_in_flight = true;
-        self.prune_status = Some(format!("pruning {} worktree(s)...", candidates.len()));
+        self.prune_status = Some(rail::pruning_label(candidates.len()));
         cx.notify();
 
         let task = cx.spawn(async move |this, cx| {
@@ -576,7 +574,7 @@ impl AdeApp {
                 this.prune_in_flight = false;
                 let (removed, errors) = outcome;
                 this.prune_status = Some(if errors.is_empty() {
-                    format!("pruned {removed} worktree(s)")
+                    rail::pruned_label(removed)
                 } else {
                     format!(
                         "pruned {removed}; {} failed: {}",
@@ -1816,7 +1814,7 @@ impl AdeApp {
                 let status = self
                     .prune_status
                     .clone()
-                    .unwrap_or_else(|| format!("{worktree_count} worktrees \u{b7} {disk_label}"));
+                    .unwrap_or_else(|| rail::worktree_disk_label(worktree_count, &disk_label));
                 div()
                     .id("rail-footer-status")
                     .min_w_0()
@@ -1838,6 +1836,47 @@ impl AdeApp {
 /// all four `Self::request_prune` calls landing before the first batch's
 /// `wt_core::remove_worktree` has run - must leave exactly one batch in flight, never two
 /// racing ones sharing `Self::_prune_task`.
+/// The rail agent row's review-ready file count (§2.3's `12 files` trailing text), which the
+/// design calls out as needing "singular and plural both, everywhere" (GitHub issue #281).
+#[cfg(test)]
+mod agent_trailing_text_count_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn review_row(review_file_count: Option<usize>) -> AgentRow {
+        AgentRow {
+            id: 1,
+            kind: ProcessKind::claude(),
+            title: "agent-a".to_string(),
+            cwd: std::path::PathBuf::from("/a"),
+            status: Status::Review,
+            branch: Some("feature-x".to_string()),
+            add: 0,
+            del: 0,
+            question_preview: None,
+            exit_code: None,
+            activity: None,
+            elapsed: Duration::ZERO,
+            review_file_count,
+        }
+    }
+
+    #[test]
+    fn review_file_count_conjugates_at_zero_one_and_two() {
+        assert_eq!(agent_trailing_text(&review_row(Some(0))), "0 files");
+        assert_eq!(agent_trailing_text(&review_row(Some(1))), "1 file");
+        assert_eq!(agent_trailing_text(&review_row(Some(2))), "2 files");
+        assert_eq!(agent_trailing_text(&review_row(Some(12))), "12 files");
+    }
+
+    /// No count at all is still an empty string, not `"0 files"` - the absence of a measurement
+    /// and a measured zero are different facts, and only the latter is a conjugation case.
+    #[test]
+    fn an_unmeasured_review_row_has_no_trailing_text() {
+        assert_eq!(agent_trailing_text(&review_row(None)), "");
+    }
+}
+
 #[cfg(test)]
 mod prune_regression_tests {
     use super::*;

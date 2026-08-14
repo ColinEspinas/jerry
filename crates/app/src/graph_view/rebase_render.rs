@@ -9,6 +9,7 @@ use super::rebase::{
     RebaseActionKind, RebaseModeState, RebasePhase, ResultBlock, ResultBlockStatus,
 };
 use super::*;
+use crate::root::plural;
 use gpui::{DragMoveEvent, KeyDownEvent};
 use wt_core::rebase::RebaseOutcome;
 
@@ -157,7 +158,7 @@ impl AdeApp {
                             .font(font(theme::font::MONO))
                             .text_size(px(10.5))
                             .text_color(theme::text::DIM)
-                            .child(format!("{n} \u{2192} {m} commits")),
+                            .child(format!("{n} \u{2192} {}", plural::count(m, "commit", None))),
                     )
                     .child(
                         render_rebase_button("Cancel", false, enabled).when(enabled, |el| {
@@ -252,8 +253,8 @@ impl AdeApp {
                         .text_size(px(10.5))
                         .text_color(theme::status::FAIL)
                         .child(format!(
-                            "stopped at {stopped_at} of {total} \u{b7} {} conflict(s) in {file_label}",
-                            conflicted_files.len()
+                            "stopped at {stopped_at} of {total} \u{b7} {} in {file_label}",
+                            plural::count(conflicted_files.len(), "conflict", None)
                         )),
                 )
                 .child(div().flex_1())
@@ -636,8 +637,9 @@ impl AdeApp {
                             .text_size(px(10.0))
                             .text_color(theme::text::DIM)
                             .child(format!(
-                                "{} \u{2192} {count} commits",
-                                rebase_state.plan.len()
+                                "{} \u{2192} {}",
+                                rebase_state.plan.len(),
+                                plural::count(count, "commit", None)
                             )),
                     ),
             );
@@ -685,8 +687,9 @@ impl AdeApp {
         let enabled = !op_in_flight;
         Some(
             render_rebase_warning_shell(format!(
-                "{running} agent(s) running in this worktree - a rebase rewrites files under \
-                 them."
+                "{} running in this worktree - a rebase rewrites files under {}.",
+                plural::count(running, "agent", None),
+                plural::form(running, "it", "them")
             ))
             .child(
                 div()
@@ -761,8 +764,11 @@ fn render_rebase_result_block(block: &ResultBlock) -> gpui::AnyElement {
                     .text_color(theme::text::GHOST)
                     .child(match (block.folded_count, status_label) {
                         (0, Some(status)) => status.to_string(),
-                        (n, Some(status)) => format!("{n} commits folded in \u{b7} {status}"),
-                        (n, None) => format!("{n} commits folded in"),
+                        (n, Some(status)) => format!(
+                            "{} folded in \u{b7} {status}",
+                            plural::count(n, "commit", None)
+                        ),
+                        (n, None) => format!("{} folded in", plural::count(n, "commit", None)),
                     }),
             )
         })
@@ -776,8 +782,10 @@ fn render_rebase_remote_warning(rebase_state: &RebaseModeState) -> Option<gpui::
     }
     Some(
         render_rebase_warning_shell(format!(
-            "{count} commit(s) in this plan are already on the tracked remote branch - a \
-             force-with-lease push will be needed afterward."
+            "{} in this plan {} already on the tracked remote branch - a force-with-lease push \
+             will be needed afterward.",
+            plural::count(count, "commit", None),
+            plural::form(count, "is", "are")
         ))
         .into_any_element(),
     )
@@ -790,8 +798,9 @@ fn render_rebase_stop_count_warning(rebase_state: &RebaseModeState) -> Option<gp
     }
     Some(
         render_rebase_warning_shell(format!(
-            "Stops {n} time(s) - each `edit` row and each message-less `reword` row hands \
-             control back to you before the rebase continues."
+            "Stops {} - each `edit` row and each message-less `reword` row hands control back \
+             to you before the rebase continues.",
+            plural::count(n, "time", None)
         ))
         .into_any_element(),
     )

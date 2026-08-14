@@ -9,7 +9,9 @@
 //! the genuinely cross-zone mechanics: focus/overlay discipline ([`focus`], [`OverlayFocus`]), pane resizing
 //! ([`resize`] plus its pure width-clamp half, [`layout`]), the scoped rem-size override
 //! Surface C's zoom paints through ([`rem_scope`]), the shared keycap/chip/message widgets
-//! ([`widgets`]), the background-task slot type ([`task_pool`]), and the "New file" prompt
+//! ([`widgets`]), the app-wide pluralisation helper every counter in the window conjugates
+//! through ([`plural`] - see its module docs for the rule, which is binding on new code), the
+//! background-task slot type ([`task_pool`]), and the "New file" prompt
 //! ([`new_file`]), which is an overlay reachable from two different zones and so belongs to
 //! neither.
 //!
@@ -4726,6 +4728,7 @@ pub mod layout;
 pub(crate) mod menu_commands;
 pub(crate) mod menus;
 pub(crate) mod new_file;
+pub(crate) mod plural;
 pub(crate) mod rem_scope;
 pub(crate) mod resize;
 pub(crate) mod scrollbar;

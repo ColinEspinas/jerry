@@ -61,6 +61,7 @@ use crate::code_surface::lsp_ui::{
 };
 use crate::code_surface::symbols;
 use crate::lsp::diagnostics as diagnostics_view;
+use crate::root::plural;
 use crate::root::{
     AdeApp, EditorBackspace, EditorCollapseCursors, EditorCopy, EditorCut, EditorDedent,
     EditorDelete, EditorDown, EditorEnd, EditorEnter, EditorEscape, EditorHome, EditorIndent,
@@ -1606,8 +1607,8 @@ fn render_fold_marker(hidden_count: usize, line_number: usize) -> impl IntoEleme
         // marker documents.
         .text_size(gpui::rems(0.85))
         .child(format!(
-            "\u{22ef} {hidden_count} line{}",
-            if hidden_count == 1 { "" } else { "s" }
+            "\u{22ef} {}",
+            plural::count(hidden_count, "line", None)
         ))
 }
 

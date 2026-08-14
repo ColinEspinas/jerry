@@ -6,6 +6,7 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use crate::root::plural;
 
 /// Half-diagonal of an 11×1px rect rotated ±45° about its own center - `5.5 * cos(45°)`. Used to
 /// place the close glyph's two crossing strokes (see [`render_close_glyph`]).
@@ -423,18 +424,23 @@ fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, String)> {
 /// ("No two counters in the window may share wording while counting different units"), and
 /// pluralizes correctly at exactly 1 vs 2+ - `Status::Ask` conjugates its verb too (`"1 agent
 /// needs input"` vs `"2 agents need input"`), matching the design's own two example counts.
+///
+/// Both halves of that agreement come from [`crate::root::plural`]: the noun via
+/// [`plural::count`], the verb via [`plural::form`]. This is the sentence-conjugation case
+/// rev 6 §7 rule 9 calls out, and it deliberately goes through the same helper as every bare
+/// `"N files"` in the window rather than keeping its own `== 1` test.
 fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<String> {
     if count == 0 {
         return None;
     }
-    let agents = if count == 1 { "agent" } else { "agents" };
+    let agents = plural::count(count, "agent", None);
     match status {
-        Status::Ask => {
-            let verb = if count == 1 { "needs" } else { "need" };
-            Some(format!("{count} {agents} {verb} input"))
-        }
-        Status::Fail => Some(format!("{count} {agents} failed")),
-        Status::Run => Some(format!("{count} {agents} running")),
+        Status::Ask => Some(format!(
+            "{agents} {} input",
+            plural::form(count, "needs", "need")
+        )),
+        Status::Fail => Some(format!("{agents} failed")),
+        Status::Run => Some(format!("{agents} running")),
         Status::Review | Status::Idle => None,
     }
 }

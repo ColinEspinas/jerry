@@ -57,6 +57,18 @@ crates already follow everywhere, and new code is expected to match them:
   CLI (worktree add/remove, merges) — see that crate's module docs. This matters for
   correctness (filenames with spaces/quotes) as much as safety; don't build git commands
   by formatting a string.
+- **Every user-visible count goes through the pluralisation helper; never inline a ternary.**
+  `crates/app/src/root/plural.rs` is the one place that decides singular vs plural. Write
+  `plural::count(n, "file", None)` (or `Some("matches")` for an irregular plural), and
+  `plural::form(n, "needs", "need")` for anything else in the sentence that has to agree with
+  the number — a verb, an auxiliary, a pronoun. Do not write `if n == 1 { "" } else { "s" }`
+  at the call site, and do not hardcode the plural noun (`format!("{n} agents")`), which is
+  the same bug wearing a disguise: the single-item case is usually the *common* one, so those
+  labels sat on screen reading `1 agents` / `1 servers · 1 errors`. Zero is plural in English
+  (`0 files`), and the helper already knows that; hiding a counter at zero, or saying
+  something qualitatively different there (`"nothing unreviewed"`), stays the call site's own
+  decision. Labels with no noun to agree with (`3 wt`, `12 shown`, `hunk 2 of 5`) have nothing
+  to conjugate and are left alone. See that module's docs for the full rule and its rationale.
 - **No fake functionality.** No UI element bound to hardcoded/sample data standing in for
   a real data source, no simulated command output, no button that looks wired up but
   isn't. If a subsystem genuinely isn't built yet, the convention in this codebase is to

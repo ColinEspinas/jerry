@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use wt_core::diff::WorktreeDiff;
 use wt_core::review::UntrackedCoverage;
 
+use crate::root::plural;
 use crate::work_surface::agents::AgentKind;
 
 /// Why a baseline is where it is - the two, and only two, real ways a baseline is ever set
@@ -315,8 +316,7 @@ pub fn review_summary_label(review: &AgentReview) -> String {
         ReviewLoadState::Error(_) => "review unavailable".to_string(),
         ReviewLoadState::Loaded(diff) => match diff.files.len() {
             0 => "nothing unreviewed".to_string(),
-            1 => "1 file unreviewed".to_string(),
-            count => format!("{count} files unreviewed"),
+            count => format!("{} unreviewed", plural::count(count, "file", None)),
         },
     }
 }
@@ -443,6 +443,36 @@ mod tests {
         });
         assert!(review.diff().is_some());
         assert_eq!(review_summary_label(&review), "nothing unreviewed");
+    }
+
+    /// The Review strip's own count, conjugated through [`crate::root::plural`] rather than the
+    /// per-count match arms it used to spell out by hand (GitHub issue #281).
+    #[test]
+    fn review_summary_label_conjugates_at_zero_one_and_two() {
+        let label_for = |file_count: usize| {
+            let mut review = AgentReview::new(baseline(BaselineReason::Spawn, 0));
+            review.load = ReviewLoadState::Loaded(WorktreeDiff {
+                base_branch: "since it started".to_string(),
+                base_commit: "a".repeat(40),
+                files: (0..file_count)
+                    .map(|i| wt_core::diff::DiffFile {
+                        path: PathBuf::from(format!("f{i}.rs")),
+                        old_path: None,
+                        status: wt_core::diff::FileChangeStatus::Modified,
+                        is_binary: false,
+                        hunks: Vec::new(),
+                        truncated: false,
+                    })
+                    .collect(),
+                truncated: false,
+            });
+            review_summary_label(&review)
+        };
+        // Zero is the qualitatively different "nothing" wording, not a conjugation case.
+        assert_eq!(label_for(0), "nothing unreviewed");
+        assert_eq!(label_for(1), "1 file unreviewed");
+        assert_eq!(label_for(2), "2 files unreviewed");
+        assert_eq!(label_for(7), "7 files unreviewed");
     }
 
     /// Advancing the baseline must drop everything that described the old one - keeping a loaded

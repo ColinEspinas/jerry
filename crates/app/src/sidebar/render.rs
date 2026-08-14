@@ -1,5 +1,6 @@
 use super::*;
 use crate::keymap;
+use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
     hover_bg, menu_popover_chrome, render_committed_tag, render_keycap_row,
@@ -373,8 +374,8 @@ impl AdeApp {
 
         self.worktree_history_op_in_flight = Some(worktree_history::WorktreeHistoryOpKind::Commit);
         self.worktree_history_status = Some(format!(
-            "committing {file_count} file{} in {branch_display}\u{2026}",
-            if file_count == 1 { "" } else { "s" }
+            "committing {} in {branch_display}\u{2026}",
+            plural::count(file_count, "file", None)
         ));
         cx.notify();
 
@@ -392,8 +393,8 @@ impl AdeApp {
                 match result {
                     Ok(_outcome) => {
                         this.worktree_history_status = Some(format!(
-                            "committed {file_count} file{} in {branch_display}",
-                            if file_count == 1 { "" } else { "s" }
+                            "committed {} in {branch_display}",
+                            plural::count(file_count, "file", None)
                         ));
                         for path in &paths {
                             this.staged_files.remove(path);
@@ -1080,7 +1081,7 @@ impl AdeApp {
                 vec![entry.path.clone()]
             };
             let label = if drag_paths.len() > 1 {
-                format!("{} items", drag_paths.len())
+                plural::count(drag_paths.len(), "item", None)
             } else {
                 entry.name.clone()
             };
@@ -1554,7 +1555,7 @@ impl AdeApp {
     /// "how many of those staged files is the next commit about to include" (today the same set,
     /// but a distinct question).
     ///
-    /// The `N file(s)` label counts every row the list really paints, but the progress bar's
+    /// The `N files` label counts every row the list really paints, but the progress bar's
     /// denominator is the *stageable* subset (`changes::stageable_count`): a committed-clean file
     /// (GitHub issue #220) is a real row with genuinely nothing left to stage, so counting it
     /// against the bar would pin a fully-staged worktree short of full forever.
@@ -1599,7 +1600,7 @@ impl AdeApp {
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::DIM)
-                    .child(format!("{total} file{}", if total == 1 { "" } else { "s" })),
+                    .child(plural::count(total, "file", None)),
             )
             .child(
                 div()

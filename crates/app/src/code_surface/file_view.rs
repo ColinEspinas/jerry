@@ -10,6 +10,7 @@ use super::*;
 use crate::lsp::client::{lsp_file_status, LspFileStatus};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use crate::root::plural;
 use crate::root::widgets::render_sidebar_message;
 use std::collections::HashSet;
 
@@ -1630,7 +1631,11 @@ fn lsp_status_label(status: &LspFileStatus, binary: Option<&str>) -> (gpui::Rgba
             let label = if *errors == 0 && *warnings == 0 {
                 format!("{binary}: no diagnostics")
             } else {
-                format!("{binary}: {errors} errors, {warnings} warnings")
+                format!(
+                    "{binary}: {}, {}",
+                    plural::count(*errors, "error", None),
+                    plural::count(*warnings, "warning", None)
+                )
             };
             (color.into(), label)
         }
@@ -1764,8 +1769,30 @@ mod lsp_status_label_tests {
                 binary_for("vue")
             )
             .1,
-            "vue-language-server: 2 errors, 1 warnings"
+            "vue-language-server: 2 errors, 1 warning"
         );
+    }
+
+    /// Both diagnostic counts conjugate, and they conjugate *independently* (GitHub issue
+    /// #281). This label used to hardcode both plurals, so the single-error/single-warning
+    /// case - much the most common one while actually editing - read `1 errors, 1 warnings`.
+    #[test]
+    fn diagnostic_counts_conjugate_independently_at_zero_one_and_two() {
+        let label = |errors: usize, warnings: usize| {
+            lsp_status_label(
+                &LspFileStatus::Analyzed { errors, warnings },
+                binary_for("rs"),
+            )
+            .1
+        };
+        // 0/0 is the qualitatively different "no diagnostics" state, not a conjugation case.
+        assert_eq!(label(0, 0), "rust-analyzer: no diagnostics");
+        assert_eq!(label(1, 0), "rust-analyzer: 1 error, 0 warnings");
+        assert_eq!(label(0, 1), "rust-analyzer: 0 errors, 1 warning");
+        assert_eq!(label(1, 1), "rust-analyzer: 1 error, 1 warning");
+        assert_eq!(label(2, 1), "rust-analyzer: 2 errors, 1 warning");
+        assert_eq!(label(1, 2), "rust-analyzer: 1 error, 2 warnings");
+        assert_eq!(label(2, 2), "rust-analyzer: 2 errors, 2 warnings");
     }
 
     /// The specific bug this issue's own new `LspConnection::liveness_failure_reason` made

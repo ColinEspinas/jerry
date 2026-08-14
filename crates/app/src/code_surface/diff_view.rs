@@ -5,6 +5,7 @@ use super::zoom::zoom_scoped;
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use crate::root::plural;
 use crate::root::widgets::render_sidebar_message;
 use std::rc::Rc;
 
@@ -579,8 +580,8 @@ pub(in crate::code_surface) fn render_fold_marker(
         .text_size(rems(0.85))
         .text_color(theme::diff::FOLD_FG)
         .child(format!(
-            "\u{22ef} {gap} unchanged line{}",
-            if gap == 1 { "" } else { "s" }
+            "\u{22ef} {}",
+            plural::count(gap, "unchanged line", None)
         ))
 }
 

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
 
+use crate::root::plural;
 use crate::theme;
 use wt_core::diff::{DiffFile, DiffHunk, DiffLineKind, FileChangeStatus};
 
@@ -280,10 +281,7 @@ pub fn commit_button_label(staged_count: usize) -> String {
     if staged_count == 0 {
         "Commit".to_string()
     } else {
-        format!(
-            "Commit {staged_count} file{}",
-            if staged_count == 1 { "" } else { "s" }
-        )
+        format!("Commit {}", plural::count(staged_count, "file", None))
     }
 }
 
@@ -296,7 +294,7 @@ pub fn draft_commit_message(staged: &[&DiffFile]) -> String {
     match staged {
         [] => String::new(),
         [only] => format!("Update {}", only.path.display()),
-        many => format!("Update {} files", many.len()),
+        many => format!("Update {}", plural::count(many.len(), "file", None)),
     }
 }
 
@@ -804,6 +802,7 @@ mod tests {
 
     #[test]
     fn commit_button_label_is_plural_for_more_than_one_staged_file() {
+        assert_eq!(commit_button_label(2), "Commit 2 files");
         assert_eq!(commit_button_label(3), "Commit 3 files");
     }
 
