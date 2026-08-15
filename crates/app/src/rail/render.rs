@@ -5245,3 +5245,237 @@ mod rail_rev6_render_tests {
         );
     }
 }
+
+/// Proves GitHub issue #364's real fix: with many worktrees open, [`AdeApp::render_rail_list`]
+/// used to build every worktree row unconditionally, on every render, regardless of scroll
+/// position - which is why hovering was slow, since GPUI's own `.hover()` forces a full
+/// `Window::refresh()` (and a refresh bypasses every view's own per-entity render cache) on every
+/// hover-region transition. Mirrors `crate::sidebar::render::virtualization_tests` exactly, the
+/// same real black-box proof this app already trusts for the file tree's own virtualized
+/// `uniform_list`: absence/presence of a real painted element, not an internal call counter,
+/// because that is the one thing a regression in this exact area (an eager `.children(...)` tree
+/// standing in for real virtualization again) cannot fake past.
+#[cfg(test)]
+mod rail_virtualization_tests {
+    use super::*;
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Deliberately more rows than any plausible test viewport can show at 27px each, mirroring
+    /// `crate::sidebar::render::virtualization_tests`' own 300-file tree fixture - "dozens to
+    /// hundreds" per the live report this issue is about.
+    const ROW_COUNT: usize = 120;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// Seeds [`ROW_COUNT`] real, distinct worktree entries directly onto `app.worktrees` - real
+    /// on-disk directories (so every row's own path is real, not merely syntactically valid), but
+    /// without the real `git worktree add` process spawn each of ~120 real linked worktrees would
+    /// cost: `Self::build_repo_groups`/`rail::flatten_rail_list_items`/`Self::render_rail_list`
+    /// never distinguish "loaded from a real `git worktree list` porcelain scan" from "seeded
+    /// directly" - both paths converge on the exact same `WorktreeItem`/`WorktreeRow`/`RepoGroup`
+    /// types this file's own `rail_row_tests`/`prune_regression_tests` already seed the same way
+    /// for their own synthetic fixtures. Returns every seeded path in seed order; the caller owns
+    /// `keepalive` so the real `TempDir`s (and the directories they hold open) outlive the test.
+    fn seed_many_worktrees(app: &mut AdeApp, keepalive: &mut Vec<TempDir>) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(ROW_COUNT);
+        let mut items = Vec::with_capacity(ROW_COUNT);
+        for index in 0..ROW_COUNT {
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().to_path_buf();
+            keepalive.push(dir);
+            items.push(worktree_item(path.clone(), &format!("wt-{index:03}")));
+            paths.push(path);
+        }
+        app.worktrees = items;
+        paths
+    }
+
+    /// The real `worktree-row-{index}-{path}` `debug_selector`
+    /// [`AdeApp::render_worktree_row`] paints its header under, resolved the same defensive way
+    /// `crate::rail::menu_render`'s own `worktree_row_selector` test helper does: `index` is
+    /// [`rail::WorktreeRow::urgency_rank`]'s real sort position, never the seed order, so this
+    /// asks the live render for it rather than assuming one.
+    fn worktree_row_selector(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        worktree_path: &Path,
+    ) -> &'static str {
+        let index = app
+            .update(cx, |app, cx| app.build_repo_groups(cx))
+            .iter()
+            .find_map(|group| group.rows.iter().position(|row| row.path == worktree_path))
+            .expect("the worktree must be a real, rendered rail row");
+        Box::leak(format!("worktree-row-{index}-{}", worktree_path.display()).into_boxed_str())
+    }
+
+    /// Before this fix, this row would have painted too: `Self::render_rail_list` built every
+    /// worktree row unconditionally, regardless of scroll position. `crate::sidebar::render::
+    /// virtualization_tests::a_file_tree_row_far_below_the_viewport_is_never_painted`'s own docs
+    /// record the same class of measurement for the file tree - "~145ms of a ~200ms `Window::
+    /// draw`" - before *that* surface's equivalent fix.
+    #[gpui::test]
+    fn a_worktree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        // Small enough that `ROW_COUNT` rows at 27px each genuinely overflow the rail's own
+        // viewport many times over - the same reasoning `crate::rail::menu_render`'s own
+        // `scrolling_the_rail_does_not_move_or_clip_an_open_menu` resizes for.
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let first = worktree_row_selector(&app, cx, &paths[0]);
+        let far_below = worktree_row_selector(&app, cx, &paths[ROW_COUNT - 1]);
+
+        assert!(
+            cx.debug_bounds(first).is_some(),
+            "the first worktree row must really paint - if it doesn't, this test proves \
+             nothing about virtualization, only that the rail is empty"
+        );
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "the {ROW_COUNT}th worktree row is far below any plausible viewport, so a real \
+             virtualized list must never build it as an element at all"
+        );
+    }
+
+    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
+    /// must still be reachable by scrolling - mirrors `crate::sidebar::render::
+    /// virtualization_tests::scrolling_the_virtualized_file_tree_materializes_a_row_that_was_not_painted`
+    /// exactly, including its "a deliberately huge delta needs no row-height/viewport-size model
+    /// of its own" reasoning: `gpui::ListState` clamps to its own real maximum scroll offset.
+    #[gpui::test]
+    fn scrolling_the_virtualized_rail_materializes_a_row_that_was_not_painted(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let far_path = paths[ROW_COUNT - 1].clone();
+        let far_below = worktree_row_selector(&app, cx, &far_path);
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before scrolling"
+        );
+
+        // `gpui::ListState::scroll_to_reveal_item`, not a simulated wheel delta: unlike
+        // `uniform_list` (every row the same measured height, so its own real maximum scroll
+        // offset is known upfront), `gpui::list`'s rows are genuinely variable height and mostly
+        // unmeasured this far below the fold, so a single huge wheel delta clamps against
+        // whatever total height it has measured *so far* (near-zero, with only the first
+        // viewport's worth of rows ever rendered) rather than the real end of a `ROW_COUNT`-row
+        // list - the real, gpui-native "jump to an item by index regardless of whether its
+        // height has ever been measured" API is this one.
+        let target_index = app.update(cx, |app, cx| {
+            let groups = app.build_repo_groups(cx);
+            let items = rail::flatten_rail_list_items(&groups, |row| app.worktree_is_expanded(row));
+            items
+                .iter()
+                .position(|item| match item {
+                    rail::RailListItem::WorktreeRow {
+                        group_index,
+                        row_index,
+                    } => groups[*group_index].rows[*row_index].path == far_path,
+                    _ => false,
+                })
+                .expect("the far-below worktree must be a real flattened list item")
+        });
+        // One `scroll_to_reveal_item` call only gets as far as `gpui::ListState` can compute from
+        // what it has *already measured* - real, unlike `uniform_list`'s single known row height,
+        // items past whatever the viewport has ever shown are still `Unmeasured` (contributing no
+        // real height to its running total yet), so revealing an item this far past the fold
+        // takes the same real incremental steps a user dragging the scrollbar all the way down
+        // would drive: each call measures a little further, which is what the next call's own
+        // computation then has to work with. `ROW_COUNT` calls is a generous, real upper bound
+        // (this fixture never needs more than a handful in practice), not a magic constant.
+        for _ in 0..ROW_COUNT {
+            app.update(cx, |app, cx| {
+                app.rail_list_state.scroll_to_reveal_item(target_index);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.debug_bounds(far_below).is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            cx.debug_bounds(far_below).is_some(),
+            "scrolling to reveal the last row must really materialize it - if this fails the \
+             list is not scrollable any more, which is a far worse regression than the render \
+             cost this change set out to fix"
+        );
+    }
+
+    /// The live report itself, made falsifiable: hovering a row that is really on screen must
+    /// never materialize one that is not, even though GPUI's own `.hover()` forces a full
+    /// `Window::refresh()` on the transition (`crate::rail::state::RailListItem`'s own docs on
+    /// exactly why that refresh alone doesn't bound the work without real virtualization
+    /// underneath it). Before this fix this assertion would have failed outright: every row,
+    /// including this one, was built on every render, hover-triggered refreshes included.
+    #[gpui::test]
+    fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let first_row = worktree_row_selector(&app, cx, &paths[0]);
+        let far_below = worktree_row_selector(&app, cx, &paths[ROW_COUNT - 1]);
+        let first_bounds = cx
+            .debug_bounds(first_row)
+            .expect("the first worktree row must really paint");
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before any hover"
+        );
+
+        // A real hover-region transition: away from every row first (so entering the first row's
+        // own hitbox is a genuine transition, the one GPUI's own `.hover()` reacts to by calling
+        // `Window::refresh()`), then onto it.
+        cx.simulate_mouse_move(gpui::point(px(1.0), px(1.0)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(first_bounds.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "hovering a row that is really on screen must not materialize one that is not - a \
+             hover-triggered `Window::refresh()` bypassing every view's per-entity render cache \
+             (see `crate::rail::state::RailListItem`'s own docs) is exactly what made the rail \
+             slow to hover with many rows open before this fix, and exactly what real \
+             virtualization has to stay correct under"
+        );
+    }
+}
