@@ -22,36 +22,28 @@ Servers, Themes).
 ## Status
 
 A working prototype, not a released product — see [open issues](../../issues) for what's rough or
-in progress. Built primarily through AI-agent-driven development sessions. GPUI's Linux backend
-compiles both the `wayland` and `x11` features and picks between them at runtime from
-`$WAYLAND_DISPLAY`/`$DISPLAY`; macOS has been run locally on Apple Silicon; Windows is currently
-build-verified in CI only.
+in progress. GPUI's Linux backend compiles both the `wayland` and `x11` features and picks between
+them at runtime from `$WAYLAND_DISPLAY`/`$DISPLAY`; macOS has been run locally on Apple Silicon;
+Windows is currently build-verified in CI only.
 
-## Install
+## Quick start
 
-Prebuilt binaries for Linux, macOS, and Windows are attached to each
-[release](../../releases/latest) (`jerry-linux.tar.gz`, `jerry-macos.tar.gz`,
-`jerry-windows.zip`). Otherwise, build from source below.
+**Prebuilt binary** — grab `jerry-linux.tar.gz`, `jerry-macos.tar.gz`, or `jerry-windows.zip` from
+the [latest release](../../releases/latest).
 
-## The stack
+**From source:**
 
-- **Rust**, pinned to the exact toolchain in [`rust-toolchain.toml`](rust-toolchain.toml).
-- **[GPUI](https://www.gpui.rs/)** for the UI, a plain git dependency on
-  [zed-industries/zed](https://github.com/zed-industries/zed) pinned to a specific commit (see
-  [below](#gpui-version-pin)) — Cargo fetches it like any other dependency.
-- **[`alacritty_terminal`](https://github.com/zed-industries/alacritty)** (the same fork/revision
-  Zed's own `terminal` crate uses) for ANSI/grid terminal emulation, and **`portable-pty`** for
-  spawning and managing the underlying PTY processes.
-- **[`gix`](https://crates.io/crates/gix)** for read-only git operations and the **`git` CLI**
-  (explicit argument vectors, never shell strings) for anything that mutates the repository.
-- **[`lsp-types`](https://crates.io/crates/lsp-types)** plus a hand-written client in `lsp-core`
-  that speaks to separately-installed language servers: `rust-analyzer`,
-  `typescript-language-server`, Vue Language Tools, `pyright`, `gopls` — auto-detected per-server
-  from each server's own `initialize` response. Settings → Language Servers links each server's
-  install docs.
-- **`tree-sitter`**, with grammars for Rust, TypeScript/TSX, and Python.
+```sh
+cargo build --workspace
+cargo run --release -p app
+```
 
-## Workspace layout
+Needs the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) and, on Linux, real
+system packages — see [System dependencies](#system-dependencies) below if the plain build fails.
+Use `--release`: a debug-profile GPUI build is commonly 5–20x slower for this app's own per-frame
+work (layout/paint, `tree-sitter` parsing, terminal-grid decode).
+
+## Architecture
 
 ```
 crates/
@@ -61,33 +53,24 @@ crates/
   app/        the GPUI application itself (binary crate)
 assets/       bundled fonts (IBM Plex Sans/Mono, OFL) used by the app
 design_handoff_jerry_ade/
-              the design handoff this UI ("Jerry") was built from — reference only,
-              not something to port markup from
+              the design handoff this UI ("Jerry") was built from — reference only
 docs/
-  architecture/  target architecture (dependency rule, Command/Query core)
-  adr/           architecture decision records
+  architecture/  target architecture, and the reasoning behind each rule
   themes.md, theme-palette-design.md
 ```
 
-`crates/wt-core`, `crates/pty-core`, and `crates/lsp-core` have no `gpui` dependency and never
-should — see [`docs/architecture/overview.md`](docs/architecture/overview.md) for the target
-shape and [`CLAUDE.md`](CLAUDE.md) for the standards this workspace holds itself to.
+`wt-core`/`pty-core`/`lsp-core` have no `gpui` dependency and never should — `crates/app` is the
+only crate that depends on GPUI. See [`docs/architecture/overview.md`](docs/architecture/overview.md)
+for the target shape and why.
 
-Theming is documented separately: [`docs/themes.md`](docs/themes.md) for the file format and
-authoring workflow, [`docs/theme-palette-design.md`](docs/theme-palette-design.md) for the syntax
-palette's design rationale.
+Built on **GPUI** (a pinned git dependency on [zed-industries/zed](https://github.com/zed-industries/zed),
+see [below](#gpui-version-pin)), **[`alacritty_terminal`](https://github.com/zed-industries/alacritty)**
++ **`portable-pty`** for terminal/PTY, **[`gix`](https://crates.io/crates/gix)** + the real `git`
+CLI for version control, **[`lsp-types`](https://crates.io/crates/lsp-types)** with a hand-written
+client for `rust-analyzer`/`typescript-language-server`/Vue Language Tools/`pyright`/`gopls`, and
+**`tree-sitter`** (Rust, TypeScript/TSX, Python) for syntax highlighting.
 
-## Building and running it
-
-### GPUI version pin
-
-`gpui` and `gpui_platform` are plain git dependencies on
-[zed-industries/zed](https://github.com/zed-industries/zed), pinned via `rev =` in the root
-[`Cargo.toml`](Cargo.toml) to `7b030b500810b04cf5fb4aa5973be99a502d9f36` — the exact commit this
-workspace was built and verified against. A different (e.g. newer) commit may or may not still
-build against this workspace's code — GPUI's API isn't stable across arbitrary upstream revisions.
-
-### System dependencies
+## System dependencies
 
 **Linux** needs real dev packages for Wayland/X11/Vulkan/fontconfig:
 
@@ -109,39 +92,36 @@ MetalToolchain`. No Homebrew packages — GPUI's macOS backend links Xcode's own
 
 **Windows** needs no extra system packages beyond the Rust toolchain.
 
-`.claude/commands/setup.md` (`/setup` in Claude Code) runs these checks for you.
+`/setup` (this repo's `.claude/commands/setup.md`, if you're using Claude Code) runs these checks
+for you.
 
-### Build and test
+### GPUI version pin
+
+`gpui`/`gpui_platform` are pinned via `rev =` in the root [`Cargo.toml`](Cargo.toml) to
+`7b030b500810b04cf5fb4aa5973be99a502d9f36` — the exact commit this workspace was built and verified
+against. A newer commit may or may not still build against this workspace's code; bump it
+deliberately, not casually.
+
+## Contributing
 
 ```sh
-cargo build --workspace
 cargo test --workspace
-cargo run -p app
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-These build the **debug** profile — fast to iterate on, but a debug-profile GPUI app is commonly
-5–20x slower for this app's own per-frame work (layout/paint, `tree-sitter` parsing, terminal-grid
-decode). For actually using the app, run the release profile instead:
+must all pass — see [`CLAUDE.md`](CLAUDE.md) for the full standards, [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for the process, and [`docs/development-workflow.md`](docs/development-workflow.md) for how a
+change moves from issue to merged PR. `.github/workflows/ci.yml` runs the same checks on every
+push. If you're using [Claude Code](https://claude.com/claude-code), this repo's `.claude/`
+directory (skills, agents, commands) is set up already — install [rtk](https://github.com/rtk-ai/rtk)
+and run `/setup` to cut token usage on command output; optional, not a build dependency.
 
-```sh
-cargo run --release -p app
-```
+## Contributors
 
-`cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` must also
-pass — see [`CLAUDE.md`](CLAUDE.md) for the full set of standards,
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution process, and
-[`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
-issue → PR in this repo. If you use [Claude Code](https://claude.com/claude-code), this repo's
-`.claude/` directory (skills, agents, commands) is set up for it already — installing the
-[rtk](https://github.com/rtk-ai/rtk) CLI first and running `/setup` cuts token usage on command
-output noticeably; it's optional, not a build dependency.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and
-`cargo fmt --check` on Linux, plus a build-only job on macOS and Windows (with a narrow
-per-process-sampling test on each, since neither compiles `#[cfg(test)]` modules under a plain
-build).
+- [Colin Espinas](https://github.com/ColinEspinas)
+- [Lucas Boinet](https://github.com/lucasboinet)
+- [Lucas](https://github.com/LucasPcq)
 
 ## License
 
