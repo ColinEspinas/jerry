@@ -239,7 +239,7 @@ impl AdeApp {
         self.markdown_view = markdown_preview::MarkdownView::Source;
         // Every "this file is now the selected tree row" path reveals it (GitHub issue #18 §5).
         // A click in the tree has its ancestors expanded already, so this is a no-op there - but
-        // go-to-definition (`Self::navigate_to_definition`), a palette result and a terminal link
+        // go-to-definition (`Self::open_file_at_line`), a palette result and a terminal link
         // all land on files in folders nobody has expanded, and now that the tree starts
         // collapsed, highlighting a row that isn't showing would be no highlight at all.
         //
@@ -355,7 +355,7 @@ impl AdeApp {
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         // Clear any stale pending cursor line from an abandoned navigation;
-        // `navigate_to_definition` re-sets it right after this if it has a target line.
+        // `open_file_at_line` re-sets it right after this if it has a target line.
         self.pending_cursor_line = None;
         let relative = path
             .strip_prefix(&self.file_tree_root)
@@ -858,7 +858,7 @@ impl AdeApp {
 
     /// Handles `TerminalPaneEvent::OpenPath` - a mod-held click on a detected path/`path:line`
     /// link in an agent's terminal output. `path` is already resolved against the agent's cwd
-    /// (see `crate::terminal::links::resolve`). Reuses [`Self::navigate_to_definition`] when the
+    /// (see `crate::terminal::links::resolve`). Reuses [`Self::open_file_at_line`] when the
     /// link carried a line number, else [`Self::open_file_view`].
     ///
     /// Unlike every other caller of `open_file_view`, a terminal link's path isn't guaranteed to
@@ -880,7 +880,7 @@ impl AdeApp {
             return;
         }
         match line {
-            Some(line) => self.navigate_to_definition(path, line as usize, window, cx),
+            Some(line) => self.open_file_at_line(path, line as usize, window, cx),
             None => self.open_file_view(path, window, cx),
         }
     }
@@ -1195,7 +1195,7 @@ mod code_view_cache_tests {
 }
 
 /// Regression coverage for the cross-file cursor leak [`AdeApp::pending_cursor_line`] describes:
-/// [`AdeApp::navigate_to_definition`] to a file B that isn't cached yet leaves a one-shot target
+/// [`AdeApp::open_file_at_line`] to a file B that isn't cached yet leaves a one-shot target
 /// line waiting for B's background load; opening a different file C before that resolves must
 /// not let C's load misapply B's stale target line.
 #[cfg(test)]
@@ -1218,7 +1218,7 @@ mod cross_file_navigation_tests {
         // Landing on B's line 5 - B isn't cached yet, so this sets `pending_cursor_line` rather
         // than `code_cursor` directly.
         app.update_in(cx, |app, window, cx| {
-            app.navigate_to_definition(file_b.clone(), 5, window, cx);
+            app.open_file_at_line(file_b.clone(), 5, window, cx);
         });
         assert_eq!(
             app.read_with(cx, |app, _| app.pending_cursor_line.clone()),

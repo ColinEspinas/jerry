@@ -37,6 +37,7 @@
 //! written once for the cells and forgotten for the badges.
 
 use crate::icons::Icon;
+use crate::lsp::diagnostics::Severity;
 use crate::root::plural;
 use crate::theme;
 
@@ -194,6 +195,79 @@ impl StripCell {
     }
 }
 
+/// One diagnostic in the Problems list, already reduced to what the row paints and what a click
+/// on it needs.
+///
+/// A view model rather than a borrowed `lsp_types::Diagnostic`: the list is scoped to a worktree,
+/// not to an open buffer, so it outlives no particular file's state and needs nothing from
+/// `lsp_types` past the fields below. It lives here, with the rest of the strip's data, so the
+/// list's real decisions - what a filter query matches, how `line:column` prints, how the tally is
+/// counted - are assertable without a window; [`crate::rail::strip_render`] is where a real
+/// `crate::lsp::client::LspClientState` is read into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub severity: Severity,
+    pub message: String,
+    /// The path, relative to the worktree root - every row in this list is inside the checkout by
+    /// construction (see `crate::rail::strip_render::AdeApp::worktree_problems`), and a Problems
+    /// list showing 60 characters of shared prefix on every row says nothing per row.
+    pub file: String,
+    /// The real absolute path the click opens. Kept beside [`Self::file`] rather than re-joined
+    /// from it at click time: re-deriving a path from a *display* string is how a row that shows
+    /// one file opens another.
+    pub path: std::path::PathBuf,
+    /// 1-based, the way every compiler and every other row in this app prints - and the way
+    /// `crate::code_surface::lsp_ui::AdeApp::open_file_at_line` takes it. LSP's own positions are
+    /// 0-based; the conversion happens once, where the diagnostic is read, rather than at each of
+    /// the two use sites.
+    pub line: u32,
+    pub column: u32,
+    /// The server that reported it (`rustc`, `clippy`, `rust-analyzer`), when it named itself.
+    pub source: Option<String>,
+}
+
+impl Problem {
+    /// `line:column`, the way `Jerry.dc.html`'s own `p.line` prints it (`212:17`).
+    pub fn position(&self) -> String {
+        format!("{}:{}", self.line, self.column)
+    }
+
+    /// Whether this row survives the sidebar's own filter box - the same case-insensitive
+    /// substring test over the row's own visible text that [`crate::rail::state::WorktreeRow::
+    /// matches_filter`] applies to a worktree row, so one field behaves the same way whichever
+    /// view is under it. A blank query matches everything.
+    ///
+    /// This is what lets the filter row's placeholder really say `filter problems`
+    /// (`REVISION-2026-08-13.md` §1) rather than promising a filter that does nothing (§7 rule 1).
+    pub fn matches_filter(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        self.message.to_lowercase().contains(&query)
+            || self.file.to_lowercase().contains(&query)
+            || self
+                .source
+                .as_deref()
+                .is_some_and(|source| source.to_lowercase().contains(&query))
+    }
+
+    /// Most severe first, then by file, then by position - the list-level counterpart of
+    /// [`Severity::rank`]'s own within-a-line "worst wins" ordering.
+    ///
+    /// A **total** order, deliberately: `lsp_core::LspClient::published_diagnostics` already sorts
+    /// by path so a re-render can't reshuffle, and a comparison that stopped at severity would
+    /// hand that back by leaving equal-severity rows in whatever order the map yielded them.
+    pub fn worst_first(left: &Problem, right: &Problem) -> std::cmp::Ordering {
+        right
+            .severity
+            .rank()
+            .cmp(&left.severity.rank())
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| (left.line, left.column).cmp(&(right.line, right.column)))
+    }
+}
+
 /// The severities really present in the selected worktree's diagnostics, tallied over the real
 /// list rather than authored as a pair.
 ///
@@ -208,6 +282,24 @@ pub struct ProblemTally {
 }
 
 impl ProblemTally {
+    /// `problems` counted into `REVISION-2026-08-13.md` §2's three buckets.
+    ///
+    /// LSP's `Information` and `Hint` both land in [`Self::hints`]: §2's own table names three
+    /// severities and the mock tallies both into its `info` bucket, so these are two levels the
+    /// design does not distinguish anywhere - which is why summing them is not §7 rule 4's "two
+    /// states distinguished anywhere in the app are never summed anywhere in it".
+    pub fn over(problems: &[Problem]) -> Self {
+        let mut tally = ProblemTally::default();
+        for problem in problems {
+            match problem.severity {
+                Severity::Error => tally.errors += 1,
+                Severity::Warning => tally.warnings += 1,
+                Severity::Information | Severity::Hint => tally.hints += 1,
+            }
+        }
+        tally
+    }
+
     /// Every diagnostic in the worktree, whatever its severity - the number the marker's tooltip
     /// reports.
     pub fn total(self) -> usize {
@@ -350,6 +442,159 @@ mod tests {
 
     fn views(cells: &[StripCell]) -> Vec<SidebarView> {
         cells.iter().map(|cell| cell.view).collect()
+    }
+
+    fn problem(severity: Severity, file: &str, line: u32, message: &str, source: &str) -> Problem {
+        Problem {
+            severity,
+            message: message.to_string(),
+            file: file.to_string(),
+            path: std::path::PathBuf::from("/wt").join(file),
+            line,
+            column: 9,
+            source: Some(source.to_string()),
+        }
+    }
+
+    /// The Problems list's own filter really applies, and the strip's marker deliberately does
+    /// not follow it - the strip reports what is really in the worktree, the list reports what you
+    /// asked to see.
+    #[test]
+    fn a_filter_narrows_the_list_without_touching_what_the_strip_reports() {
+        let rows = vec![
+            problem(
+                Severity::Error,
+                "src/auth/session.rs",
+                212,
+                "cannot borrow `self.tokens` as mutable",
+                "rustc",
+            ),
+            problem(
+                Severity::Warning,
+                "tests/auth_race.rs",
+                44,
+                "unused variable: `barrier`",
+                "clippy",
+            ),
+        ];
+
+        assert_eq!(
+            rows.iter().filter(|row| row.matches_filter("")).count(),
+            2,
+            "a blank query matches everything, exactly as it does for a worktree row"
+        );
+        // By message, by path, and by the server that reported it - all three of the row's own
+        // visible fields.
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.matches_filter("BORROW"))
+                .count(),
+            1,
+            "case-insensitive, over the message"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.matches_filter("tests/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.matches_filter("clippy"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.matches_filter("nothing"))
+                .count(),
+            0
+        );
+
+        assert_eq!(
+            ProblemTally::over(&rows),
+            ProblemTally {
+                errors: 1,
+                warnings: 1,
+                hints: 0
+            },
+            "the tally the strip's marker reads is over the whole worktree, unfiltered"
+        );
+    }
+
+    /// §2's row spec prints `line:column`, 1-based - the shape `Jerry.dc.html`'s own `212:17`
+    /// takes, and the shape the click's own target line is derived from.
+    #[test]
+    fn a_rows_position_reads_the_way_every_compiler_prints_one() {
+        let row = problem(Severity::Error, "src/db/mod.rs", 118, "no method", "rustc");
+        assert_eq!(row.position(), "118:9");
+    }
+
+    /// Worst first, then file, then position - and **total**, so two rows of one severity keep the
+    /// order the store handed them rather than swapping between renders.
+    #[test]
+    fn the_list_orders_worst_first_and_never_leaves_two_rows_tied() {
+        let mut rows = [
+            problem(Severity::Hint, "src/a.rs", 4, "hint", "clippy"),
+            problem(Severity::Warning, "src/z.rs", 1, "warning", "clippy"),
+            problem(Severity::Error, "src/z.rs", 9, "second error", "rustc"),
+            problem(Severity::Error, "src/z.rs", 2, "first error", "rustc"),
+            problem(Severity::Error, "src/a.rs", 7, "earlier file", "rustc"),
+            problem(Severity::Information, "src/a.rs", 3, "info", "clippy"),
+        ];
+        rows.sort_by(Problem::worst_first);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.file.as_str(), row.line))
+                .collect::<Vec<_>>(),
+            vec![
+                ("src/a.rs", 7),
+                ("src/z.rs", 2),
+                ("src/z.rs", 9),
+                ("src/z.rs", 1),
+                ("src/a.rs", 3),
+                ("src/a.rs", 4),
+            ]
+        );
+        assert!(
+            rows.windows(2)
+                .all(|pair| Problem::worst_first(&pair[0], &pair[1]) != std::cmp::Ordering::Equal),
+            "an ordering that left two rows equal would let a re-render reshuffle them under the \
+             pointer"
+        );
+    }
+
+    /// §2's "the header names every severity the list is showing" over a real list, including the
+    /// authored-pair defect it was written for: `Information` and `Hint` are one bucket, so five
+    /// diagnostics can never sit under a header reading four.
+    #[test]
+    fn the_tally_counts_every_row_the_list_is_showing() {
+        let rows = vec![
+            problem(Severity::Error, "a.rs", 1, "one", "rustc"),
+            problem(Severity::Error, "b.rs", 1, "two", "rustc"),
+            problem(Severity::Warning, "c.rs", 1, "three", "clippy"),
+            problem(Severity::Warning, "d.rs", 1, "four", "clippy"),
+            problem(Severity::Information, "e.rs", 1, "five", "clippy"),
+        ];
+        let tally = ProblemTally::over(&rows);
+        assert_eq!(
+            tally,
+            ProblemTally {
+                errors: 2,
+                warnings: 2,
+                hints: 1
+            }
+        );
+        assert_eq!(
+            tally.total(),
+            rows.len(),
+            "\u{a7}2's own defect: an authored {{err: 2, warn: 2}} pair left the info row \
+             uncounted, so five diagnostics sat under a badge reading 4"
+        );
+        assert_eq!(
+            tally.count_line().as_deref(),
+            Some("2 errors \u{b7} 2 warnings \u{b7} 1 hint")
+        );
     }
 
     /// §4u/§4v: the strip is down to two view cells and the overflow. Search went to the right

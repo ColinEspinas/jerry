@@ -1884,8 +1884,9 @@ pub struct AdeApp {
     pub(crate) _goto_definition_tasks: TaskPool,
     /// One-shot "the next completed load of this exact file should land the cursor on this
     /// line, not line 1" instruction for [`Self::spawn_file_load`]'s completion handler, set by
-    /// [`Self::navigate_to_definition`] when a go-to-definition result names a file that isn't
-    /// already open. Keyed by the target path (not just a line number) so an unrelated file's
+    /// [`Self::open_file_at_line`] whenever a navigation names a line in a file that isn't
+    /// already open - a go-to-definition result, a terminal `path:line` link, or a sidebar
+    /// Problems row. Keyed by the target path (not just a line number) so an unrelated file's
     /// completed load can never misapply a stale entry meant for a different, still-loading
     /// file. Consumed via `Option::take` (only when the path matches) by whichever of
     /// [`Self::render_file_view`] or `spawn_file_load`'s completion handler applies it first;

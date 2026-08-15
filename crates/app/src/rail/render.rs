@@ -801,11 +801,16 @@ impl AdeApp {
         // make the strip's cells vanish.
         let has_worktrees = groups.iter().any(|group| !group.all_rows.is_empty());
         let view = self.effective_sidebar_view(has_worktrees);
+        // Built once, for the same reason `groups` is: the Problems cell's marker and the
+        // Problems body are two answers about one set of diagnostics, and `REVISION-2026-08-13.md`
+        // §2's "tallied over their own data" is only structurally guaranteed if there is one
+        // `data` for both to be over.
+        let problems = self.worktree_problems();
         let cells = rail_strip::strip_view_cells(
             has_worktrees,
             view,
             agents_needing_you(&self.build_agent_rows(cx)),
-            self.worktree_problem_tally(),
+            rail_strip::ProblemTally::over(&problems),
         );
 
         div()
@@ -844,7 +849,7 @@ impl AdeApp {
                             .min_h_0()
                             .overflow_y_scroll()
                             .track_scroll(&self.rail_scroll_handle)
-                            .child(self.render_sidebar_body(view, &groups, cx)),
+                            .child(self.render_sidebar_body(view, &groups, &problems, cx)),
                     )
                     .children(self.render_vertical_scrollbar(
                         "rail-scrollbar",

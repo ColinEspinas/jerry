@@ -105,7 +105,7 @@ pub fn find_links(text: &str) -> Vec<LinkMatch> {
                 .name("line")
                 .and_then(|m| m.as_str().parse::<u32>().ok())
                 // A captured `:0` (e.g. `foo.rs:0`) is not a valid 1-based line -
-                // `crate::code_surface::lsp_ui::AdeApp::navigate_to_definition`'s own
+                // `crate::code_surface::lsp_ui::AdeApp::open_file_at_line`'s own
                 // `one_based_line` parameter makes that contract explicit.
                 .filter(|&line| line != 0);
             let column = caps
