@@ -941,6 +941,22 @@ pub(in crate::code_surface) fn render_diff_line(
         // never name different rows.
         .id(gpui::SharedString::from(row_selector.clone()))
         .flex()
+        // A row is at least as wide as the pane, and may be wider.
+        //
+        // Live report, found while reproducing GitHub issue #288's own: a click in the empty
+        // space to the right of a short diff line did **nothing at all**. The row is the note
+        // gesture's hit target (see the `on_click` at the bottom of this function), and a
+        // `gpui::uniform_list` item whose own width is `auto` is laid out at its *content* width -
+        // `Drawable::layout_as_root` never goes through the `stretch_auto_size_to_fill` the window
+        // root does (see `crate::review_notes::render::AdeApp::render_review_note_card`'s own
+        // note on the same mechanism). So the hit box, the hover lift and the add/remove tint all
+        // stopped at the last glyph of the line, several hundred pixels short of the pane, with
+        // nothing on screen saying where the clickable part ended.
+        //
+        // `min_w_full` rather than `w_full` deliberately: a line longer than the pane must still
+        // be able to lay itself out at its real width (the list's own content width is measured
+        // from these items), which a hard `width:100%` would forbid.
+        .min_w_full()
         .items_center()
         .font(font(theme::font::MONO))
         .text_size(rems(1.0))
