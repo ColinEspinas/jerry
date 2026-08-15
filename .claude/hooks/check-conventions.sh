@@ -2,8 +2,14 @@
 # Deterministic ratchet check for the two structural rules in CLAUDE.md that clippy can't
 # express without the glob-import cleanup first (docs/adr/0003-ui-must-not-call-adapters.md):
 # no new `use super::*` glob, no new adapter call from a render.rs file. This does not rely on
-# an LLM following instructions - it's a real grep run by a real script, on every commit
-# locally (via pre-commit-check.sh) and every push (via ci.yml).
+# an LLM following instructions - it's a real grep run by a real script, wired to three points
+# so drift is caught as early as possible rather than only at the end:
+#   1. PostToolUse:Edit|Write (settings.json) - fires right after every file edit, for the
+#      fastest possible feedback. Can't block the edit that already happened, but the failing
+#      exit code and message surface immediately instead of waiting for a commit attempt.
+#   2. PreToolUse:Bash, nested inside pre-commit-check.sh - a real, hard block: a `git commit`
+#      that would land a new violation is denied outright, not just warned about.
+#   3. ci.yml - the backstop that runs regardless of what happened locally.
 #
 # It is a RATCHET, not a zero-tolerance check: the codebase already has hundreds of
 # pre-existing violations (tracked as backlog, not fixed in this pass), so the rule enforced
