@@ -971,6 +971,13 @@ pub struct AdeApp {
     /// `crate::root::caret_blink::AdeApp::wire_caret_blink`. Held for this instance's whole
     /// lifetime; an unheld `gpui::Subscription` is dropped, and a dropped one stops firing.
     pub(crate) _caret_blink_subscriptions: Vec<Subscription>,
+    /// Every `FocusHandle` [`Self::wire_caret_blink`] has subscribed - the same handles
+    /// [`Self::_caret_blink_subscriptions`] covers, kept as a live list so a blur can ask "is
+    /// some *other* caret-bearing surface focused right now?" rather than assuming it is the
+    /// last word on the focus change it is reporting. That question is what makes
+    /// [`Self::stop_caret_blink_on_blur`] independent of the order GPUI happens to run these
+    /// subscriptions in - see its own docs for the real bug that ordering caused.
+    pub(crate) caret_blink_handles: Vec<FocusHandle>,
     /// Whether the git graph tab (GitHub issue #1, phase (a)) exists in the tab strip. Unlike
     /// [`Self::open_files`] there is at most one - "one per window" per the design spec - so this
     /// is a plain `bool`, not a collection.
