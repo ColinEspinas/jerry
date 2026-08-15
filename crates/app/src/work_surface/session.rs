@@ -148,7 +148,7 @@ impl AdeApp {
                     })
                 }
                 // See `Self::record_worktree_session`'s own docs for why neither is recorded.
-                TabRef::Graph | TabRef::Review(_) => None,
+                TabRef::Graph | TabRef::Review(_) | TabRef::Run => None,
             })
             .collect()
     }
@@ -466,7 +466,7 @@ mod session_restore_tests {
                         }
                     })
                 }
-                TabRef::Graph | TabRef::Review(_) => None,
+                TabRef::Graph | TabRef::Review(_) | TabRef::Run => None,
             })
             .collect()
     }

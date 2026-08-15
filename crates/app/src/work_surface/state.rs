@@ -36,6 +36,17 @@ pub enum TabRef {
     /// of the feature - even though, like `Graph`, at most one is open per window at a time
     /// (`crate::root::AdeApp::review_tab_open`).
     Review(AgentId),
+    /// The run-transcript tab (GitHub issue #227), showing one finished run's own recording.
+    ///
+    /// Carries no payload, like `Graph` and unlike `Review`: `design_handoff_jerry_ade/revision
+    /// 5/REVISION-2026-08-13.md` §3 is "**one run tab per worktree**; opening another replaces
+    /// it", and this order is already per worktree
+    /// (`crate::root::AdeApp::tab_order`), so within one strip there is never a second one to
+    /// tell this apart from. Which run it shows lives in
+    /// `crate::root::AdeApp::run_tab_by_worktree` - keeping it out of the identity is what makes
+    /// "replaced" keep the tab's dragged position rather than closing and reopening it at the
+    /// end of the strip.
+    Run,
 }
 
 /// Reconciles a worktree's stored tab order (`crate::root::AdeApp::tab_order`) against what's
@@ -61,6 +72,7 @@ pub fn reconcile_tab_order(
     open_files: &[PathBuf],
     graph_open: bool,
     review_open: Option<AgentId>,
+    run_open: bool,
 ) -> Vec<TabRef> {
     // GitHub issue #225: a review tab is live only when it's really open *and* the agent it
     // reviews is one of this worktree's own agents. Both halves matter: the first drops a closed
@@ -75,6 +87,10 @@ pub fn reconcile_tab_order(
             TabRef::File(path) => open_files.contains(path),
             TabRef::Graph => graph_open,
             TabRef::Review(id) => review_live(id),
+            // GitHub issue #227: `run_open` is already this worktree's own fact - the caller
+            // looks it up in `run_tab_by_worktree` by cwd - so unlike `review_open` there is no
+            // second "does it belong here" half to check.
+            TabRef::Run => run_open,
         })
         .cloned()
         .collect();
@@ -101,6 +117,9 @@ pub fn reconcile_tab_order(
         if review_live(&id) && !order.contains(&TabRef::Review(id)) {
             order.push(TabRef::Review(id));
         }
+    }
+    if run_open && !order.contains(&TabRef::Run) {
+        order.push(TabRef::Run);
     }
     order
 }
@@ -867,6 +886,7 @@ mod tests {
             &[PathBuf::from("a.rs"), PathBuf::from("b.rs")],
             false,
             None,
+            false,
         );
         assert_eq!(
             order,
@@ -889,7 +909,14 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false, None);
+        let order = reconcile_tab_order(
+            &stored,
+            &[1, 2],
+            &[PathBuf::from("a.rs")],
+            false,
+            None,
+            false,
+        );
         assert_eq!(order, stored);
     }
 
@@ -903,7 +930,7 @@ mod tests {
             TabRef::File(PathBuf::from("a.rs")),
             TabRef::Agent(2),
         ];
-        let order = reconcile_tab_order(&stored, &[2], &[], false, None);
+        let order = reconcile_tab_order(&stored, &[2], &[], false, None, false);
         assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
@@ -912,7 +939,14 @@ mod tests {
     #[test]
     fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
         let stored = vec![TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1, 2], &[PathBuf::from("a.rs")], false, None);
+        let order = reconcile_tab_order(
+            &stored,
+            &[1, 2],
+            &[PathBuf::from("a.rs")],
+            false,
+            None,
+            false,
+        );
         assert_eq!(
             order,
             vec![
@@ -928,7 +962,7 @@ mod tests {
     /// gets, not silently dropped or given a hardcoded fixed position.
     #[test]
     fn reconcile_appends_a_freshly_opened_graph_tab() {
-        let order = reconcile_tab_order(&[], &[1], &[], true, None);
+        let order = reconcile_tab_order(&[], &[1], &[], true, None, false);
         assert_eq!(order, vec![TabRef::Agent(1), TabRef::Graph]);
     }
 
@@ -938,7 +972,7 @@ mod tests {
     #[test]
     fn reconcile_preserves_a_stored_graph_tab_position() {
         let stored = vec![TabRef::Graph, TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1], &[], true, None);
+        let order = reconcile_tab_order(&stored, &[1], &[], true, None, false);
         assert_eq!(order, stored);
     }
 
@@ -948,14 +982,14 @@ mod tests {
     #[test]
     fn reconcile_drops_a_closed_graph_tab() {
         let stored = vec![TabRef::Agent(1), TabRef::Graph];
-        let order = reconcile_tab_order(&stored, &[1], &[], false, None);
+        let order = reconcile_tab_order(&stored, &[1], &[], false, None, false);
         assert_eq!(order, vec![TabRef::Agent(1)]);
     }
 
     /// GitHub issue #225: a freshly opened review tab is appended like every other kind.
     #[test]
     fn reconcile_appends_a_freshly_opened_review_tab() {
-        let order = reconcile_tab_order(&[], &[1], &[], false, Some(1));
+        let order = reconcile_tab_order(&[], &[1], &[], false, Some(1), false);
         assert_eq!(order, vec![TabRef::Agent(1), TabRef::Review(1)]);
     }
 
@@ -963,7 +997,7 @@ mod tests {
     fn reconcile_preserves_a_stored_review_tab_position() {
         let stored = vec![TabRef::Review(1), TabRef::Agent(1)];
         assert_eq!(
-            reconcile_tab_order(&stored, &[1], &[], false, Some(1)),
+            reconcile_tab_order(&stored, &[1], &[], false, Some(1), false),
             stored
         );
     }
@@ -971,7 +1005,7 @@ mod tests {
     #[test]
     fn reconcile_drops_a_closed_review_tab() {
         let stored = vec![TabRef::Agent(1), TabRef::Review(1)];
-        let order = reconcile_tab_order(&stored, &[1], &[], false, None);
+        let order = reconcile_tab_order(&stored, &[1], &[], false, None, false);
         assert_eq!(order, vec![TabRef::Agent(1)]);
     }
 
@@ -981,7 +1015,7 @@ mod tests {
     #[test]
     fn reconcile_drops_a_review_tab_whose_agent_is_gone() {
         let stored = vec![TabRef::Review(7)];
-        assert!(reconcile_tab_order(&stored, &[], &[], false, Some(7)).is_empty());
+        assert!(reconcile_tab_order(&stored, &[], &[], false, Some(7), false).is_empty());
     }
 
     /// The review tab belongs to *one* worktree's strip - the worktree its agent runs in. Another
@@ -989,8 +1023,50 @@ mod tests {
     #[test]
     fn a_review_tab_never_leaks_into_another_worktrees_strip() {
         // Worktree B's strip: its own agent 2 is open, but the review is for agent 1 (worktree A).
-        let order = reconcile_tab_order(&[], &[2], &[], false, Some(1));
+        let order = reconcile_tab_order(&[], &[2], &[], false, Some(1), false);
         assert_eq!(order, vec![TabRef::Agent(2)]);
+    }
+
+    /// GitHub issue #227: the run-transcript tab joins the same order every other kind is in -
+    /// appended when freshly opened, kept where a drag put it, and dropped when closed.
+    #[test]
+    fn reconcile_treats_the_run_tab_like_every_other_kind() {
+        assert_eq!(
+            reconcile_tab_order(&[], &[1], &[], false, None, true),
+            vec![TabRef::Agent(1), TabRef::Run],
+            "a freshly opened run tab lands last, like every other new tab"
+        );
+
+        let stored = vec![TabRef::Run, TabRef::Agent(1)];
+        assert_eq!(
+            reconcile_tab_order(&stored, &[1], &[], false, None, true),
+            stored,
+            "and a dragged position is honoured rather than re-appended"
+        );
+
+        assert_eq!(
+            reconcile_tab_order(&stored, &[1], &[], false, None, false),
+            vec![TabRef::Agent(1)],
+            "a closed run tab is dropped, not left dangling in the strip"
+        );
+    }
+
+    /// §3's "one run tab per worktree" is structural, not a rule the reconciler has to enforce:
+    /// [`TabRef::Run`] carries no payload, so a stored order physically cannot hold two of them
+    /// distinctly - and re-reconciling never grows a second.
+    #[test]
+    fn a_worktree_strip_can_never_hold_two_run_tabs() {
+        let once = reconcile_tab_order(&[], &[1], &[], false, None, true);
+        let twice = reconcile_tab_order(&once, &[1], &[], false, None, true);
+        assert_eq!(
+            once, twice,
+            "reconciliation is idempotent for the run tab too"
+        );
+        assert_eq!(
+            twice.iter().filter(|tab| **tab == TabRef::Run).count(),
+            1,
+            "\u{a7}3: one run tab per worktree, replaced on the next open"
+        );
     }
 
     /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands

@@ -3114,6 +3114,19 @@ pub mod history {
     /// own lines are already coloured, so it stays correct in a theme that recolours them.
     pub const TRANSCRIPT_OPACITY: f32 = 0.70;
 
+    /// The run-transcript footer's `Resume here` button - §3's own triple, verbatim: "**Resume
+    /// here** (`enter`, green `#1c3a2a` / `#376b4d` / `#9fdcb6`)", i.e. fill / border / label.
+    ///
+    /// [`RESUME_BORDER`] and [`RESUME_FG`] share [`button::GREEN_KEYCAP`]'s and
+    /// [`button::GREEN_FG`]'s values, and [`RESUME_BG_HOVER`] is [`button::GREEN_BG`] exactly -
+    /// this is the app's one green affirmative family, not a second one. They carry their own
+    /// keys for [`DRIFT_TEXT`]'s reason: a theme should be able to move the one button that
+    /// restarts a finished conversation without moving every green button in the window.
+    pub const RESUME_BG: ColorToken = token("history.resume_bg", 0x1c3a2a);
+    pub const RESUME_BG_HOVER: ColorToken = token("history.resume_bg_hover", 0x24503a);
+    pub const RESUME_BORDER: ColorToken = token("history.resume_border", 0x376b4d);
+    pub const RESUME_FG: ColorToken = token("history.resume_fg", 0x9fdcb6);
+
     /// Every real [`ColorToken`] this module declares - see [`super::TOKEN_GROUPS`].
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("OUT_DONE_FG", OUT_DONE_FG),
@@ -3141,6 +3154,10 @@ pub mod history {
         ("TRANSCRIPT_BODY", TRANSCRIPT_BODY),
         ("TRANSCRIPT_DETAIL", TRANSCRIPT_DETAIL),
         ("TRANSCRIPT_LEAD", TRANSCRIPT_LEAD),
+        ("RESUME_BG", RESUME_BG),
+        ("RESUME_BG_HOVER", RESUME_BG_HOVER),
+        ("RESUME_BORDER", RESUME_BORDER),
+        ("RESUME_FG", RESUME_FG),
     ];
 }
 

@@ -327,10 +327,11 @@ impl AdeApp {
                     self.archive_agent(id, window, cx);
                 }
             }
-            // Unreachable while [`Self::HISTORY_VIEW_AVAILABLE`] is `false`: that row is rendered
-            // disabled, and a disabled row carries no click handler at all. Left as an explicit
-            // no-op rather than a call into a surface this build genuinely does not have.
-            RailMenuAction::OpenHistory => {}
+            // GitHub issue #227: the overflow's own destination row. Switches the sidebar body to
+            // the repo → worktree → run index, which is how History is reached at all - §4t moved
+            // it out of the strip, so this row is its only entry point besides a worktree's own
+            // `↺ N earlier runs` line.
+            RailMenuAction::OpenHistory => self.open_history_view(cx),
             RailMenuAction::OpenSettings => self.open_settings(window, cx),
             // Handled above, before the menu was closed.
             RailMenuAction::OpenIn | RailMenuAction::RemoveWorktree => {}

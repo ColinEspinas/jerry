@@ -800,7 +800,9 @@ impl AdeApp {
     /// (`REVISION-2026-08-13.md` §1: "Gate this at the source ... not in the template"), so
     /// deriving them from one pass is what makes it impossible for the strip to offer a switcher
     /// over rows the body does not have - as well as saving a second full rebuild per frame.
-    pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `&mut self` for GitHub issue #227's History body alone - see
+    /// [`Self::render_sidebar_body`]'s own docs.
+    pub(crate) fn render_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // `Rc`, not a plain `Vec`: `Self::render_rail_list`'s own `gpui::list` render-item
         // closure captures this and is kept around by GPUI across frames, so it must be cheap to
         // clone - see that function's own docs.
@@ -965,6 +967,7 @@ impl AdeApp {
                 placeholder: match view {
                     rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
                     rail_strip::SidebarView::Problems => "filter problems",
+                    rail_strip::SidebarView::History => "filter runs",
                 },
                 font: theme::font::MONO,
                 text_size: self.ui_text_size(10.5),
@@ -1240,23 +1243,16 @@ impl AdeApp {
                     .into_any_element(),
                 None => div().into_any_element(),
             },
-            rail::RailListItem::HistoryHeader { .. } => {
-                self.render_history_header().into_any_element()
-            }
-            rail::RailListItem::PastAgentRow {
+            rail::RailListItem::EarlierRunsLink {
                 group_index,
                 row_index,
-                history_index,
             } => match groups
                 .get(*group_index)
                 .and_then(|group| group.rows.get(*row_index))
-                .and_then(|row| row.history.get(*history_index))
             {
-                Some(past) => {
-                    let now_unix = self.history_now_unix();
-                    self.render_past_agent_row(past, now_unix, trailing_pb, cx)
-                        .into_any_element()
-                }
+                Some(row) => self
+                    .render_earlier_runs_link(&row.path, row.history.len(), trailing_pb, cx)
+                    .into_any_element(),
                 None => div().into_any_element(),
             },
         }
@@ -1512,7 +1508,7 @@ impl AdeApp {
     /// `trailing_pb` carries the 7px gap to the next worktree's own block
     /// (`STAGE-A-CHANGELOG.md` §4n/§4s) - `true` exactly when this header is the last item in its
     /// own worktree's block, i.e. when it has no expanded children for the flattened
-    /// [`rail::RailListItem::AgentRow`]/[`rail::RailListItem::PastAgentRow`] items to carry it
+    /// [`rail::RailListItem::AgentRow`]/[`rail::RailListItem::EarlierRunsLink`] items to carry it
     /// instead. See [`rail::RailListItem::is_last_in_worktree_block`].
     ///
     /// Clicking the row selects this worktree (`Self::select_worktree_by_path`), restoring
@@ -1565,11 +1561,11 @@ impl AdeApp {
         // sit at the repo root while the tab strip showed something else entirely.
         let is_selected = self.current_worktree_path().as_deref() == Some(row.path.as_path());
         let has_agents = !row.agents.is_empty();
-        let has_history = !row.history.is_empty();
-        // GitHub issue #227: a worktree with no live agent but real persisted history must still
-        // be expandable - the caret/expand state used to be gated on `has_agents` alone, which
-        // would hide a bare worktree's history behind a caret that never rendered at all.
-        let has_children = has_agents || has_history;
+        // GitHub issue #227: history is no longer a *child* of this row. It moved out of the rail
+        // into the sidebar's own History view, and what is left here is the `↺ N earlier runs`
+        // line under the row ([`Self::render_earlier_runs_link`]) - which is not behind the caret,
+        // so the caret is back to meaning exactly "this worktree has live agents".
+        let has_children = has_agents;
         // `is_expanded` is a real parameter now, not recomputed here - see this function's own
         // docs on why. Guard against a childless row somehow being passed `is_expanded: true`
         // anyway (defensive; `rail::flatten_rail_list_items` never does), the same way the old
@@ -2033,176 +2029,73 @@ impl AdeApp {
             .when(trailing_pb, |el| el.pb(px(7.0)))
     }
 
-    /// A worktree row's "History" section label (GitHub issue #227) - `Self::render_rail_list`'s
-    /// flattened [`rail::RailListItem::HistoryHeader`] resolves here. Split out of the old
-    /// `render_history_section` for the same reason [`Self::render_repo_group_header`] was split
-    /// out of `render_repo_group`: [`Self::render_past_agent_row`] (one per real
-    /// persisted-but-not-running agent) is now its own sibling list item, not a child this
-    /// function loops over and builds unconditionally.
-    fn render_history_header(&self) -> impl IntoElement {
-        div()
-            .pl(px(13.0))
-            .pt(px(4.0))
-            .pb(px(2.0))
-            .font(font(theme::font::MONO))
-            .text_size(self.ui_text_size(8.5))
-            .text_color(theme::text::GHOSTER)
-            .child("HISTORY")
-    }
-
-    /// Real wall-clock seconds since the Unix epoch, mirroring
-    /// `crate::work_surface::agents::unix_now`'s own `unwrap_or(0)` for a nonsense clock - shared
-    /// by every [`Self::render_past_agent_row`] call in one frame (`Self::render_rail_list`'s
-    /// dispatch) so they all agree on what "now" was, the same way the old `render_history_section`
-    /// computed it once for its whole loop.
-    fn history_now_unix(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    /// One row under a worktree's "History" section: a real, persisted-but-not-currently-running
-    /// agent (`crate::hooks::history::PastAgent`). Deliberately not selectable/highlightable the
-    /// way [`Self::render_agent_row`] is - there is no live pane behind it to switch to - so its
-    /// only real interaction is the trailing resume button.
+    /// A worktree row's `\u{21ba} N earlier runs` line (GitHub issue #227).
     ///
-    /// The button reads "Resume" when [`crate::hooks::history::PastAgent::session_id`] is real -
-    /// a literal `claude --resume <session_id>`, verified against a real binary (see
-    /// `crate::hooks::event::HookReport::session_id`'s own docs) - and "Reopen" otherwise, the
-    /// honest label for the fallback (`crate::hooks::flow::AdeApp::resume_past_agent`) of simply
-    /// spawning a fresh agent back into this worktree. Never claims to continue a conversation it
-    /// cannot.
-    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter.
-    fn render_past_agent_row(
+    /// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §6, in full: "A 19-high
+    /// `\u{21ba} 2 earlier runs` line under a worktree row, switching the sidebar to History for
+    /// that worktree. **Only on worktrees with no live agent** - a first pass put it under every
+    /// worktree: eight identical rows, no information, and it pushed the rail past its height."
+    ///
+    /// This **replaced** the inline `HISTORY` section that used to render here - a small label
+    /// plus one two-line row per past run, each with its own `Resume`/`Reopen` button - which is
+    /// deleted rather than left beside it, per `REVISION-2026-08-14.md` §7 rule 5: "Replacing a
+    /// control means deleting its old keys in the same edit - a key defined twice is two
+    /// specifications of one thing, and the reader cannot tell which is real." Everything it did
+    /// is now done better one surface over: the runs are in [`crate::run_history::render`]'s
+    /// repo → worktree → run index, with their real titles, outcomes and drift, and `Resume` is
+    /// the run-transcript tab's own footer action, beside the sentence that says what resuming
+    /// will mean (`crate::run_history::tab::AdeApp::render_run_view`).
+    ///
+    /// The gate is `has_agents`, not "is this row expanded": this is a line *under* the worktree
+    /// row, not one of its children, so a folded worktree still offers it - which is also why
+    /// `crate::rail::state::flatten_rail_list_items` emits it outside the expansion gate.
+    ///
+    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter. This
+    /// line is always the last item in its worktree's block when it is present at all (a
+    /// worktree with a live agent never gets one), so it is where the 7px inter-group gap lands.
+    fn render_earlier_runs_link(
         &self,
-        past: &crate::hooks::history::PastAgent,
-        now_unix: i64,
+        path: &std::path::Path,
+        count: usize,
         trailing_pb: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let status = past.status;
-        let chip_icon = self.render_agent_chip_icon(
-            ProcessKind::Agent(past.kind),
-            px(15.0),
-            self.ui_text_size(9.0),
-        );
-        let last_active = crate::graph_view::state::relative_time(past.updated_at_unix, now_unix);
-        let summary = past
-            .question
-            .clone()
-            .or_else(|| past.activity.clone())
-            .unwrap_or_else(|| format!("{} session", past.kind.label()));
-        let resume_label = if past.session_id.is_some() {
-            "Resume"
-        } else {
-            "Reopen"
-        };
-        let key = past.key.clone();
-        let resume_key = key.clone();
-
+    ) -> impl IntoElement + use<> {
+        let target = path.to_path_buf();
+        let element_id = gpui::SharedString::from(format!("earlier-runs-{}", path.display()));
+        let selector = element_id.clone();
         div()
-            .id(format!("history-row-{key}"))
+            .id(element_id)
+            .debug_selector(move || selector.to_string())
             .flex()
-            .pl(px(13.0))
-            // Same real indent under its worktree the live agent row uses (and the same bug this
-            // row had until now: padding-left and border-left folded onto one div put the edge
-            // flush at x=0 instead of indented under it). `Jerry.dc.html`'s own history row
-            // (`g.rows`/`h.*`) is the identical shape: outer `padding-left:13px`, a separate 1px
-            // `#1e2225` connector, then a content box with its own `border-left:2px`.
-            .child(div().flex_none().w(px(1.0)).bg(theme::border::ZONE))
+            .items_center()
+            .gap(px(5.0))
+            .h(px(19.0))
+            // Lands under the branch label, past the caret slot and the connector - the same x
+            // every agent row's own content starts at.
+            .pl(px(21.0))
+            .pr(px(10.0))
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            .tooltip(text_tooltip("Open History for this worktree"))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_history_for_worktree(target.clone(), window, cx);
+            }))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .pl(px(7.0))
-                    .pr(px(10.0))
-                    .pt(px(6.0))
-                    .pb(px(7.0))
-                    .gap(px(2.0))
-                    // The 2px slot is reserved so a history row's content lines up with the live
-                    // agent rows above it, and deliberately left **unpainted**. A past agent has
-                    // no selected state (there is no pane behind it - see this function's own
-                    // docs), so the only thing a painted edge here could restate is the status,
-                    // which this row already says twice on its second line: the 4px status dot
-                    // and the `was <state>` word. That is §4m's rule 2 exactly - "the edge was
-                    // the third statement... and always the least precise" - and painting it
-                    // would make a finished run the loudest thing in a rail whose §4n hierarchy
-                    // work is about pushing children *below* their parent, not above it.
-                    .border_l(px(2.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(chip_icon)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font(font(theme::font::SANS))
-                                    .text_size(self.ui_text_size(11.5))
-                                    .text_color(theme::text::DIM)
-                                    .child(summary),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .font(font(theme::font::MONO))
-                                    .text_size(self.ui_text_size(9.5))
-                                    .text_color(theme::text::GHOST)
-                                    .child(last_active),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pl(px(21.0))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(4.0))
-                                    .h(px(4.0))
-                                    .rounded_full()
-                                    .bg(status.color()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font(font(theme::font::SANS))
-                                    .text_size(self.ui_text_size(9.5))
-                                    .text_color(theme::text::FAINT)
-                                    .child(format!("was {}", agent_state_word(status))),
-                            )
-                            .child(
-                                div()
-                                    .id(format!("history-resume-{resume_key}"))
-                                    .flex_none()
-                                    .cursor_pointer()
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded(theme::radius::CHIP)
-                                    .bg(theme::button::BLUE_BG)
-                                    .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
-                                    .font(font(theme::font::SANS))
-                                    .text_size(self.ui_text_size(9.5))
-                                    .text_color(theme::button::BLUE_FG)
-                                    .child(resume_label)
-                                    .on_click(cx.listener(
-                                        move |this, _event: &ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            this.resume_past_agent(&resume_key, window, cx);
-                                        },
-                                    )),
-                            ),
-                    ),
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::GHOSTER)
+                    .child("\u{21ba}"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::FAINT)
+                    .child(crate::run_history::model::earlier_runs_label(count)),
             )
             .when(trailing_pb, |el| el.pb(px(7.0)))
     }

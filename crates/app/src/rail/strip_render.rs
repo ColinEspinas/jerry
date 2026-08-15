@@ -243,6 +243,10 @@ impl AdeApp {
         let element_id = match view {
             SidebarView::Worktrees => "sidebar-strip-worktrees",
             SidebarView::Problems => "sidebar-strip-problems",
+            // Unreachable: cells come from `strip::strip_view_cells`, which maps over
+            // `SidebarView::ALL`, and History is deliberately not in it (§4t). Named anyway
+            // rather than left to a catch-all, so this match keeps asking the question.
+            SidebarView::History => "sidebar-strip-history",
         };
         let glyph = cell.glyph_color();
 
@@ -328,7 +332,7 @@ impl AdeApp {
     /// [`Self::rail_scroll_handle`] scroller the rail used for both views before - genuinely few
     /// rows, so no virtualization is needed there.
     pub(in crate::rail) fn render_sidebar_body(
-        &self,
+        &mut self,
         view: SidebarView,
         groups: &std::rc::Rc<Vec<RepoGroup>>,
         problems: &[Problem],
@@ -336,33 +340,68 @@ impl AdeApp {
     ) -> gpui::AnyElement {
         match view {
             SidebarView::Worktrees => self.render_rail_list(groups, cx),
-            SidebarView::Problems => div()
-                .relative()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .id("agent-rail-list")
-                        // Lets a real test measure the scroller's own painted box - the rail
-                        // menus' "rendered outside the scrolling list" guarantee (GitHub issue
-                        // #290) is only checkable against it.
-                        .debug_selector(|| "agent-rail-list".to_string())
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.rail_scroll_handle)
-                        .child(self.render_problems_view(problems, cx)),
-                )
-                .children(scrollbar::render_vertical_scrollbar(
-                    "rail-scrollbar",
-                    &self.rail_scroll_handle,
-                    &[],
-                    cx,
-                ))
-                .into_any_element(),
+            SidebarView::Problems => {
+                let body = self.render_problems_view(problems, cx);
+                self.scrolled_sidebar_body(body, cx)
+            }
+            // GitHub issue #227. `&mut self` exists for this arm alone: History's body is the one
+            // that needs a real background load before it can answer
+            // (`crate::run_history::flow::AdeApp::load_run_drift` - one `git rev-list` per
+            // checkout with history). Idempotent and single-flight, and asked for here rather
+            // than at startup so a window whose user never opens History runs none - the same
+            // shape `crate::lsp::client::AdeApp::ensure_lsp_client` already has on the code
+            // surface's own render path.
+            //
+            // It shares the Problems view's plain scroller rather than the Worktrees view's
+            // virtualized `gpui::list` for the same reason Problems does: the rows are
+            // genuinely few (`crate::hooks::store::MAX_RECORDED_AGENTS` caps the whole
+            // window's history), and the tree is a two-level structure of headers and rows
+            // rather than the flat, uniform row list a `list` measures.
+            SidebarView::History => {
+                let body = self.render_history_view(cx);
+                self.scrolled_sidebar_body(body, cx)
+            }
         }
+    }
+
+    /// The plain scroller the two non-virtualized sidebar views share - Problems and History.
+    ///
+    /// One helper rather than the block written twice, for §7 rule 7's reason: this is one
+    /// control drawn for two views, and two copies drift on the debug selector first - which is
+    /// exactly the id the rail menus' "rendered outside the scrolling list" guarantee (GitHub
+    /// issue #290) is measured against. The Worktrees view deliberately does not come through
+    /// here: it is a real virtualized `gpui::list` that owns its own scroll offset.
+    fn scrolled_sidebar_body(
+        &self,
+        body: gpui::AnyElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("agent-rail-list")
+                    // Lets a real test measure the scroller's own painted box - the rail menus'
+                    // "rendered outside the scrolling list" guarantee (GitHub issue #290) is only
+                    // checkable against it.
+                    .debug_selector(|| "agent-rail-list".to_string())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.rail_scroll_handle)
+                    .child(body),
+            )
+            .children(scrollbar::render_vertical_scrollbar(
+                "rail-scrollbar",
+                &self.rail_scroll_handle,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// The Problems view: the real count line over the real rows, or the real empty note.
@@ -645,6 +684,8 @@ fn render_strip_marker(view: SidebarView, marker: StripMarker) -> impl IntoEleme
     let selector = match view {
         SidebarView::Worktrees => "sidebar-strip-worktrees-marker",
         SidebarView::Problems => "sidebar-strip-problems-marker",
+        // Unreachable - History has no cell, so it has no marker either. See `SidebarView`.
+        SidebarView::History => "sidebar-strip-history-marker",
     };
     div()
         // Lets a real test prove the marker is really absent on a window with nothing waiting -

@@ -613,17 +613,21 @@ pub enum RailListItem {
         row_index: usize,
         agent_index: usize,
     },
-    /// The small "HISTORY" label above an expanded worktree row's past-agent rows - emitted only
-    /// when [`WorktreeRow::history`] is non-empty.
-    HistoryHeader {
+    /// The `\u{21ba} N earlier runs` line under a worktree row (GitHub issue #227,
+    /// `REVISION-2026-08-13.md` \u{a7}6).
+    ///
+    /// Emitted **outside** the expansion gate, and **only for a worktree with no live agent** -
+    /// both halves are \u{a7}6's own spec: it is a line *under* the row rather than one of its
+    /// children, so a folded worktree still offers it, and "a first pass put it under every
+    /// worktree: eight identical rows, no information".
+    ///
+    /// This replaced the `HistoryHeader`/`PastAgentRow` pair that used to flatten the rail's own
+    /// inline `HISTORY` section here. Both are deleted rather than left beside it
+    /// (`REVISION-2026-08-14.md` \u{a7}7 rule 5) - the runs themselves live in the sidebar's
+    /// History view now (`crate::run_history::render`).
+    EarlierRunsLink {
         group_index: usize,
         row_index: usize,
-    },
-    /// One persisted-but-not-running agent under an expanded worktree row's History section.
-    PastAgentRow {
-        group_index: usize,
-        row_index: usize,
-        history_index: usize,
     },
 }
 
@@ -634,8 +638,8 @@ impl RailListItem {
     /// Flattened, each worktree's block is a variable number of separate list items rather than
     /// one wrapping div, so the gap moves onto whichever item now actually paints last - the
     /// [`Self::WorktreeRow`] itself when collapsed or childless, otherwise the last
-    /// [`Self::AgentRow`] or, when this worktree has real history, the last
-    /// [`Self::PastAgentRow`].
+    /// [`Self::AgentRow`] or, on a worktree with no live agent but real history, its own
+    /// [`Self::EarlierRunsLink`].
     ///
     /// Always `false` for an errored worktree row, matching
     /// `crate::rail::render::AdeApp::render_worktree_row`'s own pre-flatten behaviour exactly: its
@@ -666,26 +670,30 @@ impl RailListItem {
                 else {
                     return false;
                 };
-                return row.error.is_none()
-                    && row.history.is_empty()
-                    && *agent_index + 1 == row.agents.len();
+                // No `history.is_empty()` term any more: a worktree with a live agent never gets
+                // an `EarlierRunsLink` at all (GitHub issue #227 / \u{a7}6's own gate), so the last
+                // agent row really is the last item in the block.
+                return row.error.is_none() && *agent_index + 1 == row.agents.len();
             }
-            RailListItem::HistoryHeader { .. } => return false,
-            RailListItem::PastAgentRow {
+            // Always last when present: it is emitted after the row's children, and only for a
+            // worktree that has none.
+            RailListItem::EarlierRunsLink {
                 group_index,
                 row_index,
-                history_index,
             } => {
-                let Some(row) = groups
+                return groups
                     .get(*group_index)
                     .and_then(|g| g.rows.get(*row_index))
-                else {
-                    return false;
-                };
-                return row.error.is_none() && *history_index + 1 == row.history.len();
+                    .is_some_and(|row| row.error.is_none());
             }
         };
-        row.error.is_none() && (!expanded || (row.agents.is_empty() && row.history.is_empty()))
+        // A worktree row is last in its own block unless something follows it. Exactly two things
+        // can, and they are mutually exclusive by construction (see [`flatten_rail_list_items`]):
+        // its own agent rows, when it is expanded and has any, and - only on a worktree with no
+        // live agent - its `\u{21ba} N earlier runs` line.
+        let agent_rows_follow = expanded && !row.agents.is_empty();
+        let earlier_runs_line_follows = row.agents.is_empty() && !row.history.is_empty();
+        row.error.is_none() && !agent_rows_follow && !earlier_runs_line_follows
     }
 }
 
@@ -716,29 +724,25 @@ pub fn flatten_rail_list_items(
             if row.error.is_some() {
                 continue;
             }
-            let has_children = !row.agents.is_empty() || !row.history.is_empty();
-            if !has_children || !expanded(row) {
-                continue;
-            }
-            for agent_index in 0..row.agents.len() {
-                items.push(RailListItem::AgentRow {
-                    group_index,
-                    row_index,
-                    agent_index,
-                });
-            }
-            if !row.history.is_empty() {
-                items.push(RailListItem::HistoryHeader {
-                    group_index,
-                    row_index,
-                });
-                for history_index in 0..row.history.len() {
-                    items.push(RailListItem::PastAgentRow {
+            // GitHub issue #227: history is no longer one of a row's children, so "has children"
+            // is back to meaning exactly "has live agents" - which is also what the disclosure
+            // caret means again.
+            if !row.agents.is_empty() && expanded(row) {
+                for agent_index in 0..row.agents.len() {
+                    items.push(RailListItem::AgentRow {
                         group_index,
                         row_index,
-                        history_index,
+                        agent_index,
                     });
                 }
+            }
+            // \u{a7}6's line, and \u{a7}6's gate: only on a worktree with no live agent, and
+            // outside the expansion gate, because it sits *under* the row rather than inside it.
+            if row.agents.is_empty() && !row.history.is_empty() {
+                items.push(RailListItem::EarlierRunsLink {
+                    group_index,
+                    row_index,
+                });
             }
         }
     }
@@ -1403,6 +1407,85 @@ mod tests {
         );
         assert_eq!(rows[1].agents[0].id, 1);
         assert_eq!(rows[1].agents[1].id, 2);
+    }
+
+    /// GitHub issue #227 / §6, as the flattened list really emits it: the `↺ N earlier runs`
+    /// line appears **only** on a worktree with no live agent, appears whether or not that row is
+    /// expanded (it sits *under* the row, not inside it), and is the last item in its block - so
+    /// it, not the worktree row, carries the 7px inter-group gap.
+    ///
+    /// Also the deletion, stated as an assertion: history no longer flattens into a `HISTORY`
+    /// header plus one row per run. Those items are gone, and a worktree's runs live in the
+    /// sidebar's History view (`crate::run_history::render`).
+    #[test]
+    fn the_earlier_runs_line_is_emitted_only_for_a_worktree_with_no_live_agent() {
+        let past = |worktree: &str| crate::hooks::history::PastAgent {
+            key: format!("{worktree}|Claude|1"),
+            worktree: PathBuf::from(worktree),
+            kind: crate::work_surface::agents::AgentKind::Claude,
+            spawned_at_unix: 1,
+            status: Status::Idle,
+            activity: None,
+            question: None,
+            updated_at_unix: 100,
+            session_id: None,
+            title: None,
+            turns: 0,
+            ended_at_unix: None,
+            diffstat: None,
+        };
+        let worktrees = vec![
+            worktree_entry("/repo-wt/busy", clean_note(false)),
+            worktree_entry("/repo-wt/quiet", clean_note(false)),
+            worktree_entry("/repo-wt/fresh", clean_note(false)),
+        ];
+        // `busy` has both a live agent and history; `quiet` has only history; `fresh` has neither.
+        let agents = vec![row(1, Status::Run, "agent-a", "/repo-wt/busy")];
+        let rows = build_worktree_rows_with_history(
+            &worktrees,
+            &agents,
+            &[past("/repo-wt/busy"), past("/repo-wt/quiet")],
+        );
+        let groups = vec![RepoGroup {
+            repo_id: crate::rail::repo::RepoId(1),
+            repo_name: "repo".to_string(),
+            all_rows: rows.clone(),
+            rows,
+            rows_loaded: true,
+        }];
+
+        for expanded in [false, true] {
+            let items = flatten_rail_list_items(&groups, |_| expanded);
+            let links: Vec<usize> = items
+                .iter()
+                .filter_map(|item| match item {
+                    RailListItem::EarlierRunsLink { row_index, .. } => Some(*row_index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                links,
+                vec![1],
+                "expanded={expanded}: only `quiet` (history, no live agent) gets the line -                  \u{a7}6's own gate, and it does not hide behind the caret"
+            );
+
+            let link = items
+                .iter()
+                .find(|item| matches!(item, RailListItem::EarlierRunsLink { .. }))
+                .expect("the line");
+            assert!(
+                link.is_last_in_worktree_block(&groups, expanded),
+                "expanded={expanded}: the line is what ends `quiet`'s block, so it carries the gap"
+            );
+            let quiet_row = items
+                .iter()
+                .find(|item| matches!(item, RailListItem::WorktreeRow { row_index: 1, .. }))
+                .expect("quiet's own row");
+            assert!(
+                !quiet_row.is_last_in_worktree_block(&groups, expanded),
+                "expanded={expanded}: and the row above it therefore is not"
+            );
+        }
     }
 
     #[test]

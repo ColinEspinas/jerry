@@ -272,6 +272,10 @@ impl AdeApp {
         // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
         // discipline and, in exactly this way, did not.
         self.leave_review_tab(window, cx);
+        // GitHub issue #227: the run-transcript tab occupies the centre pane exactly as the
+        // graph and review tabs do, so it needs the identical teardown - see
+        // `crate::run_history::tab::AdeApp::leave_run_tab`.
+        self.leave_run_tab(window, cx);
 
         let had_open_file_tab = self.open_change.is_some();
         if had_open_file_tab {
@@ -677,6 +681,7 @@ impl AdeApp {
             self.open_files(),
             self.graph_tab_open,
             self.review_tab_open,
+            self.run_tab_by_worktree.contains_key(&cwd),
         )
     }
 
@@ -868,7 +873,8 @@ impl AdeApp {
             work_surface::TabRef::Agent(id) => self.agents.iter().find(|agent| agent.id == id),
             work_surface::TabRef::File(_)
             | work_surface::TabRef::Graph
-            | work_surface::TabRef::Review(_) => None,
+            | work_surface::TabRef::Review(_)
+            | work_surface::TabRef::Run => None,
         })
     }
 
@@ -988,6 +994,11 @@ impl AdeApp {
                 // draggable order every other kind already goes through.
                 work_surface::TabRef::Review(id) => {
                     bar = bar.child(crate::review::render::render_review_tab(self, id, cx));
+                }
+                // GitHub issue #227: the run-transcript tab, a full member of the same combined,
+                // draggable order - one per worktree, replaced rather than stacked.
+                work_surface::TabRef::Run => {
+                    bar = bar.child(crate::run_history::tab::render_run_tab(self, cx));
                 }
             }
         }
@@ -2581,6 +2592,13 @@ impl AdeApp {
             return surface.child(body).into_any_element();
         }
 
+        // GitHub issue #227: and so does the run-transcript tab. Same reasoning as above - the
+        // flags are never both set, because every opener leaves the others.
+        if self.run_tab_active {
+            let body = self.render_run_view(cx);
+            return surface.child(body).into_any_element();
+        }
+
         if self.graph_tab_active {
             let body = self.render_graph_view(cx);
             return surface.child(body).into_any_element();
@@ -2916,6 +2934,11 @@ pub(crate) enum DraggedTab {
         id: AgentId,
         label: String,
     },
+    /// GitHub issue #227 - the run-transcript tab. No id payload, for
+    /// [`work_surface::TabRef::Run`]'s own reason: a worktree's strip holds at most one.
+    Run {
+        label: String,
+    },
 }
 
 impl DraggedTab {
@@ -2925,6 +2948,7 @@ impl DraggedTab {
             DraggedTab::File { label, .. } => label,
             DraggedTab::Graph { label } => label,
             DraggedTab::Review { label, .. } => label,
+            DraggedTab::Run { label } => label,
         }
     }
 
@@ -2936,6 +2960,7 @@ impl DraggedTab {
             DraggedTab::File { path, .. } => work_surface::TabRef::File(path.clone()),
             DraggedTab::Graph { .. } => work_surface::TabRef::Graph,
             DraggedTab::Review { id, .. } => work_surface::TabRef::Review(*id),
+            DraggedTab::Run { .. } => work_surface::TabRef::Run,
         }
     }
 }

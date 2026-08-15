@@ -439,9 +439,49 @@ impl RunTree {
         self.repos.iter().map(RunRepo::run_count).sum()
     }
 
+    /// How many worktree groups the tree really paints, across every repo.
+    pub fn worktree_count(&self) -> usize {
+        self.repos.iter().map(|repo| repo.groups.len()).sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.total() == 0
     }
+
+    /// The view's own count line - `REVISION-2026-08-13.md` §1: "each view's body opens with its
+    /// own count line", and §2's rule for what one may say: "Both list headers ... are **tallied
+    /// over their own data**".
+    ///
+    /// So this counts *this tree* - what the body is actually showing after the scope and the
+    /// filter - rather than the whole history, and it names both levels of the hierarchy it is
+    /// showing, the way §2's own `10 results · 5 files · 3 worktrees` does. Both terms go through
+    /// [`crate::root::plural`] (§7 rule 9).
+    ///
+    /// `None` when there is nothing to count: the empty note ([`empty_note`]) or the
+    /// filtered-away note ([`filtered_away_note`]) says the real thing instead, exactly as
+    /// [`crate::rail::strip::ProblemTally::count_line`] does for a clean worktree.
+    pub fn count_line(&self) -> Option<String> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} \u{b7} {}",
+            plural::count(total, "run", None),
+            plural::count(self.worktree_count(), "worktree", None),
+        ))
+    }
+}
+
+/// The rail's own `↺ 2 earlier runs` line under a worktree row - `REVISION-2026-08-13.md` §6.
+///
+/// Agreement through [`crate::root::plural::form`] rather than [`crate::root::plural::count`]
+/// because the count is not adjacent to its noun here: `2 earlier runs` puts a word between them,
+/// which is exactly the case §8a's helper docs name ("For anything else that has to agree with a
+/// count ... call `form` directly, so the sentence still has exactly one place that looks at the
+/// number").
+pub fn earlier_runs_label(count: usize) -> String {
+    format!("{count} earlier {}", plural::form(count, "run", "runs"))
 }
 
 /// Builds the real repo → worktree → run tree.
@@ -1183,6 +1223,60 @@ mod tests {
             empty_note(HistoryScope::All, Some("feat/auth")),
             "No agent has finished a run yet."
         );
+    }
+
+    /// §2's "tallied over their own data": the line counts the tree the body is really painting,
+    /// both levels of it, and says nothing at all when there is nothing to count.
+    #[test]
+    fn the_count_line_tallies_the_tree_the_body_is_really_showing() {
+        let runs = vec![run("/a/wt-1", 10), run("/a/wt-2", 20), run("/b/wt-3", 30)];
+        let worktrees = vec![
+            worktree("/a/wt-1", "alpha", "feature-a"),
+            worktree("/a/wt-2", "alpha", "feature-b"),
+            worktree("/b/wt-3", "beta", "main"),
+        ];
+        let tree = build_run_tree(
+            &runs,
+            &worktrees,
+            None,
+            HistoryScope::All,
+            "",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            tree.count_line().as_deref(),
+            Some("3 runs \u{b7} 3 worktrees")
+        );
+
+        // Narrowed by the filter, the line follows - it reports what is on screen, not what is
+        // on disk. `tree.unfiltered` is what remembers the difference.
+        let narrowed = build_run_tree(
+            &runs,
+            &worktrees,
+            None,
+            HistoryScope::All,
+            "feature-a",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            narrowed.count_line().as_deref(),
+            Some("1 run \u{b7} 1 worktree"),
+            "\u{a7}7 rule 9: singular through the helper, on both terms"
+        );
+        assert_eq!(
+            RunTree::default().count_line(),
+            None,
+            "an empty tree gets its empty note, not a line of zeroes"
+        );
+    }
+
+    /// §6's rail line, singular and plural both.
+    #[test]
+    fn the_rail_link_says_one_earlier_run_in_the_singular() {
+        assert_eq!(earlier_runs_label(1), "1 earlier run");
+        assert_eq!(earlier_runs_label(2), "2 earlier runs");
     }
 
     #[test]
