@@ -1435,8 +1435,14 @@ pub struct AdeApp {
     /// positioned off the control that opens it.
     pub(crate) resources_readout_bounds: gpui::Bounds<Pixels>,
     /// Every provider's real rate-limit budget (GitHub issue #294) - what the agent pane strip's
-    /// cluster and the budget popover both read. Written only by
-    /// `crate::budget::flow::AdeApp::apply_budget_poll_result`, from real poll results.
+    /// cluster and the budget popover both read.
+    ///
+    /// **This window's copy of a process-wide fact**, not the fact itself: the budget one poll
+    /// fetched belongs to every window, and so do the rate-limit rules that decide when the next
+    /// poll may run, so the truth lives in `crate::budget::state::shared_budget` and this is
+    /// refreshed from it by `crate::budget::flow::AdeApp::sync_budget_from_shared`. Written only
+    /// from there, and only from real poll results - see that module for why a per-window budget
+    /// meant N windows read every provider N times as often.
     pub(crate) budget: crate::budget::state::BudgetState,
     /// Whether the agent pane's rate-limit budget popover is open (GitHub issue #294) - one of
     /// the [`menus::MenuSurface`]s, so it obeys the app's one-menu-at-a-time invariant.

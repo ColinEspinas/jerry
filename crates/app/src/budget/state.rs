@@ -13,8 +13,10 @@
 //! [`crate::budget::fetch`]'s parsers, so nothing downstream can hold a value whose direction is
 //! ambiguous.
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use super::fetch::ProviderRead;
 use crate::work_surface::agents::{AgentKind, ProcessKind};
 
 /// How often the background loop re-reads every connected provider
@@ -45,18 +47,67 @@ pub const MANUAL_REFRESH_FLOOR: Duration = Duration::from_secs(15);
 /// stopped answering.
 pub const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
-/// Whether the background poll loop runs at all in this build.
+/// How long [`ProviderBudget::in_flight`] may stay set before it is treated as a lost poll rather
+/// than as a running one.
+///
+/// The guard is cleared by a landing result, and [`crate::budget::fetch::read_provider_catching_panics`]
+/// plus `crate::budget::flow`'s own "apply to the shared state before touching the window"
+/// ordering are what make a result land on every ordinary path, panic included. This constant is
+/// what covers the paths *nobody* can enumerate - an executor thread that dies, a future that is
+/// dropped mid-await, a bug not yet written. Without it a single lost result silently disables
+/// the background poll **and** every `Refresh`/`Retry` click for the rest of the process's life,
+/// with the popover stuck on `checking…`: a failure mode with no error message and no way back.
+///
+/// Six [`crate::budget::fetch::REQUEST_TIMEOUT`]s (asserted against it at compile time, in that
+/// module), so a request that is merely slow is never raced by a second one.
+pub const IN_FLIGHT_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether this *build* compiles the provider poll in at all - `false` under `cfg(test)`.
 ///
 /// **Off under `cfg(test)`, deliberately and non-negotiably.** The poll reads the *developer's
 /// own* OAuth credential off disk and sends it to a real provider endpoint; a test suite that did
 /// that would spend a real person's real rate-limit allowance (and hammer a limiter that is
 /// already tight) every time anyone ran `cargo test`. Everything the loop does *around* the
 /// network call - the single-flight guard, the manual-refresh floor, applying a result to state,
-/// every derived readout - is tested directly against
-/// `crate::budget::flow::AdeApp::apply_budget_poll_result`, and the two response parsers are
-/// tested against real payloads. The one thing not covered by a test is "does the timer fire",
-/// which is the same line the updater's own periodic loop draws.
+/// every derived readout - is tested directly against [`BudgetState::apply_read`], and the two
+/// response parsers are tested against real payloads. The one thing not covered by a test is
+/// "does the timer fire".
+///
+/// **This constant alone is not the guarantee** - see [`polling_enabled`], which is what every
+/// caller actually asks. `cfg!(test)` is true only while the `app` crate is itself being compiled
+/// *as* a test target; an integration test under `crates/app/tests/` links `app` as an ordinary
+/// dependency, where this is `true` and the guard silently disarms.
 pub const POLLING_ENABLED: bool = !cfg!(test);
+
+/// Set this to anything (`JERRY_DISABLE_PROVIDER_POLL=1`) and no provider is ever read, in any
+/// build.
+///
+/// The kill switch [`POLLING_ENABLED`] cannot be, because a compile-time `cfg` does not survive a
+/// crate boundary. Any test harness that drives this app's UI - today's `#[gpui::test]`s already
+/// get [`POLLING_ENABLED`], a future `crates/app/tests/` integration test would not - must set
+/// this in its environment, and this repo's CI sets it for every job so a suite added there is
+/// covered whether or not whoever adds it remembers. It is also the switch to reach for when
+/// running the real app against a rate-limited account, or offline.
+///
+/// A `JERRY_`-prefixed environment variable rather than a Cargo feature for the same reason
+/// `JERRY_REQUIRE_REAL_CLAUDE` (`crate::hooks::integration_tests`) is one: it works for a test
+/// binary, a `cargo run`, a packaged build and a CI job identically, and needs no cooperation
+/// from Cargo's feature resolution to reach a crate compiled as a plain dependency.
+pub const DISABLE_PROVIDER_POLL_ENV: &str = "JERRY_DISABLE_PROVIDER_POLL";
+
+/// Whether a real provider read may happen in this process, right now. The single question every
+/// caller in `crate::budget::flow` asks before touching a credential or the network.
+pub fn polling_enabled() -> bool {
+    polling_enabled_from(POLLING_ENABLED, std::env::var_os(DISABLE_PROVIDER_POLL_ENV))
+}
+
+/// The pure half of [`polling_enabled`] - so the rule is tested without mutating the
+/// process-global environment (`std::env::set_var` is unsound to race in a threaded test binary),
+/// the same split [`crate::budget::fetch::credential_dir_from`] already uses for its own
+/// environment override.
+pub fn polling_enabled_from(compiled_in: bool, disable_env: Option<std::ffi::OsString>) -> bool {
+    compiled_in && disable_env.is_none()
+}
 
 /// A provider Jerry can read a rate-limit budget from.
 ///
@@ -353,7 +404,8 @@ pub struct ProviderBudget {
     pub connected: bool,
     /// The most recent *successful* read, with the real instant it landed.
     pub last_ok: Option<(ProviderSnapshot, Instant)>,
-    /// `Some` when the most recent attempt failed - the message is the popover's tooltip, and its
+    /// `Some` when the most recent attempt failed - the message is the tooltip on that provider's
+    /// own popover row (`crate::budget::render::AdeApp::render_budget_other_row`), and its
     /// presence is what earns the `Retry`. Cleared by a successful read.
     pub last_error: Option<String>,
     /// A poll is in flight for this provider right now. Single-flight per provider: a manual
@@ -392,19 +444,40 @@ impl ProviderBudget {
         self.connected && self.last_error.is_some()
     }
 
-    /// Whether a poll may start right now. `manual` clicks are additionally held to
-    /// [`MANUAL_REFRESH_FLOOR`] since the last attempt; the background loop's own cadence is
-    /// [`POLL_INTERVAL`], so it needs no second floor.
+    /// Whether a poll may start right now: nothing already open, and long enough since the last
+    /// attempt - [`MANUAL_REFRESH_FLOOR`] for a click, the full [`POLL_INTERVAL`] for the
+    /// background loop.
+    ///
+    /// **Both floors live here, not in the caller.** The heartbeat used to hold its own cadence
+    /// and ask this only about single-flight, which meant the rule that actually protects the
+    /// provider's limiter was enforced by whichever code path happened to remember it. Every real
+    /// read now passes one gate that knows both.
+    ///
+    /// The single-flight guard ages out after [`IN_FLIGHT_STALE_AFTER`] rather than being trusted
+    /// forever - see that constant for the failure mode that buys.
     pub fn may_poll_now(&self, manual: bool, now: Instant) -> bool {
-        if self.in_flight {
+        if self.in_flight && !self.in_flight_is_stale(now) {
             return false;
         }
-        if !manual {
-            return true;
-        }
+        let floor = if manual {
+            MANUAL_REFRESH_FLOOR
+        } else {
+            POLL_INTERVAL
+        };
         match self.last_attempt {
-            Some(at) => now.saturating_duration_since(at) >= MANUAL_REFRESH_FLOOR,
+            Some(at) => now.saturating_duration_since(at) >= floor,
             None => true,
+        }
+    }
+
+    /// Whether an open request has been open so long that it is better explained as lost than as
+    /// running. A guard with no `last_attempt` behind it cannot be aged (nothing says when it was
+    /// set) and is left alone - that combination is not reachable, because the two are written
+    /// together in [`BudgetState::claim_poll`].
+    fn in_flight_is_stale(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            Some(at) => now.saturating_duration_since(at) >= IN_FLIGHT_STALE_AFTER,
+            None => false,
         }
     }
 
@@ -421,6 +494,10 @@ impl ProviderBudget {
 }
 
 /// Every provider's state, keyed by provider - the whole feature's live data.
+///
+/// One of these is the process's real budget ([`shared_budget`]); every window holds a *copy* of
+/// it to render from. See that function for why the truth is process-global rather than per
+/// window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetState {
     claude: ProviderBudget,
@@ -428,6 +505,63 @@ pub struct BudgetState {
 }
 
 impl BudgetState {
+    /// Takes the right to start exactly one real read of `provider`, marking it in flight, or
+    /// answers `false` because something else already holds that right (or because a click came
+    /// inside [`MANUAL_REFRESH_FLOOR`]).
+    ///
+    /// Deliberately a claim rather than a question followed by a write: this runs against the
+    /// process-global [`shared_budget`] with its lock held, so the check and the flag it sets are
+    /// one indivisible step. Two windows waking their heartbeats at the same instant is the
+    /// ordinary case, not a rare race.
+    pub fn claim_poll(&mut self, provider: Provider, manual: bool, now: Instant) -> bool {
+        if !self.get(provider).may_poll_now(manual, now) {
+            return false;
+        }
+        let budget = self.get_mut(provider);
+        budget.in_flight = true;
+        budget.last_attempt = Some(now);
+        true
+    }
+
+    /// Folds one real read into one provider's state. The whole state machine, in one place and
+    /// with no `Context` and no window - so every transition is directly testable without either.
+    ///
+    /// The three outcomes are kept genuinely distinct (rev 6 §7 rule 6):
+    ///
+    /// - **not connected** clears everything, including any numbers from before. A provider whose
+    ///   credential has gone (a logout while Jerry was running) is not a provider with stale
+    ///   numbers - the data is not ours to show any more.
+    /// - **ok** replaces the numbers and clears the failure.
+    /// - **failed** records the reason and *keeps* the previous numbers. They are still the last
+    ///   true reading; §2's `last read <age>` takes over once they age past [`STALE_AFTER`], and
+    ///   the failure itself surfaces as the `Retry` and as that row's tooltip.
+    ///
+    /// Every path clears [`ProviderBudget::in_flight`], including the failure one - that is the
+    /// other half of [`claim_poll`], and the reason a panicked read is converted into a
+    /// [`ProviderRead::Failed`] rather than allowed to swallow the result
+    /// ([`crate::budget::fetch::read_provider_catching_panics`]).
+    pub fn apply_read(&mut self, provider: Provider, read: ProviderRead, now: Instant) {
+        let budget = self.get_mut(provider);
+        budget.in_flight = false;
+        match read {
+            ProviderRead::NotConnected => {
+                budget.connected = false;
+                budget.last_ok = None;
+                budget.last_error = None;
+            }
+            ProviderRead::Ok(snapshot) => {
+                budget.connected = true;
+                budget.last_ok = Some((snapshot, now));
+                budget.last_error = None;
+            }
+            ProviderRead::Failed(reason) => {
+                budget.connected = true;
+                log::warn!("{} rate-limit read failed: {reason}", provider.id());
+                budget.last_error = Some(reason);
+            }
+        }
+    }
+
     pub fn get(&self, provider: Provider) -> &ProviderBudget {
         match provider {
             Provider::Claude => &self.claude,
@@ -467,6 +601,46 @@ impl BudgetState {
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(provider, _)| provider)
     }
+}
+
+/// The one budget this **process** has, shared by every window in it.
+///
+/// # Why this is global rather than a field on each window
+///
+/// `File > New Window` (`crate::title_bar::menu`) builds a second, wholly independent `AdeApp`.
+/// With the poll bookkeeping on that struct, every rate-limit rule this module has - the
+/// [`POLL_INTERVAL`] cadence, the [`MANUAL_REFRESH_FLOOR`] on clicks, the single-flight guard -
+/// would be per *window*, so N windows would read every provider N times as often. The endpoint
+/// on the other end is the one that already answered a real `429` during issue #294's Phase 0
+/// research (see [`POLL_INTERVAL`]'s own docs); multiplying its traffic by the number of windows
+/// somebody happens to have open is exactly the "a budget readout that spent budget to fetch
+/// itself" failure that constant exists to prevent.
+///
+/// The same shape `crate::sound::claim_app_start_sound` already uses for "once per process, not
+/// once per window", for the same underlying reason: a process-wide fact cannot live in a
+/// per-window struct.
+///
+/// Sharing the *results* too - rather than only claiming the right to poll and leaving other
+/// windows blank - is what keeps every window's readout real: a second window renders the same
+/// numbers the single shared poll fetched, refreshed onto its own copy by
+/// `crate::budget::flow::AdeApp::sync_budget_from_shared`, instead of sitting on a permanent
+/// `checking…` it is not allowed to resolve.
+pub fn shared_budget() -> &'static Mutex<BudgetState> {
+    static SHARED: OnceLock<Mutex<BudgetState>> = OnceLock::new();
+    SHARED.get_or_init(|| Mutex::new(BudgetState::default()))
+}
+
+/// [`shared_budget`], locked, recovering rather than propagating if a previous holder panicked.
+///
+/// Poison is deliberately ignored: the data behind this lock is a readout, every field of it is
+/// overwritten wholesale by the next poll, and there is no invariant a half-finished write could
+/// break. Answering `unwrap()` here would turn one panic anywhere near the budget into a panic in
+/// *every* window on every heartbeat afterwards - the same permanently-wedged failure mode
+/// [`IN_FLIGHT_STALE_AFTER`] and the poll's own `catch_unwind` exist to rule out.
+pub fn lock_shared_budget() -> MutexGuard<'static, BudgetState> {
+    shared_budget()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Real coverage for the model itself - the thresholds, the state machine, and every string.
@@ -675,7 +849,7 @@ mod budget_state_tests {
     }
 
     #[test]
-    fn a_manual_refresh_is_floored_but_the_background_poll_is_not() {
+    fn a_manual_refresh_is_floored_and_the_background_poll_holds_the_full_interval() {
         let now = Instant::now();
         let mut budget = ProviderBudget {
             connected: true,
@@ -698,14 +872,214 @@ mod budget_state_tests {
             "and allowed again once the floor has passed"
         );
         assert!(
-            budget.may_poll_now(false, now + Duration::from_secs(1)),
-            "the background loop has its own cadence and is not held to the manual floor"
+            !budget.may_poll_now(false, now + MANUAL_REFRESH_FLOOR),
+            "the background loop is held to its own, much longer cadence - a click may jump the \
+             queue, a timer may not"
+        );
+        assert!(
+            budget.may_poll_now(false, now + POLL_INTERVAL),
+            "and takes its turn once a full interval has passed"
         );
 
         budget.in_flight = true;
         assert!(
-            !budget.may_poll_now(false, now + POLL_INTERVAL),
+            !budget.may_poll_now(false, now + IN_FLIGHT_STALE_AFTER / 2),
             "single-flight per provider: nothing starts a second request while one is open"
+        );
+        assert!(
+            budget.may_poll_now(false, now + POLL_INTERVAL),
+            "but the guard is not trusted past the point where the request must be lost - see \
+             `a_lost_poll_ages_out_instead_of_wedging_the_provider_forever`"
+        );
+    }
+
+    /// The wedge this guards against was real: `in_flight` is set before a read starts and
+    /// cleared when its result lands, so a result that never lands - a panicked parse, a dead
+    /// executor thread - left it set forever, and [`ProviderBudget::may_poll_now`] then refused
+    /// the background loop *and* every `Refresh`/`Retry` click for the rest of the session, with
+    /// the popover stuck on `checking…` and no error anywhere.
+    #[test]
+    fn a_lost_poll_ages_out_instead_of_wedging_the_provider_forever() {
+        let started = Instant::now();
+        let budget = ProviderBudget {
+            connected: true,
+            in_flight: true,
+            last_attempt: Some(started),
+            ..Default::default()
+        };
+
+        assert!(
+            !budget.may_poll_now(false, started + Duration::from_secs(1)),
+            "single-flight still holds while the request is plausibly still running"
+        );
+        assert!(
+            !budget.may_poll_now(
+                true,
+                started + IN_FLIGHT_STALE_AFTER - Duration::from_secs(1)
+            ),
+            "and right up to the age-out, for a click as much as for the loop"
+        );
+        assert!(
+            budget.may_poll_now(true, started + IN_FLIGHT_STALE_AFTER),
+            "past it the request is better explained as lost than as running: the `Retry` button \
+             must come back to life rather than stay dead for the session, since it is the \
+             control a user reaches for when the readout looks stuck"
+        );
+        assert!(
+            budget.may_poll_now(false, started + POLL_INTERVAL),
+            "and the background loop takes the provider back over at its own next turn - the \
+             age-out lifts the guard, it does not shorten the cadence"
+        );
+    }
+
+    /// A landed result always clears the guard, on every one of the three outcomes - the ordinary
+    /// half of the same contract.
+    #[test]
+    fn every_landed_result_clears_the_single_flight_guard() {
+        let now = Instant::now();
+        for read in [
+            ProviderRead::NotConnected,
+            ProviderRead::Ok(snapshot(81.0, 40.0)),
+            ProviderRead::Failed("the provider answered 429".to_string()),
+        ] {
+            let mut state = BudgetState::default();
+            assert!(
+                state.claim_poll(Provider::Claude, false, now),
+                "a fresh provider may always be claimed"
+            );
+            assert!(state.get(Provider::Claude).in_flight);
+            state.apply_read(Provider::Claude, read.clone(), now);
+            assert!(
+                !state.get(Provider::Claude).in_flight,
+                "{read:?} must clear the guard - a result that lands and leaves it set is the \
+                 wedge in another costume"
+            );
+        }
+    }
+
+    /// The whole of §4c's state machine, driven through the same entry point a real poll uses.
+    #[test]
+    fn a_real_read_becomes_state_and_a_failure_keeps_the_numbers_it_had() {
+        let now = Instant::now();
+        let mut state = BudgetState::default();
+
+        state.apply_read(Provider::Claude, ProviderRead::NotConnected, now);
+        assert_eq!(
+            state.get(Provider::Claude).readout(now),
+            ProviderReadout::NotConnected,
+            "no credential is `not connected`, and nothing was sent anywhere"
+        );
+
+        let good = snapshot(81.0, 40.0);
+        state.apply_read(Provider::Claude, ProviderRead::Ok(good.clone()), now);
+        assert_eq!(
+            state.get(Provider::Claude).readout(now),
+            ProviderReadout::Numbers(&good)
+        );
+
+        state.apply_read(
+            Provider::Claude,
+            ProviderRead::Failed("the provider answered 429".to_string()),
+            now,
+        );
+        assert_eq!(
+            state.get(Provider::Claude).readout(now),
+            ProviderReadout::Numbers(&good),
+            "a failed refresh does not erase numbers that are still true"
+        );
+        assert!(
+            state.get(Provider::Claude).can_retry(),
+            "but it does earn the `Retry` \u{a7}4c puts beside a failure"
+        );
+        assert_eq!(
+            state.get(Provider::Claude).last_error.as_deref(),
+            Some("the provider answered 429"),
+            "and the real reason is kept, for the row's tooltip"
+        );
+
+        // A logout mid-session: the credential is gone, and so are the numbers.
+        state.apply_read(Provider::Claude, ProviderRead::NotConnected, now);
+        assert_eq!(
+            state.get(Provider::Claude).readout(now),
+            ProviderReadout::NotConnected
+        );
+        assert!(
+            state.get(Provider::Claude).last_ok.is_none(),
+            "numbers from a provider we are no longer logged into are not ours to show"
+        );
+    }
+
+    /// §4c's rate-limit discipline is a rule about this *process*, not about one window: two
+    /// windows sharing one [`BudgetState`] get one poll between them, not one each. Driven here
+    /// against a local state standing in for [`shared_budget`], which is the same value the real
+    /// windows claim against.
+    #[test]
+    fn two_windows_claiming_the_same_budget_get_one_poll_between_them() {
+        let now = Instant::now();
+        let mut shared = BudgetState::default();
+
+        assert!(
+            shared.claim_poll(Provider::Claude, false, now),
+            "the first window's heartbeat starts the read"
+        );
+        assert!(
+            !shared.claim_poll(Provider::Claude, false, now),
+            "the second window's heartbeat, a moment later, must find the read already open - \
+             not open a competing one against an endpoint that answers 429"
+        );
+        assert!(
+            !shared.claim_poll(Provider::Claude, true, now),
+            "and a `Refresh` clicked in that second window is held to the same shared guard"
+        );
+
+        shared.apply_read(
+            Provider::Claude,
+            ProviderRead::Ok(snapshot(81.0, 40.0)),
+            now,
+        );
+        assert!(
+            !shared.claim_poll(Provider::Claude, false, now + POLL_INTERVAL / 2),
+            "the cadence is shared too: half an interval later neither window may poll"
+        );
+        assert!(
+            shared.claim_poll(Provider::Claude, false, now + POLL_INTERVAL),
+            "and whichever window's heartbeat gets there first takes the next one"
+        );
+    }
+
+    /// The shared budget really is one value for the whole process - the property the paragraph
+    /// above rests on, checked rather than assumed.
+    #[test]
+    fn the_shared_budget_is_a_single_process_wide_value() {
+        assert!(
+            std::ptr::eq(shared_budget(), shared_budget()),
+            "every window must claim against the same state, or none of the rate-limit rules \
+             mean anything across windows"
+        );
+    }
+
+    /// The `cfg(test)` gate only covers this crate's *own* test targets. Anything else that drives
+    /// this app - a future `crates/app/tests/` integration test, where `app` is compiled as a
+    /// plain dependency with `cfg(test)` off - needs a switch that survives the crate boundary.
+    #[test]
+    fn the_environment_kill_switch_disables_polling_in_any_build() {
+        assert!(
+            polling_enabled_from(true, None),
+            "a real build with no switch set polls, or the feature does not exist"
+        );
+        assert!(
+            !polling_enabled_from(true, Some(std::ffi::OsString::from("1"))),
+            "and the switch turns it off even in a build that compiled it in - the case an \
+             integration-test crate would otherwise walk straight into, reading the developer's \
+             own OAuth credential and spending their real allowance"
+        );
+        assert!(
+            !polling_enabled_from(true, Some(std::ffi::OsString::from(""))),
+            "set-but-empty is still set: a harness that exports it without a value means it"
+        );
+        assert!(
+            !polling_enabled_from(false, None),
+            "and this crate's own test targets stay off with or without it"
         );
     }
 

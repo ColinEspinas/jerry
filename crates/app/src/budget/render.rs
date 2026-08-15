@@ -526,6 +526,17 @@ impl AdeApp {
             )
     }
 
+    /// One provider's row. The `refresh failed` / `last read <age>` text carries the **real
+    /// reason** the last attempt failed as its tooltip.
+    ///
+    /// `refresh failed` on its own says only that something went wrong; the difference between
+    /// "the provider answered 401" (the CLI's stored token has expired - re-authenticate *there*,
+    /// Jerry does not log anyone in) and "the provider answered 429" (the endpoint's own limiter -
+    /// wait, do not keep clicking `Retry`) is the whole of what a reader can act on, and it was
+    /// already being carried all the way here in [`super::state::ProviderBudget::last_error`] only
+    /// to be dropped one line short of the screen. It hangs off the state text rather than the
+    /// whole row so it points at the thing it explains, and it sits beside the `Retry` the same
+    /// failure earns.
     fn render_budget_other_row(
         &self,
         provider: Provider,
@@ -534,6 +545,15 @@ impl AdeApp {
     ) -> impl IntoElement {
         let budget = self.budget.get(provider);
         let readout = budget.readout(now);
+        // Only for a state the failure actually explains: a provider showing real, fresh numbers
+        // may still hold a `last_error` from a newer attempt that failed, and hanging "the
+        // provider answered 429" off numbers that are correct would read as though they were not.
+        let failure_reason = match &readout {
+            ProviderReadout::RefreshFailed | ProviderReadout::LastRead(_) => {
+                budget.last_error.clone()
+            }
+            _ => None,
+        };
         let (state_text, state_color) = match &readout {
             ProviderReadout::Numbers(snapshot) => (
                 snapshot.summary_label(),
@@ -571,11 +591,19 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .id(match provider {
+                        Provider::Claude => "budget-popover-state-claude",
+                        Provider::Codex => "budget-popover-state-codex",
+                    })
+                    .debug_selector(move || format!("budget-popover-state-{}", provider.id()))
                     .flex_none()
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(state_color)
-                    .child(state_text),
+                    .child(state_text)
+                    .when_some(failure_reason, |el, reason| {
+                        el.tooltip(text_tooltip(reason))
+                    }),
             )
             .when(can_retry, |el| {
                 el.child(
