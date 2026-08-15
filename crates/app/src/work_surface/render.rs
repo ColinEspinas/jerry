@@ -2631,9 +2631,7 @@ impl AdeApp {
                 let show_context_bar =
                     agent.kind.is_agent_session() || self.current_worktree_is_bare();
                 surface
-                    .children(
-                        show_context_bar.then(|| self.render_agent_context_bar(agent, cx)),
-                    )
+                    .children(show_context_bar.then(|| self.render_agent_context_bar(agent, cx)))
                     .child(body)
             }
             None => surface.child(self.render_no_agents_empty_state(cx)),
@@ -5749,7 +5747,8 @@ mod agent_pane_readout_tests {
         });
         let agent_id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
         app.update(cx, |app, cx| {
-            app.agents.set_kind_for_test(agent_id, ProcessKind::claude());
+            app.agents
+                .set_kind_for_test(agent_id, ProcessKind::claude());
             cx.notify();
         });
         let shell_id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
@@ -5770,9 +5769,7 @@ mod agent_pane_readout_tests {
             "premise: the shell tab really is the one showing in the centre pane"
         );
 
-        app.update_in(cx, |app, window, cx| {
-            app.select_agent(agent_id, window, cx)
-        });
+        app.update_in(cx, |app, window, cx| app.select_agent(agent_id, window, cx));
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("agent-context-bar").is_some(),
