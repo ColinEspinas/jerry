@@ -1890,6 +1890,13 @@ impl AdeApp {
     /// `no agent` - it is not one of the removed worktree verbs, and §4e's own rule ("an action
     /// belongs in the scope of the object it acts on") puts starting an agent squarely in an
     /// agent surface.
+    ///
+    /// **Not rendered over a `Shell` tab in a worktree that does have agents** - see
+    /// [`Self::render_center_pane`]'s `show_context_bar`, which reproduces `Jerry.dc.html`'s
+    /// `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0` and the mock's own reason:
+    /// "The whole row is agent identity, so it belongs to agent panes only… in a terminal pane
+    /// there is no agent to describe. Kept when the worktree has no agents at all, since it holds
+    /// that empty state's CTA."
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -2056,11 +2063,19 @@ impl AdeApp {
     /// rather than showing a decorative keycap for one (the same precedent
     /// [`Self::render_plus_menu`]'s "Open file…" row sets).
     ///
-    /// A `Claude`/`Codex` agent's pid is shown once, in the info footer below
-    /// ([`Self::render_pty_info_footer`]) - not duplicated here. GitHub issue #20 moved `clear`
-    /// into that same info footer, alongside pid/grid-dims/env - see that method's own docs for
-    /// the click entry point, and [`Self::handle_terminal_clear_action`] for the real, rebindable
-    /// keybinding that now sits behind it too.
+    /// An agent pane's pid rides **this header**, and a shell's rides its info footer - which is
+    /// exactly where `Jerry.dc.html` puts each. The mock's two pane branches are mutually
+    /// exclusive (`isChat: isAgent(tab)` vs `isTerminal: tab === 'terminal'`) and only the
+    /// `isTerminal` one has a `pid`/`termSize` bottom bar; the `isChat` header reads
+    /// `{{ focus.cli }} · pid {{ focus.pid }} … {{ focus.ptyHint }}`. See
+    /// [`Self::render_pty_info_footer`] and [`Self::render_pty_footer`] for the bottom half of
+    /// that same split.
+    ///
+    /// GitHub issue #20 moved `clear` into the **terminal's** info footer, alongside
+    /// pid/grid-dims/env - see that method's own docs for the click entry point, and
+    /// [`Self::handle_terminal_clear_action`] for the real, rebindable keybinding, which is
+    /// scoped to a focused `TerminalPane` and so still works in an agent pane that no longer
+    /// paints the hint.
     pub(in crate::work_surface) fn render_pty_header(
         &self,
         agent: &Agent,
@@ -2069,6 +2084,7 @@ impl AdeApp {
         let pane = agent.pane.read(cx);
         let program_label = pane.program_label();
         let is_running = pane.is_running();
+        let pid = pane.pid();
         let exit_code = pane.exit_status().map(|status| status.exit_code());
         let status_value = self.agent_status(agent, cx);
         let state_label = work_surface::pty_state_label(is_running, status_value, exit_code);
@@ -2111,9 +2127,20 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child(agent.cwd.display().to_string()),
             ),
-            // No per-kind header content for an agent - pid is shown once, in the info
-            // footer below.
-            ProcessKind::Agent(_) => header,
+            // An agent pane has no info footer under it (that bar is the terminal pane's, per
+            // the mock's `isTerminal` branch), so its pid rides the header - `{{ focus.cli }}
+            // pid {{ focus.pid }}` in the mock's `isChat` branch, in the same `#4a5057`
+            // (`theme::text::PATH`) the terminal footer's own `pid` uses.
+            ProcessKind::Agent(_) => header.children(pid.map(|pid| {
+                div()
+                    .id("pty-header-pid")
+                    .debug_selector(|| "pty-header-pid".to_string())
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.5))
+                    .text_color(theme::text::PATH)
+                    .child(format!("pid {pid}"))
+            })),
         };
 
         let macos = self.window_controls_style().is_macos();
@@ -2139,13 +2166,25 @@ impl AdeApp {
         )
     }
 
-    /// The terminal pane's info footer: pid, grid dimensions, the environment chip, `clear`
+    /// The **shell** pane's info footer: pid, grid dimensions, the environment chip, `clear`
     /// (GitHub issue #20 - moved here from the header, see [`Self::render_pty_header`]'s own
-    /// docs), and a hint about file:line references. Rendered for every agent kind -
-    /// `TerminalPane` is the same component behind a `Shell` tab and a `Claude`/`Codex` tab (see
-    /// that module's docs), so pid, grid dimensions, and `clear` are equally meaningful for
-    /// either. Distinct from, and rendered alongside, [`Self::render_pty_footer`] - the
-    /// agent-level readout strip (GitHub issue #295 / §4t).
+    /// docs), and a hint about file:line references.
+    ///
+    /// [`ProcessKind::Shell`] only, and mutually exclusive with [`Self::render_pty_footer`] - a
+    /// pane gets one bottom bar, never both. `Jerry.dc.html`'s two pane branches are `sc-if`
+    /// siblings on mutually exclusive conditions (`isTerminal: tab === 'terminal'` vs
+    /// `isChat: isAgent(tab)`), and only the `isTerminal` one carries this bar:
+    /// `pid {{ focus.pid }} │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
+    /// a tab`. Its `isChat` sibling's only bottom bar is the `hasBar` readout strip. Issue #20
+    /// named this bar "the **terminal** footer" too ("2. Terminal: move Clear into the footer"),
+    /// and §4b gates the environment chip "in both the window bar and **the terminal footer**".
+    ///
+    /// Rendering it under an agent as well was the double-bar bug the user reported live against
+    /// the shipped build ("both are displayed at the same time in both terminal and agents but
+    /// should not"): `TerminalPane` being one component behind both tab kinds is a fact about the
+    /// widget, not a licence for the chrome around it, and the mock draws the two kinds' chrome
+    /// differently on purpose. An agent's pid is not lost with this bar - it moved to the header,
+    /// which is where the `isChat` branch has always drawn it.
     pub(in crate::work_surface) fn render_pty_info_footer(
         &self,
         agent: &Agent,
@@ -2173,6 +2212,7 @@ impl AdeApp {
 
         let mut footer = div()
             .id("pty-info-footer")
+            .debug_selector(|| "pty-info-footer".to_string())
             .flex()
             .flex_none()
             .items_center()
@@ -2220,20 +2260,32 @@ impl AdeApp {
         )
     }
 
-    /// Surface A/B's shared bottom strip - **a readout, not an action bar** (GitHub issue #295,
+    /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue #295,
     /// `STAGE-A-CHANGELOG.md` §4t).
     ///
-    /// It renders **whenever there is an agent**, not only when that agent's status happens to
+    /// [`ProcessKind::Agent`] only, and mutually exclusive with
+    /// [`Self::render_pty_info_footer`] - a pane gets one bottom bar, never both. §4t's "the bar
+    /// now renders **whenever there is an agent**" is a statement about *status*, not about pane
+    /// kind: it means the strip no longer waits for a status that offers a button. A `Shell` tab
+    /// is not "an agent" in that sentence's sense - `Jerry.dc.html` gates the whole strip on
+    /// `isChat: isAgent(tab)`, and §4u′ says so from the other direction when it accepts that the
+    /// budget popover is "reachable only from an agent pane. **On a terminal tab**, the graph or
+    /// Settings there is no way to open it… those surfaces have no agent spending anything."
+    /// Reading it as "whenever there is a pane" is what stacked this strip under the terminal's
+    /// own info footer in every tab.
+    ///
+    /// It renders whenever there is an agent, not only when that agent's status happens to
     /// offer an action, which is what turns the now-buttonless `ask`/`run`/`finished` states from
     /// absent strips into useful ones. Left to right: whatever run-scoped verbs the status really
     /// earns ([`work_surface::footer_actions`] - none at all for three of the five statuses), a
     /// spacer, then this one agent's own cost, right-aligned
     /// ([`Self::render_agent_cost_readout`]).
     ///
-    /// Still missing from the strip: the per-agent provider budget §4t puts to the right of the
-    /// cost. That is GitHub issue #294's own research spike (`5h ▓▓▓▓▓▓░ 92%   7d ▓▓▓▓░░░ 65%`,
-    /// plus the popover §4u′ moved into this strip) and is deliberately not faked here - there is
-    /// no real rate-limit source in this build to read it from yet.
+    /// Then, past a 1px divider, the per-agent provider budget §4t puts to the right of the cost
+    /// (`5h ▓▓▓▓▓▓░ 92%   7d ▓▓▓▓░░░ 65%`, plus the popover §4u′ moved into this strip) -
+    /// GitHub issue #294, [`Self::render_agent_budget_readout`]. That readout is itself `None`
+    /// for a pane that spends no provider, which a `Shell` never can - a second, narrower reason
+    /// this whole strip is agent-only.
     ///
     /// No `JERRY` wordmark (deliberate deviation from the design mockup, per direct user request -
     /// see this crate's `lib.rs`/`BUILD-LOG.md` for context, not a bug fix).
@@ -2551,12 +2603,37 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(agent.pane.clone().into_any_element()),
                         )
-                        .child(self.render_pty_info_footer(agent, cx))
-                        .child(self.render_pty_footer(agent, cx))
+                        // One bottom bar per pane, picked by pane kind - never both stacked.
+                        // `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if`
+                        // siblings: `isTerminal` gets `pid │ 148×38 │ [wsl] … file:line
+                        // references open in a tab`, `isChat` gets the `hasBar` readout strip
+                        // (actions · cost · budget) and puts its pid in the header instead.
+                        // Rendering both under every pane is the duplication reported live
+                        // against the shipped build - see the two methods' own docs.
+                        .child(match agent.kind {
+                            ProcessKind::Shell => {
+                                self.render_pty_info_footer(agent, cx).into_any_element()
+                            }
+                            ProcessKind::Agent(_) => {
+                                self.render_pty_footer(agent, cx).into_any_element()
+                            }
+                        })
                         .into_any_element()
                 };
+                // `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0` - the identity
+                // bar belongs to agent panes, plus the bare-worktree case that holds the
+                // `Start an agent` CTA. The mock's own comment: "The whole row is agent
+                // identity, so it belongs to agent panes only… in a terminal pane there is no
+                // agent to describe. Kept when the worktree has no agents at all, since it holds
+                // that empty state's CTA." Same shell-tab-wearing-agent-chrome mistake as the
+                // stacked footers below, and #295 listed "the bar stays scoped to agent panes"
+                // as an acceptance criterion.
+                let show_context_bar =
+                    agent.kind.is_agent_session() || self.current_worktree_is_bare();
                 surface
-                    .child(self.render_agent_context_bar(agent, cx))
+                    .children(
+                        show_context_bar.then(|| self.render_agent_context_bar(agent, cx)),
+                    )
                     .child(body)
             }
             None => surface.child(self.render_no_agents_empty_state(cx)),
@@ -5507,15 +5584,25 @@ mod agent_pane_readout_tests {
     /// the finished and asking states, which §4r emptied, are useful strips again rather than
     /// absent ones."
     ///
-    /// A freshly spawned shell has just written its prompt, so it is `Status::Run` - the status
+    /// A freshly spawned pane has just written its prompt, so it is `Status::Run` - the status
     /// §4t emptied of buttons entirely (`⌃C` in the focused pty is the interrupt). The strip must
     /// still paint, and must carry this agent's own cost readout.
+    ///
+    /// Relabelled to a real agent kind first: §4t's "whenever there is an agent" is about
+    /// *status*, not pane kind, and a `Shell` tab gets the terminal pane's own info footer
+    /// instead ([`AdeApp::render_pty_info_footer`]). This test asserted the strip painted for a
+    /// plain shell before that was fixed - which is exactly the duplication the user reported.
     #[gpui::test]
     fn a_running_agents_strip_still_paints_and_carries_its_own_cost(cx: &mut TestAppContext) {
         let repo = init_repo();
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
 
         let status = app.read_with(cx, |app, cx| {
             let agent = app
@@ -5528,7 +5615,7 @@ mod agent_pane_readout_tests {
         assert_eq!(
             status,
             Status::Run,
-            "premise: a shell that just printed its prompt is `Run`, the status §4t emptied"
+            "premise: a pane that just printed its prompt is `Run`, the status §4t emptied"
         );
         assert!(
             work_surface::footer_actions(status).is_empty(),
@@ -5550,6 +5637,148 @@ mod agent_pane_readout_tests {
                 && cx.debug_bounds("footer-action-DiscardWorktree").is_none(),
             "and no action button at all may paint on a running agent"
         );
+    }
+
+    /// One bottom bar per pane, picked by pane kind - reported live against the shipped build as
+    /// "the footer of the terminals and agents… right now both are displayed at the same time in
+    /// both terminal and agents but should not".
+    ///
+    /// `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if` siblings
+    /// (`isTerminal: tab === 'terminal'` and `isChat: isAgent(tab)`). The `isTerminal` one is the
+    /// only one with a `pid │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
+    /// a tab` bar; the `isChat` one's only bottom bar is the `hasBar` readout strip. So a `Shell`
+    /// tab paints the info footer and **not** the readout strip.
+    #[gpui::test]
+    fn a_shell_tab_paints_the_info_footer_and_not_the_agent_readout_strip(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the spawned agent")
+                .kind),
+            ProcessKind::Shell,
+            "premise: `spawn_and_select` really spawns a plain shell, not an agent CLI"
+        );
+        assert!(
+            cx.debug_bounds("pty-info-footer").is_some(),
+            "a shell tab keeps the terminal pane's own bottom bar - the mock's `isTerminal` \
+             branch, and issue #20's \"the terminal footer owns Clear\""
+        );
+        assert!(
+            cx.debug_bounds("pty-footer").is_none(),
+            "and it must not also paint the agent readout strip underneath it. \u{a7}4t's \"the \
+             bar now renders whenever there is an agent\" is about *status*, not pane kind - the \
+             mock gates the whole strip on `isChat: isAgent(tab)`, and \u{a7}4u\u{2032} accepts \
+             that the budget popover is unreachable \"on a terminal tab\" precisely because a \
+             terminal has no such strip"
+        );
+        assert!(
+            cx.debug_bounds("pty-footer-cost").is_none()
+                && cx.debug_bounds("pty-footer-budget").is_none(),
+            "and neither of the strip's readouts may leak into a shell tab on their own"
+        );
+    }
+
+    /// The other half of the same split: a real `Claude`/`Codex` tab paints the readout strip and
+    /// **not** the terminal's info footer - and its `pid` is not lost with that bar, because the
+    /// mock's `isChat` header carries it (`{{ focus.cli }}  pid {{ focus.pid }}`).
+    #[gpui::test]
+    fn an_agent_tab_paints_only_the_readout_strip_and_keeps_its_pid_in_the_header(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, cx| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .expect("the spawned agent")
+                    .pane
+                    .read(cx)
+                    .pid()
+                    .is_some()
+            }),
+            "premise: the real spawned child has a real pid to show"
+        );
+        assert!(
+            cx.debug_bounds("pty-footer").is_some(),
+            "an agent tab keeps \u{a7}4t's readout strip"
+        );
+        assert!(
+            cx.debug_bounds("pty-info-footer").is_none(),
+            "and must not also paint the terminal pane's pid/dimensions/clear bar above it - the \
+             mock's `isChat` branch has no such bar at all"
+        );
+        assert!(
+            cx.debug_bounds("pty-header-pid").is_some(),
+            "the pid moves to the header rather than being lost with the info footer - \
+             `{{ focus.cli }}  pid {{ focus.pid }}` in the mock's `isChat` header"
+        );
+    }
+
+    /// `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0`, and the mock's own comment:
+    /// "The whole row is agent identity, so it belongs to agent panes only… **in a terminal pane
+    /// there is no agent to describe.** Kept when the worktree has no agents at all, since it
+    /// holds that empty state's CTA."
+    ///
+    /// #295 listed "the bar stays scoped to agent panes" as an acceptance criterion. It was not
+    /// true: a shell tab in a worktree that *does* have agents wore the whole identity row.
+    #[gpui::test]
+    fn a_shell_tab_beside_a_real_agent_gets_no_identity_bar(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.worktrees = vec![worktree_row(repo.path().to_path_buf(), "main")];
+            app.select_worktree(0, window, cx);
+        });
+        let agent_id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(agent_id, ProcessKind::claude());
+            cx.notify();
+        });
+        let shell_id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "premise: this worktree really does hold a real agent session, so the `noAgents` \
+             clause that legitimately keeps the bar does not apply"
+        );
+        assert!(
+            cx.debug_bounds("agent-context-bar").is_none(),
+            "a shell tab in a worktree with agents describes no agent - the identity row must \
+             not paint over it"
+        );
+        assert!(
+            cx.debug_bounds("pty-info-footer").is_some(),
+            "premise: the shell tab really is the one showing in the centre pane"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("agent-context-bar").is_some(),
+            "and switching back to the real agent tab restores it - the bar is scoped, not deleted"
+        );
+        let _ = shell_id;
     }
 
     /// §4t: the cost is "blank for an agent that is not running". Not a dimmed `...`, not a
@@ -5601,6 +5830,14 @@ mod agent_pane_readout_tests {
         // from a genuine `ProcessSignal::Exited { success: false }` rather than being set.
         let id = spawn_and_select(&app, cx, worktree_path.clone(), Some("/bin/false"));
         wait_for_exit(&app, cx, id);
+        // Relabelled to a real agent kind: the strip this test measures is the *agent* pane's
+        // (`isChat` in the mock), and a `Shell` tab gets the terminal info footer instead. The
+        // failure is a genuine non-zero exit either way - only the chrome around it is gated.
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
 
         let status = app.read_with(cx, |app, cx| {
             let agent = app

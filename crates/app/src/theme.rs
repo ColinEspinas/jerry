@@ -3359,9 +3359,11 @@ pub mod band {
     pub const FILTER_ROW: Pixels = px(30.0);
     pub const SURFACE_FOOTER: Pixels = px(28.0);
     pub const PTY_HEADER: Pixels = px(27.0);
-    /// The terminal pane's info footer band (`pid` · grid dimensions · environment chip ·
-    /// right-aligned static copy) - distinct from [`SURFACE_FOOTER`] (the agent-level readout
-    /// strip, rendered separately below it: GitHub issue #295 / `STAGE-A-CHANGELOG.md` §4t).
+    /// The **shell** pane's info footer band (`pid` · grid dimensions · environment chip ·
+    /// right-aligned static copy) - the alternative to [`SURFACE_FOOTER`] (the **agent** pane's
+    /// readout strip: GitHub issue #295 / `STAGE-A-CHANGELOG.md` §4t), never stacked with it. A
+    /// pane gets exactly one bottom bar, chosen by `ProcessKind`, matching `Jerry.dc.html`'s
+    /// mutually exclusive `isTerminal` / `isChat` branches.
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
     /// 26 -> 28 (`CHANGELOG.md`'s change 7: "Height 26 -> 28"), then 28 -> 30 for rev 6's
