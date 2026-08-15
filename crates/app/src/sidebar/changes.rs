@@ -34,48 +34,66 @@ pub fn diff_file_stats(file: &DiffFile) -> (u32, u32) {
     (add, del)
 }
 
-/// The Changes row's optional tag pill - `new`/`del`, derived from the file's `FileChangeStatus`.
-/// A plain modification or rename gets no pill. There's deliberately no `conflict` case:
-/// `wt_core::diff::diff_against_base` is a plain two-way diff against the merge-base with no
-/// merge-conflict signal to derive one from (that would need e.g. `git status`'s unmerged-path
-/// list), so this function never fabricates one.
+/// Git's own status letter for one file row - `A`, `M` or `D`
+/// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j).
+///
+/// **Total, not optional**, and that is the whole point of §4j: the `new`/`del` word pills this
+/// replaced marked only the exceptions, so a *modified* file - the common case - got no mark at
+/// all and "the row could not answer 'what happened to this file', which is the first thing a
+/// reviewer asks". Every row gets a letter, in a fixed column, so every filename also starts on
+/// the same x.
+///
+/// There is deliberately no `conflict` variant, and never was one to remove here: §4j's second
+/// fault is that "`conflict` is not a git status - it was an overlay meaning 'two agents touched
+/// this', which the pair of author chips beside it already states", and
+/// `wt_core::diff::diff_against_base` is a plain two-way diff with no unmerged-path signal to
+/// derive one from anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeTag {
-    New,
+pub enum StatusLetter {
+    Added,
+    Modified,
     Deleted,
 }
 
-pub fn change_tag(status: FileChangeStatus) -> Option<ChangeTag> {
+/// The letter for a file's `FileChangeStatus`.
+///
+/// `Renamed` maps to `Modified`, not to a fourth `R` letter: §4j's table is exactly three
+/// letters, each with one colour, and the rename fact already has its own dedicated channel on
+/// the row - `crate::sidebar::render::render_moved_tag`'s neutral `moved` chip, which
+/// [`is_real_rename`] gates and which this change does not touch. Adding `R` here would be a
+/// fourth colour the design never allocated, stating a fact the row already states.
+pub fn status_letter(status: FileChangeStatus) -> StatusLetter {
     match status {
-        FileChangeStatus::Added => Some(ChangeTag::New),
-        FileChangeStatus::Deleted => Some(ChangeTag::Deleted),
-        FileChangeStatus::Modified | FileChangeStatus::Renamed => None,
+        FileChangeStatus::Added => StatusLetter::Added,
+        FileChangeStatus::Deleted => StatusLetter::Deleted,
+        FileChangeStatus::Modified | FileChangeStatus::Renamed => StatusLetter::Modified,
     }
 }
 
-pub struct TagStyle {
-    pub label: &'static str,
-    pub fg: Rgba,
-    pub bg: Rgba,
-}
-
-pub fn tag_style(tag: ChangeTag) -> TagStyle {
-    match tag {
-        ChangeTag::New => {
-            let (fg, bg) = theme::tag::NEW;
-            TagStyle {
-                label: "new",
-                fg: fg.into(),
-                bg: bg.into(),
-            }
+impl StatusLetter {
+    /// The single character painted in the row's fixed status column.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            StatusLetter::Added => "A",
+            StatusLetter::Modified => "M",
+            StatusLetter::Deleted => "D",
         }
-        ChangeTag::Deleted => {
-            let (fg, bg) = theme::tag::DELETED;
-            TagStyle {
-                label: "del",
-                fg: fg.into(),
-                bg: bg.into(),
-            }
+    }
+
+    /// What the letter's own tooltip spells out - §4j: "Tooltips spell the letter out."
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            StatusLetter::Added => "Added",
+            StatusLetter::Modified => "Modified",
+            StatusLetter::Deleted => "Deleted",
+        }
+    }
+
+    pub fn color(self) -> Rgba {
+        match self {
+            StatusLetter::Added => theme::tag::STATUS_ADDED.into(),
+            StatusLetter::Modified => theme::tag::STATUS_MODIFIED.into(),
+            StatusLetter::Deleted => theme::tag::STATUS_DELETED.into(),
         }
     }
 }
@@ -420,19 +438,57 @@ mod tests {
         assert_eq!(diff_file_stats(&file), (0, 0));
     }
 
+    /// `STAGE-A-CHANGELOG.md` §4j: every status maps to a letter, including the common case.
+    /// The word pills this replaced returned `None` for `Modified`, which is the exact defect
+    /// §4j names - "only the exceptions were marked".
     #[test]
-    fn added_files_get_the_new_tag_and_deleted_files_get_the_del_tag() {
-        assert_eq!(change_tag(FileChangeStatus::Added), Some(ChangeTag::New));
+    fn every_file_status_gets_a_letter_including_the_common_case() {
+        assert_eq!(status_letter(FileChangeStatus::Added), StatusLetter::Added);
         assert_eq!(
-            change_tag(FileChangeStatus::Deleted),
-            Some(ChangeTag::Deleted)
+            status_letter(FileChangeStatus::Modified),
+            StatusLetter::Modified
+        );
+        assert_eq!(
+            status_letter(FileChangeStatus::Deleted),
+            StatusLetter::Deleted
+        );
+        // A rename is a modification as far as the letter column is concerned - the row's own
+        // `moved` chip is what states the rename. See `status_letter`'s own docs.
+        assert_eq!(
+            status_letter(FileChangeStatus::Renamed),
+            StatusLetter::Modified
         );
     }
 
     #[test]
-    fn modified_and_renamed_files_get_no_tag() {
-        assert_eq!(change_tag(FileChangeStatus::Modified), None);
-        assert_eq!(change_tag(FileChangeStatus::Renamed), None);
+    fn the_letters_are_gits_own_and_their_tooltips_spell_them_out() {
+        assert_eq!(StatusLetter::Added.glyph(), "A");
+        assert_eq!(StatusLetter::Modified.glyph(), "M");
+        assert_eq!(StatusLetter::Deleted.glyph(), "D");
+        assert_eq!(StatusLetter::Added.tooltip(), "Added");
+        assert_eq!(StatusLetter::Modified.tooltip(), "Modified");
+        assert_eq!(StatusLetter::Deleted.tooltip(), "Deleted");
+    }
+
+    /// §4j's own colour table, and its stated reason for the middle row: added is green, deleted
+    /// is red, and modified is *neutral* - "the common case does not shout". A `M` painted in
+    /// either hue would put the loudest colour in the panel on the least remarkable row.
+    #[test]
+    fn modified_is_neutral_while_added_and_deleted_carry_their_hues() {
+        assert_eq!(StatusLetter::Added.color(), theme::tag::STATUS_ADDED.into());
+        assert_eq!(
+            StatusLetter::Modified.color(),
+            theme::tag::STATUS_MODIFIED.into()
+        );
+        assert_eq!(
+            StatusLetter::Deleted.color(),
+            theme::tag::STATUS_DELETED.into()
+        );
+        assert_ne!(StatusLetter::Modified.color(), StatusLetter::Added.color());
+        assert_ne!(
+            StatusLetter::Modified.color(),
+            StatusLetter::Deleted.color()
+        );
     }
 
     #[test]

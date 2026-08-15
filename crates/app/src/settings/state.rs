@@ -536,6 +536,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::NewAgentPane" => Some("New agent pane"),
         "app::NewGitGraph" => Some("Open git graph"),
         "app::NextChangedFile" => Some("Next changed file"),
+        "app::ToggleChangeSeen" => Some("Mark file seen / unseen"),
         "app::JumpToAgent1" => Some("Jump to agent 1"),
         "app::JumpToAgent2" => Some("Jump to agent 2"),
         "app::JumpToAgent3" => Some("Jump to agent 3"),
@@ -1883,6 +1884,7 @@ mod tests {
                 "New agent pane",
                 "Open git graph",
                 "Next changed file",
+                "Mark file seen / unseen",
                 "Jump to agent 1",
                 "Jump to agent 2",
                 "Jump to agent 3",
@@ -2077,6 +2079,10 @@ mod tests {
         // (`cmd-c`/`cmd-v` on macOS, `ctrl-shift-c`/`ctrl-shift-v` elsewhere), both
         // `Some("terminal")` - see `crate::default_key_bindings`'s own entry for why the shifted
         // variants, and why leaving them unbound was the bug.
+        // GitHub issue #286 added 1 more real scoped binding: `v` -> `ToggleChangeSeen`, under
+        // the same `Some("diff && !file-editor")` predicate `]` carries and for the same reason -
+        // a plain letter must never be claimed over a focused terminal, and the seen-state it
+        // toggles belongs to the file whose diff is open.
         // GitHub issue #304 added 6 more real scoped bindings: the interactive-rebase plan's own
         // `RebaseReorderUp`/`RebaseReorderDown`/`RebasePickRow`/`RebaseSquashRow`/`RebaseDropRow`
         // under `Some("rebase-plan && !text-input")` (5 - see `crate::default_key_bindings` for
@@ -2089,7 +2095,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            81,
+            82,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \

@@ -186,30 +186,52 @@ pub(crate) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::A
         .into_any_element()
 }
 
-/// The Changes row / diff toolbar's optional `new`/`del` tag pill.
-pub(crate) fn render_tag_pill(tag: ChangeTag) -> impl IntoElement {
-    let style = changes::tag_style(tag);
+/// Git's own status letter for one file - `A`/`M`/`D` - in the fixed 9px, centred column
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j specifies, with the tooltip
+/// that spells it out.
+///
+/// One function for all four sites that show it (the Uncommitted rows, the diff toolbar above a
+/// file, the commit file list, and the review file list) rather than four hand-written spans, for
+/// `REVISION-2026-08-14.md` §7 rule 7's reason: "a row of icons needs one shared optical box, not
+/// one size per icon". The 9px box is what makes every filename in a list start on the same x -
+/// which the word pills it replaced could not do, since they were absent on most rows and two
+/// different widths on the rest.
+///
+/// This **replaced** `render_tag_pill`, and that function is gone rather than left beside it, per
+/// §7 rule 5: "Replacing a control means deleting its old keys in the same edit - a key defined
+/// twice is two specifications of one thing, and the reader cannot tell which is real."
+///
+/// Stateful (`.id(..)`) because the tooltip is: GPUI puts `tooltip` on
+/// `StatefulInteractiveElement`, so an icon-only control that has to explain itself has to carry
+/// an id. `id` is the caller's, since only the caller knows which file's row this letter is in.
+pub(crate) fn render_status_letter(
+    id: impl Into<gpui::ElementId>,
+    letter: changes::StatusLetter,
+    text_size: Pixels,
+) -> gpui::Stateful<gpui::Div> {
     div()
+        .id(id)
         .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(theme::radius::CHIP)
-        .bg(style.bg)
+        .w(px(9.0))
+        .flex()
+        .justify_center()
         .font(font(theme::font::MONO))
-        .text_size(px(9.5))
-        .text_color(style.fg)
-        .child(style.label)
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_size(text_size)
+        .text_color(letter.color())
+        .tooltip(text_tooltip(letter.tooltip()))
+        .child(letter.glyph())
 }
 
 /// The Changes row's `committed` tag - a file that differs from the base branch only because a
 /// real commit on this branch already holds that difference (`crate::sidebar::changes::
 /// is_committed_clean`, GitHub issue #220).
 ///
-/// Deliberately **not** a [`ChangeTag`] variant: `ChangeTag` is documented as derived from the
-/// file's `FileChangeStatus`, and this is orthogonal to it - a committed-clean file can perfectly
-/// well also be an addition, and would then need both this and the `new` pill. That is the same
-/// reason `crate::sidebar::render::render_moved_tag` is its own neutral chip rather than a
-/// `ChangeTag`, and this matches its look exactly so the row's two status-independent pills read
+/// Deliberately **not** a [`changes::StatusLetter`] variant: the letter is documented as git's
+/// own report of what happened to the file, and this is orthogonal to it - a committed-clean file
+/// can perfectly well also be an addition, and would then need both this and an `A`. That is the
+/// same reason `crate::sidebar::render::render_moved_tag` is its own neutral chip rather than a
+/// fourth letter, and this matches its look exactly so the row's two status-independent pills read
 /// as one family.
 pub(crate) fn render_committed_tag() -> impl IntoElement {
     div()

@@ -48,6 +48,80 @@ pub fn unstage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
+/// Real, immediate **discard** of one path's uncommitted changes - the second click of
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4i's two-step `Discard?` confirm
+/// (GitHub issue #286). Puts `path` back exactly as `HEAD` has it, in both the index and the
+/// working tree, or removes it outright if `HEAD` never had it.
+///
+/// §4i is explicit about what this is: *"It destroys an agent's work with no git object behind it
+/// to recover from - the one irreversible action in the panel."* That is literally true here, and
+/// deliberately not softened by stashing behind the user's back: a silent stash would make the
+/// panel's own two-click confirm a lie about what it does, and would leave a growing pile of
+/// entries the UI never mentions. The confirm **is** the safety net.
+///
+/// Two real cases, decided by whether `HEAD` has the path at all - not by parsing a status letter,
+/// which would be a second source of truth for a fact git can answer directly:
+///
+/// - **`HEAD` has it** (a modified, deleted, or staged-modified file): `git checkout HEAD --
+///   <path>`, which rewrites the index entry *and* the working-tree file from the commit in one
+///   call. Plain `git checkout -- <path>` would only restore the working tree from the *index*, so
+///   a file whose modification had already been staged would silently keep its staged change.
+/// - **`HEAD` does not have it** (a brand-new file, staged or untracked): `git rm --cached` to
+///   drop any index entry, then delete the file from disk. `git checkout HEAD` cannot be used
+///   here - there is no blob at that path to check out, and the call fails.
+///
+/// `--ignore-unmatch` on the `git rm` covers the untracked-and-never-staged half of the second
+/// case, where there is no index entry to remove and an unqualified `git rm` would exit non-zero.
+///
+/// Performs blocking I/O.
+pub fn discard_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
+    if head_has_path(worktree_path, path)? {
+        let args: Vec<OsString> = vec![
+            "checkout".into(),
+            "HEAD".into(),
+            "--".into(),
+            path.as_os_str().to_owned(),
+        ];
+        let output = run_git(worktree_path, &args)?;
+        return check_success(&args, &output);
+    }
+
+    let args: Vec<OsString> = vec![
+        "rm".into(),
+        "--cached".into(),
+        "--quiet".into(),
+        "--ignore-unmatch".into(),
+        "--".into(),
+        path.as_os_str().to_owned(),
+    ];
+    let output = run_git(worktree_path, &args)?;
+    check_success(&args, &output)?;
+
+    let absolute = worktree_path.join(path);
+    match std::fs::remove_file(&absolute) {
+        Ok(()) => Ok(()),
+        // Already gone is the goal state, not a failure - a file staged as added and then deleted
+        // from disk by hand reaches this arm, and it is genuinely discarded.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::WorktreeIo(err)),
+    }
+}
+
+/// Whether `HEAD` really holds a blob at `path` - `git cat-file -e HEAD:<path>`, which exits
+/// non-zero (and says so on stderr) when it does not. Asked of git rather than derived from a
+/// status letter so [`discard_path`]'s two branches can never disagree with the repository.
+///
+/// A repository with no commits at all has no `HEAD`, so this answers `false` and every path in
+/// it takes the remove branch - which is correct: nothing there has a committed state to go back
+/// to.
+fn head_has_path(worktree_path: &Path, path: &Path) -> Result<bool, Error> {
+    let mut spec = OsString::from("HEAD:");
+    spec.push(path.as_os_str());
+    let args: Vec<OsString> = vec!["cat-file".into(), "-e".into(), spec];
+    let output = run_git(worktree_path, &args)?;
+    Ok(output.status.success())
+}
+
 /// The real, current set of staged paths in `worktree_path`'s git index (`git diff --cached
 /// --name-only`), worktree-relative. The live source of truth [`app::root::AdeApp::staged_files`]
 /// re-derives from on every worktree load/switch, rather than starting empty and silently
@@ -485,5 +559,114 @@ mod tests {
 
         unstage_path(repo.path(), Path::new("file.txt")).expect("unstage_path");
         assert!(staged_paths(repo.path()).expect("staged_paths").is_empty());
+    }
+
+    #[test]
+    fn discard_path_really_restores_a_modified_file_from_head() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "the agent wrote this\n").expect("modify");
+
+        discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).expect("read"),
+            "hello\n",
+            "discard must put the file back exactly as HEAD has it"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "file.txt"]),
+            "",
+            "and leave nothing dirty behind"
+        );
+    }
+
+    /// The case plain `git checkout -- <path>` gets wrong: that restores the working tree from
+    /// the *index*, so an already-staged modification survives it untouched. `git checkout HEAD
+    /// -- <path>` is what really discards both halves.
+    #[test]
+    fn discard_path_also_drops_a_change_that_was_already_staged() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "the agent wrote this\n").expect("modify");
+        git(repo.path(), &["add", "file.txt"]);
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "file.txt"]),
+            "M  file.txt"
+        );
+
+        discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).expect("read"),
+            "hello\n"
+        );
+        assert!(
+            staged_paths(repo.path()).expect("staged_paths").is_empty(),
+            "the index entry must be gone too, not just the working-tree edit"
+        );
+    }
+
+    #[test]
+    fn discard_path_restores_a_file_the_agent_deleted() {
+        let repo = init_repo();
+        fs::remove_file(repo.path().join("file.txt")).expect("delete");
+
+        discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).expect("read"),
+            "hello\n",
+            "a deleted tracked file comes back"
+        );
+    }
+
+    #[test]
+    fn discard_path_removes_an_untracked_file_outright() {
+        let repo = init_repo();
+        fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
+
+        discard_path(repo.path(), Path::new("new.txt")).expect("discard_path");
+
+        assert!(
+            !repo.path().join("new.txt").exists(),
+            "HEAD has no version of a brand-new file to restore, so discarding it means \
+             deleting it"
+        );
+    }
+
+    /// A file the agent created *and* staged: `git checkout HEAD -- <path>` would fail outright
+    /// (there is no blob at that path in `HEAD`), so this takes the `git rm --cached` + unlink
+    /// branch, and both halves have to really happen.
+    #[test]
+    fn discard_path_removes_a_staged_addition_from_both_the_index_and_the_disk() {
+        let repo = init_repo();
+        fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
+        git(repo.path(), &["add", "new.txt"]);
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain", "new.txt"]),
+            "A  new.txt"
+        );
+
+        discard_path(repo.path(), Path::new("new.txt")).expect("discard_path");
+
+        assert!(!repo.path().join("new.txt").exists());
+        assert!(
+            staged_paths(repo.path()).expect("staged_paths").is_empty(),
+            "the staged addition must be gone from the real index"
+        );
+    }
+
+    #[test]
+    fn discarding_one_path_leaves_every_other_dirty_path_alone() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "edited\n").expect("modify");
+        fs::write(repo.path().join("other.txt"), "also new\n").expect("write");
+
+        discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("other.txt")).expect("read"),
+            "also new\n",
+            "discard is per-file - it must never touch a neighbouring change"
+        );
     }
 }

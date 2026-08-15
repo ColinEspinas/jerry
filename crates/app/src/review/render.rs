@@ -19,7 +19,7 @@ use super::state::{
 use super::*;
 
 use crate::code_surface::diff_view::DiffDetailSurface;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::root::widgets::{render_sidebar_message, render_status_letter};
 use crate::work_surface::render::{DraggedTab, TabChromeArgs};
 
 impl AdeApp {
@@ -388,7 +388,7 @@ impl AdeApp {
         let selected = open_file == Some(file.path.as_path());
         let (add, del) = changes::diff_file_stats(file);
         let (dir, name) = changes::split_dir_name(&file.path);
-        let tag = changes::change_tag(file.status);
+        let letter = changes::status_letter(file.status);
 
         div()
             .id(format!("review-row-{}", file.path.display()))
@@ -432,6 +432,15 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.open_review_file(path.clone(), cx);
             }))
+            // `STAGE-A-CHANGELOG.md` §4j's fixed column, ahead of the directory - this is a
+            // list of file rows like the Uncommitted section, so every filename in it starts on
+            // the same x. The `new`/`del` word pill this replaced sat at the far end of the row
+            // and was absent from every modified file.
+            .child(render_status_letter(
+                gpui::SharedString::from(format!("review-status-{}", file.path.display())),
+                letter,
+                self.ui_text_size(10.0),
+            ))
             .when(!dir.is_empty(), |el| {
                 el.child(
                     div()
@@ -453,7 +462,6 @@ impl AdeApp {
                     .text_color(theme::text::STRONG)
                     .child(name),
             )
-            .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
             .child(
                 div()
                     .flex_none()

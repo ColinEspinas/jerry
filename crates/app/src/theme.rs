@@ -2376,20 +2376,46 @@ pub mod toggle {
     ];
 }
 
-/// Small status tags and the file tree's own A/M change marks.
+/// Git's own `A`/`M`/`D` status letters on a file row, and the file tree's own A/M change marks.
+///
+/// # The letters replaced the word badges (`STAGE-A-CHANGELOG.md` §4j)
+///
+/// This module used to hold a `NEW`/`DELETED`/`CONFLICT` fg/bg pair each, painting a filled
+/// `new`/`del` word pill. §4j deleted all three for three stated faults:
+///
+/// 1. **Only the exceptions were marked.** `new` and `del` got a badge; a *modified* file - the
+///    common case - got nothing, so the row could not answer "what happened to this file".
+/// 2. **`conflict` is not a git status.** It was an overlay meaning "two agents touched this",
+///    which the row's pair of author chips already states.
+/// 3. **A filled word badge outweighs the filename**, in a row whose subject is the path.
+///
+/// What replaces them is git's own letter, one per row, in a fixed 9px column:
+///
+/// | | Meaning | Colour |
+/// |---|---|---|
+/// | `A` | Added | `#5f9c78` |
+/// | `M` | Modified | `#767d84` - "the common case does not shout" |
+/// | `D` | Deleted | `#b06a66` |
+///
+/// [`STATUS_MODIFIED`] deliberately shares its hex with [`super::changes::FILENAME_SEEN`] and
+/// still carries its own key, the same convention [`super::changes::RUN_META_ENDED`]'s own docs
+/// record: a distinct element gets a distinct token even when two of them currently resolve to
+/// the same grey.
+///
+/// [`TREE_MODIFIED`] is **not** this `M` and is deliberately left alone: the Files tree paints
+/// its own change marks amber (`#a3873f`) in `Jerry.dc.html`'s own tree rows, where the mark is
+/// the only thing saying a file is dirty at all and genuinely is the exception. On a Changes row
+/// every line is a change, which is exactly why §4j's `M` recedes.
 pub mod tag {
     use super::{token, ColorToken};
 
-    pub const NEW: (ColorToken, ColorToken) =
-        (token("tag.new.fg", 0x7fc79a), token("tag.new.bg", 0x1e3b2a));
-    pub const DELETED: (ColorToken, ColorToken) = (
-        token("tag.deleted.fg", 0xd18b86),
-        token("tag.deleted.bg", 0x3a1e1e),
-    );
-    pub const CONFLICT: (ColorToken, ColorToken) = (
-        token("tag.conflict.fg", 0xe0b263),
-        token("tag.conflict.bg", 0x3a2c14),
-    );
+    /// `A` - a file git reports as added (`STAGE-A-CHANGELOG.md` §4j).
+    pub const STATUS_ADDED: ColorToken = token("tag.status_added", 0x5f9c78);
+    /// `M` - a file git reports as modified. Neutral on purpose: "the common case does not
+    /// shout" (`STAGE-A-CHANGELOG.md` §4j).
+    pub const STATUS_MODIFIED: ColorToken = token("tag.status_modified", 0x767d84);
+    /// `D` - a file git reports as deleted (`STAGE-A-CHANGELOG.md` §4j).
+    pub const STATUS_DELETED: ColorToken = token("tag.status_deleted", 0xb06a66);
     pub const TREE_ADDED: ColorToken = token("tag.tree_added", 0x5f9c78); // "A" mark
     pub const TREE_MODIFIED: ColorToken = token("tag.tree_modified", 0xa3873f); // "M" mark
 
@@ -2397,12 +2423,9 @@ pub mod tag {
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
     /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
-        ("NEW.fg", NEW.0),
-        ("NEW.bg", NEW.1),
-        ("DELETED.fg", DELETED.0),
-        ("DELETED.bg", DELETED.1),
-        ("CONFLICT.fg", CONFLICT.0),
-        ("CONFLICT.bg", CONFLICT.1),
+        ("STATUS_ADDED", STATUS_ADDED),
+        ("STATUS_MODIFIED", STATUS_MODIFIED),
+        ("STATUS_DELETED", STATUS_DELETED),
         ("TREE_ADDED", TREE_ADDED),
         ("TREE_MODIFIED", TREE_MODIFIED),
     ];
@@ -2730,6 +2753,17 @@ pub mod changes {
     /// The armed `Discard?` pill's label.
     pub const DISCARD_FG: ColorToken = token("changes.discard_fg", 0xe0847e);
 
+    /// A hover-action button's own hover fill, inside the floating bar §4i puts on a hovered row.
+    /// The bar's shell is the app's one popover chrome
+    /// (`crate::root::widgets::menu_popover_chrome`, whose [`super::surface::PALETTE`]/
+    /// [`super::border::POPOVER`]/[`super::radius::CARD`] really are §4i's own stated `#15181b`,
+    /// `1px #2b3238`, radius 6); only the two buttons inside it need values of their own.
+    pub const HOVER_ACTION_HOVER_BG: ColorToken = token("changes.hover_action_hover_bg", 0x232930);
+    /// The discard button's hover fill - a red wash rather than [`HOVER_ACTION_HOVER_BG`]'s
+    /// neutral one, because it is the one irreversible action in the panel and the hover is the
+    /// last moment before the two-click confirm starts.
+    pub const DISCARD_HOVER_BG: ColorToken = token("changes.discard_hover_bg", 0x33191b);
+
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
     /// own docs for what walks this and why every token has to appear here.
@@ -2749,6 +2783,8 @@ pub mod changes {
         ("DISCARD_BG", DISCARD_BG),
         ("DISCARD_BORDER", DISCARD_BORDER),
         ("DISCARD_FG", DISCARD_FG),
+        ("HOVER_ACTION_HOVER_BG", HOVER_ACTION_HOVER_BG),
+        ("DISCARD_HOVER_BG", DISCARD_HOVER_BG),
     ];
 }
 

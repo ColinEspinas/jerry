@@ -238,6 +238,19 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
         gpui::KeyBinding::new("secondary-shift-g", root::NewGitGraph, None),
         gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff && !file-editor")),
+        // GitHub issue #286 / `STAGE-A-CHANGELOG.md` §4i: "opening a file marks it seen - that is
+        // what the word means - and `V` unmarks. The convention is stated in the name's own
+        // tooltip", with `V mark seen` in the Changes panel's own legend.
+        //
+        // Scoped exactly like `"]"` immediately above, and for the same real reason: this is a
+        // *plain letter*, so leaving it global would swallow a literal `v` in a focused terminal
+        // agent. `"diff"` is the context `crate::code_surface::render` puts on the read-only Diff
+        // surface, which is precisely where this action has a subject - the file whose diff is
+        // open is the file `AdeApp::handle_toggle_change_seen` marks or unmarks. `!file-editor`
+        // keeps it off the editable File view, where `v` is a character to type; `"diff"`'s File
+        // arm adds `"file-editor"` onto the same node rather than replacing it, which is the exact
+        // live bug that narrowed `"]"`'s own predicate.
+        gpui::KeyBinding::new("v", root::ToggleChangeSeen, Some("diff && !file-editor")),
         gpui::KeyBinding::new("secondary-1", root::JumpToAgent1, None),
         gpui::KeyBinding::new("secondary-2", root::JumpToAgent2, None),
         gpui::KeyBinding::new("secondary-3", root::JumpToAgent3, None),
