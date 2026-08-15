@@ -1,17 +1,30 @@
 //! The budget model: which providers exist, which agent spends which one, what a window's
-//! headroom means, and every string the pane strip and the popover print.
+//! usage means, and every string the pane strip and the popover print.
 //!
 //! Pure and GPUI-free, like `crate::status_bar::resources` - so "a connected provider that goes
 //! stale shows `last read <age>` in place of its own numbers" is a property that can be tested
 //! directly against a state value, without a window.
 //!
-//! # Headroom, not spend
+//! # Used, not left
 //!
-//! Both providers report a *utilisation* (percent **used**). Every number this module carries and
-//! prints is the complement of that - percent **left** - which is what the popover's own footnote
-//! (`counts headroom, not spend`) promises the reader. The conversion happens once, in
-//! [`crate::budget::fetch`]'s parsers, so nothing downstream can hold a value whose direction is
-//! ambiguous.
+//! Both providers report a *utilisation* (percent **used**), and that is the number this module
+//! carries and prints, unconverted: `61% used`, on a meter that fills as it is spent. The design
+//! bundle specified the complement (`65% left`, on a meter where full is good), and this build
+//! shipped that first; it was overruled by the product owner after seeing it, and the reason is
+//! worth recording, because it is the sort of thing that gets "corrected" back by whoever next
+//! reads the bundle. `% used` is the figure both providers' own APIs report, the figure both
+//! CLIs' own `/status` displays show, and the one a reader already has in their head from every
+//! other quota they have ever seen - and a meter that empties as you work reads as a *drain* even
+//! when the number beside it is fine.
+//!
+//! Two consequences worth stating plainly, because getting either backwards would be a real bug
+//! rather than a matter of taste:
+//!
+//! - **The bar and the number tell the same story.** [`BudgetWindow::fill_fraction`] is the
+//!   *usage*, so a nearly-full bar sits beside a high `% used` and both mean "nearly spent".
+//! - **The hue still keys off what is left.** [`budget_level`] takes *headroom*
+//!   ([`BudgetWindow::headroom_percent`]), because "amber below 40% left" is a statement about
+//!   remaining budget and stays true however the number is printed. `95% used` is red, not green.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -201,6 +214,11 @@ impl BudgetLevel {
 
 /// The step a real headroom percentage falls in. Boundaries follow §2's own wording exactly:
 /// *above* 40 is healthy, 15-40 inclusive is amber, *below* 15 is red.
+///
+/// **Takes headroom, not usage**, even though usage is what every surface now prints - the
+/// thresholds are a statement about how much budget is left, and passing a `% used` figure in
+/// here would silently invert every colour on screen (a spent window would read green). The one
+/// conversion lives in [`BudgetWindow::headroom_percent`], so no caller has to remember it.
 pub fn budget_level(headroom_percent: f32) -> BudgetLevel {
     if headroom_percent > 40.0 {
         BudgetLevel::Ok
@@ -211,8 +229,8 @@ pub fn budget_level(headroom_percent: f32) -> BudgetLevel {
     }
 }
 
-/// One rate-limit window of one provider: how much of it is left, when it resets, and what to
-/// call it.
+/// One rate-limit window of one provider: how much of it has been spent, when it resets, and what
+/// to call it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BudgetWindow {
     /// The window's own duration, as the strip prints it - `5h`, `7d`. Owned rather than
@@ -220,9 +238,10 @@ pub struct BudgetWindow {
     /// `limit_window_seconds` and the label is formatted from it ([`window_label`]), so a plan
     /// whose primary window is not five hours labels itself correctly instead of lying.
     pub label: String,
-    /// Percent **left**, 0-100 - already the complement of the API's own "used" figure. See this
-    /// module's docs.
-    pub headroom_percent: f32,
+    /// Percent **used**, 0-100 - exactly the figure both providers report (Claude's
+    /// `utilization`, Codex's `used_percent`), clamped but not converted. See this module's docs
+    /// for why this is stored the way the API sends it rather than as its complement.
+    pub used_percent: f32,
     /// When this window rolls over, as an absolute instant, so the popover's countdown really
     /// counts down while it is open instead of freezing at whatever it read at poll time. `None`
     /// when the provider did not send one.
@@ -230,26 +249,36 @@ pub struct BudgetWindow {
 }
 
 impl BudgetWindow {
+    /// Percent **left** - the complement of [`Self::used_percent`], and the only thing that reads
+    /// it. Nothing on screen prints this; it exists because the hue thresholds are defined on
+    /// remaining budget ([`budget_level`]) and must stay that way whatever the printed number
+    /// says.
+    pub fn headroom_percent(&self) -> f32 {
+        (100.0 - self.used_percent).clamp(0.0, 100.0)
+    }
+
     pub fn level(&self) -> BudgetLevel {
-        budget_level(self.headroom_percent)
+        budget_level(self.headroom_percent())
     }
 
-    /// `"92%"` - the value half of the readout. Rounded to whole percent: both APIs report whole
-    /// or near-whole numbers, and a decimal place on a five-hour window is precision this fact
-    /// does not have.
+    /// `"61%"` - the value half of the readout, as percent **used**. Rounded to whole percent:
+    /// both APIs report whole or near-whole numbers, and a decimal place on a five-hour window is
+    /// precision this fact does not have.
     pub fn value_label(&self) -> String {
-        format!("{}%", self.headroom_percent.round() as i64)
+        format!("{}%", self.used_percent.round() as i64)
     }
 
-    /// `"92% left"` - the popover's own longer form, which has the room to remove the
-    /// left/used ambiguity inline rather than only in the footnote.
+    /// `"61% used"` - the popover's own longer form, which has the room to say which direction
+    /// the number runs in inline rather than only in the footnote.
     pub fn popover_value_label(&self) -> String {
-        format!("{} left", self.value_label())
+        format!("{} used", self.value_label())
     }
 
-    /// The meter's fill as a real 0.0-1.0 fraction.
+    /// The meter's fill as a real 0.0-1.0 fraction: the **usage**, so the bar fills up as the
+    /// window is spent and a nearly-full red bar sits beside a high `% used`. See this module's
+    /// docs - the bar and the number have to tell one story, and this is which one.
     pub fn fill_fraction(&self) -> f32 {
-        (self.headroom_percent / 100.0).clamp(0.0, 1.0)
+        (self.used_percent / 100.0).clamp(0.0, 1.0)
     }
 
     /// `"resets in 4h 53m"`, or `None` when the provider sent no reset instant at all - which the
@@ -339,23 +368,24 @@ pub struct ProviderSnapshot {
 }
 
 impl ProviderSnapshot {
-    /// The window with the least headroom - what ranks providers in the popover ("the tightest
-    /// provider on top"). `None` for a provider that reported no windows at all, which is a real
-    /// possibility for an account with no limits attached and is deliberately not coerced to
-    /// `Some(100)`.
+    /// The tightest window - the most spent, equivalently the one with the least headroom - which
+    /// is what ranks providers in the popover ("the tightest provider on top"). `None` for a
+    /// provider that reported no windows at all, which is a real possibility for an account with
+    /// no limits attached and is deliberately not coerced to `Some(0)`.
     pub fn tightest(&self) -> Option<&BudgetWindow> {
         self.windows.iter().min_by(|a, b| {
-            a.headroom_percent
-                .partial_cmp(&b.headroom_percent)
+            a.headroom_percent()
+                .partial_cmp(&b.headroom_percent())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     }
 
-    /// The `Other providers` row's one-line summary: `"5h 92%  ·  7d 65%"`.
+    /// The `Other providers` row's one-line summary: `"5h 8%  ·  7d 35%"`.
     ///
     /// **Window label before the value**, like every other budget string in this app - §4c,
-    /// verbatim: "`92% 5h` parsed as '92% for 5 hours'; `5h 92%` parses as '5-hour window, 92%
-    /// left'".
+    /// verbatim: "`92% 5h` parsed as '92% for 5 hours'; `5h 92%` parses as '5-hour window, 92%'".
+    /// That argument is about which half of the pair leads, and is untouched by the direction the
+    /// number itself runs in.
     pub fn summary_label(&self) -> String {
         self.windows
             .iter()
@@ -486,7 +516,7 @@ impl ProviderBudget {
     pub fn tightest_headroom(&self, now: Instant) -> Option<f32> {
         match self.readout(now) {
             ProviderReadout::Numbers(snapshot) => {
-                snapshot.tightest().map(|window| window.headroom_percent)
+                snapshot.tightest().map(|window| window.headroom_percent())
             }
             _ => None,
         }
@@ -648,10 +678,12 @@ pub fn lock_shared_budget() -> MutexGuard<'static, BudgetState> {
 mod budget_state_tests {
     use super::*;
 
-    fn window(label: &str, headroom: f32) -> BudgetWindow {
+    /// A window of `used` percent - the direction every one of these numbers runs in, so a test
+    /// that reads `19.0` means "19% spent, 81% left" and never the other way round.
+    fn window(label: &str, used: f32) -> BudgetWindow {
         BudgetWindow {
             label: label.to_string(),
-            headroom_percent: headroom,
+            used_percent: used,
             resets_at: None,
         }
     }
@@ -710,7 +742,7 @@ mod budget_state_tests {
     /// readout amber and say the session is constrained when it is not.
     #[test]
     fn each_window_takes_its_own_hue_rather_than_the_tighter_ones() {
-        let snapshot = snapshot(81.0, 40.0);
+        let snapshot = snapshot(19.0, 60.0);
         assert_eq!(snapshot.windows[0].level(), BudgetLevel::Ok);
         assert_eq!(snapshot.windows[1].level(), BudgetLevel::Warn);
         assert_eq!(
@@ -721,15 +753,54 @@ mod budget_state_tests {
     }
 
     /// §4c, verbatim: "`92% 5h` parsed as '92% for 5 hours'; `5h 92%` parses as '5-hour window,
-    /// 92% left'". The label leads.
+    /// 92%'". The label leads - an argument about ordering that the direction of the number
+    /// itself does not touch.
     #[test]
     fn every_window_string_puts_the_window_label_before_the_value() {
-        let snapshot = snapshot(92.0, 65.0);
-        assert_eq!(snapshot.summary_label(), "5h 92%  \u{b7}  7d 65%");
+        let snapshot = snapshot(8.0, 35.0);
+        assert_eq!(snapshot.summary_label(), "5h 8%  \u{b7}  7d 35%");
         assert!(
             snapshot.summary_label().starts_with("5h "),
-            "the window label must lead - `92% 5h` reads as `92% for 5 hours`"
+            "the window label must lead - `8% 5h` reads as `8% for 5 hours`"
         );
+    }
+
+    /// **Every number on screen is percent used, and the bar agrees with it.** The design bundle
+    /// specified the complement (`92% left`, on a meter where full is good) and this build shipped
+    /// that first; the product owner overruled it after seeing it. Pinned here in one place so the
+    /// flip cannot drift back a field at a time - and so the *hue*, which still keys off what is
+    /// left, cannot be flipped along with the number by accident.
+    #[test]
+    fn every_printed_percentage_is_usage_and_the_meter_fills_with_it() {
+        let nearly_spent = window("5h", 95.0);
+        assert_eq!(
+            nearly_spent.value_label(),
+            "95%",
+            "the strip prints what has been spent, not what is left"
+        );
+        assert_eq!(nearly_spent.popover_value_label(), "95% used");
+        assert!(
+            (nearly_spent.fill_fraction() - 0.95).abs() < f32::EPSILON,
+            "and the meter is nearly full, because the bar and the number have to tell one story"
+        );
+        assert_eq!(
+            nearly_spent.level(),
+            BudgetLevel::Critical,
+            "95% used is 5% left, which is red - the hue keys off headroom however the number is \
+             printed, and inverting it along with the display would paint a spent window green"
+        );
+
+        let untouched = window("7d", 0.0);
+        assert_eq!(untouched.value_label(), "0%");
+        assert_eq!(untouched.fill_fraction(), 0.0, "an unspent window is empty");
+        assert_eq!(untouched.level(), BudgetLevel::Ok);
+
+        // An over-quota account can report past 100; the meter must not overflow its own track,
+        // and the number must not read as a percentage that cannot exist.
+        let over_quota = window("5h", 130.0);
+        assert_eq!(over_quota.fill_fraction(), 1.0);
+        assert_eq!(over_quota.headroom_percent(), 0.0);
+        assert_eq!(over_quota.level(), BudgetLevel::Critical);
     }
 
     #[test]
@@ -753,7 +824,7 @@ mod budget_state_tests {
     #[test]
     fn a_reset_countdown_reads_largest_unit_first_and_never_goes_negative() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut window = window("5h", 92.0);
+        let mut window = window("5h", 8.0);
 
         window.resets_at = Some(now + Duration::from_secs(4 * 3600 + 53 * 60));
         assert_eq!(window.reset_label(now).as_deref(), Some("resets in 4h 53m"));
@@ -817,7 +888,7 @@ mod budget_state_tests {
             "and it earns the `Retry` \u{a7}4c puts beside it"
         );
 
-        let fresh = snapshot(81.0, 40.0);
+        let fresh = snapshot(19.0, 60.0);
         budget.last_ok = Some((fresh.clone(), now));
         budget.last_error = None;
         assert_eq!(
@@ -939,7 +1010,7 @@ mod budget_state_tests {
         let now = Instant::now();
         for read in [
             ProviderRead::NotConnected,
-            ProviderRead::Ok(snapshot(81.0, 40.0)),
+            ProviderRead::Ok(snapshot(19.0, 60.0)),
             ProviderRead::Failed("the provider answered 429".to_string()),
         ] {
             let mut state = BudgetState::default();
@@ -970,7 +1041,7 @@ mod budget_state_tests {
             "no credential is `not connected`, and nothing was sent anywhere"
         );
 
-        let good = snapshot(81.0, 40.0);
+        let good = snapshot(19.0, 60.0);
         state.apply_read(Provider::Claude, ProviderRead::Ok(good.clone()), now);
         assert_eq!(
             state.get(Provider::Claude).readout(now),
@@ -1034,7 +1105,7 @@ mod budget_state_tests {
 
         shared.apply_read(
             Provider::Claude,
-            ProviderRead::Ok(snapshot(81.0, 40.0)),
+            ProviderRead::Ok(snapshot(19.0, 60.0)),
             now,
         );
         assert!(
@@ -1095,16 +1166,16 @@ mod budget_state_tests {
         );
 
         state.get_mut(Provider::Claude).connected = true;
-        state.get_mut(Provider::Claude).last_ok = Some((snapshot(81.0, 40.0), now));
+        state.get_mut(Provider::Claude).last_ok = Some((snapshot(19.0, 60.0), now));
         assert_eq!(state.lead_provider(now), Some(Provider::Claude));
 
         state.get_mut(Provider::Codex).connected = true;
-        state.get_mut(Provider::Codex).last_ok = Some((snapshot(99.0, 12.0), now));
+        state.get_mut(Provider::Codex).last_ok = Some((snapshot(1.0, 88.0), now));
         assert_eq!(
             state.lead_provider(now),
             Some(Provider::Codex),
-            "codex's 12% weekly is tighter than claude's 40%, even though its session window is \
-             the healthier of the two"
+            "codex's 88%-spent week is tighter than claude's 60%, even though its session window \
+             is the healthier of the two"
         );
 
         // A provider whose numbers went stale cannot lead on numbers nobody can see.

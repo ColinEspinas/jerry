@@ -190,11 +190,12 @@ mod budget_flow_tests {
     use crate::root::focus::palette_focus_tests::open_test_app;
     use gpui::TestAppContext;
 
-    fn snapshot(headroom: f32) -> ProviderSnapshot {
+    /// One window of `used` percent - the direction every budget number runs in.
+    fn snapshot(used: f32) -> ProviderSnapshot {
         ProviderSnapshot {
             windows: vec![BudgetWindow {
                 label: "5h".to_string(),
-                headroom_percent: headroom,
+                used_percent: used,
                 resets_at: None,
             }],
         }
@@ -287,7 +288,7 @@ mod budget_flow_tests {
         // Exactly what the first window's poll does: claim the process-wide right to read, then
         // land the result on the shared state.
         let landed = Instant::now();
-        let fetched = snapshot(81.0);
+        let fetched = snapshot(19.0);
         {
             let mut shared = lock_shared_budget();
             assert!(

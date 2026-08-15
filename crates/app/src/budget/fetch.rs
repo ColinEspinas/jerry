@@ -333,7 +333,8 @@ fn http_get_usage(provider: Provider, credential: &Credential) -> Result<String,
         .map_err(|err| format!("the response could not be read: {err}"))
 }
 
-/// Parses one provider's usage payload into windows of *headroom*.
+/// Parses one provider's usage payload into windows of *usage* - the figure each API already
+/// reports, carried through unconverted (`crate::budget::state`'s "Used, not left").
 pub fn parse_usage(provider: Provider, body: &str) -> Result<ProviderSnapshot, String> {
     match provider {
         Provider::Claude => parse_claude_usage(body),
@@ -341,11 +342,15 @@ pub fn parse_usage(provider: Provider, body: &str) -> Result<ProviderSnapshot, S
     }
 }
 
-/// Percent used -> percent left, clamped to the real 0-100 range an over-quota account can
-/// otherwise leave (a `utilization` above 100 is possible and would otherwise render as a
-/// negative meter).
-fn headroom_from_utilization(utilization: f64) -> f32 {
-    (100.0 - utilization).clamp(0.0, 100.0) as f32
+/// A provider's own "percent used" figure, clamped to the real 0-100 range an over-quota account
+/// can otherwise leave (a `utilization` above 100 is possible, and would otherwise render as a
+/// meter overflowing its own track).
+///
+/// Clamped but **not** converted: the number every surface prints is the one the API sent - see
+/// `crate::budget::state`'s own docs for why this build shows `% used` rather than the design
+/// bundle's `% left`.
+fn used_percent_from(utilization: f64) -> f32 {
+    utilization.clamp(0.0, 100.0) as f32
 }
 
 /// Anthropic's `GET /api/oauth/usage`.
@@ -375,7 +380,7 @@ pub fn parse_claude_usage(body: &str) -> Result<ProviderSnapshot, String> {
         };
         windows.push(BudgetWindow {
             label: label.to_string(),
-            headroom_percent: headroom_from_utilization(utilization),
+            used_percent: used_percent_from(utilization),
             resets_at: entry
                 .get("resets_at")
                 .and_then(|value| value.as_str())
@@ -426,7 +431,7 @@ pub fn parse_codex_usage(body: &str) -> Result<ProviderSnapshot, String> {
             .unwrap_or(0);
         windows.push(BudgetWindow {
             label: window_label(seconds),
-            headroom_percent: headroom_from_utilization(used),
+            used_percent: used_percent_from(used),
             resets_at: codex_reset_instant(entry),
         });
     }
@@ -598,10 +603,11 @@ mod budget_fetch_tests {
       }
     }"#;
 
-    /// The one direction rule the whole feature rests on: the API reports *used*, every value in
-    /// Jerry is *left*. `19% used` must become `81% left`, never `19%`.
+    /// The one direction rule the whole feature rests on: the API reports *used*, and so does
+    /// every value in Jerry. `19% used` stays `19%`, and is never quietly flipped to the `81%
+    /// left` this build shipped first.
     #[test]
-    fn the_claude_payload_parses_into_two_windows_of_headroom_not_spend() {
+    fn the_claude_payload_parses_into_two_windows_of_usage_not_headroom() {
         let snapshot = parse_claude_usage(CLAUDE_LIVE_PAYLOAD).expect("a real payload parses");
         assert_eq!(
             snapshot.windows.len(),
@@ -610,11 +616,16 @@ mod budget_fetch_tests {
         );
         assert_eq!(snapshot.windows[0].label, "5h");
         assert_eq!(
-            snapshot.windows[0].headroom_percent, 81.0,
-            "19% used is 81% left - the popover's footnote promises headroom, not spend"
+            snapshot.windows[0].used_percent, 19.0,
+            "the payload's own `utilization: 19.0`, carried through rather than converted"
+        );
+        assert_eq!(
+            snapshot.windows[0].headroom_percent(),
+            81.0,
+            "and its complement is still derivable, because that is what the hue keys off"
         );
         assert_eq!(snapshot.windows[1].label, "7d");
-        assert_eq!(snapshot.windows[1].headroom_percent, 40.0);
+        assert_eq!(snapshot.windows[1].used_percent, 60.0);
         assert_eq!(
             snapshot.tightest().map(|w| w.label.clone()),
             Some("7d".to_string()),
@@ -663,13 +674,17 @@ mod budget_fetch_tests {
             snapshot.windows[0].label, "5h",
             "the label comes from `limit_window_seconds`, not from an assumption"
         );
-        assert_eq!(snapshot.windows[0].headroom_percent, 99.0);
+        assert_eq!(
+            snapshot.windows[0].used_percent, 1.0,
+            "the payload's own `used_percent: 1`, printed as the 1% it is"
+        );
         assert_eq!(snapshot.windows[1].label, "7d");
-        assert_eq!(snapshot.windows[1].headroom_percent, 88.0);
+        assert_eq!(snapshot.windows[1].used_percent, 12.0);
         assert_eq!(
             snapshot.summary_label(),
-            "5h 99%  \u{b7}  7d 88%",
-            "window label before the value, on this provider too"
+            "5h 1%  \u{b7}  7d 12%",
+            "window label before the value, on this provider too - and the value is what has been \
+             spent, not what is left"
         );
     }
 
@@ -710,7 +725,7 @@ mod budget_fetch_tests {
     /// before the read starts, to wedge every subsequent poll *and* every `Refresh`/`Retry` click
     /// for the rest of the session with it.
     ///
-    /// The contract asserted here is the whole fix: the window still parses, its headroom - the
+    /// The contract asserted here is the whole fix: the window still parses, its percentage - the
     /// number the reader actually came for - is still real, and only the unusable reset instant is
     /// dropped.
     #[test]
@@ -732,9 +747,8 @@ mod budget_fetch_tests {
             let snapshot = parse_codex_usage(&codex_window_with(&hostile))
                 .unwrap_or_else(|err| panic!("{hostile} must still parse a window, got {err}"));
             assert_eq!(
-                snapshot.windows[0].headroom_percent, 75.0,
-                "{hostile}: the headroom is still a real number - only the reset instant is \
-                 unusable"
+                snapshot.windows[0].used_percent, 25.0,
+                "{hostile}: the usage is still a real number - only the reset instant is unusable"
             );
             assert_eq!(
                 snapshot.windows[0].resets_at, None,
