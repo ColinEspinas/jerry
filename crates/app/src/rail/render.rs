@@ -795,7 +795,10 @@ impl AdeApp {
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    // Live report: a decorative gap between the real text and its own caret
+                    // reads as "there's a space between the char and where it's typed" - a
+                    // cursor sits flush against the last glyph, it doesn't float clear of it.
+                    // Removed here and everywhere else this same caret+text pair appears.
                     // GitHub issue #45 / live report: the caret used to be a fixed trailing
                     // child, which put it visually *after* the placeholder text whenever
                     // `filter_query` was empty. It now sits before the placeholder (the real

@@ -1109,7 +1109,10 @@ impl AdeApp {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    // No decorative gap before the caret - see
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                    // comment for why (live report: it read as a gap between the
+                    // typed text and where it's actually being typed).
                     .h(px(20.0))
                     .w(px(168.0))
                     .px(px(7.0))
@@ -2064,7 +2067,10 @@ impl AdeApp {
                     .cursor_pointer()
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    // No decorative gap before the caret - see
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                    // comment for why (live report: it read as a gap between the
+                    // typed text and where it's actually being typed).
                     .h(px(20.0))
                     .w(px(96.0))
                     .px(px(7.0))
@@ -2637,7 +2643,10 @@ impl AdeApp {
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
+                    // No decorative gap before the caret - see
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                    // comment for why (live report: it read as a gap between the
+                    // typed text and where it's actually being typed).
                     // GitHub issue #45 / live report: same fix as
                     // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
                     // before the placeholder (real cursor position 0) while the filter is empty,
