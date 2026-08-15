@@ -1412,6 +1412,7 @@ impl AdeApp {
         // the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other`) stays exactly
         // that - unaffected by either spacer, both of which sit outside it.
         div()
+            .w_full()
             .flex()
             .flex_col()
             .when(!is_first, |el| el.child(div().h(px(12.0))))
@@ -1438,6 +1439,7 @@ impl AdeApp {
         group: &RepoGroup,
     ) -> impl IntoElement {
         div()
+            .w_full()
             .px(px(12.0))
             .pb(px(6.0))
             .font(font(theme::font::MONO))
@@ -1537,6 +1539,7 @@ impl AdeApp {
             // entry has no usable, real path to select into).
             return div()
                 .id(id)
+                .w_full()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1718,6 +1721,7 @@ impl AdeApp {
             // repo that isn't focused.
             .debug_selector(move || id)
             .cursor_pointer()
+            .w_full()
             .flex()
             .items_center()
             .h(px(27.0))
@@ -1826,6 +1830,7 @@ impl AdeApp {
         // not a style meant for an ordinary flex sibling" reason.
         if trailing_pb {
             div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .child(header)
@@ -1894,6 +1899,7 @@ impl AdeApp {
             // anchoring, so the two must stay one format.
             .debug_selector(move || format!("agent-row-{id}"))
             .cursor_pointer()
+            .w_full()
             .flex()
             .pl(px(13.0))
             // The row's real indent under its worktree: 13px of empty space (padding, not a
@@ -2072,6 +2078,7 @@ impl AdeApp {
         div()
             .id(element_id)
             .debug_selector(move || selector.to_string())
+            .w_full()
             .flex()
             .items_center()
             .gap(px(5.0))
@@ -5020,6 +5027,65 @@ mod rail_rev6_render_tests {
             "the content box (and the status-edge border painted on it) must start 14px in from \
              the row's own left edge - 13px of indent plus the 1px connector line - never flush \
              with x=0, which is what the worktree row's own edge uses"
+        );
+    }
+
+    /// Live report, screenshot-confirmed: "worktree pane is messed up, width issues" -
+    /// inconsistent row widths, and agent rows that don't share their parent worktree row's own
+    /// left/right extent. Root cause: `gpui::list` (GitHub issue #364's virtualization) lays each
+    /// item out via `Element::layout_as_root` with a real, *definite* available width - the
+    /// list's own painted `bounds.size.width` (verified directly against vendored
+    /// `gpui::elements::list`'s `layout_all_items`/`layout_items`, the same "read the real
+    /// upstream source" idiom this file's own scrollbar geometry notes already use) - but unlike
+    /// an ordinary `div().flex().flex_col()` parent, it does **not** stretch a root item to that
+    /// width by default. `render_change_row`/`render_section_header` (the pre-existing,
+    /// correct `gpui::list` user this rail work explicitly modeled itself on) already carry an
+    /// explicit `.w_full()` on their own root element for exactly this reason; every
+    /// `RailListItem` render function was missing it.
+    ///
+    /// Measured, not asserted from the source: every real painted row must span exactly the
+    /// rail's own real list width, the same real container `Self::render_rail_list` wraps
+    /// `gpui::list` in.
+    #[gpui::test]
+    fn every_rail_list_item_spans_the_full_rail_width(cx: &mut TestAppContext) {
+        let (_repo, wt, app, cx) = open_with_a_failed_agent(cx);
+
+        let wt_path = wt.path().to_path_buf();
+        let agent_id = app.update(cx, |app, _cx| {
+            app.agents
+                .iter()
+                .find(|a| a.cwd == wt_path)
+                .expect("the real failed agent this helper seeds, in its own worktree")
+                .id
+        });
+
+        let list = cx
+            .debug_bounds("agent-rail-list")
+            .expect("the rail's own list band must paint");
+        let worktree_row = cx
+            .debug_bounds(selector(format!("worktree-row-0-{}", wt_path.display())))
+            .expect("the worktree row must paint");
+        let agent_row = cx
+            .debug_bounds(selector(format!("agent-row-{agent_id}")))
+            .expect("the agent row under it must paint");
+
+        assert_eq!(
+            worktree_row.size.width, list.size.width,
+            "a worktree row is one gpui::list item and must span the list's real available \
+             width, not shrink to fit its own label/status content"
+        );
+        assert_eq!(
+            agent_row.size.width, list.size.width,
+            "an agent row is also its own gpui::list item and must span the exact same real \
+             width as the worktree row above it - a narrower agent row is what made the \
+             screenshot's agent rows look misaligned/indented wrong relative to their parent"
+        );
+        assert_eq!(
+            worktree_row.origin.x, agent_row.origin.x,
+            "both rows are flush against the same list origin - the agent row's own 13px \
+             indent is internal padding (proven by \
+             the_agent_row_is_really_indented_under_its_worktree_not_flush_with_it above), not \
+             a narrower or offset root box"
         );
     }
 
