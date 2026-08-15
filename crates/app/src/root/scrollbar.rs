@@ -262,13 +262,14 @@ impl gpui::Render for ScrollbarDrag {
 /// A free function generic over `Context<T>` rather than an `AdeApp` method (GitHub issue
 /// #331): every call site until that issue happened to be a method on `AdeApp` itself, so it
 /// was originally written as one, taking an unused `&self` purely to be callable as
-/// `scrollbar::render_vertical_scrollbar(...)` from those sites. `crate::terminal::pane::
-/// TerminalPane` is a genuinely separate `Entity<TerminalPane>` with its own `Context<TerminalPane>`
-/// - it has no `AdeApp` to call this through - and the body never actually touched `self` (both
-/// `cx.listener` closures below take `_this`, unused), so generalizing the signature is a real
-/// behavior-preserving mechanical change, not a rework: every existing `AdeApp` call site
-/// still type-checks unchanged (`T` is inferred from `cx`'s own type), just spelled as a plain
-/// function call instead of a method call.
+/// `self.render_vertical_scrollbar(...)` from those sites. `crate::terminal::pane::
+/// TerminalPane` is a genuinely separate `Entity<TerminalPane>` with its own
+/// `Context<TerminalPane>`, with no `AdeApp` to call this through, and the body never actually
+/// touched `self` (both `cx.listener` closures below take `_this`, unused), so generalizing the
+/// signature is a real behavior-preserving mechanical change, not a rework: every existing
+/// `AdeApp` call site still type-checks unchanged (`T` is inferred from `cx`'s own type), just
+/// spelled as a plain function call (`scrollbar::render_vertical_scrollbar(...)`) instead of a
+/// method call.
 pub(crate) fn render_vertical_scrollbar<T: 'static, H: ScrollableHandle>(
     id: &'static str,
     handle: &H,

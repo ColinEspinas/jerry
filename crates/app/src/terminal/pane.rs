@@ -79,18 +79,23 @@
 //! anything - and feeds a confirmed exit into the exact same `newly_exited`/`process_ended`
 //! state transition the unix EOF path already uses.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, font, prelude::*, px, rgb, BorderStyle, Bounds, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Pixels, Size, Task, Window,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Pixels, ScrollWheelEvent, Size,
+    Task, Window,
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
+use crate::root::scrollbar::{self, ScrollableHandle};
+use crate::root::widgets::text_tooltip;
 use crate::terminal::grid::{
-    CellPosition, CellSide, CellWidth, GridCell, TerminalGrid, TerminalPalette,
+    CellPosition, CellSide, CellWidth, GridCell, ScrollAmount, TerminalGrid, TerminalPalette,
 };
 use crate::terminal::links::{self as terminal_links, LinkMatch};
 use crate::terminal::osc::Progress;
@@ -569,6 +574,103 @@ mod shell_program_tests {
     }
 }
 
+/// Real GPUI scroll handle backing the terminal's own scrollback (GitHub issue #331) - the
+/// [`ScrollableHandle`] adapter that lets [`TerminalPane`] reuse the exact same shared overlay
+/// scrollbar every other scrollable region in this app uses
+/// (`crate::root::scrollbar::render_vertical_scrollbar`, see that module's own docs), even
+/// though the terminal's real scroll position is `alacritty_terminal::Term`'s line-based
+/// `display_offset` (`TerminalGrid::scroll_offset`), not a GPUI-native scrollable div's pixel
+/// offset.
+///
+/// `Rc<RefCell<..>>`, not owned data: [`ScrollableHandle::set_scroll_offset`] is called from the
+/// scrollbar's own `on_mouse_down`/`on_drag_move` closures, which only ever get a `.clone()` of
+/// this handle, never `&mut TerminalPane` - so a click/drag has to leave a real record somewhere
+/// the *next* [`TerminalPane::render`] can pick up and turn into a real
+/// `TerminalGrid::set_scroll_offset` call (see [`TerminalScrollState::requested_display_offset`]).
+/// The same `Rc`'d-interior-mutability idiom `crate::terminal::grid::TermEventSink` uses, for the
+/// same "the real callback signature only ever hands out `&self`" reason.
+#[derive(Clone)]
+struct TerminalScrollHandle(Rc<RefCell<TerminalScrollState>>);
+
+#[derive(Default)]
+struct TerminalScrollState {
+    viewport_bounds: Bounds<Pixels>,
+    row_height: Pixels,
+    history_len: usize,
+    display_offset: usize,
+    /// Set by [`ScrollableHandle::set_scroll_offset`] (a scrollbar click/drag); drained by
+    /// [`TerminalPane::render`] at the top of the next render and turned into a real
+    /// `TerminalGrid::set_scroll_offset` call.
+    requested_display_offset: Option<usize>,
+}
+
+impl TerminalScrollHandle {
+    fn new() -> Self {
+        Self(Rc::new(RefCell::new(TerminalScrollState::default())))
+    }
+
+    /// Pushes the grid's real current scroll state into the handle - called once per render,
+    /// before the scrollbar itself is built, so [`ScrollableHandle`]'s geometry methods answer
+    /// with this frame's real numbers rather than a stale previous frame's.
+    fn sync(
+        &self,
+        viewport_bounds: Bounds<Pixels>,
+        row_height: Pixels,
+        history_len: usize,
+        display_offset: usize,
+    ) {
+        let mut state = self.0.borrow_mut();
+        state.viewport_bounds = viewport_bounds;
+        state.row_height = row_height;
+        state.history_len = history_len;
+        state.display_offset = display_offset;
+    }
+
+    /// Drains a scrollbar-driven target display offset, if the user clicked or dragged the
+    /// thumb since the last render.
+    fn take_requested_display_offset(&self) -> Option<usize> {
+        self.0.borrow_mut().requested_display_offset.take()
+    }
+}
+
+impl ScrollableHandle for TerminalScrollHandle {
+    /// Lines-from-top, not `TerminalGrid::scroll_offset`'s own live-relative convention: `0` at
+    /// the *oldest* retained line (the top of the track) and [`TerminalScrollState::history_len`]
+    /// at the live tail (the bottom of the track) - matching `gpui::ScrollHandle`'s own "offset
+    /// grows toward the bottom of the content" convention, and what makes the scrollbar thumb
+    /// sit at the *bottom* of the track while live-following, exactly like every real terminal
+    /// emulator's own scrollbar.
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.0.borrow().viewport_bounds
+    }
+
+    fn max_scroll_offset(&self) -> gpui::Point<Pixels> {
+        let state = self.0.borrow();
+        gpui::point(
+            px(0.0),
+            px(state.row_height.as_f32() * state.history_len as f32),
+        )
+    }
+
+    fn scroll_offset(&self) -> gpui::Point<Pixels> {
+        let state = self.0.borrow();
+        let lines_from_top = state.history_len.saturating_sub(state.display_offset) as f32;
+        gpui::point(px(0.0), px(-(state.row_height.as_f32() * lines_from_top)))
+    }
+
+    fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+        let mut state = self.0.borrow_mut();
+        let row_height = state.row_height.as_f32();
+        if row_height <= 0.0 {
+            return;
+        }
+        let max_px = row_height * state.history_len as f32;
+        let scrolled_px = (-offset.y.as_f32()).clamp(0.0, max_px);
+        let lines_from_top = (scrolled_px / row_height).round() as usize;
+        state.requested_display_offset = Some(state.history_len.saturating_sub(lines_from_top));
+    }
+}
+
 /// An event [`TerminalPane`] emits (`cx.emit`) for its owner to react to - the same
 /// `EventEmitter`/`cx.subscribe_in` pattern `vendor/zed/crates/terminal/src/terminal.rs`'s own
 /// `Event::Open(MaybeNavigationTarget)` uses for the same "a click resolved to a navigation
@@ -681,6 +783,24 @@ pub struct TerminalPane {
     /// frame and consumed within that frame (see [`theme_terminal_palette`]).
     #[cfg(test)]
     last_painted_palette: Option<TerminalPalette>,
+    /// The scrollback scrollbar's own [`ScrollableHandle`] adapter (GitHub issue #331) - see
+    /// [`TerminalScrollHandle`]'s own docs for why the terminal needs one at all, rather than
+    /// reusing a plain `gpui::ScrollHandle` the way every other scrollable region does.
+    scroll_handle: TerminalScrollHandle,
+    /// Accumulated, not-yet-applied mouse-wheel/trackpad scroll distance, in pixels (GitHub
+    /// issue #331). A mouse-wheel notch (`gpui::ScrollDelta::Lines`) always converts to a whole
+    /// number of grid lines cleanly, but trackpad deltas (`ScrollDelta::Pixels`) essentially
+    /// never divide evenly by [`Self::line_height_px`] - truncating every single event to whole
+    /// lines would silently drop each event's sub-line remainder, and a slow trackpad flick
+    /// would scroll nothing at all. This carries that remainder across events; see
+    /// [`Self::handle_scroll_wheel`].
+    pending_scroll_px: f32,
+    /// `true` once real pty output has arrived while [`Self::grid`] was scrolled back (GitHub
+    /// issue #331) - drives the "jump to bottom" affordance's highlighted "there's new output"
+    /// state. Cleared the moment [`Self::grid`]'s own scroll offset is observed back at live
+    /// (`render`, every frame - self-correcting, since the grid is the single source of truth
+    /// for "are we scrolled back", never mirrored here).
+    new_output_while_scrolled: bool,
 }
 
 impl TerminalPane {
@@ -712,6 +832,9 @@ impl TerminalPane {
             selecting: false,
             #[cfg(test)]
             last_painted_palette: None,
+            scroll_handle: TerminalScrollHandle::new(),
+            pending_scroll_px: 0.0,
+            new_output_while_scrolled: false,
         };
         this.spawn_process(cx);
         this
@@ -1148,6 +1271,118 @@ impl TerminalPane {
         self.selecting = false;
     }
 
+    /// Mouse-wheel/trackpad scrollback (GitHub issue #331) - converts `event.delta` into whole
+    /// grid lines, carrying any sub-line remainder in [`Self::pending_scroll_px`], then drives
+    /// `TerminalGrid::scroll_display` directly.
+    ///
+    /// A real `on_scroll_wheel` handler, not GPUI's built-in `overflow_y_scroll`/`track_scroll`
+    /// mechanism every other scrollable region in this app uses (`crate::root::scrollbar`'s own
+    /// docs): this pane paints its own fixed-size cell grid rather than a tall scrollable div of
+    /// child rows (see the module docs), so there is no GPUI-native scrollable content for that
+    /// mechanism to act on - the grid's real "scroll position" is `alacritty_terminal::Term`'s
+    /// own `display_offset`, and only `TerminalGrid::scroll_display` can move it.
+    ///
+    /// A negative `delta.y` (the platform convention for "scrolling down" - the same sign
+    /// `vendor/zed/crates/gpui/src/elements/div.rs`'s own built-in scroll listener adds straight
+    /// onto a `ScrollHandle`'s offset, whose own docs say "negative when scrolled down") scrolls
+    /// toward the live tail; a positive one scrolls up into history - matching
+    /// [`ScrollAmount::Lines`]'s own sign convention, so the delta needs no inversion here.
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row_height = self.line_height_px();
+        if row_height <= 0.0 {
+            return;
+        }
+        let delta_px = event.delta.pixel_delta(px(row_height)).y.as_f32();
+        self.pending_scroll_px += delta_px;
+        let lines = (self.pending_scroll_px / row_height).trunc();
+        if lines == 0.0 {
+            return;
+        }
+        self.pending_scroll_px -= lines * row_height;
+        self.grid.scroll_display(ScrollAmount::Lines(lines as i32));
+        cx.notify();
+    }
+
+    /// Applies a scrollbar click/drag's requested target, if one was recorded since the last
+    /// render (see [`TerminalScrollHandle`]'s own docs for why this is deferred by a frame
+    /// rather than applied immediately). Called at the top of every `render`, before this
+    /// frame's rows are read out of [`Self::grid`], so a click/drag is reflected in the very
+    /// same frame it's applied in rather than lagging an extra one.
+    fn apply_pending_scrollbar_target(&mut self) {
+        if let Some(target) = self.scroll_handle.take_requested_display_offset() {
+            self.grid.set_scroll_offset(target);
+        }
+    }
+
+    /// The "jump to bottom" affordance (GitHub issue #331) - `None` (nothing painted, nothing
+    /// hit-tested) whenever [`TerminalGrid::is_scrolled_back`] is `false`, since there is
+    /// nothing to jump to: this only ever appears while genuinely showing scrollback, matching
+    /// [`crate::root::scrollbar::render_vertical_scrollbar`]'s own "`None` when there's nothing
+    /// to act on" convention.
+    ///
+    /// Highlighted (`theme::status::RUN`, the same blue `theme::terminal::CURSOR` already
+    /// paints this pane's own cursor with) once [`Self::new_output_while_scrolled`] has
+    /// latched - real output arrived underneath while the human was reading history, the same
+    /// "something happened while you were looking elsewhere" idea `crate::rail::status`'s own
+    /// attention signal answers for a whole tab, applied here to a single pane's own scroll
+    /// state instead. A plain `text_tooltip` carries the explanation rather than a keycap: no
+    /// new keyboard shortcut is bound to this action (typing while scrolled back already jumps
+    /// back on its own - see `Self::handle_key_down`), so there is no key combo for a keycap to
+    /// show.
+    fn render_jump_to_bottom_affordance(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.grid.is_scrolled_back() {
+            return None;
+        }
+        let highlighted = self.new_output_while_scrolled;
+        let (fg, border, label): (gpui::Rgba, gpui::Rgba, &'static str) = if highlighted {
+            (
+                theme::status::RUN.into(),
+                theme::status::RUN.into(),
+                "New output \u{2193}",
+            )
+        } else {
+            (
+                theme::text::SECONDARY.into(),
+                theme::border::POPOVER.into(),
+                "\u{2193} Scrolled",
+            )
+        };
+        Some(
+            div()
+                .id("terminal-jump-to-bottom")
+                .absolute()
+                .bottom(px(10.0))
+                .right(px(scrollbar::CONTENT_CLEARANCE))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .h(px(20.0))
+                .px(px(8.0))
+                .rounded(theme::radius::CARD_SM)
+                .bg(theme::surface::POPOVER)
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
+                .font(font(theme::font::SANS))
+                .text_size(px(10.5))
+                .text_color(fg)
+                .child(label)
+                .tooltip(text_tooltip("Jump to the live output"))
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.grid.scroll_display(ScrollAmount::Bottom);
+                    this.new_output_while_scrolled = false;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// Test-only seam: feeds bytes straight into this pane's grid, exactly as
     /// [`Self::spawn_process`]'s poll loop does for pty output - lets a test put known,
     /// deterministic text on screen without synchronizing against a real child process's
@@ -1373,6 +1608,15 @@ impl TerminalPane {
                                     // unbounded if that ever changes is not a bound.
                                     drained_bytes += chunk.len().max(1);
                                     this.grid.append_bytes(&chunk);
+                                    // GitHub issue #331: real output arrived while the human was
+                                    // looking at scrollback - latch the "new output" indicator
+                                    // for the jump-to-bottom affordance. `Self::grid` already
+                                    // stays pinned to the same historical lines on its own (see
+                                    // `TerminalGrid::scroll_display`'s docs), so this is purely
+                                    // the UI signal, never a scroll-position decision.
+                                    if this.grid.is_scrolled_back() {
+                                        this.new_output_while_scrolled = true;
+                                    }
                                     this.activity_at = Some(Instant::now());
                                     // Consume the grid's one-shot OSC 9 / 777 notification flag
                                     // right where the bytes that could have set it were parsed,
@@ -1489,6 +1733,29 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #331: plain (unmodified) PageUp/PageDown scroll real retained
+        // scrollback rather than being forwarded to the pty. Claiming these is safe:
+        // `keystroke_to_bytes` never mapped either key to any byte sequence to begin with (see
+        // its own docs' deliberately small subset), so this app never actually forwarded a
+        // PageUp/PageDown to the child process before now - not taking over a keystroke a
+        // full-screen program (`vim`/`less`/`htop`) might otherwise have received. The alt
+        // screen keeps no scrollback of its own (`TerminalGrid::scroll_display`'s docs), so a
+        // PageUp/PageDown reaching one there is already a real no-op. Modified variants
+        // (Shift/Ctrl/Alt+PageUp, ...) fall through unclaimed, same as before this issue.
+        if !event.keystroke.modifiers.modified() {
+            let scroll = match event.keystroke.key.as_str() {
+                "pageup" => Some(ScrollAmount::PageUp),
+                "pagedown" => Some(ScrollAmount::PageDown),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                self.grid.scroll_display(scroll);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         let Some(session) = &self.session else {
             return;
         };
@@ -1506,6 +1773,13 @@ impl TerminalPane {
         if let Err(err) = write_result {
             self.spawn_error = Some(format!("failed to write input: {err}"));
             cx.notify();
+        }
+        // GitHub issue #331: typing while scrolled back jumps back to the live tail - the
+        // standard terminal convention (iTerm2, Alacritty, Windows Terminal all do this): a real
+        // keystroke reaching the child process is the human demonstrating they want to interact
+        // with the live process, not keep reading history underneath it.
+        if self.grid.is_scrolled_back() {
+            self.grid.scroll_display(ScrollAmount::Bottom);
         }
         // Consumed as terminal input; don't let it also be interpreted as an app-level
         // keybinding (matches `vendor/zed/crates/terminal_view/src/terminal_view.rs`'s
@@ -2317,6 +2591,18 @@ impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize_pty(window);
 
+        // GitHub issue #331: apply a scrollbar click/drag from the previous frame before this
+        // frame reads `self.grid`'s scroll state - see `Self::apply_pending_scrollbar_target`'s
+        // own docs for why this can't happen synchronously inside the scrollbar's own handlers.
+        self.apply_pending_scrollbar_target();
+        // The grid's own `display_offset` is the single source of truth for "are we scrolled
+        // back" - self-correcting the moment it's observed back at live, rather than needing an
+        // explicit "the user jumped back" event from every place that can cause that (the
+        // affordance's own click, a keystroke, `Scroll::Bottom` from anywhere else).
+        if !self.grid.is_scrolled_back() {
+            self.new_output_while_scrolled = false;
+        }
+
         // GitHub issue #211: the real measured monospace advance (`Self::cell_size`, cached), so
         // `render_row` can pin a double-width run to exactly the two columns per character it
         // owns instead of trusting whatever advance the font happens to give that glyph.
@@ -2382,6 +2668,10 @@ impl Render for TerminalPane {
             )
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            // GitHub issue #331: real mouse-wheel/trackpad scrollback - see
+            // `Self::handle_scroll_wheel`'s own docs for why this is a direct handler rather
+            // than GPUI's built-in scrollable-div mechanism.
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .relative()
             .flex()
             .flex_col()
@@ -2423,6 +2713,25 @@ impl Render for TerminalPane {
                     .child("[process exited]"),
             );
         }
+
+        // GitHub issue #331: the shared overlay scrollbar (`crate::root::scrollbar`, the same
+        // component the file tree/diff view/completions popup/etc. all reuse - see that
+        // module's own docs) - synced from the grid's real current scroll state right before
+        // it's built, so its geometry reflects this exact frame's numbers, including any
+        // `Self::apply_pending_scrollbar_target` call already applied above.
+        self.scroll_handle.sync(
+            self.content_bounds.unwrap_or_default(),
+            px(self.line_height_px()),
+            self.grid.scroll_history_len(),
+            self.grid.scroll_offset(),
+        );
+        pane = pane.children(scrollbar::render_vertical_scrollbar(
+            "terminal-scrollbar",
+            &self.scroll_handle,
+            &[],
+            cx,
+        ));
+        pane = pane.children(self.render_jump_to_bottom_affordance(cx));
 
         pane
     }
