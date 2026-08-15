@@ -55,6 +55,7 @@ menu_row_hover             = "#d7dde1"
 menu_row_hover_destructive = "#f0dadc"
 tab_close_hover            = "#d1d6da"  # A file tab's close-affordance hover fill
 lsp_popover_footer         = "#e5e9eb"
+runs_well                  = "#edeff2"  # The Changes panel's Runs section
 
 # The 1px rules that separate things - zone edges, card and popover outlines, and the
 # selected-row edge.
@@ -198,7 +199,9 @@ edge_neutral      = "#d3d8dc"  # COMMITS' 2px left edge.
 edge_against_main = "#80577b"  # AGAINST MAIN's 2px left edge
 section_label     = "#666b70"  # Section header label - 9.5px/600 uppercase, .09em tracking.
 section_count     = "#a9aeb5"  # Section header count
-section_caret     = "#979da2"  # The section header's own disclosure caret (▾/▸).
+section_caret     = "#73777c"  # The section header's own disclosure caret (▾/▸).
+run_meta_live     = "#9a8865"
+run_meta_ended    = "#979da2"  # A run row's meta line once the run has ended
 section_stat_add  = "#366948"  # The right-aligned per-section diffstat's +N, 10px mono.
 section_stat_del  = "#a66663"  # The right-aligned per-section diffstat's −N, 10px mono.
 filename_unseen   = "#3b3e41"  # A filename not seen since the agent last changed it

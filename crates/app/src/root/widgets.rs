@@ -2,6 +2,47 @@ use super::*;
 use crate::icon_pack;
 use crate::work_surface::agents::ProcessKind;
 
+/// **The** disclosure caret - the one control, at one size, that expands or collapses a list
+/// anywhere in this app: a rail worktree row, a Changes-panel section header, a group header.
+///
+/// `STAGE-A-CHANGELOG.md` §4p is explicit that this is a single control and drew the line for it:
+///
+/// > Every disclosure caret is one control. […] All five now match the rail: **10px `#8b9197`**,
+/// > span width 9 -> 11 so the larger glyph does not crowd its label.
+/// >
+/// > The line drawn: a **disclosure caret** (expands or collapses a list - rail rows, panel
+/// > sections, group headers) gets that treatment. A **dropdown chevron** bound to a button or
+/// > chip (the `+` tab launcher, the rebase action chips) is a different control and stays at
+/// > 8-8.5px - it is a hint on a target that is already big enough.
+///
+/// So this is a function rather than a copied snippet: two call sites that must not drift are one
+/// call site. `text_size` is the caller's already-scaled `AdeApp::ui_text_size(10.0)` (see
+/// `crate::sidebar::render::render_changes_footer`'s own docs for why scaling is passed in rather
+/// than computed here), and the caller owns the click handler - the caret is a glyph, not a button,
+/// and every one of its call sites already has a larger clickable row or header around it.
+///
+/// The caller also owns the **colour**, and deliberately so: both call sites want the same
+/// `#8b9197` ([`theme::changes::SECTION_CARET`] and [`theme::text::DIM`] are one value), but the
+/// rail's caret also carries §4o's hover lift to `#c2c7cc`, armed on the 13x27 hit box around this
+/// glyph. A `text_color` set *here* would win over that hover the same way a CSS `color` on the
+/// child wins over one on the hovered parent, and the lift would silently do nothing. Inheriting
+/// is what makes it work.
+///
+/// Deliberately *not* `crate::sidebar::render::render_tree_caret`: that one reserves its width for
+/// a non-expandable **file** row so the tree's icon column stays aligned, which is a second job
+/// this control does not have.
+pub(crate) fn render_disclosure_caret(open: bool, text_size: Pixels) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(11.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font(font(theme::font::MONO))
+        .text_size(text_size)
+        .child(if open { "\u{25be}" } else { "\u{25b8}" })
+}
+
 /// The two keycap sizes: `Standard` (primary shortcuts - the rail's `+`/⌘N, the status bar's
 /// `⌘P`) and `Hint` (smaller, for hint-row contexts like footers and empty-state hint lists).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +307,7 @@ pub(crate) fn hover_keycap_row<E: InteractiveElement + Styled>(el: E) -> E {
 /// seventh menu built on this function can't drift from the other six at all.
 ///
 /// `shadow` is the one real parameter, not a second flavor to copy-paste around: every popover
-/// shares the same blur/alpha (`0.55`) inside [`theme::shadow::MENU`]/[`theme::shadow::COMMIT_MENU`],
+/// shares the same blur/alpha (`0.55`) inside [`theme::shadow::MENU`],
 /// and only the `y` offset's sign genuinely differs, for the commit menu's own upward-opening
 /// direction (see that constant's own docs).
 ///

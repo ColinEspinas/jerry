@@ -1,6 +1,6 @@
 use super::*;
 use crate::root::plural;
-use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize};
+use crate::root::widgets::{render_disclosure_caret, render_keycap_row, text_tooltip, KeycapSize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -1504,14 +1504,26 @@ impl AdeApp {
                     el.cursor_pointer()
                         // GitHub issue #128 - same lightweight text-only hover
                         // `Self::render_status_zoom_value` uses for an equally small, box-free
-                        // clickable glyph.
+                        // clickable glyph. It works because the shared caret helper below paints
+                        // no colour of its own - the glyph inherits this wrapper's, which is the
+                        // element the hover is armed on.
                         .hover(|el| el.text_color(theme::text::STRONG))
                         // §4's "tooltips on every icon-only control". The wording is
                         // `Jerry.dc.html`'s own, which states the thing the glyph cannot: this
                         // control toggles the group *without* selecting the worktree, which is
                         // what the `stop_propagation` below actually does.
                         .tooltip(text_tooltip("Collapse or expand without selecting"))
-                        .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
+                        // `STAGE-A-CHANGELOG.md` §4o/§4p: this used to be its own hand-drawn
+                        // glyph, which is exactly the drift §4p closed - "every disclosure caret
+                        // is one control". It is now the shared one
+                        // (`crate::root::widgets::render_disclosure_caret`), the same call the
+                        // Changes panel's four section headers make, so the two cannot diverge
+                        // again. The 13x27 hit box, the tooltip and the hover stay here: they are
+                        // this row's business, not the glyph's.
+                        .child(render_disclosure_caret(
+                            is_expanded,
+                            self.ui_text_size(10.0),
+                        ))
                         .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             cx.stop_propagation();
                             this.toggle_worktree_collapsed(worktree_path.clone(), is_expanded, cx);

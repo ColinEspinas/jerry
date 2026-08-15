@@ -893,6 +893,10 @@ pub mod surface {
     pub const KEYCAP_HINT: ColorToken = token("surface.keycap_hint", 0x15181a);
     pub const CHIP_NEUTRAL: ColorToken = token("surface.chip_neutral", 0x23272b);
     pub const CURRENT_LINE: ColorToken = token("surface.current_line", 0x181c20);
+    /// The Changes panel's Runs section - pinned to the panel's own bottom in its own capped,
+    /// independently-scrolled well, distinct from the lighter [`HEADER`] the other three sections'
+    /// shared scroller sits on (`Jerry.dc.html` line 1433: `background:#0f1113`).
+    pub const RUNS_WELL: ColorToken = token("surface.runs_well", 0x0f1113);
     /// The Windows/Linux title bar's close caption button's hover fill. The design handoff
     /// (`Jerry.dc.html`: `style-hover="background:#8c3a38"`, unchanged through revision 3) spec'd
     /// a muted maroon; Colin asked for this to be the real Windows Fluent Design close-hover red
@@ -965,6 +969,7 @@ pub mod surface {
         ("MENU_ROW_HOVER_DESTRUCTIVE", MENU_ROW_HOVER_DESTRUCTIVE),
         ("TAB_CLOSE_HOVER", TAB_CLOSE_HOVER),
         ("LSP_POPOVER_FOOTER", LSP_POPOVER_FOOTER),
+        ("RUNS_WELL", RUNS_WELL),
     ];
 }
 
@@ -2650,7 +2655,28 @@ pub mod changes {
     /// Section header count - 9.5px mono, immediately after the label.
     pub const SECTION_COUNT: ColorToken = token("changes.section_count", 0x4a5057);
     /// The section header's own disclosure caret (`▾`/`▸`).
-    pub const SECTION_CARET: ColorToken = token("changes.section_caret", 0x5e646a);
+    ///
+    /// `#8b9197`, not §1's own `#5e646a`: `STAGE-A-CHANGELOG.md` §4p supersedes it, and the
+    /// shipped mock confirms the later value. §4p's rule is that a **disclosure caret** - the
+    /// control that expands or collapses a list, wherever it appears - is *one* control at one
+    /// size, so the four Changes-panel section headers wear the same 10px `#8b9197` glyph the
+    /// rail's own worktree caret does. (A *dropdown chevron* bound to a button or chip is a
+    /// different control and deliberately stays smaller - see
+    /// `crate::sidebar::render::AdeApp::render_commit_composer`'s `▾`.)
+    pub const SECTION_CARET: ColorToken = token("changes.section_caret", 0x8b9197);
+
+    /// A run row's meta line while the run is **still moving** (`STAGE-A-CHANGELOG.md` §4l).
+    ///
+    /// §4l removed the row's separate `live`/`frozen` badge - "it restated `running`/`ended` one
+    /// line below" - and moved the state onto the meta line's own colour instead: warm while the
+    /// run is live, neutral once it has ended. This warm is deliberately *not*
+    /// [`super::status::ASK`]'s amber: it is a fact about how final a diffstat is, not an urgency,
+    /// and the two must not read as the same signal one row apart.
+    pub const RUN_META_LIVE: ColorToken = token("changes.run_meta_live", 0x8a7548);
+    /// A run row's meta line once the run has ended - the neutral half of [`RUN_META_LIVE`]'s
+    /// pair. Same hex as [`super::text::FAINTER`], a distinct token for a distinct element (the
+    /// same convention [`super::text::TREE_CARET`]'s own docs record).
+    pub const RUN_META_ENDED: ColorToken = token("changes.run_meta_ended", 0x5e646a);
     /// The right-aligned per-section diffstat's `+N`, 10px mono.
     pub const SECTION_STAT_ADD: ColorToken = token("changes.section_stat_add", 0x7fc79a);
     /// The right-aligned per-section diffstat's `−N`, 10px mono.
@@ -2680,6 +2706,8 @@ pub mod changes {
         ("SECTION_LABEL", SECTION_LABEL),
         ("SECTION_COUNT", SECTION_COUNT),
         ("SECTION_CARET", SECTION_CARET),
+        ("RUN_META_LIVE", RUN_META_LIVE),
+        ("RUN_META_ENDED", RUN_META_ENDED),
         ("SECTION_STAT_ADD", SECTION_STAT_ADD),
         ("SECTION_STAT_DEL", SECTION_STAT_DEL),
         ("FILENAME_UNSEEN", FILENAME_UNSEEN),
@@ -2935,6 +2963,11 @@ pub mod band {
     pub const PALETTE_INPUT: Pixels = px(44.0);
     pub const PALETTE_ROW: Pixels = px(30.0);
     pub const CHANGE_ROW: Pixels = px(27.0);
+    /// One Changes-panel section header (`REVISION-2026-08-14.md` §1: "Section header: 24 high").
+    pub const CHANGES_SECTION_HEADER: Pixels = px(24.0);
+    /// One Runs-section row - two lines, `padding: 7 10 8 8`, 3px between them
+    /// (`STAGE-A-CHANGELOG.md` §4l: "Row height 31 -> 48").
+    pub const RUN_ROW: Pixels = px(48.0);
     pub const TREE_ROW: Pixels = px(22.0);
     pub const KEYCAP: Pixels = px(15.0);
     /// The hint-size keycap's height.
@@ -2978,13 +3011,6 @@ pub mod shadow {
     /// menus too, not just the `+` menu; only the name had drifted from what it actually covers.
     pub const MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(14.0), px(30.0));
     // rgba(0,0,0,0.55)
-    /// The commit composer's `▾` split-button popover shadow (Revision R12 §5) - same blur/alpha
-    /// as [`MENU`], just a negative `y`: unlike every other popover in this module, it opens
-    /// *upward* from a button near the bottom of the Changes panel. Before GitHub issue #129 this
-    /// also had its own, slightly different blur/alpha (`26`/`0.5`, vs `MENU`'s `30`/`0.55`) with
-    /// no real reason for the difference beyond having been introduced separately - direction is
-    /// the only genuine difference this popover needs.
-    pub const COMMIT_MENU: (Pixels, Pixels, Pixels) = (px(0.0), px(-14.0), px(30.0));
     // rgba(0,0,0,0.55)
 }
 

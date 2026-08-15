@@ -191,10 +191,45 @@ impl DiffBase {
     }
 }
 
-/// Compute the real diff of the worktree at `worktree_path` against its base, per this
-/// module's docs. Performs blocking I/O (opens the repository via `gix`, and spawns a real
-/// `git diff` child process).
-pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
+/// The comparison points one worktree offers, resolved once through `gix`.
+///
+/// Extracted so the three scopes the Changes panel draws (GitHub issue #285: *Uncommitted* =
+/// working tree vs `HEAD`, *Commits* = the branch's own commits, *Against main* = the merge-base
+/// diff) all agree about where `HEAD` is and where the base is, instead of each re-deriving it
+/// from its own `gix` walk and being able to disagree about the answer mid-refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaseResolution {
+    /// The worktree's own checked-out branch, `None` when `HEAD` is detached.
+    pub(crate) worktree_branch: Option<String>,
+    /// The worktree's `HEAD` commit, as a hex sha. Always a real, born commit - a resolution is
+    /// only produced at all once `HEAD` peels to something.
+    pub(crate) head_sha: String,
+    /// The detected default branch, whether or not a merge-base with it exists (see the module
+    /// docs' "What 'base' means" section for the detection order).
+    pub(crate) detected_base_branch: Option<String>,
+    /// `Some((base branch, merge-base sha))` only when there is a genuinely usable base to diff
+    /// against: a default branch was detected, it is not this worktree's own branch, and the two
+    /// histories share a common ancestor.
+    pub(crate) base: Option<(String, String)>,
+}
+
+impl BaseResolution {
+    /// The branch name a diff produced from this resolution is *labelled* with - the real base
+    /// branch where there is one, otherwise the worktree's own branch (possibly empty for a
+    /// detached `HEAD`). Purely descriptive; nothing is diffed against it.
+    fn label_branch(&self) -> String {
+        self.detected_base_branch
+            .clone()
+            .unwrap_or_else(|| self.worktree_branch.clone().unwrap_or_default())
+    }
+}
+
+/// Resolves `worktree_path`'s `HEAD` and its base, per this module's own base-detection order.
+/// `Ok(None)` means `HEAD` is unborn - a freshly initialized repository with no commits at all,
+/// which has nothing to compare against, not even its own working tree.
+///
+/// Performs blocking I/O (`gix` reads only).
+pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution>, Error> {
     let repo = open_repo(worktree_path)?;
 
     let mut head = repo
@@ -206,66 +241,114 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
         .map_err(|source| Error::PeelHead(Box::new(source)))?;
 
     let Some(worktree_head_id) = worktree_head_id else {
+        return Ok(None);
+    };
+    let head_sha = worktree_head_id.detach().to_string();
+
+    let Some((base_branch, base_commit_id)) = detect_default_base(&repo)? else {
+        return Ok(Some(BaseResolution {
+            worktree_branch,
+            head_sha,
+            detected_base_branch: None,
+            base: None,
+        }));
+    };
+
+    // The worktree's own branch *is* the default branch: there is a detected base, but nothing
+    // meaningful to diff against it.
+    if worktree_branch.as_deref() == Some(base_branch.as_str()) {
+        return Ok(Some(BaseResolution {
+            worktree_branch,
+            head_sha,
+            detected_base_branch: Some(base_branch),
+            base: None,
+        }));
+    }
+
+    let merge_base = match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
+        Ok(id) => Some(id.detach().to_string()),
+        // A real default branch exists, but shares no common ancestor with this worktree's
+        // history - so there is no point to diff from.
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => None,
+        Err(source) => return Err(Error::MergeBase(Box::new(source))),
+    };
+
+    Ok(Some(BaseResolution {
+        worktree_branch,
+        head_sha,
+        detected_base_branch: Some(base_branch.clone()),
+        base: merge_base.map(|sha| (base_branch, sha)),
+    }))
+}
+
+/// Compute the real diff of the worktree at `worktree_path` against its base, per this
+/// module's docs. Performs blocking I/O (opens the repository via `gix`, and spawns a real
+/// `git diff` child process).
+pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
+    let Some(resolved) = resolve_base(worktree_path)? else {
         // Unborn HEAD: a freshly initialized repository with no commits yet has nothing to
         // diff against any base - not even its own uncommitted changes, since there is no
         // commit to diff the working tree against.
         return Ok(DiffBase::NoBaseFound);
     };
-    let worktree_head_sha = worktree_head_id.detach().to_string();
 
-    let Some((base_branch, base_commit_id)) = detect_default_base(&repo)? else {
+    let Some((base_branch, merge_base_sha)) = resolved.base.clone() else {
         let uncommitted = compute_diff(
             worktree_path,
-            &worktree_head_sha,
+            &resolved.head_sha,
             ShadowIndexContent::IntentToAdd,
-            worktree_branch.unwrap_or_default(),
+            resolved.label_branch(),
         )?;
         return Ok(DiffBase::NoBase {
-            branch: None,
+            branch: resolved.detected_base_branch,
             uncommitted,
         });
-    };
-
-    if worktree_branch.as_deref() == Some(base_branch.as_str()) {
-        let uncommitted = compute_diff(
-            worktree_path,
-            &worktree_head_sha,
-            ShadowIndexContent::IntentToAdd,
-            base_branch.clone(),
-        )?;
-        return Ok(DiffBase::NoBase {
-            branch: Some(base_branch),
-            uncommitted,
-        });
-    }
-
-    let merge_base_id = match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
-        Ok(id) => id.detach(),
-        Err(gix::repository::merge_base::Error::NotFound { .. }) => {
-            // A real default branch exists, but shares no common ancestor with this worktree's
-            // history - still real uncommitted changes to show against `HEAD`, same as the
-            // on-default-branch case just above.
-            let uncommitted = compute_diff(
-                worktree_path,
-                &worktree_head_sha,
-                ShadowIndexContent::IntentToAdd,
-                base_branch.clone(),
-            )?;
-            return Ok(DiffBase::NoBase {
-                branch: Some(base_branch),
-                uncommitted,
-            });
-        }
-        Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
 
     let diff = compute_diff(
         worktree_path,
-        &merge_base_id.to_string(),
+        &merge_base_sha,
         ShadowIndexContent::IntentToAdd,
         base_branch,
     )?;
     Ok(DiffBase::Diff(diff))
+}
+
+/// The **Uncommitted** scope (GitHub issue #285): the worktree's working tree against its own
+/// `HEAD` - "what is dirty in the checkout".
+///
+/// Deliberately a *different question* from [`diff_against_base`], not a filtered view of it.
+/// `diff_against_base` compares against the merge-base with the default branch, so its file list
+/// mixes work that is already committed on this branch with work that is not
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1's *Against main* scope: "what
+/// would land"). This compares against `HEAD`, so a file whose only difference from `main` is
+/// already inside a commit on this branch does not appear here at all. The two agree only on a
+/// branch with no commits of its own.
+///
+/// Untracked files are included, via the same `--intent-to-add` shadow index
+/// ([`prepare_shadow_index`]) `diff_against_base` uses - an agent's brand-new file is exactly the
+/// kind of dirty the checkout has.
+///
+/// `Ok(None)` means `HEAD` is unborn: there is no commit to diff the working tree against, which
+/// is the same single case [`DiffBase::NoBaseFound`] is reserved for. It is never used to mean
+/// "nothing changed" - that is `Ok(Some(diff))` with an empty `files`.
+///
+/// Performs blocking I/O (opens the repository via `gix`, and spawns a real `git diff` child
+/// process).
+pub fn diff_against_head(worktree_path: &Path) -> Result<Option<WorktreeDiff>, Error> {
+    let Some(resolved) = resolve_base(worktree_path)? else {
+        return Ok(None);
+    };
+    let label = resolved
+        .worktree_branch
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_string());
+    Ok(Some(compute_diff(
+        worktree_path,
+        &resolved.head_sha,
+        ShadowIndexContent::IntentToAdd,
+        label,
+    )?))
 }
 
 /// Defensive validation for an object id about to be handed to a spawned `git` process as a
@@ -341,6 +424,213 @@ pub(crate) fn compute_diff(
         files,
         truncated: output_truncated || files_truncated,
     })
+}
+
+/// Cap on how many commits the **Commits** scope loads, mirroring [`MAX_FILES`]' "cap the loaded
+/// data, independent of what's rendered" convention. A branch with more commits than this than its
+/// base is truncated, not silently hung on.
+const MAX_BRANCH_COMMITS: usize = 300;
+
+/// One commit written down on this branch since its base - a row of the **Commits** section
+/// (GitHub issue #285).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCommit {
+    /// The full hex commit id.
+    pub id: String,
+    /// git's own abbreviation of [`Self::id`] (`%h`), honouring the repository's real
+    /// `core.abbrev`/uniqueness rules - never a hand-truncated prefix.
+    pub short_id: String,
+    pub subject: String,
+    pub author_name: String,
+    pub author_time_unix: i64,
+    /// Lines this commit added, summed over its own `--numstat`.
+    ///
+    /// **Zero for a merge commit**, and honestly so: `git log --numstat` with no `-m`/`-c` reports
+    /// no file lines for a merge, git's own "a merge has no single meaningful diff" behaviour -
+    /// exactly what [`crate::graph::commit_changed_files`] already documents for the same reason.
+    /// A binary file also contributes nothing, since git prints `-` rather than a line count for
+    /// one; that is a real absence of a line count, not a zero this function invented.
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// The **Commits** scope (GitHub issue #285): what is already written down on this branch, and
+/// the net diffstat of writing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCommits {
+    /// The short name of the base branch the range was taken against, or `None` when there is no
+    /// usable base (see [`DiffBase::NoBase`]'s own cases) - in which case [`Self::commits`] is
+    /// empty rather than falling back to the whole of history.
+    pub base_branch: Option<String>,
+    /// The merge-base commit the range starts at, when there is one.
+    pub base_commit: Option<String>,
+    /// Newest first, exactly as `git log` lists them.
+    pub commits: Vec<BranchCommit>,
+    /// The **net** diffstat of `<merge-base>..HEAD` - one `git diff --numstat`, not the sum of
+    /// [`Self::commits`]' own stats.
+    ///
+    /// The two are genuinely different numbers and the net one is the honest answer to "what is
+    /// written down": a line a commit added and a later commit removed is in the sum twice and in
+    /// the net answer not at all, and a merge commit contributes nothing to the sum at all (see
+    /// [`BranchCommit::added`]). This is the same quantity `Against main` reports, minus whatever
+    /// is still uncommitted.
+    pub added: u32,
+    pub removed: u32,
+    /// `true` if more than [`MAX_BRANCH_COMMITS`] commits were on the branch, so [`Self::commits`]
+    /// is a prefix of the real range.
+    pub truncated: bool,
+}
+
+/// Reads the commits on `worktree_path`'s branch since its merge-base with the detected default
+/// branch, plus the net diffstat of that range - the **Commits** section's data (GitHub issue
+/// #285: "what is written down").
+///
+/// With no usable base (an unborn `HEAD`, no detectable default branch, the worktree sitting on
+/// the default branch itself, or unrelated histories) this returns an **empty** range rather than
+/// falling back to all of history: "the commits this branch added" has no answer without a point
+/// to have added them from, and listing every commit in the repository would be a different,
+/// wrong answer rather than a degraded one.
+///
+/// Performs blocking I/O: opens the repository via `gix` and spawns two real `git` child
+/// processes.
+pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> {
+    let empty = BranchCommits {
+        base_branch: None,
+        base_commit: None,
+        commits: Vec::new(),
+        added: 0,
+        removed: 0,
+        truncated: false,
+    };
+
+    let Some(resolved) = resolve_base(worktree_path)? else {
+        return Ok(empty);
+    };
+    let Some((base_branch, merge_base_sha)) = resolved.base else {
+        return Ok(empty);
+    };
+    validate_object_id(&merge_base_sha, "merge-base id")?;
+    validate_object_id(&resolved.head_sha, "commit id")?;
+
+    let range = format!("{merge_base_sha}..{}", resolved.head_sha);
+
+    // One `git log` for both the commit list and each commit's own numstat. `%x1e` (RS) starts
+    // every record and `%x1f` (US) separates the fields inside its header line, so a subject
+    // containing tabs, newlines or any other punctuation cannot be misparsed as a field boundary
+    // or as the start of a numstat line.
+    let log_args: Vec<OsString> = vec![
+        "-c".into(),
+        "core.quotePath=false".into(),
+        "log".into(),
+        "--no-color".into(),
+        "--numstat".into(),
+        format!("--max-count={}", MAX_BRANCH_COMMITS + 1).into(),
+        "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s".into(),
+        range.clone().into(),
+    ];
+    let (log_output, log_truncated) =
+        capture_git_stdout(worktree_path, &log_args, MAX_DIFF_OUTPUT_BYTES, None)?;
+    let log_text = String::from_utf8_lossy(&log_output);
+    let mut commits = parse_branch_commits(&log_text);
+    let over_cap = commits.len() > MAX_BRANCH_COMMITS;
+    commits.truncate(MAX_BRANCH_COMMITS);
+
+    // The section header's own diffstat: the *net* change across the whole range, in one call.
+    // `..` (two dots) with a real merge-base on the left is the same range `git log` above walked.
+    let numstat_args: Vec<OsString> = vec![
+        "-c".into(),
+        "core.quotePath=false".into(),
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--numstat".into(),
+        range.into(),
+    ];
+    let (numstat_output, numstat_truncated) =
+        capture_git_stdout(worktree_path, &numstat_args, MAX_DIFF_OUTPUT_BYTES, None)?;
+    let (added, removed) = sum_numstat(&String::from_utf8_lossy(&numstat_output));
+
+    Ok(BranchCommits {
+        base_branch: Some(base_branch),
+        base_commit: Some(merge_base_sha),
+        commits,
+        added,
+        removed,
+        truncated: over_cap || log_truncated || numstat_truncated,
+    })
+}
+
+/// Parses `git log --numstat --format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s` output - see
+/// [`commits_since_base`] for why those separators.
+fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
+    let mut commits = Vec::new();
+    // `split('\u{1e}')` yields one leading empty piece before the first record; `filter` drops it
+    // rather than a `skip(1)` that would silently eat a real record if git ever stopped emitting
+    // the leading separator.
+    for record in text.split('\u{1e}') {
+        let record = record.trim_start_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let mut lines = record.lines();
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        let mut fields = header.split('\u{1f}');
+        let (Some(id), Some(short_id), Some(author_name), Some(author_time), Some(subject)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        // A header that doesn't carry a real hex id is not a commit record - skipped rather than
+        // recorded with a fabricated id that a later `git show` would fail on.
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let (added, removed) = sum_numstat(&lines.collect::<Vec<_>>().join("\n"));
+        commits.push(BranchCommit {
+            id: id.to_string(),
+            short_id: short_id.to_string(),
+            subject: subject.to_string(),
+            author_name: author_name.to_string(),
+            // An unparseable `%at` becomes `0` rather than dropping the commit: the timestamp only
+            // drives a relative-age label, and losing the commit entirely would be the bigger lie.
+            author_time_unix: author_time.parse().unwrap_or(0),
+            added,
+            removed,
+        });
+    }
+    commits
+}
+
+/// Sums `git --numstat` lines (`<added>\t<removed>\t<path>`).
+///
+/// A binary file's `-\t-\t<path>` contributes nothing, which is git's own way of saying it has no
+/// line counts - deliberately not counted as a zero-line change *or* skipped silently into some
+/// other bucket. Saturating, so a pathological diff cannot wrap a total into a smaller number.
+fn sum_numstat(text: &str) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let (Some(add), Some(del)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if fields.next().is_none() {
+            continue;
+        }
+        if let Ok(add) = add.parse::<u32>() {
+            added = added.saturating_add(add);
+        }
+        if let Ok(del) = del.parse::<u32>() {
+            removed = removed.saturating_add(del);
+        }
+    }
+    (added, removed)
 }
 
 /// Merge-state of a worktree's `HEAD` against the repository's detected default base branch
@@ -2700,6 +2990,252 @@ index 0000000..fedcba9
                 behind: 2
             }),
             "well-formed output must still parse normally"
+        );
+    }
+    /// A feature branch with one real commit of its own plus one still-uncommitted edit - the
+    /// shape that makes the three Changes-panel scopes give three genuinely different answers
+    /// (GitHub issue #285).
+    fn repo_with_a_commit_and_a_dirty_file() -> TempDir {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("committed.txt"), "one\ntwo\n").expect("write committed");
+        git(repo.path(), &["add", "committed.txt"]);
+        git(
+            repo.path(),
+            &["commit", "-m", "a real commit on the feature branch"],
+        );
+        fs::write(
+            repo.path().join("file.txt"),
+            "hello\nedited but not committed\n",
+        )
+        .expect("write dirty");
+        repo
+    }
+
+    #[test]
+    fn the_uncommitted_scope_excludes_what_is_already_committed_on_this_branch() {
+        // The whole reason `diff_against_head` exists (GitHub issue #285): `diff_against_base`
+        // lists `committed.txt` because it differs from `main`, but nothing about it is dirty.
+        let repo = repo_with_a_commit_and_a_dirty_file();
+
+        let against_base = diff_against_base(repo.path()).expect("diff_against_base");
+        let base_paths: Vec<&Path> = against_base
+            .diff()
+            .expect("a real base diff")
+            .files
+            .iter()
+            .map(|file| file.path.as_path())
+            .collect();
+        assert!(
+            base_paths.contains(&Path::new("committed.txt")),
+            "sanity: the against-main scope really does list the committed file - otherwise the \
+             assertion below would pass for the wrong reason"
+        );
+
+        let uncommitted = diff_against_head(repo.path())
+            .expect("diff_against_head")
+            .expect("HEAD is born, so there is a real answer");
+        let paths: Vec<&Path> = uncommitted
+            .files
+            .iter()
+            .map(|file| file.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![Path::new("file.txt")],
+            "the uncommitted scope is the working tree against HEAD, so a file whose only \
+             difference from main is already committed must not appear in it at all"
+        );
+    }
+
+    #[test]
+    fn the_uncommitted_scope_includes_a_brand_new_untracked_file() {
+        // Untracked files are exactly the kind of dirty an agent produces, and `git diff HEAD`
+        // cannot see them without the `--intent-to-add` shadow index.
+        let repo = init_repo();
+        fs::write(repo.path().join("agent_wrote_this.rs"), "fn main() {}\n").expect("write");
+
+        let uncommitted = diff_against_head(repo.path())
+            .expect("diff_against_head")
+            .expect("born HEAD");
+        let paths: Vec<&Path> = uncommitted
+            .files
+            .iter()
+            .map(|file| file.path.as_path())
+            .collect();
+        assert!(paths.contains(&Path::new("agent_wrote_this.rs")));
+    }
+
+    #[test]
+    fn the_uncommitted_scope_is_empty_not_absent_for_a_clean_worktree() {
+        // `Ok(None)` means "HEAD is unborn", never "nothing changed" - a caller must be able to
+        // tell a clean checkout from a repository with no commits at all.
+        let repo = init_repo();
+        let uncommitted = diff_against_head(repo.path())
+            .expect("diff_against_head")
+            .expect("a clean worktree still has a real, empty answer");
+        assert!(uncommitted.files.is_empty());
+    }
+
+    #[test]
+    fn an_unborn_head_has_no_uncommitted_scope_at_all() {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        fs::write(dir.path().join("file.txt"), "hello\n").expect("write");
+        assert_eq!(
+            diff_against_head(dir.path()).expect("diff_against_head"),
+            None,
+            "there is no commit to diff the working tree against"
+        );
+    }
+
+    #[test]
+    fn the_commits_scope_lists_only_this_branch_s_own_commits_newest_first() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("first.txt"), "a\nb\n").expect("write");
+        git(repo.path(), &["add", "first.txt"]);
+        git(repo.path(), &["commit", "-m", "first on the branch"]);
+        fs::write(repo.path().join("second.txt"), "c\n").expect("write");
+        git(repo.path(), &["add", "second.txt"]);
+        git(repo.path(), &["commit", "-m", "second on the branch"]);
+
+        let commits = commits_since_base(repo.path()).expect("commits_since_base");
+        assert_eq!(commits.base_branch, Some("main".to_string()));
+        let subjects: Vec<&str> = commits
+            .commits
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["second on the branch", "first on the branch"],
+            "newest first, and `initial commit` (which is on main too) must not be in the range"
+        );
+        assert_eq!(
+            (commits.added, commits.removed),
+            (3, 0),
+            "two added lines in `first.txt` and one in `second.txt`, none removed"
+        );
+        assert_eq!(
+            (commits.commits[0].added, commits.commits[0].removed),
+            (1, 0)
+        );
+        assert_eq!(
+            (commits.commits[1].added, commits.commits[1].removed),
+            (2, 0)
+        );
+        assert!(commits.commits.iter().all(|commit| commit.id.len() > 7
+            && commit.short_id.len() >= 4
+            && commit.id.starts_with(&commit.short_id)));
+        assert!(commits
+            .commits
+            .iter()
+            .all(|commit| commit.author_time_unix > 0));
+        assert!(!commits.truncated);
+    }
+
+    #[test]
+    fn the_commits_scope_reports_the_net_range_diffstat_not_the_sum_of_its_commits() {
+        // A line one commit adds and the next removes is in the per-commit sum twice and in the
+        // net answer not at all. "What is written down" is the net answer.
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("churn.txt"), "one\ntwo\nthree\n").expect("write");
+        git(repo.path(), &["add", "churn.txt"]);
+        git(repo.path(), &["commit", "-m", "add three lines"]);
+        fs::write(repo.path().join("churn.txt"), "one\n").expect("write");
+        git(repo.path(), &["add", "churn.txt"]);
+        git(repo.path(), &["commit", "-m", "take two back"]);
+
+        let commits = commits_since_base(repo.path()).expect("commits_since_base");
+        let summed = commits
+            .commits
+            .iter()
+            .fold((0u32, 0u32), |(add, del), commit| {
+                (add + commit.added, del + commit.removed)
+            });
+        assert_eq!(
+            summed,
+            (3, 2),
+            "sanity: the per-commit sum really is 3 added / 2 removed"
+        );
+        assert_eq!(
+            (commits.added, commits.removed),
+            (1, 0),
+            "but only one line is actually written down at the end of the range"
+        );
+    }
+
+    #[test]
+    fn a_worktree_on_its_own_default_branch_has_an_empty_commits_scope_not_all_of_history() {
+        // "The commits this branch added" has no answer without a point to have added them from,
+        // and listing every commit in the repository would be a different, wrong answer.
+        let repo = init_repo();
+        let commits = commits_since_base(repo.path()).expect("commits_since_base");
+        assert!(commits.commits.is_empty());
+        assert_eq!(commits.base_branch, None);
+        assert_eq!((commits.added, commits.removed), (0, 0));
+    }
+
+    #[test]
+    fn a_commit_subject_carrying_the_numstat_separator_is_still_parsed_as_one_commit() {
+        // The record/field separators exist so a subject cannot be mistaken for a field boundary
+        // or for the start of a numstat line.
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("tabbed.txt"), "x\n").expect("write");
+        git(repo.path(), &["add", "tabbed.txt"]);
+        git(
+            repo.path(),
+            &["commit", "-m", "fix\t1\t2\tsrc/looks_like_numstat.rs"],
+        );
+
+        let commits = commits_since_base(repo.path()).expect("commits_since_base");
+        assert_eq!(commits.commits.len(), 1);
+        assert_eq!(
+            commits.commits[0].subject,
+            "fix\t1\t2\tsrc/looks_like_numstat.rs"
+        );
+        assert_eq!(
+            (commits.commits[0].added, commits.commits[0].removed),
+            (1, 0),
+            "the subject's tab-separated numbers must not be counted as this commit's numstat"
+        );
+    }
+
+    #[test]
+    fn a_merge_commit_contributes_no_line_counts_rather_than_invented_ones() {
+        let repo = init_repo();
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("feature.txt"), "f\n").expect("write");
+        git(repo.path(), &["add", "feature.txt"]);
+        git(repo.path(), &["commit", "-m", "feature work"]);
+        git(repo.path(), &["checkout", "-b", "side", "main"]);
+        fs::write(repo.path().join("side.txt"), "s\n").expect("write");
+        git(repo.path(), &["add", "side.txt"]);
+        git(repo.path(), &["commit", "-m", "side work"]);
+        git(repo.path(), &["checkout", "feature"]);
+        git(
+            repo.path(),
+            &["merge", "--no-ff", "-m", "merge side", "side"],
+        );
+
+        let commits = commits_since_base(repo.path()).expect("commits_since_base");
+        let merge = commits
+            .commits
+            .iter()
+            .find(|commit| commit.subject == "merge side")
+            .expect("the merge commit is in the range");
+        assert_eq!(
+            (merge.added, merge.removed),
+            (0, 0),
+            "git reports no single meaningful diff for a merge, and this must not fabricate one"
+        );
+        assert_eq!(
+            (commits.added, commits.removed),
+            (2, 0),
+            "the range's net diffstat still counts both branches' real lines"
         );
     }
 }

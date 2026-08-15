@@ -3,11 +3,26 @@ use crate::keymap;
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
-    hover_bg, menu_popover_chrome, render_committed_tag, render_keycap_row, render_sidebar_message,
-    render_tag_pill, text_tooltip, KeycapSize,
+    hover_bg, menu_popover_chrome, render_committed_tag, render_disclosure_caret,
+    render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
+use std::time::Instant;
+
+/// How much extra the Changes panel's `gpui::list` measures above and below the viewport.
+///
+/// One run row's worth (`theme::band::RUN_ROW`, the tallest row the panel has), so the first row
+/// scrolling into view is already measured and the list does not pop. Deliberately small: overdraw
+/// is real work done for rows nobody is looking at, and the whole point of virtualizing this list
+/// is not doing that work.
+pub(crate) const CHANGES_LIST_OVERDRAW: gpui::Pixels = px(48.0);
+
+/// git's own conventional short form of a commit id, for a label that only has room for one.
+/// Never a hand-picked width elsewhere in this file - one length, defined once.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
@@ -327,10 +342,11 @@ impl AdeApp {
     /// The commit composer's primary action (Revision R12 §5) - a real `git add -- <staged
     /// paths>` + `git commit` (`wt_core::undo::commit_paths`) on [`Self::diff_root`] (the
     /// worktree the currently-shown diff/staged set belongs to), using
-    /// `changes::draft_commit_message`'s placeholder message (see that function's own docs for
-    /// why real agent-drafted messages are out of scope here). A genuine no-op - never a
-    /// clickable-looking op that silently does nothing - with nothing staged, or while another
-    /// worktree-history operation is already in flight (shares
+    /// [`Self::staged_commit_message`] - the user's own typed text; there is no auto-drafted
+    /// fallback (see that method's own docs), so an empty message is as much a no-op as nothing
+    /// staged. A genuine no-op - never a clickable-looking op that silently does nothing - with
+    /// nothing staged, no message, or while another worktree-history operation is already in
+    /// flight (shares
     /// [`Self::worktree_history_op_in_flight`] with `Keep all changes`/`Discard worktree`/`Undo`/
     /// `Redo` - see `worktree_history::flow`'s own module docs for why one flag is enough
     /// discipline here). On success, clears exactly the committed `paths` (captured once, up
@@ -359,15 +375,13 @@ impl AdeApp {
         if self.worktree_history_op_in_flight.is_some() {
             return;
         }
-        let Some(diff) = self.current_diff() else {
+        let Some(paths) = self.staged_uncommitted_paths() else {
             return;
         };
-        let staged = changes::staged_subset(&diff.files, &self.staged_files);
-        if staged.is_empty() {
+        let message = self.staged_commit_message();
+        if message.trim().is_empty() {
             return;
         }
-        let message = changes::draft_commit_message(&staged);
-        let paths: Vec<PathBuf> = staged.iter().map(|file| file.path.clone()).collect();
         let worktree_path = self.diff_root.clone();
         let branch_display = self.branch_display_for(&worktree_path);
         let file_count = paths.len();
@@ -403,6 +417,292 @@ impl AdeApp {
                     }
                     Err(err) => {
                         this.worktree_history_status = Some(format!("commit failed: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._worktree_history_task = Some(task);
+    }
+
+    /// The staged subset of the **uncommitted** scope, as real paths - `None` when nothing is
+    /// staged, which is the one shape every commit-composer action's guard wants.
+    ///
+    /// The uncommitted scope, not the merge-base diff: staging acts on the working tree, and a
+    /// path whose only difference from `main` is already committed has nothing there to stage.
+    pub(in crate::sidebar) fn staged_uncommitted_paths(&self) -> Option<Vec<PathBuf>> {
+        let diff = self.uncommitted_diff.loaded()?;
+        let staged = changes::staged_subset(&diff.files, &self.staged_files);
+        if staged.is_empty() {
+            return None;
+        }
+        Some(staged.iter().map(|file| file.path.clone()).collect())
+    }
+
+    /// The message every commit path in this composer writes - the user's own typed text,
+    /// verbatim, and nothing else.
+    ///
+    /// There used to be an auto-derived fallback here ("Update `<path>`"/"Update `N` files"),
+    /// live-recomputed from [`Self::staged_files`] whenever nothing had been typed yet. Removed
+    /// per explicit product decision: a focused, untouched box would silently repaint a
+    /// *different* string - and visibly move its caret between the before-empty-placeholder and
+    /// after-real-text positions - purely because staging state changed elsewhere, never because
+    /// the user touched this input at all ("why does the caret change once we stage a file? ...
+    /// just use a normal message input the user has to fill"). One stable input, exactly like
+    /// every other real text field in this app: it shows what was typed into it and nothing it
+    /// wasn't.
+    pub(in crate::sidebar) fn staged_commit_message(&self) -> String {
+        self.commit_message.as_str().to_string()
+    }
+
+    /// Click-to-focus for the commit message field - moves real keyboard focus onto it. Nothing
+    /// to seed any more (see [`Self::staged_commit_message`]'s own docs): the field starts empty
+    /// and stays whatever the user typed into it.
+    pub(in crate::sidebar) fn focus_commit_message(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.commit_message_focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Mirrors [`crate::rail::render::AdeApp::handle_filter_key_down`] exactly - see that
+    /// function's own docs for the modifier guard and the real undo/redo wiring this shares.
+    pub(in crate::sidebar) fn handle_commit_message_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        let changed = match keystroke.key.as_str() {
+            "backspace" => self.commit_message.pop(Instant::now()),
+            _ => match keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    self.commit_message.push_str(text, Instant::now())
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    pub(in crate::sidebar) fn handle_commit_message_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_message.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::sidebar) fn handle_commit_message_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_message.redo() {
+            cx.notify();
+        }
+    }
+
+    /// Whether `action` can really run right now, and - when it cannot - the reason, stated on the
+    /// row itself.
+    ///
+    /// `REVISION-2026-08-14.md` §7 rule 1: "Ship the affordance with the behaviour, or ship
+    /// neither." Every row in this menu is now backed by a real `wt_core` call, so what is left to
+    /// get right is that a row which *cannot* act says so instead of looking clickable - and says
+    /// *why*, in the same "the reason on the button itself" shape §1 rule 3 specifies for the
+    /// Merge gate.
+    pub(in crate::sidebar) fn commit_menu_availability(
+        &self,
+        action: CommitMenuAction,
+    ) -> Result<(), String> {
+        if self.worktree_history_op_in_flight.is_some() {
+            return Err("another git operation is still running".to_string());
+        }
+        let staged = self.staged_uncommitted_paths().map(|paths| paths.len());
+        // A loaded uncommitted scope is also the proof that `HEAD` is born: `diff_against_head`
+        // reports `Ok(None)` for an unborn `HEAD`, which `load_diff` turns into an `Error`.
+        let Some(uncommitted) = self.uncommitted_diff.loaded() else {
+            return Err("the working tree has not been read yet".to_string());
+        };
+        // Every action below except amending writes `Self::staged_commit_message` verbatim
+        // (`AmendLastCommit` keeps the commit it folds into's own existing message) - with no
+        // more auto-drafted fallback, a real message is a real precondition now, the same way
+        // "nothing staged" already is.
+        let has_message = !self.staged_commit_message().trim().is_empty();
+        match action {
+            CommitMenuAction::CommitAndPush => {
+                if staged.is_none() {
+                    return Err("nothing staged".to_string());
+                }
+                if !has_message {
+                    return Err("write a commit message first".to_string());
+                }
+                if self.composer_branch().is_none() {
+                    return Err("HEAD is detached, so there is no branch to push".to_string());
+                }
+                Ok(())
+            }
+            CommitMenuAction::CommitAllFiles => {
+                if uncommitted.files.is_empty() {
+                    return Err("nothing uncommitted to commit".to_string());
+                }
+                if !has_message {
+                    return Err("write a commit message first".to_string());
+                }
+                Ok(())
+            }
+            CommitMenuAction::AmendLastCommit => {
+                if staged.is_none() {
+                    return Err("nothing staged to fold into the last commit".to_string());
+                }
+                // Amending needs a commit to amend. The Commits scope knows whether this branch
+                // has one of its own; with no base branch it cannot say, and git's own refusal is
+                // then the honest answer rather than a guess made here.
+                if self.branch_commits.loaded().is_some_and(|commits| {
+                    commits.base_branch.is_some() && commits.commits.is_empty()
+                }) {
+                    return Err("this branch has no commit of its own to amend".to_string());
+                }
+                Ok(())
+            }
+            CommitMenuAction::StashStaged => {
+                if staged.is_none() {
+                    return Err("nothing staged to stash".to_string());
+                }
+                if !has_message {
+                    return Err("write a message first".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The composer's target branch, or `None` for a detached `HEAD` - the one lookup both the
+    /// composer's own right-aligned label and the `Commit and push` row read.
+    pub(in crate::sidebar) fn composer_branch(&self) -> Option<String> {
+        self.worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone())
+    }
+
+    /// Runs one `▾` menu action for real, on the background executor, under the same single-flight
+    /// guard and the same status-line reporting `Self::commit_staged_files` already uses.
+    pub(in crate::sidebar) fn run_commit_menu_action(
+        &mut self,
+        action: CommitMenuAction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_menu_availability(action).is_err() {
+            return;
+        }
+        self.commit_menu_open = false;
+
+        let worktree_path = self.diff_root.clone();
+        let branch_display = self.branch_display_for(&worktree_path);
+        let branch = self.composer_branch();
+        let message = self.staged_commit_message();
+        let staged = self.staged_uncommitted_paths().unwrap_or_default();
+        let file_count = staged.len();
+
+        self.worktree_history_op_in_flight = Some(worktree_history::WorktreeHistoryOpKind::Commit);
+        self.worktree_history_status = Some(match action {
+            CommitMenuAction::CommitAndPush => format!(
+                "committing and pushing {} in {branch_display}\u{2026}",
+                plural::count(file_count, "file", None)
+            ),
+            CommitMenuAction::CommitAllFiles => {
+                format!("committing everything in {branch_display}\u{2026}")
+            }
+            CommitMenuAction::AmendLastCommit => format!(
+                "amending {branch_display}'s last commit with {}\u{2026}",
+                plural::count(file_count, "file", None)
+            ),
+            CommitMenuAction::StashStaged => format!(
+                "stashing {} in {branch_display}\u{2026}",
+                plural::count(file_count, "file", None)
+            ),
+        });
+        cx.notify();
+
+        let run_path = worktree_path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result: Result<String, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    match action {
+                        CommitMenuAction::CommitAndPush => {
+                            wt_core::undo::commit_paths(&run_path, &staged, &message)
+                                .map_err(|err| err.to_string())?;
+                            // Pushed by name, not by a bare `git push`: `push_branch` sets an
+                            // upstream when the branch has none, which is the normal state for a
+                            // worktree branch Jerry itself created.
+                            let branch = branch.ok_or_else(|| {
+                                "HEAD is detached, so there is no branch to push".to_string()
+                            })?;
+                            wt_core::remote::push_branch(
+                                &run_path,
+                                &branch,
+                                wt_core::remote::PushForce::None,
+                            )
+                            .map_err(|err| err.to_string())?;
+                            Ok(format!(
+                                "committed {} and pushed {branch}",
+                                plural::count(file_count, "file", None)
+                            ))
+                        }
+                        CommitMenuAction::CommitAllFiles => {
+                            wt_core::undo::commit_all_changes(&run_path, &message)
+                                .map_err(|err| err.to_string())?;
+                            Ok("committed every uncommitted file".to_string())
+                        }
+                        CommitMenuAction::AmendLastCommit => {
+                            wt_core::undo::amend_head_with_paths(&run_path, &staged)
+                                .map_err(|err| err.to_string())?;
+                            Ok(format!(
+                                "amended the last commit with {}",
+                                plural::count(file_count, "file", None)
+                            ))
+                        }
+                        CommitMenuAction::StashStaged => {
+                            wt_core::undo::stash_staged(&run_path, &format!("jerry: {message}"))
+                                .map_err(|err| err.to_string())?;
+                            Ok(format!(
+                                "stashed {}",
+                                plural::count(file_count, "file", None)
+                            ))
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.worktree_history_op_in_flight = None;
+                match result {
+                    Ok(status) => {
+                        this.worktree_history_status =
+                            Some(format!("{status} in {branch_display}"));
+                        // Every one of these four really moves the index, so the app's own idea of
+                        // what is staged is re-derived from real git by the reload below rather
+                        // than patched here - see `Self::load_diff`'s own docs on why staged state
+                        // is re-queried instead of cached.
+                        this.load_diff(worktree_path.clone(), cx);
+                    }
+                    Err(err) => {
+                        this.worktree_history_status =
+                            Some(format!("{} failed: {err}", action.label()));
                     }
                 }
                 cx.notify();
@@ -1510,293 +1810,922 @@ impl AdeApp {
                     self.window_controls_style().is_macos(),
                     self.tree_inline_edit.is_none(),
                 )),
-            RightSidebarView::Changes => match self.current_diff() {
-                Some(diff) => {
-                    let header = self.render_changes_header(diff);
-                    container
-                        .child(header)
-                        // Not `.overflow_y_scroll()` - see the Files arm's own comment above;
-                        // `Self::render_changes_rows`'s `uniform_list` owns its own scrolling.
-                        .child(
-                            div()
-                                .id("right-sidebar-body")
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_h_0()
-                                .child(self.render_changes_rows(cx)),
-                        )
-                        .children(self.render_staging_error(cx))
-                        .child(self.render_commit_composer(diff, cx))
-                        .child(render_changes_footer(self.ui_text_size(10.0)))
-                }
-                // This arm keeps its `.overflow_y_scroll()`: it renders a single message, never
-                // a `uniform_list`, and `Self::render_diff_state_message`'s "failed to compute
-                // diff: {err}" carries an arbitrarily long real error.
-                None => container.child(
+            // GitHub issue #285: four collapsible sections, with the commit composer pinned
+            // **above** them rather than at the panel's foot. The composer is a git control and
+            // the sections are what it acts on, so it reads first; that ordering is
+            // `REVISION-2026-08-14.md` §1's own sketch. Of the four, only Runs is pinned to the
+            // panel's own *bottom*, in its own capped well below the other three's shared
+            // scroller (`Self::render_changes_runs_section`) - `Jerry.dc.html` line 1433's own
+            // separate `max-height:170px` wrapper, not a fourth entry in the shared one.
+            RightSidebarView::Changes => container
+                .child(self.render_commit_composer(cx))
+                .children(self.render_staging_error(cx))
+                // Not `.overflow_y_scroll()` - `Self::render_changes_sections`' `gpui::list` owns
+                // its own scrolling, exactly like the Files arm's `uniform_list` above.
+                .child(
                     div()
                         .id("right-sidebar-body")
+                        .flex()
+                        .flex_col()
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .child(self.render_diff_state_message()),
-                ),
-            },
+                        .child(self.render_changes_sections(cx)),
+                )
+                .child(self.render_changes_runs_section(cx))
+                .child(render_changes_footer(self.ui_text_size(10.0))),
         }
         .into_any_element()
     }
 
-    /// The Changes header: file count, a staged-progress bar, and `N staged` count, both
-    /// computed directly from [`Self::staged_files`]'s membership against `diff`'s file
-    /// list rather than an independently tracked counter that could drift. Distinct wording from
-    /// the commit composer's own `N of M staged` count just below it (Revision R12 §5/§4's "no
-    /// two counters in the window may share wording while counting different units") - this one
-    /// answers "how many of the worktree's changed files are staged", the composer's answers
-    /// "how many of those staged files is the next commit about to include" (today the same set,
-    /// but a distinct question).
+    /// The real base branch the panel's Commits and Against-main sections are scoped to, or `None`
+    /// when git could not detect one (this worktree *is* the default branch, no default branch
+    /// exists, or the histories are unrelated - see `wt_core::diff::DiffBase::NoBase`).
     ///
-    /// The `N files` label counts every row the list really paints, but the progress bar's
-    /// denominator is the *stageable* subset (`changes::stageable_count`): a committed-clean file
-    /// (GitHub issue #220) is a real row with genuinely nothing left to stage, so counting it
-    /// against the bar would pin a fully-staged worktree short of full forever.
-    pub(in crate::sidebar) fn render_changes_header(
-        &self,
-        diff: &WorktreeDiff,
-    ) -> impl IntoElement {
-        let total = diff.files.len();
-        let stageable = changes::stageable_count(&diff.files, self.dirty_files.as_ref());
-        let staged = diff
-            .files
-            .iter()
-            .filter(|file| self.staged_files.contains(&file.path))
-            .count();
-        let progress = changes::StagedProgress {
-            staged,
-            total: stageable,
-        };
-        let fraction = progress.fraction();
-        const BAR_WIDTH: f32 = 56.0;
-
-        // Test-only outside `cfg(test)`/`test-support`, exactly like the commit composer's own
-        // `commit-composer-progress-{n}-of-{m}` selector: the real counts baked into the string so
-        // an interaction test can prove this header moved with real git state instead of a
-        // hardcoded number.
-        let files_selector = format!("changes-header-{total}-files");
-        let staged_selector = format!("changes-header-{staged}-of-{stageable}-staged");
-
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(12.0))
-            .py(px(7.0))
-            .bg(theme::surface::HEADER)
-            .border_b_1()
-            .border_color(theme::border::INNER)
-            .child(
-                div()
-                    .debug_selector(move || files_selector)
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(theme::text::DIM)
-                    .child(plural::count(total, "file", None)),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_none()
-                    .w(px(BAR_WIDTH))
-                    .h(px(3.0))
-                    .rounded(px(1.5))
-                    .bg(theme::diff::STAT_EMPTY)
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .h(px(3.0))
-                            .w(px(BAR_WIDTH * fraction))
-                            .rounded(px(1.5))
-                            .bg(theme::status::REVIEW),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(move || staged_selector)
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.0))
-                    .text_color(theme::text::DIM)
-                    .child(format!("{staged} staged")),
-            )
+    /// Read from the loaded `Commits` scope rather than the merge-base diff's own `base_branch`:
+    /// `WorktreeDiff::base_branch` is a *label* that falls back to the worktree's own branch when
+    /// there is no real base (see `wt_core::diff::compute_diff`'s `label_branch`), so reading it
+    /// would let the Against-main header claim a base that does not exist.
+    pub(in crate::sidebar) fn changes_base_branch(&self) -> Option<&str> {
+        self.branch_commits
+            .loaded()
+            .and_then(|commits| commits.base_branch.as_deref())
     }
 
-    /// The Changes list's scrollable rows - falls back to [`Self::render_diff_state_message`]
-    /// if the diff isn't loaded, or a "no changes" message for a clean worktree.
-    pub(in crate::sidebar) fn render_changes_rows(
+    /// The Runs section's rows: one per real agent session open in this worktree, with its
+    /// diffstat read straight off the uncommitted change set's own per-author partition.
+    ///
+    /// A shell is not a run and is filtered out (`ProcessKind::is_agent_session`) - it has no
+    /// durable agent key, writes nothing the provenance store attributes, and would render a row
+    /// permanently reading `no files yet`.
+    pub(in crate::sidebar) fn changes_run_rows(&self, cx: &gpui::App) -> Vec<sections::RunRow> {
+        let sources: Vec<sections::RunSource> = self
+            .current_worktree_agents()
+            .filter_map(|agent| {
+                let ProcessKind::Agent(kind) = agent.kind else {
+                    return None;
+                };
+                let status = self.agent_status(agent, cx);
+                // "Live" is the process still being alive, not the app's urgency vocabulary: an
+                // agent waiting on a question is still holding its worktree open and can still
+                // write the moment it is answered, so its diff is no more final than a busy one's.
+                let live = agent.pane.read(cx).is_running();
+                Some(sections::RunSource {
+                    agent_id: agent.id,
+                    agent_key: crate::provenance::AgentKey::new(
+                        crate::review::state::baseline_key(&agent.cwd, kind, agent.spawned_at_unix),
+                    ),
+                    agent_label: kind.label().to_string(),
+                    initial: work_surface::agent_initial(agent.kind),
+                    tint: work_surface::agent_tint(agent.kind),
+                    live,
+                    // A live run's age is how long it has been going; an ended one's is how long
+                    // since it last did anything, which is when it ended. `Status` is consulted
+                    // only to keep the two apart, never to fabricate a third answer.
+                    elapsed: match (live, status) {
+                        (true, _) => agent.spawned_at.elapsed(),
+                        (false, _) => agent
+                            .pane
+                            .read(cx)
+                            .idle_duration()
+                            .unwrap_or_else(|| agent.spawned_at.elapsed()),
+                    },
+                })
+            })
+            .collect();
+        sections::run_rows(&sources, &self.uncommitted_change_set)
+    }
+
+    /// The whole panel, flattened into one row list (GitHub issue #285) - split by
+    /// [`sections::SectionRow::section`] into [`Self::render_changes_sections`]' shared scroller
+    /// (Uncommitted, Commits, Against main) and [`Self::render_changes_runs_section`]'s own
+    /// pinned-bottom well (Runs), rather than rendered as one flat list itself.
+    ///
+    /// Every section's body is built whether or not the section is open, so its header can state a
+    /// true count while collapsed; only an **open** section's body is actually pushed. That is
+    /// what makes `SectionHeader::count` and the number of rows the section renders the same
+    /// number by construction rather than by two counters agreeing - see that field's own docs.
+    pub(in crate::sidebar) fn changes_section_rows(
+        &self,
+        cx: &gpui::App,
+    ) -> Vec<sections::SectionRow> {
+        let base_branch = self.changes_base_branch().map(str::to_string);
+        let mut rows: Vec<sections::SectionRow> = Vec::new();
+
+        for section in sections::ChangesSection::ORDER {
+            let body = self.changes_section_body(section, cx);
+            // Against main is the one exception: it renders no row per file (see
+            // `SectionRow::AgainstMainContext`'s own docs), so its count reads the real file
+            // total directly rather than counting rows that do not exist.
+            let count = match section {
+                sections::ChangesSection::AgainstMain => self.change_set.len(),
+                _ => body.iter().filter(|row| row.is_counted()).count(),
+            };
+            let open = self.changes_sections.is_open(section);
+            rows.push(sections::SectionRow::Header(sections::SectionHeader {
+                section,
+                label: section.label(base_branch.as_deref()),
+                count,
+                stat: self.changes_section_stat(section, &body),
+                open,
+                seen: match section {
+                    sections::ChangesSection::Uncommitted => Some((
+                        self.seen_files
+                            .seen_count(&self.diff_root, &self.uncommitted_change_set),
+                        count,
+                    )),
+                    _ => None,
+                },
+            }));
+            if open {
+                rows.extend(body);
+            }
+        }
+        rows
+    }
+
+    /// One section's body rows, in render order.
+    fn changes_section_body(
+        &self,
+        section: sections::ChangesSection,
+        cx: &gpui::App,
+    ) -> Vec<sections::SectionRow> {
+        use sections::{ChangesSection, NoteEmphasis, SectionRow};
+
+        let quiet = |text: &str| SectionRow::Note {
+            section,
+            text: text.to_string(),
+            emphasis: NoteEmphasis::Quiet,
+        };
+        let warn = |text: String| SectionRow::Note {
+            section,
+            text,
+            emphasis: NoteEmphasis::Warning,
+        };
+
+        match section {
+            ChangesSection::Runs => {
+                let rows = self.changes_run_rows(cx);
+                if rows.is_empty() {
+                    return vec![quiet("no agents have run in this worktree yet")];
+                }
+                rows.into_iter().map(SectionRow::Run).collect()
+            }
+            ChangesSection::Uncommitted => {
+                if let Some(error) = self.uncommitted_diff.error() {
+                    return vec![warn(error.to_string())];
+                }
+                let Some(diff) = self.uncommitted_diff.loaded() else {
+                    return vec![quiet("computing uncommitted changes...")];
+                };
+                // Rows come from the **change set**, not the diff's own file list: the change set
+                // is keyed by path, so "a path appears once per worktree" (`REVISION-2026-08-14`
+                // §1's rule 1) is a property of the list this renders rather than a rule this
+                // loop has to remember. A diff that somehow named one path twice is already one
+                // row by the time it gets here.
+                let mut body: Vec<SectionRow> = (0..self.uncommitted_change_set.len())
+                    .map(SectionRow::UncommittedFile)
+                    .collect();
+                if body.is_empty() {
+                    return vec![quiet("nothing uncommitted in this checkout")];
+                }
+                if diff.truncated {
+                    body.push(warn(
+                        "diff truncated: this checkout's real changes exceeded wt_core::diff's \
+                         own load limits, so some files or lines are missing from this list"
+                            .to_string(),
+                    ));
+                }
+                body
+            }
+            ChangesSection::Commits => {
+                if let Some(error) = self.branch_commits.error() {
+                    return vec![warn(error.to_string())];
+                }
+                let Some(commits) = self.branch_commits.loaded() else {
+                    return vec![quiet("reading this branch's commits...")];
+                };
+                if commits.base_branch.is_none() {
+                    // Honest, and distinct from "no commits": without a base there is no such
+                    // thing as "the commits this branch added", so the section states that rather
+                    // than showing an empty list that would read as "you have committed nothing".
+                    return vec![quiet(
+                        "no base branch to measure this branch's own commits against",
+                    )];
+                }
+                if commits.commits.is_empty() {
+                    return vec![quiet("nothing committed on this branch yet")];
+                }
+                let mut body: Vec<SectionRow> = commits
+                    .commits
+                    .iter()
+                    .cloned()
+                    .map(SectionRow::Commit)
+                    .collect();
+                if commits.truncated {
+                    body.push(warn(
+                        "this branch has more commits than wt_core::diff loads at once, so the \
+                         list above is only its most recent"
+                            .to_string(),
+                    ));
+                }
+                body
+            }
+            ChangesSection::AgainstMain => {
+                let Some(diff) = self.current_diff() else {
+                    // The real reason, from the one place that words it - loading, a genuine
+                    // `git` error, or an unborn `HEAD` with no base at all - never a blanket
+                    // "computing..." that would keep claiming to be busy after a real failure.
+                    let (text, color) = self.diff_state_message();
+                    return vec![SectionRow::Note {
+                        section,
+                        text,
+                        emphasis: if color == theme::status::FAIL {
+                            NoteEmphasis::Warning
+                        } else {
+                            NoteEmphasis::Quiet
+                        },
+                    }];
+                };
+                if self.change_set.is_empty() {
+                    return vec![quiet("this branch matches its base exactly")];
+                }
+                let mut body: Vec<SectionRow> = Vec::new();
+                // The read-only context card, deliberately **not** a counted row - see
+                // `SectionRow::is_counted`. This section carries no action buttons at all: a
+                // product decision recorded on GitHub issue #285, overriding
+                // `REVISION-2026-08-14.md` §1's rule 3 and `STAGE-A-CHANGELOG.md` §4e. Merging a
+                // branch into its base is the git graph's job (issue #241) and removing a
+                // worktree already has its own entry point on the rail's worktree context menu,
+                // so putting either here would be a second home for an action that already has
+                // one - the exact defect §4e removed them from the agent header for.
+                //
+                // No per-file rows, though issue #285's own checklist says "diffstat, file list
+                // and commit context" - a deliberate deviation from that restated checklist back
+                // toward `Jerry.dc.html` itself: line 1422's `baseRows` is a synthetic one-entry
+                // array (`wtBaseDefs`'s `files` is a plain count, never an array of files), so a
+                // committed file was never meant to be its own row here. Requested directly:
+                // "commited files should not appear on the changes tab under against master."
+                let base = self.changes_base_branch().map(str::to_string);
+                if let Some(base) = base {
+                    body.push(SectionRow::AgainstMainContext {
+                        text: format!(
+                            "{} would land on {base}",
+                            plural::count(self.change_set.len(), "file", None)
+                        ),
+                        // Real `git rev-list --left-right --count` figures the app already
+                        // refreshes for the status bar, never recounted here. With none cached
+                        // yet, the card states the merge-base it *is* scoped to rather than
+                        // printing `0 ahead \u{b7} 0 behind`, which would be a claim git has not
+                        // made.
+                        sub: match self.ahead_behind_cache.get(&self.diff_root) {
+                            Some(counts) => {
+                                format!("{} ahead \u{b7} {} behind", counts.ahead, counts.behind)
+                            }
+                            None => format!("merge-base {}", short_sha(&diff.base_commit)),
+                        },
+                    });
+                }
+                if diff.truncated {
+                    body.push(warn(
+                        "diff truncated: this branch's real changes exceeded wt_core::diff's own \
+                         load limits, so some files or lines are missing from this list"
+                            .to_string(),
+                    ));
+                }
+                body
+            }
+        }
+    }
+
+    /// One section's header diffstat.
+    ///
+    /// Runs is summed over the very rows it is about to render, so the header can never claim a
+    /// total its own rows do not add up to. The other three read the one stored total their scope
+    /// already has.
+    fn changes_section_stat(
+        &self,
+        section: sections::ChangesSection,
+        body: &[sections::SectionRow],
+    ) -> crate::provenance::DiffStat {
+        use crate::provenance::DiffStat;
+        use sections::{ChangesSection, SectionRow};
+        match section {
+            ChangesSection::Runs => body
+                .iter()
+                .fold(DiffStat::default(), |total, row| match row {
+                    SectionRow::Run(run) => total.plus(run.stat),
+                    _ => total,
+                }),
+            ChangesSection::Uncommitted => self.uncommitted_change_set.total(),
+            ChangesSection::Commits => self
+                .branch_commits
+                .loaded()
+                .map(|commits| DiffStat::new(commits.added, commits.removed))
+                .unwrap_or_default(),
+            ChangesSection::AgainstMain => self.change_set.total(),
+        }
+    }
+
+    /// Opens or closes one section. Per section, and touching no other one.
+    pub(in crate::sidebar) fn toggle_changes_section(
+        &mut self,
+        section: sections::ChangesSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.changes_sections.toggle(section);
+        cx.notify();
+    }
+
+    /// The Changes panel's main scroller: **three** of its four sections' worth of rows
+    /// (Uncommitted, Commits, Against main) in a single `gpui::list`, with the same shared overlay
+    /// scrollbar every other scrollable region in this app draws (`crate::root::scrollbar`). Runs
+    /// is deliberately excluded - it renders in its own pinned-bottom well,
+    /// [`Self::render_changes_runs_section`], matching `Jerry.dc.html` line 1433's own separate
+    /// `max-height:170px;overflow-y:auto` wrapper rather than sharing this scroller.
+    ///
+    /// `gpui::list`, not the `uniform_list` this panel used to use, for one structural reason: even
+    /// with Runs split out, these three sections still put a 24px header and a 27px file row in the
+    /// same scroller, and `uniform_list` sizes **every** slot from item 0's measured height. `gpui::
+    /// list` is GPUI's own variable-height virtualized list and is still genuinely virtualized: it
+    /// builds only the items its viewport (plus [`Self::CHANGES_LIST_OVERDRAW`]) actually covers,
+    /// which `virtualization_tests` asserts against a live render exactly as it did before.
+    pub(in crate::sidebar) fn render_changes_sections(
         &self,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let Some(diff) = self.current_diff() else {
-            // Defensive: `Self::render_right_sidebar`'s Changes arm already matched
-            // `Some(diff)` before calling this. Kept scrollable anyway for the same reason
-            // that arm's own `None` branch is - this returns a real, unbounded error string.
-            return div()
-                .id("changes-state-message")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(self.render_diff_state_message())
-                .into_any_element();
-        };
-        if diff.files.is_empty() {
-            return render_sidebar_message("no changes".to_string(), theme::text::FAINT.into());
+        let rows: std::rc::Rc<Vec<sections::SectionRow>> = std::rc::Rc::new(
+            self.changes_section_rows(cx)
+                .into_iter()
+                .filter(|row| row.section() != sections::ChangesSection::Runs)
+                .collect(),
+        );
+        // `ListState` owns a measured height per item, so it has to be told when the item set
+        // changes size. Reset only on a real change: a reset drops the scroll position, and doing
+        // it every frame would pin the panel to the top. `ListState::reset` takes `&self` (its
+        // state is behind an `Rc<RefCell<_>>`), which is what lets this run from a `&self` render.
+        if self.changes_sections_list.item_count() != rows.len() {
+            self.changes_sections_list.reset(rows.len());
         }
 
-        let total_files = diff.files.len();
-        let truncated = diff.truncated;
-        let rendered_count = total_files.min(MAX_RENDERED_DIFF_FILES);
-
-        // `flex_1().min_h_0()` rather than `size_full()` - see `Self::render_file_tree`'s own
-        // comment on the same choice.
-        let mut column = div()
-            .id("changes-rows")
-            .flex()
-            .flex_col()
-            .w_full()
-            .flex_1()
-            .min_h_0();
-        // `diff.truncated` is `wt_core::diff`'s own load-time cap firing (2MB of raw `git diff`
-        // output, or more than 300 changed files) - distinct from a single file's own
-        // `DiffFile::truncated` (per-file hunk-line cap, surfaced in
-        // `Self::render_diff_file_detail`) and this list's own `MAX_RENDERED_DIFF_FILES`
-        // *render* cap below, which only ever omits already fully-loaded data.
-        //
-        // A sibling of the list rather than its first child, now that the rows are a
-        // `uniform_list`: it is not a `theme::band::CHANGE_ROW`-tall row, and `uniform_list`
-        // sizes every slot from item 0 alone.
-        if truncated {
-            column = column.child(render_sidebar_message(
-                "diff truncated: this worktree's real changes exceeded wt_core::diff's own \
-                 load limits, so some files or lines are missing from this list"
-                    .to_string(),
-                theme::status::ASK.into(),
-            ));
-        }
-
-        // Virtualized for the same measured reason as `Self::render_file_tree` - see that
-        // method's own docs. Up to `MAX_RENDERED_DIFF_FILES` change rows were previously built,
-        // laid out and painted every frame regardless of how few were on screen; every row is
-        // exactly `theme::band::CHANGE_ROW` tall, which is `uniform_list`'s one real requirement.
-        let changes_list = uniform_list(
-            "changes-rows-list",
-            rendered_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
-                // Re-resolved (not captured) so a diff that got replaced between this
-                // frame's `item_count` read and this call renders fewer rows rather than
-                // indexing a stale snapshot.
-                let Some(diff) = this.current_diff() else {
-                    return Vec::new();
-                };
-                let start = range.start.min(diff.files.len());
-                let end = range.end.min(diff.files.len());
-                diff.files[start..end]
-                    .iter()
-                    .map(|file| this.render_change_row(file, cx).into_any_element())
-                    .collect::<Vec<_>>()
-            }),
+        let build_rows = rows.clone();
+        let list = gpui::list(
+            self.changes_sections_list.clone(),
+            cx.processor(
+                move |this: &mut Self,
+                      index: usize,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    // Bounds-checked rather than indexed: the row list is a snapshot taken when
+                    // this frame's `render` ran, and a diff replaced between then and now must
+                    // render nothing rather than panic - the same defensive re-resolve the file
+                    // tree's own virtualized list documents.
+                    match build_rows.get(index) {
+                        Some(row) => this.render_section_row(row, window, cx),
+                        None => div().into_any_element(),
+                    }
+                },
+            ),
         )
+        .w_full()
         .flex_1()
-        .min_h_0()
-        .track_scroll(&self.changes_rows_scroll_handle);
+        .min_h_0();
 
         // See `Self::render_file_tree`'s own docs on why the scrollbar must be a sibling of the
-        // list, inside its own non-scrolling `.relative()` wrapper, never a child of `list`
-        // itself.
-        column = column.child(
-            div()
-                .relative()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .child(changes_list)
-                .children(self.render_vertical_scrollbar(
-                    "changes-rows-scrollbar",
-                    &self.changes_rows_scroll_handle,
-                    &[],
-                    cx,
-                )),
-        );
-
-        if total_files > rendered_count {
-            column = column.child(render_sidebar_message(
-                format!(
-                    "... and {} more changed files not shown",
-                    total_files - rendered_count
-                ),
-                theme::text::FAINT.into(),
-            ));
-        }
-        column.into_any_element()
+        // list, inside its own non-scrolling `.relative()` wrapper.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .children(self.render_vertical_scrollbar(
+                "changes-sections-scrollbar",
+                &self.changes_sections_list,
+                &[],
+                cx,
+            ))
+            .into_any_element()
     }
 
-    /// One Changes row: a staging checkbox, `dir`/`name`, an optional tag pill, `+n`/`−n`, and
-    /// the five-segment stat bar. Clicking anywhere on the
-    /// row other than the checkbox itself (see [`Self::render_staging_checkbox`]'s
-    /// `stop_propagation`) opens the file's diff via [`Self::open_change_diff`] - the checkbox
-    /// **is** staging, not "reviewed": it has its own click target, entirely separate from the
-    /// row body's.
+    /// The Runs section, pinned to the Changes panel's own bottom in its own capped,
+    /// independently-scrolled well - `Jerry.dc.html` line 1433's `flex:none;max-height:170px;
+    /// overflow-y:auto` wrapper, which sits *outside* the shared scroller the other three
+    /// sections share rather than as a fourth entry inside it (the user: "run row should be
+    /// pinned to the bottom and not to the top look at the design").
     ///
-    /// **A committed-clean file gets no checkbox at all** (GitHub issue #220). The Changes list is
-    /// a diff against the merge-base with the default branch, so it legitimately shows files whose
-    /// difference from that base is already inside a real commit on this branch - and until this
-    /// fix every one of them painted an unchecked, actionable "stage me" box, which is what made
-    /// committed work read as unstaged. Such a row keeps its place in the list (reviewing the
-    /// whole branch against main is the entire point of this panel) and stays clickable to open
-    /// its diff; what changes is that the checkbox is replaced by
-    /// [`Self::render_committed_marker`]'s inert check plus a `committed` pill
-    /// (`crate::root::widgets::render_committed_tag`). A checked-but-disabled checkbox was the
-    /// alternative and was rejected: in this panel a checked box means "staged, and the next
-    /// commit will include it", and reusing that exact mark for "this is already *in* a commit"
-    /// would trade one wrong reading for another.
-    pub(in crate::sidebar) fn render_change_row(
+    /// Plain `.overflow_y_scroll()`, not `gpui::list`: Runs holds one row per agent open in this
+    /// worktree - genuinely few, unlike the shared scroller's many file rows across three
+    /// sections - so it needs no virtualization, the same reasoning the status bar's own
+    /// capped-and-scrollable resources tree already uses.
+    pub(in crate::sidebar) fn render_changes_runs_section(
         &self,
-        file: &DiffFile,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use sections::{ChangesSection, SectionRow};
+        let rows: Vec<SectionRow> = self
+            .changes_section_rows(cx)
+            .into_iter()
+            .filter(|row| row.section() == ChangesSection::Runs)
+            .collect();
+        div()
+            .id("changes-runs-section")
+            .flex_none()
+            .max_h(px(170.0))
+            .overflow_y_scroll()
+            .bg(theme::surface::RUNS_WELL)
+            .children(rows.iter().map(|row| {
+                match row {
+                    SectionRow::Header(header) => {
+                        self.render_section_header(header, cx).into_any_element()
+                    }
+                    SectionRow::Run(run) => self.render_run_row(run, cx).into_any_element(),
+                    SectionRow::Note {
+                        section,
+                        text,
+                        emphasis,
+                    } => self
+                        .render_section_note(*section, text, *emphasis)
+                        .into_any_element(),
+                    // Runs never produces any other `SectionRow` kind - see `changes_section_body`.
+                    _ => div().into_any_element(),
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Dispatches one flattened row to the renderer for its kind.
+    fn render_section_row(
+        &self,
+        row: &sections::SectionRow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use sections::{ChangesSection, SectionRow};
+        match row {
+            SectionRow::Header(header) => self.render_section_header(header, cx).into_any_element(),
+            SectionRow::Run(run) => self.render_run_row(run, cx).into_any_element(),
+            SectionRow::UncommittedFile(index) => {
+                match self.uncommitted_change_set.entries().get(*index) {
+                    Some(entry) => self
+                        .render_change_row(entry, ChangesSection::Uncommitted, cx)
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                }
+            }
+            SectionRow::Commit(commit) => self.render_commit_row(commit).into_any_element(),
+            SectionRow::AgainstMainContext { text, sub } => self
+                .render_against_main_context(text, sub)
+                .into_any_element(),
+            SectionRow::Note {
+                section,
+                text,
+                emphasis,
+            } => self
+                .render_section_note(*section, text, *emphasis)
+                .into_any_element(),
+        }
+    }
+
+    /// One section header: caret, uppercase label, count, and a right-aligned split diffstat, in
+    /// the rev-6 `theme::changes` tokens (`REVISION-2026-08-14.md` §1). Clicking anywhere on it
+    /// opens or closes the section.
+    ///
+    /// The diffstat is **split** into its own `+N` and `−N` colours rather than painted as one
+    /// green string, because `STAGE-A-CHANGELOG.md` §4o's rule is exactly that: "A value that is
+    /// coloured anywhere must be coloured everywhere" - every other diffstat in this app already
+    /// splits, so a one-colour one here would be the same number styled two ways depending on
+    /// which row it landed in.
+    fn render_section_header(
+        &self,
+        header: &sections::SectionHeader,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let path = file.path.clone();
-        let open_path = path.clone();
-        let staged = self.staged_files.contains(&file.path);
-        let committed = changes::is_committed_clean(&file.path, self.dirty_files.as_ref());
-        let selected = self.open_change.as_deref() == Some(file.path.as_path());
-        // GitHub issue #284: the row's `+n`/`−n` is the change set's own combined diffstat, which
-        // is *defined* as the sum of that path's per-author shares
-        // (`crate::provenance::change_set::ChangeSetEntry::stat`). Routing the row through it is
-        // what makes "one row per path, with the de-duplicated author union" the list the app
-        // really renders rather than a parallel structure - the attribution UI (GitHub issue #287)
-        // then reads the authors off the very same entry this number came from, with no way for
-        // the two to disagree.
-        //
-        // The fallback is for the one frame where a diff has landed but `rebuild_change_set` has
-        // not run yet; with no provenance recorded the two are the same number anyway, since every
-        // line simply lands in the unattributed bucket.
-        let (add, del) = match self.change_set.entry(&file.path) {
-            Some(entry) => {
-                let stat = entry.stat();
-                (stat.added, stat.removed)
-            }
-            None => changes::diff_file_stats(file),
+        let section = header.section;
+        let selector = format!(
+            "changes-section-{}-{}-{}",
+            section.key(),
+            header.count,
+            if header.open { "open" } else { "collapsed" }
+        );
+        let stat_selector = match sections::section_diffstat(header.stat) {
+            Some((add, del)) => format!("changes-section-{}-stat-{add}-{del}", section.key()),
+            None => format!("changes-section-{}-stat-empty", section.key()),
         };
-        let (dir, name) = changes::split_dir_name(&file.path);
-        let tag = changes::change_tag(file.status);
-        let segments = changes::stat_bar_segments(add, del);
+        let stat = sections::section_diffstat(header.stat);
+        let seen = header.seen.and_then(|(seen, total)| {
+            sections::seen_label(seen, total).map(|label| (label, seen, total))
+        });
 
-        // See `Self::render_file_tree_row`'s own `debug_selector` for why this exists, and why
-        // the closure borrows `file` instead of capturing an owned `String`.
         div()
-            .id(format!("change-row-{}", file.path.display()))
-            .debug_selector(|| format!("change-row-{}", file.path.display()))
+            .id(gpui::SharedString::from(format!(
+                "changes-section-{}",
+                section.key()
+            )))
+            .debug_selector(move || selector)
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .h(theme::band::CHANGES_SECTION_HEADER)
+            .pl(px(8.0))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .bg(theme::surface::HEADER)
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            // The shared caret glyph inherits its colour from whatever wraps it (see
+            // `render_disclosure_caret`'s own docs on why it paints none of its own). Set here
+            // rather than on the glyph: this row's other children - the label, the count, the
+            // seen meter and the diffstat - all name their own token, so nothing else inherits it.
+            .text_color(theme::changes::SECTION_CARET)
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.toggle_changes_section(section, cx);
+            }))
+            .child(render_disclosure_caret(
+                header.open,
+                self.ui_text_size(10.0),
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::changes::SECTION_LABEL)
+                    .child(header.label.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::changes::SECTION_COUNT)
+                    .child(header.count.to_string()),
+            )
+            .child(div().flex_1().min_w_0())
+            .when_some(seen, |el, (label, seen, total)| {
+                const METER_WIDTH: f32 = 34.0;
+                let fraction = sections::seen_fraction(seen, total);
+                let seen_selector = format!("changes-section-uncommitted-{seen}-of-{total}-seen");
+                el.child(
+                    div()
+                        .debug_selector(move || seen_selector)
+                        .flex_none()
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(10.0))
+                        .text_color(theme::text::GHOSTER)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(px(METER_WIDTH))
+                        .h(px(3.0))
+                        .rounded(px(1.5))
+                        .bg(theme::diff::STAT_EMPTY)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(0.0))
+                                .h(px(3.0))
+                                .w(px(METER_WIDTH * fraction))
+                                .rounded(px(1.5))
+                                .bg(theme::diff::STAT_ADD),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .debug_selector(move || stat_selector)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .when_some(stat, |el, (add, del)| {
+                        el.child(
+                            div()
+                                .text_color(theme::changes::SECTION_STAT_ADD)
+                                .child(add),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme::changes::SECTION_STAT_DEL)
+                                .child(del),
+                        )
+                    }),
+            )
+    }
+
+    /// One Runs row (`STAGE-A-CHANGELOG.md` §4l): line 1 is the title alone at full width, line 2
+    /// is `<agent> · ended 2m` on the left with `12 files +285 −119` pushed right. Left edge is
+    /// the run's own agent tint, and there is **no checkbox, ever** - a run is not a stageable
+    /// thing, and one agent's share of a file the other agent also wrote is not separately
+    /// stageable at all (`REVISION-2026-08-14.md` §1's table and rule 1).
+    ///
+    /// Clicking focuses that agent's tab - a real, existing action
+    /// ([`Self::activate_agent_tab`]), not a new surface.
+    ///
+    /// No row tooltip, though `Jerry.dc.html`'s own markup carries one (`title="{{ r.tip }}"`,
+    /// stating the live/frozen consequence `STAGE-A-CHANGELOG.md` §4l moved off the row's visible
+    /// text) - a deliberate, requested deviation from both the mock and that citation, not an
+    /// oversight.
+    fn render_run_row(&self, run: &sections::RunRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let agent_id = run.agent_id;
+        let selector = format!("changes-run-{}", run.agent_id);
+        let stat_selector = format!(
+            "changes-run-{}-stat-+{}-{}{}",
+            run.agent_id, run.stat.added, "\u{2212}", run.stat.removed
+        );
+        div()
+            .id(gpui::SharedString::from(format!(
+                "changes-run-row-{}",
+                run.agent_id
+            )))
+            .debug_selector(move || selector)
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_start()
+            .gap(px(8.0))
+            .h(theme::band::RUN_ROW)
+            .pt(px(7.0))
+            .pb(px(8.0))
+            .pl(px(8.0))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .border_l_2()
+            .border_color(run.tint_fg)
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.select_agent(agent_id, window, cx);
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px(1.0))
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .rounded(theme::radius::CHIP)
+                    .bg(run.tint_bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(8.0))
+                    .text_color(run.tint_fg)
+                    .child(run.initial),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(self.ui_text_size(11.5))
+                            .text_color(theme::text::STRONG)
+                            .child(run.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_shrink_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .font(font(theme::font::MONO))
+                                    .text_size(self.ui_text_size(10.0))
+                                    .text_color(run.meta_color())
+                                    .child(run.meta.clone()),
+                            )
+                            .child(div().flex_1().min_w_0())
+                            .child(
+                                div()
+                                    .debug_selector(move || stat_selector)
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .font(font(theme::font::MONO))
+                                    .text_size(self.ui_text_size(10.0))
+                                    .child(
+                                        div()
+                                            .text_color(theme::text::PATH)
+                                            .child(run.files_label.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(theme::diff::STAT_ADD)
+                                            .child(format!("+{}", run.stat.added)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(theme::diff::STAT_DEL)
+                                            .child(format!("\u{2212}{}", run.stat.removed)),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
+    /// One Commits row: short sha, subject, and the commit's own diffstat. No checkbox and no left
+    /// edge - a commit is neutral scope (`REVISION-2026-08-14.md` §1's table), and there is
+    /// nothing about an already-written commit to stage.
+    fn render_commit_row(&self, commit: &wt_core::diff::BranchCommit) -> impl IntoElement {
+        let selector = format!("changes-commit-{}", commit.short_id);
+        div()
+            .debug_selector(move || selector)
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .h(theme::band::CHANGE_ROW)
+            .pl(px(10.0))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::text::PATH)
+                    .child(commit.short_id.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .truncate()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(11.5))
+                    .text_color(theme::text::DIM)
+                    .child(commit.subject.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::diff::STAT_ADD)
+                    .child(format!("+{}", commit.added)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::diff::STAT_DEL)
+                    .child(format!("\u{2212}{}", commit.removed)),
+            )
+    }
+
+    /// The Against-main section's read-only context card - what would land, and the branch's
+    /// ahead/behind. **No action buttons**: see `Self::changes_section_body`'s own comment for the
+    /// product decision that keeps merge and worktree deletion out of this panel.
+    fn render_against_main_context(&self, text: &str, sub: &str) -> impl IntoElement {
+        let selector = format!("changes-against-main-context-{text}");
+        div()
+            .debug_selector(move || selector)
+            .flex_none()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .py(px(8.0))
+            .pl(px(10.0))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .border_l_2()
+            .border_color(theme::changes::EDGE_AGAINST_MAIN)
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(11.5))
+                    .text_color(theme::text::SECONDARY)
+                    .child(text.to_string()),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(sub.to_string()),
+            )
+    }
+
+    /// A section's own message row - empty, loading, failed or truncated.
+    fn render_section_note(
+        &self,
+        section: sections::ChangesSection,
+        text: &str,
+        emphasis: sections::NoteEmphasis,
+    ) -> impl IntoElement {
+        let selector = format!("changes-section-{}-note", section.key());
+        div()
+            .debug_selector(move || selector)
+            .flex_none()
+            .w_full()
+            .py(px(7.0))
+            .pl(px(10.0))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .font(font(theme::font::SANS))
+            .text_size(self.ui_text_size(10.5))
+            .text_color(emphasis.color())
+            .child(text.to_string())
+    }
+
+    /// One file row - a staging checkbox (Uncommitted only), `dir`/`name`, an optional tag pill,
+    /// `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the row other than the
+    /// checkbox itself (see [`Self::render_staging_checkbox`]'s `stop_propagation`) opens the
+    /// file's diff and marks it seen.
+    ///
+    /// ## It renders a `ChangeSetEntry`, not a `DiffFile`
+    ///
+    /// The change set is keyed by path (`crate::provenance::change_set`), so *one path is one
+    /// row* (`REVISION-2026-08-14.md` §1's first "rule that is easy to get wrong") is a property
+    /// of the list this draws from rather than a rule the caller has to remember. The row's `+n`/`−n`
+    /// is that entry's own combined diffstat, which is **defined** as the sum of its per-author
+    /// shares, so the Runs section's numbers and this row's number cannot disagree: they are the
+    /// same partition read two ways. The `DiffFile` is still looked up alongside, for the one thing
+    /// the entry does not carry - the pre-rename path behind the `moved` tag.
+    ///
+    /// ## Checkboxes exist in exactly one section
+    ///
+    /// `REVISION-2026-08-14.md` §9, box 1. An Against-main row gets none at all, and this is now
+    /// structural rather than a per-file condition: the Uncommitted section is the working tree
+    /// against `HEAD`, so *everything* in it is genuinely stageable and nothing in it can be the
+    /// already-committed-clean row GitHub issue #220 was about. That row still exists - in the
+    /// Against-main section, which is the scope that legitimately lists committed work - where it
+    /// carries `crate::root::widgets::render_committed_tag`'s `committed` pill and no checkbox.
+    /// The old checkbox-slot marker is gone with the slot: there is no checkbox column in that
+    /// section for an inert `✓` to sit in.
+    pub(in crate::sidebar) fn render_change_row(
+        &self,
+        entry: &crate::provenance::change_set::ChangeSetEntry,
+        section: sections::ChangesSection,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = entry.path.clone();
+        let open_path = path.clone();
+        let staged = self.staged_files.contains(&entry.path);
+        let selected = self.open_change.as_deref() == Some(entry.path.as_path());
+        let stat = entry.stat();
+        let (add, del) = (stat.added, stat.removed);
+        let (dir, name) = changes::split_dir_name(&entry.path);
+        let tag = changes::change_tag(entry.status);
+        let segments = changes::stat_bar_segments(add, del);
+        let stageable = section.has_checkboxes();
+        // Only meaningful in the Against-main scope, which is the one that lists work already
+        // written down - see this method's own docs.
+        let committed = !stageable
+            && section == sections::ChangesSection::AgainstMain
+            && changes::is_committed_clean(&entry.path, self.dirty_files.as_ref());
+        // `theme::changes`' own docs: the filename owns "seen", the checkbox owns "staged" - one
+        // fact per channel.
+        let seen = self.seen_files.is_seen(&self.diff_root, &entry.path, stat) && stageable;
+        let renamed = self
+            .diff_for(section)
+            .map(|diff| {
+                diff.files
+                    .iter()
+                    .any(|file| file.path == entry.path && changes::is_real_rename(file))
+            })
+            .unwrap_or(false);
+        let selector_prefix = if stageable {
+            "change-row".to_string()
+        } else {
+            format!("{}-row", section.key())
+        };
+        let row_selector = format!("{selector_prefix}-{}", entry.path.display());
+        let edge_selector = format!("{row_selector}-selection-edge");
+        let dir_selector = format!("{selector_prefix}-dir-{}", entry.path.display());
+        let section_edge = section.edge_color();
+
+        div()
+            .id(gpui::SharedString::from(row_selector.clone()))
+            .debug_selector({
+                let row_selector = row_selector.clone();
+                move || row_selector
+            })
             .relative()
             .flex()
             .w_full()
@@ -1806,8 +2735,8 @@ impl AdeApp {
             .pl(px(9.0))
             // GitHub issue #123: reuses the same shared clearance the file tree's own rows use
             // (`crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs) - this row sits next to
-            // the identical overlay scrollbar (`Self::render_changes_rows`'s
-            // "changes-rows-scrollbar"), so it needs the same real gap, not just a
+            // the identical overlay scrollbar (`Self::render_changes_sections`'
+            // "changes-sections-scrollbar"), so it needs the same real gap, not just a
             // similar-looking bare number that happens to already clear the *old*,
             // insufficient value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
@@ -1822,22 +2751,23 @@ impl AdeApp {
             // row's content 2px right the instant it was clicked. See
             // `crate::graph_view::render::AdeApp::render_graph_row`'s identical fix for the full
             // reasoning - same bug, same shape, same fix: no bottom border, and a real, separate,
-            // always-painted child for the left selection edge.
+            // always-painted child for the left edge.
             .child(
                 div()
-                    .debug_selector({
-                        let path = file.path.clone();
-                        move || format!("change-row-{}-selection-edge", path.display())
-                    })
+                    .debug_selector(move || edge_selector)
                     .absolute()
                     .left_0()
                     .top_0()
                     .bottom_0()
                     .w(px(2.0))
+                    // The section's own edge colour (`REVISION-2026-08-14.md` §1's table:
+                    // uncommitted blue, branch-scope violet) is what this channel now carries, and
+                    // selection is painted over it - so an unselected row in a scoped section
+                    // still states which scope it is in, which is the whole point of the edge.
                     .bg(if selected {
                         theme::border::SELECTED_EDGE.into()
                     } else {
-                        work_surface::TRANSPARENT
+                        section_edge.unwrap_or(work_surface::TRANSPARENT)
                     }),
             )
             .when(selected, |el| el.bg(theme::surface::ROW_SELECTED))
@@ -1847,11 +2777,8 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.open_change_diff(open_path.clone(), window, cx);
             }))
-            .child(if committed {
-                self.render_committed_marker(&path).into_any_element()
-            } else {
-                self.render_staging_checkbox(path, staged, cx)
-                    .into_any_element()
+            .when(stageable, |el| {
+                el.child(self.render_staging_checkbox(path.clone(), staged, cx))
             })
             .when(!dir.is_empty(), |el| {
                 el.child(
@@ -1863,7 +2790,7 @@ impl AdeApp {
                     // claim on whatever space is available, and the directory prefix truncates on
                     // its own budget instead of squeezing the name down to make room.
                     div()
-                        .debug_selector(|| format!("change-row-dir-{}", file.path.display()))
+                        .debug_selector(move || dir_selector)
                         .flex_none()
                         .max_w(px(120.0))
                         .overflow_hidden()
@@ -1881,19 +2808,22 @@ impl AdeApp {
                     .overflow_hidden()
                     .truncate()
                     .font(font(theme::font::MONO))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(self.ui_text_size(11.5))
-                    // Staged rows read at full strength; unstaged drop to `theme::text::DIM` -
-                    // the exact inverse of the old "reviewed" dimming this replaces (Revision R12
-                    // §5), never both conventions at once. A committed-clean row lands on `DIM`
-                    // too, and correctly so under that same rule: this dimming means "not part of
-                    // the commit being composed", which is true of a file already sitting in an
-                    // earlier commit. Its `committed` pill and marker, not its text weight, are
-                    // what say *why*.
-                    .text_color(if staged {
-                        theme::text::STRONG
+                    .font_weight(if seen {
+                        gpui::FontWeight::NORMAL
                     } else {
+                        gpui::FontWeight::MEDIUM
+                    })
+                    .text_size(self.ui_text_size(11.5))
+                    // `STAGE-A-CHANGELOG.md` §4i: the filename itself carries **seen**, because
+                    // "when a row already contains the thing a state is about, style that thing".
+                    // Staged is the checkbox's job and only the checkbox's - do not reintroduce a
+                    // colour for it here.
+                    .text_color(if !stageable {
                         theme::text::DIM
+                    } else if seen {
+                        theme::changes::FILENAME_SEEN
+                    } else {
+                        theme::changes::FILENAME_UNSEEN
                     })
                     .child(name),
             )
@@ -1903,10 +2833,7 @@ impl AdeApp {
             .when(committed, |el| el.child(render_committed_tag()))
             // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
             // isn't `new`/`del`), so without this it looked identical to an unchanged file.
-            // `changes::is_real_rename` only fires when `old_path` differs from the current path.
-            .when(changes::is_real_rename(file), |el| {
-                el.child(render_moved_tag())
-            })
+            .when(renamed, |el| el.child(render_moved_tag()))
             .child(
                 div()
                     .flex_none()
@@ -1924,6 +2851,17 @@ impl AdeApp {
                     .child(format!("\u{2212}{del}")),
             )
             .child(render_stat_bar(segments))
+    }
+
+    /// The loaded `WorktreeDiff` behind one file section's rows - the Uncommitted section's
+    /// working-tree-against-`HEAD` diff, or the Against-main section's merge-base diff. `None` for
+    /// the two sections that draw no file rows at all.
+    fn diff_for(&self, section: sections::ChangesSection) -> Option<&WorktreeDiff> {
+        match section {
+            sections::ChangesSection::Uncommitted => self.uncommitted_diff.loaded(),
+            sections::ChangesSection::AgainstMain => self.current_diff(),
+            sections::ChangesSection::Runs | sections::ChangesSection::Commits => None,
+        }
     }
 
     /// The Changes row's 12×12 staging checkbox (Revision R12 §5: the checkbox **is** staging,
@@ -1969,38 +2907,6 @@ impl AdeApp {
             }))
     }
 
-    /// What sits in the checkbox slot for a committed-clean Changes row (GitHub issue #220): the
-    /// same 12×12 footprint so the list's text column stays aligned, holding an inert `✓` in
-    /// [`theme::text::GHOST`] - no border, no fill, no hover, no `cursor_pointer`, and above all
-    /// no click handler, because there is no real git operation for it to run. Staging an
-    /// already-committed, clean file is a `git add` that changes nothing, so a checkbox here would
-    /// be a control bound to a no-op - exactly the kind of thing that must not be drawn.
-    ///
-    /// The `✓` is deliberately grey rather than the checkbox's `theme::button::GREEN_FG`: green
-    /// means "staged for the next commit" everywhere else in this panel, and this state is the
-    /// different, quieter fact that the change is already in history. The row's `committed` pill
-    /// (`crate::root::widgets::render_committed_tag`) carries the word itself; a
-    /// [`text_tooltip`] spells it out on hover.
-    pub(in crate::sidebar) fn render_committed_marker(&self, path: &Path) -> impl IntoElement {
-        let selector = format!("committed-marker-{}", path.display());
-        div()
-            .id(format!("committed-marker-{}", path.display()))
-            .debug_selector(move || selector)
-            .flex_none()
-            .w(px(12.0))
-            .h(px(12.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font(font(theme::font::MONO))
-            .text_size(self.ui_text_size(9.0))
-            .text_color(theme::text::GHOST)
-            .child("\u{2713}")
-            .tooltip(text_tooltip(
-                "Already committed on this branch - nothing to stage",
-            ))
-    }
-
     /// The commit composer at the foot of the Changes panel (Revision R12 §5): header row
     /// (`COMMIT` · `N of M staged` · staged diffstat), a pre-drafted message box, and the primary
     /// commit action with its `▾` split-button menu. The staged set is derived once, early
@@ -2011,16 +2917,22 @@ impl AdeApp {
     /// looking ghost `Commit` in that case (never hidden outright).
     pub(in crate::sidebar) fn render_commit_composer(
         &self,
-        diff: &WorktreeDiff,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let staged = changes::staged_subset(&diff.files, &self.staged_files);
+        // The **uncommitted** scope, not the merge-base diff this used to read (GitHub issue
+        // #285). A commit composer's denominator is what is dirty in the checkout; the merge-base
+        // diff also lists files whose only difference from `main` is already committed, which is
+        // why it needed `changes::stageable_count` to subtract them back out again. That
+        // subtraction is gone with the need for it - everything in this list is genuinely
+        // stageable, by construction of the scope.
+        let uncommitted: &[DiffFile] = self
+            .uncommitted_diff
+            .loaded()
+            .map(|diff| diff.files.as_slice())
+            .unwrap_or(&[]);
+        let staged = changes::staged_subset(uncommitted, &self.staged_files);
         let staged_count = staged.len();
-        // The stageable count, not `diff.files.len()` - same reasoning as
-        // `Self::render_changes_header`'s own denominator (GitHub issue #220): a committed-clean
-        // file can never join this commit, so counting it here would make `N of M staged` claim
-        // outstanding work that doesn't exist.
-        let total = changes::stageable_count(&diff.files, self.dirty_files.as_ref());
+        let total = uncommitted.len();
         let (add, del) = changes::staged_diff_stats(&staged);
         let stat_text = if staged_count > 0 {
             format!("+{add} \u{2212}{del}")
@@ -2035,46 +2947,29 @@ impl AdeApp {
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| "(detached)".to_string());
 
-        // The agent whose tint/initial the message box's chip shows - the current worktree's
-        // first real agent, if any. There is no per-message "which agent drafted this"
-        // fact to read (`changes::draft_commit_message`'s own docs cover why the message itself
-        // is a deterministic placeholder, not real agent output) - `ProcessKind::Shell`'s
-        // existing neutral chip (`work_surface::agent_tint`'s own docs: "isn't an agent, so it
-        // gets a neutral chip instead of an invented tint") is the honest fallback with none.
-        let drafting_kind = self
-            .current_worktree_agents()
-            .find(|agent| agent.kind.is_agent_session())
-            .map(|agent| agent.kind);
-        let drafted_by = match drafting_kind {
-            Some(kind) => format!("drafted by {}", kind.label()),
-            None => "drafted by no agent".to_string(),
-        };
-        let chip_kind = drafting_kind.unwrap_or(ProcessKind::Shell);
-        let (chip_fg, chip_bg) = work_surface::agent_tint(chip_kind);
-        let chip_initial = work_surface::agent_initial(chip_kind);
-
-        let message = if staged.is_empty() {
-            String::new()
-        } else {
-            changes::draft_commit_message(&staged)
-        };
+        // The single source of truth every commit path writes - the user's own typed text, and
+        // nothing else (see `Self::staged_commit_message`'s own docs for the auto-drafted
+        // fallback this used to have and why it was removed).
+        let message = self.staged_commit_message();
 
         let busy = self.worktree_history_op_in_flight.is_some();
         let committing = self.worktree_history_op_in_flight
             == Some(worktree_history::WorktreeHistoryOpKind::Commit);
-        let can_commit = staged_count > 0 && !busy;
+        let can_commit = staged_count > 0 && !message.trim().is_empty() && !busy;
         let label = if committing {
             "committing\u{2026}".to_string()
         } else {
             changes::commit_button_label(staged_count)
         };
-        // Visual state (green vs. ghost) tracks whether anything is staged, independent of
-        // `can_commit`'s click-gating - the same "keep the enabled look while a busy label
-        // shows" precedent `Self::render_footer_action_button` already follows for its own
-        // `discarding…`/`keeping…` busy labels.
-        let has_staged = staged_count > 0;
+        // Visual state (green vs. ghost) tracks the same "would this click actually do
+        // something" fact `can_commit` gates on, *except* busy - the same "keep the enabled look
+        // while a busy label shows" precedent `Self::render_footer_action_button` already follows
+        // for its own `discarding…`/`keeping…` busy labels. Staged-but-no-message deliberately
+        // stays ghost, not green: a green, clickable-looking button that silently no-ops without
+        // a message would be exactly the anti-pattern this composer's own docs warn against.
+        let ready_to_commit = staged_count > 0 && !message.trim().is_empty();
         let (primary_bg, primary_border, primary_fg): (gpui::Rgba, gpui::Rgba, gpui::Rgba) =
-            if has_staged {
+            if ready_to_commit {
                 (
                     theme::button::GREEN_BG.into(),
                     theme::button::GREEN_BG.into(),
@@ -2192,86 +3087,81 @@ impl AdeApp {
                     ),
             )
             .child(
-                // The pre-drafted message box.
+                // The message box - a normal text input the user fills in themselves, nothing
+                // pre-drafted (see `Self::staged_commit_message`'s own docs).
                 div()
+                    .id("commit-composer-message")
+                    .debug_selector(|| "commit-composer-message-field".to_string())
                     .flex_none()
                     .border_1()
                     .border_color(theme::border::CARD)
                     .rounded(theme::radius::CARD_SM)
                     .bg(theme::surface::CARD_SUNK)
                     .px(px(9.0))
-                    .pt(px(7.0))
-                    .pb(px(8.0))
+                    .py(px(7.0))
+                    .track_focus(&self.commit_message_focus_handle)
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_commit_message_text_undo))
+                    .on_action(cx.listener(Self::handle_commit_message_text_redo))
+                    .on_key_down(cx.listener(Self::handle_commit_message_key_down))
+                    .cursor_text()
+                    // Live report ("carret is not centered verticaly, when typing it goes to the
+                    // right side of the input"): this row used to be `.items_start()` with
+                    // `.flex_1().min_w_0()` on the *text* div below. `flex_1` stretched the text
+                    // div's layout box across the whole field, so the caret - a `flex_none`
+                    // sibling rendered *after* it in DOM order once the message is non-empty -
+                    // sat pinned at the field's right edge instead of adjacent to the last glyph,
+                    // and `items_start` top-aligned the 14px caret bar against the 17px text
+                    // line. Now the exact structure every working simple input uses
+                    // (`Self::render_rail_filter_row`'s caret+text wrapper, `Self::
+                    // render_new_file_prompt`'s name box): an `items_center` row whose text div is
+                    // intrinsically sized, so the caret sits right next to the real text.
+                    //
+                    // No decorative gap before the caret - see
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own comment for why
+                    // (live report: it read as a gap between the typed text and where it's
+                    // actually being typed). This field was written while that 2px gap was still
+                    // on every other input in the app; it goes here for the same reason it went
+                    // everywhere else.
+                    .flex()
+                    .items_center()
+                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                        this.focus_commit_message(window, cx);
+                    }))
+                    // Mirrors `Self::render_rail_filter_row`'s own fix exactly (GitHub issue #45):
+                    // a caret pinned unconditionally *after* this child sits glued to the end of
+                    // the placeholder when the field is empty, instead of at the real cursor
+                    // position (0, before any text at all). It belongs before the placeholder
+                    // when empty and after the real message once there is any.
+                    .when(message.is_empty(), |el| {
+                        el.child(self.render_simple_input_caret(
+                            "commit-composer-message-caret",
+                            &self.commit_message_focus_handle,
+                        ))
+                    })
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pb(px(5.0))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(13.0))
-                                    .h(px(13.0))
-                                    .rounded(theme::radius::CHIP)
-                                    .bg(chip_bg)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font(font(theme::font::MONO))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_size(px(7.5))
-                                    .text_color(chip_fg)
-                                    .child(chip_initial),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .truncate()
-                                    .font(font(theme::font::SANS))
-                                    .text_size(px(9.5))
-                                    .text_color(theme::text::FAINTER)
-                                    .child(drafted_by),
-                            )
-                            .child(
-                                // Non-interactive by design: there is no real agent-drafted
-                                // message generation to redraft *from* yet - see
-                                // `changes::draft_commit_message`'s own docs. Shown, never
-                                // clickable-looking (no cursor/hover), matching this codebase's
-                                // `ActionKind::Unimplemented` convention for a real, visible,
-                                // honestly-inert affordance.
-                                div()
-                                    .flex_none()
-                                    .font(font(theme::font::SANS))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_size(px(9.5))
-                                    .text_color(theme::text::DIMMER)
-                                    .child("redraft"),
-                            ),
+                            .debug_selector(move || message_selector)
+                            .font(font(theme::font::SANS))
+                            .text_size(px(11.5))
+                            .line_height(px(17.0))
+                            .text_color(if message.is_empty() {
+                                theme::text::FAINT
+                            } else {
+                                theme::text::STRONG
+                            })
+                            .child(if message.is_empty() {
+                                "commit message".to_string()
+                            } else {
+                                message.clone()
+                            }),
                     )
-                    .child(
-                        div().flex().items_start().child(
-                            div()
-                                .debug_selector(move || message_selector)
-                                .flex_1()
-                                .min_w_0()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(11.5))
-                                .line_height(px(17.0))
-                                .text_color(if message.is_empty() {
-                                    theme::text::FAINT
-                                } else {
-                                    theme::text::STRONG
-                                })
-                                .child(if message.is_empty() {
-                                    "no files staged yet".to_string()
-                                } else {
-                                    message
-                                }),
-                        ),
-                    ),
+                    .when(!message.is_empty(), |el| {
+                        el.child(self.render_simple_input_caret(
+                            "commit-composer-message-caret",
+                            &self.commit_message_focus_handle,
+                        ))
+                    }),
             )
             .child(
                 // Primary action + split-button menu + right-aligned target branch.
@@ -2362,9 +3252,13 @@ impl AdeApp {
     }
 
     /// The commit composer's `▾` split-button popover (Revision R12 §5): *Commit and push* /
-    /// *Commit all N files* / *Amend last commit* / *Stash staged files*. Opens **upward** -
-    /// `bottom`-anchored, not `top` - since the button it hangs off sits near the bottom of the
-    /// Changes panel.
+    /// *Commit all files* / *Amend last commit* / *Stash staged files*.
+    ///
+    /// Opens **downward**, `top`-anchored. It used to open upward, because the composer used to
+    /// sit at the foot of the Changes panel; GitHub issue #285 pinned the composer *above* the
+    /// four sections instead (`REVISION-2026-08-14.md` §1), so an upward popover would now open
+    /// into the panel header and off the top of the window. Direction follows the anchor, and the
+    /// anchor moved.
     ///
     /// ## Why this is rendered from `AdeApp::render`, not from the composer (GitHub issue #176)
     ///
@@ -2383,35 +3277,26 @@ impl AdeApp {
     /// `crate::graph_view::render::AdeApp::render_graph_view`'s own docs record the same move for
     /// the graph's two menus, made for the same reason.
     ///
-    /// Every row is real, visible, and **honestly non-interactive**: only the primary `Commit N
-    /// files` button (`Self::commit_staged_files`, backed by a real `wt_core::undo::commit_paths`)
-    /// has real backing today. Push credentials, amend, and stash all need real git plumbing this
-    /// phase doesn't add - each row is dimmed and un-clickable, the same
-    /// `work_surface::state::ActionKind::Unimplemented` convention this codebase already uses for
-    /// "visible, real, but not wired up yet" (never a clickable-looking no-op).
-    pub(crate) fn render_commit_menu(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        // The composer's own painted box, in window space. The popover keeps its R12 §5 geometry
-        // relative to that box - inset 12px on both sides, 44px of clearance above the composer's
-        // bottom edge so it clears the primary button row - just expressed against the window now
-        // that this is a root-level child.
+    /// **Every row is real** as of GitHub issue #285. They were placeholders - dimmed, visible,
+    /// un-clickable - which `REVISION-2026-08-14.md` §7 rule 1 rules out for good: *"Ship the
+    /// affordance with the behaviour, or ship neither."* Each is now backed by a real `wt_core`
+    /// call ([`CommitMenuAction`]), and a row that genuinely cannot act right now is dimmed with
+    /// the **reason** in place of its hint rather than looking clickable and doing nothing.
+    pub(crate) fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The composer's own painted box, in window space. The popover keeps its R12 §5 side
+        // geometry relative to that box - inset 12px on both sides - and hangs 1px below its
+        // bottom edge, so it reads as belonging to the `▾` it came from rather than floating.
         let composer = self.commit_composer_bounds;
-        let window_height = window.bounds().size.height;
         let popover_left = composer.origin.x + px(12.0);
         let popover_width = (composer.size.width - px(24.0)).max(px(0.0));
-        let popover_bottom = window_height - (composer.origin.y + composer.size.height) + px(44.0);
+        let popover_top = composer.origin.y + composer.size.height + px(1.0);
 
         let branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.path == self.diff_root)
-            .and_then(|item| item.branch.clone())
+            .composer_branch()
             .unwrap_or_else(|| "(detached)".to_string());
         let total = self
-            .current_diff()
+            .uncommitted_diff
+            .loaded()
             .map(|diff| diff.files.len())
             .unwrap_or(0);
 
@@ -2465,80 +3350,155 @@ impl AdeApp {
                         .left(popover_left)
                         .w(popover_width)
                         // The scrim starts at `theme::band::TITLE_BAR`, not at the window top, so
-                        // a distance measured from the *window's* bottom edge still lands right -
-                        // `bottom` is unaffected by where the top edge was clipped.
-                        .bottom(popover_bottom)
+                        // a `top` measured in window space has to have that offset taken back off
+                        // - the scrim's own origin *is* `TITLE_BAR`, and an absolutely-positioned
+                        // child resolves against its positioned ancestor, not the window.
+                        .top(popover_top - theme::band::TITLE_BAR)
                         // Kept from when this popover lived inside the composer: it paints over
                         // real Changes rows and the primary commit button, and blocking the mouse
                         // structurally (rather than relying on bubble-phase listener ordering)
                         // is what stops a click on the panel reaching them.
                         .occlude()
                         .py(px(4.0)),
-                    // `COMMIT_MENU`, not `MENU`: same blur/alpha as every other menu (GitHub
-                    // issue #129), just a negative `y` for this popover's own upward-opening
-                    // direction - see that constant's own docs.
-                    theme::shadow::COMMIT_MENU,
+                    // `MENU`, like every other downward-opening popover in the app, now that
+                    // this one opens downward too - `COMMIT_MENU`'s negative `y` existed only for
+                    // the upward direction this popover no longer has.
+                    theme::shadow::MENU,
                 )
                 .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
                 }))
-                .child(render_commit_menu_row(
-                    "Commit and push",
-                    format!("origin/{branch}"),
-                ))
-                .child(render_commit_menu_row(
-                    "Commit all files",
-                    format!("stages the rest first \u{2022} {total} total"),
-                ))
-                .child(render_commit_menu_row(
-                    "Amend last commit",
-                    "rewrites the tip".to_string(),
-                ))
-                .child(render_commit_menu_row(
-                    "Stash staged files",
-                    "keeps the worktree clean".to_string(),
-                )),
+                .children(CommitMenuAction::ORDER.map(|action| {
+                    self.render_commit_menu_row(action, action.hint(&branch, total), cx)
+                })),
             )
     }
 }
 
-/// One row of [`AdeApp::render_commit_menu`]'s split-button popover - label + sub-label, no
-/// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
-/// deliberately doesn't reuse: the design has no per-row glyph here). Always dimmed and
-/// non-interactive - see [`AdeApp::render_commit_menu`]'s own docs for why.
-///
-/// Deliberately no `.hover()` - `crate::work_surface::render::AdeApp::render_footer_action`'s own
-/// docs already establish this codebase's rule for an unimplemented action: never a clickable-
-/// looking no-op. The real gap GitHub issue #128 found wasn't a missing hover, it was that
-/// nothing dimmed the row enough to read as disabled *without* one - the `.opacity()` below is
-/// that fix, at the same whole-row grain `crate::graph_view::render`'s dashed elbow segments use
-/// for an analogous "still real, just visually de-emphasized" treatment.
-fn render_commit_menu_row(label: &'static str, sub: String) -> impl IntoElement {
-    div()
-        .id(format!("commit-menu-row-{label}"))
-        .debug_selector(move || format!("commit-menu-row-{label}"))
-        .flex()
-        .flex_col()
-        .gap(px(1.0))
-        .px(px(10.0))
-        .py(px(5.0))
-        .cursor_default()
-        .opacity(0.5)
-        .child(
-            div()
-                .font(font(theme::font::SANS))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(11.0))
-                .text_color(theme::text::GHOSTER)
-                .child(label),
-        )
-        .child(
-            div()
-                .font(font(theme::font::MONO))
-                .text_size(px(9.5))
-                .text_color(theme::text::FAINTER)
-                .child(sub),
-        )
+/// The four real actions the commit composer's `▾` split-button menu offers, each backed by a real
+/// `wt_core` call - see [`AdeApp::run_commit_menu_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitMenuAction {
+    /// `wt_core::undo::commit_paths` then `wt_core::remote::push_branch`.
+    CommitAndPush,
+    /// `wt_core::undo::commit_all_changes` - `git add -A` and commit, not just the staged subset.
+    CommitAllFiles,
+    /// `wt_core::undo::amend_head_with_paths` - folds the staged paths into the tip, keeping its
+    /// message.
+    AmendLastCommit,
+    /// `wt_core::undo::stash_staged` - `git stash push --staged`, leaving unstaged work alone.
+    StashStaged,
+}
+
+impl CommitMenuAction {
+    /// Top to bottom, in the order the mock lists them.
+    pub(crate) const ORDER: [CommitMenuAction; 4] = [
+        CommitMenuAction::CommitAndPush,
+        CommitMenuAction::CommitAllFiles,
+        CommitMenuAction::AmendLastCommit,
+        CommitMenuAction::StashStaged,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            CommitMenuAction::CommitAndPush => "Commit and push",
+            CommitMenuAction::CommitAllFiles => "Commit all files",
+            CommitMenuAction::AmendLastCommit => "Amend last commit",
+            CommitMenuAction::StashStaged => "Stash staged files",
+        }
+    }
+
+    /// The row's sub-label when the action really can run - what it will *do*, in the real terms
+    /// of this worktree (its branch, its file count), never a generic sentence.
+    pub(crate) fn hint(self, branch: &str, uncommitted_files: usize) -> String {
+        match self {
+            CommitMenuAction::CommitAndPush => format!("origin/{branch}"),
+            CommitMenuAction::CommitAllFiles => format!(
+                "stages the rest first \u{2022} {}",
+                plural::count(uncommitted_files, "file", None)
+            ),
+            CommitMenuAction::AmendLastCommit => "rewrites the tip".to_string(),
+            CommitMenuAction::StashStaged => "keeps the worktree clean".to_string(),
+        }
+    }
+
+    /// The stable id/selector fragment for this row.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            CommitMenuAction::CommitAndPush => "commit-and-push",
+            CommitMenuAction::CommitAllFiles => "commit-all-files",
+            CommitMenuAction::AmendLastCommit => "amend-last-commit",
+            CommitMenuAction::StashStaged => "stash-staged-files",
+        }
+    }
+}
+
+impl AdeApp {
+    /// One row of [`AdeApp::render_commit_menu`]'s split-button popover - label + sub-label, no
+    /// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
+    /// deliberately doesn't reuse: the design has no per-row glyph here).
+    ///
+    /// A row whose action can really run is a real click target with a real hover. A row whose
+    /// action cannot states the reason where its hint would be and keeps the
+    /// no-cursor/no-hover/no-handler treatment this codebase already uses for an action that is
+    /// visible but not available - never a clickable-looking no-op
+    /// (`crate::work_surface::render::AdeApp::render_footer_action`'s own rule).
+    fn render_commit_menu_row(
+        &self,
+        action: CommitMenuAction,
+        hint: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let availability = self.commit_menu_availability(action);
+        let enabled = availability.is_ok();
+        let sub = match &availability {
+            Ok(()) => hint,
+            Err(reason) => reason.clone(),
+        };
+        let selector = format!("commit-menu-row-{}", action.key());
+        let state_selector = format!(
+            "commit-menu-row-{}-{}",
+            action.key(),
+            if enabled { "enabled" } else { "disabled" }
+        );
+
+        div()
+            .id(gpui::SharedString::from(selector))
+            .debug_selector(move || state_selector)
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .px(px(10.0))
+            .py(px(5.0))
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.run_commit_menu_action(action, cx);
+                    }))
+            })
+            .when(!enabled, |el| el.cursor_default().opacity(0.5))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(11.0))
+                    .text_color(if enabled {
+                        theme::text::HEADING
+                    } else {
+                        theme::text::GHOSTER
+                    })
+                    .child(action.label()),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.5))
+                    .text_color(theme::text::FAINTER)
+                    .child(sub),
+            )
+    }
 }
 
 /// Which data source the right sidebar currently shows for the selected worktree - Zone 3's
@@ -3032,16 +3992,19 @@ mod virtualization_tests {
         );
     }
 
-    /// The Changes list got the same treatment, and needs the same proof.
+    /// The Changes panel gets the same treatment, and needs the same proof - and needs it *more*
+    /// since GitHub issue #285 moved it from `gpui::uniform_list` to `gpui::list` (four sections
+    /// of genuinely different row heights in one scroller, which `uniform_list` cannot represent).
+    /// A different virtualized element is still a virtualized element only if a real render says
+    /// so, which is what this asserts.
     ///
-    /// The margin here is real but thinner than it looks, so it is worth stating rather than
-    /// implying: the test display is 1920x1080
-    /// (`vendor/zed/crates/gpui/src/platform/test/display.rs`), and `MAX_RENDERED_DIFF_FILES`
-    /// (40) rows at `theme::band::CHANGE_ROW` (27px) is exactly 1080px. What puts the last row
-    /// off screen is the ~159px of real window chrome above and below it (title bar, panel
-    /// header, Changes header, footer, status bar) - about five rows' worth. If that chrome ever
-    /// shrinks substantially this test fails loudly rather than silently passing for the wrong
-    /// reason, but it is not the comfortable margin a bigger row count would buy.
+    /// The margin is real but worth stating: the test display is 1920x1080
+    /// (`vendor/zed/crates/gpui/src/platform/test/display.rs`), and 40 file rows at
+    /// `theme::band::CHANGE_ROW` (27px) is exactly 1080px - so what puts the last row off screen
+    /// is the real window chrome above and below it (title bar, panel header, commit composer,
+    /// four section headers, footer, status bar), which under the new layout is substantially
+    /// *more* than the ~159px it used to be. If that chrome ever shrinks drastically this test
+    /// fails loudly rather than silently passing for the wrong reason.
     #[gpui::test]
     fn a_changes_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -4514,6 +5477,93 @@ mod commit_composer_tests {
         (app, cx)
     }
 
+    /// A real click into the message field plus real keystrokes - there is no auto-drafted
+    /// fallback any more (see `AdeApp::staged_commit_message`'s own docs), so every test that
+    /// needs a real commit to actually happen has to type one first, the same way a real user
+    /// would.
+    fn type_commit_message(cx: &mut gpui::VisualTestContext, text: &str) {
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.simulate_input(text);
+        cx.run_until_parked();
+    }
+
+    /// Live report ("The input is completly broken, carret is not centered verticaly, when
+    /// typing it goes to the right side of the input"): the message *text* div used to carry
+    /// `.flex_1().min_w_0()`, which stretched its own layout box across the whole field, so the
+    /// caret - the next `flex_none` sibling in the row once a message exists - painted pinned
+    /// at the field's right edge no matter how short the typed message was, and the row's
+    /// `.items_start()` top-aligned the 14px caret bar against the text line instead of
+    /// centering it. Same measured-bounds discipline as
+    /// `rail::render::rail_filter_caret_tests`: the caret must sit before the placeholder when
+    /// empty, hug the real typed text's right edge (not the field's) once typed, and sit
+    /// vertically centered in the field.
+    #[gpui::test]
+    fn message_caret_hugs_the_real_text_and_is_vertically_centered(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let field = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let empty_caret = cx
+            .debug_bounds("commit-composer-message-caret")
+            .expect("the caret element must really lay out with an empty message");
+        let placeholder = cx
+            .debug_bounds("commit-composer-message-empty")
+            .expect("the placeholder text must really paint");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty message, the caret must sit before (at or left of) the \
+             placeholder's own start x - got caret {empty_caret:?} vs placeholder \
+             {placeholder:?}",
+        );
+
+        cx.simulate_input("fix");
+        cx.run_until_parked();
+
+        let caret = cx
+            .debug_bounds("commit-composer-message-caret")
+            .expect("the caret element must really lay out with a typed message");
+        let text = cx
+            .debug_bounds("commit-composer-message-fix")
+            .expect("the real typed message must really paint");
+        let field = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        let text_right = text.origin.x + text.size.width;
+        assert!(
+            caret.origin.x >= text_right,
+            "with a typed message, the caret must sit at or after the text's own right edge - \
+             got caret {caret:?} vs text {text:?}",
+        );
+        assert!(
+            caret.origin.x - text_right <= px(4.0),
+            "the caret must hug the real typed text's right edge, not sit pushed to the \
+             field's right edge (the flex_1-on-the-text-div bug) - got caret {caret:?} vs \
+             text {text:?}",
+        );
+        let field_right = field.origin.x + field.size.width;
+        assert!(
+            field_right - (caret.origin.x + caret.size.width) > px(20.0),
+            "for a short message the caret must be well clear of the field's right edge - \
+             got caret {caret:?} in field {field:?}",
+        );
+        let caret_center = caret.origin.y + caret.size.height / 2.0;
+        let field_center = field.origin.y + field.size.height / 2.0;
+        assert!(
+            caret_center >= field_center - px(2.0) && caret_center <= field_center + px(2.0),
+            "the caret must be vertically centered in the field - got caret center \
+             {caret_center:?} vs field center {field_center:?} (caret {caret:?}, field \
+             {field:?})",
+        );
+    }
+
     #[gpui::test]
     fn the_composer_reflects_real_staged_count_diffstat_branch_and_message(
         cx: &mut TestAppContext,
@@ -4565,12 +5615,10 @@ mod commit_composer_tests {
             "the stale 0-of-2 header must not still be painted alongside the new one"
         );
         assert!(
-            cx.debug_bounds("commit-composer-message-Update a.txt")
-                .is_some(),
-            "with only a.txt staged, the message box must show \
-             `changes::draft_commit_message`'s real single-file draft for that exact path - the \
-             same fixture shape `changes::tests::draft_commit_message_names_the_one_file_when_\
-             exactly_one_is_staged` already establishes"
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "staging a.txt must not put any text in the message box on its own - there is no \
+             auto-drafted fallback (removed per explicit product decision); the user has to type \
+             their own message"
         );
         assert!(
             cx.debug_bounds("commit-composer-stat-").is_none(),
@@ -4627,6 +5675,338 @@ mod commit_composer_tests {
         );
     }
 
+    /// The other half of the same "genuine no-op" rule: something staged but no message typed
+    /// must also refuse to commit - "a normal message input that the user has to fill", not an
+    /// optional one with a fallback.
+    #[gpui::test]
+    fn the_primary_button_is_a_genuine_no_op_with_nothing_typed(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.staged_commit_message().is_empty()),
+            "premise: something is staged, but no message has been typed"
+        );
+
+        let commits_before = commit_count(repo.path());
+        let bounds = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint even with no message");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "a real click on the primary button with something staged but no message must never \
+             create a real commit"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
+            "a disabled click must never even set the real \"committing…\" status"
+        );
+    }
+
+    /// GitHub issue #285 follow-up (live report): the message box painted a real draft but had
+    /// no way to edit it at all - a click and a keystroke changed nothing. Driven through a real
+    /// click on the real painted field, then real simulated keystrokes, exactly the way
+    /// `rail::render::rail_filter_caret_tests::caret_sits_before_the_placeholder_when_empty_and_\
+    /// after_the_text_once_typed` proves the rail filter's own field is real.
+    #[gpui::test]
+    fn clicking_the_message_box_and_typing_really_edits_it(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "sanity check: staging a.txt puts no text in the box - there is no auto-drafted \
+             fallback"
+        );
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let (focused, message_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.commit_message_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&message_handle),
+            "a real click on the field must really focus it"
+        );
+
+        cx.simulate_input("fixes the race, closes #1");
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race, closes #1",
+            "the real keystrokes must land in the field, not vanish"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "fixes the race, closes #1",
+            "the edited text must be what the composer would actually commit - the same single \
+             source of truth the primary button and the ▾ menu both read"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-message-fixes the race, closes #1")
+                .is_some(),
+            "the box must really repaint the user's own typed text"
+        );
+    }
+
+    /// Live report: "once a file is staged the commit message input breaks again... this should
+    /// be the same input." Typed first, before anything is staged (so the field seeds from the
+    /// empty draft, not a real file's), then a file gets staged out from under it - the field
+    /// must keep the user's own text, keep real keyboard focus, and keep accepting real
+    /// keystrokes, exactly the way [`clicking_the_message_box_and_typing_really_edits_it`] proves
+    /// for the reverse order (stage first, then type).
+    #[gpui::test]
+    fn typing_before_staging_survives_a_later_stage(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "sanity check: nothing is staged yet, so the box starts on the empty draft"
+        );
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let message_handle = app.update_in(cx, |app, _window, _cx| {
+            app.commit_message_focus_handle.clone()
+        });
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&message_handle),
+            "a real click on the empty field must really focus it"
+        );
+
+        cx.simulate_input("fixes the race");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race",
+            "sanity check: typing into the empty field works before anything is staged"
+        );
+
+        // A real click on the checkbox itself, not a direct `toggle_staged` call - this goes
+        // through GPUI's real mouse-down/mouse-up dispatch, which is what a live mousedown-then-
+        // blur interaction (were there one) would actually exercise.
+        let checkbox = cx
+            .debug_bounds("stage-checkbox-a.txt")
+            .expect("the staging checkbox must really paint");
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app
+                .staged_files
+                .contains(&PathBuf::from("a.txt"))),
+            "sanity check: the click really staged the file"
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race",
+            "staging a file must not touch the user's own already-typed message"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "fixes the race",
+            "and the composer must still read the user's text, not fall back to a fresh draft \
+             for the newly-staged file"
+        );
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&message_handle),
+            "staging a file must not steal keyboard focus off the message field"
+        );
+
+        cx.simulate_input(", closes #2");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race, closes #2",
+            "the field must still be genuinely editable after a stage happened under it - not \
+             just displaying stale text but refusing further real keystrokes"
+        );
+    }
+
+    /// Live report: staging a file made the message box's caret "align right of the input, not
+    /// blinking" - GitHub issue #45's own failure mode, taken literally, the same live-loop proof
+    /// `rail::render::focusing_the_rail_filter_starts_the_real_shared_blink_loop` uses:
+    /// `commit_message_focus_handle` was built inside the `Self` literal in `root::state`, so it
+    /// could not join the constructor's first `AdeApp::wire_caret_blink` call (that one runs
+    /// before `this` exists) and needed to join the later, second call the way
+    /// `graph_state.branches_filter_focus_handle`/`new_file_focus_handle`/
+    /// `graph_state.branch_prompt_focus_handle` already do - it had been left out of both.
+    /// Left out, `caret_blink_visible` never toggles for this field: it stays frozen at whatever
+    /// it happened to be, which reads as "solid, not blinking" - and once a staged file's draft
+    /// makes the message non-empty, that frozen bar sits after the real text, i.e. "aligned right
+    /// of the input".
+    #[gpui::test]
+    fn focusing_the_commit_message_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        // `on_focus`/`on_blur` only fire while GPUI considers the window itself "active" - see
+        // `focusing_the_rail_filter_starts_the_real_shared_blink_loop`'s own docs.
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "a fresh focus must start solid/visible"
+        );
+
+        cx.background_executor.advance_clock(
+            crate::root::caret_blink::CARET_BLINK_INTERVAL + std::time::Duration::from_millis(50),
+        );
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "focusing the commit message field must have started the real, live shared blink \
+             task - if `commit_message_focus_handle` were never wired into \
+             `AdeApp::wire_caret_blink`, no timer would be running at all and this flag would \
+             still be stuck solid"
+        );
+    }
+
+    /// The edited message must be what a real commit actually writes, not just what the box
+    /// displays - the whole point of wiring the field into `staged_commit_message` rather than a
+    /// parallel piece of state the primary button never reads.
+    #[gpui::test]
+    fn a_real_commit_writes_the_users_own_edited_message(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_input("REWRITTEN");
+        cx.run_until_parked();
+
+        let primary = cx
+            .debug_bounds("commit-composer-primary")
+            .expect("the primary button must really paint with something staged and a message");
+        cx.simulate_click(primary.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let log = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(repo.path())
+            .output()
+            .expect("real git log");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "REWRITTEN",
+            "the real commit on disk must carry the user's own typed message verbatim"
+        );
+    }
+
+    /// Focusing the field alone (no real keystroke) must not itself become an undoable step -
+    /// the very first `Ctrl+Z` after clicking in must not blank a message the user never typed.
+    #[gpui::test]
+    fn focusing_the_message_field_is_not_itself_an_undoable_step(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| !app.commit_message.can_undo()),
+            "clicking into the field must not itself be a real, undoable edit"
+        );
+
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.commit_message.can_undo()),
+            "sanity check: a real keystroke must be undoable"
+        );
+    }
+
+    /// Live report: "just check a file to be staged and the commit message becomes... visually
+    /// [broken]... why does the carret change once we stage a file?", followed by: "Just don't
+    /// draft messages from staged files anymore... use a normal message input that the user has
+    /// to fill." There is no more auto-drafted fallback at all (see
+    /// `Self::staged_commit_message`'s own docs) - staging, unstaging, or staging a second file
+    /// must never put any text in the box or take any away from what the user actually typed.
+    #[gpui::test]
+    fn staging_never_writes_anything_into_the_message_box(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "",
+            "sanity check: nothing staged, nothing typed - the box is genuinely empty"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+            app.toggle_staged(PathBuf::from("b.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "",
+            "staging two files must not draft any message at all - the box stays exactly what \
+             the user left it as"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "and the box really paints the plain empty placeholder, not a derived string"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+            app.toggle_staged(PathBuf::from("b.txt"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "",
+            "unstaging everything again must not have written anything either"
+        );
+    }
+
     #[gpui::test]
     fn clicking_the_primary_button_reaches_the_real_commit_staged_files_action(
         cx: &mut TestAppContext,
@@ -4639,6 +6019,7 @@ mod commit_composer_tests {
             app.toggle_staged(a_path.clone(), cx);
         });
         cx.run_until_parked();
+        type_commit_message(cx, "update a.txt");
 
         let commits_before = commit_count(repo.path());
 
@@ -4720,63 +6101,211 @@ mod commit_composer_tests {
         );
     }
 
+    /// `REVISION-2026-08-14.md` §7 rule 1: "Ship the affordance with the behaviour, or ship
+    /// neither." Every one of the four `▾` rows used to be a dimmed placeholder; each is now
+    /// backed by a real `wt_core` call, and this proves it against a real repository - a real
+    /// commit object, a real amend, a real stash - rather than trusting the row's own docs.
     #[gpui::test]
-    fn every_commit_menu_row_except_the_primary_button_is_genuinely_inert(cx: &mut TestAppContext) {
+    fn commit_and_push_really_commits_and_reports_the_real_push_failure(cx: &mut TestAppContext) {
+        // No `origin` in this fixture, deliberately: the commit half must really happen and the
+        // push half must fail *loudly*, with git's own words on the status line. A row that
+        // silently swallowed an unreachable remote would be the worst of both worlds.
         let repo = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
-
-        let a_path = PathBuf::from("a.txt");
         app.update(cx, |app, cx| {
-            app.toggle_staged(a_path, cx);
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+        type_commit_message(cx, "update a.txt");
+
+        let commits_before = commit_count(repo.path());
+        app.update(cx, |app, cx| {
+            app.run_commit_menu_action(CommitMenuAction::CommitAndPush, cx);
         });
         cx.run_until_parked();
 
-        let toggle_bounds = cx
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before + 1,
+            "the commit half of `Commit and push` must really create a commit object"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"]),
+            "a.txt",
+            "and it must contain exactly the staged path, not the whole worktree"
+        );
+        let status = app
+            .read_with(cx, |app, _| app.worktree_history_status.clone())
+            .expect("the action must report what happened");
+        assert!(
+            status.contains("failed"),
+            "with no `origin` configured the push must surface its real failure, not be silently \
+             swallowed - got {status:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn commit_all_files_really_commits_the_unstaged_ones_too(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        // Nothing staged at all: this is the row's whole point - it stages the rest first.
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "premise: nothing is staged, so a plain `Commit` could not do this"
+        );
+        type_commit_message(cx, "commit everything");
+        let commits_before = commit_count(repo.path());
+        app.update(cx, |app, cx| {
+            app.run_commit_menu_action(CommitMenuAction::CommitAllFiles, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(commit_count(repo.path()), commits_before + 1);
+        let committed = git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"]);
+        assert!(
+            committed.contains("a.txt") && committed.contains("b.txt"),
+            "both changed files must be in the commit - got {committed:?}"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["status", "--porcelain"]),
+            "",
+            "and the worktree must really be clean afterwards"
+        );
+    }
+
+    #[gpui::test]
+    fn amend_last_commit_really_rewrites_the_tip_without_adding_a_commit(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        git(repo.path(), &["add", "b.txt"]);
+        git(repo.path(), &["commit", "-m", "a commit worth amending"]);
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+
+        let commits_before = commit_count(repo.path());
+        let tip_before = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        app.update(cx, |app, cx| {
+            app.run_commit_menu_action(CommitMenuAction::AmendLastCommit, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "an amend must not add a commit - that would be a plain commit wearing the wrong name"
+        );
+        assert_ne!(
+            git_output(repo.path(), &["rev-parse", "HEAD"]),
+            tip_before,
+            "but it must really rewrite the tip object"
+        );
+        assert_eq!(
+            git_output(repo.path(), &["log", "-1", "--format=%s"]),
+            "a commit worth amending",
+            "keeping the tip's own message: this row amends, it does not reword"
+        );
+        assert!(
+            git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"])
+                .contains("a.txt"),
+            "and the staged file must really be inside the amended tip now"
+        );
+    }
+
+    #[gpui::test]
+    fn stash_staged_files_really_stashes_the_staged_half_only(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        app.update(cx, |app, cx| {
+            app.toggle_staged(PathBuf::from("a.txt"), cx);
+        });
+        cx.run_until_parked();
+        type_commit_message(cx, "stash this");
+
+        let commits_before = commit_count(repo.path());
+        app.update(cx, |app, cx| {
+            app.run_commit_menu_action(CommitMenuAction::StashStaged, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "stashing is not committing"
+        );
+        assert!(
+            !git_output(repo.path(), &["stash", "list"]).is_empty(),
+            "a real stash entry must exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).expect("read a.txt"),
+            "one\ntwo\nthree\n",
+            "the staged edit must be gone from the working tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).expect("read b.txt"),
+            "uno\ndos\ntres\ncuatro\n",
+            "and the unstaged edit must be untouched - the row's hint says `keeps the worktree \
+             clean`, not `throws away everything`"
+        );
+    }
+
+    /// A row that genuinely cannot act right now must say so rather than look clickable, and must
+    /// really do nothing if clicked at its painted position anyway.
+    #[gpui::test]
+    fn a_commit_menu_row_with_nothing_staged_is_disabled_and_does_nothing_when_clicked(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "premise: nothing staged"
+        );
+        type_commit_message(cx, "commit everything");
+
+        let toggle = cx
             .debug_bounds("commit-composer-menu-toggle")
             .expect("the ▾ toggle must really paint");
-        cx.simulate_click(toggle_bounds.center(), gpui::Modifiers::none());
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
         cx.run_until_parked();
+
+        for selector in [
+            "commit-menu-row-commit-and-push-disabled",
+            "commit-menu-row-amend-last-commit-disabled",
+            "commit-menu-row-stash-staged-files-disabled",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must render as disabled with nothing staged"
+            );
+        }
         assert!(
-            app.read_with(cx, |app, _| app.commit_menu_open),
-            "sanity check: the menu must really be open before this test's own click on the \
-             toggle can be told apart from the rows' clicks below"
+            cx.debug_bounds("commit-menu-row-commit-all-files-enabled")
+                .is_some(),
+            "`Commit all files` stages the rest itself, so it is the one row that is available \
+             with nothing staged - and there really are changed files here"
         );
 
         let commits_before = commit_count(repo.path());
-        let staged_before = app.read_with(cx, |app, _| app.staged_files.clone());
+        let disabled = cx
+            .debug_bounds("commit-menu-row-stash-staged-files-disabled")
+            .expect("the disabled row must really paint");
+        cx.simulate_click(disabled.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
 
-        // Literal selectors, not `format!` - `debug_bounds` takes a `&'static str` (the same
-        // constraint `guide_alignment_tests`' own comment documents).
-        for selector in [
-            "commit-menu-row-Commit and push",
-            "commit-menu-row-Commit all files",
-            "commit-menu-row-Amend last commit",
-            "commit-menu-row-Stash staged files",
-        ] {
-            let row_bounds = cx
-                .debug_bounds(selector)
-                .unwrap_or_else(|| panic!("{selector} must really paint while the menu is open"));
-            cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
-            cx.run_until_parked();
-
-            assert!(
-                app.read_with(cx, |app, _| app.commit_menu_open),
-                "a real click on {selector} must not silently do the scrim's job and close the \
-                 menu - it has no real action of its own, so it must also have no side effect \
-                 that only coincidentally resembles one"
-            );
-            assert_eq!(
-                commit_count(repo.path()),
-                commits_before,
-                "a real click on {selector} must never create a real git commit - it is dimmed \
-                 and unwired on purpose"
-            );
-            assert_eq!(
-                app.read_with(cx, |app, _| app.staged_files.clone()),
-                staged_before,
-                "a real click on {selector} must never change the real staged set"
-            );
-        }
+        assert_eq!(
+            commit_count(repo.path()),
+            commits_before,
+            "a disabled row must really be a no-op, not merely look like one"
+        );
+        assert!(
+            git_output(repo.path(), &["stash", "list"]).is_empty(),
+            "and it must certainly not have stashed anything"
+        );
     }
 
     /// GitHub issue #176's "the commit one is particularly bugged and hard to close". Before this
@@ -4866,16 +6395,18 @@ mod commit_composer_tests {
             "and inset the same 12px on the right"
         );
         assert!(
-            popover.origin.y + popover.size.height < composer.origin.y + composer.size.height,
-            "the popover opens *upward*: its bottom edge {:?} must sit above the composer's own \
-             bottom edge {:?}, clearing the primary commit button row",
-            popover.origin.y + popover.size.height,
+            popover.origin.y >= composer.origin.y + composer.size.height,
+            "the popover opens *downward* now that GitHub issue #285 pinned the composer above \
+             the sections: its top edge {:?} must sit at or below the composer's own bottom edge \
+             {:?}. Opening upward from here would open into the panel header and off the top of \
+             the window.",
+            popover.origin.y,
             composer.origin.y + composer.size.height
         );
         assert!(
-            popover.origin.y < composer.origin.y,
-            "the four-row popover is taller than the composer, so its top must genuinely paint \
-             above the composer - the exact overflow that made a composer-scoped scrim wrong"
+            popover.origin.y + popover.size.height > composer.origin.y + composer.size.height,
+            "and the four-row popover really extends past the composer's own box - the exact \
+             overflow that made a composer-scoped scrim wrong"
         );
         assert!(
             app.read_with(cx, |app, _| app.commit_menu_open),
@@ -5201,84 +6732,97 @@ mod commit_composer_tests {
         );
     }
 
-    /// GitHub issue #220, "Changes are displayed as unstaged but are commited". The Changes list
-    /// diffs against the merge-base with the default branch, so a file whose difference from that
-    /// base is already inside a real commit sits in the same list as a genuinely uncommitted one.
-    /// It must still be *visible* there (reviewing the whole branch is the point of the panel),
-    /// but it must not present an actionable staging checkbox - `git add` on an already-committed,
-    /// clean file does nothing at all.
+    /// GitHub issue #220, "Changes are displayed as unstaged but are commited" - **now answered
+    /// structurally** by GitHub issue #285's four sections rather than by a per-row condition.
+    ///
+    /// The Uncommitted section is the working tree against `HEAD`, so a file whose difference from
+    /// `main` is already inside a real commit is not in it at all - there is no row for it to
+    /// render a misleading checkbox on. It is still counted in the Against-main section's header,
+    /// the scope that legitimately covers committed work - but not as a row of its own: that
+    /// section renders no row per file at all (see `SectionRow::AgainstMainContext`'s own docs).
     #[gpui::test]
-    fn a_committed_clean_file_shows_no_staging_checkbox_but_a_really_edited_one_does(
+    fn a_committed_file_is_in_the_against_main_section_not_the_uncommitted_one(
         cx: &mut TestAppContext,
     ) {
         let repo = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
-        assert_eq!(
-            app.read_with(cx, |app, _| app.current_diff().map(|d| d.files.len())),
-            Some(2),
-            "sanity check: the merge-base diff really does list both files - if it listed only \
-             the dirty one, everything below would pass for the wrong reason"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.dirty_files.clone()),
-            Some([PathBuf::from("dirty.txt")].into_iter().collect()),
-            "the real `git status --porcelain` read must name exactly the uncommitted file"
-        );
-
         assert!(
-            cx.debug_bounds("change-row-committed.txt").is_some(),
-            "the committed file must stay in the Changes list - reviewing the branch against \
-             main is exactly what this panel is for, so it must not be filtered out"
+            cx.debug_bounds("change-row-dirty.txt").is_some(),
+            "the genuinely uncommitted file is an Uncommitted row"
+        );
+        assert!(
+            cx.debug_bounds("stage-checkbox-dirty.txt").is_some(),
+            "and it keeps its real, actionable staging checkbox"
+        );
+        assert!(
+            cx.debug_bounds("change-row-committed.txt").is_none(),
+            "the committed file must not be an Uncommitted row at all - nothing about it is dirty"
         );
         assert!(
             cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
-            "the committed-clean file must NOT paint a staging checkbox - that unchecked box is \
-             the whole bug: it claimed committed work was still unstaged"
-        );
-        assert!(
-            cx.debug_bounds("committed-marker-committed.txt").is_some(),
-            "it must paint the inert committed marker in the checkbox's place instead, so the \
-             row still says something true about its state rather than going blank"
+            "so there is no row for it to paint a misleading `stage me` checkbox on - this is \
+             issue #220, removed by construction rather than by a per-row condition"
         );
 
+        // ...and it really is counted in the branch-scope section, which starts collapsed - but
+        // never as a row of its own, open or not (see `SectionRow::AgainstMainContext`'s own
+        // docs: Against main renders no row per file at all).
         assert!(
-            cx.debug_bounds("stage-checkbox-dirty.txt").is_some(),
-            "the genuinely uncommitted file must keep its real, actionable staging checkbox"
+            cx.debug_bounds("against-main-row-committed.txt").is_none(),
+            "premise: Against main starts collapsed, so nothing of it is painted yet"
+        );
+        app.update(cx, |app, cx| {
+            app.toggle_changes_section(sections::ChangesSection::AgainstMain, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("against-main-row-committed.txt").is_none(),
+            "expanding Against main must still not paint a row for the committed file - only its \
+             one context card"
+        );
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let against_main_count = rows.iter().find_map(|row| match row {
+            sections::SectionRow::Header(header)
+                if header.section == sections::ChangesSection::AgainstMain =>
+            {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(2),
+            "reviewing what the branch would land is exactly what this scope is for - the \
+             committed file is still counted (alongside dirty.txt), just not given its own row"
         );
         assert!(
-            cx.debug_bounds("committed-marker-dirty.txt").is_none(),
-            "and must never be marked committed"
+            cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
+            "and it offers no checkbox anywhere: `REVISION-2026-08-14.md` §9 box 1, checkboxes \
+             exist only in Uncommitted"
         );
     }
 
-    /// The header's denominator is the *stageable* count, not the raw file count: with one of the
-    /// two listed files already committed there is exactly one thing left to stage, and staging it
-    /// must fill the bar rather than stalling at a permanent one-of-two.
+    /// The composer's denominator is the **uncommitted** scope, so it counts what is genuinely
+    /// stageable without having to subtract already-committed files back out again.
     #[gpui::test]
-    fn the_changes_header_counts_only_really_stageable_files_in_its_denominator(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_composer_counts_only_the_uncommitted_scope_in_its_denominator(cx: &mut TestAppContext) {
         let repo = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert!(
-            cx.debug_bounds("changes-header-2-files").is_some(),
-            "both files are really in the list, so the file count says 2"
-        );
-        assert!(
-            cx.debug_bounds("changes-header-0-of-1-staged").is_some(),
-            "but only one of them can be staged at all, so that is the real denominator"
-        );
-        assert!(
-            cx.debug_bounds("changes-header-0-of-2-staged").is_none(),
-            "counting the committed file as outstanding work is exactly the misleading fraction \
-             this fix removes"
+            cx.debug_bounds("changes-section-uncommitted-1-open")
+                .is_some(),
+            "exactly one file is dirty in this checkout, and the section header says so"
         );
         assert!(
             cx.debug_bounds("commit-composer-progress-0-of-1").is_some(),
-            "the composer's own `N of M staged` must agree - two counters in one panel may not \
-             disagree about how much is left to stage"
+            "so the composer's denominator is 1 - counting the committed file as outstanding \
+             work is exactly the misleading fraction this scope removes"
+        );
+        assert!(
+            cx.debug_bounds("commit-composer-progress-0-of-2").is_none(),
+            "the merge-base file count must not leak into a working-tree counter"
         );
 
         app.update(cx, |app, cx| {
@@ -5292,52 +6836,18 @@ mod commit_composer_tests {
             "sanity check: that really staged it in the real git index"
         );
         assert!(
-            cx.debug_bounds("changes-header-1-of-1-staged").is_some(),
-            "with the only stageable file staged, the header must read fully staged - not `1 of \
-             2`, which would imply a second file still needs attention when none does"
+            cx.debug_bounds("commit-composer-progress-1-of-1").is_some(),
+            "with the only stageable file staged, the composer must read fully staged"
         );
     }
 
-    /// The committed row's marker is inert by construction (no click handler at all), so a click
-    /// at its exact painted position must reach the row underneath and open the file's diff -
-    /// never run a meaningless `git add` on an already-clean file.
+    /// After a real commit the just-committed file leaves the Uncommitted section entirely (the
+    /// working tree now matches `HEAD` for it) and is still counted in Against main, which is the
+    /// scope that lists what the branch would land - though never as a row of its own.
     #[gpui::test]
-    fn clicking_a_committed_files_marker_stages_nothing_in_real_git(cx: &mut TestAppContext) {
-        let repo = repo_with_a_committed_and_a_dirty_file();
-        let (app, cx) = open_changes_view(cx, &repo);
-
-        let marker = cx
-            .debug_bounds("committed-marker-committed.txt")
-            .expect("the committed marker must really paint");
-        cx.simulate_click(marker.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain"]),
-            "M dirty.txt",
-            "the real index must be untouched: only dirty.txt's own unstaged modification, no \
-             newly staged committed.txt"
-        );
-        assert!(
-            app.read_with(cx, |app, _| !app
-                .staged_files
-                .contains(Path::new("committed.txt"))),
-            "and nothing may claim it got staged in memory either"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.open_change.clone()),
-            Some(PathBuf::from("committed.txt")),
-            "with no click handler of its own the marker lets the click through to the row, \
-             which opens the file's diff - the committed file stays fully reviewable"
-        );
-    }
-
-    /// Before the fix, committing from the composer left the just-committed files in the Changes
-    /// list (correctly - they still differ from `main`) but *still* showing unchecked staging
-    /// checkboxes, which is the exact user-visible report in issue #220. After a real commit the
-    /// reloaded diff must reclassify them.
-    #[gpui::test]
-    fn committing_a_staged_file_flips_its_row_from_stageable_to_committed(cx: &mut TestAppContext) {
+    fn committing_a_staged_file_moves_it_out_of_uncommitted_and_into_against_main(
+        cx: &mut TestAppContext,
+    ) {
         let repo = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
@@ -5349,6 +6859,7 @@ mod commit_composer_tests {
             cx.debug_bounds("stage-checkbox-dirty.txt").is_some(),
             "sanity check: it is stageable (and now staged) before the commit"
         );
+        type_commit_message(cx, "commit the dirty file");
 
         let commits_before = commit_count(repo.path());
         app.update(cx, |app, cx| {
@@ -5362,22 +6873,42 @@ mod commit_composer_tests {
         );
 
         assert!(
-            cx.debug_bounds("change-row-dirty.txt").is_some(),
-            "it still differs from `main`, so it stays in the list - `commit_staged_files`' own \
-             docs are explicit about that"
+            cx.debug_bounds("change-row-dirty.txt").is_none(),
+            "nothing about it is dirty any more, so it is not an Uncommitted row"
         );
         assert!(
             cx.debug_bounds("stage-checkbox-dirty.txt").is_none(),
-            "but it must no longer offer to stage anything: this is the reported bug, a file the \
-             user just committed still rendering an unchecked staging checkbox"
+            "and it certainly must not still render an unchecked staging checkbox - the exact \
+             user-visible report in GitHub issue #220"
         );
         assert!(
-            cx.debug_bounds("committed-marker-dirty.txt").is_some(),
-            "it must read as committed now"
+            cx.debug_bounds("changes-section-uncommitted-0-open")
+                .is_some(),
+            "the Uncommitted section is genuinely empty now, and its header says 0"
         );
+
+        app.update(cx, |app, cx| {
+            app.toggle_changes_section(sections::ChangesSection::AgainstMain, cx);
+        });
+        cx.run_until_parked();
         assert!(
-            cx.debug_bounds("changes-header-0-of-0-staged").is_some(),
-            "with everything committed there is nothing stageable left at all"
+            cx.debug_bounds("against-main-row-dirty.txt").is_none(),
+            "it still differs from `main`, so it is still counted in the branch-scope section - \
+             but never as a row of its own, open or not"
+        );
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let against_main_count = rows.iter().find_map(|row| match row {
+            sections::SectionRow::Header(header)
+                if header.section == sections::ChangesSection::AgainstMain =>
+            {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(2),
+            "dirty.txt (just committed) and committed.txt both differ from main now"
         );
     }
 
@@ -5457,6 +6988,635 @@ mod commit_composer_tests {
             "the directory prefix must never exceed its real cap - got {:?} for a twelve-\
              segment nested path, which is exactly the case GitHub issue #243 was filed against",
             dir_bounds.size.width
+        );
+    }
+}
+
+/// GitHub issue #285's own acceptance criteria, against a real repository and a real render: four
+/// collapsible sections in one scroller, every header's count equal to the rows it really paints,
+/// checkboxes in exactly one of them, and Runs summing to Uncommitted.
+#[cfg(test)]
+mod changes_sections_tests {
+    use super::*;
+    use crate::provenance::{AgentKey, Author, DiffStat};
+    use crate::root::focus::palette_focus_tests;
+    use crate::sidebar::sections::{ChangesSection, SectionRow};
+    use gpui::TestAppContext;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A feature branch that genuinely populates all four scopes at once: two commits of its own
+    /// (Commits), two still-uncommitted edits (Uncommitted), and therefore four paths that differ
+    /// from `main` (Against main).
+    fn four_scope_repo() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("dirty-a.txt"), "one\n").expect("write");
+        std::fs::write(repo.path().join("dirty-b.txt"), "one\n").expect("write");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+
+        std::fs::write(repo.path().join("done-a.txt"), "committed a\n").expect("write");
+        git(repo.path(), &["add", "done-a.txt"]);
+        git(repo.path(), &["commit", "-m", "first branch commit"]);
+        std::fs::write(repo.path().join("done-b.txt"), "committed b\n").expect("write");
+        git(repo.path(), &["add", "done-b.txt"]);
+        git(repo.path(), &["commit", "-m", "second branch commit"]);
+
+        std::fs::write(repo.path().join("dirty-a.txt"), "one\ntwo\n").expect("write");
+        std::fs::write(repo.path().join("dirty-b.txt"), "one\ntwo\n").expect("write");
+        repo
+    }
+
+    fn open_changes_view<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    fn open_every_section(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext) {
+        app.update(cx, |app, cx| {
+            for section in ChangesSection::ORDER {
+                if !app.changes_sections.is_open(section) {
+                    app.toggle_changes_section(section, cx);
+                }
+            }
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_panel_is_four_sections_with_runs_and_uncommitted_open_by_default(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = four_scope_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        // Two dirty paths, two commits of this branch's own, four paths against `main`.
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-2-open")
+                .is_some(),
+            "the Uncommitted header must state its real count and start open"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-commits-2-collapsed")
+                .is_some(),
+            "Commits states a true count while collapsed - that is the whole point of a header \
+             count on a closed section"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-against-main-4-collapsed")
+                .is_some(),
+            "and so does Against main"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-runs-0-open").is_some(),
+            "Runs is open by default too, even with no agent having run here yet"
+        );
+
+        // Only the open sections' rows are painted.
+        assert!(
+            cx.debug_bounds("change-row-dirty-a.txt").is_some(),
+            "an open section paints its rows"
+        );
+        assert!(
+            cx.debug_bounds("against-main-row-done-a.txt").is_none(),
+            "a collapsed section paints none of them"
+        );
+        assert!(
+            cx.debug_bounds("changes-commit-").is_none(),
+            "nor does Commits"
+        );
+    }
+
+    /// `REVISION-2026-08-14.md` §1's rule 4, and `STAGE-A-CHANGELOG.md` §4f: **the tab is called
+    /// `Changes`**, it holds all four sections, and `Uncommitted` is the name of one of them.
+    ///
+    /// §4f is about a real collision that had already happened once - §3.2's `Changes` ->
+    /// `Uncommitted` rename was meant for the *section* and got applied to the *panel tab* too,
+    /// naming a four-section panel after one of its four sections. So this pins both levels at
+    /// once rather than the tab alone: the tab says `Changes`, and the thing called `Uncommitted`
+    /// is a section inside it, alongside three others.
+    #[gpui::test]
+    fn the_tab_is_called_changes_and_uncommitted_is_one_of_its_four_sections(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        // Index 1 of the right sidebar's own two-segment toggle - the segment the panel is
+        // reached through. Its label is a literal in `render_right_sidebar_toggle`, so what this
+        // proves is that the segment exists and is the selected one; the label itself is pinned
+        // by the `ChoiceOption::new("Changes")` literal beside it.
+        assert!(
+            cx.debug_bounds("choice-right-sidebar-toggle-1").is_some(),
+            "the panel is reached through the second segment of the Files/Changes toggle"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.right_sidebar_view),
+            RightSidebarView::Changes,
+            "and that segment selects the Changes view"
+        );
+
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let labels: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SectionRow::Header(header) => Some(header.label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "UNCOMMITTED".to_string(),
+                "COMMITS".to_string(),
+                "AGAINST MAIN".to_string(),
+                "RUNS".to_string(),
+            ],
+            "one panel, four sections, and `Uncommitted` is one of them - never the name of the \
+             whole panel"
+        );
+    }
+
+    #[gpui::test]
+    fn every_section_header_count_equals_the_number_of_rows_it_renders(cx: &mut TestAppContext) {
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        open_every_section(&app, cx);
+
+        // The generic form, over the exact row list the renderer consumes: for every header
+        // *except Against main*, the number of counted rows between it and the next header is
+        // that header's own `count`. Against main is the one exception - it renders no row per
+        // file at all (`SectionRow::AgainstMainContext`'s own docs), so its count is checked
+        // separately below, against the real file total instead of a rendered-row tally.
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let mut current: Option<(ChangesSection, usize)> = None;
+        let mut counted = 0usize;
+        let mut checked = 0usize;
+        let close = |section: ChangesSection, claimed: usize, actual: usize| {
+            if section == ChangesSection::AgainstMain {
+                return;
+            }
+            assert_eq!(
+                claimed,
+                actual,
+                "the {} header claims {claimed} rows but the list holds {actual}",
+                section.key()
+            );
+        };
+        for row in &rows {
+            if let SectionRow::Header(header) = row {
+                if let Some((section, claimed)) = current.take() {
+                    close(section, claimed, counted);
+                    checked += 1;
+                }
+                current = Some((header.section, header.count));
+                counted = 0;
+            } else if row.is_counted() {
+                counted += 1;
+            }
+        }
+        if let Some((section, claimed)) = current.take() {
+            close(section, claimed, counted);
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "all four sections must have been checked");
+
+        let against_main_count = rows.iter().find_map(|row| match row {
+            SectionRow::Header(header) if header.section == ChangesSection::AgainstMain => {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(4),
+            "against main's count is the real file total (dirty-a, dirty-b, done-a, done-b), \
+             not a tally of rows it never renders"
+        );
+
+        // ...and the rows really paint, so the check above is about a list that reaches the screen.
+        for selector in ["change-row-dirty-a.txt", "change-row-dirty-b.txt"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must really paint once its section is open"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn checkboxes_exist_only_in_the_uncommitted_section(cx: &mut TestAppContext) {
+        // `REVISION-2026-08-14.md` §9, box 1.
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        open_every_section(&app, cx);
+
+        assert!(
+            cx.debug_bounds("stage-checkbox-dirty-a.txt").is_some(),
+            "the Uncommitted section stages"
+        );
+        assert!(
+            cx.debug_bounds("against-main-row-dirty-a.txt").is_none(),
+            "Against main renders no row per file at all (`SectionRow::AgainstMainContext`'s own \
+             docs), so there is no second row here for a stray checkbox to double up on"
+        );
+        // The structural guarantee is `ChangesSection::has_checkboxes`, asserted directly in
+        // `crate::sidebar::sections`' own tests; this is its rendered half.
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let sections_with_files: Vec<ChangesSection> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SectionRow::UncommittedFile(_) => Some(ChangesSection::Uncommitted),
+                SectionRow::Commit(_) => Some(ChangesSection::Commits),
+                SectionRow::Run(_) => Some(ChangesSection::Runs),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sections_with_files.contains(&ChangesSection::Commits),
+            "premise: the other file-bearing section really does have rows here"
+        );
+        assert_eq!(
+            sections_with_files
+                .iter()
+                .filter(|section| section.has_checkboxes())
+                .count(),
+            2,
+            "only the two Uncommitted rows may stage - every other row in the panel is read-only"
+        );
+    }
+
+    #[gpui::test]
+    fn collapsing_a_section_unpaints_its_rows_and_keeps_its_count(cx: &mut TestAppContext) {
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        assert!(cx.debug_bounds("change-row-dirty-a.txt").is_some());
+
+        app.update(cx, |app, cx| {
+            app.toggle_changes_section(ChangesSection::Uncommitted, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("change-row-dirty-a.txt").is_none(),
+            "collapsing must really unpaint the rows, not merely hide them"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-2-collapsed")
+                .is_some(),
+            "but the header must keep stating the true count - triage needs to see that there \
+             *are* uncommitted changes without operating a control"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-runs-0-open").is_some(),
+            "and collapsing one section must not move another"
+        );
+    }
+
+    #[gpui::test]
+    fn the_against_main_section_renders_no_action_buttons_and_no_file_rows(
+        cx: &mut TestAppContext,
+    ) {
+        // The product decision recorded on GitHub issue #285, overriding
+        // `REVISION-2026-08-14.md` §1 rule 3 and `STAGE-A-CHANGELOG.md` §4e: merging is the git
+        // graph's job and worktree removal already has its entry point on the rail, so this
+        // section is read-only.
+        //
+        // And, separately: no row per committed file either, reported directly ("commited files
+        // should not appear on the changes tab under against master") and confirmed against
+        // `Jerry.dc.html` line 1422's own `baseRows` - a synthetic one-entry array, never a
+        // per-file loop. Against main's only real body row is its context card.
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        open_every_section(&app, cx);
+
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let against_main: Vec<&SectionRow> = rows
+            .iter()
+            .skip_while(|row| !matches!(row, SectionRow::Header(header) if header.section == ChangesSection::AgainstMain))
+            .skip(1)
+            .take_while(|row| !matches!(row, SectionRow::Header(_)))
+            .collect();
+        assert!(
+            !against_main.is_empty(),
+            "premise: the section really has a body here"
+        );
+        for row in &against_main {
+            assert!(
+                matches!(
+                    row,
+                    SectionRow::AgainstMainContext { .. } | SectionRow::Note { .. }
+                ),
+                "the Against-main section may only hold its context card and its own notes - no \
+                 action rows, and no row per file: {row:?}"
+            );
+        }
+        assert!(
+            against_main
+                .iter()
+                .any(|row| matches!(row, SectionRow::AgainstMainContext { .. })),
+            "it does still carry the read-only commit context"
+        );
+        assert!(
+            cx.debug_bounds("against-main-row-done-a.txt").is_none(),
+            "and neither committed file painted a row of its own"
+        );
+        assert!(cx.debug_bounds("against-main-row-done-b.txt").is_none());
+    }
+
+    #[gpui::test]
+    fn the_runs_header_matches_the_uncommitted_header_when_one_agent_wrote_everything(
+        cx: &mut TestAppContext,
+    ) {
+        // `STAGE-A-CHANGELOG.md` §3's own verification of the mock, as a live render: "Runs
+        // `+319 −145` and Uncommitted `+319 −145` agree exactly." The provenance is recorded
+        // through the store's real `PreToolUse`/write/`PostToolUse` door, exactly as the hook
+        // layer drives it - no fabricated attribution.
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("agent.txt"), "one\n").expect("write");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+
+        let (app, cx) = open_changes_view(cx, &repo);
+        let agent_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup agent");
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(agent_id, ProcessKind::claude());
+        });
+
+        // The very key `crate::provenance::flow` files a real hook edit under.
+        let key = app.read_with(cx, |app, _| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .expect("agent");
+            AgentKey::new(crate::review::state::baseline_key(
+                &agent.cwd,
+                crate::work_surface::agents::AgentKind::Claude,
+                agent.spawned_at_unix,
+            ))
+        });
+        let file = repo.path().join("agent.txt");
+        app.update(cx, |app, _cx| {
+            app.line_provenance.begin_agent_edit(repo.path(), &file);
+        });
+        std::fs::write(&file, "one\ntwo\nthree\n").expect("agent writes");
+        app.update_in(cx, |app, window, cx| {
+            app.line_provenance
+                .record_agent_edit(repo.path(), &file, &key);
+            app.load_diff(repo.path().to_path_buf(), cx);
+            let _ = window;
+        });
+        cx.run_until_parked();
+
+        let (runs, uncommitted) = app.read_with(cx, |app, _| {
+            (
+                app.uncommitted_change_set
+                    .split()
+                    .get(&Author::Agent(key.clone()))
+                    .copied()
+                    .unwrap_or_default(),
+                app.uncommitted_change_set.total(),
+            )
+        });
+        assert_eq!(
+            runs,
+            DiffStat::new(2, 0),
+            "sanity: the agent really added two lines, as git sees it"
+        );
+        assert_eq!(
+            runs, uncommitted,
+            "every uncommitted line here is this agent's, so the Runs total is the Uncommitted \
+             total exactly - by construction, since both are read off one partition"
+        );
+
+        // ...and the two headers really paint that agreement.
+        assert!(
+            cx.debug_bounds("changes-section-runs-stat-+2-\u{2212}0")
+                .is_some(),
+            "the Runs header must paint the agent's own share"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-stat-+2-\u{2212}0")
+                .is_some(),
+            "and the Uncommitted header must paint the identical figure"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-runs-1-open").is_some(),
+            "one agent has run here, so the Runs section has exactly one row"
+        );
+        assert!(
+            cx.debug_bounds("changes-run-0").is_some()
+                || cx.debug_bounds("changes-run-1").is_some(),
+            "and that row must really paint"
+        );
+    }
+
+    #[gpui::test]
+    fn a_live_runs_row_states_that_it_is_running_and_switching_focus_changes_no_count(
+        cx: &mut TestAppContext,
+    ) {
+        // Audit I2: the header count equals the rendered row count, and switching agent focus
+        // changes neither. Before the union, the header read one agent's set while the rows read
+        // another's - two sources able to disagree on screen.
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        let first = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup agent");
+        app.update(cx, |app, _cx| {
+            app.agents.set_kind_for_test(first, ProcessKind::claude());
+        });
+        let second = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::claude(),
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // `Agents::spawn` notifies its own new pane entity, not the root, so the right sidebar is
+        // not repainted by the spawn alone - the same nudge every other test in this file that
+        // spawns mid-test needs.
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("changes-section-runs-2-open").is_some(),
+            "two real agent sessions in this worktree are two runs"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-2-open")
+                .is_some(),
+            "and the Uncommitted count is its own, unrelated, real number"
+        );
+
+        let rows = app.update(cx, |app, cx| app.changes_run_rows(cx));
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row.live),
+            "both processes are genuinely alive, so both rows must say so"
+        );
+        assert!(
+            rows.iter().all(|row| row.meta.contains("running")),
+            "a live run's meta line reads `running`: {:?}",
+            rows.iter().map(|row| row.meta.clone()).collect::<Vec<_>>()
+        );
+
+        // Switching which agent is focused must move neither count nor row set.
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(second, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-2-open")
+                .is_some(),
+            "the Uncommitted count is a fact about the worktree, not about which agent is focused"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-runs-2-open").is_some(),
+            "and so is the Runs count"
+        );
+        assert!(
+            cx.debug_bounds("change-row-dirty-a.txt").is_some(),
+            "and the rows themselves must not change under a focus switch either"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(first, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("changes-section-runs-2-open").is_some());
+    }
+
+    #[gpui::test]
+    fn a_live_run_and_an_ended_run_render_side_by_side(cx: &mut TestAppContext) {
+        // The mock's sad path (`STAGE-A-SELFCHECK.md`): "a live run and a frozen run render side
+        // by side in the Runs section […] both rows verifiable in one screen." The ended run here
+        // is a genuinely exited process, not a flag.
+        let repo = four_scope_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        let live = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup agent");
+        app.update(cx, |app, _cx| {
+            app.agents.set_kind_for_test(live, ProcessKind::claude());
+        });
+        // A real process that really exits immediately: `/bin/false` returns 1 and is gone.
+        // Spawned as a `Shell` because `shell_override` only applies to that kind
+        // (`Agents::spawn_inner` builds an agent's `TerminalSpec` from the CLI itself), then
+        // relabelled - the same real-process-plus-relabel the title bar's own live tests use, so
+        // what this asserts about is a genuinely exited child, not a flag.
+        let ended = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                Some("/bin/false"),
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, _cx| {
+            app.agents.set_kind_for_test(ended, ProcessKind::claude());
+        });
+        cx.run_until_parked();
+        // A real OS process really has to exit, which takes real wall-clock time - so this waits
+        // on the genuine `is_running()` transition rather than assuming it, and gives up loudly
+        // rather than asserting against a process that never died.
+        let mut exited = false;
+        for _ in 0..200 {
+            app.update(cx, |_app, cx| cx.notify());
+            cx.run_until_parked();
+            if app.read_with(cx, |app, cx| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == ended)
+                    .is_some_and(|agent| !agent.pane.read(cx).is_running())
+            }) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // The pane notices its child's real pty EOF on its own poll timer, and this context's
+            // executor is deterministic - so real time has to be given to the child *and* the
+            // clock has to be advanced for the poll that observes it.
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            exited,
+            "premise: the `/bin/false` agent must really have exited, or this test would be \
+             asserting about a live process"
+        );
+
+        let rows = app.update(cx, |app, cx| app.changes_run_rows(cx));
+        assert_eq!(rows.len(), 2, "both runs are in the section at once");
+        let live_row = rows
+            .iter()
+            .find(|row| row.agent_id == live)
+            .expect("the live run's row");
+        let ended_row = rows
+            .iter()
+            .find(|row| row.agent_id == ended)
+            .expect("the ended run's row");
+
+        assert!(live_row.live, "the still-alive process is a live run");
+        assert!(live_row.meta.contains("running"), "got {:?}", live_row.meta);
+        assert!(
+            !ended_row.live,
+            "the real, exited process is an ended run - this is a genuine `is_running() == false`, \
+             not a test flag"
+        );
+        assert!(
+            ended_row.meta.contains("ended"),
+            "an ended run's meta says `ended`: got {:?}",
+            ended_row.meta
+        );
+        assert_ne!(
+            live_row.meta_color(),
+            ended_row.meta_color(),
+            "warm while it is still moving, neutral once it has ended - that colour split is the \
+             only thing carrying the state on the row itself (STAGE-A-CHANGELOG.md §4l)"
+        );
+        assert!(
+            cx.debug_bounds("changes-section-runs-2-open").is_some(),
+            "and both rows are on one screen, under one header stating two"
         );
     }
 }

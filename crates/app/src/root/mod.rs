@@ -110,6 +110,7 @@ use crate::settings::store::{self as settings_store, CfgFormat, Settings};
 use crate::sidebar::changes::{self, ChangeTag};
 use crate::sidebar::file_tree;
 use crate::sidebar::fold_state;
+use crate::sidebar::sections;
 use crate::sidebar::tree_ops;
 use crate::status_bar::process_stats;
 use crate::text_history;
@@ -324,11 +325,6 @@ pub(crate) const REPO_WORKTREES_FETCH_CONCURRENCY: usize = 4;
 /// [`AdeApp::file_view_last_freshness_check`]).
 pub(crate) const FILE_FRESHNESS_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Cap on how many changed files the diff view renders, independent of `wt_core::diff`'s own
-/// `MAX_FILES` cap (300) on the loaded diff. The Files tree used to have a matching
-/// render cap; it no longer does (GitHub issue #18 §4), so this one now stands alone.
-pub(crate) const MAX_RENDERED_DIFF_FILES: usize = 40;
-
 /// Cap on how many hunk lines a single file's diff renders, independent of `wt_core::diff`'s
 /// own per-file `MAX_HUNK_LINES_PER_FILE` cap (2000) on loaded data.
 pub(crate) const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 300;
@@ -442,11 +438,6 @@ pub struct AdeApp {
     /// handle `crate::sidebar::render::AdeApp::render_file_tree`'s own `uniform_list` is
     /// `track_scroll`'d with - not a second, parallel tracking mechanism.
     pub(crate) file_tree_scroll_handle: UniformListScrollHandle,
-    /// The Changes list's own equivalent of [`Self::file_tree_scroll_handle`] - a separate handle
-    /// (not shared) because the two `uniform_list`s are mutually exclusive tabs of the same panel
-    /// but never rendered at the same time, and giving them independent scroll state is what lets
-    /// switching tabs and back restore each list's own scroll position rather than the other's.
-    pub(crate) changes_rows_scroll_handle: UniformListScrollHandle,
     pub(crate) diff_root: PathBuf,
     pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
@@ -531,6 +522,43 @@ pub struct AdeApp {
     /// (`crate::provenance::flow::AdeApp::rebuild_change_set`), called from the two writes that
     /// can invalidate it - `Self::load_diff` finishing, and provenance changing.
     pub(crate) change_set: crate::provenance::change_set::ChangeSet,
+    /// The **Uncommitted** scope (GitHub issue #285): the working tree against its own `HEAD`,
+    /// loaded by the same background task [`Self::diff_state`] is, so the panel's four sections
+    /// never describe two different moments in git's history.
+    ///
+    /// Deliberately *not* derivable from [`Self::diff_state`]: that is the merge-base diff, whose
+    /// file list mixes committed and uncommitted work with no signal to tell them apart (GitHub
+    /// issue #220). See `wt_core::diff::diff_against_head`'s own docs.
+    pub(crate) uncommitted_diff: sections::ScopeLoad<wt_core::diff::WorktreeDiff>,
+    /// [`Self::uncommitted_diff`]'s file list joined with [`Self::line_provenance`] - one row per
+    /// path, each carrying its authors and the per-author `split`.
+    ///
+    /// This is what the Runs section's per-run diffstats are read off, which is what makes them
+    /// sum to the Uncommitted section's own total by construction rather than by agreement
+    /// (`STAGE-A-CHANGELOG.md` §5). [`Self::change_set`] is the same join over the *merge-base*
+    /// diff and serves the Against-main section; the two are separate because their scopes are,
+    /// and rebuilt together through one function so neither can go stale on its own.
+    pub(crate) uncommitted_change_set: crate::provenance::change_set::ChangeSet,
+    /// The **Commits** scope (GitHub issue #285): what is already written down on this branch.
+    pub(crate) branch_commits: sections::ScopeLoad<wt_core::diff::BranchCommits>,
+    /// Which of the Changes panel's four sections are open. Per section, not per worktree -
+    /// "show me the commits" is a statement about how the user is working right now, not a
+    /// property of one checkout, and the mock keys it the same way.
+    pub(crate) changes_sections: sections::SectionCollapse,
+    /// The Changes panel's one scroller (GitHub issue #285). `gpui::ListState`, not a
+    /// `UniformListScrollHandle`: the four sections are one scroller holding genuinely different
+    /// row heights (24px header, 27px file row, 48px two-line run row), which `uniform_list`
+    /// cannot represent - it sizes every slot from item 0. See `crate::sidebar::sections`'
+    /// [`sections::SectionRow`] for the item model, and `crate::root::scrollbar` for how the one
+    /// shared overlay scrollbar still draws against it.
+    pub(crate) changes_sections_list: gpui::ListState,
+    /// Which changed files have been **seen since the agent last changed them**.
+    ///
+    /// `REVISION-2026-08-14.md` §1's rule 2: "`reviewed` and `staged` are separate fields.
+    /// Reviewing must never stage." This is the `reviewed` half, and it is a separate field of a
+    /// separate type from [`Self::staged_files`] precisely so nothing can read one for the other.
+    /// It drives the Uncommitted header's `N/M seen` counter and meter; it drives no index.
+    pub(crate) seen_files: sections::SeenFiles,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
@@ -1216,6 +1244,15 @@ pub struct AdeApp {
     /// than freezing whatever it happened to be the first time it rendered.
     pub(crate) rail_collapse_overrides: HashMap<PathBuf, bool>,
     pub(crate) filter_focus_handle: FocusHandle,
+    /// The Changes panel's commit message field - genuinely editable text with the same real,
+    /// undoable history every other field in this app gets (GitHub issue #17 -
+    /// [`text_history::TextField`]). A normal, empty text input the user has to fill in
+    /// themselves - no auto-drafted fallback (removed per explicit product decision: see
+    /// [`crate::sidebar::render::AdeApp::staged_commit_message`]'s own docs for why). Every commit
+    /// path (the primary button, the `▾` menu) reads this same field, so they always agree on
+    /// what gets written, and none of them will act at all with it empty.
+    pub(crate) commit_message: text_history::TextField,
+    pub(crate) commit_message_focus_handle: FocusHandle,
     /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"
     /// fallback target (`Self::select_worktree`, `Self::close_agent`, `Self::cancel_new_file`),
     /// deliberately **not** [`Self::filter_focus_handle`].
@@ -3113,7 +3150,7 @@ impl Render for AdeApp {
                     && !self.settings_open
                     && self.right_sidebar_view == RightSidebarView::Changes
                     && self.current_diff().is_some(),
-                |el| el.child(self.render_commit_menu(window, cx)),
+                |el| el.child(self.render_commit_menu(cx)),
             )
             .children(self.render_hover_card(window, cx))
             .children(self.render_completions_popover(cx))

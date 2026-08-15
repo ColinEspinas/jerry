@@ -334,7 +334,6 @@ impl AdeApp {
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             file_tree_scroll_handle: UniformListScrollHandle::new(),
-            changes_rows_scroll_handle: UniformListScrollHandle::new(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
             agent_reviews: HashMap::new(),
@@ -351,6 +350,19 @@ impl AdeApp {
             line_provenance_path,
             line_provenance_owned: std::collections::BTreeSet::new(),
             change_set: crate::provenance::change_set::ChangeSet::default(),
+            uncommitted_diff: crate::sidebar::sections::ScopeLoad::Loading,
+            uncommitted_change_set: crate::provenance::change_set::ChangeSet::default(),
+            branch_commits: crate::sidebar::sections::ScopeLoad::Loading,
+            changes_sections: crate::sidebar::sections::SectionCollapse::default(),
+            // Starts empty and is reset to the real row count from the one place that builds the
+            // rows (`crate::sidebar::render::AdeApp::render_changes_sections`) - never seeded with
+            // a guessed count, which `gpui::list` would then measure against nothing.
+            changes_sections_list: gpui::ListState::new(
+                0,
+                gpui::ListAlignment::Top,
+                crate::sidebar::render::CHANGES_LIST_OVERDRAW,
+            ),
+            seen_files: crate::sidebar::sections::SeenFiles::default(),
             review_tab_open: None,
             review_tab_active: false,
             review_focus_handle: cx.focus_handle(),
@@ -471,6 +483,8 @@ impl AdeApp {
             filter_query: text_history::TextField::new(),
             rail_collapse_overrides: HashMap::new(),
             filter_focus_handle,
+            commit_message: text_history::TextField::new(),
+            commit_message_focus_handle: cx.focus_handle(),
             rail_focus_handle: cx.focus_handle(),
             empty_state_focus_handle: cx.focus_handle(),
             diff_cache: HashMap::new(),
@@ -694,6 +708,13 @@ impl AdeApp {
                 // it joins this later call for the same reason `branches_filter_focus_handle`
                 // does - see this call's own docs just above.
                 &this.graph_state.branch_prompt_focus_handle,
+                // GitHub issue #285's commit-message field is a fourth: another real
+                // `text_history::TextField` input built inside this same `Self` literal, live-
+                // reported missing its blink exactly like the three above once did - focusing it
+                // left `caret_blink_visible` frozen at whatever it last was (never toggling, since
+                // no subscription ever called `start_caret_blink` for this handle), so the caret
+                // rendered as a permanently solid bar instead of blinking.
+                &this.commit_message_focus_handle,
             ],
             window,
             cx,

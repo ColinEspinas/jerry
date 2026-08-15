@@ -5,13 +5,17 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
-use crate::root::widgets::{render_sidebar_message, render_tag_pill};
+use crate::root::widgets::render_tag_pill;
 use crate::settings::widgets::ChoiceOption;
 
 impl AdeApp {
-    /// A themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff.
-    pub(crate) fn render_diff_state_message(&self) -> gpui::AnyElement {
-        let (text, color) = match &self.diff_state {
+    /// A themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff, as its
+    /// own text plus the emphasis it deserves - so a caller that needs the words in a different
+    /// container (the Changes panel's Against-main section states them as one of its own section
+    /// notes, `crate::sidebar::sections::SectionRow::Note`) gets them from here rather than
+    /// writing a second, drifting copy of the same four cases.
+    pub(crate) fn diff_state_message(&self) -> (String, crate::theme::ColorToken) {
+        match &self.diff_state {
             DiffLoadState::Loading => ("computing diff...".to_string(), theme::text::FAINT),
             DiffLoadState::Error(err) => (
                 format!("failed to compute diff: {err}"),
@@ -31,8 +35,7 @@ impl AdeApp {
             DiffLoadState::Loaded(DiffBase::Diff(_) | DiffBase::NoBase { .. }) => {
                 (String::new(), theme::text::FAINT)
             }
-        };
-        render_sidebar_message(text, color.into())
+        }
     }
 
     /// The centre's single-file Surface C, opened by a Changes-row click (`diff_file` always

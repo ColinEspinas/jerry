@@ -6,17 +6,17 @@
 //!
 //! ## Why one shared component, not nine hand-copied ones
 //!
-//! Every one of those regions already scrolls via one of GPUI's two real scroll-state types -
-//! `gpui::ScrollHandle` (a plain `div().overflow_y_scroll().track_scroll(&handle)`) or
+//! Every one of those regions already scrolls via one of GPUI's three real scroll-state types -
+//! `gpui::ScrollHandle` (a plain `div().overflow_y_scroll().track_scroll(&handle)`),
 //! `gpui::UniformListScrollHandle` (`uniform_list(...).track_scroll(&handle)`, used by every
-//! virtualized list in this app - see e.g. `crate::sidebar::render::AdeApp::render_file_tree`'s own
-//! docs on why virtualization matters here). Both expose the same real geometry
-//! (`ScrollHandle::offset`/`max_offset`/`bounds`/`set_offset` -
-//! `vendor/zed/crates/gpui/src/elements/div.rs:3938-4077`; `UniformListScrollHandle` simply wraps
-//! one as its own `pub base_handle` field - `vendor/zed/crates/gpui/src/elements/
-//! uniform_list.rs:80,116`), so [`ScrollableHandle`] below is the one, real, tiny adapter that
-//! lets [`AdeApp::render_vertical_scrollbar`] draw a real overlay thumb against either kind
-//! without a second, drifting implementation per region.
+//! fixed-row-height virtualized list in this app - see e.g.
+//! `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why virtualization matters
+//! here), or `gpui::ListState` (`gpui::list(...)`, GPUI's own variable-row-height virtualized list -
+//! used by the Changes panel's four sections, whose row heights genuinely differ, see
+//! `crate::sidebar::sections`' own docs). All three expose the same real geometry - viewport
+//! bounds, a maximum offset, a current offset and a setter - so [`ScrollableHandle`] below is the
+//! one, real, tiny adapter that lets [`AdeApp::render_vertical_scrollbar`] draw a real overlay
+//! thumb against any of them without a second, drifting implementation per region.
 //! [`crate::root::scrollbar_geometry`] carries the actual thumb-length/position math, kept
 //! `gpui`-free and unit-tested there directly (see that module's own docs) - written
 //! axis-generically (`viewport`/`max_offset` along *a* scroll axis, not literally "vertical") even
@@ -168,20 +168,72 @@ impl ScrollbarMark {
 }
 
 /// See this module's own top docs for why this trait exists at all - it is the one real place
-/// `gpui::ScrollHandle` and `gpui::UniformListScrollHandle` are treated as interchangeable.
+/// GPUI's several scrollable regions are treated as interchangeable.
+///
+/// It used to be one method (`base_handle() -> ScrollHandle`), which worked while every scrollable
+/// region in the app was either a plain `overflow_y_scroll` div or a `gpui::uniform_list` - both of
+/// which really are a `gpui::ScrollHandle` underneath. `gpui::ListState` (GitHub issue #285: the
+/// Changes panel's four sections are one scroller holding genuinely different row heights, which
+/// `uniform_list` cannot represent - it sizes every slot from item 0) is **not**: it owns a
+/// `SumTree` of measured item heights and exposes its scroll position through its own
+/// `*_for_scrollbar` API, with no `ScrollHandle` to hand back.
+///
+/// So the trait is now the four operations the scrollbar actually performs, which all three can
+/// answer honestly, rather than a concrete type two of them happen to share. Nothing about the
+/// scrollbar itself changed - it is the same one control on all three regions.
 pub(crate) trait ScrollableHandle: Clone + 'static {
-    fn base_handle(&self) -> ScrollHandle;
+    /// The scrolled region's own painted box, in window space.
+    fn viewport_bounds(&self) -> gpui::Bounds<Pixels>;
+    /// How far the content can scroll past the viewport - `0` when it does not overflow.
+    fn max_scroll_offset(&self) -> gpui::Point<Pixels>;
+    /// The current scroll offset. `y` is **negative** when scrolled down, matching
+    /// `gpui::ScrollHandle`'s own convention.
+    fn scroll_offset(&self) -> gpui::Point<Pixels>;
+    fn set_scroll_offset(&self, offset: gpui::Point<Pixels>);
 }
 
 impl ScrollableHandle for ScrollHandle {
-    fn base_handle(&self) -> ScrollHandle {
-        self.clone()
+    fn viewport_bounds(&self) -> gpui::Bounds<Pixels> {
+        self.bounds()
+    }
+    fn max_scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.max_offset()
+    }
+    fn scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.offset()
+    }
+    fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+        self.set_offset(offset);
     }
 }
 
 impl ScrollableHandle for UniformListScrollHandle {
-    fn base_handle(&self) -> ScrollHandle {
-        self.0.borrow().base_handle.clone()
+    fn viewport_bounds(&self) -> gpui::Bounds<Pixels> {
+        self.0.borrow().base_handle.bounds()
+    }
+    fn max_scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.0.borrow().base_handle.max_offset()
+    }
+    fn scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.0.borrow().base_handle.offset()
+    }
+    fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+        self.0.borrow().base_handle.set_offset(offset);
+    }
+}
+
+impl ScrollableHandle for gpui::ListState {
+    fn viewport_bounds(&self) -> gpui::Bounds<Pixels> {
+        gpui::ListState::viewport_bounds(self)
+    }
+    fn max_scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.max_offset_for_scrollbar()
+    }
+    fn scroll_offset(&self) -> gpui::Point<Pixels> {
+        self.scroll_px_offset_for_scrollbar()
+    }
+    fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+        self.set_offset_from_scrollbar(offset);
     }
 }
 
@@ -214,19 +266,18 @@ impl AdeApp {
         marks: &[ScrollbarMark],
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let base = handle.base_handle();
-        let bounds = base.bounds();
+        let bounds = handle.viewport_bounds();
         let viewport = bounds.size.height.as_f32();
-        let max_offset = base.max_offset().y.as_f32();
+        let max_offset = handle.max_scroll_offset().y.as_f32();
         if viewport <= 0.0 || max_offset <= 0.5 {
             return None;
         }
-        let scrolled = (-base.offset().y.as_f32()).clamp(0.0, max_offset);
+        let scrolled = (-handle.scroll_offset().y.as_f32()).clamp(0.0, max_offset);
         let thumb_len = geometry::thumb_length(viewport, max_offset);
         let thumb_top = geometry::thumb_position(viewport, max_offset, scrolled);
 
-        let jump_handle = base.clone();
-        let drag_handle = base.clone();
+        let jump_handle = handle.clone();
+        let drag_handle = handle.clone();
 
         Some(
             div()
@@ -245,17 +296,17 @@ impl AdeApp {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |_this, event: &MouseDownEvent, _window, cx| {
-                        let viewport = jump_handle.bounds().size.height.as_f32();
-                        let max_offset = jump_handle.max_offset().y.as_f32();
-                        let track_top = jump_handle.bounds().origin.y.as_f32();
+                        let viewport = jump_handle.viewport_bounds().size.height.as_f32();
+                        let max_offset = jump_handle.max_scroll_offset().y.as_f32();
+                        let track_top = jump_handle.viewport_bounds().origin.y.as_f32();
                         let new_scrolled = geometry::offset_for_pointer(
                             viewport,
                             max_offset,
                             track_top,
                             event.position.y.as_f32(),
                         );
-                        let current = jump_handle.offset();
-                        jump_handle.set_offset(gpui::point(current.x, px(-new_scrolled)));
+                        let current = jump_handle.scroll_offset();
+                        jump_handle.set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
                         cx.notify();
                     }),
                 )
@@ -310,17 +361,18 @@ impl AdeApp {
                                 if drag.id != id {
                                     return;
                                 }
-                                let viewport = drag_handle.bounds().size.height.as_f32();
-                                let max_offset = drag_handle.max_offset().y.as_f32();
-                                let track_top = drag_handle.bounds().origin.y.as_f32();
+                                let viewport = drag_handle.viewport_bounds().size.height.as_f32();
+                                let max_offset = drag_handle.max_scroll_offset().y.as_f32();
+                                let track_top = drag_handle.viewport_bounds().origin.y.as_f32();
                                 let new_scrolled = geometry::offset_for_pointer(
                                     viewport,
                                     max_offset,
                                     track_top,
                                     event.event.position.y.as_f32(),
                                 );
-                                let current = drag_handle.offset();
-                                drag_handle.set_offset(gpui::point(current.x, px(-new_scrolled)));
+                                let current = drag_handle.scroll_offset();
+                                drag_handle
+                                    .set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
                                 cx.notify();
                             },
                         )),
