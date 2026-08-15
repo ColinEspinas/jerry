@@ -5,6 +5,12 @@ use crate::root::widgets::{render_disclosure_caret, text_tooltip, SimpleInput};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// How far past [`AdeApp::rail_list_state`]'s own viewport `Self::render_rail_list`'s `gpui::list`
+/// measures rows ahead of time - the same real overdraw margin
+/// `crate::sidebar::render::CHANGES_LIST_OVERDRAW` uses for the identical "a little slack so a
+/// small scroll doesn't have to measure a brand new row synchronously" reason.
+pub(crate) const RAIL_LIST_OVERDRAW: gpui::Pixels = px(48.0);
+
 /// The agent row's line-2 state word (§2.3) - deliberately distinct from [`Status::label`]
 /// (`"Idle"`, used everywhere else this enum shows text, e.g. the work-surface context bar):
 /// only the rail agent row uses `"paused"` for [`Status::Idle`], since that's the one place the
@@ -795,7 +801,10 @@ impl AdeApp {
     /// deriving them from one pass is what makes it impossible for the strip to offer a switcher
     /// over rows the body does not have - as well as saving a second full rebuild per frame.
     pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups = self.build_repo_groups(cx);
+        // `Rc`, not a plain `Vec`: `Self::render_rail_list`'s own `gpui::list` render-item
+        // closure captures this and is kept around by GPUI across frames, so it must be cheap to
+        // clone - see that function's own docs.
+        let groups: std::rc::Rc<Vec<RepoGroup>> = std::rc::Rc::new(self.build_repo_groups(cx));
         // A window with no worktree row anywhere is §1's First-run/Empty-day state: "with no
         // worktrees there are no views to offer". Read off `all_rows` rather than `rows` for the
         // same reason every count in `RepoGroup` is: a filter query that hides every row must not
@@ -832,33 +841,13 @@ impl AdeApp {
                 self.render_worktree_selection_notice_banner(cx),
                 |el, banner| el.child(banner),
             )
-            .child(
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .id("agent-rail-list")
-                            // Lets a real test measure the scroller's own painted box - the rail
-                            // menus' "rendered outside the scrolling list" guarantee (GitHub
-                            // issue #290) is only checkable against it.
-                            .debug_selector(|| "agent-rail-list".to_string())
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.rail_scroll_handle)
-                            .child(self.render_sidebar_body(view, &groups, &problems, cx)),
-                    )
-                    .children(scrollbar::render_vertical_scrollbar(
-                        "rail-scrollbar",
-                        &self.rail_scroll_handle,
-                        &[],
-                        cx,
-                    )),
-            )
+            // The scrolling body itself - see `Self::render_sidebar_body`'s own docs on why the
+            // two views no longer share one scroll-owning wrapper here: the Worktrees view's own
+            // `Self::render_rail_list` now owns real virtualized scrolling
+            // ([`Self::rail_list_state`]) rather than eagerly building every row into a plain
+            // `overflow_y_scroll()` div, while Problems keeps that plain scroller
+            // ([`Self::rail_scroll_handle`]) - genuinely few rows, no virtualization needed.
+            .child(self.render_sidebar_body(view, &groups, &problems, cx))
             .child(self.render_rail_footer(cx))
     }
 
@@ -1076,34 +1065,201 @@ impl AdeApp {
     ///
     /// Takes the groups rather than rebuilding them (GitHub issue #291): the sidebar strip above
     /// this list gates itself on the same data, and one pass is what guarantees the switcher and
-    /// the rows under it are talking about the same worktrees - see [`Self::render_rail`].
+    /// the rows under it are talking about the same worktrees - see [`Self::render_rail`]. Held
+    /// as an `Rc` (not a borrowed slice) so [`Self::render_rail_list`]'s own render-item closure
+    /// can capture it for `O(1)`, without cloning every group's rows just to hand them to a
+    /// closure GPUI keeps around across frames.
+    ///
+    /// Real virtualization (GitHub issue #364), not a render cap: this used to build every repo
+    /// header, worktree row, agent row and history row
+    /// unconditionally, on every render, regardless of scroll position - the real reason hovering
+    /// any one row in a rail with many worktrees/agents open measurably slowed down, since GPUI's
+    /// own `.hover()` triggers a full `Window::refresh()` on every hover-region transition (see
+    /// [`rail::RailListItem`]'s own docs for exactly why that made per-row-scoped hover state a
+    /// dead end). [`rail::flatten_rail_list_items`] turns `groups` into the real flat sequence of
+    /// rows this renders, and `gpui::list` - the same variable-row-height virtualized list
+    /// `crate::sidebar::render::AdeApp::render_changes_sections` already uses - builds only the
+    /// ones its own viewport (plus a small overdraw margin) actually covers.
     pub(in crate::rail) fn render_rail_list(
         &self,
-        groups: &[RepoGroup],
+        groups: &std::rc::Rc<Vec<RepoGroup>>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // GitHub issue #113: a repo with zero open worktrees still renders its own group
-        // (`Self::render_repo_group` paints every group's header regardless of
-        // `rows`/`all_rows`), so the only case left with genuinely nothing to show
-        // is no repo at all - defensive rather than reachable through any real UI path today,
-        // since `Self::render_rail` (this function's only caller) is itself only ever rendered
-        // once `Self::focused_repo` is `Some`, which requires at least one entry in `Self::repos`.
+        // (`Self::render_repo_group_header`/[`rail::flatten_rail_list_items`] emit every group's
+        // header regardless of `rows`/`all_rows`), so the only case left with genuinely nothing
+        // to show is no repo at all - defensive rather than reachable through any real UI path
+        // today, since `Self::render_rail` (this function's only caller) is itself only ever
+        // rendered once `Self::focused_repo` is `Some`, which requires at least one entry in
+        // `Self::repos`.
         if groups.is_empty() {
             return self.render_rail_empty_message("no worktrees found");
         }
 
-        let mut list = div()
-            .id("rail-repo-groups")
-            // Lets a real test prove the Worktrees *body* really is what the strip's Worktrees
-            // cell switches to, and really is gone when Problems is selected - see
-            // `crate::rail::strip_render`'s `clicking_a_cell_really_switches_the_panel_under_it`.
-            .debug_selector(|| "rail-repo-groups".to_string())
-            .flex()
-            .flex_col();
-        for (index, group) in groups.iter().enumerate() {
-            list = list.child(self.render_repo_group(group, index, cx));
+        let items: std::rc::Rc<Vec<rail::RailListItem>> =
+            std::rc::Rc::new(rail::flatten_rail_list_items(groups, |row| {
+                self.worktree_is_expanded(row)
+            }));
+        // `ListState` owns a measured height per item, so it has to be told when the item set
+        // changes size - see `Self::render_changes_sections`'s own docs on this exact idiom
+        // (`gpui::ListState::reset` takes `&self`, which is what lets this run from a `&self`
+        // render). Reset only on a real change: a reset drops the scroll position, and doing it
+        // on every render - including the ones a hover-triggered `Window::refresh()` causes, this
+        // whole change's entire reason for existing - would pin the rail to the top on every
+        // hover.
+        if self.rail_list_state.item_count() != items.len() {
+            self.rail_list_state.reset(items.len());
         }
-        list.into_any_element()
+
+        let build_items = items.clone();
+        let build_groups = groups.clone();
+        let list = gpui::list(
+            self.rail_list_state.clone(),
+            cx.processor(
+                move |this: &mut Self,
+                      index: usize,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    // Bounds-checked rather than indexed, mirroring `Self::render_changes_sections`'s
+                    // own dispatch: this frame's flattened snapshot may be stale by the time
+                    // `gpui::list` actually asks for one of its rows, and a stale index must
+                    // render nothing rather than panic.
+                    match build_items.get(index) {
+                        Some(item) => this.render_rail_list_item(&build_groups, item, window, cx),
+                        None => div().into_any_element(),
+                    }
+                },
+            ),
+        )
+        .w_full()
+        .flex_1()
+        .min_h_0();
+
+        // See `Self::render_file_tree`'s own docs (mirrored by `Self::render_changes_sections`)
+        // on why the scrollbar must be a sibling of the list, inside its own non-scrolling
+        // `.relative()` wrapper - the outer `#agent-rail-list` band is not that wrapper itself
+        // any more (it no longer scrolls: `gpui::list` owns its own scroll offset via
+        // [`Self::rail_list_state]`), just the same real painted band
+        // `crate::rail::menu_render`'s own tests measure against.
+        div()
+            .id("agent-rail-list")
+            .debug_selector(|| "agent-rail-list".to_string())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("rail-repo-groups")
+                    // Lets a real test prove the Worktrees *body* really is what the strip's
+                    // Worktrees cell switches to, and really is gone when Problems is selected -
+                    // see `crate::rail::strip_render`'s own
+                    // `clicking_a_cell_really_switches_the_panel_under_it`.
+                    .debug_selector(|| "rail-repo-groups".to_string())
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .children(scrollbar::render_vertical_scrollbar(
+                        "rail-scrollbar",
+                        &self.rail_list_state,
+                        &[],
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Dispatches one flattened [`rail::RailListItem`] to the renderer for its kind - see that
+    /// type's own docs. `groups` and `item` are both resolved fresh against this frame's own
+    /// snapshot by [`Self::render_rail_list`]'s caller (never a captured, possibly-stale
+    /// reference), the same defensive re-resolve `crate::sidebar::render::AdeApp::
+    /// render_section_row` already documents for the identical reason.
+    fn render_rail_list_item(
+        &self,
+        groups: &[RepoGroup],
+        item: &rail::RailListItem,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let trailing_pb = item.is_last_in_worktree_block(
+            groups,
+            match item {
+                rail::RailListItem::WorktreeRow {
+                    group_index,
+                    row_index,
+                } => groups
+                    .get(*group_index)
+                    .and_then(|group| group.rows.get(*row_index))
+                    .is_some_and(|row| self.worktree_is_expanded(row)),
+                _ => false,
+            },
+        );
+        match item {
+            rail::RailListItem::RepoHeader { group_index } => match groups.get(*group_index) {
+                Some(group) => self
+                    .render_repo_group_header(group, *group_index)
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            rail::RailListItem::RepoEmptyMessage { group_index } => {
+                match groups.get(*group_index) {
+                    Some(group) => self
+                        .render_repo_group_empty_message(group)
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                }
+            }
+            rail::RailListItem::WorktreeRow {
+                group_index,
+                row_index,
+            } => match groups
+                .get(*group_index)
+                .and_then(|group| group.rows.get(*row_index))
+            {
+                Some(row) => {
+                    let is_expanded = self.worktree_is_expanded(row);
+                    self.render_worktree_row(row, *row_index, is_expanded, trailing_pb, cx)
+                        .into_any_element()
+                }
+                None => div().into_any_element(),
+            },
+            rail::RailListItem::AgentRow {
+                group_index,
+                row_index,
+                agent_index,
+            } => match groups
+                .get(*group_index)
+                .and_then(|group| group.rows.get(*row_index))
+                .and_then(|row| row.agents.get(*agent_index))
+            {
+                Some(agent) => self
+                    .render_agent_row(agent, trailing_pb, cx)
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            rail::RailListItem::HistoryHeader { .. } => {
+                self.render_history_header().into_any_element()
+            }
+            rail::RailListItem::PastAgentRow {
+                group_index,
+                row_index,
+                history_index,
+            } => match groups
+                .get(*group_index)
+                .and_then(|group| group.rows.get(*row_index))
+                .and_then(|row| row.history.get(*history_index))
+            {
+                Some(past) => {
+                    let now_unix = self.history_now_unix();
+                    self.render_past_agent_row(past, now_unix, trailing_pb, cx)
+                        .into_any_element()
+                }
+                None => div().into_any_element(),
+            },
+        }
     }
 
     pub(in crate::rail) fn render_rail_empty_message(
@@ -1170,11 +1326,16 @@ impl AdeApp {
     ///   twin defect on the Changes panel's own labels, where `flex:none` *without* nowrap let
     ///   `AGAINST MAIN` wrap to two lines and grow its header.
     /// - **Two urgency counts, not one sentence.** See [`Self::render_repo_urgency_count`].
-    pub(in crate::rail) fn render_repo_group(
+    ///
+    /// `Self::render_rail_list`'s flattened [`rail::RailListItem::RepoHeader`] resolves here.
+    /// Split out of the old `render_repo_group` (GitHub issue #364) so it can be one standalone
+    /// virtualized list item rather
+    /// than a fixed piece of a div that also unconditionally built every one of this group's
+    /// rows.
+    pub(in crate::rail) fn render_repo_group_header(
         &self,
         group: &RepoGroup,
         index: usize,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let repo_id = group.repo_id;
         let is_first = index == 0;
@@ -1187,8 +1348,6 @@ impl AdeApp {
             .gap(px(6.0))
             .h(px(26.0))
             .px(px(12.0))
-            // §4s: 3px to this header's own first worktree row, against the 7px between rows.
-            .mb(px(3.0))
             // §4s/§4u: a bare rule above the label, and none at all on the first band.
             .when(!is_first, |el| {
                 el.border_t_1().border_color(theme::border::DIVIDER)
@@ -1239,53 +1398,60 @@ impl AdeApp {
                 group.failed_count(),
             ));
 
-        let mut group_div = div()
-            .id(("repo-group", repo_id.0))
+        // §4s/§4u: 3px to this header's own first worktree row (against the 7px between rows),
+        // and a 12px spacer above every band but the first - both real sibling boxes now, not
+        // `mb`/`pt` on the header itself. `gpui::list`/`gpui::UniformList` measure each item via
+        // `Element::layout_as_root`, which - verified directly against a real render, the same way
+        // `crate::root::scrollbar`'s own geometry notes verify against
+        // `vendor/zed/crates/gpui/src/elements/uniform_list.rs` - does not fold a root element's
+        // own margin into its measured height the way an ordinary flex sibling's would be, so a
+        // flattened list item's inter-item spacing has to be real boxes in its own returned
+        // element tree instead. The header's own 26px measured height (`rail_rev6_render_tests::
+        // the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other`) stays exactly
+        // that - unaffected by either spacer, both of which sit outside it.
+        div()
             .flex()
             .flex_col()
-            // §4u: repo-to-repo separation is a 12px spacer above every band but the first.
-            .when(!is_first, |el| el.pt(px(12.0)))
-            .child(header);
+            .when(!is_first, |el| el.child(div().h(px(12.0))))
+            .child(header)
+            .child(div().h(px(3.0)))
+    }
 
-        if group.rows.is_empty() {
-            // GitHub issue #113: previously this repo's whole group (header included) was
-            // dropped from the rail entirely whenever it had no rows to show - see
-            // `Self::render_rail_list`'s own updated docs. A real, worded inline message now
-            // takes that empty row-list's place instead, distinguishing three real cases: this
-            // repo's own first real fetch hasn't resolved yet (`!group.rows_loaded` - normally
-            // just a brief window right after `Self::add_repo`, not a standing limitation), it
-            // genuinely has no open worktrees, or the filter box is hiding them - never claiming
-            // "no worktrees open yet" for a repo whose data this app hasn't actually fetched,
-            // which may well have several worktrees on disk.
-            group_div = group_div.child(
-                div()
-                    .px(px(12.0))
-                    .pb(px(6.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(9.5))
-                    .text_color(theme::text::GHOSTER)
-                    .child(if !group.rows_loaded {
-                        // No "click to open" here: the header is not clickable (see this
-                        // function's own docs), and this repo's own real background fetch
-                        // (`crate::root::AdeApp::start_repo_worktrees_polling`) resolves this
-                        // state on its own moments later.
-                        "not loaded yet"
-                    } else if group.all_rows.is_empty() {
-                        "no worktrees open yet"
-                    } else {
-                        "no worktrees match this filter"
-                    }),
-            );
-        } else {
-            group_div = group_div.children(
-                group
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| self.render_worktree_row(row, index, cx)),
-            );
-        }
-        group_div
+    /// The inline "not loaded yet" / "no worktrees open yet" / "no worktrees match this filter"
+    /// message shown in place of a repo group's rows when it has none to show -
+    /// `Self::render_rail_list`'s flattened [`rail::RailListItem::RepoEmptyMessage`] resolves
+    /// here. Split out of the old `render_repo_group` for the same reason
+    /// [`Self::render_repo_group_header`] was.
+    ///
+    /// GitHub issue #113: previously this repo's whole group (header included) was dropped from
+    /// the rail entirely whenever it had no rows to show. A real, worded inline message takes
+    /// that empty row-list's place instead, distinguishing three real cases: this repo's own
+    /// first real fetch hasn't resolved yet (`!group.rows_loaded` - normally just a brief window
+    /// right after `Self::add_repo`, not a standing limitation), it genuinely has no open
+    /// worktrees, or the filter box is hiding them - never claiming "no worktrees open yet" for a
+    /// repo whose data this app hasn't actually fetched, which may well have several worktrees on
+    /// disk.
+    pub(in crate::rail) fn render_repo_group_empty_message(
+        &self,
+        group: &RepoGroup,
+    ) -> impl IntoElement {
+        div()
+            .px(px(12.0))
+            .pb(px(6.0))
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(9.5))
+            .text_color(theme::text::GHOSTER)
+            .child(if !group.rows_loaded {
+                // No "click to open" here: the header is not clickable (see
+                // `Self::render_repo_group_header`'s own docs), and this repo's own real
+                // background fetch (`crate::root::AdeApp::start_repo_worktrees_polling`) resolves
+                // this state on its own moments later.
+                "not loaded yet"
+            } else if group.all_rows.is_empty() {
+                "no worktrees open yet"
+            } else {
+                "no worktrees match this filter"
+            })
     }
 
     /// Whether `row`'s agent rows are currently shown - an explicit per-worktree override in
@@ -1329,11 +1495,25 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// One worktree row (§2.2: 27 high, padding `0 10 0 6`, gap 6) plus, when expanded, its
-    /// agent rows (§2.3) - the rail's real "worktree owns N agents" structure. `index` (unique
-    /// within its repo group) disambiguates element ids for the real degenerate case
-    /// `crate::rail::worktrees::WorktreeItem`'s docs call out: more than one unreadable worktree
-    /// entry shares the same (empty) `path`, which alone would collide.
+    /// One worktree row's own header band (§2.2: 27 high, padding `0 10 0 6`, gap 6) - the rail's
+    /// real "worktree owns N agents" structure now renders its agent rows (§2.3) and history rows
+    /// as their own sibling [`rail::RailListItem`]s (see that type's own docs for why), so this
+    /// builds only the one 27px band every worktree row always has, whether or not it is
+    /// expanded. `index` (unique within its repo group) disambiguates element ids for the real
+    /// degenerate case `crate::rail::worktrees::WorktreeItem`'s docs call out: more than one
+    /// unreadable worktree entry shares the same (empty) `path`, which alone would collide.
+    ///
+    /// `is_expanded` is passed in rather than recomputed from [`Self::worktree_is_expanded`] so
+    /// this always agrees with whatever [`rail::flatten_rail_list_items`] decided when it chose
+    /// whether to emit this row's agent/history items at all - recomputing it here from the same
+    /// mutable [`Self::rail_collapse_overrides`] a caret click can change mid-frame would risk the
+    /// caret glyph disagreeing with which children the list actually rendered.
+    ///
+    /// `trailing_pb` carries the 7px gap to the next worktree's own block
+    /// (`STAGE-A-CHANGELOG.md` §4n/§4s) - `true` exactly when this header is the last item in its
+    /// own worktree's block, i.e. when it has no expanded children for the flattened
+    /// [`rail::RailListItem::AgentRow`]/[`rail::RailListItem::PastAgentRow`] items to carry it
+    /// instead. See [`rail::RailListItem::is_last_in_worktree_block`].
     ///
     /// Clicking the row selects this worktree (`Self::select_worktree_by_path`), restoring
     /// whatever tab it was left on (§2.3: "Clicking a worktree header restores whatever tab it
@@ -1343,6 +1523,8 @@ impl AdeApp {
         &self,
         row: &WorktreeRow,
         index: usize,
+        is_expanded: bool,
+        trailing_pb: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = format!("worktree-row-{index}-{}", row.path.display());
@@ -1388,7 +1570,11 @@ impl AdeApp {
         // be expandable - the caret/expand state used to be gated on `has_agents` alone, which
         // would hide a bare worktree's history behind a caret that never rendered at all.
         let has_children = has_agents || has_history;
-        let is_expanded = has_children && self.worktree_is_expanded(row);
+        // `is_expanded` is a real parameter now, not recomputed here - see this function's own
+        // docs on why. Guard against a childless row somehow being passed `is_expanded: true`
+        // anyway (defensive; `rail::flatten_rail_list_items` never does), the same way the old
+        // local computation always `&&`-ed against `has_children`.
+        let is_expanded = has_children && is_expanded;
 
         let edge_color =
             worktree_row_edge(row.aggregate_status(), row.note.is_prunable(), is_selected);
@@ -1585,36 +1771,23 @@ impl AdeApp {
             .child(div().flex_1().min_w(px(2.0)))
             .child(trailing);
 
-        let mut container = div()
-            .id(("worktree-group", index as u64))
-            .flex()
-            .flex_col()
-            // §4n/§4s: 7px between worktree groups, against the 1px this had before and the 3px
-            // the repo header now sits above its own first row. "The ratio is the point: space
-            // inside a group is now smaller than the space between groups, so a worktree and its
-            // agents read as one block."
-            .pb(px(7.0))
-            .child(header);
-        if is_expanded {
-            for agent in &row.agents {
-                container = container.child(self.render_agent_row(agent, cx));
-            }
-            if has_history {
-                container = container.child(self.render_history_section(&row.history, cx));
-            }
-        }
-
         // GitHub issue #12's "locked worktrees are visually marked, with the lock reason
         // surfaced (tooltip is fine)" - `row.note.is_locked` alone (already threaded through
         // `build_worktree_entries` from `WorktreeItem::is_locked`) is what drives the `·
         // locked`/`locked` text `WorktreeNote::label` already renders in the stat column above;
-        // this adds the *reason* as a tooltip on the whole row. Looked up from `self.worktrees`
-        // by path rather than threaded onto `WorktreeRow` itself - `WorktreeNote` is shared with
-        // the periodic status-poll snapshot (`crate::rail::state::compute_status_snapshot`) and
-        // already has a lot of call sites; a worktree list is always small, so a linear lookup
-        // here per row per render is real but negligible cost next to everything else this
-        // function already computes.
-        if row.note.is_locked {
+        // this adds the *reason* as a tooltip. Looked up from `self.worktrees` by path rather
+        // than threaded onto `WorktreeRow` itself - `WorktreeNote` is shared with the periodic
+        // status-poll snapshot (`crate::rail::state::compute_status_snapshot`) and already has a
+        // lot of call sites; a worktree list is always small, so a linear lookup here per row per
+        // render is real but negligible cost next to everything else this function already
+        // computes.
+        //
+        // Scoped to this header band alone, not the whole worktree block the way it was before
+        // this row's agent/history rows became their own sibling list items rather than this
+        // row's own children (`rail::RailListItem`'s own docs): a locked worktree's own row is
+        // what carries the mark, and its lock state has no separate meaning to state on a live
+        // agent row underneath it.
+        let header = if row.note.is_locked {
             let lock_reason = self
                 .worktrees
                 .iter()
@@ -1624,8 +1797,12 @@ impl AdeApp {
                 Some(reason) => format!("Locked: {reason}"),
                 None => "Locked".to_string(),
             };
-            container = container.tooltip(text_tooltip(tooltip_text));
-        }
+            header
+                .tooltip(text_tooltip(tooltip_text))
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        };
 
         // No question-preview card renders here, deliberately. `design_handoff_jerry_ade/revision
         // 3/REVISION-2026-07-31.md` §2.3, verbatim: "**No question preview.** The amber ask box is
@@ -1637,7 +1814,24 @@ impl AdeApp {
         // The row's `needs input` dot and state word are what the rail is for. `AgentRow` carries
         // no preview field at all any more (and `Self::build_agent_rows` no longer scrapes the pty
         // grid for one) - see `rail_correction_tests`.
-        container.into_any_element()
+        //
+        // `trailing_pb`'s 7px is a real sibling spacer box, not `.pb()` on `header` itself: `header`
+        // carries a fixed `.h(px(27.0))` (`taffy`'s default `BoxSizing::BorderBox`, which this
+        // whole crate relies on - see e.g. `crate::root::scrollbar`'s own geometry notes), so
+        // padding there would shrink the row's own 27px content area rather than add space below
+        // it. See `Self::render_repo_group_header`'s own docs on the identical spacer idiom, used
+        // there for the same "a flattened list item's own inter-item spacing has to be a real box,
+        // not a style meant for an ordinary flex sibling" reason.
+        if trailing_pb {
+            div()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(div().h(px(7.0)))
+                .into_any_element()
+        } else {
+            header
+        }
     }
 
     /// One agent row (§2.3): indented 13, a 1px spine (2px and status-coloured when this is the
@@ -1664,9 +1858,13 @@ impl AdeApp {
     /// does not need to have a color here"). Urgency lives in the dot and the state word; an
     /// asking agent used to carry three amber elements, and the third of them stated *when*, which
     /// is not a severity.
+    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter - `true`
+    /// exactly when [`rail::RailListItem::is_last_in_worktree_block`] says this is the flattened
+    /// item that now carries the 7px gap to the next worktree's own block.
     pub(in crate::rail) fn render_agent_row(
         &self,
         agent: &AgentRow,
+        trailing_pb: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self.agents.active_id() == Some(agent.id);
@@ -1832,41 +2030,36 @@ impl AdeApp {
                             ),
                     ),
             )
+            .when(trailing_pb, |el| el.pb(px(7.0)))
     }
 
-    /// A worktree row's "History" section (GitHub issue #227): a small label, then one
-    /// [`Self::render_past_agent_row`] per real persisted-but-not-running agent. Only ever called
-    /// when `past` is non-empty - see [`Self::render_worktree_row`]'s own `has_history` gate,
-    /// which is also this app's answer to "a worktree with no persisted history shows nothing":
-    /// no empty state renders here at all, because this whole section is never reached for one.
-    fn render_history_section(
-        &self,
-        past: &[crate::hooks::history::PastAgent],
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        // Real wall-clock seconds since the Unix epoch, mirroring
-        // `crate::work_surface::agents::unix_now`'s own `unwrap_or(0)` for a nonsense clock.
-        let now_unix = std::time::SystemTime::now()
+    /// A worktree row's "History" section label (GitHub issue #227) - `Self::render_rail_list`'s
+    /// flattened [`rail::RailListItem::HistoryHeader`] resolves here. Split out of the old
+    /// `render_history_section` for the same reason [`Self::render_repo_group_header`] was split
+    /// out of `render_repo_group`: [`Self::render_past_agent_row`] (one per real
+    /// persisted-but-not-running agent) is now its own sibling list item, not a child this
+    /// function loops over and builds unconditionally.
+    fn render_history_header(&self) -> impl IntoElement {
+        div()
+            .pl(px(13.0))
+            .pt(px(4.0))
+            .pb(px(2.0))
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(8.5))
+            .text_color(theme::text::GHOSTER)
+            .child("HISTORY")
+    }
+
+    /// Real wall-clock seconds since the Unix epoch, mirroring
+    /// `crate::work_surface::agents::unix_now`'s own `unwrap_or(0)` for a nonsense clock - shared
+    /// by every [`Self::render_past_agent_row`] call in one frame (`Self::render_rail_list`'s
+    /// dispatch) so they all agree on what "now" was, the same way the old `render_history_section`
+    /// computed it once for its whole loop.
+    fn history_now_unix(&self) -> i64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or(0);
-        div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .pl(px(13.0))
-                    .pt(px(4.0))
-                    .pb(px(2.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(8.5))
-                    .text_color(theme::text::GHOSTER)
-                    .child("HISTORY"),
-            )
-            .children(
-                past.iter()
-                    .map(|past_agent| self.render_past_agent_row(past_agent, now_unix, cx)),
-            )
+            .unwrap_or(0)
     }
 
     /// One row under a worktree's "History" section: a real, persisted-but-not-currently-running
@@ -1880,10 +2073,12 @@ impl AdeApp {
     /// honest label for the fallback (`crate::hooks::flow::AdeApp::resume_past_agent`) of simply
     /// spawning a fresh agent back into this worktree. Never claims to continue a conversation it
     /// cannot.
+    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter.
     fn render_past_agent_row(
         &self,
         past: &crate::hooks::history::PastAgent,
         now_unix: i64,
+        trailing_pb: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status = past.status;
@@ -2009,6 +2204,7 @@ impl AdeApp {
                             ),
                     ),
             )
+            .when(trailing_pb, |el| el.pb(px(7.0)))
     }
 
     /// The real `Y GB` (`+` suffixed if [`Self::disk_usage`] was truncated) disk-usage label, or
@@ -2786,7 +2982,7 @@ mod rail_row_tests {
         });
 
         app.update(cx, |app, cx| {
-            let groups = app.build_repo_groups(cx);
+            let groups = std::rc::Rc::new(app.build_repo_groups(cx));
             let _ = app.render_rail_list(&groups, cx);
         });
     }
@@ -5046,6 +5242,240 @@ mod rail_rev6_render_tests {
             header_to_row < row_to_row,
             "the ratio is the point: a header that sits as far from its own rows as they sit \
              from each other groups nothing"
+        );
+    }
+}
+
+/// Proves GitHub issue #364's real fix: with many worktrees open, [`AdeApp::render_rail_list`]
+/// used to build every worktree row unconditionally, on every render, regardless of scroll
+/// position - which is why hovering was slow, since GPUI's own `.hover()` forces a full
+/// `Window::refresh()` (and a refresh bypasses every view's own per-entity render cache) on every
+/// hover-region transition. Mirrors `crate::sidebar::render::virtualization_tests` exactly, the
+/// same real black-box proof this app already trusts for the file tree's own virtualized
+/// `uniform_list`: absence/presence of a real painted element, not an internal call counter,
+/// because that is the one thing a regression in this exact area (an eager `.children(...)` tree
+/// standing in for real virtualization again) cannot fake past.
+#[cfg(test)]
+mod rail_virtualization_tests {
+    use super::*;
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Deliberately more rows than any plausible test viewport can show at 27px each, mirroring
+    /// `crate::sidebar::render::virtualization_tests`' own 300-file tree fixture - "dozens to
+    /// hundreds" per the live report this issue is about.
+    const ROW_COUNT: usize = 120;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// Seeds [`ROW_COUNT`] real, distinct worktree entries directly onto `app.worktrees` - real
+    /// on-disk directories (so every row's own path is real, not merely syntactically valid), but
+    /// without the real `git worktree add` process spawn each of ~120 real linked worktrees would
+    /// cost: `Self::build_repo_groups`/`rail::flatten_rail_list_items`/`Self::render_rail_list`
+    /// never distinguish "loaded from a real `git worktree list` porcelain scan" from "seeded
+    /// directly" - both paths converge on the exact same `WorktreeItem`/`WorktreeRow`/`RepoGroup`
+    /// types this file's own `rail_row_tests`/`prune_regression_tests` already seed the same way
+    /// for their own synthetic fixtures. Returns every seeded path in seed order; the caller owns
+    /// `keepalive` so the real `TempDir`s (and the directories they hold open) outlive the test.
+    fn seed_many_worktrees(app: &mut AdeApp, keepalive: &mut Vec<TempDir>) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(ROW_COUNT);
+        let mut items = Vec::with_capacity(ROW_COUNT);
+        for index in 0..ROW_COUNT {
+            let dir = TempDir::new().expect("tempdir");
+            let path = dir.path().to_path_buf();
+            keepalive.push(dir);
+            items.push(worktree_item(path.clone(), &format!("wt-{index:03}")));
+            paths.push(path);
+        }
+        app.worktrees = items;
+        paths
+    }
+
+    /// The real `worktree-row-{index}-{path}` `debug_selector`
+    /// [`AdeApp::render_worktree_row`] paints its header under, resolved the same defensive way
+    /// `crate::rail::menu_render`'s own `worktree_row_selector` test helper does: `index` is
+    /// [`rail::WorktreeRow::urgency_rank`]'s real sort position, never the seed order, so this
+    /// asks the live render for it rather than assuming one.
+    fn worktree_row_selector(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        worktree_path: &Path,
+    ) -> &'static str {
+        let index = app
+            .update(cx, |app, cx| app.build_repo_groups(cx))
+            .iter()
+            .find_map(|group| group.rows.iter().position(|row| row.path == worktree_path))
+            .expect("the worktree must be a real, rendered rail row");
+        Box::leak(format!("worktree-row-{index}-{}", worktree_path.display()).into_boxed_str())
+    }
+
+    /// Before this fix, this row would have painted too: `Self::render_rail_list` built every
+    /// worktree row unconditionally, regardless of scroll position. `crate::sidebar::render::
+    /// virtualization_tests::a_file_tree_row_far_below_the_viewport_is_never_painted`'s own docs
+    /// record the same class of measurement for the file tree - "~145ms of a ~200ms `Window::
+    /// draw`" - before *that* surface's equivalent fix.
+    #[gpui::test]
+    fn a_worktree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        // Small enough that `ROW_COUNT` rows at 27px each genuinely overflow the rail's own
+        // viewport many times over - the same reasoning `crate::rail::menu_render`'s own
+        // `scrolling_the_rail_does_not_move_or_clip_an_open_menu` resizes for.
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let first = worktree_row_selector(&app, cx, &paths[0]);
+        let far_below = worktree_row_selector(&app, cx, &paths[ROW_COUNT - 1]);
+
+        assert!(
+            cx.debug_bounds(first).is_some(),
+            "the first worktree row must really paint - if it doesn't, this test proves \
+             nothing about virtualization, only that the rail is empty"
+        );
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "the {ROW_COUNT}th worktree row is far below any plausible viewport, so a real \
+             virtualized list must never build it as an element at all"
+        );
+    }
+
+    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
+    /// must still be reachable by scrolling - mirrors `crate::sidebar::render::
+    /// virtualization_tests::scrolling_the_virtualized_file_tree_materializes_a_row_that_was_not_painted`
+    /// exactly, including its "a deliberately huge delta needs no row-height/viewport-size model
+    /// of its own" reasoning: `gpui::ListState` clamps to its own real maximum scroll offset.
+    #[gpui::test]
+    fn scrolling_the_virtualized_rail_materializes_a_row_that_was_not_painted(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let far_path = paths[ROW_COUNT - 1].clone();
+        let far_below = worktree_row_selector(&app, cx, &far_path);
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before scrolling"
+        );
+
+        // `gpui::ListState::scroll_to_reveal_item`, not a simulated wheel delta: unlike
+        // `uniform_list` (every row the same measured height, so its own real maximum scroll
+        // offset is known upfront), `gpui::list`'s rows are genuinely variable height and mostly
+        // unmeasured this far below the fold, so a single huge wheel delta clamps against
+        // whatever total height it has measured *so far* (near-zero, with only the first
+        // viewport's worth of rows ever rendered) rather than the real end of a `ROW_COUNT`-row
+        // list - the real, gpui-native "jump to an item by index regardless of whether its
+        // height has ever been measured" API is this one.
+        let target_index = app.update(cx, |app, cx| {
+            let groups = app.build_repo_groups(cx);
+            let items = rail::flatten_rail_list_items(&groups, |row| app.worktree_is_expanded(row));
+            items
+                .iter()
+                .position(|item| match item {
+                    rail::RailListItem::WorktreeRow {
+                        group_index,
+                        row_index,
+                    } => groups[*group_index].rows[*row_index].path == far_path,
+                    _ => false,
+                })
+                .expect("the far-below worktree must be a real flattened list item")
+        });
+        // One `scroll_to_reveal_item` call only gets as far as `gpui::ListState` can compute from
+        // what it has *already measured* - real, unlike `uniform_list`'s single known row height,
+        // items past whatever the viewport has ever shown are still `Unmeasured` (contributing no
+        // real height to its running total yet), so revealing an item this far past the fold
+        // takes the same real incremental steps a user dragging the scrollbar all the way down
+        // would drive: each call measures a little further, which is what the next call's own
+        // computation then has to work with. `ROW_COUNT` calls is a generous, real upper bound
+        // (this fixture never needs more than a handful in practice), not a magic constant.
+        for _ in 0..ROW_COUNT {
+            app.update(cx, |app, cx| {
+                app.rail_list_state.scroll_to_reveal_item(target_index);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.debug_bounds(far_below).is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            cx.debug_bounds(far_below).is_some(),
+            "scrolling to reveal the last row must really materialize it - if this fails the \
+             list is not scrollable any more, which is a far worse regression than the render \
+             cost this change set out to fix"
+        );
+    }
+
+    /// The live report itself, made falsifiable: hovering a row that is really on screen must
+    /// never materialize one that is not, even though GPUI's own `.hover()` forces a full
+    /// `Window::refresh()` on the transition (`crate::rail::state::RailListItem`'s own docs on
+    /// exactly why that refresh alone doesn't bound the work without real virtualization
+    /// underneath it). Before this fix this assertion would have failed outright: every row,
+    /// including this one, was built on every render, hover-triggered refreshes included.
+    #[gpui::test]
+    fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let mut keepalive = Vec::new();
+        let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_resize(gpui::size(px(760.0), px(400.0)));
+        cx.run_until_parked();
+
+        let first_row = worktree_row_selector(&app, cx, &paths[0]);
+        let far_below = worktree_row_selector(&app, cx, &paths[ROW_COUNT - 1]);
+        let first_bounds = cx
+            .debug_bounds(first_row)
+            .expect("the first worktree row must really paint");
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before any hover"
+        );
+
+        // A real hover-region transition: away from every row first (so entering the first row's
+        // own hitbox is a genuine transition, the one GPUI's own `.hover()` reacts to by calling
+        // `Window::refresh()`), then onto it.
+        cx.simulate_mouse_move(gpui::point(px(1.0), px(1.0)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(first_bounds.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "hovering a row that is really on screen must not materialize one that is not - a \
+             hover-triggered `Window::refresh()` bypassing every view's per-entity render cache \
+             (see `crate::rail::state::RailListItem`'s own docs) is exactly what made the rail \
+             slow to hover with many rows open before this fix, and exactly what real \
+             virtualization has to stay correct under"
         );
     }
 }

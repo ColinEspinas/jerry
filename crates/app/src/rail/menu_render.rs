@@ -7,8 +7,9 @@
 //! ## Both menus render at the root, not in the rail
 //!
 //! `REVISION-2026-08-14.md` §4, verbatim: "All menus render outside the scrolling list. Inside it
-//! they are clipped by the scroller and scroll away from their anchor." The rail list really is a
-//! scroller (`#agent-rail-list`, `overflow_y_scroll` + `track_scroll`), so a menu rendered as a
+//! they are clipped by the scroller and scroll away from their anchor." The rail's Worktrees list
+//! really is a scroller - a real virtualized `gpui::list` (`crate::rail::render::AdeApp::
+//! rail_list_state`) painted inside the same `#agent-rail-list` band - so a menu rendered as a
 //! child of a row would be clipped by it, would slide away from the pointer it was anchored to on
 //! the next wheel event, and would vanish outright whenever its row left the viewport.
 //! `STAGE-A-CHANGELOG.md` §4w generalises it: "an overlay anchored in viewport coordinates must
@@ -774,8 +775,13 @@ mod rail_menu_tests {
         let row_before = cx.debug_bounds(row_selector).expect("the row must paint");
 
         app.update(cx, |app, cx| {
-            app.rail_scroll_handle
-                .set_offset(gpui::point(px(0.0), px(-40.0)));
+            // `gpui::ListState`, not `gpui::ScrollHandle`, now owns the Worktrees list's real
+            // scroll offset (`crate::rail::render::AdeApp::rail_list_state`) - see that field's
+            // own docs. Same negative-`y`-means-scrolled-down convention `ScrollHandle::
+            // set_offset` used, via the identical scrollbar-facing setter
+            // `crate::root::scrollbar::ScrollableHandle` calls on a drag.
+            app.rail_list_state
+                .set_offset_from_scrollbar(gpui::point(px(0.0), px(-40.0)));
             cx.notify();
         });
         cx.run_until_parked();

@@ -56,6 +56,7 @@ use crate::icons::{IconRow, IconSize};
 use crate::lsp::client::LspClientState;
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::rail::strip::{self, Problem, ProblemTally, SidebarView, StripCell, StripMarker};
+use crate::root::scrollbar;
 use crate::root::widgets::text_tooltip;
 
 impl AdeApp {
@@ -319,16 +320,48 @@ impl AdeApp {
     /// marker and this body are two answers about one set of diagnostics, and deriving them from
     /// one pass is what makes it impossible for the marker to report a number the list below it
     /// does not contain (`REVISION-2026-08-13.md` §2: "tallied over their own data").
+    ///
+    /// Each view owns its **own** scroll-owning wrapper now, rather than sharing one built here:
+    /// [`Self::render_rail_list`] (Worktrees) is a real virtualized `gpui::list`
+    /// ([`Self::rail_list_state`]) which manages its own scroll offset, while
+    /// [`Self::render_problems_view`] keeps the plain `overflow_y_scroll()` +
+    /// [`Self::rail_scroll_handle`] scroller the rail used for both views before - genuinely few
+    /// rows, so no virtualization is needed there.
     pub(in crate::rail) fn render_sidebar_body(
         &self,
         view: SidebarView,
-        groups: &[RepoGroup],
+        groups: &std::rc::Rc<Vec<RepoGroup>>,
         problems: &[Problem],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match view {
             SidebarView::Worktrees => self.render_rail_list(groups, cx),
-            SidebarView::Problems => self.render_problems_view(problems, cx),
+            SidebarView::Problems => div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .id("agent-rail-list")
+                        // Lets a real test measure the scroller's own painted box - the rail
+                        // menus' "rendered outside the scrolling list" guarantee (GitHub issue
+                        // #290) is only checkable against it.
+                        .debug_selector(|| "agent-rail-list".to_string())
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.rail_scroll_handle)
+                        .child(self.render_problems_view(problems, cx)),
+                )
+                .children(scrollbar::render_vertical_scrollbar(
+                    "rail-scrollbar",
+                    &self.rail_scroll_handle,
+                    &[],
+                    cx,
+                ))
+                .into_any_element(),
         }
     }
 
