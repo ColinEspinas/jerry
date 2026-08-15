@@ -134,6 +134,78 @@ pub enum EventKind {
     IdleNudge,
 }
 
+/// Whether an edit event fired *before* the agent wrote, or *after*.
+///
+/// Both halves are load-bearing for per-agent attribution (GitHub issue #284), and for opposite
+/// reasons. `PreToolUse` is the only moment anything in this process can still see what the file
+/// looked like *before* the agent touched it - without it, the first edit to a five-hundred-line
+/// file has nothing to diff against and the agent would appear to have written all of it.
+/// `PostToolUse` is the moment the new content is really on disk, so it is the only moment the
+/// diff is worth taking. See `crate::provenance::store` for what each one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditPhase {
+    /// `PreToolUse`: the agent is about to write this file.
+    Before,
+    /// `PostToolUse`: the agent has written this file.
+    After,
+}
+
+/// A file an agent's tool call is about to write, or has just written (GitHub issue #284).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditedFile {
+    pub phase: EditPhase,
+    /// Exactly the path string the payload carried, **not** normalised here. Every real capture
+    /// on this machine held an absolute path, but a relative one is a real shape too (see
+    /// `crate::hooks::server`'s own tests), and which worktree it belongs to is not a question
+    /// this module can answer - `crate::provenance::flow` resolves it against the agent's own
+    /// `cwd`, which is the only place both halves are known.
+    pub path: String,
+    /// The payload's own `cwd`, present on every real Claude Code event. This is what a relative
+    /// `path` would be relative to.
+    pub cwd: Option<String>,
+}
+
+/// The tools whose whole purpose is to write a file, and the `tool_input` key each puts the path
+/// under.
+///
+/// An allow-list rather than "any tool with a `file_path`", because the distinction being drawn
+/// is *did the file just change*, and `Read`/`Grep`/`Glob` all carry a `file_path`/`path` while
+/// changing nothing. Attributing on a `Read` would hand an agent every line of every file it
+/// merely looked at.
+///
+/// `Bash` is deliberately absent even though `sed -i`/`>` really do write: the payload carries a
+/// shell command, not a path, and guessing which files a command touched from its text is exactly
+/// the "confidently wrong" class this codebase refuses elsewhere. Such a change is instead picked
+/// up as an unattributed or hand edit, which is the honest answer.
+const EDITING_TOOLS: [(&str, &str); 4] = [
+    ("Edit", "file_path"),
+    ("Write", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+/// The file a `PreToolUse`/`PostToolUse` payload says is being written, if its tool writes files
+/// at all.
+fn edited_file(tool: &str, value: &serde_json::Value, phase: EditPhase) -> Option<EditedFile> {
+    let key = EDITING_TOOLS
+        .iter()
+        .find_map(|(name, key)| (*name == tool).then_some(*key))?;
+    let path = value
+        .get("tool_input")?
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())?;
+    Some(EditedFile {
+        phase,
+        path: path.to_owned(),
+        cwd: value
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_owned),
+    })
+}
+
 /// One parsed hook event, reduced to exactly what the rail row needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookReport {
@@ -163,6 +235,15 @@ pub struct HookReport {
     /// or malformed request will carry one), which a reader must treat as "no id available",
     /// never as a reason to fail the rest of the report.
     pub session_id: Option<String>,
+    /// The file this tool call writes, for GitHub issue #284's per-agent line provenance. `None`
+    /// for every event that is not a file-writing tool call - which is most of them.
+    ///
+    /// This is the one thing this module extracts that the *rail* has no use for. It is here
+    /// rather than in a second parser because the raw payload only exists at this one point in
+    /// the program (`crate::hooks::server::handle_connection` hands over these bytes and keeps
+    /// nothing), and a second parse of the same JSON for a second consumer is how two readers of
+    /// one payload start disagreeing about what it said.
+    pub edit: Option<EditedFile>,
 }
 
 impl HookReport {
@@ -175,6 +256,7 @@ impl HookReport {
             activity: None,
             question: None,
             session_id: None,
+            edit: None,
         }
     }
 }
@@ -336,12 +418,17 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 Some(argument) => truncated(&format!("{tool}: {argument}"), ACTIVITY_MAX_CHARS),
                 None => truncated(tool, ACTIVITY_MAX_CHARS),
             };
+            let phase = match event_name {
+                "PreToolUse" => EditPhase::Before,
+                _ => EditPhase::After,
+            };
             Some(HookReport {
                 kind: EventKind::Transition,
                 fact: HookFact::Working,
                 activity,
                 question: None,
                 session_id: None,
+                edit: edited_file(tool, &value, phase),
             })
         }
 
@@ -359,6 +446,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .and_then(serde_json::Value::as_str)
                     .and_then(|error| truncated(error, QUESTION_MAX_CHARS)),
                 session_id: None,
+                edit: None,
             })
         }
 
@@ -382,6 +470,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     activity: None,
                     question: truncated(asked, QUESTION_MAX_CHARS),
                     session_id: None,
+                    edit: None,
                 });
             }
             let argument = tool_input.and_then(tool_input_preview);
@@ -398,6 +487,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 activity: None,
                 question,
                 session_id: None,
+                edit: None,
             })
         }
 
@@ -423,6 +513,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .and_then(serde_json::Value::as_str)
                     .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
                 session_id: None,
+                edit: None,
             })
         }
 
@@ -437,6 +528,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
             session_id: None,
+            edit: None,
         }),
 
         _ => None,
@@ -549,6 +641,122 @@ mod tests {
                 "an unreadable question must fall back, never guess: {input}"
             );
         }
+    }
+
+    #[test]
+    fn a_real_captured_write_names_the_file_it_is_about_to_write_and_the_one_it_just_wrote() {
+        // GitHub issue #284's whole input signal, off the real captured payload above. The two
+        // phases are not interchangeable: `Before` is the only chance to see what the file looked
+        // like *before* the agent touched it, and `After` is the only moment the new content is
+        // really on disk.
+        let before = parse("PreToolUse", REAL_PRE_TOOL_USE_WRITE).expect("real payload must parse");
+        assert_eq!(
+            before.edit,
+            Some(EditedFile {
+                phase: EditPhase::Before,
+                path: "/tmp/capture/done.txt".to_string(),
+                cwd: Some("/tmp/capture".to_string()),
+            })
+        );
+
+        // The same real body arrives again as the matching `PostToolUse` - verified against a real
+        // `claude` 2.1.228, which sends the identical `tool_input` on both.
+        let after = parse("PostToolUse", REAL_PRE_TOOL_USE_WRITE).expect("real payload must parse");
+        assert_eq!(
+            after.edit.as_ref().map(|edit| edit.phase),
+            Some(EditPhase::After)
+        );
+    }
+
+    #[test]
+    fn every_file_writing_tool_is_recognised_and_nothing_else_is() {
+        // The allow-list is the whole guard: `Read`/`Grep`/`Glob` all carry a `file_path` or
+        // `path` too, and attributing on one of those would hand an agent every line of every file
+        // it merely looked at.
+        for (tool, key) in [
+            ("Edit", "file_path"),
+            ("Write", "file_path"),
+            ("MultiEdit", "file_path"),
+            ("NotebookEdit", "notebook_path"),
+        ] {
+            let payload = format!(
+                r#"{{"cwd":"/wt","hook_event_name":"PostToolUse","tool_name":"{tool}","tool_input":{{"{key}":"src/main.rs"}}}}"#
+            );
+            let report = parse("PostToolUse", payload.as_bytes())
+                .unwrap_or_else(|| panic!("{tool} must parse"));
+            assert_eq!(
+                report.edit.map(|edit| edit.path),
+                Some("src/main.rs".to_string()),
+                "{tool} really writes files"
+            );
+        }
+
+        for (tool, key) in [
+            ("Read", "file_path"),
+            ("Grep", "path"),
+            ("Glob", "path"),
+            ("Bash", "command"),
+            ("mcp__memory__store", "file_path"),
+        ] {
+            let payload = format!(
+                r#"{{"cwd":"/wt","hook_event_name":"PostToolUse","tool_name":"{tool}","tool_input":{{"{key}":"src/main.rs"}}}}"#
+            );
+            let report = parse("PostToolUse", payload.as_bytes())
+                .unwrap_or_else(|| panic!("{tool} must parse"));
+            assert_eq!(
+                report.edit, None,
+                "{tool} changes nothing, so it must attribute nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_event_with_no_usable_path_carries_no_edit_rather_than_an_empty_one() {
+        for tool_input in [
+            r#"{}"#,
+            r#"{"file_path":""}"#,
+            r#"{"file_path":"   "}"#,
+            r#"{"file_path":42}"#,
+            r#"{"notebook_path":"x.ipynb"}"#,
+        ] {
+            let payload = format!(
+                r#"{{"hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{tool_input}}}"#
+            );
+            let report = parse("PostToolUse", payload.as_bytes()).expect("must parse");
+            assert_eq!(report.edit, None, "{tool_input}");
+        }
+        // No `cwd` at all is a real shape for a hand-made request: the path still stands on its
+        // own if it is absolute, and the reader is told there is nothing to resolve it against.
+        let report = parse(
+            "PostToolUse",
+            br#"{"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"file_path":"/wt/a.txt"}}"#,
+        )
+        .expect("must parse");
+        assert_eq!(report.edit.expect("edit").cwd, None);
+    }
+
+    #[test]
+    fn a_turn_boundary_or_a_notification_carries_no_edit() {
+        assert_eq!(parse("Stop", REAL_STOP).expect("parse").edit, None);
+        assert_eq!(
+            parse(
+                "Notification",
+                br#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"m"}"#
+            )
+            .expect("parse")
+            .edit,
+            None
+        );
+        assert_eq!(
+            parse(
+                "PostToolUseFailure",
+                br#"{"hook_event_name":"PostToolUseFailure","tool_name":"Edit","tool_input":{"file_path":"a.txt"},"error":"boom"}"#
+            )
+            .expect("parse")
+            .edit,
+            None,
+            "a tool call that failed did not write the file it was asked to"
+        );
     }
 
     #[test]

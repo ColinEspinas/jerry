@@ -1770,7 +1770,24 @@ impl AdeApp {
         let staged = self.staged_files.contains(&file.path);
         let committed = changes::is_committed_clean(&file.path, self.dirty_files.as_ref());
         let selected = self.open_change.as_deref() == Some(file.path.as_path());
-        let (add, del) = changes::diff_file_stats(file);
+        // GitHub issue #284: the row's `+n`/`−n` is the change set's own combined diffstat, which
+        // is *defined* as the sum of that path's per-author shares
+        // (`crate::provenance::change_set::ChangeSetEntry::stat`). Routing the row through it is
+        // what makes "one row per path, with the de-duplicated author union" the list the app
+        // really renders rather than a parallel structure - the attribution UI (GitHub issue #287)
+        // then reads the authors off the very same entry this number came from, with no way for
+        // the two to disagree.
+        //
+        // The fallback is for the one frame where a diff has landed but `rebuild_change_set` has
+        // not run yet; with no provenance recorded the two are the same number anyway, since every
+        // line simply lands in the unattributed bucket.
+        let (add, del) = match self.change_set.entry(&file.path) {
+            Some(entry) => {
+                let stat = entry.stat();
+                (stat.added, stat.removed)
+            }
+            None => changes::diff_file_stats(file),
+        };
         let (dir, name) = changes::split_dir_name(&file.path);
         let tag = changes::change_tag(file.status);
         let segments = changes::stat_bar_segments(add, del);

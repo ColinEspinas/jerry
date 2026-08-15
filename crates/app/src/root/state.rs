@@ -150,6 +150,13 @@ impl AdeApp {
             .map(crate::hooks::store::AgentStatusState::load_at)
             .unwrap_or_default();
 
+        // GitHub issue #284's per-agent line provenance resolves the same way. Unlike the two
+        // above it is genuinely read back at startup - `restore_line_provenance`, called once
+        // this literal exists, re-reads each recorded file to prove the spans still describe it.
+        let line_provenance_path = settings_path
+            .as_deref()
+            .map(crate::provenance::persist_state::line_provenance_path_for);
+
         // The hook side-channel starts out absent and is brought up lazily, on the first Claude
         // agent this instance spawns - see `AdeApp::hook_injection_for`. Still exactly one
         // listener per instance, shared by every Claude agent it ever spawns; just not one opened
@@ -340,6 +347,10 @@ impl AdeApp {
             agent_status_state,
             agent_status_path,
             agent_status_owned: std::collections::BTreeSet::new(),
+            line_provenance: crate::provenance::store::ProvenanceStore::default(),
+            line_provenance_path,
+            line_provenance_owned: std::collections::BTreeSet::new(),
+            change_set: crate::provenance::change_set::ChangeSet::default(),
             review_tab_open: None,
             review_tab_active: false,
             review_focus_handle: cx.focus_handle(),
@@ -352,6 +363,7 @@ impl AdeApp {
             _review_release_tasks: HashMap::new(),
             _review_persist_task: None,
             _agent_status_persist_task: None,
+            _line_provenance_persist_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
@@ -715,6 +727,12 @@ impl AdeApp {
         // startup", not only "apply overrides when later edited". Unconditional: a rebound
         // keymap applies just as much to a genuinely empty window as a focused one.
         this.apply_effective_key_bindings(cx);
+        // GitHub issue #284: reads back the previous run's per-agent line attribution, re-reading
+        // each recorded file to prove the spans still describe it (see
+        // `crate::provenance::persist_state`). Unconditional and cheap - it does nothing at all
+        // when nothing was ever recorded - and deliberately before the first render, so a restored
+        // worktree's attribution is live from the first frame rather than appearing a poll later.
+        this.restore_line_provenance();
         // Applies the real, persisted theme selection at startup (`Self::apply_theme_selection`)
         // - if `follow_system` is also on, the real, current OS appearance takes priority over
         // whatever `theme.name` was last persisted as, matching `Self::sync_theme_to_system_

@@ -51,14 +51,14 @@
 //! rendered as markup, and none can reach a `ProcessKind::Shell` row (see
 //! [`crate::rail::status::derive_status`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::hooks::event::{self, HookFact, HookReport, MAX_PAYLOAD_BYTES};
+use crate::hooks::event::{self, EditedFile, HookFact, HookReport, MAX_PAYLOAD_BYTES};
 use crate::work_surface::agents::AgentId;
 
 /// How long a single blocking read may wait for *some* data to arrive.
@@ -128,6 +128,19 @@ const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Smallest write budget allowed for the reply, used when the read phase already consumed the
 /// whole [`REQUEST_DEADLINE`] - see [`handle_connection`].
 const REPLY_WRITE_FLOOR: Duration = Duration::from_millis(500);
+
+/// How many un-drained agent edits [`EditLog`] will hold before it starts dropping the oldest.
+///
+/// The UI thread drains this every [`crate::root::STATUS_POLL_INTERVAL`], and a real agent lands
+/// a few file writes per turn, so this is roughly three orders of magnitude of headroom over the
+/// worst realistic burst. It exists for the same reason [`MAX_TRACKED_AGENTS`] does: the listener
+/// cannot check ids against live agents, so anything that knows the token can push entries, and
+/// an unbounded queue behind a paused UI thread is a memory leak with a network trigger.
+///
+/// Oldest-first eviction, not newest-first: an edit that has been waiting longest is the one
+/// whose file has most likely already been overwritten again, so its `PostToolUse` diff would be
+/// the least accurate of the queue. Dropping it costs the least truth.
+const MAX_PENDING_EDITS: usize = 4096;
 
 /// One agent's most recent hook fact, as stored for the rail to read.
 #[derive(Debug, Clone)]
@@ -218,6 +231,81 @@ impl HookInbox {
     }
 }
 
+/// One agent's file write, as it came off the wire (GitHub issue #284).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEdit {
+    /// Which agent - the `agent=` query parameter, i.e. the `JERRY_AGENT_ID` the spawn set.
+    pub agent: AgentId,
+    /// The file and the phase - see [`crate::hooks::event::EditedFile`].
+    pub file: EditedFile,
+    /// The file's content as it stood when a [`crate::hooks::event::EditPhase::Before`] event
+    /// arrived - always `None` for an `After` event.
+    ///
+    /// Read **here**, on the connection thread, rather than by the reader that eventually consumes
+    /// this entry, and that is not an optimisation - it is the only correct moment. `PreToolUse`
+    /// fires *before* the agent writes; the UI thread drains this log up to one
+    /// `crate::root::STATUS_POLL_INTERVAL` later, by which time the write has landed. A snapshot
+    /// taken then would be the *after* content wearing the before's name, every recorded edit
+    /// would diff clean, and nothing would ever be attributed to anyone.
+    ///
+    /// `None` also for a file `crate::provenance::store::snapshot_for_edit` will not track
+    /// (binary, unreadable, past its caps), in which case no baseline is taken at all.
+    pub before: Option<String>,
+}
+
+/// Every file write no reader has taken yet, oldest first.
+///
+/// Deliberately **not** [`HookInbox`]'s "latest wins" shape, and the difference is the whole
+/// reason this is a second structure rather than another field on `HookRecord`. A status is a
+/// state: the newest one is the truth and the previous one is worthless. An edit is an *event*:
+/// a turn that writes six files produces six facts, every one of which has to be applied, and the
+/// UI thread only looks every [`crate::root::STATUS_POLL_INTERVAL`]. Stored latest-wins, five of
+/// those six writes would be silently dropped, and the provenance store would attribute the
+/// sixth file's diff while five others drifted out of date - the exact "confidently wrong" shape
+/// this codebase refuses.
+///
+/// Ordering across agents is preserved as it arrived rather than grouped per agent: two agents
+/// writing the same file interleave in real time, and replaying them out of order would hand one
+/// agent's lines to the other.
+#[derive(Debug, Default)]
+pub struct EditLog {
+    pending: VecDeque<AgentEdit>,
+    /// How many entries were evicted un-drained since the last drain - a real number for a real
+    /// log line, so an overflow is visible rather than silent.
+    dropped: usize,
+}
+
+impl EditLog {
+    pub fn record(&mut self, agent: AgentId, file: EditedFile, before: Option<String>) {
+        while self.pending.len() >= MAX_PENDING_EDITS {
+            self.pending.pop_front();
+            self.dropped += 1;
+        }
+        self.pending.push_back(AgentEdit {
+            agent,
+            file,
+            before,
+        });
+    }
+
+    /// Takes everything pending, in arrival order, leaving the log empty. Returns
+    /// `(edits, dropped_since_last_drain)`.
+    pub fn drain(&mut self) -> (Vec<AgentEdit>, usize) {
+        let dropped = std::mem::take(&mut self.dropped);
+        (self.pending.drain(..).collect(), dropped)
+    }
+
+    /// Drops an agent's un-drained edits - called when the agent closes, so a recycled
+    /// [`AgentId`] cannot be handed a dead agent's writes.
+    pub fn forget(&mut self, id: AgentId) {
+        self.pending.retain(|edit| edit.agent != id);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 /// Folds a `Notification` into the fact Jerry already holds for the same agent, returning the
 /// report that should actually be stored.
 ///
@@ -269,6 +357,11 @@ fn merge_nudge(previous: &HookReport, incoming: HookReport) -> HookReport {
         // The nudge is the more recent payload, so prefer its session id, but never lose one by
         // taking a payload that happened to omit it.
         session_id: incoming.session_id.or_else(|| previous.session_id.clone()),
+        // A `Notification` never carries an edit, so this only ever restores what the kept fact
+        // already said. Delivery of edits does not depend on this field either way - they are
+        // appended to [`EditLog`] straight off the wire, before any merging - but a stored report
+        // whose `edit` disagreed with the rest of it would be a trap for the next reader.
+        edit: previous.edit.clone(),
     }
 }
 
@@ -300,6 +393,7 @@ pub struct HookListener {
     port: u16,
     token: String,
     inbox: Arc<Mutex<HookInbox>>,
+    edits: Arc<Mutex<EditLog>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -315,10 +409,12 @@ impl HookListener {
         let port = listener.local_addr()?.port();
         let token = generate_token();
         let inbox: Arc<Mutex<HookInbox>> = Arc::new(Mutex::new(HookInbox::default()));
+        let edits: Arc<Mutex<EditLog>> = Arc::new(Mutex::new(EditLog::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let thread_token = token.clone();
         let thread_inbox = Arc::clone(&inbox);
+        let thread_edits = Arc::clone(&edits);
         let thread_shutdown = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("jerry-hook-listener".to_owned())
@@ -347,11 +443,17 @@ impl HookListener {
                     let slot = InFlightSlot::take(Arc::clone(&in_flight));
                     let handler_token = thread_token.clone();
                     let handler_inbox = Arc::clone(&thread_inbox);
+                    let handler_edits = Arc::clone(&thread_edits);
                     let spawned = std::thread::Builder::new()
                         .name("jerry-hook-conn".to_owned())
                         .spawn(move || {
                             let _slot = slot;
-                            handle_connection(stream, &handler_token, &handler_inbox);
+                            handle_connection(
+                                stream,
+                                &handler_token,
+                                &handler_inbox,
+                                &handler_edits,
+                            );
                         });
                     if let Err(err) = spawned {
                         // The slot was moved into the closure only on success; on failure it was
@@ -365,6 +467,7 @@ impl HookListener {
             port,
             token,
             inbox,
+            edits,
             shutdown,
         })
     }
@@ -416,11 +519,29 @@ impl HookListener {
         }
     }
 
-    /// Drops an agent's recorded facts - see [`HookInbox::forget`].
+    /// Drops an agent's recorded facts - see [`HookInbox::forget`] and [`EditLog::forget`].
     pub fn forget(&self, id: AgentId) {
         if let Ok(mut inbox) = self.inbox.lock() {
             inbox.forget(id);
         }
+        if let Ok(mut edits) = self.edits.lock() {
+            edits.forget(id);
+        }
+    }
+
+    /// Takes every file write reported since the last call, in arrival order (GitHub issue #284).
+    /// Returns `(edits, dropped)`; `dropped` counts entries evicted un-drained by
+    /// [`MAX_PENDING_EDITS`], which is a real (if never-yet-observed) failure worth logging rather
+    /// than swallowing.
+    ///
+    /// A poisoned lock reports "nothing pending" rather than panicking - the same rule
+    /// [`Self::signal_for`] follows, and for the same reason: attribution is a refinement, and
+    /// losing it must never take the app down.
+    pub fn drain_edits(&self) -> (Vec<AgentEdit>, usize) {
+        let Ok(mut edits) = self.edits.lock() else {
+            return (Vec::new(), 0);
+        };
+        edits.drain()
     }
 
     /// This agent's most recently reported real Claude Code `session_id` (GitHub issue #227),
@@ -567,14 +688,19 @@ impl Response {
 }
 
 /// Reads one request off `stream`, records whatever it turned out to be, and writes a response.
-fn handle_connection(mut stream: TcpStream, token: &str, inbox: &Arc<Mutex<HookInbox>>) {
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    inbox: &Arc<Mutex<HookInbox>>,
+    edits: &Arc<Mutex<EditLog>>,
+) {
     // One absolute budget for the whole exchange, taken before the first byte is read - see
     // `REQUEST_DEADLINE`.
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
 
     let response =
-        read_and_record(&mut stream, token, inbox, deadline).unwrap_or(Response::BadRequest);
+        read_and_record(&mut stream, token, inbox, edits, deadline).unwrap_or(Response::BadRequest);
 
     // The reply is written *after* the read phase, which may already have consumed the whole
     // deadline - so a fixed write timeout here simply adds to the worst-case hold rather than
@@ -604,6 +730,7 @@ fn read_and_record(
     stream: &mut TcpStream,
     token: &str,
     inbox: &Arc<Mutex<HookInbox>>,
+    edits: &Arc<Mutex<EditLog>>,
     deadline: Instant,
 ) -> Option<Response> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
@@ -682,6 +809,22 @@ fn read_and_record(
     // Jerry-spawned pane, or a hand-made request): accept the request so the client isn't left
     // retrying, but record nothing - there is no row it could belong to.
     if let (Some(agent_id), Some(report)) = (agent_id, event::parse(&event_name, &body)) {
+        // The edit is appended *before* the inbox merge and from the same parse, so it is never
+        // affected by `merge_nudge` deciding the report itself is superseded - a file really was
+        // written whatever the row's status ends up saying (GitHub issue #284).
+        if let Some(file) = report.edit.clone() {
+            // The "before" snapshot has to be taken now, on this thread, while the agent is still
+            // *asking* to write - see `AgentEdit::before` for what happens if it is deferred.
+            let before = match file.phase {
+                event::EditPhase::Before => crate::provenance::store::snapshot_for_edit(
+                    &crate::provenance::absolute_edit_path(&file),
+                ),
+                event::EditPhase::After => None,
+            };
+            if let Ok(mut edits) = edits.lock() {
+                edits.record(agent_id, file, before);
+            }
+        }
         if let Ok(mut inbox) = inbox.lock() {
             inbox.record(agent_id, report);
         }
@@ -785,6 +928,175 @@ mod tests {
                 body.len()
             ),
         )
+    }
+
+    /// One real edit-tool payload, in the shape a real `claude` 2.1.228 sends.
+    fn edit_body(event: &str, file: &std::path::Path) -> String {
+        format!(
+            r#"{{"session_id":"5a4bef04","cwd":"/tmp/capture","hook_event_name":"{event}","tool_name":"Edit","tool_input":{{"file_path":"{}","old_string":"a","new_string":"b"}},"tool_use_id":"toolu_01"}}"#,
+            file.display()
+        )
+    }
+
+    #[test]
+    fn every_file_write_in_a_burst_survives_the_drain_rather_than_only_the_last_one() {
+        // The whole reason `EditLog` is a second structure rather than another field on
+        // `HookRecord`: a turn that writes six files is six facts, and the inbox next to it keeps
+        // exactly one. Stored latest-wins, five of these would be gone before the UI thread looked
+        // (GitHub issue #284).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = HookListener::start().expect("listener");
+        let files: Vec<std::path::PathBuf> = (0..6)
+            .map(|n| dir.path().join(format!("f{n}.rs")))
+            .collect();
+        for file in &files {
+            std::fs::write(file, "before\n").expect("seed");
+            post(
+                listener.port(),
+                listener.token(),
+                "event=PostToolUse&agent=7",
+                &edit_body("PostToolUse", file),
+            );
+        }
+
+        let (edits, dropped) = listener.drain_edits();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.file.path.clone())
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect::<Vec<_>>(),
+            "every write, in arrival order"
+        );
+        assert!(
+            edits.iter().all(|edit| edit.agent == 7),
+            "and each under the agent that reported it"
+        );
+
+        let (drained_again, _) = listener.drain_edits();
+        assert!(
+            drained_again.is_empty(),
+            "a drain really takes them - a second reader must not replay the same edits"
+        );
+    }
+
+    #[test]
+    fn a_pre_tool_use_captures_the_file_as_it_stands_before_the_agent_writes() {
+        // The timing this whole field exists for: the snapshot is read while the request is being
+        // handled, so a write that lands milliseconds later cannot get into it. Deferring this to
+        // the UI thread's drain would make every recorded edit diff clean against itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "before\n").expect("seed");
+
+        let listener = HookListener::start().expect("listener");
+        post(
+            listener.port(),
+            listener.token(),
+            "event=PreToolUse&agent=7",
+            &edit_body("PreToolUse", &file),
+        );
+        // The agent's own write, after the event and before anyone drains.
+        std::fs::write(&file, "after\n").expect("agent write");
+        post(
+            listener.port(),
+            listener.token(),
+            "event=PostToolUse&agent=7",
+            &edit_body("PostToolUse", &file),
+        );
+
+        let (edits, _) = listener.drain_edits();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits[0].before.as_deref(),
+            Some("before\n"),
+            "the before snapshot must be the content as of the PreToolUse, not as of the drain"
+        );
+        assert_eq!(
+            edits[1].before, None,
+            "a PostToolUse has nothing to snapshot - the file is read at record time"
+        );
+    }
+
+    #[test]
+    fn an_event_that_writes_no_file_never_reaches_the_edit_log() {
+        let listener = HookListener::start().expect("listener");
+        for (event, body) in [
+            (
+                "PostToolUse",
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"/tmp/a.rs"}}"#,
+            ),
+            (
+                "PostToolUse",
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            ),
+            ("Stop", r#"{"hook_event_name":"Stop"}"#),
+            (
+                "Notification",
+                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"m"}"#,
+            ),
+        ] {
+            post(
+                listener.port(),
+                listener.token(),
+                &format!("event={event}&agent=7"),
+                body,
+            );
+        }
+        assert!(listener.drain_edits().0.is_empty());
+    }
+
+    #[test]
+    fn forgetting_an_agent_drops_its_undrained_edits_so_a_recycled_id_cannot_inherit_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "before\n").expect("seed");
+        let listener = HookListener::start().expect("listener");
+        for agent in [7, 8] {
+            post(
+                listener.port(),
+                listener.token(),
+                &format!("event=PostToolUse&agent={agent}"),
+                &edit_body("PostToolUse", &file),
+            );
+        }
+
+        listener.forget(7);
+        let (edits, _) = listener.drain_edits();
+        assert_eq!(
+            edits.iter().map(|edit| edit.agent).collect::<Vec<_>>(),
+            vec![8],
+            "the closed agent's writes go with it; the live agent's stay"
+        );
+    }
+
+    #[test]
+    fn the_edit_log_sheds_its_oldest_entries_rather_than_growing_without_bound() {
+        let mut log = EditLog::default();
+        for index in 0..MAX_PENDING_EDITS + 3 {
+            log.record(
+                7,
+                EditedFile {
+                    phase: event::EditPhase::After,
+                    path: format!("f{index}.rs"),
+                    cwd: None,
+                },
+                None,
+            );
+        }
+        let (edits, dropped) = log.drain();
+        assert_eq!(edits.len(), MAX_PENDING_EDITS);
+        assert_eq!(dropped, 3, "an overflow is counted, not swallowed");
+        assert_eq!(
+            edits.first().map(|edit| edit.file.path.as_str()),
+            Some("f3.rs"),
+            "the oldest go first - their files are the ones most likely already overwritten"
+        );
+        assert_eq!(log.drain().1, 0, "the dropped count resets with the drain");
     }
 
     #[test]

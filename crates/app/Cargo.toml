@@ -68,6 +68,26 @@ serde_json = { workspace = true }
 # Already in the lock file transitively (via `self_update`'s stack), so this is a direct
 # dependency on a crate that was being compiled anyway rather than new build surface.
 rand = "0.9"
+# GitHub issue #284: the real line-level diff behind `crate::provenance`'s per-agent attribution.
+# Carrying a line's author across an edit is exactly "which of the old lines survived, and where
+# did they land" - a longest-common-subsequence problem, not a text-formatting one, so the
+# `git diff` shell-out `wt_core::diff` uses (which exists to reproduce git's *unified diff text*,
+# see that module's own "gix vs. the git CLI" docs) is the wrong tool: it would mean a child
+# process and a temp file per keystroke-scale edit, then re-parsing git's own output back into
+# ranges. `imara-diff` is the algorithm layer underneath that - it is `gix-diff`'s own blob-diff
+# engine (`gix-diff` depends on exactly this crate at exactly this version), so this is the same
+# implementation the git-side of this workspace already leans on, reached directly. Pinned to the
+# version this workspace's `Cargo.lock` already resolves via `gix`, so this promotes an
+# already-compiled crate to a direct dependency rather than adding new build surface - the same
+# call `rand`/`streaming-iterator`/`unicode-segmentation` above already made.
+imara-diff = "0.1.8"
+# GitHub issue #284: content digests for `crate::provenance::persist_state`. Persisted line spans
+# are only meaningful against the exact file content they were computed from, so each record
+# carries a digest of that content and is discarded (rather than misapplied) when the file changed
+# while Jerry was not running - see that module's docs. `sha2` is already a direct dependency of
+# `wt-core` (`review::baseline_ref_name`) and already in this workspace's lock file at this exact
+# version, so this adds no new crate to the build graph.
+sha2 = "0.10"
 # Real path/`path:line[:col]` link detection inside terminal output (`crate::terminal_links`) -
 # pinned to the same `"1.5"` requirement `vendor/zed/Cargo.toml` itself pins, matching this
 # project's established shared-dependency convention (this is a generic text-scanning utility
