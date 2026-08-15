@@ -23,7 +23,7 @@
 
 use super::*;
 
-/// Every real floating menu/dropdown surface in the app - the twelve built on
+/// Every real floating menu/dropdown surface in the app - the thirteen built on
 /// [`crate::root::widgets::menu_popover_chrome`].
 ///
 /// Deliberately *not* including the command palette, the "New file" prompt, or the Settings
@@ -86,6 +86,12 @@ pub(crate) enum MenuSurface {
     /// [`crate::root::widgets::menu_popover_chrome`] like all the others, so it belongs to the
     /// same one-at-a-time invariant rather than owning a second dismissal rule of its own.
     Resources,
+    /// The agent pane strip's rate-limit budget popover (GitHub issue #294) -
+    /// [`AdeApp::budget_popover_open`]. Anchored to a readout *inside the workspace body* rather
+    /// than to window chrome, but it is the same click-away popover built on
+    /// [`crate::root::widgets::menu_popover_chrome`], so it belongs to the same one-at-a-time
+    /// invariant.
+    Budget,
 }
 
 impl MenuSurface {
@@ -93,7 +99,7 @@ impl MenuSurface {
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
     /// until it is really wired to real state - that pairing is what stops a new menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 12] = [
+    pub(crate) const ALL: [MenuSurface; 13] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
@@ -106,6 +112,7 @@ impl MenuSurface {
         MenuSurface::RailRow,
         MenuSurface::RailOverflow,
         MenuSurface::Resources,
+        MenuSurface::Budget,
     ];
 }
 
@@ -126,6 +133,7 @@ impl AdeApp {
             MenuSurface::RailRow => self.rail_row_menu.is_some(),
             MenuSurface::RailOverflow => self.rail_overflow_menu.is_some(),
             MenuSurface::Resources => self.resources_popover_open,
+            MenuSurface::Budget => self.budget_popover_open,
         }
     }
 
@@ -165,6 +173,7 @@ impl AdeApp {
             }
             MenuSurface::RailOverflow => self.rail_overflow_menu = None,
             MenuSurface::Resources => self.resources_popover_open = false,
+            MenuSurface::Budget => self.budget_popover_open = false,
         }
     }
 
@@ -249,6 +258,7 @@ mod menu_surface_tests {
             origin_y: 4.0,
         });
         app.resources_popover_open = true;
+        app.budget_popover_open = true;
     }
 
     #[gpui::test]

@@ -303,6 +303,7 @@ dependencies = [
  "pty-core",
  "rand 0.9.5",
  "regex",
+ "reqwest",
  "rodio",
  "self_update",
  "serde",

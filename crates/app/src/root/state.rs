@@ -517,6 +517,9 @@ impl AdeApp {
             process_stats_sampled_at: None,
             resources_popover_open: false,
             resources_readout_bounds: gpui::Bounds::default(),
+            budget: crate::budget::state::BudgetState::default(),
+            budget_popover_open: false,
+            budget_readout_bounds: gpui::Bounds::default(),
             disk_usage: None,
             worktree_disk_usage: HashMap::new(),
             prune_status: None,
@@ -567,6 +570,7 @@ impl AdeApp {
             _prune_task: None,
             _worktree_history_task: None,
             _update_check_task: None,
+            _budget_poll_task: None,
             _update_download_task: None,
             _agent_rows_task: None,
             _merge_task: None,
@@ -888,6 +892,11 @@ impl AdeApp {
         // start_update_check_loop`'s own docs. Unconditional for the same reason the keybindings/
         // theme setup above is: it has nothing to do with which (if any) repo is focused.
         this.start_update_check_loop(cx);
+        // GitHub issue #294: the per-provider rate-limit budget poll. Unconditional like the
+        // update check above, and for the same reason - it has nothing to do with which (if any)
+        // repo is focused. It polls nothing at all until there is a real agent session to show a
+        // budget for; see `crate::budget::flow::AdeApp::poll_budgets_if_due`.
+        this.start_budget_poll_loop(cx);
         // GitHub issue #226: the app-start sound. `crate::sound::claim_app_start_sound` is the
         // real "once per process" gate - a second window (`File > New Window`,
         // `crate::title_bar::menu`) constructs a second `AdeApp` and reaches this same line, but

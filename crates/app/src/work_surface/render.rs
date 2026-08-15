@@ -2306,8 +2306,27 @@ impl AdeApp {
         }
 
         footer = footer.child(div().flex_1());
-        match self.render_agent_cost_readout(is_running, pid) {
-            Some(readout) => footer.child(readout),
+        // GitHub issue #294: this agent's provider budget, to the right of its cost (§4t).
+        let budget = self.render_agent_budget_readout(agent.kind, cx);
+        if let Some(cost) = self.render_agent_cost_readout(is_running, pid) {
+            footer = footer.child(cost);
+            // §4t's own grouping: the two readouts are separate facts (what this agent costs
+            // *this machine*, and what it costs *its provider*), so they get the footer's own 1px
+            // divider between them rather than running together as one string. No divider when
+            // only one of the two is there - the same "never a hairline separating nothing from
+            // nothing" rule §4t applied when it deleted the footer's own budget slot.
+            if budget.is_some() {
+                footer = footer.child(
+                    div()
+                        .flex_none()
+                        .w(px(1.0))
+                        .h(px(13.0))
+                        .bg(theme::status_bar::DIVIDER),
+                );
+            }
+        }
+        match budget {
+            Some(budget) => footer.child(budget),
             None => footer,
         }
     }

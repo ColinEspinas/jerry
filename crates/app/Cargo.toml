@@ -217,6 +217,28 @@ tree-sitter-css = "0.25.0"
 # decoder pairs the settings page's sound-library importer accepts alongside WAV). `cpal` is what
 # actually reintroduces `libasound2-dev` on Linux (see this crate's own README/CI comments next to
 # that package) - `rodio` itself has no system dependency beyond what `cpal` already requires.
+# GitHub issue #294's per-provider rate-limit budget (`crate::budget::fetch`): one plain
+# `GET` per provider against its own usage endpoint, authorised with the credential that
+# provider's own CLI already stored on this machine. `reqwest` rather than a new HTTP crate
+# because it is *already compiled into this binary* - `self_update` above depends on exactly
+# this version with exactly these features (`blocking`, `rustls`, verified against the
+# published `self_update` 0.44.0 manifest's own `[dependencies.reqwest]` section and this
+# workspace's `Cargo.lock`), so naming it here promotes an already-built crate to a direct
+# dependency and adds no new build surface at all - the same call `rand`/`imara-diff`/
+# `streaming-iterator` already made. Pinned to the version `Cargo.lock` already resolves.
+#
+# `blocking`, not the async client: every background call in this crate is a blocking function
+# handed to `cx.background_executor()` (see `crate::updater::flow`, `crate::review::flow`),
+# and reaching for the async client would mean introducing a tokio runtime this app does not
+# otherwise have. `rustls`, not `default-tls`, matching the `self_update` entry above so this
+# binary keeps exactly one TLS stack. `default-features = false` because the real default
+# (`default-tls`, `charset`, `http2`, `system-proxy`) would add OpenSSL beside that rustls.
+# `json` is deliberately *not* enabled: the parsers here take a `&str` so they can be unit
+# tested against real captured payloads, and `serde_json` is already a direct dependency.
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "rustls",
+] }
 rodio = { version = "0.22.2", default-features = false, features = [
     "playback",
     "wav",

@@ -2596,9 +2596,13 @@ pub mod scrollbar {
 /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §2).
 ///
 /// Rev 6 moved budget from a single global footer readout to **one meter per agent**, because a
-/// budget is per-provider and a provider belongs to an agent. The meter fills to the tighter of
-/// the two windows (`5h` / `7d`), and its fill hue is the one place in the readout where colour
-/// carries meaning:
+/// budget is per-provider and a provider belongs to an agent. There is then **one bar per window**
+/// (`5h` / `7d`), each hued on its own value - §4u′, and GitHub issue #294's Phase 0 spike, which
+/// found that both supported providers really do report two independent windows with their own
+/// utilisations and their own reset instants. (§2's older "the meter fills to the tighter of the
+/// two windows" is the superseded shape: a single bar hides *which* limit is tight, and on the
+/// live account the spike measured, a healthy 5-hour window sat next to a 7-day one on the amber
+/// boundary.) The fill hue is the one place in the readout where colour carries meaning:
 ///
 /// > Hue `#7fc79a` above 40%, `#c99b4e` 15-40%, `#c4726d` below.
 ///
