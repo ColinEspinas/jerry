@@ -9001,8 +9001,11 @@ mod change_row_tests {
         };
         assert_eq!(
             predicate(stage),
-            "diff && !file-editor",
-            "`!file-editor` keeps a typed space out of this binding's hands in the File view"
+            "diff && !file-editor && !text-input",
+            "`!file-editor` keeps a typed space out of this binding's hands in the File view, and \
+             `!text-input` does the same for GitHub issue #288's pinned review-note card - a real \
+             text input *inside* the `\"diff\"` node that `\"file-editor\"` does not cover, where \
+             a bare space would otherwise stage the file instead of separating two words"
         );
         assert_eq!(
             predicate(stage),

@@ -606,6 +606,10 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::RebaseSquashRow" => Some("Rebase plan: squash"),
         "app::RebaseDropRow" => Some("Rebase plan: drop"),
         "app::RebaseStart" => Some("Rebase plan: start rebase"),
+        // GitHub issue #288 - the diff's own review-note verbs. `mod+enter` is drawn as real
+        // keycaps on the notes bar, so it is rebindable here like everything else that is.
+        "app::SendReviewNotes" => Some("Diff: send review notes to the agent"),
+        "app::ToggleLineNote" => Some("Diff: note on this line"),
         _ => None,
     }
 }
@@ -2009,6 +2013,8 @@ mod tests {
                 "Rebase plan: squash",
                 "Rebase plan: drop",
                 "Rebase plan: start rebase",
+                "Diff: send review notes to the agent",
+                "Diff: note on this line",
             ]
         );
     }
@@ -2090,11 +2096,17 @@ mod tests {
         // under `Some("rebase-plan && !text-input")` (5 - see `crate::default_key_bindings` for
         // why the negated conjunct is load-bearing over a surface that contains a real text
         // field) and `RebaseStart` under plain `Some("rebase-plan")` (1).
-        // The Changes-footer prose fix added 1 more real scoped binding: `space` ->
-        // `ToggleChangeStaged`, under the same `Some("diff && !file-editor")` predicate `v` and
-        // `]` carry - `Jerry.dc.html`'s `changesHints` advertises `space stage` in that footer and
-        // nothing was bound to it. `!file-editor` matters more here than for either of those: a
-        // space is a character to type in the File view.
+        // GitHub issue #288 added 2 more real scoped bindings, on the diff's own review-notes
+        // surface: `SendReviewNotes` (`mod+enter`) under plain `Some("diff-view")` - the notes
+        // bar draws it as keycaps, and having just typed a note is the likeliest moment to send
+        // the batch - and `ToggleLineNote` (`c`) under `Some("diff-view && !text-input")`, the
+        // same negated conjunct and the same reason as the rebase plan's plain letters above:
+        // the pinned note card is a real text field inside that very container.
+        // The Changes-footer prose fix added 1 more: `space` -> `ToggleChangeStaged`, alongside
+        // `v` and `]` - `Jerry.dc.html`'s `changesHints` advertises `space stage` in that footer
+        // and nothing was bound to it. All three of those now also carry `&& !text-input`, since
+        // issue #288's pinned note card is a real text input *inside* the `"diff"` node that
+        // `"file-editor"` does not cover.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -2102,7 +2114,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            83,
+            85,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
@@ -2112,9 +2124,10 @@ mod tests {
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
              EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
              (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) plus \
-             every real interactive-rebase plan binding (6, GitHub issue #304) plus \
-             `space -> ToggleChangeStaged` (1, the Changes footer's own `space stage` hint) to be \
-             scoped, not global"
+             every real interactive-rebase plan binding (6, GitHub issue #304) plus every \
+             real review-note binding (2, GitHub issue #288) plus `space -> \
+             ToggleChangeStaged` (1, the Changes footer's own `space stage` hint) to be scoped, \
+             not global"
         );
         assert!(
             scoped

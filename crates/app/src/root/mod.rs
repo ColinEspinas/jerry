@@ -275,6 +275,14 @@ actions!(
         RebaseSquashRow,
         RebaseDropRow,
         RebaseStart,
+        // GitHub issue #288's two diff-line review-note gestures. Both are scoped to the
+        // `"diff-view"` key context the notes surface puts on its own container
+        // (`crate::review_notes::render::AdeApp::wrap_diff_with_notes`), never global - see
+        // `crate::default_key_bindings` for each one's own scoping, and in particular why
+        // `ToggleLineNote`'s plain `c` needs the `&& !text-input` conjunct that `SendReviewNotes`
+        // deliberately does not.
+        SendReviewNotes,
+        ToggleLineNote,
     ]
 );
 
@@ -555,6 +563,30 @@ pub struct AdeApp {
     /// diff and serves the Against-main section; the two are separate because their scopes are,
     /// and rebuilt together through one function so neither can go stale on its own.
     pub(crate) uncommitted_change_set: crate::provenance::change_set::ChangeSet,
+    /// Every diff-line review note this window holds (GitHub issue #288), keyed worktree -> path
+    /// -> line anchor. See `crate::review_notes` for the model and the three rules it enforces.
+    pub(crate) review_notes: crate::review_notes::NoteStore,
+    /// Where [`Self::review_notes`] is persisted - `review-notes.toml`, next to `settings.toml`.
+    /// `None` only when this instance has no real settings path at all (an in-test app).
+    pub(crate) review_notes_path: Option<PathBuf>,
+    /// Which encoded worktree keys this window may rewrite in that file - the same
+    /// merge-ownership set [`Self::line_provenance_owned`] keeps, and for the same reason.
+    pub(crate) review_notes_owned: std::collections::BTreeSet<String>,
+    /// The one note currently open for typing, if any - see `crate::review_notes::flow::NoteDraft`
+    /// for why there is exactly one rather than one per card.
+    pub(crate) note_draft: Option<crate::review_notes::flow::NoteDraft>,
+    /// The diff line `C` would toggle a note on: the last one a note was opened on. There is no
+    /// diff-line caret in this read-only virtualized list, so this is the whole of "the line you
+    /// are on" - see `crate::review_notes::flow::AdeApp::handle_toggle_line_note`.
+    pub(crate) note_cursor: Option<crate::review_notes::NoteRef>,
+    /// Why the last send failed, if it did. Shown in the notes bar rather than swallowed: a review
+    /// note that silently reached nobody is the worst outcome this feature has.
+    pub(crate) note_send_error: Option<String>,
+    /// Focus for the open note card's own hand-rolled single-line input.
+    pub(crate) note_focus_handle: FocusHandle,
+    /// Focus for the diff pane's notes container, which is what makes its `"diff-view"` key
+    /// context - and so the `mod+enter`/`c` bindings the bar draws as keycaps - really live.
+    pub(crate) diff_notes_focus_handle: FocusHandle,
     /// The per-author diff filter (GitHub issue #287), if one is in force: which file it was
     /// entered from, and whose lines it keeps at full opacity.
     ///
@@ -1041,6 +1073,15 @@ pub struct AdeApp {
     /// `crate::provenance::flow::AdeApp::persist_line_provenance`. One slot, newest wins: the
     /// state is captured whole at spawn time, so a newer write genuinely supersedes an older one.
     pub(crate) _line_provenance_persist_task: Option<Task<()>>,
+    /// Holds the in-flight *immediate* write of [`Self::review_notes`] - see
+    /// `crate::review_notes::flow::AdeApp::persist_review_notes`. One slot, newest wins, exactly
+    /// like the provenance write above it.
+    pub(crate) _review_notes_persist_task: Option<Task<()>>,
+    /// Holds the in-flight **debounced** write, kept apart from the immediate one on purpose: a
+    /// `Task` cancels on drop, so one shared slot would let the next keystroke's timer cancel a
+    /// write that a closing card or a send had already committed to. See
+    /// `crate::review_notes::flow::AdeApp::schedule_review_notes_persist`.
+    pub(crate) _review_notes_debounce_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,

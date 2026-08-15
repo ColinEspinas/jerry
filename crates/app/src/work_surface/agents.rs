@@ -283,6 +283,30 @@ impl Agents {
         self.count_for_cwd(&agent.cwd) == 1
     }
 
+    /// **The worktree's primary agent**: its own last-active tab (see [`Self::active_by_cwd`]),
+    /// or - for a worktree that has never had one recorded - its first open agent in creation
+    /// order. `None` if the worktree has no open agents at all.
+    ///
+    /// This is the rule [`Self::activate_for_worktree`] has always applied when the rail moves to
+    /// a worktree; it is factored out here because GitHub issue #288 needs the same answer to a
+    /// different question - *"which agent do this file's review notes go to, when the file itself
+    /// names nobody"* - and two copies of "which agent does this worktree mean" is exactly how the
+    /// centre pane and a send target would come to disagree on screen.
+    ///
+    /// Deliberately **not** filtered to agent sessions here: this answers "which tab is this
+    /// worktree's", and a worktree whose only tab is a shell really does have that shell as its
+    /// primary. Callers that need a party capable of *revising code* filter on
+    /// `ProcessKind::is_agent_session` themselves - `crate::review_notes::flow` does, and says
+    /// why.
+    pub fn primary_for_cwd(&self, cwd: &Path) -> Option<&Agent> {
+        let remembered = self
+            .active_by_cwd
+            .get(cwd)
+            .copied()
+            .and_then(|id| self.agents.iter().find(|agent| agent.id == id));
+        remembered.or_else(|| self.agents.iter().find(|agent| agent.cwd == cwd))
+    }
+
     pub fn active_id(&self) -> Option<AgentId> {
         self.active
     }
@@ -456,6 +480,20 @@ impl Agents {
         }
     }
 
+    /// Test-only sibling of [`Self::set_kind_for_test`]: overrides an already-spawned agent's
+    /// recorded spawn second without touching its real process.
+    ///
+    /// The spawn second is half of `crate::review::state::baseline_key`, i.e. half of the durable
+    /// identity `crate::provenance` files a line's author under. A test that seeds provenance for
+    /// a specific agent has to be able to make a live tab carry that same key, and the alternative
+    /// - waiting for the wall clock to land on the right second - is not a test.
+    #[cfg(test)]
+    pub(crate) fn set_spawned_at_unix_for_test(&mut self, id: AgentId, spawned_at_unix: i64) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.spawned_at_unix = spawned_at_unix;
+        }
+    }
+
     /// Real `SIGSTOP`, via `TerminalPane::pause`, against every real agent session (never a bare
     /// [`ProcessKind::Shell`] - mirrors [`Self::count_for_cwd`]'s own "a shell has no turns and
     /// nothing to review" convention) currently open in `cwd` - GitHub issue #242 phase B's
@@ -550,17 +588,7 @@ impl Agents {
     /// keyboard focus in the same step (the previously-active agent's pane may no longer be
     /// rendered at all once the tab strip's own per-worktree filter applies).
     pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
-        let remembered = self
-            .active_by_cwd
-            .get(cwd)
-            .copied()
-            .filter(|id| self.agents.iter().any(|agent| agent.id == *id));
-        let id = remembered.or_else(|| {
-            self.agents
-                .iter()
-                .find(|agent| agent.cwd == cwd)
-                .map(|agent| agent.id)
-        });
+        let id = self.primary_for_cwd(cwd).map(|agent| agent.id);
         self.active = id;
         if let Some(id) = id {
             self.active_by_cwd.insert(cwd.to_path_buf(), id);

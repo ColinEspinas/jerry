@@ -226,6 +226,29 @@ critical = "#984d60"  # Below 15% remaining.
 track    = "#1c2124"  # The unfilled remainder of the meter
 stale    = "#4e565b"
 
+# Diff-line review notes (GitHub issue #288, STAGE-A-CHANGELOG.md §1's two §6.2 rows and the
+# audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
+[notes]
+edge             = "#00789d"
+card_bg          = "#12191c"  # The pinned card's fill.
+card_border      = "#1a333f"
+card_fg          = "#8a9194"  # The card's own note text.
+card_placeholder = "#454d51"  # The placeholder shown in an empty, still-being-typed card.
+mark_draft       = "#488199"  # A card's draft mark
+mark_sent        = "#689057"  # A card's sent mark, and the bar's own ✓ sent confirmation.
+dot              = "#518fa8"
+dot_empty        = "#2d3336"  # The same column's ○
+bar_bg           = "#11191d"  # The notes bar's band.
+bar_border       = "#152b35"  # Its 1px bottom rule against the hunks below it.
+bar_label        = "#6599ae"  # The bar's count sentence (1 note on this file).
+bar_meta         = "#454d51"
+bar_error        = "#984d60"
+send_bg          = "#112027"
+send_border      = "#144a5c"  # Its 1px border, and its keycaps' border.
+send_hover_bg    = "#132830"  # Its hover fill.
+send_fg          = "#6599ae"  # Its label.
+send_cap_fg      = "#488199"  # Its ⌘⏎ keycaps' glyphs.
+
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 # The code surface
