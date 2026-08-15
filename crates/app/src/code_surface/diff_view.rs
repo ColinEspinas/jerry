@@ -354,6 +354,21 @@ impl AdeApp {
         let rows: Rc<Vec<DiffRow>> = Rc::new(diff_rows(file));
         let row_count = rows.len();
 
+        // GitHub issue #287's gutter attribution, resolved once per frame for the same reason
+        // `rows` is: the row builder runs several times per frame, and this walks every hunk.
+        // Empty whenever this worktree has nothing on record for this path, which is what makes
+        // "attribution renders only where provenance exists" structural rather than a rule each
+        // row has to remember - there is simply no author to read.
+        let line_authors: Rc<Vec<Vec<crate::provenance::Author>>> =
+            Rc::new(self.diff_line_authors(file));
+        // The filter is a fact about the file the *Changes* surface has open
+        // (`AdeApp::active_author_filter` checks it against `open_change`), so the Review tab -
+        // which can hold a different file at the same time - is never dimmed by it.
+        let author_filter: Option<crate::provenance::Author> = match surface {
+            DiffDetailSurface::Changes => self.active_author_filter().cloned(),
+            DiffDetailSurface::Review => None,
+        };
+
         let list = uniform_list(
             // Per-surface and per-path (see `DiffDetailSurface::id_prefix`'s own docs): a
             // different open diff, or the other surface entirely, is a different list, not the
@@ -410,12 +425,21 @@ impl AdeApp {
                                         .and_then(|nums| nums.get(line))
                                         .copied()
                                         .unwrap_or((None, None));
+                                    // Positional, and guarded exactly like the highlight cache
+                                    // beside it: if the open file changed shape between this
+                                    // frame's plan and this call, the answer is "no author",
+                                    // never a neighbouring line's author.
+                                    let author = line_authors
+                                        .get(hunk)
+                                        .and_then(|authors| authors.get(line));
                                     render_diff_line(
                                         diff_line,
                                         rendered,
                                         numbers,
                                         surface.id_prefix(),
                                         row,
+                                        author,
+                                        author_filter.as_ref(),
                                     )
                                     .into_any_element()
                                 }
@@ -660,12 +684,34 @@ fn render_diff_gutter_number(number: Option<usize>) -> impl IntoElement {
 /// This function stays honest either way: it falls back to `line`'s own raw, plainly-colored
 /// content and a blank gutter rather than panicking, guessing, or - the failure mode this guard
 /// exists to prevent - ever being handed (and blindly rendering) another file's real lines.
+///
+/// ## The author gutter (GitHub issue #287)
+///
+/// `author` adds a **second** left-edge channel, ahead of the diff-kind accent bar rather than
+/// instead of it: `REVISION-2026-08-14.md` §1's per-agent attribution answers *who wrote this
+/// line*, which is a different question from *what this diff does to it*, and the whole point of
+/// this row's existing "one fact per channel" discipline is that two facts never share one.
+/// Reading left to right the row now says: who wrote it, what changed, which lines, and what it
+/// says.
+///
+/// It is drawn **only where provenance really exists**. `None` - an unattributed line, a context
+/// line, or a file this worktree has no record for - paints no bar at all, not a neutral one:
+/// `crate::provenance::render::author_gutter_color`'s own `None` means "no answer", and the
+/// honest rendering of no answer is an empty gutter. The neutral tint is spoken for; it means
+/// `you`.
+///
+/// `filter` dims every line whose author is somebody *else* to
+/// `crate::provenance::render::FILTER_DIM_OPACITY` (the mock's 0.32). A line with no author is
+/// deliberately **not** dimmed - `Jerry.dc.html`'s own `muted = attr && who && who !== attr` - so
+/// filtering by one author never hides the context its work sits in.
 pub(in crate::code_surface) fn render_diff_line(
     line: &wt_core::diff::DiffLine,
     rendered: Option<&code_view::RenderedLine>,
     numbers: (Option<usize>, Option<usize>),
     selector_prefix: &'static str,
     row_index: usize,
+    author: Option<&crate::provenance::Author>,
+    filter: Option<&crate::provenance::Author>,
 ) -> impl IntoElement {
     // `accent` (`Some` only for Added/Removed) drives both the left-edge bar below and the sign
     // glyph's own color - [`theme::diff::ADD_FG`]/[`DEL_FG`], not the more muted `ADD_SIGN`/
@@ -691,6 +737,11 @@ pub(in crate::code_surface) fn render_diff_line(
     };
     let sign_color = accent.unwrap_or(theme::diff::CTX_FG);
 
+    // `Some` only for a line a real author is on record for and that this build can name - see
+    // this function's own docs.
+    let author_bar = author.and_then(crate::provenance::render::author_gutter_color);
+    let dimmed = crate::provenance::render::line_is_dimmed(author, filter);
+
     let mut row = div()
         .flex()
         .items_center()
@@ -705,8 +756,35 @@ pub(in crate::code_surface) fn render_diff_line(
     if let Some(bg) = bg {
         row = row.bg(bg);
     }
+    if dimmed {
+        row = row.opacity(crate::provenance::render::FILTER_DIM_OPACITY);
+    }
+    // The author channel, ahead of the diff-kind accent below it - see this function's own docs.
+    // The box is only painted when there is a real author to paint: an unattributed line's gutter
+    // is genuinely empty, and the 2px it would have occupied belongs to nothing.
+    if let Some(bar) = author_bar {
+        let tooltip = author.and_then(crate::provenance::render::author_tooltip);
+        let bar_selector = format!("{selector_prefix}-author-{row_index}");
+        row = row.child(
+            div()
+                .id(gpui::SharedString::from(bar_selector.clone()))
+                .debug_selector(move || bar_selector)
+                .flex_none()
+                .w(px(2.0))
+                .self_stretch()
+                .bg(bar)
+                .when_some(tooltip, |el, tip| {
+                    el.tooltip(crate::root::widgets::text_tooltip(tip))
+                }),
+        );
+    }
+    let kind_selector = format!("{selector_prefix}-kind-{row_index}");
     row = row.child(
         div()
+            // Named so a render test can prove the two gutter channels really coexist: GitHub
+            // issue #287's author bar is an *additional* channel, and a version of it that had
+            // quietly replaced this one would still look plausible in a screenshot.
+            .debug_selector(move || kind_selector)
             .flex_none()
             .w(px(3.0))
             // `self_stretch()`, not a fixed height - matches `render_file_view_line`'s own

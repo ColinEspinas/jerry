@@ -1,9 +1,11 @@
 //! Per-agent line provenance: which agent wrote each line of each file in a shared worktree
 //! (GitHub issue #284).
 //!
-//! This is the backend half. There is deliberately no UI here - the gutter tints, the author
-//! chips and the `⚠` shared-file ring are GitHub issue #287, built on the API this folder
-//! exposes.
+//! [`store`], [`change_set`], [`persist_state`] and [`flow`] are the backend half (GitHub issue
+//! #284): who wrote which line, and nothing about how it looks. [`render`] is the visible half
+//! (GitHub issue #287) - the gutter tints, the author chips, the `⚠` shared-file ring and the
+//! per-author filter - and it is the *only* module here that knows a colour or a glyph, so the
+//! backend stays as testable without a window as it was the day it was written.
 //!
 //! ## What this answers, and why it is not blame
 //!
@@ -59,10 +61,13 @@
 //! - [`persist_state`] - the on-disk sibling file, so attribution survives a restart.
 //! - [`flow`] - the `impl AdeApp` glue: draining the hook layer's edit log, recording a hand edit
 //!   from Jerry's own editor, and building the current worktree's change set.
+//! - [`render`] - the UI layer: one author to one tint, glyph and sentence, plus the chip group,
+//!   the `⚠` ring and the per-author filter (GitHub issue #287).
 
 pub mod change_set;
 pub(crate) mod flow;
 pub mod persist_state;
+pub mod render;
 pub mod store;
 
 #[cfg(test)]
@@ -90,6 +95,29 @@ impl AgentKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Which CLI this agent is - parsed back out of the key
+    /// (`<encoded worktree>|<kind label>|<spawn second>`), which is the only place the fact
+    /// survives once the agent itself has closed. This is what turns a stored author into a
+    /// colour and a name for GitHub issue #287's gutter bar and author chips.
+    ///
+    /// Split from the **right**, not the left: the encoded worktree is `utf8:<path>` and a real
+    /// path may legitimately contain `|`, so `split('|')` would find the wrong two segments for
+    /// such a path. The last two are always the kind label and the spawn second.
+    ///
+    /// `None` for a key this build cannot read - a record persisted by a future version naming an
+    /// agent kind that does not exist here, or a hand-edited state file. The UI renders that as
+    /// *no* attribution rather than picking a colour for it: a wrong author is worse than an
+    /// absent one, which is the same rule [`Author::Unattributed`] exists for.
+    pub fn kind(&self) -> Option<crate::work_surface::agents::AgentKind> {
+        let mut parts = self.0.rsplit('|');
+        let _spawned_at = parts.next()?;
+        let label = parts.next()?;
+        // Nothing before the kind label means this is not a `baseline_key` at all, only something
+        // shaped a bit like the tail of one.
+        parts.next()?;
+        crate::work_surface::agents::AgentKind::from_label(label)
     }
 }
 

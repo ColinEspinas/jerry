@@ -231,7 +231,7 @@ pub(crate) struct GraphTabState {
     /// `crate::graph_view::render::LOAD_MORE_BATCH` higher per completed "load more".
     ///
     /// The next cap is derived from *this*, not from `graph.rows.len()`, for two real reasons:
-    /// `rows` can carry a synthetic "Uncommitted changes" row that was never subject to the cap
+    /// `rows` can carry a synthetic "Working tree" row that was never subject to the cap
     /// at all (`wt_core::graph::build_graph`), and deriving it from the last *requested* cap makes
     /// the sequence strictly monotonic, so even a history that shrinks under us (an amend, a
     /// rebase, a `gc` between two walks) still terminates instead of ping-ponging between two

@@ -182,6 +182,20 @@ impl ChangeSet {
             .collect()
     }
 
+    /// Everyone who wrote anything anywhere in this worktree, de-duplicated, in [`Author`]'s own
+    /// order - the working-tree graph row's `by` union (GitHub issue #287).
+    ///
+    /// The union of the rows' own author lists, read off the same partition every row's `+n`/`−n`
+    /// is read off, so the graph row and the panel can never name different sets of authors for
+    /// one worktree.
+    pub fn authors(&self) -> Vec<Author> {
+        self.split()
+            .into_iter()
+            .filter(|(_, stat)| !stat.is_empty())
+            .map(|(author, _)| author)
+            .collect()
+    }
+
     /// The paths carrying lines from more than one agent - the rows that get the `⚠` ring.
     pub fn shared_paths(&self) -> Vec<&Path> {
         self.entries
@@ -236,14 +250,20 @@ pub fn build_change_set(diff: &WorktreeDiff, provenance: Option<&WorktreeProvena
     }
 }
 
-/// Partitions one file's diff lines by author.
+/// Every diff line's author, hunk by hunk, index-aligned with `file.hunks[h].lines` - **the**
+/// per-line answer, and the one the diff view's gutter bar paints (GitHub issue #287).
 ///
-/// Every line lands in exactly one bucket, which is the whole reason the shares sum to the total.
-fn split_for(
-    file: &DiffFile,
-    provenance: Option<&WorktreeProvenance>,
-) -> BTreeMap<Author, DiffStat> {
-    let mut split: BTreeMap<Author, DiffStat> = BTreeMap::new();
+/// A **context** line is deliberately [`Author::Unattributed`]: it is a line this diff does not
+/// change, so "who wrote it" is a question about history, not about this diff, and answering it
+/// would paint an unchanged line as somebody's work. That is also why context lines contribute
+/// nothing to [`split_for`]'s buckets - they are not part of the diffstat either.
+///
+/// [`split_for`] is **defined as** a fold over this, rather than a second walk of the same hunks
+/// with the same rules. `STAGE-A-CHANGELOG.md` §5's open question was exactly that the run diff
+/// and the split must not be able to drift; the gutter is a third reader of the same fact, and
+/// the only way three readers cannot disagree is if there is one computation. So a line's tint
+/// and its contribution to the row's `+n`/`−n` are the same decision, taken once.
+pub fn line_authors(file: &DiffFile, provenance: Option<&WorktreeProvenance>) -> Vec<Vec<Author>> {
     let record = provenance.and_then(|records| records.get(&file.path));
 
     // The removal ledger, as remaining capacity per anchor. A removed diff line is attributed only
@@ -252,6 +272,10 @@ fn split_for(
     // that lines up with nothing (it recorded a deletion of a line that was itself added after
     // this diff's base, so git never saw it) is simply never spent, and a removed line the ledger
     // cannot explain is `Unattributed`. Neither is padded out to make the numbers look complete.
+    //
+    // It is spent across the whole file in hunk order, which is why this is one pass over the
+    // file rather than a per-hunk helper: two passes would each start with a full ledger and
+    // spend the same recorded deletion twice.
     let mut ledger: BTreeMap<usize, Vec<(Author, u32)>> = BTreeMap::new();
     if let Some(record) = record {
         for mark in record.removals() {
@@ -262,37 +286,64 @@ fn split_for(
         }
     }
 
+    let mut per_hunk: Vec<Vec<Author>> = Vec::with_capacity(file.hunks.len());
     for hunk in &file.hunks {
         // A header this app cannot parse means no line numbers, so nothing in it can be located -
         // its lines are counted honestly and attributed to nobody, rather than counted from a
         // guessed starting line.
         let new_start = parse_hunk_new_range(&hunk.header).map(|(start, _)| start);
         let mut new_line = new_start.unwrap_or(0);
+        let mut authors: Vec<Author> = Vec::with_capacity(hunk.lines.len());
 
         for line in &hunk.lines {
             match line.kind {
-                DiffLineKind::Context => new_line += 1,
+                DiffLineKind::Context => {
+                    new_line += 1;
+                    authors.push(Author::Unattributed);
+                }
                 DiffLineKind::Added => {
-                    let author = match (record, new_start) {
+                    authors.push(match (record, new_start) {
                         (Some(record), Some(_)) => record.author_at(new_line),
                         _ => Author::Unattributed,
-                    };
-                    split.entry(author).or_default().added += 1;
+                    });
                     new_line += 1;
                 }
                 DiffLineKind::Removed => {
                     // The removed line sat immediately before new line `new_line`, which is
                     // `new_line - 1` as the 0-based index `RemovalMark::at` uses.
-                    let author = match new_start {
+                    authors.push(match new_start {
                         Some(_) => take_removal(&mut ledger, new_line.saturating_sub(1)),
                         None => Author::Unattributed,
-                    };
-                    split.entry(author).or_default().removed += 1;
+                    });
                 }
             }
         }
+        per_hunk.push(authors);
     }
 
+    per_hunk
+}
+
+/// Partitions one file's diff lines by author - a fold over [`line_authors`], never a second
+/// walk of its own.
+///
+/// Every added and removed line lands in exactly one bucket, which is the whole reason the shares
+/// sum to the total. Context lines are in neither, exactly as they are in neither half of a
+/// diffstat.
+fn split_for(
+    file: &DiffFile,
+    provenance: Option<&WorktreeProvenance>,
+) -> BTreeMap<Author, DiffStat> {
+    let mut split: BTreeMap<Author, DiffStat> = BTreeMap::new();
+    for (hunk, authors) in file.hunks.iter().zip(line_authors(file, provenance)) {
+        for (line, author) in hunk.lines.iter().zip(authors) {
+            match line.kind {
+                DiffLineKind::Context => {}
+                DiffLineKind::Added => split.entry(author).or_default().added += 1,
+                DiffLineKind::Removed => split.entry(author).or_default().removed += 1,
+            }
+        }
+    }
     split
 }
 
@@ -588,6 +639,128 @@ impl UserApi {
             entry.share(&Author::Unattributed),
             DiffStat::default(),
             "every line of this diff is accounted for, so nothing falls through"
+        );
+    }
+
+    /// GitHub issue #287's gutter, at the level the gutter actually reads: one author per diff
+    /// line. The mock's own acceptance criterion for `users.rs` is "**three distinct gutter
+    /// tints, one of which is the neutral hand-edit tint**", which is only reachable if this
+    /// really returns three different authors over the file's own lines.
+    #[test]
+    fn every_diff_line_of_the_shared_file_carries_the_author_who_really_wrote_it() {
+        let fixture = Fixture::two_agent_worktree();
+        let base = diff_against_base(fixture.dir.path()).expect("diff");
+        let diff = base.diff().expect("a real diff");
+        let file = diff
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("src/api/users.rs"))
+            .expect("the shared file must be in the diff");
+
+        let authors = line_authors(file, fixture.store.worktree(fixture.dir.path()));
+        assert_eq!(
+            authors.len(),
+            file.hunks.len(),
+            "one entry per hunk, so a caller can index this with the same (hunk, line) pair it \
+             already indexes the hunks with"
+        );
+        for (hunk, hunk_authors) in file.hunks.iter().zip(&authors) {
+            assert_eq!(
+                hunk.lines.len(),
+                hunk_authors.len(),
+                "and one entry per line inside it - the gutter reads this positionally"
+            );
+        }
+
+        // Who wrote what, by the line's own text rather than by index, so this test states the
+        // real claim rather than a coordinate.
+        let author_of = |needle: &str| -> Author {
+            for (hunk, hunk_authors) in file.hunks.iter().zip(&authors) {
+                for (line, author) in hunk.lines.iter().zip(hunk_authors) {
+                    if line.kind == DiffLineKind::Added && line.content.contains(needle) {
+                        return author.clone();
+                    }
+                }
+            }
+            panic!("no added line containing {needle:?}");
+        };
+        assert_eq!(
+            author_of("QueryBuilder::table"),
+            Author::Agent(fixture.s3.clone()),
+            "the `list` rewrite is s3's line"
+        );
+        assert_eq!(
+            author_of("cache.get_or_load"),
+            Author::Agent(fixture.s10.clone()),
+            "the `search` rewrite is s10's"
+        );
+        assert_eq!(
+            author_of("cache key must include tenant_id"),
+            Author::You,
+            "and the human's own hand edit flipped that line back to `you` (Orca's second rule)"
+        );
+
+        // Context lines are nobody's. `Jerry.dc.html` gives its unchanged rows no author at all,
+        // and painting one would tint a line this diff does not change.
+        for (hunk, hunk_authors) in file.hunks.iter().zip(&authors) {
+            for (line, author) in hunk.lines.iter().zip(hunk_authors) {
+                if line.kind == DiffLineKind::Context {
+                    assert_eq!(
+                        *author,
+                        Author::Unattributed,
+                        "context line {:?} must carry no attribution",
+                        line.content
+                    );
+                }
+            }
+        }
+    }
+
+    /// The gutter and the row's `+n`/`−n` are one computation, not two that agree today -
+    /// `STAGE-A-CHANGELOG.md` §5's own open question, closed structurally.
+    #[test]
+    fn the_per_author_split_is_exactly_the_fold_of_the_per_line_authors() {
+        let fixture = Fixture::two_agent_worktree();
+        let base = diff_against_base(fixture.dir.path()).expect("diff");
+        let diff = base.diff().expect("a real diff");
+        let records = fixture.store.worktree(fixture.dir.path());
+        let change_set = fixture.change_set();
+
+        for file in &diff.files {
+            let mut folded: BTreeMap<Author, DiffStat> = BTreeMap::new();
+            for (hunk, hunk_authors) in file.hunks.iter().zip(line_authors(file, records)) {
+                for (line, author) in hunk.lines.iter().zip(hunk_authors) {
+                    match line.kind {
+                        DiffLineKind::Context => {}
+                        DiffLineKind::Added => folded.entry(author).or_default().added += 1,
+                        DiffLineKind::Removed => folded.entry(author).or_default().removed += 1,
+                    }
+                }
+            }
+            let entry = change_set.entry(&file.path).expect("row");
+            assert_eq!(
+                &folded,
+                entry.split(),
+                "{}'s gutter and its row's diffstat must be the same partition",
+                file.path.display()
+            );
+        }
+    }
+
+    /// The `by` union for a whole worktree - the graph's working-tree row (audit item I4).
+    #[test]
+    fn the_worktree_wide_author_union_is_everyone_who_wrote_anything_in_it() {
+        let fixture = Fixture::two_agent_worktree();
+        let change_set = fixture.change_set();
+        assert_eq!(
+            change_set.authors(),
+            vec![
+                Author::Agent(fixture.s3.clone()),
+                Author::Agent(fixture.s10.clone()),
+                Author::You,
+            ],
+            "both agents and the hand edit - `s: 's3'` pinning one agent to the whole working \
+             tree is exactly what I4 removed"
         );
     }
 

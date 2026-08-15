@@ -554,6 +554,15 @@ pub struct AdeApp {
     /// diff and serves the Against-main section; the two are separate because their scopes are,
     /// and rebuilt together through one function so neither can go stale on its own.
     pub(crate) uncommitted_change_set: crate::provenance::change_set::ChangeSet,
+    /// The per-author diff filter (GitHub issue #287), if one is in force: which file it was
+    /// entered from, and whose lines it keeps at full opacity.
+    ///
+    /// Pinned to a path rather than left global - see
+    /// [`crate::provenance::render::AuthorFilter`]'s own docs for why that is a correctness
+    /// choice, not tidiness. Read through
+    /// [`crate::provenance::render::AdeApp::active_author_filter`], never directly, so a stale
+    /// filter for a file that is no longer open can never dim anything.
+    pub(crate) author_filter: Option<crate::provenance::render::AuthorFilter>,
     /// The **Commits** scope (GitHub issue #285): what is already written down on this branch.
     pub(crate) branch_commits: sections::ScopeLoad<wt_core::diff::BranchCommits>,
     /// Which of the Changes panel's four sections are open. Per section, not per worktree -

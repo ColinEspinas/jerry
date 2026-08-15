@@ -1844,6 +1844,8 @@ impl AdeApp {
                 .child(render_changes_footer(
                     self.ui_text_size(10.0),
                     self.change_seen_toggle_live(),
+                    self.window_controls_style().is_macos(),
+                    self.change_author_filter_live(),
                 )),
         }
         .into_any_element()
@@ -2910,6 +2912,26 @@ impl AdeApp {
                     name_cell
                 }
             })
+            // GitHub issue #287: who wrote this file, right after its name - `REVISION-2026-08-14.md`
+            // §1's "agent chip per row […] amber ring when it has two authors", and
+            // `REVISION-2026-07-31.md` §4's gate that chips exist only in a multi-agent worktree.
+            // `render_author_chips` owns both the gate and the ring; this row only says where they
+            // go.
+            // `stageable` is the Uncommitted scope, which is exactly where the design puts these:
+            // *"Each **Uncommitted** row gains a chip group after the filename"*. An Against-main
+            // row lists work already committed, where "who wrote this line" is git's own question
+            // and git's own answer (`git blame`), not this app's local, uncommitted-only record -
+            // and the ring's filter would open a diff against a base these chips were never
+            // measured over.
+            .when(stageable, |el| {
+                el.children(self.render_author_chips(
+                    "change-row",
+                    &entry.path,
+                    &crate::provenance::render::chip_authors(entry),
+                    entry.is_shared(),
+                    cx,
+                ))
+            })
             // Alongside the status letter, never instead of it: a file added by a commit on this
             // branch is genuinely both an `A` (relative to the base) and `committed`.
             .when(committed, |el| el.child(render_committed_tag()))
@@ -3253,6 +3275,23 @@ impl AdeApp {
         self.open_change
             .as_ref()
             .is_some_and(|path| self.uncommitted_change_set.entry(path).is_some())
+    }
+
+    /// Whether `alt`+click really has something to act on right now - the gate on
+    /// [`render_changes_footer`]'s `⌥click filter by author` hint, and the exact same honesty rule
+    /// [`Self::change_seen_toggle_live`] implements for `V`.
+    ///
+    /// The gesture acts on an **author chip**, so it is live exactly when a chip is on screen: a
+    /// multi-agent worktree (`REVISION-2026-07-31.md` §4's own gate, read through
+    /// `crate::provenance::render::AdeApp::worktree_has_multiple_agents` rather than re-derived)
+    /// with at least one row this app can really draw an author for.
+    pub(in crate::sidebar) fn change_author_filter_live(&self) -> bool {
+        self.worktree_has_multiple_agents()
+            && self
+                .uncommitted_change_set
+                .entries()
+                .iter()
+                .any(|entry| !crate::provenance::render::chip_authors(entry).is_empty())
     }
 
     /// §4i's own wording for a filename that **is** seen, verbatim, including the `V` it names as
@@ -3992,8 +4031,11 @@ impl AdeApp {
 pub(in crate::sidebar) fn render_changes_footer(
     text_size: Pixels,
     seen_toggle_live: bool,
+    macos: bool,
+    author_filter_live: bool,
 ) -> impl IntoElement {
     div()
+        .debug_selector(|| "changes-footer".to_string())
         .flex_none()
         .h(theme::band::SURFACE_FOOTER)
         .px(px(12.0))
@@ -4006,12 +4048,25 @@ pub(in crate::sidebar) fn render_changes_footer(
         .font(font(theme::font::MONO))
         .text_size(text_size)
         .text_color(theme::text::HINT)
-        .child("click a file to open its diff in the centre")
+        // **The only shrinkable thing in the row** - `REVISION-2026-08-14.md` §4's own rule for
+        // the rail's repo header, which is the same shape of problem: a fixed-width band holding
+        // one prose lead-in and N `flex:none` readouts. The keycaps are what this strip is *for*
+        // (`STAGE-A-CHANGELOG.md` §2 lists exactly three of them and no prose at all), so the
+        // sentence ellipsizes and every hint stays whole, rather than the third hint being pushed
+        // off the panel's right edge the moment it appears.
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .truncate()
+                .child("click a file to open its diff in the centre"),
+        )
         .when(seen_toggle_live, |el| {
             el.child(
                 div()
                     .id("changes-footer-seen-hint")
                     .debug_selector(|| "changes-footer-seen-hint".to_string())
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(5.0))
@@ -4029,6 +4084,37 @@ pub(in crate::sidebar) fn render_changes_footer(
                             .text_size(text_size)
                             .text_color(theme::text::PATH)
                             .child("mark seen"),
+                    ),
+            )
+        })
+        // `STAGE-A-CHANGELOG.md` §2's third hint on this strip, `⌥click filter by author`, as real
+        // keycaps rather than the prose `alt+click` (ride-along I10). Gated on the affordance
+        // genuinely being on screen: `alt`+click filters by clicking an *author chip*, and chips
+        // only exist in a multi-agent worktree (`REVISION-2026-07-31.md` §4), so in a one-agent
+        // worktree this would advertise a gesture with nothing to perform it on - the same honesty
+        // rule `seen_toggle_live` above and `render_file_tree_footer`'s `live` already implement.
+        .when(author_filter_live, |el| {
+            el.child(
+                div()
+                    .id("changes-footer-author-filter-hint")
+                    .debug_selector(|| "changes-footer-author-filter-hint".to_string())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(render_keycap_row(
+                        &keymap::resolve_combo(
+                            crate::provenance::render::AUTHOR_FILTER_SPEC,
+                            macos,
+                        ),
+                        KeycapSize::Hint,
+                    ))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(text_size)
+                            .text_color(theme::text::PATH)
+                            .child("filter by author"),
                     ),
             )
         })

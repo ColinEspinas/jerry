@@ -136,6 +136,11 @@ impl AdeApp {
                         .child(label),
                 )
             })
+            // GitHub issue #287 / `STAGE-A-CHANGELOG.md` §4b: the one dismissible `<agent> only ✕`
+            // indicator, in `Jerry.dc.html`'s own slot - after the diffstat, before the toolbar's
+            // spacer - and present *only* while a filter is really in force, so a filtered diff
+            // can never read as the whole diff and an unfiltered one carries no dead control.
+            .children(self.render_author_filter_indicator(cx))
             .child(div().flex_1())
             .when(is_markdown_file, |el| {
                 el.child(self.render_markdown_view_toggle(cx))

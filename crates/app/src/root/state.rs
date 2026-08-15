@@ -352,6 +352,7 @@ impl AdeApp {
             change_set: crate::provenance::change_set::ChangeSet::default(),
             uncommitted_diff: crate::sidebar::sections::ScopeLoad::Loading,
             uncommitted_change_set: crate::provenance::change_set::ChangeSet::default(),
+            author_filter: None,
             branch_commits: crate::sidebar::sections::ScopeLoad::Loading,
             changes_sections: crate::sidebar::sections::SectionCollapse::default(),
             // Starts empty and is reset to the real row count from the one place that builds the
