@@ -291,7 +291,8 @@ impl AdeApp {
                 // (`self.palette_focus.clear()`).
                 self.code_focus.clear();
             } else {
-                restore_focus(&self.agents, &mut self.code_focus, window, cx);
+                let fallback = self.focus_fallback_handle();
+                restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
             }
         }
         let cwd = self

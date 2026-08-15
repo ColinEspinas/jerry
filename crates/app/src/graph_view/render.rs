@@ -91,7 +91,8 @@ impl AdeApp {
         self.tree_context_menu = None;
         self.tree_inline_edit = None;
         if self.tree_focus_handle.is_focused(window) {
-            restore_focus(&self.agents, &mut self.code_focus, window, cx);
+            let fallback = self.focus_fallback_handle();
+            restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
         }
         self.palette_focus.forget_target(&self.tree_focus_handle);
         self.settings_focus.forget_target(&self.tree_focus_handle);
@@ -103,7 +104,8 @@ impl AdeApp {
         // left `code_focus_handle` captured as this tab's own return target, a handle that stops
         // being rendered the moment `open_change` clears.
         if self.code_focus_handle.is_focused(window) {
-            restore_focus(&self.agents, &mut self.code_focus, window, cx);
+            let fallback = self.focus_fallback_handle();
+            restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
         }
         self.palette_focus.forget_target(&self.code_focus_handle);
         self.settings_focus.forget_target(&self.code_focus_handle);
@@ -217,7 +219,8 @@ impl AdeApp {
                 .branches_filter_focus_handle
                 .is_focused(window)
         {
-            restore_focus(&self.agents, &mut self.graph_focus, window, cx);
+            let fallback = self.focus_fallback_handle();
+            restore_focus(&self.agents, &mut self.graph_focus, fallback, window, cx);
         }
         self.palette_focus.forget_target(&self.graph_focus_handle);
         self.settings_focus.forget_target(&self.graph_focus_handle);
