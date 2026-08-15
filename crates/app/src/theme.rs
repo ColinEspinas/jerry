@@ -2869,6 +2869,97 @@ pub mod graph {
     /// "44px tall"). Sits where [`TOOLBAR`] normally would while the graph pane is in rebase
     /// mode - see `crate::graph_view::rebase_render`'s module docs.
     pub const REBASE_BANNER: Pixels = px(44.0);
+    /// An interactive-rebase plan row's height (`revision 5/REVISION-2026-08-12.md` §1.4: "Plan
+    /// rows - 28 high"). Deliberately **not** [`ROW`] (26, the ordinary commit list's): §1.4's
+    /// fold elbow is specified as `top:-1`/`bottom:13` inside this box, which only lands on the
+    /// action chip's centreline (an 18-high chip centred in 28 has its centre at 14, and a
+    /// bottom-inset-13 box's inside-painted 1px bottom border occupies exactly 14..15) at 28.
+    /// §2.2's own rebase menu anchor formula (`44 + 22 + 3 + row × 28 + 30`) counts in 28s too.
+    pub const REBASE_ROW: Pixels = px(28.0);
+    /// The plan list's own 3px top/bottom padding (§2.2's `+ 3` term).
+    pub const REBASE_LIST_PAD: Pixels = px(3.0);
+    /// The plan footer band's height (§1.4: "**Footer**, 28 high").
+    pub const REBASE_FOOTER: Pixels = px(28.0);
+    /// The fold elbow's slot width on a `squash`/`fixup` row (§1.4: "20 wide on `squash`/`fixup`
+    /// rows only"). A non-folding row has no slot at all, which is what makes a fold row read as
+    /// indented under the commit it folds into.
+    pub const REBASE_FOLD_INDENT: Pixels = px(20.0);
+    /// The fold elbow's own insets inside [`REBASE_FOLD_INDENT`] (§1.4: "inset 5 each side,
+    /// `top:-1` so it meets the row above's edge, `bottom:13` so it lands on the chip
+    /// centreline").
+    pub const REBASE_FOLD_ELBOW_INSET_X: Pixels = px(5.0);
+    pub const REBASE_FOLD_ELBOW_TOP: Pixels = px(-1.0);
+    pub const REBASE_FOLD_ELBOW_BOTTOM: Pixels = px(13.0);
+    /// The action chip's height (§1.4: "18 high, `0 7` padding").
+    pub const REBASE_CHIP: Pixels = px(18.0);
+    /// The action menu's width (§1.4: "**Action menu:** 274 wide").
+    pub const REBASE_MENU_WIDTH: Pixels = px(274.0);
+    /// The action menu's own row columns (§1.4: "✓ mark 9 · action name 46 · hint flex").
+    pub const REBASE_MENU_MARK: Pixels = px(9.0);
+    pub const REBASE_MENU_NAME: Pixels = px(46.0);
+    /// The plan's own column widths (§1.3: "`action` 104 (13 left pad, clears the rows' 2px
+    /// selection edge) · `commit` flex · `files` 62 right · `sha` 62 right · pause column 22").
+    pub const REBASE_COL_ACTION: Pixels = px(104.0);
+    pub const REBASE_COL_ACTION_PAD: Pixels = px(13.0);
+    pub const REBASE_COL_NUMERIC: Pixels = px(62.0);
+    pub const REBASE_COL_PAUSE: Pixels = px(22.0);
+    /// The drag handle's slot (§1.4: "drag handle | 11 wide").
+    pub const REBASE_DRAG_SLOT: Pixels = px(11.0);
+    /// Every 5px square this surface paints - the pause marks (§1.5), the footer legend's own
+    /// copy of the outlined one, the warning-stack severity dots (§1.7) and the stopped strip's
+    /// (§1.8). One constant because the design deliberately makes them the same mark.
+    pub const REBASE_MARK: Pixels = px(5.0);
+
+    /// The six interactive-rebase action chips (§1.4's action table, verbatim). Their own token
+    /// family rather than reaches into [`super::term`]/[`super::budget`]/[`super::diff`]: several
+    /// of these hexes already exist elsewhere in this module under names that mean something
+    /// entirely different (`#d8a94a` is [`TAG_CHIP_FG`], `#8fbde6` is `term::PROMPT`, `#c4726d`
+    /// is `button::DANGER_FG`), and a re-theme of "the terminal's prompt colour" must not silently
+    /// move "what `reword` looks like" - the same call [`super::status_bar`]'s own load-hue tokens
+    /// document. §1.4 is explicit that these are "the existing status palette - no new hues", so
+    /// this family introduces no hue the reserved-hue rule ([`super::agent`]) does not already
+    /// allocate: `edit` is the attention amber it shares with the planned-pause mark, `drop` is
+    /// the failure/deletion red, `squash`/`fixup` are the additions green (one step apart, because
+    /// they do the same thing to history), `reword` is the informational blue.
+    pub const REBASE_PICK_FG: ColorToken = token("graph.rebase_pick_fg", 0xa9b0b7);
+    pub const REBASE_PICK_BG: ColorToken = token("graph.rebase_pick_bg", 0x1c2023);
+    pub const REBASE_PICK_BORDER: ColorToken = token("graph.rebase_pick_border", 0x2a2f34);
+    pub const REBASE_REWORD_FG: ColorToken = token("graph.rebase_reword_fg", 0x8fbde6);
+    pub const REBASE_REWORD_BG: ColorToken = token("graph.rebase_reword_bg", 0x1d2532);
+    pub const REBASE_REWORD_BORDER: ColorToken = token("graph.rebase_reword_border", 0x2b3d4f);
+    /// A `reword` row's message field before a message has really been supplied (§1.6: "1px
+    /// border `#3b4a58` (→ `#2b3d4f` once a message is supplied)"). The brighter of the pair, on
+    /// purpose: an unanswered field is the one asking for something.
+    pub const REBASE_REWORD_BORDER_EMPTY: ColorToken =
+        token("graph.rebase_reword_border_empty", 0x3b4a58);
+    pub const REBASE_EDIT_FG: ColorToken = token("graph.rebase_edit_fg", 0xd8a94a);
+    pub const REBASE_EDIT_BG: ColorToken = token("graph.rebase_edit_bg", 0x2b2413);
+    pub const REBASE_EDIT_BORDER: ColorToken = token("graph.rebase_edit_border", 0x3f3418);
+    pub const REBASE_SQUASH_FG: ColorToken = token("graph.rebase_squash_fg", 0x7fc79a);
+    pub const REBASE_SQUASH_BG: ColorToken = token("graph.rebase_squash_bg", 0x16261e);
+    pub const REBASE_SQUASH_BORDER: ColorToken = token("graph.rebase_squash_border", 0x24503a);
+    pub const REBASE_FIXUP_FG: ColorToken = token("graph.rebase_fixup_fg", 0x5f9c78);
+    pub const REBASE_FIXUP_BG: ColorToken = token("graph.rebase_fixup_bg", 0x16261e);
+    pub const REBASE_FIXUP_BORDER: ColorToken = token("graph.rebase_fixup_border", 0x1e3b2a);
+    pub const REBASE_DROP_FG: ColorToken = token("graph.rebase_drop_fg", 0xc4726d);
+    pub const REBASE_DROP_BG: ColorToken = token("graph.rebase_drop_bg", 0x2a1719);
+    pub const REBASE_DROP_BORDER: ColorToken = token("graph.rebase_drop_border", 0x4a2422);
+    /// Any action chip's hover border (§1.4: "hover border `#3a4148`").
+    pub const REBASE_CHIP_HOVER_BORDER: ColorToken =
+        token("graph.rebase_chip_hover_border", 0x3a4148);
+    /// The plan row's `⋮⋮` drag handle (§1.4: "`⋮⋮` 9px mono `#363b40`").
+    pub const REBASE_DRAG_HANDLE: ColorToken = token("graph.rebase_drag_handle", 0x363b40);
+    /// The column header's own outlined pause square (§1.3: "pause column 22, carrying an
+    /// outlined 5px square in `#3a3f44`" - dimmer than the rows' own `#8a6420`
+    /// `status::ASK_CARD_EDGE`, because it is a legend, not a live mark).
+    pub const REBASE_HEADER_PAUSE_MARK: ColorToken =
+        token("graph.rebase_header_pause_mark", 0x3a3f44);
+    /// A warning row's body line (§1.7: "body 10.5px/15 `#767d84`").
+    pub const REBASE_WARNING_BODY: ColorToken = token("graph.rebase_warning_body", 0x767d84);
+    /// The remote-commits warning's own dot (§1.7 warning 2: "blue `#8fbde6`"). Same hex as
+    /// [`REBASE_REWORD_FG`], separate token for the same reason that family exists at all: this
+    /// one means "informational, not urgent", not "this row will be reworded".
+    pub const REBASE_WARNING_REMOTE: ColorToken = token("graph.rebase_warning_remote", 0x8fbde6);
     /// The column header band's height (`revision 3/REVISION-2026-07-31.md` §6.1: "Column
     /// header, 22 high"). Sits between [`TOOLBAR`] and the row list -
     /// `crate::graph_view::render::AdeApp::render_graph_view` renders it as a real sibling band,
@@ -2953,6 +3044,30 @@ pub mod graph {
         ("HEADER_LABEL_FG", HEADER_LABEL_FG),
         ("BEHIND_WARN", BEHIND_WARN),
         ("BRANCH_NO_LANE_DOT", BRANCH_NO_LANE_DOT),
+        ("REBASE_PICK_FG", REBASE_PICK_FG),
+        ("REBASE_PICK_BG", REBASE_PICK_BG),
+        ("REBASE_PICK_BORDER", REBASE_PICK_BORDER),
+        ("REBASE_REWORD_FG", REBASE_REWORD_FG),
+        ("REBASE_REWORD_BG", REBASE_REWORD_BG),
+        ("REBASE_REWORD_BORDER", REBASE_REWORD_BORDER),
+        ("REBASE_REWORD_BORDER_EMPTY", REBASE_REWORD_BORDER_EMPTY),
+        ("REBASE_EDIT_FG", REBASE_EDIT_FG),
+        ("REBASE_EDIT_BG", REBASE_EDIT_BG),
+        ("REBASE_EDIT_BORDER", REBASE_EDIT_BORDER),
+        ("REBASE_SQUASH_FG", REBASE_SQUASH_FG),
+        ("REBASE_SQUASH_BG", REBASE_SQUASH_BG),
+        ("REBASE_SQUASH_BORDER", REBASE_SQUASH_BORDER),
+        ("REBASE_FIXUP_FG", REBASE_FIXUP_FG),
+        ("REBASE_FIXUP_BG", REBASE_FIXUP_BG),
+        ("REBASE_FIXUP_BORDER", REBASE_FIXUP_BORDER),
+        ("REBASE_DROP_FG", REBASE_DROP_FG),
+        ("REBASE_DROP_BG", REBASE_DROP_BG),
+        ("REBASE_DROP_BORDER", REBASE_DROP_BORDER),
+        ("REBASE_CHIP_HOVER_BORDER", REBASE_CHIP_HOVER_BORDER),
+        ("REBASE_DRAG_HANDLE", REBASE_DRAG_HANDLE),
+        ("REBASE_HEADER_PAUSE_MARK", REBASE_HEADER_PAUSE_MARK),
+        ("REBASE_WARNING_BODY", REBASE_WARNING_BODY),
+        ("REBASE_WARNING_REMOTE", REBASE_WARNING_REMOTE),
     ];
 }
 
@@ -2966,6 +3081,13 @@ pub mod radius {
     pub const BUTTON: Pixels = px(4.0);
     pub const CHIP: Pixels = px(3.0); // chips, keycaps, segments
     pub const MARK: Pixels = px(2.0); // stat bars, small squares
+    /// The 5px squares the interactive-rebase plan paints - its pause marks (`revision 5/
+    /// REVISION-2026-08-12.md` §1.5), its warning-stack severity dots (§1.7) and the stopped
+    /// strip's own (§1.8). All four are specified `border-radius:1px`, and at 5px across the
+    /// difference from [`MARK`] is the difference between reading as a square and reading as a
+    /// dot - which is load-bearing here, since this app already uses a real circle for "an agent's
+    /// status" and these deliberately are not that.
+    pub const MARK_SM: Pixels = px(1.0);
     pub const PILL: Pixels = px(8.0); // toggle track (26x15)
 }
 

@@ -35,6 +35,112 @@ impl gpui::Render for DraggedRebaseRow {
     }
 }
 
+/// Design spec §1.4's footer hint strip, verbatim and in order:
+/// `alt+↑↓ reorder · P pick · S squash · D drop · mod+enter start`.
+///
+/// Authored as `crate::keymap` spec strings, never as literal glyphs, so every one of them
+/// renders through `crate::keymap::resolve_combo` and picks up the platform's own modifier
+/// exactly like every other keycap in the app. Each spec is the real, registered keystroke of the
+/// matching action in `crate::default_key_bindings` - `"P"`/`"S"`/`"D"` are shown uppercase (a
+/// keycap is a key, not a character) while the binding itself is the unmodified letter, the same
+/// way `Jerry.dc.html`'s own reference footer prints them.
+const REBASE_FOOTER_HINTS: [(&str, &str); 5] = [
+    ("alt+\u{2191}\u{2193}", "reorder"),
+    ("P", "pick"),
+    ("S", "squash"),
+    ("D", "drop"),
+    ("mod+enter", "start"),
+];
+
+/// Which of design spec §1.7's three warnings a stack row is - and, through [`Self::dot`], the
+/// severity it renders at. GitHub issue #305: all three used to render `theme::status::ASK`
+/// regardless of what they meant, which flattened the gradient §1.7 is explicit about (the
+/// running-agent warning is "the one no other git client needs"; the stop count is a neutral
+/// fact) into three identical attention-amber rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebaseWarningKind {
+    /// §1.7 warning 1 - agents are really running in this worktree.
+    RunningAgents,
+    /// §1.7 warning 2 - some of the plan's commits are already on the tracked remote.
+    RemoteCommits,
+    /// §1.7 warning 3 - how many times the plan will hand control back.
+    StopCount,
+}
+
+impl RebaseWarningKind {
+    /// A stable, human-readable tag for this row's `debug_selector`s.
+    fn slug(self) -> &'static str {
+        match self {
+            RebaseWarningKind::RunningAgents => "agents",
+            RebaseWarningKind::RemoteCommits => "remote",
+            RebaseWarningKind::StopCount => "stops",
+        }
+    }
+
+    /// Design spec §1.7's own per-warning hue, verbatim: amber `#e2a336` · blue `#8fbde6` ·
+    /// grey `#565d64`. Every one is an already-named token whose meaning matches (attention,
+    /// informational, idle) - see [`rebase_warning_severity_tests`], which pins both the hexes
+    /// and the fact that no two of the three are the same colour.
+    pub(crate) fn dot(self) -> theme::ColorToken {
+        match self {
+            RebaseWarningKind::RunningAgents => theme::status::ASK,
+            RebaseWarningKind::RemoteCommits => theme::graph::REBASE_WARNING_REMOTE,
+            RebaseWarningKind::StopCount => theme::status::IDLE,
+        }
+    }
+}
+
+/// One action's chip colours - design spec §1.4's action table, verbatim. See
+/// [`rebase_action_style`].
+pub(crate) struct RebaseActionStyle {
+    pub fg: theme::ColorToken,
+    pub bg: theme::ColorToken,
+    pub border: theme::ColorToken,
+}
+
+/// The single place design spec §1.4's action palette is decided (GitHub issue #302). Every
+/// surface that colours by action reads it - the chip, its dropdown option's label, and §1.4's
+/// fold elbow, whose stroke is specified as "a 1px elbow **in the action's colour**" - so those
+/// three can never drift into disagreeing about what `squash` looks like.
+///
+/// Returns `theme::ColorToken`s rather than resolved `Rgba`s deliberately: a token is what a real
+/// theme can retint, and it is also what [`rebase_action_palette_tests`] can compare exactly.
+pub(crate) fn rebase_action_style(action: RebaseActionKind) -> RebaseActionStyle {
+    let (fg, bg, border) = match action {
+        RebaseActionKind::Pick => (
+            theme::graph::REBASE_PICK_FG,
+            theme::graph::REBASE_PICK_BG,
+            theme::graph::REBASE_PICK_BORDER,
+        ),
+        RebaseActionKind::Reword => (
+            theme::graph::REBASE_REWORD_FG,
+            theme::graph::REBASE_REWORD_BG,
+            theme::graph::REBASE_REWORD_BORDER,
+        ),
+        RebaseActionKind::Edit => (
+            theme::graph::REBASE_EDIT_FG,
+            theme::graph::REBASE_EDIT_BG,
+            theme::graph::REBASE_EDIT_BORDER,
+        ),
+        RebaseActionKind::Squash => (
+            theme::graph::REBASE_SQUASH_FG,
+            theme::graph::REBASE_SQUASH_BG,
+            theme::graph::REBASE_SQUASH_BORDER,
+        ),
+        RebaseActionKind::Fixup => (
+            theme::graph::REBASE_FIXUP_FG,
+            theme::graph::REBASE_FIXUP_BG,
+            theme::graph::REBASE_FIXUP_BORDER,
+        ),
+        RebaseActionKind::Drop => (
+            theme::graph::REBASE_DROP_FG,
+            theme::graph::REBASE_DROP_BG,
+            theme::graph::REBASE_DROP_BORDER,
+        ),
+    };
+    RebaseActionStyle { fg, bg, border }
+}
+
 impl AdeApp {
     /// The graph pane's whole interactive-rebase surface (design spec §1): banner, the Stopped-
     /// phase strip (only while stopped on a real conflict), the plan's own column header, and the
@@ -45,6 +151,52 @@ impl AdeApp {
             .id("graph-rebase-view")
             .debug_selector(|| "graph-rebase-view".to_string())
             .track_focus(&self.graph_focus_handle)
+            // GitHub issue #304: the one real key context behind design spec §1.4's footer
+            // keycaps. Every binding scoped to it is registered in `crate::default_key_bindings`
+            // (see that function's own docs for why four of the five also carry `&& !text-input`,
+            // and `crate::keymap_overrides::real_context_stacks` for the two live stacks this
+            // node produces).
+            .key_context("rebase-plan")
+            .on_action(cx.listener(
+                |this, _action: &crate::root::RebaseReorderUp, _window, cx| {
+                    this.move_selected_rebase_plan_row(true, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _action: &crate::root::RebaseReorderDown, _window, cx| {
+                    this.move_selected_rebase_plan_row(false, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _action: &crate::root::RebasePickRow, _window, cx| {
+                    this.set_selected_rebase_row_action(RebaseActionKind::Pick, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _action: &crate::root::RebaseSquashRow, _window, cx| {
+                    this.set_selected_rebase_row_action(RebaseActionKind::Squash, cx);
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _action: &crate::root::RebaseDropRow, _window, cx| {
+                    this.set_selected_rebase_row_action(RebaseActionKind::Drop, cx);
+                }),
+            )
+            // The keyboard twin of the `Start rebase` button, guarded exactly the way that
+            // button is: `start_rebase` itself no-ops while `op_in_flight`, so a held
+            // `mod+enter` can never launch a second overlapping git subprocess.
+            .on_action(
+                cx.listener(|this, _action: &crate::root::RebaseStart, _window, cx| {
+                    if this
+                        .graph_state
+                        .rebase
+                        .as_ref()
+                        .is_some_and(|state| matches!(state.phase, RebasePhase::Planning))
+                    {
+                        this.start_rebase(cx);
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .flex_1()
@@ -60,6 +212,72 @@ impl AdeApp {
         container
             .child(render_rebase_column_header())
             .child(self.render_rebase_plan_rows(cx))
+            .child(self.render_rebase_plan_footer())
+            .into_any_element()
+    }
+
+    /// Design spec §1.4's **Footer**, 28 high: the keycap hints, a flex spacer, §1.5's
+    /// `pauses here` legend, then §1.1's order note.
+    ///
+    /// A real pinned band (`flex_none`, a sibling of the scroller - not a child of it). GitHub
+    /// issue #304's actual bug: the order note used to be appended *inside*
+    /// [`Self::render_rebase_plan_rows`]' `overflow_y_scroll` container, so on any plan long
+    /// enough to scroll it left the screen exactly when it mattered - and §1.1 is explicit that
+    /// this note is the whole mitigation for the plan running oldest-first against a
+    /// newest-first graph ("do not drop it").
+    fn render_rebase_plan_footer(&self) -> gpui::AnyElement {
+        let macos = self.window_controls_style().is_macos();
+        div()
+            .id("rebase-plan-footer")
+            .debug_selector(|| "rebase-plan-footer".to_string())
+            .flex_none()
+            .h(theme::graph::REBASE_FOOTER)
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .bg(theme::surface::FOOTER)
+            .border_t_1()
+            .border_color(theme::border::INNER)
+            .child(crate::root::widgets::render_hint_row(
+                REBASE_FOOTER_HINTS.iter().map(|(spec, label)| {
+                    crate::root::widgets::render_hint_pair(
+                        &crate::keymap::resolve_combo(spec, macos),
+                        *label,
+                    )
+                    .into_any_element()
+                }),
+            ))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("rebase-pause-legend")
+                    .debug_selector(|| "rebase-pause-legend".to_string())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    // §1.5's own outlined mark, not a second glyph for the same idea - "one
+                    // column, one legend".
+                    .child(render_rebase_pause_marker(true, false))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::PATH)
+                            .child("pauses here"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("rebase-order-note")
+                    .debug_selector(|| "rebase-order-note".to_string())
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(10.0))
+                    .text_color(theme::text::HINT)
+                    .child("oldest first \u{b7} applied top to bottom"),
+            )
             .into_any_element()
     }
 
@@ -161,20 +379,33 @@ impl AdeApp {
                             .child(format!("{n} \u{2192} {}", plural::count(m, "commit", None))),
                     )
                     .child(
-                        render_rebase_button("Cancel", false, enabled).when(enabled, |el| {
-                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.cancel_rebase_mode(cx);
-                            }))
-                        }),
+                        render_rebase_button("Cancel", RebaseButtonStyle::Ghost, enabled, &[])
+                            .when(enabled, |el| {
+                                el.on_click(cx.listener(
+                                    |this, _event: &ClickEvent, _window, cx| {
+                                        this.cancel_rebase_mode(cx);
+                                    },
+                                ))
+                            }),
                     )
-                    .child(render_rebase_button("Start rebase", true, enabled).when(
-                        enabled,
-                        |el| {
+                    // GitHub issue #304: the real `mod+enter` keycaps §1.2 asks for, behind the
+                    // real `crate::root::RebaseStart` binding - not a painted-on hint.
+                    .child(
+                        render_rebase_button(
+                            "Start rebase",
+                            RebaseButtonStyle::Primary,
+                            enabled,
+                            &crate::keymap::resolve_combo(
+                                "mod+enter",
+                                self.window_controls_style().is_macos(),
+                            ),
+                        )
+                        .when(enabled, |el| {
                             el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                                 this.start_rebase(cx);
                             }))
-                        },
-                    ))
+                        }),
+                    )
                     .into_any_element()
             }
             RebasePhase::Stopped { .. } => div()
@@ -182,25 +413,30 @@ impl AdeApp {
                 .items_center()
                 .gap(px(10.0))
                 .child(
-                    render_rebase_button("Abort", false, enabled).when(enabled, |el| {
-                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.abort_rebase(cx);
-                        }))
-                    }),
+                    render_rebase_button("Abort", RebaseButtonStyle::GhostDanger, enabled, &[])
+                        .when(enabled, |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.abort_rebase(cx);
+                            }))
+                        }),
                 )
                 .child(
-                    render_rebase_button("Skip", false, enabled).when(enabled, |el| {
-                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.skip_rebase(cx);
-                        }))
-                    }),
+                    render_rebase_button("Skip", RebaseButtonStyle::Ghost, enabled, &[]).when(
+                        enabled,
+                        |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.skip_rebase(cx);
+                            }))
+                        },
+                    ),
                 )
                 .child(
-                    render_rebase_button("Continue", true, enabled).when(enabled, |el| {
-                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.continue_rebase(cx);
-                        }))
-                    }),
+                    render_rebase_button("Continue", RebaseButtonStyle::Confirm, enabled, &[])
+                        .when(enabled, |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.continue_rebase(cx);
+                            }))
+                        }),
                 )
                 .into_any_element(),
         }
@@ -247,25 +483,48 @@ impl AdeApp {
                 .bg(theme::status::BANNER_BG)
                 .border_b_1()
                 .border_color(theme::status::BANNER_BORDER)
+                // §1.8's own 5px amber square, the same mark §1.5's filled pause marker paints -
+                // one vocabulary for "the rebase handed control back here".
                 .child(
                     div()
-                        .font(font(theme::font::MONO))
-                        .text_size(px(10.5))
-                        .text_color(theme::status::FAIL)
+                        .debug_selector(|| "rebase-stopped-strip-mark".to_string())
+                        .flex_none()
+                        .w(theme::graph::REBASE_MARK)
+                        .h(theme::graph::REBASE_MARK)
+                        .rounded(theme::radius::MARK_SM)
+                        .bg(theme::status::ASK),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "rebase-stopped-strip-text".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight(450.0))
+                        .text_size(px(11.0))
+                        // GitHub issue #305: amber `#c99b4e`, not `status::FAIL`'s red. A rebase
+                        // stopping on a conflict is "needs input", which is exactly what this
+                        // app's amber is reserved for (see `theme::agent`'s reserved-hue rule);
+                        // the red it used to wear is reserved for "failure and deletions" and
+                        // said the rebase had broken rather than that it is waiting.
+                        .text_color(theme::status::ASK_CARD_FG)
                         .child(format!(
                             "stopped at {stopped_at} of {total} \u{b7} {} in {file_label}",
                             plural::count(conflicted_files.len(), "conflict", None)
                         )),
                 )
-                .child(div().flex_1())
                 .child(
                     div()
                         .id("rebase-resolve-conflict-link")
                         .debug_selector(|| "rebase-resolve-conflict-link".to_string())
+                        .flex_none()
                         .cursor_pointer()
                         .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight(450.0))
                         .text_size(px(10.5))
-                        .text_color(theme::button::BLUE_FG)
+                        .text_color(theme::text::SECONDARY)
+                        .hover(|el| el.text_color(theme::text::SELECTED))
                         .child("Resolve in the diff view")
                         .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                             this.resolve_rebase_conflict_in_diff_view(window, cx);
@@ -304,6 +563,9 @@ impl AdeApp {
             .flex_col()
             .flex_1()
             .min_h_0()
+            // Design spec §2.2's rebase menu anchor formula (`44 + 22 + 3 + row × 28 + 30`) counts
+            // this 3 as the list's own top padding - see `Self::render_rebase_action_menu`.
+            .py(theme::graph::REBASE_LIST_PAD)
             .overflow_y_scroll()
             // Every row's own action chip and its dropdown options already `cx.stop_propagation()`
             // (see `Self::render_rebase_action_chip`/`Self::render_rebase_action_menu`), so a
@@ -314,16 +576,6 @@ impl AdeApp {
                 this.close_rebase_action_menu(cx);
             }))
             .children(rows)
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(9.5))
-                    .text_color(theme::text::GHOST)
-                    .child("oldest first \u{b7} applied top to bottom"),
-            )
             .into_any_element()
     }
 
@@ -350,6 +602,8 @@ impl AdeApp {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "\u{2014}".to_string());
         let action_menu_open = rebase_state.action_menu_open == Some(index);
+        let is_selected = rebase_state.selected_index() == Some(index);
+        let action_style = rebase_action_style(row.action);
         let dragging_this = rebase_state.dragging_row.as_deref() == Some(commit.as_str());
         let insertion_caret = rebase_state
             .drag_insertion
@@ -374,11 +628,29 @@ impl AdeApp {
             .relative()
             .flex()
             .items_center()
-            .gap(px(8.0))
-            .h(theme::graph::ROW)
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(theme::border::INNER)
+            // Design spec §1.4: 28 high, no separator rule (the plan is one continuous list, not
+            // the graph's own ruled commit rows), and no horizontal padding of its own - the 2px
+            // selection edge plus the 11-wide drag-handle slot is exactly §1.3's "13 left pad,
+            // clears the rows' 2px selection edge" on the `action` column header above it.
+            .h(theme::graph::REBASE_ROW)
+            // Always painted, transparent when unselected: a border that only exists on the
+            // selected row would shift every other row 2px sideways the moment selection moved -
+            // the exact bug `crate::rail::render`'s agent rows were fixed for in GitHub issue
+            // #289.
+            .border_l_2()
+            .border_color(if is_selected {
+                theme::border::SELECTED_EDGE.into()
+            } else {
+                work_surface::TRANSPARENT
+            })
+            .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
+            .when(!is_selected, |el| {
+                el.hover(|el| el.bg(theme::surface::ROW_HOVER))
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.select_rebase_plan_row(index, cx);
+            }))
             .when(dragging_this, |el| el.opacity(0.4))
             .on_drag(drag_value, move |dragged, _position, _window, cx| {
                 this_entity.update(cx, |this, cx| {
@@ -414,25 +686,21 @@ impl AdeApp {
                         .bg(theme::button::BLUE_FG),
                 )
             })
+            // Design spec §1.4: "drag handle | 11 wide, `⋮⋮` 9px mono `#363b40`".
             .child(
                 div()
                     .flex_none()
-                    .w(px(14.0))
+                    .w(theme::graph::REBASE_DRAG_SLOT)
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_grab()
                     .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
-                    .text_color(theme::text::GHOST)
-                    .child("\u{2237}"),
+                    .text_size(px(9.0))
+                    .text_color(theme::graph::REBASE_DRAG_HANDLE)
+                    .child("\u{22ee}\u{22ee}"),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(14.0))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
-                    .text_color(theme::text::GHOST)
-                    .child(if is_folded { "\u{2514}" } else { "" }),
-            )
+            .child(render_rebase_fold_elbow(index, is_folded, action_style.fg))
             .child(self.render_rebase_action_chip(index, row.action, cx))
             .child(if is_reword {
                 self.render_rebase_reword_field(index, row, cx)
@@ -440,48 +708,64 @@ impl AdeApp {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .ml(px(9.0))
                     .truncate()
                     .font(font(theme::font::SANS))
-                    .text_size(px(11.0))
-                    .when(is_folded, |el| el.text_color(theme::text::FAINTER))
-                    .when(is_dropped, |el| {
-                        el.text_color(theme::text::FAINTER).line_through()
+                    .text_size(px(11.5))
+                    // §1.4's subject ramp, in the design's own precedence: dropped wins over
+                    // folded wins over selected wins over normal.
+                    .text_color(if is_dropped {
+                        theme::text::GHOST
+                    } else if is_folded {
+                        theme::text::DIM
+                    } else if is_selected {
+                        theme::text::SELECTED
+                    } else {
+                        theme::text::STRONG
                     })
-                    .when(!is_folded && !is_dropped, |el| {
-                        el.text_color(theme::text::BODY)
-                    })
+                    .when(is_dropped, |el| el.line_through())
                     .child(row.original_subject.clone())
                     .into_any_element()
             })
             .child(
                 div()
                     .flex_none()
-                    .w(px(36.0))
+                    .w(theme::graph::REBASE_COL_NUMERIC)
+                    .text_right()
                     .font(font(theme::font::MONO))
                     .text_size(px(10.0))
-                    .text_color(theme::text::FAINTER)
+                    .text_color(if is_dropped {
+                        theme::text::DISABLED
+                    } else {
+                        theme::text::PATH
+                    })
                     .child(files_label),
             )
             .child(
                 div()
                     .flex_none()
-                    .w(px(56.0))
+                    .w(theme::graph::REBASE_COL_NUMERIC)
+                    .text_right()
                     .font(font(theme::font::MONO))
                     .text_size(px(10.0))
-                    .text_color(theme::text::FAINTER)
+                    .text_color(if is_dropped {
+                        theme::text::DISABLED
+                    } else {
+                        theme::text::FAINTER
+                    })
                     .child(row.short_sha.clone()),
             )
             .child(
                 div()
                     .flex_none()
-                    .w(px(18.0))
+                    .w(theme::graph::REBASE_COL_PAUSE)
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(render_rebase_pause_marker(planned_pause, actual_stop)),
             )
             .when(action_menu_open, |el| {
-                el.child(self.render_rebase_action_menu(index, cx))
+                el.child(self.render_rebase_action_menu(index, row.action, cx))
             })
             .into_any_element()
     }
@@ -492,72 +776,148 @@ impl AdeApp {
         action: RebaseActionKind,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let style = rebase_action_style(action);
         div()
             .id(("rebase-action-chip", index))
             .debug_selector(move || format!("rebase-action-chip-{index}"))
             .flex_none()
-            .w(px(76.0))
-            .px(px(6.0))
-            .py(px(2.0))
+            // Design spec §1.4: "18 high, `0 7` padding, radius 3, `<action> ▾`". Deliberately
+            // **not** a fixed width: the chip is sized by its own label, which is what makes the
+            // six of them read as six different things rather than one column of interchangeable
+            // boxes (GitHub issue #302).
+            .h(theme::graph::REBASE_CHIP)
+            .px(px(7.0))
             .rounded(theme::radius::CHIP)
-            .bg(theme::surface::CHIP_NEUTRAL)
+            .bg(style.bg)
+            .border_1()
+            .border_color(style.border)
+            .hover(|el| el.border_color(theme::graph::REBASE_CHIP_HOVER_BORDER))
             .cursor_pointer()
             .flex()
             .items_center()
-            .justify_center()
-            .gap(px(3.0))
+            .gap(px(5.0))
             .font(font(theme::font::MONO))
+            .font_weight(gpui::FontWeight::MEDIUM)
             .text_size(px(10.0))
-            .text_color(theme::text::HEADING)
+            .text_color(style.fg)
             .child(action.label())
-            .child(div().text_color(theme::text::GHOST).child("\u{25be}"))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_size(px(8.0))
+                    .text_color(theme::text::FAINTER)
+                    .child("\u{25be}"),
+            )
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
+                // The chip selects its own row before opening the menu - otherwise the keyboard
+                // actions in §1.4's footer would still be pointed at whatever row was selected
+                // before, while the user is visibly working on this one.
+                this.select_rebase_plan_row(index, cx);
                 this.toggle_rebase_action_menu(index, cx);
             }))
             .into_any_element()
     }
 
     /// The action chip's own dropdown - real `pick`/`reword`/`edit`/`squash`/`fixup`/`drop`
-    /// options, positioned via a plain `.relative()`/`.absolute()` nesting inside the row itself
-    /// (unlike the row `⋯`/Push menus, this never needs window-space bounds: it never has to
-    /// escape its own row's layout box - see `crate::graph_view::render::render_graph_row_menu`'s
-    /// own docs for why *that* popover needs the heavier window-space mechanism instead).
-    fn render_rebase_action_menu(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// options with design spec §1.4's own hints, positioned by a plain `.relative()`/
+    /// `.absolute()` nesting inside its own row (unlike the row `⋯`/Push menus, this needs no
+    /// window-space bounds: its anchor is a fixed offset from the row it belongs to, so it
+    /// follows that row for free when the plan list scrolls - see
+    /// `crate::graph_view::render::render_graph_row_menu`'s own docs for why *that* popover needs
+    /// the heavier window-space mechanism instead).
+    ///
+    /// Painted through `gpui::deferred`, which is the whole reason that nesting is viable. The
+    /// menu genuinely does escape its own row's box (274 × six rows, against a 28-high row), and
+    /// an ordinary `.absolute()` child is still painted in its parent's turn - so every *later*
+    /// plan row drew straight over the top of it. That was live-reproduced on a real build of
+    /// this branch and is exactly what §1.4's own "menu at z-index 30" asks not to happen;
+    /// `deferred` defers the child's paint until after every ancestor has drawn, keeping its
+    /// layout (and therefore its scroll-following anchor) exactly where it is.
+    fn render_rebase_action_menu(
+        &self,
+        index: usize,
+        current: RebaseActionKind,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let mut menu = div()
             .id(("rebase-action-menu", index))
+            .debug_selector(move || format!("rebase-action-menu-{index}"))
             .absolute()
-            .top(theme::graph::ROW)
-            .left(px(10.0))
-            .w(px(90.0))
-            .py(px(3.0))
+            // Design spec §1.4's own anchor: `left:16`, `top = 44 + 22 + 3 + row × 28 + 30`.
+            // Expressed relative to the row (which this menu is a child of) the pane-space
+            // formula's first four terms *are* the row's own top - `44` banner + `22` column
+            // header + `3` list padding + `row × 28` - so what is left is the trailing `+ 30`,
+            // i.e. one row height plus 2. Stated as arithmetic on the same constants rather than
+            // as a literal 30, so a row-height change can never silently put the menu back on top
+            // of the row it belongs to (§1.4: "verify it never overlaps the row it belongs to").
+            .top(theme::graph::REBASE_ROW + px(2.0))
+            .left(px(16.0))
+            .w(theme::graph::REBASE_MENU_WIDTH)
+            .py(px(4.0))
             .occlude()
             .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
             }));
         menu = crate::root::widgets::menu_popover_chrome(menu, theme::shadow::MENU);
         for kind in RebaseActionKind::ALL {
+            let style = rebase_action_style(kind);
+            let is_current = kind == current;
             menu = menu.child(
                 div()
                     .id(format!("rebase-action-option-{index}-{}", kind.label()))
                     .debug_selector(move || {
                         format!("rebase-action-option-{index}-{}", kind.label())
                     })
-                    .px(px(8.0))
-                    .py(px(4.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
                     .cursor_pointer()
+                    // §1.4: "current action highlighted `#1d2226`" - the same fill this menu's
+                    // own hover uses, deliberately: "the row you are on" and "the row you would
+                    // land on" are one visual idea here.
+                    .when(is_current, |el| el.bg(theme::surface::MENU_ROW_HOVER))
                     .hover(|el| el.bg(theme::surface::MENU_ROW_HOVER))
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::text::HEADING)
-                    .child(kind.label())
+                    // §1.4: "Rows are ✓ mark 9 · action name 46 in 10.5px/500 mono · hint flex
+                    // in 10px Plex Sans `#5e646a`".
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(theme::graph::REBASE_MENU_MARK)
+                            .font(font(theme::font::MONO))
+                            .text_size(px(9.0))
+                            .text_color(theme::graph::REBASE_SQUASH_FG)
+                            .child(if is_current { "\u{2713}" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(theme::graph::REBASE_MENU_NAME)
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(10.5))
+                            .text_color(style.fg)
+                            .child(kind.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::SANS))
+                            .text_size(px(10.0))
+                            .text_color(theme::text::FAINTER)
+                            .child(kind.hint()),
+                    )
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                         this.set_rebase_row_action(index, kind, cx);
                     })),
             );
         }
-        menu.into_any_element()
+        gpui::deferred(menu).with_priority(1).into_any_element()
     }
 
     /// Design spec §1.4: a reword row's subject replaced by a real single-line text input,
@@ -572,28 +932,44 @@ impl AdeApp {
     ) -> gpui::AnyElement {
         let text = row.reword_message.as_str().to_string();
         let focus_handle = row.reword_focus_handle.clone();
+        let supplied = row.has_supplied_reword_message();
         div()
             .id(("rebase-reword-field", index))
             .flex_1()
             .min_w_0()
+            .ml(px(9.0))
             .track_focus(&focus_handle)
             .key_context("text-input")
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.handle_rebase_reword_key_down(index, event, window, cx);
             }))
-            .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+            // §1.4: "Its click must stop propagating, so placing the caret does not fight row
+            // selection" - but the row still becomes the selected one, since that is visibly the
+            // row being worked on and is what §1.4's keyboard actions then act upon.
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
+                this.select_rebase_plan_row(index, cx);
             }))
-            .px(px(6.0))
-            .py(px(2.0))
+            // §1.6: 21 high, `0 7` padding, radius 3, 1px border that turns from `#3b4a58` to
+            // `#2b3d4f` once a message is really supplied - the same "supplied" predicate the
+            // pause column and the stop count already read (`has_supplied_reword_message`), so
+            // the field's own border can never disagree with them.
+            .h(px(21.0))
+            .px(px(7.0))
             .rounded(theme::radius::CHIP)
-            .bg(theme::surface::SEGMENT_TRACK)
+            .bg(theme::surface::CARD_SUNK)
+            .border_1()
+            .border_color(if supplied {
+                theme::graph::REBASE_REWORD_BORDER
+            } else {
+                theme::graph::REBASE_REWORD_BORDER_EMPTY
+            })
             .flex()
             .items_center()
             .gap(px(1.0))
-            .font(font(theme::font::MONO))
-            .text_size(px(11.0))
-            .text_color(theme::text::BODY)
+            .font(font(theme::font::SANS))
+            .text_size(px(11.5))
+            .text_color(theme::text::SELECTED)
             .child(text)
             .child(self.render_simple_input_caret("rebase-reword-caret", &focus_handle))
             .into_any_element()
@@ -650,14 +1026,33 @@ impl AdeApp {
 
         panel = panel.child(div().flex_1());
 
+        // Design spec §1.7: the warning stack is **pinned at the foot** as one band of its own -
+        // a single `border-top` above the whole stack, then one bottom-ruled row per warning, not
+        // three independently top-bordered strips stacked up.
+        let mut warnings = div()
+            .id("rebase-warning-stack")
+            .debug_selector(|| "rebase-warning-stack".to_string())
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme::border::INNER)
+            .bg(theme::surface::FOOTER);
+        let mut any = false;
         if let Some(warning) = self.render_rebase_agent_warning(rebase_state.op_in_flight, cx) {
-            panel = panel.child(warning);
+            warnings = warnings.child(warning);
+            any = true;
         }
         if let Some(warning) = render_rebase_remote_warning(rebase_state) {
-            panel = panel.child(warning);
+            warnings = warnings.child(warning);
+            any = true;
         }
         if let Some(warning) = render_rebase_stop_count_warning(rebase_state) {
-            panel = panel.child(warning);
+            warnings = warnings.child(warning);
+            any = true;
+        }
+        if any {
+            panel = panel.child(warnings);
         }
 
         panel.into_any_element()
@@ -686,30 +1081,40 @@ impl AdeApp {
         }
         let enabled = !op_in_flight;
         Some(
-            render_rebase_warning_shell(format!(
-                "{} running in this worktree - a rebase rewrites files under {}.",
-                plural::count(running, "agent", None),
-                plural::form(running, "it", "them")
-            ))
+            render_rebase_warning_shell(
+                RebaseWarningKind::RunningAgents,
+                format!(
+                    "{} {} running here",
+                    plural::count(running, "agent", None),
+                    plural::form(running, "is", "are"),
+                ),
+                format!(
+                    "A rebase rewrites the files under {}. Jerry pauses {} for the rebase and \
+                     resumes {} after.",
+                    plural::form(running, "it", "them"),
+                    plural::form(running, "it", "them"),
+                    plural::form(running, "it", "them"),
+                ),
+            )
             .child(
                 div()
                     .id("rebase-pause-agents")
                     .debug_selector(|| "rebase-pause-agents".to_string())
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(theme::radius::CHIP)
+                    .flex_none()
                     .when(enabled, |el| el.cursor_pointer())
                     .when(!enabled, |el| el.cursor_default().opacity(0.5))
-                    .bg(theme::status::ASK_BG)
                     .font(font(theme::font::SANS))
-                    .text_size(px(10.0))
-                    .text_color(theme::status::ASK)
-                    .child("Pause now")
+                    .font_weight(gpui::FontWeight(450.0))
+                    .text_size(px(10.5))
+                    // §1.7: `Pause now` in `#c99b4e` - a plain text action, not a filled chip.
+                    .text_color(theme::status::ASK_CARD_FG)
                     .when(enabled, |el| {
-                        el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.pause_rebase_agents(cx);
-                        }))
-                    }),
+                        el.hover(|el| el.text_color(theme::text::SELECTED))
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.pause_rebase_agents(cx);
+                            }))
+                    })
+                    .child("Pause now"),
             )
             .into_any_element(),
         )
@@ -775,135 +1180,349 @@ fn render_rebase_result_block(block: &ResultBlock) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Design spec §1.7 warning 2 - **blue**, not amber: nothing is wrong, the plan simply has a
+/// consequence for the remote afterwards. It is the informational step of the stack's severity
+/// gradient (GitHub issue #305), which flattened entirely while all three rendered attention
+/// amber.
 fn render_rebase_remote_warning(rebase_state: &RebaseModeState) -> Option<gpui::AnyElement> {
     let count = rebase_state.already_on_upstream.len();
     if count == 0 {
         return None;
     }
+    let total = rebase_state.plan.len();
     Some(
-        render_rebase_warning_shell(format!(
-            "{} in this plan {} already on the tracked remote branch - a force-with-lease push \
-             will be needed afterward.",
-            plural::count(count, "commit", None),
-            plural::form(count, "is", "are")
-        ))
+        render_rebase_warning_shell(
+            RebaseWarningKind::RemoteCommits,
+            format!(
+                "{count} of {} {} on the remote",
+                plural::count(total, "commit", None),
+                plural::form(count, "is", "are"),
+            ),
+            format!(
+                "origin/{} will need a force-with-lease push afterwards.",
+                rebase_state.branch
+            ),
+        )
         .into_any_element(),
     )
 }
 
+/// Design spec §1.7 warning 3 - **grey**. A stop count is a fact about the plan, not a problem
+/// with it, and §1.6's whole argument is that the user can drive it to zero by typing the reword
+/// messages up front. Rendering it amber (as it used to) made a neutral count look exactly like
+/// the running-agent warning sitting above it.
 fn render_rebase_stop_count_warning(rebase_state: &RebaseModeState) -> Option<gpui::AnyElement> {
     let n = derive_stop_count(&rebase_state.plan);
     if n == 0 {
         return None;
     }
     Some(
-        render_rebase_warning_shell(format!(
-            "Stops {} - each `edit` row and each message-less `reword` row hands control back \
-             to you before the rebase continues.",
-            plural::count(n, "time", None)
-        ))
+        render_rebase_warning_shell(
+            RebaseWarningKind::StopCount,
+            format!("Stops {}", plural::count(n, "time", None)),
+            "edit always stops. A reword only stops if you leave its message alone - type it \
+             here and the rebase runs through."
+                .to_string(),
+        )
         .into_any_element(),
     )
 }
 
-fn render_rebase_warning_shell(text: String) -> gpui::Div {
+/// Design spec §1.7's warning row, verbatim: "one row each (5px square · title 11px/450 `#c2c7cc`
+/// · body 10.5px/15 `#767d84` · optional action)".
+///
+/// GitHub issue #305: this used to be a single flex row with one text child - no square, no
+/// title/body split (the two were concatenated into one sentence), and `theme::status::ASK` for
+/// **all three** warnings regardless of what they meant. `dot` is now the caller's own severity,
+/// which is what carries §1.7's deliberate amber → blue → grey gradient.
+fn render_rebase_warning_shell(kind: RebaseWarningKind, title: String, body: String) -> gpui::Div {
+    let slug = kind.slug();
     div()
         .flex_none()
         .flex()
-        .items_center()
+        .items_start()
         .gap(px(8.0))
-        .px(px(10.0))
-        .py(px(6.0))
-        .border_t_1()
-        .border_color(theme::status::BANNER_BORDER)
-        .bg(theme::status::BANNER_BG)
+        .px(px(12.0))
+        .py(px(9.0))
+        .border_b_1()
+        .border_color(theme::border::ROW)
+        .child(
+            div()
+                .debug_selector(move || format!("rebase-warning-{slug}-dot"))
+                .flex_none()
+                .w(theme::graph::REBASE_MARK)
+                .h(theme::graph::REBASE_MARK)
+                .mt(px(4.0))
+                .rounded(theme::radius::MARK_SM)
+                .bg(kind.dot()),
+        )
         .child(
             div()
                 .flex_1()
-                .font(font(theme::font::SANS))
-                .text_size(px(10.0))
-                .text_color(theme::status::ASK)
-                .child(text),
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .debug_selector(move || format!("rebase-warning-{slug}-title"))
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight(450.0))
+                        .text_size(px(11.0))
+                        .text_color(theme::text::STRONG)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("rebase-warning-{slug}-body"))
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.5))
+                        .line_height(px(15.0))
+                        .text_color(theme::graph::REBASE_WARNING_BODY)
+                        .child(body),
+                ),
         )
+}
+
+/// Which of design spec §1.2's three banner treatments a button wears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebaseButtonStyle {
+    /// `Cancel`/`Skip` - a plain ghost, hover-filled only.
+    Ghost,
+    /// `Abort` - the same ghost, in the danger red §1.2 gives it. A destructive verb rendered
+    /// exactly like `Skip` was real drift: the two do opposite things to the user's history.
+    GhostDanger,
+    /// `Start rebase` - §1.2's green primary, "with `mod+enter` keycaps in the button's own
+    /// border colour".
+    Primary,
+    /// `Continue` - the blue confirm.
+    Confirm,
 }
 
 /// `enabled` reflects `!op_in_flight` at every real call site (see `Self::
 /// render_rebase_banner_actions`'s own docs) - a disabled button renders dimmed, with no
 /// `cursor_pointer`, and (the caller's own job - see that method) no `.on_click` attached at all,
 /// so it is genuinely inert, not just styled to look that way.
+///
+/// `keycaps` are already platform-resolved (`crate::keymap::resolve_combo`) and render through
+/// `crate::root::widgets::render_action_keycap_row`, the shared helper whose whole purpose is a
+/// keycap tinted by its own button rather than by the neutral chrome palette - §1.2's "in the
+/// button's own border colour", and the same treatment the work surface's `Keep all ⌘⏎` already
+/// uses.
 fn render_rebase_button(
     label: &'static str,
-    primary: bool,
+    style: RebaseButtonStyle,
     enabled: bool,
+    keycaps: &[String],
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    let mut button = div()
         .id(format!("rebase-banner-button-{label}"))
         .debug_selector(move || format!("rebase-banner-button-{label}"))
-        .px(px(10.0))
-        .h(px(24.0))
+        .h(px(23.0))
         .flex()
         .items_center()
-        .justify_center()
+        .gap(px(7.0))
         .rounded(theme::radius::BUTTON)
+        .when(keycaps.is_empty(), |el| el.px(px(10.0)))
+        // §1.2's own asymmetric padding on a keycapped button: `0 4px 0 10px`, so the caps sit
+        // closer to the right edge than the label does to the left.
+        .when(!keycaps.is_empty(), |el| el.pl(px(10.0)).pr(px(4.0)))
         .when(enabled, |el| el.cursor_pointer())
         .when(!enabled, |el| el.cursor_default().opacity(0.45))
-        .when(enabled && primary, |el| {
-            el.bg(theme::button::BLUE_BG)
-                .text_color(theme::button::BLUE_FG)
-        })
-        .when(enabled && !primary, |el| {
-            el.bg(theme::surface::CHIP_NEUTRAL)
-                .text_color(theme::text::HEADING)
-                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-        })
-        .when(!enabled, |el| {
-            el.bg(theme::surface::CHIP_NEUTRAL)
-                .text_color(theme::text::GHOST)
-        })
         .font(font(theme::font::SANS))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_size(px(10.5))
-        .child(label)
+        .text_size(px(10.5));
+    button = match style {
+        RebaseButtonStyle::Primary => button
+            .bg(theme::button::GREEN_BG)
+            .border_1()
+            .border_color(theme::button::GREEN_KEYCAP)
+            .text_color(theme::button::GREEN_FG)
+            .when(enabled, |el| {
+                el.hover(|el| el.bg(theme::button::GREEN_BG_HOVER))
+            }),
+        RebaseButtonStyle::Confirm => button
+            .bg(theme::button::BLUE_BG)
+            .border_1()
+            .border_color(theme::button::BLUE_KEYCAP)
+            .text_color(theme::button::BLUE_FG)
+            .when(enabled, |el| {
+                el.hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+            }),
+        RebaseButtonStyle::Ghost | RebaseButtonStyle::GhostDanger => button
+            .text_color(if style == RebaseButtonStyle::GhostDanger {
+                theme::button::DANGER_FG
+            } else {
+                theme::text::DIM
+            })
+            .when(enabled, |el| {
+                el.hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            }),
+    };
+    button = button.child(label);
+    if !keycaps.is_empty() {
+        let (fg, border) = match style {
+            RebaseButtonStyle::Primary => (
+                theme::button::GREEN_KEYCAP_FG.resolve(),
+                theme::button::GREEN_KEYCAP.resolve(),
+            ),
+            _ => (
+                theme::button::BLUE_FG.resolve(),
+                theme::button::BLUE_KEYCAP.resolve(),
+            ),
+        };
+        button = button.child(crate::root::widgets::render_action_keycap_row(
+            keycaps, fg, border,
+        ));
+    }
+    button
 }
 
+/// Design spec §1.4's **fold elbow** (GitHub issue #303), verbatim: "20 wide on `squash`/`fixup`
+/// rows only: a 1px elbow in the action's colour - inset 5 each side, `top:-1` so it meets the row
+/// above's edge, `bottom:13` so it lands on the chip centreline, `border-left` + `border-bottom`,
+/// 5px corner radius. Reads up-and-left into the commit being folded into. **Same vocabulary as
+/// the graph's merge elbows**."
+///
+/// That last sentence is why this is a real drawn box rather than the mono `└` glyph it replaced:
+/// `crate::graph_view::render`'s own merge connectors are `border_l_1() + border_b_1() +
+/// rounded_bl(theme::graph::ELBOW_RADIUS)` boxes, and this reuses exactly that construction (and
+/// exactly that radius constant) so a fold really does read as the same kind of mark as a merge,
+/// not as a lookalike drawn a second way.
+///
+/// A non-folding row gets a **zero-width** slot, not an empty fixed one - that is what makes a
+/// `squash`/`fixup` row genuinely indent 20 under the commit it folds into (§4's checklist item),
+/// rather than sitting at the same x as every `pick` row with a glyph in a slot they all share.
+fn render_rebase_fold_elbow(
+    index: usize,
+    folded: bool,
+    action_fg: theme::ColorToken,
+) -> gpui::AnyElement {
+    let mut slot = div()
+        .flex_none()
+        .w(if folded {
+            theme::graph::REBASE_FOLD_INDENT
+        } else {
+            px(0.0)
+        })
+        .self_stretch()
+        .relative();
+    if folded {
+        slot = slot.child(
+            div()
+                .debug_selector(move || format!("rebase-plan-row-{index}-fold-elbow"))
+                .absolute()
+                .left(theme::graph::REBASE_FOLD_ELBOW_INSET_X)
+                .right(theme::graph::REBASE_FOLD_ELBOW_INSET_X)
+                .top(theme::graph::REBASE_FOLD_ELBOW_TOP)
+                .bottom(theme::graph::REBASE_FOLD_ELBOW_BOTTOM)
+                .border_l_1()
+                .border_b_1()
+                .border_color(action_fg)
+                .rounded_bl(theme::graph::ELBOW_RADIUS),
+        );
+    }
+    slot.into_any_element()
+}
+
+/// Design spec §1.3's column header, 22 high: `action` 104 (13 left pad, clearing the rows' 2px
+/// selection edge) · `commit` flex · `files` 62 right · `sha` 62 right · **pause column 22,
+/// carrying an outlined 5px square** as its label.
+///
+/// That last cell is the other half of §1.5's "one column, one legend" (GitHub issue #304): the
+/// mark appears here as the column's own name and once more in the footer as `pauses here`, so no
+/// row ever has to carry the word.
 fn render_rebase_column_header() -> gpui::AnyElement {
+    // The exact same label treatment `render_graph_header`'s own inner `label` helper uses
+    // (§1.3: "Same treatment as the graph's header") - 9px/450 Plex Sans, uppercased in code
+    // rather than authored uppercase, so the two headers can only ever look the same.
+    fn label(text: &'static str) -> impl IntoElement {
+        div()
+            .font(font(theme::font::SANS))
+            .font_weight(gpui::FontWeight(450.0))
+            .text_size(px(9.0))
+            .text_color(theme::graph::HEADER_LABEL_FG)
+            .child(text.to_uppercase())
+    }
+
     div()
         .id("rebase-column-header")
         .debug_selector(|| "rebase-column-header".to_string())
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(8.0))
-        .px(px(10.0))
+        .w_full()
         .h(theme::graph::HEADER)
         .bg(theme::graph::HEADER_BG)
-        .font(font(theme::font::MONO))
-        .text_size(px(9.5))
-        .text_color(theme::graph::HEADER_LABEL_FG)
-        .child(div().w(px(14.0)).child(""))
-        .child(div().w(px(14.0)).child(""))
-        .child(div().w(px(76.0)).child("action"))
-        .child(div().flex_1().child("commit"))
-        .child(div().w(px(36.0)).child("files"))
-        .child(div().w(px(56.0)).child("sha"))
-        .child(div().w(px(18.0)).child(""))
+        .border_b_1()
+        .border_color(theme::border::INNER)
+        .child(
+            div()
+                .flex_none()
+                .w(theme::graph::REBASE_COL_ACTION)
+                .pl(theme::graph::REBASE_COL_ACTION_PAD)
+                .child(label("action")),
+        )
+        .child(div().flex_1().min_w_0().child(label("commit")))
+        .child(
+            div()
+                .flex_none()
+                .w(theme::graph::REBASE_COL_NUMERIC)
+                .text_right()
+                .child(label("files")),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(theme::graph::REBASE_COL_NUMERIC)
+                .text_right()
+                .child(label("sha")),
+        )
+        .child(
+            div()
+                .id("rebase-column-header-pause")
+                .debug_selector(|| "rebase-column-header-pause".to_string())
+                .flex_none()
+                .w(theme::graph::REBASE_COL_PAUSE)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .debug_selector(|| "rebase-column-header-pause-mark".to_string())
+                        .w(theme::graph::REBASE_MARK)
+                        .h(theme::graph::REBASE_MARK)
+                        .rounded(theme::radius::MARK_SM)
+                        .border_1()
+                        .border_color(theme::graph::REBASE_HEADER_PAUSE_MARK),
+                ),
+        )
         .into_any_element()
 }
 
-/// Design spec §1.5: outlined marker for a planned pause, filled for where the rebase actually
-/// stopped. `edit`'s and a message-less `reword`'s planned/actual markers render identically -
-/// the design spec itself says the visual distinction between the two `StopReason`s isn't
-/// load-bearing.
+/// Design spec §1.5: an **outlined** 5px square for a planned pause, a **filled** one for where
+/// the rebase actually stopped. `edit`'s and a message-less `reword`'s planned/actual markers
+/// render identically - the design spec itself says the visual distinction between the two
+/// `StopReason`s isn't load-bearing.
+///
+/// The footer's own `pauses here` legend renders the outlined variant through this very function
+/// rather than hand-drawing a second square, so the legend can never come to mean a mark the
+/// column no longer paints.
 fn render_rebase_pause_marker(planned: bool, actual: bool) -> gpui::AnyElement {
     if !planned && !actual {
         return gpui::Empty.into_any_element();
     }
     div()
-        .w(px(8.0))
-        .h(px(8.0))
-        .rounded(theme::radius::CHIP)
+        .flex_none()
+        .w(theme::graph::REBASE_MARK)
+        .h(theme::graph::REBASE_MARK)
+        .rounded(theme::radius::MARK_SM)
         .when(actual, |el| el.bg(theme::status::ASK))
-        .when(!actual, |el| el.border_1().border_color(theme::status::ASK))
+        // §1.5's own two colours: the filled mark is the attention amber `#e2a336`, the outlined
+        // one the dimmer `#8a6420` edge - a planned pause is not yet an event.
+        .when(!actual, |el| {
+            el.border_1().border_color(theme::status::ASK_CARD_EDGE)
+        })
         .into_any_element()
 }
 
@@ -2054,8 +2673,752 @@ mod rebase_flow_tests {
         }
     }
 
+    // --- Design spec §1.3/§1.4/§1.5's real geometry (GitHub issues #303, #304) ---------------
+
+    /// GitHub issue #303, both halves: a `squash`/`fixup` row really indents 20 under the commit
+    /// it folds into, and the mark it carries is a real 1px drawn elbow, not a mono `└` glyph
+    /// sitting in a slot every row shares.
+    ///
+    /// Measured against the *same* row before and after a real action change, the way
+    /// `crate::graph_view::render::graph_selection_render_tests` measures its own no-shift
+    /// claim - so this is about that row moving, not about two different rows differing.
+    #[gpui::test]
+    fn a_fold_row_indents_its_chip_by_twenty_and_paints_a_real_elbow(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+
+        let picked = cx
+            .debug_bounds("rebase-action-chip-1")
+            .expect("row 1's chip must be painted while it is still a `pick`");
+        assert!(
+            cx.debug_bounds("rebase-plan-row-1-fold-elbow").is_none(),
+            "a `pick` row must paint no fold elbow at all - the elbow is the mark of a fold, and \
+             a slot every row carries could never make a fold row read as indented"
+        );
+
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(1, super::rebase::RebaseActionKind::Squash, cx);
+        });
+        cx.run_until_parked();
+
+        let folded = cx
+            .debug_bounds("rebase-action-chip-1")
+            .expect("row 1's chip must still be painted once it folds");
+        assert_eq!(
+            f32::from(folded.origin.x - picked.origin.x),
+            20.0,
+            "design spec §1.4: a fold row indents 20 (chip at {:?} while picked, {:?} while \
+             squashed)",
+            picked.origin,
+            folded.origin
+        );
+
+        let elbow = cx
+            .debug_bounds("rebase-plan-row-1-fold-elbow")
+            .expect("a folding row must paint a real elbow element");
+        let row = cx
+            .debug_bounds("rebase-plan-row-1")
+            .expect("row 1 must be painted");
+        assert_eq!(
+            f32::from(elbow.size.width),
+            10.0,
+            "§1.4's elbow is inset 5 each side of its 20-wide slot"
+        );
+        assert_eq!(
+            f32::from(elbow.origin.y - row.origin.y),
+            -1.0,
+            "§1.4's `top:-1` is what makes the elbow meet the row above's edge"
+        );
+        assert_eq!(
+            f32::from(elbow.bottom_left().y - row.origin.y),
+            15.0,
+            "§1.4's `bottom:13` on a 28-high row puts the elbow's own 1px bottom border on \
+             14..15 - the centreline of an 18-high chip centred in 28"
+        );
+        assert_eq!(
+            f32::from(folded.center().y - row.origin.y),
+            14.0,
+            "...which is exactly where the chip's centreline really is"
+        );
+        assert!(
+            elbow.origin.x < folded.origin.x,
+            "the elbow reads up-and-*left* into the commit being folded into, so it sits left \
+             of the chip it belongs to ({elbow:?} vs {folded:?})"
+        );
+    }
+
+    /// GitHub issue #304's headline bug: the order note (§1.1 calls it "the whole mitigation -
+    /// do not drop it") lived *inside* the scrolling row list, so it left the screen on exactly
+    /// the long plans where oldest-vs-newest confusion matters.
+    ///
+    /// Asserted structurally rather than by scrolling: the note is painted **below** the
+    /// scroller's own bottom edge, which is only possible if it is a sibling band rather than
+    /// scrollable content. A plan long enough to overflow makes that a real distinction.
+    #[gpui::test]
+    fn the_order_note_lives_in_a_pinned_footer_below_the_scrolling_plan_list(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        // Far more rows than any test window is tall, so the list genuinely scrolls.
+        for n in 0..40 {
+            commit(
+                repo.path(),
+                &format!("f{n}.txt"),
+                "x",
+                &format!("commit {n}"),
+            );
+        }
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(39, cx);
+        });
+        cx.run_until_parked();
+
+        let rows = cx
+            .debug_bounds("rebase-plan-rows")
+            .expect("the scrolling plan list must be painted");
+        let footer = cx
+            .debug_bounds("rebase-plan-footer")
+            .expect("design spec §1.4's footer band must exist");
+        let note = cx
+            .debug_bounds("rebase-order-note")
+            .expect("the order note must be painted");
+        let legend = cx
+            .debug_bounds("rebase-pause-legend")
+            .expect("§1.5's `pauses here` legend must be painted, once, in the footer");
+
+        assert_eq!(
+            f32::from(footer.size.height),
+            28.0,
+            "§1.4: the footer is 28 high"
+        );
+        assert!(
+            footer.origin.y >= rows.bottom_left().y,
+            "the footer must sit below the scroller, not inside it (rows {rows:?}, footer \
+             {footer:?})"
+        );
+        for (name, bounds) in [("order note", note), ("pauses-here legend", legend)] {
+            assert!(
+                footer.contains(&bounds.origin) && footer.contains(&bounds.bottom_right()),
+                "the {name} must be painted inside the pinned footer band, so a long plan can \
+                 never scroll it away (footer {footer:?}, {name} {bounds:?})"
+            );
+        }
+    }
+
+    /// §1.5's "one column, one legend": the mark is named once as the column header's own label
+    /// and once in the footer, and no row ever carries the word.
+    #[gpui::test]
+    fn the_pause_column_is_legended_in_the_header_and_once_more_in_the_footer(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+
+        let header_mark = cx
+            .debug_bounds("rebase-column-header-pause-mark")
+            .expect("§1.3: the pause column header carries an outlined 5px square as its label");
+        assert_eq!(f32::from(header_mark.size.width), 5.0);
+        assert_eq!(f32::from(header_mark.size.height), 5.0);
+
+        let header_cell = cx
+            .debug_bounds("rebase-column-header-pause")
+            .expect("the header's pause cell must be painted");
+        assert_eq!(
+            f32::from(header_cell.size.width),
+            22.0,
+            "§1.3: pause column 22 wide"
+        );
+
+        // ...and the same column in a row lines up under it, which is the whole point of the
+        // header carrying the mark rather than a word.
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Edit, cx);
+        });
+        cx.run_until_parked();
+        let row_mark = cx
+            .debug_bounds("rebase-plan-row-0")
+            .expect("row 0 must be painted");
+        let probe = gpui::Point {
+            x: header_cell.center().x,
+            y: row_mark.center().y,
+        };
+        assert!(
+            row_mark.contains(&probe),
+            "the pause column's header cell must sit over the rows it labels (header cell \
+             {header_cell:?}, row {row_mark:?})"
+        );
+    }
+
+    // --- The action menu (GitHub issue #302) ---------------------------------------------------
+
+    /// §1.4's action menu: 274 wide, one hint line per action, and a ✓ on the current one. It
+    /// used to be a 90-wide list of bare labels with no hint, no mark and no highlight.
+    #[gpui::test]
+    fn the_action_menu_is_274_wide_and_paints_all_six_actions(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+
+        let chip = cx
+            .debug_bounds("rebase-action-chip-0")
+            .expect("row 0's chip must be painted");
+        cx.simulate_click(chip.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // `debug_bounds` takes a `&'static str`, so the six selectors are literals - listed in
+        // `RebaseActionKind::ALL`'s own order and length-checked against it, so an action added
+        // to that list without a selector here fails rather than being silently skipped.
+        const OPTION_SELECTORS: [&str; 6] = [
+            "rebase-action-option-0-pick",
+            "rebase-action-option-0-reword",
+            "rebase-action-option-0-edit",
+            "rebase-action-option-0-squash",
+            "rebase-action-option-0-fixup",
+            "rebase-action-option-0-drop",
+        ];
+        assert_eq!(
+            OPTION_SELECTORS.len(),
+            super::rebase::RebaseActionKind::ALL.len()
+        );
+        let menu = cx
+            .debug_bounds("rebase-action-menu-0")
+            .expect("the open action menu must be painted");
+        assert_eq!(
+            f32::from(menu.size.width),
+            274.0,
+            "§1.4: the action menu is 274 wide - it used to be 90, which could not fit a hint \
+             at all"
+        );
+
+        let mut option_bounds = Vec::new();
+        for selector in OPTION_SELECTORS {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must be painted"));
+            // Every option row spans the menu's own inner width - the popover's 1px border on
+            // each side, and nothing else, separates it from the menu's own 274.
+            assert_eq!(
+                f32::from(bounds.size.width),
+                272.0,
+                "{selector}'s row must span the whole 274-wide menu less its 1px borders"
+            );
+            option_bounds.push(bounds);
+        }
+        // The menu opens *below* its own row and never over it (§1.4 asks for this explicitly).
+        let row = cx
+            .debug_bounds("rebase-plan-row-0")
+            .expect("row 0 must be painted");
+        assert!(
+            option_bounds[0].origin.y >= row.bottom_left().y,
+            "the action menu must never overlap the row it belongs to (row {row:?}, first \
+             option {:?})",
+            option_bounds[0]
+        );
+    }
+
+    // --- The real keyboard bindings behind §1.4's footer hints (GitHub issue #304) -------------
+
+    /// A real keystroke, on a real focused surface, really changing the plan - the footer's
+    /// `S squash` keycap is only honest if this passes.
+    #[gpui::test]
+    fn pressing_the_footers_own_letter_really_changes_the_selected_rows_action(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+
+        // Select row 1 by a real click on it, exactly as a user would.
+        let row = cx
+            .debug_bounds("rebase-plan-row-1")
+            .expect("row 1 must be painted");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .expect("in rebase mode")
+                    .selected_index(),
+                Some(1),
+                "premise: a real click really selects the row it landed on"
+            );
+        });
+
+        cx.simulate_keystrokes("s");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .expect("in rebase mode")
+                    .plan[1]
+                    .action,
+                super::rebase::RebaseActionKind::Squash,
+                "a real `S` keystroke must squash the selected row"
+            );
+        });
+
+        cx.simulate_keystrokes("d");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .expect("in rebase mode")
+                    .plan[1]
+                    .action,
+                super::rebase::RebaseActionKind::Drop,
+            );
+        });
+
+        cx.simulate_keystrokes("p");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.graph_state
+                    .rebase
+                    .as_ref()
+                    .expect("in rebase mode")
+                    .plan[1]
+                    .action,
+                super::rebase::RebaseActionKind::Pick,
+            );
+        });
+    }
+
+    /// `alt+↑↓ reorder` - the keyboard twin of the drag handle, with the selection following the
+    /// row it moved (otherwise a held `alt+↑` would walk the selection down the plan while
+    /// shuffling a different row each press).
+    #[gpui::test]
+    fn alt_arrow_really_reorders_the_selected_row_and_the_selection_follows_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let plan = &app
+                .graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan;
+            assert_eq!(
+                plan.iter()
+                    .map(|row| row.original_subject.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["second", "third"],
+                "premise: the plan starts oldest-first"
+            );
+        });
+
+        let row = cx
+            .debug_bounds("rebase-plan-row-1")
+            .expect("row 1 must be painted");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("alt-up");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect("in rebase mode");
+            assert_eq!(
+                rebase_state
+                    .plan
+                    .iter()
+                    .map(|row| row.original_subject.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["third", "second"],
+                "a real alt+↑ must really move the selected row up the plan"
+            );
+            assert_eq!(
+                rebase_state.selected_index(),
+                Some(0),
+                "the selection must follow the row it moved, not stay at the old index"
+            );
+        });
+    }
+
+    /// The `&& !text-input` conjunct on those bindings, proven the only way that matters: typing
+    /// the letter `p` into a real, focused `reword` message field must type a `p`, not silently
+    /// rewrite that row's action to `pick`. GPUI dispatches a matching `KeyBinding` *before* any
+    /// `on_key_down` listener, so without the conjunct this is exactly what would happen.
+    #[gpui::test]
+    fn typing_into_a_reword_field_never_fires_the_plans_own_letter_shortcuts(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Reword, cx);
+        });
+        cx.run_until_parked();
+
+        let focus_handle = app.read_with(cx, |app, _| {
+            app.graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan[0]
+                .reword_focus_handle
+                .clone()
+        });
+        app.update_in(cx, |_app, window, cx| {
+            window.focus(&focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("s");
+        cx.simulate_keystrokes("p");
+        cx.simulate_keystrokes("d");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app.graph_state.rebase.as_ref().expect("in rebase mode");
+            assert_eq!(
+                rebase_state.plan[0].action,
+                super::rebase::RebaseActionKind::Reword,
+                "the focused reword field must keep every letter to itself - a `p` here is a \
+                 character in a commit message, not the `pick` shortcut"
+            );
+            assert!(
+                rebase_state.plan[0]
+                    .reword_message
+                    .as_str()
+                    .ends_with("spd"),
+                "...and those three letters must really have landed in the message, got {:?}",
+                rebase_state.plan[0].reword_message.as_str()
+            );
+        });
+    }
+
+    // --- The warning stack and the stopped strip (GitHub issue #305) ---------------------------
+
+    /// §1.7's row construction: a severity square, a title and a body, as three real elements -
+    /// the stack used to be one flex row with the title and body concatenated into one sentence
+    /// and no square at all.
+    #[gpui::test]
+    fn each_warning_row_paints_a_real_dot_title_and_body(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        // A real `edit` row makes §1.7's third warning (the stop count) genuinely non-zero.
+        app.update_in(cx, |app, _window, cx| {
+            app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Edit, cx);
+        });
+        cx.run_until_parked();
+
+        let dot = cx
+            .debug_bounds("rebase-warning-stops-dot")
+            .expect("§1.7: every warning row carries a 5px severity square");
+        let title = cx
+            .debug_bounds("rebase-warning-stops-title")
+            .expect("§1.7: title and body are two real lines, not one concatenated sentence");
+        let body = cx
+            .debug_bounds("rebase-warning-stops-body")
+            .expect("§1.7: ...and the body is the second of them");
+
+        assert_eq!(f32::from(dot.size.width), 5.0);
+        assert_eq!(f32::from(dot.size.height), 5.0);
+        assert!(
+            dot.origin.x < title.origin.x,
+            "the square leads the row (dot {dot:?}, title {title:?})"
+        );
+        assert!(
+            body.origin.y > title.origin.y,
+            "the body sits under its own title (title {title:?}, body {body:?})"
+        );
+    }
+
+    /// §1.8's strip, structurally: the 5px amber square it was missing entirely, alongside the
+    /// progress text. (Its *colour* moving off `status::FAIL`'s red onto the needs-input amber
+    /// is asserted where colour can honestly be asserted - see `rebase_design_tests`' own docs.)
+    #[gpui::test]
+    fn the_stopped_strip_paints_the_amber_square_the_spec_asks_for(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        commit(repo.path(), "file.txt", "base", "base");
+        commit(repo.path(), "file.txt", "v1", "commit v1");
+        commit(repo.path(), "file.txt", "v2", "commit v2");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+        let (c1, c2) = app.read_with(cx, |app, _| {
+            let plan = &app
+                .graph_state
+                .rebase
+                .as_ref()
+                .expect("in rebase mode")
+                .plan;
+            (plan[0].commit.clone(), plan[1].commit.clone())
+        });
+        app.update_in(cx, |app, _window, _cx| {
+            let rebase_state = app.graph_state.rebase.as_mut().expect("in rebase mode");
+            super::rebase::move_rebase_plan_row(&mut rebase_state.plan, &c2, &c1, false);
+        });
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        let strip = cx
+            .debug_bounds("rebase-stopped-strip")
+            .expect("a real conflict stop must paint the strip");
+        let mark = cx
+            .debug_bounds("rebase-stopped-strip-mark")
+            .expect("§1.8's own 5px square - the strip used to have no mark at all");
+        let text = cx
+            .debug_bounds("rebase-stopped-strip-text")
+            .expect("the progress text must be painted");
+        assert_eq!(f32::from(mark.size.width), 5.0);
+        assert_eq!(f32::from(mark.size.height), 5.0);
+        assert!(strip.contains(&mark.origin));
+        assert!(
+            mark.origin.x < text.origin.x,
+            "the square leads the strip, exactly like a warning row's own"
+        );
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn wait_for_proc_state(_pid: u32, _prefix: &str) {}
     #[cfg(not(target_os = "linux"))]
     fn wait_for_proc_state_not(_pid: u32, _prefix: &str) {}
+}
+
+/// The design spec's own tables, asserted as tables (GitHub issues #302 and #305).
+///
+/// Deliberately pure `#[test]`s over the real functions the renderer itself calls, not
+/// `#[gpui::test]`s: this test harness has no way to read a painted quad's colour back, so a
+/// "the chip is really green" claim can only be made honestly one layer down - at the single
+/// function every call site resolves its colours through. The structural half of those issues
+/// (there really is an elbow, there really is a dot/title/body) is asserted against real painted
+/// bounds in [`rebase_flow_tests`] instead.
+#[cfg(test)]
+mod rebase_design_tests {
+    use super::rebase::RebaseActionKind;
+    use super::{rebase_action_style, RebaseWarningKind, REBASE_FOOTER_HINTS};
+    use crate::theme::hex_rgba;
+
+    /// `revision 5/REVISION-2026-08-12.md` §1.4's action table, transcribed here as data so a
+    /// drift in either direction is a failing assertion rather than a review catch.
+    ///
+    /// | Action | fg | bg | border |
+    /// |---|---|---|---|
+    fn spec_action_table() -> Vec<(RebaseActionKind, u32, u32, u32)> {
+        vec![
+            (RebaseActionKind::Pick, 0xa9b0b7, 0x1c2023, 0x2a2f34),
+            (RebaseActionKind::Reword, 0x8fbde6, 0x1d2532, 0x2b3d4f),
+            (RebaseActionKind::Edit, 0xd8a94a, 0x2b2413, 0x3f3418),
+            (RebaseActionKind::Squash, 0x7fc79a, 0x16261e, 0x24503a),
+            (RebaseActionKind::Fixup, 0x5f9c78, 0x16261e, 0x1e3b2a),
+            (RebaseActionKind::Drop, 0xc4726d, 0x2a1719, 0x4a2422),
+        ]
+    }
+
+    #[test]
+    fn every_action_chip_wears_the_design_specs_own_three_colours() {
+        for (action, fg, bg, border) in spec_action_table() {
+            let style = rebase_action_style(action);
+            assert_eq!(
+                style.fg.default,
+                hex_rgba(fg),
+                "{}'s chip foreground",
+                action.label()
+            );
+            assert_eq!(
+                style.bg.default,
+                hex_rgba(bg),
+                "{}'s chip background",
+                action.label()
+            );
+            assert_eq!(
+                style.border.default,
+                hex_rgba(border),
+                "{}'s chip border",
+                action.label()
+            );
+        }
+    }
+
+    /// GitHub issue #302's actual complaint: every chip rendered one neutral colour, so "the
+    /// colour-coding the design leans on carries no information at all". Six distinct
+    /// foregrounds is exactly the property that was missing - and the two folding verbs sharing
+    /// a *background* while differing in foreground is §1.4's own deliberate choice ("the two
+    /// folding actions share a hue because they do the same thing to history; `squash` is the
+    /// brighter of the pair"), asserted here rather than left to look like an oversight.
+    #[test]
+    fn no_two_actions_are_the_same_colour_and_the_two_folding_verbs_share_a_background() {
+        let mut seen: Vec<gpui::Rgba> = Vec::new();
+        for action in RebaseActionKind::ALL {
+            let fg = rebase_action_style(action).fg.default;
+            assert!(
+                !seen.contains(&fg),
+                "{} reuses another action's foreground - the chips would carry no information",
+                action.label()
+            );
+            seen.push(fg);
+        }
+        let squash = rebase_action_style(RebaseActionKind::Squash);
+        let fixup = rebase_action_style(RebaseActionKind::Fixup);
+        assert_eq!(
+            squash.bg.default, fixup.bg.default,
+            "squash and fixup share a hue on purpose - they do the same thing to history"
+        );
+        assert_ne!(
+            squash.fg.default, fixup.fg.default,
+            "...but squash is the brighter of the pair, so they stay distinguishable"
+        );
+    }
+
+    /// §4's checklist item "menu hints one line each", as data - the menu used to render a bare
+    /// `kind.label()` with no hint at all.
+    #[test]
+    fn every_action_has_the_design_specs_own_one_line_menu_hint() {
+        let expected = [
+            (RebaseActionKind::Pick, "keep the commit as it is"),
+            (RebaseActionKind::Reword, "stop to edit the message"),
+            (RebaseActionKind::Edit, "stop to amend the contents"),
+            (RebaseActionKind::Squash, "fold up, keep both messages"),
+            (RebaseActionKind::Fixup, "fold up, discard this message"),
+            (RebaseActionKind::Drop, "remove the commit"),
+        ];
+        assert_eq!(expected.len(), RebaseActionKind::ALL.len());
+        for (action, hint) in expected {
+            assert_eq!(action.hint(), hint, "{}'s menu hint", action.label());
+            assert!(
+                !action.hint().contains('\n'),
+                "{}'s hint must be one line",
+                action.label()
+            );
+        }
+    }
+
+    /// GitHub issue #305: the warning stack rendered `theme::status::ASK` for all three rows, so
+    /// §1.7's deliberate amber → blue → grey gradient was flat.
+    #[test]
+    fn the_three_warning_severities_are_three_genuinely_different_colours() {
+        let expected = [
+            (RebaseWarningKind::RunningAgents, 0xe2a336),
+            (RebaseWarningKind::RemoteCommits, 0x8fbde6),
+            (RebaseWarningKind::StopCount, 0x565d64),
+        ];
+        let mut seen: Vec<gpui::Rgba> = Vec::new();
+        for (kind, hex) in expected {
+            let dot = kind.dot().default;
+            assert_eq!(dot, hex_rgba(hex), "{kind:?}'s severity dot");
+            assert!(
+                !seen.contains(&dot),
+                "{kind:?} reuses another warning's severity colour - the gradient is flat again"
+            );
+            seen.push(dot);
+        }
+    }
+
+    /// The strongest guard the footer band can carry (GitHub issue #304): every keycap it paints
+    /// names a keystroke that a real, registered `gpui::KeyBinding` really answers to. A hint
+    /// strip is worse than no hint strip if it advertises shortcuts that do nothing, and this
+    /// surface genuinely registered no action at all before this change.
+    #[test]
+    fn every_footer_keycap_hint_is_backed_by_a_really_registered_binding() {
+        // Each footer hint, paired with the real action name(s) and registered keystroke(s) it
+        // advertises. `alt+↑↓` is one hint over two real bindings, which is why this is a list
+        // per hint rather than one entry each.
+        let expected: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            (
+                "alt+\u{2191}\u{2193}",
+                vec![
+                    ("app::RebaseReorderUp", "alt-up"),
+                    ("app::RebaseReorderDown", "alt-down"),
+                ],
+            ),
+            ("P", vec![("app::RebasePickRow", "p")]),
+            ("S", vec![("app::RebaseSquashRow", "s")]),
+            ("D", vec![("app::RebaseDropRow", "d")]),
+            (
+                "mod+enter",
+                vec![(
+                    "app::RebaseStart",
+                    if cfg!(target_os = "macos") {
+                        "cmd-enter"
+                    } else {
+                        "ctrl-enter"
+                    },
+                )],
+            ),
+        ];
+        assert_eq!(
+            expected.len(),
+            REBASE_FOOTER_HINTS.len(),
+            "a footer hint was added or removed without saying which real binding it names"
+        );
+
+        let bindings = crate::default_key_bindings();
+        for ((spec, _label), (expected_spec, actions)) in
+            REBASE_FOOTER_HINTS.iter().zip(expected.iter())
+        {
+            assert_eq!(spec, expected_spec, "footer hints are asserted in order");
+            for (action, keystroke) in actions {
+                let matching: Vec<&gpui::KeyBinding> = bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.action().name() == *action
+                            && binding.keystrokes().len() == 1
+                            && binding.keystrokes()[0].inner().unparse() == *keystroke
+                    })
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "the footer paints a {spec:?} keycap, so exactly one real {action} binding \
+                     on {keystroke:?} must exist behind it"
+                );
+                // ...and it must be scoped to this surface, never global: a bare `p` claimed
+                // app-wide would swallow the letter everywhere in the app.
+                assert!(
+                    matching[0].predicate().is_some(),
+                    "{action} must be scoped to the rebase plan, never registered globally"
+                );
+            }
+        }
+    }
 }

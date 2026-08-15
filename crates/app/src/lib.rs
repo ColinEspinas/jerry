@@ -615,6 +615,50 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::TerminalPaste,
             Some("terminal"),
         ),
+        // GitHub issue #304: the interactive-rebase plan's footer band paints the keycap hints
+        // design spec §1.4 specifies (`alt+↑↓ reorder · P pick · S squash · D drop ·
+        // mod+enter start`), and these are the real bindings behind them - the surface used to
+        // register no action at all, so every one of those hints would have been a keycap for a
+        // shortcut that did nothing.
+        //
+        // Scoped to `"rebase-plan"`, the key context `crate::graph_view::rebase_render::AdeApp::
+        // render_rebase_view` puts on the surface's own container - never global. Four of the
+        // five are additionally `&& !text-input`, and that conjunct is load-bearing rather than
+        // defensive: a `reword` row's message field is a real `"text-input"` node *inside* this
+        // very container (`render_rebase_reword_field`), and GPUI dispatches a matching
+        // `KeyBinding` **before** any `on_key_down` listener (see the `TerminalCopy` entry above
+        // for the same real fact, with its source references) - so an unqualified `"p"` here
+        // would silently set that row's action to `pick` instead of typing a `p` into the commit
+        // message. `!` scans the whole live context stack (`KeyBindingContextPredicate::
+        // eval_inner`'s `Not` arm), so the conjunct really does go false while a descendant text
+        // input is focused, which is exactly the `"]"`/`"diff && !file-editor"` precedent this
+        // list already established.
+        //
+        // `mod+enter` deliberately keeps `"rebase-plan"` alone: `Start rebase` is the one verb
+        // that should still work from inside a reword field (having just typed that message is
+        // the most likely moment to want it), and `secondary-enter` is not a keystroke a
+        // single-line field has any use for. Plain letters, unlike every other plain-letter
+        // binding in this list, are safe here for the same reason `"file-editor"`'s own are: the
+        // context is only ever live while this app's own non-typing surface holds focus, never
+        // over a terminal.
+        gpui::KeyBinding::new(
+            "alt-up",
+            root::RebaseReorderUp,
+            Some("rebase-plan && !text-input"),
+        ),
+        gpui::KeyBinding::new(
+            "alt-down",
+            root::RebaseReorderDown,
+            Some("rebase-plan && !text-input"),
+        ),
+        gpui::KeyBinding::new("p", root::RebasePickRow, Some("rebase-plan && !text-input")),
+        gpui::KeyBinding::new(
+            "s",
+            root::RebaseSquashRow,
+            Some("rebase-plan && !text-input"),
+        ),
+        gpui::KeyBinding::new("d", root::RebaseDropRow, Some("rebase-plan && !text-input")),
+        gpui::KeyBinding::new("secondary-enter", root::RebaseStart, Some("rebase-plan")),
     ];
     #[cfg(target_os = "macos")]
     bindings.push(gpui::KeyBinding::new("cmd-q", root::Quit, None));
@@ -918,6 +962,8 @@ mod undo_scoping_matrix_tests {
             "the merge hand-edit surface",
             "a focused single-line text input (palette / rail filter / settings filter / \
              new-file prompt)",
+            "the interactive-rebase plan surface, no reword field focused",
+            "the interactive-rebase plan surface with one of its reword message fields focused",
             "the focused file tree, no overlay open",
             "the file tree's inline name editor (new file / new folder / rename)",
         ]
@@ -974,7 +1020,13 @@ mod undo_scoping_matrix_tests {
             true,  // ...with completions open
             true,  // the merge hand-edit surface
             true,  // a focused single-line text input
-            // The file tree with no editor open is not a text surface.
+            // The rebase plan surface itself is not a text surface (GitHub issue #304) - its own
+            // `P`/`S`/`D`/`alt+↑↓` bindings live here, and Ctrl+Z has nothing to undo.
+            false,
+            // ...but a focused `reword` message field on one of its rows is one, and this row is
+            // exactly why those plain-letter bindings carry `&& !text-input`: this stack is live
+            // whenever a real commit message is being typed inside the rebase surface.
+            true, // The file tree with no editor open is not a text surface.
             false,
             // ...but its inline name editor *is* one. This row is the whole reason issue #19's
             // tree had to gain issue #17's `"text-input"` tag when the two branches merged:
