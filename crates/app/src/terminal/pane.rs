@@ -4876,3 +4876,369 @@ mod terminal_theme_tests {
         assert_eq!(cell.bg, bundled_rgb("Slate", "terminal.background"));
     }
 }
+
+/// GitHub issue #331, end to end at the pane level: real scroll-wheel/PageUp/PageDown input
+/// through [`TerminalPane::handle_key_down`]/[`TerminalPane::handle_scroll_wheel`], typing
+/// snapping back to the live tail, and - through a real `cat`-backed pty, not the
+/// [`TerminalPane::inject_bytes_for_test`] seam - real output arriving through the real poll
+/// loop while scrolled back neither moving the viewport nor going unnoticed.
+#[cfg(test)]
+mod scrollback_pane_tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext};
+
+    fn new_pane(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        (pane, cx)
+    }
+
+    /// A real, unmodified navigation key with no `key_char` - matches how GPUI reports
+    /// PageUp/PageDown/arrows in practice (see `keystroke_tests`' own `keystroke` helper for the
+    /// printable-character counterpart).
+    fn nav_key(key: &str) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            key_char: None,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn key_event(keystroke: Keystroke) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// Pushes `count` numbered lines directly into the grid - the same
+    /// [`TerminalPane::inject_bytes_for_test`] seam `clipboard_tests`/etc. already use - enough
+    /// to overflow the pane's real current row count into genuine retained scrollback.
+    fn push_numbered_lines(
+        pane: &gpui::Entity<TerminalPane>,
+        cx: &mut gpui::VisualTestContext,
+        count: usize,
+    ) {
+        pane.update(cx, |pane, cx| {
+            for i in 0..count {
+                pane.inject_bytes_for_test(format!("line {i}\r\n").as_bytes(), cx);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn page_up_and_page_down_scroll_the_real_display_offset(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+        assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
+        });
+        let offset = pane.read_with(cx, |pane, _| pane.grid.scroll_offset());
+        assert!(
+            offset > 0,
+            "PageUp must move the real display_offset into history"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pagedown")), window, cx);
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            0,
+            "PageDown by the same one page must land exactly back at live"
+        );
+    }
+
+    /// Real proof PageUp/PageDown are claimed *before* `keystroke_to_bytes`/`PtySession::
+    /// write_input`, not just that the grid's own offset happens to move: a real `cat` process
+    /// echoes back anything it receives on stdin, so if PageUp were (wrongly) also forwarded as
+    /// pty input, the grid would show a stray echoed byte on the next tick.
+    #[gpui::test]
+    fn page_up_never_reaches_the_real_pty(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
+        });
+        let offset_right_after = pane.read_with(cx, |pane, _| pane.grid.scroll_offset());
+        let lines_right_after = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+
+        // `cat` echoes back verbatim anything it receives on stdin - if PageUp had wrongly also
+        // been forwarded as pty input (rather than claimed before `keystroke_to_bytes` runs at
+        // all), a real echoed reply would show up in the grid, and/or the poll loop draining it
+        // could perturb `display_offset`, within a handful of real poll ticks.
+        for _ in 0..20 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            offset_right_after,
+            "display_offset must not drift after PageUp once the poll loop has had many real \
+             ticks to run - it would if a stray echoed reply had reached the pty"
+        );
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.visible_text_lines()),
+            lines_right_after,
+            "no new content may appear after PageUp with no further input - a real echoed PageUp \
+             byte sequence would show up here"
+        );
+    }
+
+    #[gpui::test]
+    fn typing_while_scrolled_back_snaps_back_to_the_live_tail(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
+        });
+        assert!(pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()));
+
+        let typed = Keystroke {
+            key: "a".to_string(),
+            key_char: Some("a".to_string()),
+            modifiers: Modifiers::default(),
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(typed), window, cx);
+        });
+
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()),
+            "a real keystroke reaching the pty must jump the view back to live"
+        );
+    }
+
+    fn wheel_event(delta: gpui::ScrollDelta) -> ScrollWheelEvent {
+        ScrollWheelEvent {
+            position: gpui::point(px(0.0), px(0.0)),
+            delta,
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        }
+    }
+
+    #[gpui::test]
+    fn mouse_wheel_lines_scroll_by_exactly_that_many_grid_lines(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0))),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 3);
+
+        // Scrolling back down (negative delta) must move back toward live by the same amount.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, -3.0))),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
+    }
+
+    /// Trackpad pixel deltas rarely divide evenly by the row height - two individually-sub-line
+    /// deltas must still accumulate into a real whole-line scroll rather than each being
+    /// truncated to zero and silently dropped (see [`TerminalPane::pending_scroll_px`]'s docs).
+    #[gpui::test]
+    fn sub_line_trackpad_deltas_accumulate_into_a_real_line_scroll(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        let row_height = pane.read_with(cx, |pane, _| pane.line_height_px());
+        let two_thirds_row = row_height * 2.0 / 3.0;
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Pixels(gpui::point(
+                    px(0.0),
+                    px(two_thirds_row),
+                ))),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            0,
+            "a single sub-line delta must not itself move a whole line yet"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Pixels(gpui::point(
+                    px(0.0),
+                    px(two_thirds_row),
+                ))),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            1,
+            "two 2/3-row deltas together exceed one full row and must produce a real one-line \
+             scroll, not be dropped individually"
+        );
+    }
+
+    /// The real integration proof for GitHub issue #331's "stay put" requirement, at the pane
+    /// level: real pty output arriving through the real poll loop while scrolled back must not
+    /// move the viewport, and must latch the jump-to-bottom affordance's own "new output"
+    /// indicator.
+    #[gpui::test]
+    fn new_real_pty_output_while_scrolled_back_does_not_move_the_viewport_and_latches_the_indicator(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        let line_count = rows * 3;
+
+        let first_batch: String = (0..line_count).map(|i| format!("line {i}\r\n")).collect();
+        pane.update(cx, |pane, cx| {
+            pane.session
+                .as_ref()
+                .expect("a real cat session must be live")
+                .write_input(first_batch.as_bytes())
+                .expect("writing to a real live pty must succeed");
+            cx.notify();
+        });
+        let last_line = format!("line {}", line_count - 1);
+        let mut echoed = false;
+        for _ in 0..300 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            if pane.read_with(cx, |pane, _| {
+                pane.visible_text_lines()
+                    .iter()
+                    .any(|line| line.contains(&last_line))
+            }) {
+                echoed = true;
+                break;
+            }
+        }
+        assert!(echoed, "the real pty must echo the first batch back");
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
+        });
+        let offset_before = pane.read_with(cx, |pane, _| pane.grid.scroll_offset());
+        assert!(offset_before > 0, "sanity check: genuinely scrolled back");
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.new_output_while_scrolled),
+            "sanity check: no new output has arrived yet"
+        );
+        // The real content on screen right now - what "stay put" promises stays visible. Not
+        // `scroll_offset()` itself: "staying put" means `display_offset` keeps pace with however
+        // many real grid rows the new output consumes (matching `alacritty_terminal`'s own
+        // `Grid::scroll_up` pinning behavior - see `TerminalGrid::scroll_display`'s docs), which
+        // is exactly what makes the *visible lines* the invariant here, not the raw offset
+        // number (a wrapped long line can advance the grid by more than one row per logical
+        // line written).
+        let lines_before = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+
+        pane.update(cx, |pane, cx| {
+            pane.session
+                .as_ref()
+                .expect("a real cat session must still be live")
+                .write_input(b"more output while scrolled back\r\n")
+                .expect("writing to a real live pty must succeed");
+            cx.notify();
+        });
+        let mut saw_new_output_flag = false;
+        for _ in 0..300 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            if pane.read_with(cx, |pane, _| pane.new_output_while_scrolled) {
+                saw_new_output_flag = true;
+                break;
+            }
+        }
+        assert!(
+            saw_new_output_flag,
+            "real output arriving through the real poll loop while scrolled back must latch \
+             the jump-to-bottom affordance's indicator"
+        );
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.visible_text_lines()),
+            lines_before,
+            "must not move the viewport off the lines the user was looking at"
+        );
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()) >= offset_before,
+            "display_offset must have kept pace with (or exceeded, if the new line wrapped) the \
+             real new output, not snapped back toward live"
+        );
+
+        // The jump-to-bottom affordance's own click handler - exercised directly, since it
+        // needs a real painted hitbox to click through GPUI's own event dispatch - clears both.
+        pane.update(cx, |pane, cx| {
+            pane.grid.scroll_display(ScrollAmount::Bottom);
+            pane.new_output_while_scrolled = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()));
+        assert!(!pane.read_with(cx, |pane, _| pane.new_output_while_scrolled));
+    }
+
+    /// The scrollbar's own `ScrollableHandle` adapter (GitHub issue #331): synced from real grid
+    /// state, its geometry must answer with the *lines-from-top* convention documented on
+    /// `TerminalScrollHandle::viewport_bounds` - live (`display_offset == 0`) at the bottom of
+    /// the track, fully scrolled back at the top.
+    #[test]
+    fn terminal_scroll_handle_reports_live_at_the_bottom_and_history_at_the_top() {
+        let handle = TerminalScrollHandle::new();
+        let bounds = Bounds {
+            origin: gpui::point(px(0.0), px(0.0)),
+            size: gpui::size(px(200.0), px(500.0)),
+        };
+        handle.sync(bounds, px(20.0), 100, 0);
+
+        assert_eq!(handle.max_scroll_offset(), gpui::point(px(0.0), px(2000.0)));
+        assert_eq!(
+            handle.scroll_offset(),
+            gpui::point(px(0.0), px(-2000.0)),
+            "display_offset == 0 (live) must report the maximum negative offset - the bottom of \
+             the track, matching every real terminal emulator's own scrollbar"
+        );
+
+        handle.sync(bounds, px(20.0), 100, 100);
+        assert_eq!(
+            handle.scroll_offset(),
+            gpui::point(px(0.0), px(0.0)),
+            "fully scrolled back (display_offset == history_len) must report offset zero - the \
+             top of the track"
+        );
+
+        // A click near the bottom of the track must request an offset close to live.
+        handle.sync(bounds, px(20.0), 100, 100);
+        handle.set_scroll_offset(gpui::point(px(0.0), px(-1900.0)));
+        assert_eq!(handle.take_requested_display_offset(), Some(5));
+    }
+}
