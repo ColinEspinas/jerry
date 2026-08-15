@@ -1644,6 +1644,9 @@ impl AdeApp {
         let totals = self.diff_totals;
 
         div()
+            // See `crate::work_surface::render::AdeApp::render_tab_strip`'s own selector: the
+            // three column headers are measured together, so all three need one.
+            .debug_selector(|| "right-panel-header".to_string())
             .flex_none()
             .h(theme::band::CHROME_HEADER)
             .flex()
@@ -1659,8 +1662,13 @@ impl AdeApp {
             // which is what the issue's screenshot shows. See
             // `crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs for the value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
+            // The third of the window's three column headers, so the rule it draws is the same
+            // one the sidebar strip and the centre tab strip draw - GitHub issue #291 /
+            // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "all three borders
+            // are `#191c1f` ... [otherwise it] would have read as one rule changing shade
+            // mid-span". This was `theme::border::INNER` (`#1c2023`), a third shade on the same y.
             .border_b_1()
-            .border_color(theme::border::INNER)
+            .border_color(theme::border::RAIL_INNER)
             .child(toggle)
             // Everything below is one right-aligned action cluster - a `flex_1` spacer, not
             // `justify_between`, keeps it pinned to the trailing edge instead of spreading

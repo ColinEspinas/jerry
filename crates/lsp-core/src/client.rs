@@ -981,6 +981,40 @@ impl LspClient {
         lock(&self.diagnostics).contains_key(uri.as_str())
     }
 
+    /// **Every** file this server has published a non-empty diagnostic set for, as real
+    /// filesystem paths - the whole-server view [`Self::diagnostics_for`] gives one file at a
+    /// time.
+    ///
+    /// Exists for the sidebar strip's Problems view (`crate::rail::strip` in the `app` crate,
+    /// GitHub issue #291), which is scoped to a *worktree* rather than to whichever file is open:
+    /// this client is already keyed on one worktree root by its caller, so its whole diagnostics
+    /// map is exactly "the diagnostics in this checkout", and re-deriving that by asking
+    /// per-path would mean first knowing every path to ask about.
+    ///
+    /// Two deliberate filters, both of which drop things a caller could not use anyway:
+    ///
+    /// - **Clean files are omitted.** A `publishDiagnostics` carrying zero diagnostics is a real
+    ///   result ("analyzed, nothing to report") and [`Self::has_diagnostics_result`] is where that
+    ///   distinction lives; a list of problems has no row for it.
+    /// - **Non-`file://` uris are omitted.** rust-analyzer really does publish against virtual
+    ///   macro-expansion buffers, which have no path to show or open - the same honest failure
+    ///   [`Self::path_for_uri`] reports, applied here by skipping rather than by guessing a path.
+    ///
+    /// Returned sorted by path so a re-render can't reshuffle the list under the pointer -
+    /// `HashMap` iteration order is arbitrary and differs run to run.
+    pub fn published_diagnostics(&self) -> Vec<(PathBuf, Vec<lsp_types::Diagnostic>)> {
+        let mut published: Vec<(PathBuf, Vec<lsp_types::Diagnostic>)> = lock(&self.diagnostics)
+            .iter()
+            .filter(|(_, diagnostics)| !diagnostics.is_empty())
+            .filter_map(|(uri, diagnostics)| {
+                let uri: Uri = uri.parse().ok()?;
+                Some((uri_to_path(&uri).ok()?, diagnostics.clone()))
+            })
+            .collect();
+        published.sort_by(|(left, _), (right, _)| left.cmp(right));
+        published
+    }
+
     /// Non-blocking: drains every "diagnostics changed" wake signal currently buffered (the
     /// reader thread sends one every time it records a fresh `publishDiagnostics` notification
     /// for *any* file, not just one specific path), returning `true` iff at least one was

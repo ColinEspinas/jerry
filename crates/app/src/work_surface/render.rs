@@ -902,15 +902,28 @@ impl AdeApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // No `border_b` here, deliberately: the *children* own this column's bottom edge. GitHub
+        // issue #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim -
+        // "the centre column drew its bottom edge **twice** - once on the tab-strip container and
+        // once on every tab - so under an inactive tab the rule was 1.6px of two shades stacked,
+        // and the active tab's cut-out (its `border-bottom` set to its own background, so it joins
+        // the pane below) was defeated by the container's line drawing straight through beneath
+        // it. ... A child cannot paint over its parent's border - the parent's border sits outside
+        // the child's box - so the container cannot own the edge if any child needs to cut it.
+        // **The tabs own it.**" Every child below therefore carries the rule itself, the `+`, the
+        // spacer and the counter cluster included, "without which the rule stopped at the last tab
+        // and 398px of the window's top edge was simply missing".
         let mut bar = div()
             .id("tab-strip")
+            // Lets a real test measure this column header's own painted box - §4v's
+            // "column headers that share a y are one rule, not three" is only checkable against
+            // all three of them at once (`crate::rail::strip_render`'s own chrome test).
+            .debug_selector(|| "tab-strip".to_string())
             .flex()
             .flex_none()
             .items_stretch()
             .h(theme::band::CHROME_HEADER)
-            .bg(theme::surface::TITLE_BAR)
-            .border_b_1()
-            .border_color(theme::border::ZONE);
+            .bg(theme::surface::TITLE_BAR);
 
         let order = self.combined_tab_order();
 
@@ -945,13 +958,22 @@ impl AdeApp {
 
         let jump_keys = self.agent_jump_keys();
 
-        bar.child(div().flex_1()).child(
+        bar.child(
+            // The spacer carries the column rule too - see the container's own comment above.
+            div()
+                .flex_1()
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER),
+        )
+        .child(
             div()
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap(px(6.0))
                 .px(px(12.0))
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER)
                 .child(render_keycap_row(&jump_keys, KeycapSize::Standard))
                 .child(
                     div()
@@ -1324,6 +1346,10 @@ impl AdeApp {
             .gap(px(5.0))
             .px(px(10.0))
             .cursor_pointer()
+            // A child of the tab strip, so it carries the column rule - see
+            // `Self::render_tab_strip`'s own comment for why the container no longer does.
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER)
             .bg(if is_open {
                 theme::surface::SEGMENT_TRACK.into()
             } else {

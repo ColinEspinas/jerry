@@ -32,6 +32,7 @@ window                     = "#f0f1f4"  # window body
 window_border              = "#cfd4d8"
 title_bar                  = "#eceef0"
 rail                       = "#edeff1"  # left rail + right panel
+sidebar_strip              = "#f5f6f9"  # The sidebar strip's own recessed band (GitHub issue #291)
 center                     = "#e8eaee"  # work surface
 pty                        = "#eff2f4"  # agent CLI + terminal
 header                     = "#e9ecef"  # context bar, panel headers
@@ -94,24 +95,25 @@ thumb_hover = "#b3bac1"
 
 # The interface text ramp, brightest to dimmest.
 [text]
-selected   = "#3b3e41"
-primary    = "#414448"
-heading    = "#484c4f"
-strong     = "#4c5053"
-body       = "#51565a"
-secondary  = "#5b6065"
-muted      = "#666b70"
-dim        = "#73777c"
-dimmer     = "#7c8287"
-faint      = "#8c9197"
-fainter    = "#979da2"
-ghost      = "#a5abb0"
-ghoster    = "#adb3b9"
-hint       = "#b3b8bc"
-gutter     = "#b9bec3"
-disabled   = "#b6bbc1"
-path       = "#a9aeb5"
-tree_caret = "#a9aeb5"  # The file tree row's ▾/▸ caret
+selected    = "#3b3e41"
+primary     = "#414448"
+heading     = "#484c4f"
+strong      = "#4c5053"
+body        = "#51565a"
+secondary   = "#5b6065"
+muted       = "#666b70"
+dim         = "#73777c"
+dimmer      = "#7c8287"
+faint       = "#8c9197"
+fainter     = "#979da2"
+ghost       = "#a5abb0"
+ghoster     = "#adb3b9"
+hint        = "#b3b8bc"
+gutter      = "#b9bec3"
+disabled    = "#b6bbc1"
+path        = "#a9aeb5"
+tree_caret  = "#a9aeb5"  # The file tree row's ▾/▸ caret
+glyph_hover = "#474b4f"
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────

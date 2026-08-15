@@ -24,6 +24,11 @@
 //!   menu (GitHub issue #290), drawn through the app's one shared menu (`crate::menu`).
 //! - [`menu_render`] - the `impl AdeApp` half of those menus: opening one off a real
 //!   right-click, and running what its rows promise.
+//! - [`strip`] - the sidebar strip's pure model (GitHub issue #291): which views the left column
+//!   offers, each cell's marker and tooltip, and the gate that empties the strip on a day with no
+//!   worktrees.
+//! - [`strip_render`] - the `impl AdeApp` half of the strip: the real 36px band, the real view
+//!   switch, and the Problems view it switches to.
 //! - [`render`] - the real GPUI rail, its rows, hover affordances and click handlers, as
 //!   `impl AdeApp` methods.
 //!
@@ -36,6 +41,7 @@ use crate::rail::state::{
     self as rail, AgentRow, RepoGroup, RepoWorktrees, WorktreeEntry, WorktreeNote, WorktreeRow,
 };
 use crate::rail::status::Status;
+use crate::rail::strip as rail_strip;
 use crate::rail::worktrees::WorktreeItem;
 use crate::root::*;
 use crate::status_bar::process_stats;
@@ -50,9 +56,11 @@ pub mod menu;
 pub mod repo;
 pub mod state;
 pub mod status;
+pub mod strip;
 pub mod title_signal;
 pub mod worktree_watch;
 pub mod worktrees;
 
 pub(crate) mod menu_render;
 pub(crate) mod render;
+pub(crate) mod strip_render;

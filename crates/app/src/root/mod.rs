@@ -625,6 +625,21 @@ pub struct AdeApp {
     /// entry cap, so "the walk stopped early because it ran out of budget" is no longer a state
     /// this app can be in.
     pub(crate) file_tree_complete: bool,
+    /// Which view the left column's sidebar strip has selected (GitHub issue #291) - see
+    /// `crate::rail::strip::SidebarView`.
+    ///
+    /// The window's first rail-level view state: before the strip, the left column was hard-wired
+    /// to one thing (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1: "The left
+    /// panel was hard-wired to one thing. It is now a switchable surface"). Deliberately **not**
+    /// persisted: it is a per-window navigation position like the right panel's own
+    /// [`Self::right_sidebar_view`], not a preference, and a window restored onto Problems for a
+    /// checkout whose diagnostics have not been recomputed yet would open on an empty panel with
+    /// no explanation.
+    ///
+    /// Read through `crate::rail::strip_render::AdeApp::effective_sidebar_view`, never directly by
+    /// a renderer: on a day with no worktrees there is no switcher, so this field's value is not
+    /// necessarily the view being shown.
+    pub(crate) sidebar_view: crate::rail::strip::SidebarView,
     /// The rail's open worktree/agent row menu (GitHub issue #290), `None` when closed - see
     /// `crate::rail::menu::RailRowMenu`. Its origin is window-space and already clamped, and it
     /// is rendered from [`Render::render`] rather than from the rail, because the rail's row list

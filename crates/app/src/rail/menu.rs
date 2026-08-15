@@ -206,10 +206,12 @@ pub fn agent_menu_groups(running: bool) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
 }
 
 /// Whether this build really has a History *view* for the `⋯` overflow to switch to. It does
-/// not: GitHub issue #227's history is rendered inline under each worktree row, and the view a
-/// sidebar strip switches to is GitHub issue #291's. Named rather than inlined as a bare `false`
-/// so the row that reads it, its disabled reason and this fact stay one thing - see
-/// [`overflow_menu_groups`].
+/// not: GitHub issue #227's history is rendered inline under each worktree row, and the sidebar
+/// strip GitHub issue #291 built has exactly two views (`crate::rail::strip::SidebarView`) -
+/// History is *reached* through this overflow rather than being a cell, per
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` section 4t, but the surface it would
+/// open is still #227's to build. Named rather than inlined as a bare `false` so the row that
+/// reads it, its disabled reason and this fact stay one thing - see [`overflow_menu_groups`].
 pub const HISTORY_VIEW_AVAILABLE: bool = false;
 
 /// The sidebar strip's `⋯` overflow (§4u): "History and Settings only, with the glyphs they had
@@ -217,10 +219,9 @@ pub const HISTORY_VIEW_AVAILABLE: bool = false;
 /// recognisability. Command palette, Keyboard shortcuts and About were filler - the palette has
 /// `⌘K` and its own surface."
 ///
-/// `history_available` is whether this build really has a History surface to switch to. It does
-/// not yet - History is rendered inline under each worktree row (GitHub issue #227) and the view
-/// that the strip switches to is GitHub issue #291's - so the row ships visibly disabled with
-/// that as its reason, rather than as a row that looks live and does nothing.
+/// `history_available` is whether this build really has a History surface to switch to - see
+/// [`HISTORY_VIEW_AVAILABLE`]. It does not yet, so the row ships visibly disabled with that as its
+/// reason, rather than as a row that looks live and does nothing.
 pub fn overflow_menu_groups(history_available: bool) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
     vec![vec![
         MenuEntry::new(RailMenuAction::OpenHistory, "History")
@@ -228,7 +229,7 @@ pub fn overflow_menu_groups(history_available: bool) -> Vec<Vec<MenuEntry<RailMe
             .tooltip("Earlier runs, by repo and worktree")
             .gated(
                 history_available,
-                "the History view arrives with the sidebar strip (issue #291); a worktree's own \
+                "there is no History surface in this build yet (issue #227); a worktree's own \
                  past runs are already listed under its row",
             ),
         MenuEntry::new(RailMenuAction::OpenSettings, "Settings")

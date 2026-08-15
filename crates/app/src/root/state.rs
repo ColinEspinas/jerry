@@ -391,6 +391,7 @@ impl AdeApp {
             // Nothing has been walked yet, so nothing may be pruned yet either.
             file_tree_complete: false,
             rail_row_menu: None,
+            sidebar_view: crate::rail::strip::SidebarView::default(),
             rail_overflow_menu: None,
             rail_overflow_button_bounds: gpui::Bounds::default(),
             remove_worktree_confirm_armed: None,

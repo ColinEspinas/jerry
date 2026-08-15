@@ -379,57 +379,63 @@ impl AdeApp {
     /// The `⋯` More cell (§4t: "a permanent cell in a 5-cell strip is a claim that you switch to
     /// it constantly. If you don't, it belongs in the overflow").
     ///
-    /// Its final home is the sidebar strip GitHub issue #291 builds; this app has no strip yet,
-    /// so it sits in the rail header beside the `+` - the rail's only existing chrome row - where
-    /// #291 can move it without any of the menu machinery below changing. A `gpui::canvas`
-    /// captures its real window-space rect (the same capture the commit composer's `▾` menu uses)
-    /// because §4w anchors this menu to the button's own rect, not to the pointer.
+    /// It is the strip's last cell, and it is a *cell*: GitHub issue #291 moved it out of the
+    /// stop-gap rail header it was parked in and into the sidebar strip that was always its home,
+    /// where it goes through `crate::rail::strip_render::strip_cell` like every other child - so
+    /// it carries the column rule, the 38px width and the glyph-only hover the rest of the strip
+    /// does. `Jerry.dc.html` gives it a `border-left` (rather than the view cells' `border-right`)
+    /// because it sits on the far side of the strip's flex spacer.
+    ///
+    /// None of the menu machinery below changed in that move, exactly as this comment promised it
+    /// would not: a `gpui::canvas` still captures the button's real window-space rect (the same
+    /// capture the commit composer's `▾` menu uses), because §4w anchors this menu to the
+    /// button's own rect rather than to the pointer.
     pub(in crate::rail) fn render_rail_overflow_button(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("rail-overflow")
-            .debug_selector(|| "rail-overflow".to_string())
-            .relative()
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(crate::icons::IconSize::Control.box_size())
-            .h(crate::icons::IconSize::Control.box_size())
-            .rounded(theme::radius::CHIP)
-            .cursor_pointer()
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-            .tooltip(text_tooltip("More \u{2014} History and Settings"))
-            .font(font(theme::font::SANS))
-            .text_size(self.ui_text_size(11.0))
-            .text_color(theme::text::DIM)
-            .child("\u{22ef}")
-            .child({
-                let this = cx.entity();
-                gpui::canvas(
-                    move |bounds, _window, cx| {
-                        this.update(cx, |this, _cx| {
-                            this.rail_overflow_button_bounds = bounds;
-                        });
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-            })
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                if this.rail_overflow_menu.is_some() {
-                    this.close_rail_overflow_menu(cx);
-                } else {
-                    this.open_rail_overflow_menu(window, cx);
-                }
-            }))
+        crate::rail::strip_render::strip_cell(
+            div()
+                .id("rail-overflow")
+                .debug_selector(|| "rail-overflow".to_string()),
+            "rail-overflow",
+            theme::border::RAIL_INNER,
+            theme::text::FAINTER,
+            div()
+                .font(font(theme::font::SANS))
+                .text_size(self.ui_text_size(11.0))
+                .group_hover("rail-overflow", |el| {
+                    el.text_color(theme::text::GLYPH_HOVER)
+                })
+                .child("\u{22ef}"),
+        )
+        .border_l_1()
+        .border_color(theme::border::INNER)
+        .tooltip(text_tooltip("More \u{2014} History and Settings"))
+        .child({
+            let this = cx.entity();
+            gpui::canvas(
+                move |bounds, _window, cx| {
+                    this.update(cx, |this, _cx| {
+                        this.rail_overflow_button_bounds = bounds;
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+        })
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            if this.rail_overflow_menu.is_some() {
+                this.close_rail_overflow_menu(cx);
+            } else {
+                this.open_rail_overflow_menu(window, cx);
+            }
+        }))
     }
 }
 

@@ -328,6 +328,15 @@ pub struct TabColors {
     pub label: Rgba,
 }
 
+/// An inactive tab's `underline` is the **window's column rule**, not a tab-level decoration -
+/// which is why it is [`theme::border::RAIL_INNER`] and not [`theme::border::ZONE`]. GitHub issue
+/// #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: once the three column
+/// headers line up, "**All three column headers are now 36** ... and all three borders are
+/// `#191c1f` - the centre strip had been `#1e2225`, which once the rules lined up would have read
+/// as one rule changing shade mid-span."
+///
+/// The active tab keeps painting its own background there instead - "so it joins the pane below" -
+/// which is the cut-out `crate::rail::strip_render`'s selected cell copies for the left column.
 pub fn tab_colors(active: bool) -> TabColors {
     if active {
         TabColors {
@@ -338,7 +347,7 @@ pub fn tab_colors(active: bool) -> TabColors {
     } else {
         TabColors {
             bg: TRANSPARENT,
-            underline: theme::border::ZONE.into(),
+            underline: theme::border::RAIL_INNER.into(),
             label: theme::text::DIMMER.into(),
         }
     }

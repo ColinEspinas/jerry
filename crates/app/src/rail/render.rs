@@ -1,6 +1,6 @@
 use super::*;
 use crate::root::plural;
-use crate::root::widgets::{render_disclosure_caret, render_keycap_row, text_tooltip, KeycapSize};
+use crate::root::widgets::{render_disclosure_caret, text_tooltip};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -25,6 +25,26 @@ fn agent_state_word(status: Status) -> &'static str {
         Status::Run => "running",
         Status::Idle => "paused",
     }
+}
+
+/// How many agents in this window are waiting on a human - the Worktrees cell's state marker
+/// (GitHub issue #291).
+///
+/// `REVISION-2026-08-13.md` §1 names the unit outright ("worktrees shows agents needing a human")
+/// and `Jerry.dc.html` computes exactly it:
+/// `sessions.filter(s => s.status === 'ask' || s.status === 'fail').length`. Those are this app's
+/// [`Status::Ask`] and [`Status::Fail`].
+///
+/// A filter over [`rail::urgency_counts`]' one real pass, not a second classification - the same
+/// relationship `crate::title_bar::render::title_bar_agent_state_chips` already has to it, so the
+/// strip's marker and the title bar's own dots cannot report different numbers for the same
+/// window.
+fn agents_needing_you(rows: &[AgentRow]) -> usize {
+    rail::urgency_counts(rows)
+        .into_iter()
+        .filter(|(status, _)| matches!(status, Status::Ask | Status::Fail))
+        .map(|(_, count)| count)
+        .sum()
 }
 
 /// The agent row's line-2 trailing text (§2.3's exact per-status table): empty for `needs
@@ -758,11 +778,36 @@ impl AdeApp {
         self._prune_task = Some(task);
     }
 
-    /// The whole agent rail (`design_handoff_jerry_ade/README.md`'s Zone 1): header,
-    /// filter row, the real scrollable agent/worktree list, and the footer - see the
-    /// README's "Rail chrome" section for the exact band heights this composes
-    /// (`theme::band::{RAIL_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
+    /// The whole left column (`design_handoff_jerry_ade/README.md`'s Zone 1): the sidebar strip,
+    /// the filter row, the real scrollable body of whichever view the strip has selected, and the
+    /// footer - see the README's "Rail chrome" section for the exact band heights this composes
+    /// (`theme::band::{CHROME_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
+    ///
+    /// GitHub issue #291 turned this from "the rail" into "the sidebar, which is showing the
+    /// rail": `crate::rail::strip_render::AdeApp::render_sidebar_strip` replaced the plain rail
+    /// header at the same [`theme::band::CHROME_HEADER`] height, and the scroller below now paints
+    /// whichever `crate::rail::strip::SidebarView` is selected.
+    ///
+    /// `crate::rail::state::RepoGroup`s are built **once**, here, and lent to both halves. The
+    /// strip's empty-day gate and the Worktrees body are two answers about the same data
+    /// (`REVISION-2026-08-13.md` §1: "Gate this at the source ... not in the template"), so
+    /// deriving them from one pass is what makes it impossible for the strip to offer a switcher
+    /// over rows the body does not have - as well as saving a second full rebuild per frame.
     pub(crate) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = self.build_repo_groups(cx);
+        // A window with no worktree row anywhere is §1's First-run/Empty-day state: "with no
+        // worktrees there are no views to offer". Read off `all_rows` rather than `rows` for the
+        // same reason every count in `RepoGroup` is: a filter query that hides every row must not
+        // make the strip's cells vanish.
+        let has_worktrees = groups.iter().any(|group| !group.all_rows.is_empty());
+        let view = self.effective_sidebar_view(has_worktrees);
+        let cells = rail_strip::strip_view_cells(
+            has_worktrees,
+            view,
+            agents_needing_you(&self.build_agent_rows(cx)),
+            self.worktree_problem_tally(),
+        );
+
         div()
             .id("agent-rail")
             // The app's real "nowhere else to put focus" fallback target - see
@@ -772,8 +817,8 @@ impl AdeApp {
             .flex()
             .flex_col()
             .size_full()
-            .child(self.render_rail_header(cx))
-            .child(self.render_rail_filter_row(cx))
+            .child(self.render_sidebar_strip(&cells, cx))
+            .child(self.render_rail_filter_row(view, cx))
             .when_some(self.render_worktrees_error_banner(), |el, banner| {
                 el.child(banner)
             })
@@ -799,7 +844,7 @@ impl AdeApp {
                             .min_h_0()
                             .overflow_y_scroll()
                             .track_scroll(&self.rail_scroll_handle)
-                            .child(self.render_rail_list(cx)),
+                            .child(self.render_sidebar_body(view, &groups, cx)),
                     )
                     .children(self.render_vertical_scrollbar(
                         "rail-scrollbar",
@@ -876,69 +921,17 @@ impl AdeApp {
         )
     }
 
-    /// Header 36 - Revision R12 §2.1: "Rail header keeps only the `+` new-session button." No
-    /// section-title label - this used to say `AGENTS` (a leftover from the pre-R12 flat rail,
-    /// carried through a rename to fix its vocabulary without checking it against this
-    /// requirement) but the spec is explicit that the header has nothing but the button itself.
-    ///
-    /// It now also carries the `⋯` overflow (GitHub issue #290). That control's designed home is
-    /// the sidebar strip GitHub issue #291 builds, which this app does not have yet; the rail
-    /// header is the one existing piece of rail chrome that already holds a control, so it is
-    /// where the button lives until #291 moves it. Nothing but this one `.child` has to change
-    /// when it does - the menu itself is anchored off the button's own captured rect.
-    pub(in crate::rail) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("rail-header")
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_end()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .h(theme::band::CHROME_HEADER)
-            .border_b_1()
-            .border_color(theme::border::RAIL_INNER)
-            .child(self.render_new_agent_button(cx))
-            .child(self.render_rail_overflow_button(cx))
-    }
-
-    /// The `+` control with its real, platform-resolved `mod+N` keycap pair (`⌘N` on macOS,
-    /// `Ctrl N` on Windows/Linux - `crate::keymap::resolve_combo`) - spawns a real new shell
-    /// agent (see [`NewAgent`]'s docs for the judgment call on the keybinding side of
-    /// this).
-    pub(in crate::rail) fn render_new_agent_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id("rail-new-agent")
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .cursor_pointer()
-            .px(px(6.0))
-            .py(px(2.0))
-            .rounded(theme::radius::CHIP)
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-            .child(
-                div()
-                    .text_color(theme::text::DIM)
-                    .text_size(self.ui_text_size(11.0))
-                    .child("+"),
-            )
-            .child(render_keycap_row(
-                &keymap::resolve_combo("mod+N", self.window_controls_style().is_macos()),
-                KeycapSize::Standard,
-            ))
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                this.new_agent(ProcessKind::Shell, window, cx);
-            }))
-    }
-
     /// Filter row 30: `/` plus the real typed query, or the placeholder text when empty -
     /// see [`Self::handle_filter_key_down`] for the (deliberately minimal) text input.
+    ///
+    /// Its placeholder follows the strip's selected view (GitHub issue #291) -
+    /// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1: "**Filter row** stays, and
+    /// its placeholder follows the view: `filter worktrees and agents` / `filter runs` / `filter
+    /// problems`." The query itself is one field across both views, and both really honour it, so
+    /// the placeholder never promises a filter that does nothing (§7 rule 1).
     pub(in crate::rail) fn render_rail_filter_row(
         &self,
+        view: rail_strip::SidebarView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_query = !self.filter_query.is_empty();
@@ -1006,7 +999,13 @@ impl AdeApp {
                             .child(if has_query {
                                 self.filter_query.as_str().to_string()
                             } else {
-                                "filter worktrees and agents".to_string()
+                                match view {
+                                    rail_strip::SidebarView::Worktrees => {
+                                        "filter worktrees and agents"
+                                    }
+                                    rail_strip::SidebarView::Problems => "filter problems",
+                                }
+                                .to_string()
                             })
                             .debug_selector(|| "rail-filter-text".to_string()),
                     )
@@ -1108,9 +1107,15 @@ impl AdeApp {
     /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
     /// There is **no rail mode toggle**"). See [`Self::build_repo_groups`] for how the groups
     /// themselves are built.
-    pub(in crate::rail) fn render_rail_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let groups = self.build_repo_groups(cx);
-
+    ///
+    /// Takes the groups rather than rebuilding them (GitHub issue #291): the sidebar strip above
+    /// this list gates itself on the same data, and one pass is what guarantees the switcher and
+    /// the rows under it are talking about the same worktrees - see [`Self::render_rail`].
+    pub(in crate::rail) fn render_rail_list(
+        &self,
+        groups: &[RepoGroup],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         // GitHub issue #113: a repo with zero open worktrees still renders its own group
         // (`Self::render_repo_group` paints every group's header regardless of
         // `rows`/`all_rows`), so the only case left with genuinely nothing to show
@@ -1121,7 +1126,14 @@ impl AdeApp {
             return self.render_rail_empty_message("no worktrees found");
         }
 
-        let mut list = div().id("rail-repo-groups").flex().flex_col();
+        let mut list = div()
+            .id("rail-repo-groups")
+            // Lets a real test prove the Worktrees *body* really is what the strip's Worktrees
+            // cell switches to, and really is gone when Problems is selected - see
+            // `crate::rail::strip_render`'s `clicking_a_cell_really_switches_the_panel_under_it`.
+            .debug_selector(|| "rail-repo-groups".to_string())
+            .flex()
+            .flex_col();
         for (index, group) in groups.iter().enumerate() {
             list = list.child(self.render_repo_group(group, index, cx));
         }
@@ -2869,7 +2881,8 @@ mod rail_row_tests {
         });
 
         app.update(cx, |app, cx| {
-            let _ = app.render_rail_list(cx);
+            let groups = app.build_repo_groups(cx);
+            let _ = app.render_rail_list(&groups, cx);
         });
     }
 
