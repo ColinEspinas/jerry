@@ -47,7 +47,169 @@ fn agent_trailing_text(agent: &AgentRow) -> String {
     }
 }
 
+/// An agent row's title colour (`STAGE-A-CHANGELOG.md` §4n, `Jerry.dc.html`'s own `titleFg`).
+///
+/// Three states, in order: the globally active agent is [`theme::text::SELECTED`]; an
+/// [`Status::Idle`] one drops to [`theme::text::DIMMER`] (it is paused, and the rail's job is
+/// "who needs me"); everything else is [`theme::rail::AGENT_TITLE`], one clear step below the
+/// worktree branch above it rather than the same [`theme::text::BODY`] it used to share with it.
+///
+/// A near-miss §4n records is worth carrying: the colour change was first applied by a
+/// non-global regex on `titleFg:`, which matches three surfaces in the mock - the flat session
+/// list, the rail's agent rows, and History rows - and hit the wrong one. Pulling this out as a
+/// named function is that lesson as code: the rail's agent title has exactly one definition, and
+/// `AdeApp::render_past_agent_row`'s History title is deliberately *not* routed through it.
+fn agent_title_color(status: Status, is_selected: bool) -> theme::ColorToken {
+    if is_selected {
+        theme::text::SELECTED
+    } else if status == Status::Idle {
+        theme::text::DIMMER
+    } else {
+        theme::rail::AGENT_TITLE
+    }
+}
+
+/// A worktree row's 2px left edge: **selection or nothing**.
+///
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4m is the whole of this function,
+/// and the three parameters are its history. The rail used to paint each worktree row with its
+/// most urgent agent's status colour, with dedicated greys for the bare and prunable cases. All
+/// three are deleted:
+///
+/// 1. **A worktree has no status. Its agents do.** Colouring the worktree row states an agent's
+///    condition on the wrong object.
+/// 2. **It was a lossy `max()`** - one colour for N agents, while the row already carries the
+///    honest version at the right granularity (the per-agent dots when collapsed, the full agent
+///    rows when expanded).
+/// 3. **It made one property mean two things in one list**: selected file rows, history rows and
+///    the selected worktree all use a 2px left edge for *selection*.
+///
+/// A first cut kept a dim edge on unselected rows and a lighter one on prunable rows. Both were
+/// caught on the next pass and are gone too: "if the edge means selection, an edge on an
+/// unselected row means nothing, and `prunable` is already stated in words on the row (`merged ·
+/// prunable`). **A channel with one meaning has exactly two states - on and off.**"
+///
+/// `aggregate_status` and `is_prunable` are still taken, unused, on purpose: they are exactly the
+/// two inputs that used to move this value, and keeping them in the signature is what lets
+/// `rail_correction_tests` prove - across every status, prunable or not - that neither can move
+/// it again. `None` is the off state (a transparent border, so the 2px gutter still holds the
+/// row's text alignment, per §4m's "The 2px gutter stays for alignment").
+fn worktree_row_edge(
+    _aggregate_status: Status,
+    _is_prunable: bool,
+    is_selected: bool,
+) -> Option<theme::ColorToken> {
+    is_selected.then_some(theme::border::SELECTED_EDGE)
+}
+
+/// Which of the repo header's **two** urgency counts a dot+count pair is
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4: "`● 2` amber... needs input
+/// and `● 1` red... failed").
+///
+/// An enum rather than two near-identical render functions, so the pair really is one control
+/// drawn twice - the thing that goes wrong otherwise is §4l's own defect, two copies of a row
+/// that drift apart in size or spacing. The *counts* themselves are separate by design and are
+/// never summed (§7 rule 4); only their rendering is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrgencyCount {
+    /// Worktrees needing input - amber.
+    NeedsInput,
+    /// Worktrees holding a failed agent - red. A worktree in both states is counted only here
+    /// (see [`rail::RepoGroup::needs_input_count`]).
+    Failed,
+}
+
+impl UrgencyCount {
+    /// The 5px dot's fill - the same two status hues the title bar's own `● 2  ● 1  ● 4` cluster
+    /// and a worktree row's per-agent dots use, which is exactly why §4q could drop the sentence:
+    /// "Replaced with the rail's existing vocabulary."
+    fn dot(self) -> theme::ColorToken {
+        match self {
+            UrgencyCount::NeedsInput => theme::status::ASK,
+            UrgencyCount::Failed => theme::status::FAIL,
+        }
+    }
+
+    /// The count's own text colour - the desaturated partner of [`Self::dot`], per §4's
+    /// `#e2a336` dot / `#c99b4e` text and `#e0625c` dot / `#c4726d` text pairs.
+    fn text(self) -> theme::ColorToken {
+        match self {
+            UrgencyCount::NeedsInput => theme::rail::REPO_ASK_COUNT,
+            UrgencyCount::Failed => theme::rail::REPO_FAIL_COUNT,
+        }
+    }
+
+    /// This pair's own tooltip sentence (§4: "each with its own tooltip").
+    fn tooltip(self, count: usize) -> String {
+        match self {
+            UrgencyCount::NeedsInput => rail::needs_input_tooltip(count),
+            UrgencyCount::Failed => rail::failed_tooltip(count),
+        }
+    }
+
+    /// The debug-selector suffix a test locates this pair by.
+    fn selector_name(self) -> &'static str {
+        match self {
+            UrgencyCount::NeedsInput => "ask",
+            UrgencyCount::Failed => "fail",
+        }
+    }
+}
+
 impl AdeApp {
+    /// One of the repo header's two urgency dot+count pairs, or **nothing at all** at zero
+    /// (`REVISION-2026-08-14.md` §4: "Each hidden at zero").
+    ///
+    /// Returns `Option` rather than an empty element so the zero case really does draw nothing -
+    /// the same "hidden at zero" shape `crate::title_bar::render::title_bar_agent_state_chip_text`
+    /// already uses, and the reason the header's right side is empty rather than holding two blank
+    /// slots for a quiet repo.
+    ///
+    /// `flex:none` and `white-space:nowrap` on both the pair and its number: §4 makes the repo
+    /// *name* the only shrinkable thing in the row, so a long repo name ellipsises and the counts
+    /// - the one thing in the header you are meant to catch at a glance - never shrink or wrap.
+    fn render_repo_urgency_count(
+        &self,
+        repo_id: repo::RepoId,
+        kind: UrgencyCount,
+        count: usize,
+    ) -> Option<impl IntoElement> {
+        if count == 0 {
+            return None;
+        }
+        let name = kind.selector_name();
+        Some(
+            div()
+                // `name` (not one shared literal) keeps the two pairs' element ids distinct
+                // within the one header they both render into.
+                .id((name, repo_id.0))
+                .debug_selector(move || format!("repo-{name}-count-{}", repo_id.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .tooltip(text_tooltip(kind.tooltip(count)))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded_full()
+                        .bg(kind.dot()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .font(font(theme::font::MONO))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(kind.text())
+                        .child(count.to_string()),
+                ),
+        )
+    }
+
     /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, hand-rolled text
     /// field (append/backspace only, no cursor positioning or selection) rather than
     /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`, judged out of
@@ -156,27 +318,17 @@ impl AdeApp {
                 // GitHub issue #239 phase 2: real, structured text straight from this agent's own
                 // hook payloads, when it has fired any recently enough to still be describing the
                 // present (`crate::hooks::event::HOOK_SIGNAL_TTL`).
-                let (hook_activity, hook_question) = match &self.hook_runtime {
-                    Some(runtime) => runtime.text_for(agent.id),
-                    None => (None, None),
+                //
+                // Only the *activity* half is read here. The question half used to feed a rail
+                // question-preview card, which revision 6 removed outright (see
+                // `Self::render_worktree_row`'s own note, and the field this row no longer
+                // carries) - it is still recorded, from this same real source, by
+                // `crate::hooks::flow::AdeApp::record_agent_statuses`, which is what History and a
+                // restored session read it back from.
+                let hook_activity = match &self.hook_runtime {
+                    Some(runtime) => runtime.text_for(agent.id).0,
+                    None => None,
                 };
-
-                // The grid scrape stays, as the fallback it now is. It is a genuinely worse
-                // signal - the last non-blank line of whatever the CLI happened to have rendered,
-                // which for a permission prompt is as likely to be a box-drawing border or a
-                // truncated menu item as the actual question - but it is the *only* signal for
-                // a Codex agent, a shell, or a Claude agent whose hooks haven't fired yet, so
-                // removing it would be a real regression for every one of those.
-                let question_preview = hook_question.or_else(|| {
-                    if status_value == Status::Ask {
-                        pane.visible_text_lines()
-                            .into_iter()
-                            .rev()
-                            .find(|line| !line.trim().is_empty())
-                    } else {
-                        None
-                    }
-                });
 
                 // Only shown while the agent is actually running: a stale "Bash: cargo test" next
                 // to an idle or review-ready row would describe something that already finished.
@@ -208,7 +360,6 @@ impl AdeApp {
                     branch,
                     add: diff.map(|summary| summary.add).unwrap_or(0),
                     del: diff.map(|summary| summary.del).unwrap_or(0),
-                    question_preview,
                     exit_code: pane.exit_status().map(|status| status.exit_code()),
                     activity,
                     elapsed: agent.spawned_at.elapsed(),
@@ -940,8 +1091,8 @@ impl AdeApp {
         }
 
         let mut list = div().id("rail-repo-groups").flex().flex_col();
-        for group in &groups {
-            list = list.child(self.render_repo_group(group, cx));
+        for (index, group) in groups.iter().enumerate() {
+            list = list.child(self.render_repo_group(group, index, cx));
         }
         list.into_any_element()
     }
@@ -964,8 +1115,8 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// One repo group (§2.0-2.1): the header (name, `N wt` count, the amber `N worktrees
-    /// waiting` when non-zero, and a per-repo `+`), then either every worktree row already
+    /// One repo group (§2.0-2.1): the header (name, `N wt` count, the two urgency dot+count pairs
+    /// when non-zero, and a per-repo `+`), then either every worktree row already
     /// ranked most-urgent-first by [`rail::group_worktrees_by_repo`], or - GitHub issue #113 - a
     /// real inline message when this repo has none to show, rather than the header (and the repo
     /// itself) simply disappearing from the rail. Every repo's header renders regardless of
@@ -978,37 +1129,61 @@ impl AdeApp {
     /// entire real repo switch ([`Self::checkout_repo_from_rail`]) itself, so the header never
     /// needs a click handler for repo switching to work.
     ///
-    /// The header's `N wt` and (via [`rail::RepoGroup::waiting_count`]) `N worktrees waiting`
-    /// are read from `group.all_rows`, **not** `group.rows` - see [`Self::build_repo_groups`]'s
-    /// docs for why: this repo's real, complete worktree list, unaffected by the rail's filter
-    /// query or by which repo is currently focused. Only the rows actually rendered below the
-    /// header (`group.rows`) may be narrower - and only that narrower list, never the header
-    /// or the `+`, is affected by an empty vs. filtered-away distinction (see the
-    /// inline message below, which does distinguish the two for its own wording).
+    /// The header's `N wt` and its two urgency counts ([`rail::RepoGroup::needs_input_count`],
+    /// [`rail::RepoGroup::failed_count`]) are read from `group.all_rows`, **not** `group.rows` -
+    /// see [`Self::build_repo_groups`]'s docs for why: this repo's real, complete worktree list,
+    /// unaffected by the rail's filter query or by which repo is currently focused. Only the rows
+    /// actually rendered below the header (`group.rows`) may be narrower - and only that narrower
+    /// list, never the header or the `+`, is affected by an empty vs. filtered-away distinction
+    /// (see the inline message below, which does distinguish the two for its own wording).
     ///
     /// `group.rows_loaded` gates the `N wt` count itself: `false` (a repo whose own first real
     /// fetch hasn't resolved yet - see [`rail::RepoWorktrees::rows_loaded`]'s docs) renders an
     /// honest em dash instead of `0 wt`, since this repo's real worktree count was never fetched
     /// and may well be nonzero - a literal `0 wt` would be a false claim about state this app
     /// hasn't actually loaded.
+    ///
+    /// ## Revision 6 (`REVISION-2026-08-14.md` §4, `STAGE-A-CHANGELOG.md` §4q/§4s/§4u)
+    ///
+    /// - **A rule, not a box.** The band is a bare `border-top` with **no fill**: "a filled band
+    ///   reads as a container, so it implied the worktrees below were *inside* something... A repo
+    ///   header is a rule between groups, not a box around one." The line sits **above** the
+    ///   label, where a separator belongs.
+    /// - **`index == 0` carries no rule at all** (§4u): the filter row's own bottom border already
+    ///   ends the chrome, and two hairlines a few px apart "read as one broken double line rather
+    ///   than two separators". Repo-to-repo separation is the 12px spacer above every *later*
+    ///   band instead.
+    /// - **26 high, content vertically centred** (§4s), 3px above its own first row while rows sit
+    ///   7px apart - "the header is visibly closer to its own rows than the rows are to each
+    ///   other, which is the whole job of a section header".
+    /// - **The name is the only shrinkable thing in the row** (§4): `flex:0 1 auto`,
+    ///   `min-width:0`, ellipsis. Every count is `flex:none` and must not wrap - §4l records the
+    ///   twin defect on the Changes panel's own labels, where `flex:none` *without* nowrap let
+    ///   `AGAINST MAIN` wrap to two lines and grow its header.
+    /// - **Two urgency counts, not one sentence.** See [`Self::render_repo_urgency_count`].
     pub(in crate::rail) fn render_repo_group(
         &self,
         group: &RepoGroup,
+        index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let waiting_label = rail::waiting_count_label(group.waiting_count());
         let repo_id = group.repo_id;
+        let is_first = index == 0;
 
         let header = div()
             .id(("repo-group-header", repo_id.0))
             .debug_selector(move || format!("repo-group-header-{}", repo_id.0))
-            // Padding `8 12 4` (§2.1).
             .flex()
             .items_center()
             .gap(px(6.0))
-            .pt(px(8.0))
+            .h(px(26.0))
             .px(px(12.0))
-            .pb(px(4.0))
+            // §4s: 3px to this header's own first worktree row, against the 7px between rows.
+            .mb(px(3.0))
+            // §4s/§4u: a bare rule above the label, and none at all on the first band.
+            .when(!is_first, |el| {
+                el.border_t_1().border_color(theme::border::DIVIDER)
+            })
             // Deliberately no `on_click`, no `cursor_pointer`, no hover background: this header
             // is a plain label, not a control - see this function's own docs. Per this file's
             // established "non-actionable control drops cursor_pointer/hover/on_click" rule (the
@@ -1016,6 +1191,10 @@ impl AdeApp {
             // must not carry click affordances either.
             .child(
                 div()
+                    // The one shrinkable thing in the row (§4).
+                    .min_w_0()
+                    .flex_shrink_1()
+                    .truncate()
                     .font(font(theme::font::SANS))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_size(self.ui_text_size(9.5))
@@ -1024,6 +1203,8 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .flex_none()
+                    .whitespace_nowrap()
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(9.5))
                     .text_color(theme::text::PATH)
@@ -1037,23 +1218,25 @@ impl AdeApp {
                         "\u{2014} wt".to_string()
                     }),
             )
-            .child(div().flex_1())
-            .when_some(waiting_label, |el, text| {
-                el.child(
-                    div()
-                        .font(font(theme::font::SANS))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(self.ui_text_size(9.5))
-                        .text_color(theme::status::ASK_CARD_FG)
-                        .child(text),
-                )
-            })
+            .child(div().flex_1().min_w(px(4.0)))
+            .children(self.render_repo_urgency_count(
+                repo_id,
+                UrgencyCount::NeedsInput,
+                group.needs_input_count(),
+            ))
+            .children(self.render_repo_urgency_count(
+                repo_id,
+                UrgencyCount::Failed,
+                group.failed_count(),
+            ))
             .child(self.render_repo_group_new_button(repo_id));
 
         let mut group_div = div()
             .id(("repo-group", repo_id.0))
             .flex()
             .flex_col()
+            // §4u: repo-to-repo separation is a 12px spacer above every band but the first.
+            .when(!is_first, |el| el.pt(px(12.0)))
             .child(header);
 
         if group.rows.is_empty() {
@@ -1258,17 +1441,9 @@ impl AdeApp {
         // would hide a bare worktree's history behind a caret that never rendered at all.
         let has_children = has_agents || has_history;
         let is_expanded = has_children && self.worktree_is_expanded(row);
-        let status = row.aggregate_status();
 
-        // 2px left edge = the colour of the worktree's most urgent agent - bare/prunable get
-        // their own dedicated colours (§2.2).
-        let edge_color: gpui::Rgba = if has_agents {
-            status.color()
-        } else if row.note.is_prunable() {
-            theme::rail::PRUNABLE_EDGE.into()
-        } else {
-            theme::status::IDLE_BG.into()
-        };
+        let edge_color =
+            worktree_row_edge(row.aggregate_status(), row.note.is_prunable(), is_selected);
 
         // `#dde2e7` active / `#c2c7cc` with agents / `#8b9197` bare (§2.2).
         let branch_color: gpui::Rgba = if is_selected {
@@ -1279,29 +1454,43 @@ impl AdeApp {
             theme::text::DIM.into()
         };
 
-        // The caret slot is always emitted, even for a childless worktree - it stays empty
-        // rather than disappearing, so every row's branch label lands at the same x offset
-        // (design_handoff_jerry_ade revision 5's own `w.caret` binding does the same: the glyph
-        // is emptied to "" but its fixed-width wrapper div never leaves the layout).
+        // The app's **one** disclosure caret (§4o/§4p): 10px `#8b9197` in a 13-wide box the full
+        // height of the row, "so the whole left column is clickable", with a hover lift and a
+        // tooltip. It was 8px `#6b7178` in an 11px box - "the smallest interactive target in the
+        // window and the one you hit most while triaging". §4p draws the line this sits on: a
+        // *disclosure* caret (rail rows, panel sections, group headers) gets this treatment, while
+        // a *dropdown chevron* bound to a button or chip stays at 8-8.5px.
+        //
+        // The slot itself is always emitted, even for a childless worktree - it stays empty
+        // (no glyph, no tooltip, no hover, no click) rather than disappearing, so every row's
+        // branch label lands at the same x offset regardless of whether that row has anything to
+        // expand (design_handoff_jerry_ade revision 5's own `w.caret` binding does the same: the
+        // glyph is emptied to "" but its fixed-width wrapper div never leaves the layout).
         let caret = {
             let worktree_path = row.path.clone();
             div()
                 .id(("worktree-caret", index as u64))
+                .debug_selector(move || format!("worktree-caret-{index}"))
                 .flex_none()
-                .w(px(11.0))
-                .h(px(11.0))
+                .w(px(13.0))
+                .h(px(27.0))
                 .flex()
                 .items_center()
                 .justify_center()
                 .font(font(theme::font::MONO))
-                .text_size(self.ui_text_size(8.0))
-                .text_color(theme::text::FAINT)
+                .text_size(self.ui_text_size(10.0))
+                .text_color(theme::text::DIM)
                 .when(has_children, |el| {
                     el.cursor_pointer()
                         // GitHub issue #128 - same lightweight text-only hover
                         // `Self::render_status_zoom_value` uses for an equally small, box-free
                         // clickable glyph.
-                        .hover(|el| el.text_color(theme::text::SELECTED))
+                        .hover(|el| el.text_color(theme::text::STRONG))
+                        // §4's "tooltips on every icon-only control". The wording is
+                        // `Jerry.dc.html`'s own, which states the thing the glyph cannot: this
+                        // control toggles the group *without* selecting the worktree, which is
+                        // what the `stop_propagation` below actually does.
+                        .tooltip(text_tooltip("Collapse or expand without selecting"))
                         .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
                         .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             cx.stop_propagation();
@@ -1323,6 +1512,10 @@ impl AdeApp {
         let mut trailing = div().flex().flex_none().items_center().gap(px(4.0));
         if has_agents {
             if !is_expanded {
+                // The collapsed row's per-agent status dots - along with the full agent rows when
+                // expanded, these are what carry status now that the row's own left edge no
+                // longer does (§4m). One dot per agent, most urgent first: the honest, per-agent
+                // version of the lossy `max()` the edge used to state.
                 let mut dot_statuses: Vec<Status> =
                     row.agents.iter().map(|agent| agent.status).collect();
                 dot_statuses.sort_by_key(|status| status.urgency_rank());
@@ -1336,15 +1529,31 @@ impl AdeApp {
                     }),
                 ));
             }
-            let (add, del) = row.diff_totals();
-            if add > 0 || del > 0 {
+            // §4o: the rail's diffstat is coloured like every other diffstat in the app, which is
+            // only possible because `rail::diff_stat_parts` returns its parts rather than one
+            // pre-joined string. The prose fallbacks below (`checkout · clean`, `merged ·
+            // prunable`) are a different kind of value and stay neutral.
+            if let Some((add, del)) = row.diff_stat_parts() {
                 trailing = trailing.child(
                     div()
+                        .flex_none()
+                        .whitespace_nowrap()
                         .font(font(theme::font::MONO))
                         .text_size(self.ui_text_size(9.5))
-                        .text_color(theme::text::GHOST)
-                        .child(format!("+{add} \u{2212}{del}")),
+                        .text_color(theme::diff::STAT_ADD)
+                        .child(add),
                 );
+                if let Some(del) = del {
+                    trailing = trailing.child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::diff::STAT_DEL)
+                            .child(del),
+                    );
+                }
             }
         }
 
@@ -1367,8 +1576,11 @@ impl AdeApp {
             .pl(px(6.0))
             .pr(px(10.0))
             .gap(px(6.0))
+            // The 2px gutter is always reserved (§4m: "The 2px gutter stays for alignment"); it
+            // is only *painted* when this row is the selected one. A `None` border colour paints
+            // nothing at all, which is the off state of a one-meaning channel.
             .border_l(px(2.0))
-            .border_color(edge_color)
+            .when_some(edge_color, |el, token| el.border_color(token))
             .when(is_selected, |el| el.bg(theme::rail::WORKTREE_ACTIVE_BG))
             .when(!is_selected, |el| {
                 el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
@@ -1395,6 +1607,11 @@ impl AdeApp {
             .id(("worktree-group", index as u64))
             .flex()
             .flex_col()
+            // §4n/§4s: 7px between worktree groups, against the 1px this had before and the 3px
+            // the repo header now sits above its own first row. "The ratio is the point: space
+            // inside a group is now smaller than the space between groups, so a worktree and its
+            // agents read as one block."
+            .pb(px(7.0))
             .child(header);
         if is_expanded {
             for agent in &row.agents {
@@ -1428,31 +1645,16 @@ impl AdeApp {
             container = container.tooltip(text_tooltip(tooltip_text));
         }
 
-        // The most urgently-waiting open agent's own question preview, if any - matches the
-        // old per-agent row's card exactly, just picked from among this worktree's several
-        // possible tabs rather than always having exactly one to show.
-        let question_preview = row
-            .agents
-            .iter()
-            .filter(|agent| agent.status == Status::Ask)
-            .find_map(|agent| agent.question_preview.as_ref());
-        if let Some(preview) = question_preview {
-            container = container.child(
-                div()
-                    .mt(px(4.0))
-                    .px(px(6.0))
-                    .py(px(4.0))
-                    .rounded(theme::radius::CHIP)
-                    .bg(theme::status::ASK_CARD_BG)
-                    .border_l(px(2.0))
-                    .border_color(theme::status::ASK_CARD_EDGE)
-                    .font(font(theme::font::SANS))
-                    .text_size(self.ui_text_size(10.5))
-                    .text_color(theme::status::ASK_CARD_FG)
-                    .child(preview.clone()),
-            );
-        }
-
+        // No question-preview card renders here, deliberately. `design_handoff_jerry_ade/revision
+        // 3/REVISION-2026-07-31.md` §2.3, verbatim: "**No question preview.** The amber ask box is
+        // gone from the rail; the question belongs in the agent pane where it can be answered."
+        // This is a design-driven removal of a card that really did ship (GitHub issue #268),
+        // confirmed as deliberate on 2026-08-14, not a regression: an amber box quoting a question
+        // in a surface with no way to answer it costs the rail's densest column two lines per
+        // asking worktree while the pane one click away already shows the question in full, live.
+        // The row's `needs input` dot and state word are what the rail is for. `AgentRow` carries
+        // no preview field at all any more (and `Self::build_agent_rows` no longer scrapes the pty
+        // grid for one) - see `rail_correction_tests`.
         container.into_any_element()
     }
 
@@ -1461,6 +1663,25 @@ impl AdeApp {
     /// elapsed, then status dot/state word/trailing text/model. Clicking it selects this
     /// agent's tab *and* its worktree (`Self::select_agent` - already does both: it's the
     /// same real entry point the palette/tab-strip use to jump straight to one agent).
+    ///
+    /// **The status edge stays here.** §4m deleted the *worktree* row's status edge because a
+    /// worktree has no status of its own - "Agent rows keep their status edge; there the status
+    /// genuinely belongs to the row's object."
+    ///
+    /// **The child no longer outranks its parent** (`STAGE-A-CHANGELOG.md` §4n). The title was
+    /// `450 11.5px/16px` in [`theme::text::BODY`] (`#b8bfc6`) while the worktree branch above it
+    /// was `500 11px` mono in the brighter [`theme::text::STRONG`] - "Larger and equally bright,
+    /// one level down. The eye landed on agent titles first and had to work backwards to find
+    /// which worktree they belonged to." It is now 11px in [`theme::rail::AGENT_TITLE`], with
+    /// tighter vertical block padding, and the fix is deliberately all on this side: **"Fix
+    /// hierarchy by shrinking the child, never by growing the parent"** - a first cut that
+    /// strengthened the branch instead pushed real branch names into ellipsis, and the branch name
+    /// is what you scan the rail for.
+    ///
+    /// The elapsed time is [`theme::text::GHOST`] (`#4e545a`) for **every** status (§4k: "the time
+    /// does not need to have a color here"). Urgency lives in the dot and the state word; an
+    /// asking agent used to carry three amber elements, and the third of them stated *when*, which
+    /// is not a severity.
     pub(in crate::rail) fn render_agent_row(
         &self,
         agent: &AgentRow,
@@ -1488,7 +1709,11 @@ impl AdeApp {
             .flex_col()
             .pl(px(13.0))
             .pr(px(10.0))
-            .py(px(4.0))
+            // §4n's tighter agent block: `5 10 6 7` -> `4 10 5 7`. The leading 13 here is this
+            // row's *indent* under its worktree rather than padding (the connector/status edge
+            // sits on it), so only the vertical pair moves.
+            .pt(px(4.0))
+            .pb(px(5.0))
             .gap(px(2.0))
             .border_l(if is_selected { px(2.0) } else { px(1.0) })
             .border_color(if is_selected {
@@ -1516,17 +1741,14 @@ impl AdeApp {
                             .min_w_0()
                             .truncate()
                             .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(11.5))
-                            .text_color(if is_selected {
-                                theme::text::SELECTED
-                            } else {
-                                theme::text::BODY
-                            })
+                            .text_size(self.ui_text_size(11.0))
+                            .text_color(agent_title_color(status, is_selected))
                             .child(agent.title.clone()),
                     )
                     .child(
                         div()
                             .flex_none()
+                            // §4k: always the neutral time token, whatever the status.
                             .font(font(theme::font::MONO))
                             .text_size(self.ui_text_size(9.5))
                             .text_color(theme::text::GHOST)
@@ -1750,51 +1972,97 @@ impl AdeApp {
         }
     }
 
-    /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real `prune`
-    /// action.
+    /// The total real disk these prune candidates would free, or `None` while the background
+    /// scan ([`Self::load_disk_usage`], whose per-worktree half is [`Self::worktree_disk_usage`])
+    /// has not yet measured **every** one of them.
+    ///
+    /// All-or-nothing on purpose: a partial sum presented as "frees N" would be a number that is
+    /// wrong in the one direction that matters (too small), and the caller
+    /// ([`rail::prune_tooltip`]) drops the clause entirely rather than under-reporting. The
+    /// `truncated` flag is OR-ed across candidates, since one truncated walk makes the whole sum
+    /// a floor.
+    pub(in crate::rail) fn prunable_disk_usage(&self, paths: &[PathBuf]) -> Option<(u64, bool)> {
+        let mut total = 0u64;
+        let mut truncated = false;
+        for path in paths {
+            let (bytes, was_truncated) = self.worktree_disk_usage.get(path).copied()?;
+            total = total.saturating_add(bytes);
+            truncated |= was_truncated;
+        }
+        Some((total, truncated))
+    }
+
+    /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real prune action.
+    ///
+    /// `prune` is a **bin icon at a 17px hit box** as of revision 6 (`REVISION-2026-08-14.md` §4):
+    /// "it was the only text action in a rail otherwise made of rows". The text-button path is
+    /// deleted in the same edit that added the icon, per §7 rule 5 - a control described twice is
+    /// two specifications of one thing. What the word could not carry moves into the tooltip
+    /// ([`rail::prune_tooltip`]), which now states what pruning means, how many candidates there
+    /// are, and how much disk it buys back.
+    ///
+    /// The two-click arm/confirm is unchanged, only restated: an armed control turns
+    /// [`theme::button::DANGER_FG`] and its tooltip becomes [`rail::prune_armed_tooltip`]. The
+    /// glyph is `crate::icons::Icon::Trash`, drawn through the shared `crate::icons::IconRow` at
+    /// `crate::icons::IconSize::Control` - the 17px box §7 rule 7 exists to keep every icon
+    /// button in the app sharing.
     pub(in crate::rail) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Includes error'd entries - the count should match what `wt_core::list_worktrees`
         // reported, problems included, not silently shrink.
         let worktree_count = self.worktrees.len();
         let disk_label = self.disk_usage_label();
-        let prunable_count = self.prunable_worktree_paths().len();
-        let prune_label = if self.prune_in_flight {
-            "pruning\u{2026}".to_string()
-        } else if self.prune_confirm_armed {
-            format!("confirm prune ({prunable_count})?")
+        let prunable_paths = self.prunable_worktree_paths();
+        let prunable_count = prunable_paths.len();
+
+        // Mirrors `Self::render_merge_flow_footer`'s `in_flight` gating: while a prune batch is
+        // running - and, equally, when there is nothing to prune (§7 rule 2: "A control that acts
+        // on results does not exist when there are none") - this control drops
+        // `cursor_pointer`/hover/`on_click` entirely rather than staying enabled-looking and
+        // inviting a click `Self::execute_prune`'s guard would silently swallow.
+        let enabled = !self.prune_in_flight && prunable_count > 0;
+        let tooltip_text = if self.prune_in_flight {
+            rail::pruning_label(prunable_count)
+        } else if self.prune_confirm_armed && prunable_count > 0 {
+            rail::prune_armed_tooltip(prunable_count)
         } else {
-            format!("prune ({prunable_count})")
+            rail::prune_tooltip(prunable_count, self.prunable_disk_usage(&prunable_paths))
+        };
+        let armed = enabled && self.prune_confirm_armed;
+        let icon_color = if !enabled {
+            theme::text::DISABLED
+        } else if armed {
+            theme::button::DANGER_FG
+        } else {
+            theme::text::FAINT
         };
 
         let prune_button = div()
             .id("rail-prune")
-            .px(px(6.0))
-            .py(px(2.0))
+            .debug_selector(|| "rail-prune".to_string())
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(crate::icons::IconSize::Control.box_size())
+            .h(crate::icons::IconSize::Control.box_size())
             .rounded(theme::radius::CHIP)
-            .font(font(theme::font::MONO))
-            .text_size(self.ui_text_size(10.0));
-        // Mirrors `Self::render_merge_flow_footer`'s `in_flight` gating: while a prune batch
-        // is running, this button drops `cursor_pointer`/hover/`on_click` entirely rather
-        // than staying enabled-looking and inviting a click `Self::execute_prune`'s guard
-        // would silently swallow.
-        let prune_button = if self.prune_in_flight {
-            prune_button
-                .cursor_default()
-                .text_color(theme::text::DISABLED)
-                .child(prune_label)
-        } else {
+            .tooltip(text_tooltip(tooltip_text))
+            .child(
+                crate::icons::IconRow::new(
+                    &self.settings.icon_pack,
+                    crate::icons::IconSize::Control,
+                )
+                .draw(crate::icons::Icon::Trash, icon_color),
+            );
+        let prune_button = if enabled {
             prune_button
                 .cursor_pointer()
-                .text_color(if prunable_count > 0 {
-                    theme::button::DANGER_FG
-                } else {
-                    theme::text::DISABLED
-                })
                 .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-                .child(prune_label)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.request_prune(cx);
                 }))
+        } else {
+            prune_button.cursor_default()
         };
 
         div()
@@ -1858,7 +2126,6 @@ mod agent_trailing_text_count_tests {
             branch: Some("feature-x".to_string()),
             add: 0,
             del: 0,
-            question_preview: None,
             exit_code: None,
             activity: None,
             elapsed: Duration::ZERO,
@@ -2129,7 +2396,6 @@ mod rail_row_tests {
             branch: Some("wt".to_string()),
             add: 0,
             del: 0,
-            question_preview: None,
             exit_code: None,
             activity: None,
             elapsed: std::time::Duration::from_secs(1),
@@ -4234,7 +4500,6 @@ mod status_wording_tests {
             branch: Some("feature-x".to_string()),
             add: 0,
             del: 0,
-            question_preview: None,
             exit_code: Some(0),
             activity: None,
             elapsed: Duration::from_secs(90),
@@ -4319,6 +4584,376 @@ mod status_wording_tests {
         assert_eq!(
             agent_trailing_text(&row(Status::Review, Some(12))),
             "12 files"
+        );
+    }
+}
+
+/// Revision 6's rail corrections (GitHub issue #289, `design_handoff_jerry_ade/revision 5/
+/// REVISION-2026-08-14.md` §4 and `STAGE-A-CHANGELOG.md` §4k-§4s), in their pure, window-free
+/// half: the two colour decisions that were structurally wrong before, and the deletion of the
+/// rail's ask card.
+#[cfg(test)]
+mod rail_correction_tests {
+    use super::*;
+
+    /// §4m, the whole rule: the worktree row's 2px left edge means **selection or nothing**.
+    ///
+    /// Swept across every real [`Status`] and both `prunable` values, because those are exactly
+    /// the two inputs that used to move this colour - the most urgent agent's status, and the
+    /// prunable/bare distinction. A regression that reintroduced either one would light up an
+    /// unselected row here, and the sweep is what makes "all three are deleted" a checkable claim
+    /// rather than a comment.
+    #[test]
+    fn the_worktree_edge_is_selection_or_nothing_whatever_the_row_holds() {
+        for status in Status::ORDER {
+            for is_prunable in [false, true] {
+                assert_eq!(
+                    worktree_row_edge(status, is_prunable, false),
+                    None,
+                    "an unselected row must draw no edge at all - not a status colour, not the \
+                     old prunable grey, not a bare grey (status {status:?}, prunable \
+                     {is_prunable})"
+                );
+                assert_eq!(
+                    worktree_row_edge(status, is_prunable, true),
+                    Some(theme::border::SELECTED_EDGE),
+                    "the selected row's edge is the app's one selection blue, whatever its \
+                     agents are doing (status {status:?}, prunable {is_prunable})"
+                );
+            }
+        }
+    }
+
+    /// §4n: the agent title is dimmer than the worktree branch above it, and dimmer still when
+    /// the agent is paused - "Fix hierarchy by shrinking the child, never by growing the parent."
+    #[test]
+    fn the_agent_title_sits_below_its_parent_branch_in_the_hierarchy() {
+        assert_eq!(
+            agent_title_color(Status::Run, false),
+            theme::rail::AGENT_TITLE,
+            "a live agent's title is the rail's own agent-title token, one step below the \
+             branch's `text::STRONG`"
+        );
+        assert_ne!(
+            agent_title_color(Status::Run, false),
+            theme::text::STRONG,
+            "the child must not share the parent's colour - equal brightness one level down is \
+             the exact defect §4n names"
+        );
+        assert_eq!(
+            agent_title_color(Status::Idle, false),
+            theme::text::DIMMER,
+            "a paused agent drops further still"
+        );
+        assert_eq!(
+            agent_title_color(Status::Fail, true),
+            theme::text::SELECTED,
+            "the globally active agent's title is the selection colour whatever its status"
+        );
+    }
+
+    /// The rail's amber question-preview card is gone (`REVISION-2026-07-31.md` §2.3: "No
+    /// question preview. The amber ask box is gone from the rail; the question belongs in the
+    /// agent pane where it can be answered"), and this is the guard that keeps it gone.
+    ///
+    /// Two independent facts, neither of which a comment could hold:
+    ///
+    /// 1. **The data is gone.** `AgentRow` carries no preview field, so there is nothing in the
+    ///    rail's own model for a card to render. That is a compile-time fact - the name appearing
+    ///    in this file's source at all would mean it came back.
+    /// 2. **The card's ink is gone.** `status.ask_card_*` were the three tokens that painted it,
+    ///    and they were the rail's only use of them. The tokens themselves stay in the palette
+    ///    (the card moves to the agent pane, it is not abolished), so the check that matters is
+    ///    that *this file* no longer reaches for them.
+    ///
+    /// Source-level, the same `include_str!`-your-own-file idiom `crate::theme`'s
+    /// `token_registry_tests` already uses, because the thing under test is the absence of code
+    /// rather than the behaviour of any.
+    #[test]
+    fn no_rail_render_code_reaches_for_the_removed_ask_card() {
+        const SOURCE: &str = include_str!("render.rs");
+        // Comment lines (doc comments included) are dropped: this file explains the removal in
+        // prose in three places, and prose naming a thing is not code reaching for it.
+        let code = SOURCE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Both needles are assembled at runtime rather than written as literals: this test's own
+        // source is inside the string it scans, so a literal would match itself.
+        let card_tokens = format!("{}{}", "ASK_", "CARD");
+        let removed_field = format!("{}{}", "question_", "preview");
+        assert!(
+            !code.contains(&card_tokens),
+            "the rail's ask card was deliberately removed - no rail code may paint \
+             `status.ask_card_*` again"
+        );
+        assert!(
+            !code.contains(&removed_field),
+            "`AgentRow`'s removed preview field was deleted with the card it fed; a reference to \
+             it here means the field (and the pty grid scrape behind it) came back"
+        );
+    }
+}
+
+/// Revision 6's rail corrections, in their *painted* half: real windows, real spawned processes,
+/// real measured bounds. Every assertion here is about something the previous rail genuinely drew
+/// differently, so each would fail against the code this issue replaced.
+#[cfg(test)]
+mod rail_rev6_render_tests {
+    use super::*;
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: label.to_string(),
+            branch: Some(label.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// `gpui::VisualTestContext::debug_bounds` takes a `&'static str`, and every selector here is
+    /// built from a real runtime path or repo id - the same `Box::leak` idiom this file's own
+    /// `click_worktree_row` and `crate::settings::render`'s `row_selector` already use, in a test
+    /// binary that exits moments later.
+    fn selector(name: String) -> &'static str {
+        Box::leak(name.into_boxed_str())
+    }
+
+    /// A real agent whose process genuinely failed to start - a `ProcessKind::Shell` spawn with a
+    /// `shell_override` naming a binary that does not exist, retagged to a real agent kind
+    /// (`Agents::set_kind_for_test`, which touches only the bookkeeping) so the rail produces a
+    /// row for it at all. `TerminalPane::spawn_error` is then really set, which
+    /// `AdeApp::agent_status` reads as `ProcessSignal::Exited { success: false }` and
+    /// `rail::status::derive_status` turns into a real [`Status::Fail`].
+    ///
+    /// Deliberately not a real `claude` spawn: that would pass or fail depending on whether the
+    /// machine running the suite has the binary installed, which is not something this test is
+    /// about.
+    fn open_with_a_failed_agent(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        gpui::Entity<crate::root::AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, _cx| {
+            app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(0, window, cx);
+            let id = app.agents.spawn(
+                ProcessKind::Shell,
+                wt.path().to_path_buf(),
+                12.0,
+                Some("/nonexistent/jerry-issue-289-not-a-real-binary"),
+                None,
+                window,
+                cx,
+            );
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+        });
+        cx.run_until_parked();
+        (repo, wt, app, cx)
+    }
+
+    /// §4/§4q and §9's checklist box 7, painted: a repo holding a failed agent shows the **red**
+    /// dot+count pair in its header, and shows **no amber one at all** - not an amber `0`, not an
+    /// amber pair that also counts it.
+    ///
+    /// This is the live counterpart to `crate::rail::state`'s pure
+    /// `a_worktree_holding_both_an_asking_and_a_failed_agent_counts_once_as_failed`: that one
+    /// proves the arithmetic, this one proves the header is really wired to it and that the
+    /// hidden-at-zero rule really removes the element rather than drawing an empty slot.
+    #[gpui::test]
+    fn a_failed_agent_paints_the_repo_headers_red_pair_and_no_amber_one(cx: &mut TestAppContext) {
+        let (_repo, _wt, app, cx) = open_with_a_failed_agent(cx);
+
+        let (repo_id, groups) =
+            app.update(cx, |app, cx| (app.repos[0].id.0, app.build_repo_groups(cx)));
+        assert_eq!(
+            groups[0].failed_count(),
+            1,
+            "sanity check: the seeded agent really did fail to start, so this repo really does \
+             hold one failed worktree"
+        );
+        assert_eq!(groups[0].needs_input_count(), 0, "sanity check");
+
+        assert!(
+            cx.debug_bounds(selector(format!("repo-fail-count-{repo_id}")))
+                .is_some(),
+            "the repo header must paint its red dot+count pair for a repo holding a failed agent"
+        );
+        assert!(
+            cx.debug_bounds(selector(format!("repo-ask-count-{repo_id}")))
+                .is_none(),
+            "and must paint no amber pair at all at zero - hidden entirely, never an empty slot \
+             (and never counting the failed worktree a second time in amber)"
+        );
+    }
+
+    /// §4q's "each hidden at zero", driven through the real render function for both pairs and
+    /// both sides of the boundary - the half of the rule a repo with a failed agent alone cannot
+    /// exercise.
+    #[gpui::test]
+    fn each_urgency_pair_is_an_element_only_when_its_own_count_is_nonzero(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| {
+            let repo_id = app.repos[0].id;
+            for kind in [UrgencyCount::NeedsInput, UrgencyCount::Failed] {
+                assert!(
+                    app.render_repo_urgency_count(repo_id, kind, 0).is_none(),
+                    "{kind:?} must render nothing at all at zero"
+                );
+                assert!(
+                    app.render_repo_urgency_count(repo_id, kind, 1).is_some(),
+                    "{kind:?} must render its pair as soon as it has something to report"
+                );
+            }
+        });
+    }
+
+    /// §4o: the caret is "10px `#8b9197` in a 13x27 box (the row's full height, so the whole left
+    /// column is clickable)" - it was 8px in an 11px box, "the smallest interactive target in the
+    /// window and the one you hit most while triaging".
+    ///
+    /// Measured, not asserted from the source: a real painted hit box, in a real window, on a
+    /// real worktree row that really has an agent under it.
+    #[gpui::test]
+    fn the_worktree_caret_is_a_full_row_height_hit_box(cx: &mut TestAppContext) {
+        let (_repo, _wt, _app, cx) = open_with_a_failed_agent(cx);
+
+        let caret = cx
+            .debug_bounds("worktree-caret-0")
+            .expect("a worktree row with an agent under it must paint a caret");
+        assert_eq!(
+            caret.size.width,
+            px(13.0),
+            "the caret's hit box spans the row's whole left column"
+        );
+        assert_eq!(
+            caret.size.height,
+            px(27.0),
+            "and the row's full 27px height - a caret you can only hit in an 11px square is the \
+             defect §4o names"
+        );
+    }
+
+    /// §4/§8: `prune` is a bin icon at a 17px hit box, and the text button it replaced is gone -
+    /// "it was the only text action in a rail otherwise made of rows", and §7 rule 5 requires the
+    /// old path to go in the same edit.
+    #[gpui::test]
+    fn the_prune_control_is_a_bin_icon_in_a_seventeen_pixel_box(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let button = cx
+            .debug_bounds("rail-prune")
+            .expect("the rail footer must paint its prune control");
+        assert_eq!(button.size.width, px(17.0));
+        assert_eq!(
+            button.size.height,
+            px(17.0),
+            "the shared 17px icon-button box (`icons::IconSize::Control`), not a text button's \
+             own intrinsic size"
+        );
+        assert!(
+            cx.debug_bounds("icon-trash").is_some(),
+            "and the real vendored Phosphor `trash` SVG must be what paints inside it"
+        );
+    }
+
+    /// §4s's spacing ratio, measured: "the header is visibly closer to its own rows than the rows
+    /// are to each other, which is the whole job of a section header" - 3px below the band, 7px
+    /// between worktrees (§4n raised the latter from 1px, where "ten groups ran together as one
+    /// stream").
+    #[gpui::test]
+    fn the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let alpha = tempfile::tempdir().expect("tempdir alpha");
+        let beta = tempfile::tempdir().expect("tempdir beta");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, cx| {
+            app.worktrees = vec![
+                worktree_item(alpha.path().to_path_buf(), "alpha"),
+                worktree_item(beta.path().to_path_buf(), "beta"),
+            ];
+            // Without this the seeded list never reaches a paint pass, and `debug_bounds` below
+            // would be reading the startup window's own tree.
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // The rendered order is `WorktreeRow::urgency_rank`'s, not the order they were seeded in,
+        // so the two row selectors are read back from the real groups this render pass built -
+        // the same idiom `worktree_tab_attribution_tests::click_worktree_row` uses.
+        let (repo_id, rendered_paths) = app.update(cx, |app, cx| {
+            let groups = app.build_repo_groups(cx);
+            (
+                app.repos[0].id.0,
+                groups[0]
+                    .rows
+                    .iter()
+                    .map(|row| row.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            rendered_paths.len(),
+            2,
+            "sanity check: both seeded worktrees are real rows in this repo's one group"
+        );
+
+        let header = cx
+            .debug_bounds(selector(format!("repo-group-header-{repo_id}")))
+            .expect("the repo band must paint");
+        let first = cx
+            .debug_bounds(selector(format!(
+                "worktree-row-0-{}",
+                rendered_paths[0].display()
+            )))
+            .expect("the first worktree row must paint");
+        let second = cx
+            .debug_bounds(selector(format!(
+                "worktree-row-1-{}",
+                rendered_paths[1].display()
+            )))
+            .expect("the second worktree row must paint");
+
+        assert_eq!(
+            header.size.height,
+            px(26.0),
+            "§4s: the band is 26 high with its content vertically centred, not held by \
+             asymmetric padding"
+        );
+        let header_to_row = first.origin.y - (header.origin.y + header.size.height);
+        let row_to_row = second.origin.y - (first.origin.y + first.size.height);
+        assert_eq!(header_to_row, px(3.0), "3px below the band");
+        assert_eq!(row_to_row, px(7.0), "7px between worktree groups");
+        assert!(
+            header_to_row < row_to_row,
+            "the ratio is the point: a header that sits as far from its own rows as they sit \
+             from each other groups nothing"
         );
     }
 }

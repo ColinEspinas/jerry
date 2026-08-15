@@ -35,10 +35,6 @@ pub struct AgentRow {
     /// every changed file. Both `0` if the diff hasn't loaded yet or there are no changes.
     pub add: usize,
     pub del: usize,
-    /// Tail-of-pty text for a waiting agent (`TerminalPane::visible_text_lines`, trimmed to
-    /// the last non-blank line) - the design's "question preview". Only populated for
-    /// [`Status::Ask`] rows.
-    pub question_preview: Option<String>,
     /// The process exit code, only for [`Status::Fail`]/[`Status::Review`]/exited-`Idle`
     /// rows. `None` while still running or never started.
     pub exit_code: Option<u32>,
@@ -46,9 +42,8 @@ pub struct AgentRow {
     /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "the live tool call -
     /// `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`".
     ///
-    /// A sibling field here rather than a payload on [`Status::Run`] itself, mirroring
-    /// [`Self::question_preview`]'s own shape immediately above (also status-conditional, also a
-    /// row-level fact rather than part of the status enum) - keeping [`Status`] itself a plain
+    /// A sibling field here rather than a payload on [`Status::Run`] itself (status-conditional,
+    /// but a row-level fact rather than part of the status enum) - keeping [`Status`] itself a plain
     /// `Copy` value users of `Status::ORDER`/`urgency_rank`/`color` etc. can keep relying on,
     /// rather than every one of those call sites suddenly needing to supply or ignore an
     /// `activity` payload for a `Run` variant they don't care about.
@@ -357,6 +352,22 @@ impl WorktreeRow {
             .unwrap_or((0, 0))
     }
 
+    /// This row's diffstat as its two **separately coloured parts**, or `None` when there is no
+    /// real diff to show - see [`diff_stat_parts`], which this is [`Self::diff_totals`] fed into.
+    pub fn diff_stat_parts(&self) -> Option<(String, Option<String>)> {
+        let (add, del) = self.diff_totals();
+        diff_stat_parts(add, del)
+    }
+
+    /// Whether any agent open in this worktree currently holds `status` - the exact granularity
+    /// the repo header's two urgency counts are defined at (see [`RepoGroup::failed_count`]), as
+    /// opposed to [`Self::aggregate_status`]'s single most-urgent answer. A worktree holding one
+    /// asking agent *and* one failed agent genuinely holds both facts; collapsing it to one
+    /// status first is what made the old single amber count claim it was only asking.
+    pub fn has_agent_with(&self, status: Status) -> bool {
+        self.agents.iter().any(|agent| agent.status == status)
+    }
+
     /// Whether this row matches a rail filter query - its own label/branch/path (see
     /// [`matches_filter_worktree_entry`]) or any of its open agents' own title/branch/kind
     /// (see [`AgentRow::matches_filter`]).
@@ -494,22 +505,48 @@ pub struct RepoGroup {
 }
 
 impl RepoGroup {
-    /// The group header's right-aligned amber `N worktrees waiting` (§2.1: "counting worktrees
-    /// in that repo holding an asking or failed agent, hidden at zero"). Deliberately worktree-
-    /// level, not agent-level: a worktree with two asking agents still counts once, since the
-    /// header is answering "how many rows in this group want me", not "how many agents".
+    /// The group header's **red** urgency count: worktrees in this repo holding at least one
+    /// failed agent, hidden at zero.
+    ///
+    /// Revision 6 (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4,
+    /// `STAGE-A-CHANGELOG.md` §4q) split the header's single amber `N worktrees waiting` into two
+    /// counts, because merging them "said 'three worktrees want you' when one of the three had
+    /// actually died, and amber is the wrong colour for that". §7 rule 4, verbatim: **"Two states
+    /// distinguished anywhere in the app are never summed anywhere in it."** The title bar has
+    /// always shown `ask`/`fail`/`running` apart; the rail header now does too.
+    ///
+    /// Deliberately worktree-level, not agent-level: a worktree with two failed agents still
+    /// counts once, since the header answers "how many rows in this group want me", not "how many
+    /// agents".
     ///
     /// Reads [`Self::all_rows`], **not** [`Self::rows`]: this count must survive a filter query
     /// that hides the very row it's counting, and must survive the group's rows being collapsed
-    /// away for a non-focused repo, per this same section's "a repo you have scrolled past
-    /// still reports that something in it wants a human".
-    pub fn waiting_count(&self) -> usize {
+    /// away for a non-focused repo, per §2.0's "a repo you have scrolled past still reports that
+    /// something in it wants a human".
+    pub fn failed_count(&self) -> usize {
         self.all_rows
             .iter()
-            .filter(|row| {
-                !row.agents.is_empty()
-                    && matches!(row.aggregate_status(), Status::Ask | Status::Fail)
-            })
+            .filter(|row| row.has_agent_with(Status::Fail))
+            .count()
+    }
+
+    /// The group header's **amber** urgency count: worktrees holding at least one asking agent
+    /// **and no failed one**, hidden at zero.
+    ///
+    /// The `and no failed one` half is the whole point of §9's checklist box 7 ("a both-states
+    /// worktree counts once as failed") and of §4q's own rule: "A worktree holding both an asking
+    /// and a failed agent counts **once, as failed** - the worse state wins, so the two counts sum
+    /// to the number of worktrees needing you rather than double-counting." Written against
+    /// [`WorktreeRow::has_agent_with`] rather than [`WorktreeRow::aggregate_status`] on purpose:
+    /// `aggregate_status` ranks `Ask` *above* `Fail` ([`Status::urgency_rank`]), so a both-states
+    /// worktree aggregates to `Ask` and would have landed in the amber count - the exact
+    /// mis-colouring §4q rejected.
+    ///
+    /// Reads [`Self::all_rows`] for the same reason [`Self::failed_count`] does.
+    pub fn needs_input_count(&self) -> usize {
+        self.all_rows
+            .iter()
+            .filter(|row| !row.has_agent_with(Status::Fail) && row.has_agent_with(Status::Ask))
             .count()
     }
 
@@ -529,25 +566,62 @@ impl RepoGroup {
     }
 }
 
-/// The group header's amber waiting-count text (§2.1's `N worktrees waiting`) - `None` at zero
-/// (hidden entirely, never an empty chip, mirroring
-/// `crate::title_bar::render::title_bar_agent_state_chip_text`'s own "hidden at zero" rule),
-/// singular for exactly one (`"1 worktree waiting"`), plural otherwise (`"N worktrees
-/// waiting"`) - the design doc's own example (`3 worktrees waiting`) never shows the singular
-/// case, but the rest of this codebase already conjugates every other counter correctly (see
-/// that same title-bar function's `"1 agent needs input"` vs `"2 agents need input"`), so this
-/// one must too.
+/// The tooltip on the repo header's **amber** dot+count pair: `"2 worktrees here need input"`.
 ///
-/// The conjugation itself is [`crate::root::plural`]'s, not a hand-written match arm per count:
-/// hiding at zero is this function's own decision (a content choice), agreeing at one versus
-/// many is not.
-pub fn waiting_count_label(count: usize) -> Option<String> {
-    if count == 0 {
+/// Revision 6 replaced the header's one prose run (`3 worktrees waiting`) with two bare
+/// dot+count pairs, and put the sentence in a tooltip instead - `STAGE-A-CHANGELOG.md` §4q's own
+/// rule: **"a count belongs in the header, a sentence belongs in a tooltip. If a header needs a
+/// sentence to be understood, the signal is wrong, not the copy."** The old
+/// `waiting_count_label` text path was deleted in the same edit that added these two, per §7
+/// rule 5 ("Replacing a control means deleting its old keys in the same edit - a key defined
+/// twice is two specifications of one thing, and the reader cannot tell which is real").
+///
+/// Both the noun and the verb agree through [`crate::root::plural`] rather than a hand-written
+/// ternary (§7 rule 9) - `Jerry.dc.html`'s own `askTip` conjugates `needs`/`need` too, and a
+/// tooltip reading "1 worktrees here need input" would be exactly the defect that rule exists for.
+/// Hiding at zero is the *caller's* decision (a content choice, made at the render site by not
+/// drawing the pair at all), so this function is total and always returns a real sentence.
+pub fn needs_input_tooltip(count: usize) -> String {
+    format!(
+        "{} here {} input",
+        plural::count(count, "worktree", None),
+        plural::form(count, "needs", "need")
+    )
+}
+
+/// The tooltip on the repo header's **red** dot+count pair: `"1 worktree here has a failed
+/// agent"` / `"2 worktrees here have failed agents"`. See [`needs_input_tooltip`] for why the
+/// sentence lives in a tooltip at all, and for the conjugation rule.
+pub fn failed_tooltip(count: usize) -> String {
+    format!(
+        "{} here {} failed {}",
+        plural::count(count, "worktree", None),
+        plural::form(count, "has a", "have"),
+        plural::form(count, "agent", "agents")
+    )
+}
+
+/// A rail worktree row's diffstat, as the two parts it is **coloured** in - `("+152",
+/// Some("−11"))` - or `None` when there is no real diff to show.
+///
+/// `STAGE-A-CHANGELOG.md` §4o, verbatim: **"A value that is coloured anywhere must be coloured
+/// everywhere, which means the logic returns its parts, not a pre-joined string."** The rail used
+/// to compose `+152 −11` into one neutral `#5e646a` string here, which is precisely why it could
+/// not be coloured, while run rows, uncommitted rows, commit rows and section headers all split
+/// theirs into `diff::STAT_ADD`/`diff::STAT_DEL`. Same number, read the same way, styled two
+/// different ways depending on which panel it was in.
+///
+/// The deletion half is `Option` rather than a `−0`: `Jerry.dc.html`'s own `wtStats` returns
+/// `del: d ? '−' + d : ''`, so a pure-addition diff shows one part, not a second one that says
+/// nothing. Both zero is `None` outright - the row's prose fallback (`checkout · clean`, `merged ·
+/// prunable`), which stays neutral, is what occupies that slot instead.
+pub fn diff_stat_parts(add: usize, del: usize) -> Option<(String, Option<String>)> {
+    if add == 0 && del == 0 {
         return None;
     }
-    Some(format!(
-        "{} waiting",
-        plural::count(count, "worktree", None)
+    Some((
+        format!("+{add}"),
+        (del > 0).then(|| format!("\u{2212}{del}")),
     ))
 }
 
@@ -560,6 +634,51 @@ pub fn worktree_disk_label(worktree_count: usize, disk_label: &str) -> String {
     format!(
         "{} \u{b7} {disk_label}",
         plural::count(worktree_count, "worktree", None)
+    )
+}
+
+/// The rail footer's prune control's tooltip - `"Prune merged worktrees \u{2014} 1 prunable,
+/// frees 214 MB"`.
+///
+/// `REVISION-2026-08-14.md` §4 turned `prune` from the rail's one text button into a bin icon at a
+/// 17px hit box, "the only text action in a rail otherwise made of rows" - and the tooltip is
+/// where the words went. It deliberately carries **more** than the button's old `prune (1)` label
+/// could: what pruning means (merged worktrees), how many are candidates, and what it buys back.
+///
+/// `freed_bytes` is `Some((bytes, truncated))` only once the real background disk scan
+/// (`crate::root::AdeApp::load_disk_usage`, whose per-worktree half lives in
+/// `crate::root::AdeApp::worktree_disk_usage`) has reported a size for **every** prune candidate.
+/// While any candidate is unmeasured it is `None` and the `, frees N` clause is simply absent
+/// rather than under-reported - the same honesty rule `crate::rail::render::AdeApp::
+/// disk_usage_label`'s `...` and the repo header's em-dash `\u{2014} wt` already follow. The
+/// `truncated` flag (a scan that hit its own walk limit) renders `frees 214 MB+`, exactly as
+/// [`format_bytes`]' caller in `disk_usage_label` does.
+///
+/// At zero candidates the sentence changes shape rather than reading `0 prunable`: nothing is
+/// offered, so the tooltip says so.
+pub fn prune_tooltip(prunable_count: usize, freed_bytes: Option<(u64, bool)>) -> String {
+    if prunable_count == 0 {
+        return "Prune merged worktrees \u{2014} nothing prunable".to_string();
+    }
+    let freed = match freed_bytes {
+        Some((bytes, truncated)) => {
+            let suffix = if truncated { "+" } else { "" };
+            format!(", frees {}{suffix}", format_bytes(bytes))
+        }
+        None => String::new(),
+    };
+    format!(
+        "Prune merged worktrees \u{2014} {} prunable{freed}",
+        prunable_count
+    )
+}
+
+/// The prune control's armed-state tooltip - the second half of the two-click arm/confirm the
+/// icon inherits unchanged from the text button it replaced.
+pub fn prune_armed_tooltip(prunable_count: usize) -> String {
+    format!(
+        "Click again to remove {}",
+        plural::count(prunable_count, "worktree", None)
     )
 }
 
@@ -839,7 +958,6 @@ mod tests {
             branch: Some("feature-x".to_string()),
             add: 0,
             del: 0,
-            question_preview: None,
             exit_code: None,
             activity: None,
             elapsed: Duration::ZERO,
@@ -1363,8 +1481,10 @@ mod tests {
         );
     }
 
+    /// §4q's split: the header's one amber count became an amber `needs input` count and a red
+    /// `failed` count, each counting worktrees (not agents), each zero when nothing qualifies.
     #[test]
-    fn repo_group_waiting_count_counts_worktrees_asking_or_failed_hiding_zero_otherwise() {
+    fn repo_group_urgency_counts_report_asking_and_failed_worktrees_separately() {
         let worktrees = vec![
             worktree_entry("/repo-wt/asking", clean_note(false)),
             worktree_entry("/repo-wt/failed", clean_note(false)),
@@ -1379,9 +1499,15 @@ mod tests {
         let rows = build_worktree_rows(&worktrees, &agents);
         let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
         assert_eq!(
-            groups[0].waiting_count(),
-            2,
-            "counts the asking and the failed worktree, not the running or bare ones"
+            groups[0].needs_input_count(),
+            1,
+            "the amber count is the asking worktree alone - never summed with the failed one \
+             (§7 rule 4: two states distinguished anywhere are never summed anywhere)"
+        );
+        assert_eq!(
+            groups[0].failed_count(),
+            1,
+            "the red count is the failed worktree alone, not the running or bare ones"
         );
 
         let all_quiet = build_worktree_rows(
@@ -1389,14 +1515,53 @@ mod tests {
             &[row(1, Status::Run, "run", "/repo-wt/running-only")],
         );
         let quiet_groups = group_worktrees_by_repo(vec![repo_worktrees(0, "quiet", all_quiet)]);
+        assert_eq!(quiet_groups[0].needs_input_count(), 0);
         assert_eq!(
-            quiet_groups[0].waiting_count(),
+            quiet_groups[0].failed_count(),
             0,
-            "hidden at zero - no asking or failed worktrees"
+            "both counts are zero for a repo whose only agent is running - the render side hides \
+             each pair at zero"
         );
     }
 
-    /// The bug the coordinator's audit found: `RepoGroup::waiting_count` and the header's
+    /// `REVISION-2026-08-14.md` §9's checklist box 7, verbatim: "Repo header shows ask and fail
+    /// separately; **a both-states worktree counts once as failed**."
+    ///
+    /// The trap this guards is real and specific: [`WorktreeRow::aggregate_status`] ranks `Ask`
+    /// *above* `Fail` ([`Status::urgency_rank`]), so a worktree holding one of each aggregates to
+    /// `Ask`. A count written against the aggregate would put this worktree in the **amber**
+    /// column - which is exactly §4q's "amber is the wrong colour for that" defect, and would also
+    /// make the two counts sum to more, or to the wrong colour, rather than to "the number of
+    /// worktrees needing you".
+    #[test]
+    fn a_worktree_holding_both_an_asking_and_a_failed_agent_counts_once_as_failed() {
+        let worktrees = vec![worktree_entry("/repo-wt/both", clean_note(false))];
+        let agents = vec![
+            row(1, Status::Ask, "ask", "/repo-wt/both"),
+            row(2, Status::Fail, "fail", "/repo-wt/both"),
+        ];
+        let rows = build_worktree_rows(&worktrees, &agents);
+        assert_eq!(
+            rows[0].aggregate_status(),
+            Status::Ask,
+            "sanity check: the aggregate really does rank Ask above Fail, so counting off it \
+             would put this worktree in the amber column"
+        );
+
+        let groups = group_worktrees_by_repo(vec![repo_worktrees(0, "jerry-core", rows)]);
+        assert_eq!(
+            groups[0].failed_count(),
+            1,
+            "the worse state wins: this worktree is counted in red"
+        );
+        assert_eq!(
+            groups[0].needs_input_count(),
+            0,
+            "and never also in amber - counted once, not twice"
+        );
+    }
+
+    /// The bug the coordinator's audit found: the header's urgency counts and the header's
     /// `N wt` count (`group.all_rows.len()` at the render site) must come from the repo's real,
     /// complete worktree list, never from whatever narrower set happens to be rendered below the
     /// header. Builds a repo whose `rows` (the "currently displayed" set - what a filter query
@@ -1449,9 +1614,9 @@ mod tests {
             "sanity check: the displayed rows really are a narrower, different set"
         );
         assert_eq!(
-            groups[0].waiting_count(),
+            groups[0].needs_input_count(),
             1,
-            "the amber waiting count must be derived from the real worktree list too - the \
+            "the amber urgency count must be derived from the real worktree list too - the \
              asking worktree exists in `all_rows` even though it isn't in the displayed `rows`"
         );
     }
@@ -1486,29 +1651,71 @@ mod tests {
         );
     }
 
+    /// §4q's "each with its own tooltip", conjugated in both the noun and the verb (§7 rule 9).
     #[test]
-    fn waiting_count_label_is_hidden_at_zero() {
-        assert_eq!(waiting_count_label(0), None);
+    fn the_two_urgency_tooltips_agree_with_their_own_counts_in_noun_and_verb() {
+        assert_eq!(needs_input_tooltip(1), "1 worktree here needs input");
+        assert_eq!(needs_input_tooltip(2), "2 worktrees here need input");
+        assert_eq!(failed_tooltip(1), "1 worktree here has a failed agent");
+        assert_eq!(failed_tooltip(3), "3 worktrees here have failed agents");
     }
 
+    /// §4o: the rail's diffstat is returned as its two coloured parts, never as one pre-joined
+    /// string - and a diff with no deletions renders one part, not a `\u{2212}0` that says nothing.
     #[test]
-    fn waiting_count_label_is_singular_for_exactly_one() {
+    fn diff_stat_parts_splits_the_rail_diffstat_and_drops_an_empty_deletion() {
         assert_eq!(
-            waiting_count_label(1).as_deref(),
-            Some("1 worktree waiting")
+            diff_stat_parts(152, 11),
+            Some(("+152".to_string(), Some("\u{2212}11".to_string())))
+        );
+        assert_eq!(diff_stat_parts(9, 0), Some(("+9".to_string(), None)));
+        assert_eq!(
+            diff_stat_parts(0, 4),
+            Some(("+0".to_string(), Some("\u{2212}4".to_string()))),
+            "a pure-deletion diff still states its (zero) additions - the pair is how a diffstat \
+             reads, and `+0 \u{2212}4` is a real answer where a bare `\u{2212}4` would be a \
+             differently-shaped one"
+        );
+        assert_eq!(
+            diff_stat_parts(0, 0),
+            None,
+            "no diff at all renders no diffstat - the row's neutral prose fallback occupies that \
+             slot instead"
         );
     }
 
+    /// §4's prune tooltip: "Prune merged worktrees \u{2014} 1 prunable, frees 214 MB" - the words
+    /// the icon itself cannot carry, including the size only when it is really known.
     #[test]
-    fn waiting_count_label_is_plural_for_two_or_more() {
+    fn the_prune_tooltip_states_the_count_and_only_a_measured_size() {
         assert_eq!(
-            waiting_count_label(2).as_deref(),
-            Some("2 worktrees waiting")
+            prune_tooltip(1, Some((214 * 1024 * 1024, false))),
+            "Prune merged worktrees \u{2014} 1 prunable, frees 214.0 MB"
         );
         assert_eq!(
-            waiting_count_label(7).as_deref(),
-            Some("7 worktrees waiting")
+            prune_tooltip(3, Some((2 * 1024 * 1024 * 1024, true))),
+            "Prune merged worktrees \u{2014} 3 prunable, frees 2.0 GB+",
+            "a truncated scan keeps the `+` suffix `disk_usage_label` already uses - the number \
+             is a floor, and the tooltip must not round it into a claim"
         );
+        assert_eq!(
+            prune_tooltip(1, None),
+            "Prune merged worktrees \u{2014} 1 prunable",
+            "an unmeasured candidate drops the whole clause rather than reporting a size that \
+             leaves it out"
+        );
+        assert_eq!(
+            prune_tooltip(0, Some((0, false))),
+            "Prune merged worktrees \u{2014} nothing prunable",
+            "zero candidates changes the sentence's shape rather than reading `0 prunable`"
+        );
+    }
+
+    /// The armed half of the two-click prune, kept from the text button it replaced.
+    #[test]
+    fn the_armed_prune_tooltip_conjugates_its_own_count() {
+        assert_eq!(prune_armed_tooltip(1), "Click again to remove 1 worktree");
+        assert_eq!(prune_armed_tooltip(2), "Click again to remove 2 worktrees");
     }
 
     /// The rail footer and Settings → Disk share this one line, and it used to read
