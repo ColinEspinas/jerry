@@ -1276,33 +1276,35 @@ impl AdeApp {
             theme::text::DIM.into()
         };
 
-        let caret = if has_children {
+        // The caret slot is always emitted, even for a childless worktree - it stays empty
+        // rather than disappearing, so every row's branch label lands at the same x offset
+        // (design_handoff_jerry_ade revision 5's own `w.caret` binding does the same: the glyph
+        // is emptied to "" but its fixed-width wrapper div never leaves the layout).
+        let caret = {
             let worktree_path = row.path.clone();
-            Some(
-                div()
-                    .id(("worktree-caret", index as u64))
-                    .flex_none()
-                    .w(px(11.0))
-                    .h(px(11.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(8.0))
-                    .text_color(theme::text::FAINT)
-                    // GitHub issue #128 - same lightweight text-only hover
-                    // `Self::render_status_zoom_value` uses for an equally small, box-free
-                    // clickable glyph.
-                    .hover(|el| el.text_color(theme::text::SELECTED))
-                    .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        this.toggle_worktree_collapsed(worktree_path.clone(), is_expanded, cx);
-                    })),
-            )
-        } else {
-            None
+            div()
+                .id(("worktree-caret", index as u64))
+                .flex_none()
+                .w(px(11.0))
+                .h(px(11.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .font(font(theme::font::MONO))
+                .text_size(self.ui_text_size(8.0))
+                .text_color(theme::text::FAINT)
+                .when(has_children, |el| {
+                    el.cursor_pointer()
+                        // GitHub issue #128 - same lightweight text-only hover
+                        // `Self::render_status_zoom_value` uses for an equally small, box-free
+                        // clickable glyph.
+                        .hover(|el| el.text_color(theme::text::SELECTED))
+                        .child(if is_expanded { "\u{25be}" } else { "\u{25b8}" })
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_worktree_collapsed(worktree_path.clone(), is_expanded, cx);
+                        }))
+                })
         };
 
         let branch_div = div()
@@ -1371,7 +1373,7 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_worktree_by_path(&path, window, cx);
             }))
-            .children(caret)
+            .child(caret)
             .child(branch_div)
             .when(!has_agents, |el| {
                 el.child(
