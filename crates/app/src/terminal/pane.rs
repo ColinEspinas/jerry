@@ -37,11 +37,16 @@
 //! (`cx.focus_handle()` + `.track_focus(..)`, the same pattern
 //! `vendor/zed/crates/terminal_view/src/terminal_view.rs` uses), and [`keystroke_to_bytes`]
 //! turns a `gpui::Keystroke` into the bytes a real terminal would send (printable characters,
-//! Enter/Backspace/Tab/Escape/arrows, `Ctrl`+letter control codes). This is a deliberately
-//! small subset of `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str` (which
-//! needs more `alacritty_terminal` terminal-mode state than this pane threads through, e.g.
-//! application cursor-key mode) - enough to type commands, use arrow keys, and send
-//! `Ctrl-C`, not a full VT100 keymap.
+//! Enter/Backspace/Tab/Escape/arrows/PageUp/PageDown, `Ctrl`+letter control codes). This is a
+//! deliberately small subset of `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str`
+//! (which needs more `alacritty_terminal` terminal-mode state than this pane threads through,
+//! e.g. application cursor-key mode) - enough to type commands, use arrow keys, page through a
+//! full-screen program, and send `Ctrl-C`, not a full VT100 keymap.
+//!
+//! PageUp/PageDown are shared between this pane and the child rather than owned outright: on the
+//! normal screen they drive this pane's own retained scrollback (GitHub issue #331), and on the
+//! alt screen - which has no scrollback for them to drive - they go to the running program
+//! instead (GitHub issue #368). See [`TerminalPane::handle_key_down`].
 //!
 //! ## Double-width characters (GitHub issue #211)
 //!
@@ -279,6 +284,21 @@ const ROW_LINE_HEIGHT_PX: f32 = 19.0;
 /// real measurement (`Window::text_system().advance`) succeeds at least once - i.e. before the
 /// very first paint.
 const APPROX_CELL_WIDTH_PX: f32 = 7.0;
+
+/// How many grid lines one detent ("notch") of a real mouse wheel is worth, used only to convert
+/// [`TerminalPane::handle_scroll_wheel`]'s line count back into wheel gestures for
+/// [`TerminalPane::forward_scroll_as_page_keys`] (GitHub issue #368).
+///
+/// Three is the long-standing platform convention (Windows' own `SPI_GETWHEELSCROLLLINES`
+/// default, and what X11 button-4/5 events are conventionally worth), and it is what GPUI
+/// actually delivers here: **measured live** against the running app over X11, a single wheel
+/// notch over a terminal pane produces a `ScrollWheelEvent` whose delta resolves to exactly
+/// `3.0` grid lines.
+///
+/// Only the alt-screen page-key path needs this. The ordinary scrollback path deliberately does
+/// not: there, a line of wheel delta really is a line of scrollback, and
+/// `TerminalGrid::scroll_display` moves by exactly that.
+const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 
 /// The pane root's own padding, applied on every side via `.p(px(PANE_PADDING_PX))` in
 /// `render`. Named as its own constant rather than left as the equivalent `.p_2()` shorthand
@@ -1282,8 +1302,9 @@ impl TerminalPane {
     /// Mouse-wheel/trackpad scrollback (GitHub issue #331) - converts `event.delta` into whole
     /// grid lines, carrying any sub-line remainder in [`Self::pending_scroll_px`], then either
     /// drives `TerminalGrid::scroll_display` directly or - while a full-screen program has the
-    /// alt screen active (GitHub issue #362) - forwards the same number of arrow-key presses to
-    /// the child process instead; see [`Self::forward_scroll_as_arrow_keys`]'s own docs for why.
+    /// alt screen active (GitHub issues #362, #368) - forwards the equivalent number of
+    /// PageUp/PageDown presses to the child process instead; see
+    /// [`Self::forward_scroll_as_page_keys`]'s own docs for why.
     ///
     /// A real `on_scroll_wheel` handler, not GPUI's built-in `overflow_y_scroll`/`track_scroll`
     /// mechanism every other scrollable region in this app uses (`crate::root::scrollbar`'s own
@@ -1297,8 +1318,8 @@ impl TerminalPane {
     /// onto a `ScrollHandle`'s offset, whose own docs say "negative when scrolled down") scrolls
     /// toward the live tail; a positive one scrolls up into history - matching
     /// [`ScrollAmount::Lines`]'s own sign convention, so the delta needs no inversion here. The
-    /// same convention carries over to [`Self::forward_scroll_as_arrow_keys`]: positive sends Up,
-    /// negative sends Down.
+    /// same convention carries over to [`Self::forward_scroll_as_page_keys`]: positive sends
+    /// PageUp, negative sends PageDown.
     fn handle_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1317,32 +1338,51 @@ impl TerminalPane {
         }
         self.pending_scroll_px -= lines * row_height;
         if self.grid.alt_scroll_forwarding_active() {
-            self.forward_scroll_as_arrow_keys(lines as i32);
+            self.forward_scroll_as_page_keys(lines as i32);
         } else {
             self.grid.scroll_display(ScrollAmount::Lines(lines as i32));
         }
         cx.notify();
     }
 
-    /// Translates a mouse-wheel scroll delta into the same arrow-key byte sequence
-    /// [`keystroke_to_bytes`] already produces for a real Up/Down key press, and writes it
-    /// straight to the pty (GitHub issue #362) - reusing that one encoder rather than a second,
-    /// hand-rolled `\x1b[A`/`\x1b[B` literal here, so the two stay identical if that mapping
-    /// ever changes (e.g. to respect `TermMode::APP_CURSOR`'s `\x1bO`-prefixed variant).
+    /// Translates a mouse-wheel scroll delta into the same PageUp/PageDown byte sequence
+    /// [`keystroke_to_bytes`] already produces for a real page-key press, and writes it straight
+    /// to the pty (GitHub issues #362, #368) - reusing that one encoder rather than a second,
+    /// hand-rolled `\x1b[5~`/`\x1b[6~` literal here, so the two can never drift apart.
     ///
-    /// The real convention xterm/iTerm2/Alacritty/kitty/Windows Terminal all implement for a
-    /// program with the alt screen active and `ALTERNATE_SCROLL` set (see
-    /// [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs): there is no real scrollback
-    /// grid under the alt screen for a wheel event to move instead, so `less`/`vim`/`htop`/an
-    /// agent CLI's own interface sees the wheel exactly as if the human pressed the arrow key
-    /// `lines.unsigned_abs()` times - one key press per grid line (matching xterm's own
-    /// behavior), not Page Up/Down for larger deltas, so a fast flick moves the program's own
-    /// cursor/selection by exactly as many lines as it would have scrolled real scrollback.
-    fn forward_scroll_as_arrow_keys(&mut self, lines: i32) {
+    /// **Why the wheel is forwarded at all.** There is no real scrollback grid under the alt
+    /// screen for a wheel event to move (see
+    /// [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs), so the only thing that can
+    /// scroll a full-screen program's view is the program itself - which means synthesising a
+    /// key it understands and handing it over. That much is the standard `alternateScroll`
+    /// behavior xterm/iTerm2/Alacritty/kitty/Windows Terminal all implement.
+    ///
+    /// **Why *page* keys and not arrow keys.** Issue #362 shipped arrow keys, on the reasoning
+    /// that xterm's own `alternateScroll` sends them. That is genuinely what xterm does, and it
+    /// works for a pager-shaped program (`less`, `vim`, `htop`) where an arrow key means "move
+    /// the view by one line". It is the wrong key for a program whose full-screen UI also owns a
+    /// *line editor*, where Up/Down mean "previous/next entry in the prompt history" and moving
+    /// the transcript is a separate, page-keyed action. Claude Code's CLI is exactly that shape,
+    /// and it does not leave this to inference: shown real arrow keys from the wheel, it printed
+    /// its own on-screen hint, **"Scroll wheel is sending arrow keys · use PgUp/PgDn to
+    /// scroll"** - a program telling us, in its own words, which key scrolls it. Page keys are
+    /// also the strictly safer default of the two: PageUp/PageDown navigate content in every
+    /// pager-shaped program too (`less` pages, `vim`'s `Ctrl-B`/`Ctrl-F`, `htop` pages), so no
+    /// program that worked with arrows loses scrolling, while programs that treat arrows as
+    /// cursor/history movement stop being poked in the editor by a scroll gesture.
+    ///
+    /// **Granularity.** One page key per *wheel notch*, not per grid line: a page key moves a
+    /// screenful, so `lines` presses would send a just-perceptible flick several screens away.
+    /// [`WHEEL_LINES_PER_NOTCH`] converts back - a single notch sends exactly one press, and a
+    /// fast flick that accumulated several notches' worth of delta sends proportionally more, so
+    /// the gesture still scales with how hard the human spun the wheel. Never rounds down to
+    /// zero presses: a wheel event that produced a whole line of movement always moves the
+    /// program by at least one page, or a slow scroll would silently do nothing.
+    fn forward_scroll_as_page_keys(&mut self, lines: i32) {
         let Some(session) = &self.session else {
             return;
         };
-        let key = if lines > 0 { "up" } else { "down" };
+        let key = if lines > 0 { "pageup" } else { "pagedown" };
         let Some(single_press) = keystroke_to_bytes(&Keystroke {
             key: key.to_string(),
             key_char: None,
@@ -1350,7 +1390,8 @@ impl TerminalPane {
         }) else {
             return;
         };
-        let presses = lines.unsigned_abs() as usize;
+        let presses =
+            ((lines.unsigned_abs() as f32 / WHEEL_LINES_PER_NOTCH).round() as usize).max(1);
         let mut bytes = Vec::with_capacity(single_press.len() * presses);
         for _ in 0..presses {
             bytes.extend_from_slice(&single_press);
@@ -1797,15 +1838,21 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         // GitHub issue #331: plain (unmodified) PageUp/PageDown scroll real retained
-        // scrollback rather than being forwarded to the pty. Claiming these is safe:
-        // `keystroke_to_bytes` never mapped either key to any byte sequence to begin with (see
-        // its own docs' deliberately small subset), so this app never actually forwarded a
-        // PageUp/PageDown to the child process before now - not taking over a keystroke a
-        // full-screen program (`vim`/`less`/`htop`) might otherwise have received. The alt
-        // screen keeps no scrollback of its own (`TerminalGrid::scroll_display`'s docs), so a
-        // PageUp/PageDown reaching one there is already a real no-op. Modified variants
-        // (Shift/Ctrl/Alt+PageUp, ...) fall through unclaimed, same as before this issue.
-        if !event.keystroke.modifiers.modified() {
+        // scrollback rather than being forwarded to the pty. Modified variants
+        // (Shift/Ctrl/Alt+PageUp, ...) fall through unclaimed, same as before that issue.
+        //
+        // GitHub issue #368 narrows the claim to the *normal* screen. Issue #331 reasoned that
+        // claiming these keys was free because "a PageUp/PageDown reaching a full-screen program
+        // is already a real no-op" - which was true only because `keystroke_to_bytes` had no
+        // mapping for either key at the time, and stopped being true the moment it gained one.
+        // The alt screen keeps no scrollback of its own (`TerminalGrid::alt_screen_active`'s
+        // docs), so claiming a page key there costs the human a keystroke and gives them
+        // literally nothing back: `scroll_display` cannot move, and the running program - which
+        // is the only thing that *can* scroll its own view - never sees the key. That is exactly
+        // what Claude Code's CLI meant by its own on-screen "use PgUp/PgDn to scroll" hint: it
+        // was telling the user to press keys this app was silently eating. On the alt screen
+        // these now fall through to the ordinary `keystroke_to_bytes` write below.
+        if !event.keystroke.modifiers.modified() && !self.grid.alt_screen_active() {
             let scroll = match event.keystroke.key.as_str() {
                 "pageup" => Some(ScrollAmount::PageUp),
                 "pagedown" => Some(ScrollAmount::PageDown),
@@ -1930,8 +1977,23 @@ impl TerminalPane {
     /// nobody watched scroll past - while a later *real* resize (an actual window resize, a
     /// font-size change, both of which reach this same method) still creates real scrollback
     /// exactly as before, since [`Self::settled_real_size`] only ever latches once.
+    ///
+    /// **That latch has to wait for the pty, not just for the grid (GitHub issue #368).** Issue
+    /// #362's version latched on the first render that had a measured `content_bounds` at all,
+    /// which - measured live against the running app - is frame 2, roughly 16ms after
+    /// [`Self::new`], while [`Self::session`] is *still `None`*: spawning the child is
+    /// asynchronous (see [`Self::spawn_process`], and [`ResizeLatch`]'s own docs for why the
+    /// session side is latched separately). The pty therefore did not exist yet, the child had
+    /// not been forked, and there was nothing whatsoever in the grid - so the discard ran
+    /// against an empty history and then, being one-shot, stopped guarding forever. Everything
+    /// it was written to catch - the child's startup output, produced while the pty is still at
+    /// the `TERMINAL_ROWS`/`TERMINAL_COLS` placeholder because the corrective resize could not
+    /// reach a session that did not exist - happens strictly *after* that. Gating the latch on
+    /// the resize having genuinely reached a live pty (`ResizeLatch::session`, only ever set by
+    /// a `PtySession::resize` that returned `Ok`) moves the discard to the first moment the
+    /// child is actually running at the size the human is looking at, which is the moment the
+    /// guard was always meant to describe.
     fn maybe_resize_pty(&mut self, window: &Window) {
-        let is_first_real_measurement = !self.settled_real_size && self.content_bounds.is_some();
         let raw_size = self
             .content_bounds
             .map(|bounds| bounds.size)
@@ -1939,8 +2001,10 @@ impl TerminalPane {
         let size = content_size_from_padding_box(raw_size);
         let cell_size = self.cell_size(window);
         let (rows, cols) = size_to_grid(size, cell_size);
+        let measured_real_size = self.content_bounds.is_some();
         self.resize_to(rows, cols);
-        if is_first_real_measurement {
+        let reached_the_pty = self.resize_latch.session == Some((rows, cols));
+        if !self.settled_real_size && measured_real_size && reached_the_pty {
             self.settled_real_size = true;
             self.grid.discard_scrollback();
         }
@@ -2227,6 +2291,14 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
         "down" => Some(b"\x1b[B".to_vec()),
         "right" => Some(b"\x1b[C".to_vec()),
         "left" => Some(b"\x1b[D".to_vec()),
+        // The standard xterm CSI `~` sequences for Prior/Next (GitHub issue #368). Added so a
+        // full-screen program can actually be *sent* a page key: `TerminalPane::handle_key_down`
+        // claims a real PageUp/PageDown for this app's own scrollback only while the normal
+        // screen is up, and `TerminalPane::forward_scroll_as_page_keys` synthesises the same two
+        // keys from the mouse wheel over the alt screen - both go through this one encoder, so
+        // there is a single definition of what a page key is on the wire.
+        "pageup" => Some(b"\x1b[5~".to_vec()),
+        "pagedown" => Some(b"\x1b[6~".to_vec()),
         "space" => Some(b" ".to_vec()),
         _ => keystroke
             .key_char
@@ -5019,6 +5091,36 @@ mod scrollback_pane_tests {
         });
     }
 
+    /// Pumps real poll ticks until `predicate` sees the pty round-trip land, or until a generous
+    /// cap is reached, then returns the joined visible text.
+    ///
+    /// Every test in this module that observes forwarded bytes does it by letting a real child
+    /// process echo them back, which is a real kernel pty round-trip: the write has to reach the
+    /// child, the child has to be scheduled, and its reply has to come back through the poll
+    /// loop. A fixed tick count is therefore a wall-clock assumption, and this workspace has a
+    /// documented history of exactly that going flaky under heavy concurrent test load. Waiting
+    /// on the *condition* instead - with a cap so a genuine regression still fails, and fails
+    /// fast - removes the assumption without weakening a single assertion: every caller still
+    /// asserts the exact byte counts afterwards.
+    fn drain_until(
+        pane: &gpui::Entity<TerminalPane>,
+        cx: &mut gpui::VisualTestContext,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let mut joined = String::new();
+        for _ in 0..400 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            joined = pane
+                .read_with(cx, |pane, _| pane.visible_text_lines())
+                .join("");
+            if predicate(&joined) {
+                break;
+            }
+        }
+        joined
+    }
+
     #[gpui::test]
     fn page_up_and_page_down_scroll_the_real_display_offset(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5145,20 +5247,26 @@ mod scrollback_pane_tests {
         assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
     }
 
-    /// GitHub issue #362: a mouse-wheel scroll reaching a pane whose child has the alt screen
-    /// active must be forwarded to the pty as real arrow-key bytes (via the same
-    /// [`keystroke_to_bytes`] encoder a real Up/Down key press uses), rather than moving
+    /// GitHub issues #362/#368: a mouse-wheel scroll reaching a pane whose child has the alt
+    /// screen active must be forwarded to the pty as real **PageUp/PageDown** bytes (via the
+    /// same [`keystroke_to_bytes`] encoder a real page-key press uses), rather than moving
     /// [`TerminalGrid::scroll_display`] - the alt screen has no scrollback of its own to move
     /// (see [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs).
     ///
+    /// Page keys, not the arrow keys issue #362 originally shipped: see
+    /// [`TerminalPane::forward_scroll_as_page_keys`]'s own docs for the live evidence (Claude
+    /// Code's CLI printing "Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll" at a
+    /// real user). This asserts the *absence* of arrow bytes as hard as it asserts the presence
+    /// of page bytes - sending both would leave the regression half-alive.
+    ///
     /// `cat -v`, not plain `cat`: it visualizes control bytes (`ESC` -> the literal two
-    /// characters `^[`) as ordinary printable text, so the forwarded `\x1b[A` bytes show up in
-    /// this pane's own grid as the literal string `^[[A` instead of being reinterpreted as a
-    /// real cursor-motion escape sequence by this same grid's own VT parser - the one way to
-    /// observe the *exact* bytes a real child process received without a second, hand-rolled
-    /// test-only pty seam.
+    /// characters `^[`) as ordinary printable text, so the forwarded `\x1b[5~` bytes show up in
+    /// this pane's own grid as the literal string `^[[5~` instead of being reinterpreted as a
+    /// real escape sequence by this same grid's own VT parser - the one way to observe the
+    /// *exact* bytes a real child process received without a second, hand-rolled test-only pty
+    /// seam.
     #[gpui::test]
-    fn alt_screen_scroll_forwards_arrow_keys_to_the_real_pty(cx: &mut TestAppContext) {
+    fn alt_screen_scroll_forwards_page_keys_to_the_real_pty(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
             TerminalPane::new(
                 TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
@@ -5184,38 +5292,40 @@ mod scrollback_pane_tests {
             );
         });
 
-        // Real `cat -v` printing back exactly what it received on stdin - give the poll loop
-        // real ticks to drain it.
-        for _ in 0..20 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
+        // Real `cat -v` printing back exactly what it received on stdin - pump the poll loop
+        // until it lands.
+        let joined = drain_until(&pane, cx, |text| text.contains("^[[5~"));
 
         assert_eq!(
             pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
             0,
             "the alt screen has no scrollback of its own - scroll_display must never have moved"
         );
-        let joined = pane
-            .read_with(cx, |pane, _| pane.visible_text_lines())
-            .join("");
         assert_eq!(
-            joined.matches("^[[A").count(),
-            2,
-            "a two-line upward scroll must forward exactly two real Up-arrow byte sequences, \
-             visualized by `cat -v` as the literal text `^[[A`: {joined:?}"
+            joined.matches("^[[5~").count(),
+            1,
+            "a two-line upward scroll is under one wheel notch, so it must forward exactly one \
+             real PageUp byte sequence, visualized by `cat -v` as the literal text `^[[5~`: \
+             {joined:?}"
         );
         assert_eq!(
-            joined.matches("^[[B").count(),
+            joined.matches("^[[6~").count(),
             0,
-            "an upward scroll must never also send a Down-arrow byte sequence: {joined:?}"
+            "an upward scroll must never also send a PageDown byte sequence: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches("^[[A").count() + joined.matches("^[[B").count(),
+            0,
+            "GitHub issue #368: no arrow-key bytes may reach the child any more - forwarding \
+             those is what made Claude Code's CLI tell the user to press PgUp/PgDn instead: \
+             {joined:?}"
         );
     }
 
-    /// The mirror of the test above: downward scroll on the alt screen must forward Down-arrow
-    /// bytes, not Up.
+    /// The mirror of the test above: downward scroll on the alt screen must forward PageDown
+    /// bytes, not PageUp.
     #[gpui::test]
-    fn alt_screen_scroll_down_forwards_down_arrow_keys(cx: &mut TestAppContext) {
+    fn alt_screen_scroll_down_forwards_page_down_keys(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
             TerminalPane::new(
                 TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
@@ -5237,21 +5347,107 @@ mod scrollback_pane_tests {
             );
         });
 
-        for _ in 0..20 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
-
-        let joined = pane
-            .read_with(cx, |pane, _| pane.visible_text_lines())
-            .join("");
+        let joined = drain_until(&pane, cx, |text| text.contains("^[[6~"));
         assert_eq!(
-            joined.matches("^[[B").count(),
-            3,
-            "a three-line downward scroll must forward exactly three real Down-arrow byte \
-             sequences: {joined:?}"
+            joined.matches("^[[6~").count(),
+            1,
+            "a three-line downward scroll is exactly one wheel notch \
+             ([`WHEEL_LINES_PER_NOTCH`]), so it must forward exactly one real PageDown byte \
+             sequence - not one per line, which would fling a full-screen program three \
+             screenfuls away on a single detent: {joined:?}"
         );
-        assert_eq!(joined.matches("^[[A").count(), 0);
+        assert_eq!(joined.matches("^[[5~").count(), 0);
+        assert_eq!(
+            joined.matches("^[[A").count() + joined.matches("^[[B").count(),
+            0
+        );
+    }
+
+    /// GitHub issue #368: a *fast flick* still scales - several notches' worth of accumulated
+    /// delta forwards proportionally more page presses, rather than being flattened to one.
+    /// Pinned alongside the single-notch cases above so the [`WHEEL_LINES_PER_NOTCH`] division
+    /// can never quietly become a constant `1`.
+    #[gpui::test]
+    fn a_fast_alt_screen_flick_forwards_proportionally_more_page_keys(cx: &mut TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+        });
+
+        // Three notches' worth of upward delta in one event.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(
+                    0.0,
+                    3.0 * WHEEL_LINES_PER_NOTCH,
+                ))),
+                window,
+                cx,
+            );
+        });
+
+        let joined = drain_until(&pane, cx, |text| text.matches("^[[5~").count() >= 3);
+        assert_eq!(
+            joined.matches("^[[5~").count(),
+            3,
+            "three notches of upward delta must forward three real PageUp presses: {joined:?}"
+        );
+    }
+
+    /// GitHub issue #368: a **real** PageUp keystroke must reach the child process while a
+    /// full-screen program owns the alt screen.
+    ///
+    /// This is the other half of the same live report. Issue #331 claimed plain PageUp/PageDown
+    /// unconditionally for this app's own scrollback, on the reasoning that a page key reaching
+    /// a full-screen program was already a no-op - true only while [`keystroke_to_bytes`] had no
+    /// mapping for either key. The alt screen keeps no scrollback, so claiming the key there
+    /// gave the human nothing and denied the running program the one key it asked for by name.
+    /// `cat -v` again visualizes the exact bytes that really crossed the pty.
+    #[gpui::test]
+    fn a_real_page_key_reaches_a_full_screen_program(cx: &mut TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.alt_screen_active()),
+            "sanity check: the alt screen must really be active"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
+            pane.handle_key_down(&key_event(nav_key("pagedown")), window, cx);
+        });
+
+        let joined = drain_until(&pane, cx, |text| {
+            text.contains("^[[5~") && text.contains("^[[6~")
+        });
+        assert_eq!(
+            joined.matches("^[[5~").count(),
+            1,
+            "a real PageUp press must cross the pty as the standard `ESC [ 5 ~`: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches("^[[6~").count(),
+            1,
+            "a real PageDown press must cross the pty as the standard `ESC [ 6 ~`: {joined:?}"
+        );
     }
 
     /// GitHub issue #362: once a full-screen program exits the alt screen, a mouse-wheel scroll
@@ -5285,7 +5481,149 @@ mod scrollback_pane_tests {
             pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
             4,
             "back on the normal screen, a scroll must move real scroll_display exactly as \
-             before this issue - not still be forwarded as arrow keys"
+             before this issue - not still be forwarded to the child as key presses"
+        );
+    }
+
+    /// **GitHub issue #368, the live report: a genuinely fresh, empty Shell pane could still be
+    /// scrolled up.**
+    ///
+    /// Issue #362's guard was a one-shot: `TerminalPane::maybe_resize_pty` discarded scrollback
+    /// exactly once, at the first render with a measured `content_bounds`. That left the whole
+    /// rest of a pane's life unguarded, and a pane's layout keeps settling long after its first
+    /// two frames - the window gets resized, a panel opens, the terminal font size changes.
+    /// Every one of those runs `alacritty_terminal`'s reflow, and reflowing a just-opened pane
+    /// narrower pushes the blank line a shell prints before its prompt out of the viewport and
+    /// into real retained history. Measured live against the running app: a real `zsh` pane went
+    /// from `history_size == 0` to `1` on a `110x36 -> 38x26` resize, and the mouse wheel then
+    /// really moved `display_offset` to `1` on a terminal that had nothing in it.
+    ///
+    /// This drives the real pane through a whole sequence of settled sizes - not just the first
+    /// one - and demands the same thing at every step: nothing to scroll to, an inert wheel, and
+    /// no scrollbar. Uses a real spawned pty pane (`new_pane`) and the same
+    /// `inject_bytes_for_test` append path real pty bytes take.
+    #[gpui::test]
+    fn a_fresh_pane_never_becomes_scrollable_as_its_layout_settles(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+
+        // A real shell's startup output: the blank line most prompts print before themselves,
+        // then a long single-line prompt that genuinely has to re-wrap at the narrower widths
+        // below - the exact shape measured in the running app.
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(
+                b"\r\n/tmp/fix-terminal-scroll-round3 on main! at 0:55:28\r\n$ ",
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Every size the app's own layout can settle the pane through, widest to narrowest and
+        // back - a window resize, a panel opening, a font-size change all land here. All of them
+        // still comfortably fit the prompt itself; a pane narrower than its own prompt really
+        // does push part of that prompt out of view, and being able to scroll up to read it is
+        // correct - `terminal::grid`'s own
+        // `a_resize_never_leaves_a_blank_line_at_the_top_of_the_scroll_track` carries that case.
+        for (width, rows) in [
+            (800.0f32, 36.0f32),
+            (300.0, 26.0),
+            (300.0, 14.0),
+            (900.0, 40.0),
+            (420.0, 20.0),
+        ] {
+            pane.update_in(cx, |pane, window, _cx| {
+                pane.content_bounds = Some(Bounds {
+                    origin: gpui::point(px(0.0), px(0.0)),
+                    size: gpui::size(px(width), px(rows * ROW_LINE_HEIGHT_PX)),
+                });
+                pane.maybe_resize_pty(window);
+            });
+            cx.run_until_parked();
+
+            let dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()),
+                0,
+                "a pane that has only ever printed a prompt must have nothing to scroll to at \
+                 {dims:?}"
+            );
+
+            pane.update_in(cx, |pane, window, cx| {
+                pane.handle_scroll_wheel(
+                    &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, 5.0))),
+                    window,
+                    cx,
+                );
+            });
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+                0,
+                "and the wheel must be genuinely inert there - this is the exact user-visible \
+                 symptom: an empty terminal that scrolls"
+            );
+            assert!(
+                cx.debug_bounds("terminal-scrollbar").is_none(),
+                "nor may the scrollbar be painted at {dims:?}"
+            );
+        }
+
+        // The guard must not have cost the pane real scrollback: genuine overflow at the
+        // settled size still works exactly as before.
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()) > 0,
+            "real overflow must still create real scrollback"
+        );
+        assert!(cx.debug_bounds("terminal-scrollbar").is_some());
+    }
+
+    /// GitHub issue #368: the discard `maybe_resize_pty` performs on settling has to wait for
+    /// the corrective resize to actually reach the **live pty**, not just the local grid.
+    ///
+    /// Issue #362's version latched on the first render that had any measured `content_bounds`,
+    /// which - measured live - is frame 2, ~16ms after `TerminalPane::new`, while
+    /// `TerminalPane::session` is still `None` because spawning the child is asynchronous. The
+    /// discard therefore ran against an empty grid on a pty that did not exist yet, and then
+    /// stopped guarding forever, which is why it never caught anything it was written for. This
+    /// pins the ordering directly: with no session, settling must not latch; once a session
+    /// exists and the resize really reaches it, it must.
+    #[gpui::test]
+    fn settling_waits_for_the_resize_to_reach_the_real_pty(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+
+        // Roll back to the pre-spawn state `TerminalPane::new` really starts in: a
+        // placeholder-sized grid, nothing measured, and - the part issue #362 missed - no live
+        // session for a resize to reach.
+        let session = pane.update(cx, |pane, _cx| {
+            pane.grid = TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS);
+            pane.content_bounds = None;
+            pane.settled_real_size = false;
+            pane.resize_latch = ResizeLatch::default();
+            pane.session.take()
+        });
+
+        let bounds = Bounds {
+            origin: gpui::point(px(0.0), px(0.0)),
+            size: gpui::size(px(800.0), px(20.0 * ROW_LINE_HEIGHT_PX)),
+        };
+        pane.update_in(cx, |pane, window, _cx| {
+            pane.content_bounds = Some(bounds);
+            pane.maybe_resize_pty(window);
+        });
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.settled_real_size),
+            "a measured resize that could not reach a pty - because the async spawn has not \
+             finished - must not count as settled: the child is still running at the spawn-time \
+             placeholder size, which is exactly the window this guard exists to cover"
+        );
+
+        // The spawn completes; the same target now genuinely reaches the pty.
+        pane.update(cx, |pane, _cx| pane.session = session);
+        pane.update_in(cx, |pane, window, _cx| pane.maybe_resize_pty(window));
+        assert!(
+            pane.read_with(cx, |pane, _| pane.settled_real_size),
+            "once the resize really reached the live pty, the pane is settled and the one-time \
+             discard has run"
         );
     }
 
