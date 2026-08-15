@@ -871,8 +871,8 @@ impl TerminalPane {
     }
 
     /// Sends `Ctrl-C` (`0x03`) to the child process's pty, exactly as [`Self::handle_key_down`]
-    /// would for an actual `Ctrl-C` keystroke - backs the surface footer's `Interrupt
-    /// \u{2303}C` action. A no-op when no session is live.
+    /// would for an actual `Ctrl-C` keystroke - backs the rail agent menu's `Pause` row. A
+    /// no-op when no session is live.
     pub fn interrupt(&mut self, _cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;

@@ -1,7 +1,13 @@
-//! Real backing for the work surface footer's `Keep all`/`Discard worktree` buttons
-//! ([`work_surface::ActionKind::KeepAllChanges`]/[`work_surface::ActionKind::DiscardWorktree`])
-//! and, since Revision R12 §5, the Changes panel commit composer's "commit staged files"
+//! Real backing for `Keep all changes` and `Discard worktree` and, since Revision R12 §5, the
+//! Changes panel commit composer's "commit staged files"
 //! (`crate::sidebar::render::AdeApp::commit_staged_files`).
+//!
+//! Their surfaces, after GitHub issue #295 cut the agent pane's action bar down to a readout
+//! (`STAGE-A-CHANGELOG.md` §4t): `Discard worktree` is the failed-run strip's second button
+//! ([`work_surface::ActionKind::DiscardWorktree`]) and the rail worktree menu's
+//! `Remove worktree…`; `Keep all changes` is the title bar's `Agent` menu, which is now its only
+//! home - §4r deleted the finished-agent button as "a fiction borrowed from buffer-based
+//! inline-diff tools", since the agent's edits are already on disk.
 //!
 //! ## One in-flight flag for all three operations
 //!

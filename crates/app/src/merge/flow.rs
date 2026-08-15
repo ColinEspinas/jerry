@@ -65,14 +65,34 @@ impl AdeApp {
         self._merge_cleanup_task = Some(task);
     }
 
-    /// The context bar's `Merge` action (see `render_merge_button`) - starts
-    /// `wt_core::merge::attempt_merge` of `id`'s worktree branch into the repository's detected
-    /// base branch, on the background executor (a `gix` open, a `git status` dirty-check, and a
-    /// spawned `git merge` child process - see that function's own docs).
+    /// Merges `id`'s worktree branch into the repository's detected base branch, on the
+    /// background executor (a `gix` open, a `git status` dirty-check, and a spawned `git merge`
+    /// child process - see `wt_core::merge::attempt_merge`'s own docs).
     ///
-    /// Only one merge flow is tracked at a time; a click while one is already in progress for
+    /// Only one merge flow is tracked at a time; a start while one is already in progress for
     /// any agent is a no-op, since two concurrent `git merge` invocations would race over the
     /// same base worktree.
+    ///
+    /// ## No UI entry point right now - deliberately, and tracked
+    ///
+    /// This used to be the agent context bar's `Merge` button. GitHub issue #295 deleted that
+    /// button outright (`STAGE-A-CHANGELOG.md` §4e: a **worktree** verb in an **agent** header,
+    /// offered twice for one two-agent worktree, offered while the agent was `Needs input`, and
+    /// "merge has preconditions - committed, base current, no live writers - and the header can
+    /// show none of them"), and §4e/#285 both name the git graph as where merging belongs.
+    ///
+    /// The graph has the *other* direction already ([`Self::start_merge_from_graph_branch`],
+    /// "Merge into current branch…"); **this** direction - a branch into its base - is the first
+    /// open bullet of GitHub issue #241, and inventing that surface was explicitly out of scope
+    /// for #295. So the flow, its `MergeOutcome` folding and its full regression suite below are
+    /// kept intact and unreachable rather than deleted and rebuilt later: the alternative is
+    /// throwing away tested behaviour a tracked issue is about to need. `#[allow(dead_code)]`
+    /// states that honestly instead of leaving a bare compiler warning for someone to silence.
+    ///
+    /// Nothing else about it is dormant: `wt_core::merge::attempt_merge` (the engine),
+    /// [`fold_merge_result`] (the shared `MergeOutcome` → UI-state mapping) and the whole
+    /// `crate::merge::render` conflict resolver are all live today via the graph direction.
+    #[allow(dead_code)]
     pub(crate) fn start_merge(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.merge_flow.is_some() {
             return;
@@ -947,6 +967,11 @@ enum MergeEditReparseOutcome {
 /// `abortable_worktree` via [`wt_core::merge::find_in_progress_merge`] rather than assuming a
 /// merge is or isn't in progress just because this call failed. If that lookup itself fails,
 /// `abortable_worktree` is `None`.
+///
+/// Reached only through [`run_merge_attempt`], so it shares that function's "no UI entry point
+/// until GitHub issue #241's graph merge-into-base lands" state - see
+/// [`AdeApp::start_merge`]'s own docs for why it is kept rather than deleted.
+#[allow(dead_code)]
 pub(in crate::merge) fn merge_error_state(
     repo_path: &std::path::Path,
     message: String,
@@ -967,6 +992,11 @@ pub(in crate::merge) fn merge_error_state(
 /// thread. For a [`wt_core::merge::MergeOutcome::Conflicted`], this also classifies every
 /// conflicted path (`wt_core::merge::classify_conflicted_file`) here, still off-thread, rather
 /// than leaving that as a second round-trip.
+///
+/// Its only caller is [`AdeApp::start_merge`], whose UI entry point GitHub issue #295 deleted and
+/// GitHub issue #241 will restore on the git graph - see that method's own docs. Its twin
+/// [`run_merge_attempt_into_current`] and their shared [`fold_merge_result`] are both live today.
+#[allow(dead_code)]
 pub(in crate::merge) fn run_merge_attempt(
     repo_path: &std::path::Path,
     worktree_path: &std::path::Path,

@@ -1293,8 +1293,8 @@ mod review_flow_tests {
             assert!(
                 app.agent_has_unreviewed_changes(id),
                 "the status poll alone must make an agent's real work reviewable - without it, \
-                 `Status::Review` could never fire, so the footer's `Review` door could never \
-                 appear, so the tab could never be opened at all"
+                 `Status::Review` could never fire, so the review door could never appear, so \
+                 the tab could never be opened at all"
             );
             assert_eq!(
                 app.agent_review_file_count(id),
@@ -1303,7 +1303,15 @@ mod review_flow_tests {
             );
             assert!(
                 app.review_available_for(id),
-                "so the footer door is genuinely offerable"
+                "so the door is genuinely offerable"
+            );
+            // GitHub issue #295 moved that door from the finished agent's pane footer (§4r
+            // emptied it entirely) to the title bar's Agent menu. Same gate, new home - and it
+            // must really be enabled, not merely listed.
+            assert!(
+                app.menu_command_enabled(crate::title_bar::menu_model::MenuCommand::ReviewAgent),
+                "the Agent menu's `Review Agent` row is the review tab's only door now, so it \
+                 must be enabled exactly when `review_available_for` is true"
             );
         });
 
@@ -1330,12 +1338,12 @@ mod review_flow_tests {
             crate::rail::status::Status::Review,
             "a successfully-exited agent with real unreviewed work must reach Status::Review"
         );
+        // GitHub issue #295 / §4r: that status's footer must now carry **nothing at all** - "a
+        // finished transcript is a record; its actions live where their object lives". The door
+        // asserted above (the Agent menu's `Review Agent`) is where it went.
         assert!(
-            work_surface::footer_actions(status_on_exit)
-                .iter()
-                .any(|action| action.kind == work_surface::ActionKind::OpenReview
-                    && action.implemented),
-            "and that status's footer must carry the real, implemented `Review` door"
+            work_surface::footer_actions(status_on_exit).is_empty(),
+            "a finished agent's pane strip must offer no action buttons at all"
         );
     }
 

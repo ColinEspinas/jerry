@@ -256,6 +256,7 @@ actions!(
         NextAgent,
         PreviousAgent,
         ArchiveAgent,
+        ReviewAgent,
         KeepAllChanges,
         DiscardWorktree,
         OpenDocumentation,
@@ -1521,9 +1522,12 @@ pub struct AdeApp {
     /// not-found binary measures ~30ms, which would cap the whole Settings surface's frame rate
     /// if run inline. `Vec::new()` until the first load completes.
     pub(crate) agent_rows: Vec<settings::AgentRow>,
-    /// The context bar's `Merge` action and Surface D's conflict-resolution flow - see
-    /// [`crate::merge::state::MergeFlow`]'s docs. `None` when no agent has an in-flight merge or
-    /// unresolved conflict.
+    /// The git graph's `Merge into current branch\u{2026}` action and Surface D's
+    /// conflict-resolution flow - see [`crate::merge::state::MergeFlow`]'s docs. `None` when no
+    /// agent has an in-flight merge or unresolved conflict. (The agent context bar's own `Merge`
+    /// button was deleted by GitHub issue #295; see
+    /// `crate::merge::flow::AdeApp::start_merge`'s docs for the direction that is waiting on
+    /// issue #241.)
     pub(crate) merge_flow: Option<merge::MergeFlow>,
     /// `true` for the duration of an in-flight `Complete merge`/`Abort merge` git operation -
     /// guards against a fast Abort-after-Complete double-click letting `git merge --abort` race
@@ -3197,6 +3201,9 @@ impl Render for AdeApp {
             )
             .when(self.menu_command_enabled(MenuCommand::ArchiveAgent), |el| {
                 el.on_action(cx.listener(Self::handle_archive_agent_menu_command))
+            })
+            .when(self.menu_command_enabled(MenuCommand::ReviewAgent), |el| {
+                el.on_action(cx.listener(Self::handle_review_agent_menu_command))
             })
             .when(
                 self.menu_command_enabled(MenuCommand::KeepAllChanges),

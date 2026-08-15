@@ -21,7 +21,6 @@
 use crate::code_surface::code_view;
 use crate::env_info;
 use crate::keymap::{self};
-use crate::merge::state as merge;
 use crate::palette::state as palette;
 use crate::rail::status::{self, Status};
 use crate::rail::title_signal;

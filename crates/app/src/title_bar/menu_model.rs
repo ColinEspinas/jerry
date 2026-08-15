@@ -68,6 +68,7 @@ pub(crate) enum MenuCommand {
     NextAgent,
     PreviousAgent,
     ArchiveAgent,
+    ReviewAgent,
     KeepAllChanges,
     DiscardWorktree,
     // Help
@@ -98,7 +99,7 @@ impl MenuCommand {
     /// ([`Self::action`], [`Self::label`], [`Self::keystroke_spec`]) are exhaustive over this
     /// same enum, so nothing here can silently end up with only some of the three - the same
     /// guarantee [`crate::root::menus::MenuSurface::ALL`] gives its own two matches.
-    pub(crate) const ALL: [MenuCommand; 30] = [
+    pub(crate) const ALL: [MenuCommand; 31] = [
         MenuCommand::OpenFile,
         MenuCommand::OpenFolder,
         MenuCommand::NewWindow,
@@ -120,6 +121,7 @@ impl MenuCommand {
         MenuCommand::NextAgent,
         MenuCommand::PreviousAgent,
         MenuCommand::ArchiveAgent,
+        MenuCommand::ReviewAgent,
         MenuCommand::KeepAllChanges,
         MenuCommand::DiscardWorktree,
         MenuCommand::Documentation,
@@ -163,6 +165,7 @@ impl MenuCommand {
             MenuCommand::NextAgent => Box::new(root::NextAgent),
             MenuCommand::PreviousAgent => Box::new(root::PreviousAgent),
             MenuCommand::ArchiveAgent => Box::new(root::ArchiveAgent),
+            MenuCommand::ReviewAgent => Box::new(root::ReviewAgent),
             MenuCommand::KeepAllChanges => Box::new(root::KeepAllChanges),
             MenuCommand::DiscardWorktree => Box::new(root::DiscardWorktree),
             MenuCommand::Documentation => Box::new(root::OpenDocumentation),
@@ -205,6 +208,7 @@ impl MenuCommand {
             MenuCommand::NextAgent => "Next Agent",
             MenuCommand::PreviousAgent => "Previous Agent",
             MenuCommand::ArchiveAgent => "Archive Agent",
+            MenuCommand::ReviewAgent => "Review Agent",
             MenuCommand::KeepAllChanges => "Keep All Changes",
             MenuCommand::DiscardWorktree => "Discard Worktree",
             MenuCommand::Documentation => "Documentation",
@@ -247,6 +251,7 @@ impl MenuCommand {
             | MenuCommand::NextAgent
             | MenuCommand::PreviousAgent
             | MenuCommand::ArchiveAgent
+            | MenuCommand::ReviewAgent
             | MenuCommand::KeepAllChanges
             | MenuCommand::DiscardWorktree
             | MenuCommand::Documentation
@@ -297,6 +302,7 @@ impl MenuCommand {
                 Command(MenuCommand::NextAgent),
                 Command(MenuCommand::PreviousAgent),
                 Separator,
+                Command(MenuCommand::ReviewAgent),
                 Command(MenuCommand::ArchiveAgent),
                 Command(MenuCommand::KeepAllChanges),
                 Command(MenuCommand::DiscardWorktree),

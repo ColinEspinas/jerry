@@ -412,9 +412,14 @@ impl AdeApp {
         status::derive_status(agent.kind, signal, terminal, hooks, has_unreviewed_changes)
     }
 
-    /// The context bar's and idle-status footer's `Archive` action - closes the tab via
-    /// [`Self::close_agent`] (see that method's docs for why every close path must go through
-    /// it rather than `Agents::close` directly).
+    /// The `Archive` action - closes the tab via [`Self::close_agent`] (see that method's docs
+    /// for why every close path must go through it rather than `Agents::close` directly).
+    ///
+    /// Its homes since GitHub issue #295 deleted the agent context bar's own copy
+    /// (`STAGE-A-CHANGELOG.md` §4e: "`Archive` is worktree lifecycle and belongs on the rail row
+    /// with prune and delete"): the rail's agent (`Archive run`) and worktree (`Archive N
+    /// agents`) context menus (`crate::rail::menu`, issue #290), and the title bar's
+    /// `Agent → Archive Agent`.
     pub(crate) fn archive_agent(
         &mut self,
         id: AgentId,
@@ -428,16 +433,16 @@ impl AdeApp {
     }
 
     /// Closes agent `id`'s tab (`Agents::close` tears down its child process and moves focus
-    /// onto whichever agent becomes active) and, if `id` is the agent whose `Merge` click
-    /// started [`Self::merge_flow`], cleans that up too (see
-    /// [`Self::clear_merge_flow_for_closed_agent`]).
+    /// onto whichever agent becomes active) and, if `id` is the agent [`Self::merge_flow`] is
+    /// running under, cleans that up too (see [`Self::clear_merge_flow_for_closed_agent`]).
     ///
     /// Every close path - [`Self::archive_agent`], [`Self::respawn_agent`]'s
     /// close-then-respawn, and the tab strip's own `×` - must go through this function rather
-    /// than `Agents::close` directly: previously only `archive_agent` cleared `merge_flow`,
-    /// so archiving (or retrying) a mid-merge agent left `merge_flow.agent_id` pointing at a
-    /// agent that no longer existed, permanently disabling the `Merge` button for every
-    /// agent (`Self::render_merge_button`'s disabled check never cleared).
+    /// than `Agents::close` directly: previously only `archive_agent` cleared `merge_flow`, so
+    /// archiving (or retrying) a mid-merge agent left `merge_flow.agent_id` pointing at an agent
+    /// that no longer existed, permanently blocking every later merge (only one flow runs at a
+    /// time - `crate::merge::flow::AdeApp::start_merge_from_graph_branch`'s own single-flight
+    /// refusal).
     ///
     /// Tells `Agents::close` to skip its own focus move whenever the centre pane isn't
     /// actually showing an agent's pane right now - a file tab is open, *or* Settings has
@@ -498,8 +503,10 @@ impl AdeApp {
         self.record_worktree_session(cx);
     }
 
-    /// The surface footer's `Interrupt ⌃C` action - sends `Ctrl-C` to the agent's pty via
-    /// `TerminalPane::interrupt`.
+    /// The rail agent menu's `Pause` action - sends `Ctrl-C` to the agent's pty via
+    /// `TerminalPane::interrupt`. The pane strip's own `Interrupt` button is gone (GitHub issue
+    /// #295 / §4t: "the pane is a terminal: `⌃C` already interrupts ... a button duplicating
+    /// a keystroke that works in the focused surface" is unearned space).
     pub(crate) fn interrupt_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
@@ -508,7 +515,8 @@ impl AdeApp {
         pane.update(cx, |pane, cx| pane.interrupt(cx));
     }
 
-    /// The surface footer's `Retry ⌘R` (failed agents) / `Resume ⌘⏎` (idle agents) action.
+    /// The pane strip's `Retry ⌘R` (failed agents) / `Resume ⌘⏎` (idle agents) action, and the
+    /// rail agent menu's `Resume` row - the two verbs GitHub issue #295 left on that strip.
     /// This app has no saved-agent resumability to resume *from* (see
     /// `crate::work_surface::state::pty_state_label`'s docs), so the honest equivalent is: close this
     /// tab, then spawn a fresh agent of the same kind into the same worktree - not literally
@@ -548,8 +556,11 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The surface footer's `Open terminal` action - selects an already-open `Shell` agent in
-    /// the same worktree, or spawns one if none exists. Each agent is its own independent tab/
+    /// The no-agent empty state's `Open terminal` action
+    /// ([`Self::render_no_agents_empty_state`]) - selects an already-open `Shell` agent in the
+    /// same worktree, or spawns one if none exists. §4e keeps this verb there and nowhere else
+    /// in the pane: everywhere else it "was always a duplicate of the `zsh` tab three rows
+    /// above". Each agent is its own independent tab/
     /// process (`crate::work_surface::agents`'s module docs), so "open terminal" just means "get me a shell
     /// in this worktree", the same capability as the rail's "+ New Shell" button.
     pub(in crate::work_surface) fn open_companion_terminal(
@@ -1859,9 +1870,25 @@ impl AdeApp {
 
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
     /// flexible, ellipsising child - every other child is `flex_none` and non-wrapping, so the
-    /// bar never wraps when the centre narrows), a status pill, and `Merge`/`Archive` - or, for a
-    /// bare worktree (Revision R12 §3: [`Self::current_worktree_is_bare`]), the agent name greyed
-    /// to `no agent` and a single blue `Start an agent` button in `Merge`/`Archive`'s place.
+    /// bar never wraps when the centre narrows), and a status pill. **Identity and status only**
+    /// (GitHub issue #295, `STAGE-A-CHANGELOG.md` §4e): the `Merge` and `Archive` buttons that
+    /// used to close this bar are deleted, not hidden.
+    ///
+    /// Both were **worktree** verbs gated only on "there is an agent", sitting in an **agent**
+    /// header. §4e's three reasons, verbatim: a two-agent worktree "offered `Merge` **twice for
+    /// one worktree**"; it was offered "while the agent was `Needs input`, blocked mid-run on a
+    /// question about two conflicting migrations"; and "merge has preconditions - committed, base
+    /// current, no live writers - and the header can show none of them". Their homes now:
+    /// merging is the git graph's job (GitHub issue #241 - its "merge branch into base" half is
+    /// still open, so that direction is genuinely unavailable until it lands), and archiving is
+    /// the rail's agent/worktree context menus (`crate::rail::menu`, issue #290) plus the title
+    /// bar's Agent menu.
+    ///
+    /// The one button that stays is a bare worktree's (Revision R12 §3:
+    /// [`Self::current_worktree_is_bare`]) `Start an agent`, with the agent name greyed to
+    /// `no agent` - it is not one of the removed worktree verbs, and §4e's own rule ("an action
+    /// belongs in the scope of the object it acts on") puts starting an agent squarely in an
+    /// agent surface.
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -1893,10 +1920,10 @@ impl AdeApp {
             .find(|item| item.path == agent.cwd)
             .and_then(|item| item.branch.clone());
         let worktree_path = agent.cwd.display().to_string();
-        let id = agent.id;
 
         let bar = div()
             .id("agent-context-bar")
+            .debug_selector(|| "agent-context-bar".to_string())
             .flex()
             .flex_none()
             .items_center()
@@ -1959,20 +1986,24 @@ impl AdeApp {
             .child(render_status_pill(status_value));
 
         if is_bare {
-            bar.child(self.render_start_agent_button(cx))
+            bar.child(self.render_start_agent_button("context-bar-start-agent", cx))
         } else {
-            bar.child(self.render_merge_button(id, cx))
-                .child(self.render_archive_button(id, cx))
+            bar
         }
     }
 
-    /// A bare worktree's context bar action (Revision R12 §3): a filled blue `Start an agent`
-    /// button with a `mod+shift+N` keycap hint, replacing `Merge`/`Archive` outright rather than
-    /// sitting alongside them - neither has anything to act on yet in a worktree with no agent.
-    /// Real, not decorative: dispatches [`Self::new_agent_pane`], the same entry point the tab
-    /// strip's `+` menu row and its own global `secondary-shift-n` keybinding already use.
+    /// The `Start an agent` button - a filled blue button with a `mod+shift+N` keycap hint. Real,
+    /// not decorative: dispatches [`Self::new_agent_pane`], the same entry point the tab strip's
+    /// `+` menu row and its own global `secondary-shift-n` keybinding already use.
+    ///
+    /// Rendered in exactly two places, both of which genuinely have no agent to act on: a bare
+    /// worktree's context bar (Revision R12 §3), where it replaced the deleted `Merge`/`Archive`
+    /// pair; and the no-agent empty state ([`Self::render_no_agents_empty_state`]), which §4t
+    /// keeps buttoned because "with no agent there is no keystroke to duplicate and no readout to
+    /// show". `element_id` distinguishes the two so GPUI never sees one id painted twice.
     pub(in crate::work_surface) fn render_start_agent_button(
         &self,
+        element_id: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = work_surface::action_button_colors(work_surface::ActionStyle::PrimaryBlue);
@@ -1980,7 +2011,8 @@ impl AdeApp {
         let parts = keymap::resolve_combo("mod+shift+N", macos);
 
         div()
-            .id("context-bar-start-agent")
+            .id(element_id)
+            .debug_selector(move || element_id.to_string())
             .flex_none()
             .cursor_pointer()
             .h(px(20.0))
@@ -2008,82 +2040,6 @@ impl AdeApp {
             ))
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.new_agent_pane(cx);
-            }))
-    }
-
-    /// The context bar's `Merge` button - starts [`Self::start_merge`]. Disabled (dimmed,
-    /// non-interactive) whenever any merge flow is already active, own agent or not (only one
-    /// runs at a time - see [`Self::start_merge`]'s docs), and shows `Merging…` in place of
-    /// `Merge` while this agent's own attempt is the one running.
-    pub(in crate::work_surface) fn render_merge_button(
-        &self,
-        id: AgentId,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let active_for_this_agent = self
-            .merge_flow
-            .as_ref()
-            .is_some_and(|flow| flow.agent_id == id);
-        let running = active_for_this_agent
-            && matches!(
-                self.merge_flow.as_ref().map(|flow| &flow.state),
-                Some(merge::MergeFlowState::Running)
-            );
-        let disabled = self.merge_flow.is_some();
-        let label = if running { "Merging\u{2026}" } else { "Merge" };
-
-        let base = div()
-            .id(("context-bar-merge", id))
-            .flex_none()
-            .h(px(20.0))
-            .px(px(8.0))
-            .rounded(theme::radius::BUTTON)
-            .border_1()
-            .flex()
-            .items_center()
-            .font(font(theme::font::SANS))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(10.5))
-            .child(label);
-
-        if disabled {
-            base.cursor_default()
-                .border_color(theme::border::BUTTON_DISABLED)
-                .text_color(theme::text::GHOSTER)
-        } else {
-            base.cursor_pointer()
-                .border_color(theme::border::BUTTON)
-                .text_color(theme::text::SECONDARY)
-                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.start_merge(id, cx);
-                }))
-        }
-    }
-
-    /// The context bar's `Archive` button - see [`Self::archive_agent`].
-    pub(in crate::work_surface) fn render_archive_button(
-        &self,
-        id: AgentId,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id(("context-bar-archive", id))
-            .flex_none()
-            .cursor_pointer()
-            .h(px(20.0))
-            .px(px(8.0))
-            .rounded(theme::radius::BUTTON)
-            .flex()
-            .items_center()
-            .font(font(theme::font::SANS))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(10.5))
-            .text_color(theme::text::FAINT)
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-            .child("Archive")
-            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                this.archive_agent(id, window, cx);
             }))
     }
 
@@ -2188,7 +2144,7 @@ impl AdeApp {
     /// `TerminalPane` is the same component behind a `Shell` tab and a `Claude`/`Codex` tab (see
     /// that module's docs), so pid, grid dimensions, and `clear` are equally meaningful for
     /// either. Distinct from, and rendered alongside, [`Self::render_pty_footer`] - the
-    /// agent-level Interrupt/Retry/Archive action footer.
+    /// agent-level readout strip (GitHub issue #295 / §4t).
     pub(in crate::work_surface) fn render_pty_info_footer(
         &self,
         agent: &Agent,
@@ -2263,24 +2219,39 @@ impl AdeApp {
         )
     }
 
-    /// Surface A/B's shared footer: git-level actions appropriate to the agent's status - see
-    /// `crate::work_surface::state::footer_actions`/[`Self::render_footer_action_button`] for which
-    /// actions are implemented vs. disabled. No longer shows a `JERRY` wordmark (deliberate
-    /// deviation from the design mockup, per direct user request - see this crate's `lib.rs`/
-    /// `BUILD-LOG.md` for context, not a bug fix).
+    /// Surface A/B's shared bottom strip - **a readout, not an action bar** (GitHub issue #295,
+    /// `STAGE-A-CHANGELOG.md` §4t).
+    ///
+    /// It renders **whenever there is an agent**, not only when that agent's status happens to
+    /// offer an action, which is what turns the now-buttonless `ask`/`run`/`finished` states from
+    /// absent strips into useful ones. Left to right: whatever run-scoped verbs the status really
+    /// earns ([`work_surface::footer_actions`] - none at all for three of the five statuses), a
+    /// spacer, then this one agent's own cost, right-aligned
+    /// ([`Self::render_agent_cost_readout`]).
+    ///
+    /// Still missing from the strip: the per-agent provider budget §4t puts to the right of the
+    /// cost. That is GitHub issue #294's own research spike (`5h ▓▓▓▓▓▓░ 92%   7d ▓▓▓▓░░░ 65%`,
+    /// plus the popover §4u′ moved into this strip) and is deliberately not faked here - there is
+    /// no real rate-limit source in this build to read it from yet.
+    ///
+    /// No `JERRY` wordmark (deliberate deviation from the design mockup, per direct user request -
+    /// see this crate's `lib.rs`/`BUILD-LOG.md` for context, not a bug fix).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
         agent: &Agent,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status_value = self.agent_status(agent, cx);
-        let is_running = agent.pane.read(cx).is_running();
+        let (is_running, pid) = {
+            let pane = agent.pane.read(cx);
+            (pane.is_running(), pane.pid())
+        };
         let actions = work_surface::footer_actions(status_value);
         let id = agent.id;
-        let cwd = agent.cwd.clone();
 
         let mut footer = div()
             .id("pty-footer")
+            .debug_selector(|| "pty-footer".to_string())
             .flex()
             .flex_none()
             .items_center()
@@ -2302,33 +2273,20 @@ impl AdeApp {
             {
                 enabled = false;
             }
-            // GitHub issue #225's single-agent gate, applied to the footer door: `Review` is real
-            // backing logic (`implemented: true`), but it is only *offerable* when this agent
-            // really has a baseline and is the sole agent in its worktree. Disabled rather than
-            // hidden, so the row doesn't shift around as agents come and go - and disabled here
-            // means genuinely inert (`Self::render_footer_action_button` drops
-            // `cursor_pointer`/hover/`on_click` entirely), never a clickable-looking no-op.
-            if action.kind == work_surface::ActionKind::OpenReview && !self.review_available_for(id)
+            // `Discard worktree` shares the worktree-history in-flight guard
+            // (`Self::worktree_history_op_in_flight`) with the title bar's Agent menu row and the
+            // rail's own `Remove worktree…` - see `crate::worktree_history::flow`'s module docs.
+            // Disabled, not just relabelled, while busy - mirrors `Self::render_rail_footer`'s own
+            // `prune_in_flight` gating.
+            if action.kind == work_surface::ActionKind::DiscardWorktree
+                && self.worktree_history_op_in_flight.is_some()
             {
-                enabled = false;
-            }
-            // `Keep all`/`Discard worktree` (Revision R10) share one in-flight guard
-            // (`Self::worktree_history_op_in_flight`) - see `crate::worktree_history::flow`'s own
-            // module docs for why one flag is enough discipline here. Disabled, not just
-            // relabelled, while busy - mirrors `Self::render_rail_footer`'s own `prune_in_flight`
-            // gating.
-            let is_worktree_history_action = matches!(
-                action.kind,
-                work_surface::ActionKind::KeepAllChanges
-                    | work_surface::ActionKind::DiscardWorktree
-            );
-            if is_worktree_history_action && self.worktree_history_op_in_flight.is_some() {
                 enabled = false;
             }
             // Busy labels are keyed off the *specific* in-flight kind, not just "something is
             // running" - a real, live-reproduced bug an audit caught: keying this off the bare
             // in-flight flag alone made every visible `Discard worktree` button across every
-            // agent read "discarding…" while an unrelated `Keep all` was running.
+            // agent read "discarding…" while an unrelated worktree-history op was running.
             let label = match action.kind {
                 work_surface::ActionKind::DiscardWorktree
                     if self.worktree_history_op_in_flight
@@ -2341,25 +2299,63 @@ impl AdeApp {
                 {
                     "confirm discard?".to_string()
                 }
-                work_surface::ActionKind::KeepAllChanges
-                    if self.worktree_history_op_in_flight
-                        == Some(worktree_history::WorktreeHistoryOpKind::Keep) =>
-                {
-                    "keeping\u{2026}".to_string()
-                }
                 _ => action.label.to_string(),
             };
-            footer = footer.child(self.render_footer_action_button(
-                id,
-                cwd.clone(),
-                action,
-                label,
-                enabled,
-                cx,
-            ));
+            footer = footer.child(self.render_footer_action_button(id, action, label, enabled, cx));
         }
 
-        footer.child(div().flex_1())
+        footer = footer.child(div().flex_1());
+        match self.render_agent_cost_readout(is_running, pid) {
+            Some(readout) => footer.child(readout),
+            None => footer,
+        }
+    }
+
+    /// §4t's per-agent cost readout: `6.2% cpu · 0.51 GB` for **this** agent's own pid, at the
+    /// status bar's own recessive tier so the pane strip and the window footer speak in the same
+    /// type sizes rather than inventing a second scale.
+    ///
+    /// `None` - genuinely nothing rendered, not a dimmed placeholder - in the two cases §4t and
+    /// `crate::status_bar::render::AdeApp::render_status_resources_readout` already agree on:
+    /// "blank for an agent that is not running" (an exited pane has no pid to sample and no cost
+    /// to report), and a build whose platform has no real sampling backend at all
+    /// (`process_stats::PLATFORM_SAMPLING_SUPPORTED`), where a permanent `...% cpu` could never
+    /// resolve.
+    ///
+    /// Reads the same `AdeApp::process_stats` sample map and the same
+    /// `crate::status_bar::resources` formatters the Resources popover and the status bar total
+    /// use - one sampling pipeline, three surfaces, never a second derivation that could disagree
+    /// with the total this agent is part of.
+    pub(in crate::work_surface) fn render_agent_cost_readout(
+        &self,
+        is_running: bool,
+        pid: Option<u32>,
+    ) -> Option<impl IntoElement> {
+        if !crate::status_bar::process_stats::PLATFORM_SAMPLING_SUPPORTED {
+            return None;
+        }
+        let pid = pid.filter(|_| is_running)?;
+        let (cpu, memory) = crate::status_bar::resources::row_sample(
+            pid,
+            &self.process_stats,
+            crate::status_bar::render::available_cores(),
+        );
+        let tier = crate::status_bar::render::StatusTier::Recessive;
+
+        Some(
+            div()
+                .id("pty-footer-cost")
+                .debug_selector(|| "pty-footer-cost".to_string())
+                .flex_none()
+                .font(font(theme::font::MONO))
+                .font_weight(tier.weight())
+                .text_size(self.ui_text_size(tier.text_size()))
+                .text_color(tier.color())
+                .tooltip(text_tooltip(
+                    "What this agent is costing this machine right now".to_string(),
+                ))
+                .child(crate::status_bar::resources::agent_readout(cpu, memory)),
+        )
     }
 
     /// One footer action button - interactive (`cursor_pointer`, hover, `on_click` dispatch on
@@ -2368,7 +2364,6 @@ impl AdeApp {
     pub(in crate::work_surface) fn render_footer_action_button(
         &self,
         id: AgentId,
-        cwd: PathBuf,
         action: work_surface::FooterAction,
         label: String,
         enabled: bool,
@@ -2381,8 +2376,10 @@ impl AdeApp {
         // text swaps above), and an element's `id` should stay stable across that, matching
         // `Self::render_rail_footer`'s own static `"rail-prune"` id for its own label-swapping
         // button.
+        let selector = format!("footer-action-{kind:?}");
         let mut button = div()
             .id(format!("footer-action-{id}-{kind:?}"))
+            .debug_selector(move || selector)
             .h(px(23.0))
             .px(px(10.0))
             .rounded(theme::radius::BUTTON)
@@ -2437,19 +2434,10 @@ impl AdeApp {
                 .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
                 .on_click(
                     cx.listener(move |this, _event: &ClickEvent, window, cx| match kind {
-                        work_surface::ActionKind::Interrupt => this.interrupt_agent(id, cx),
-                        work_surface::ActionKind::OpenTerminal => {
-                            this.open_companion_terminal(cwd.clone(), window, cx)
-                        }
                         work_surface::ActionKind::Respawn => this.respawn_agent(id, window, cx),
-                        work_surface::ActionKind::KeepAllChanges => this.keep_all_changes(id, cx),
                         work_surface::ActionKind::DiscardWorktree => {
                             this.request_discard_worktree(id, window, cx)
                         }
-                        work_surface::ActionKind::OpenReview => {
-                            this.open_review_tab(id, window, cx)
-                        }
-                        work_surface::ActionKind::Unimplemented => {}
                     }),
                 );
         } else {
@@ -2551,22 +2539,81 @@ impl AdeApp {
                     .child(self.render_agent_context_bar(agent, cx))
                     .child(body)
             }
-            None => surface.child(
+            None => surface.child(self.render_no_agents_empty_state(cx)),
+        }
+        .into_any_element()
+    }
+
+    /// The centre pane with no agent open in this worktree at all.
+    ///
+    /// The one surface GitHub issue #295 leaves buttoned, quoting §4t verbatim: "The empty-worktree
+    /// case keeps its buttons: with no agent there is no keystroke to duplicate and no readout to
+    /// show." `Start an agent` (the primary CTA, [`Self::new_agent_pane`]) and `Open terminal`
+    /// (§4e: "`Open terminal` survives only in the no-agents empty state, where it is the
+    /// legitimate secondary CTA", [`Self::open_companion_terminal`]) - the same two the design's
+    /// `noAgents` branch renders, and the only home either verb has left in this pane.
+    ///
+    /// `open_companion_terminal` is given the worktree that is genuinely selected right now
+    /// ([`Self::current_worktree_path`]), not a remembered agent cwd: with no agent open there is
+    /// no agent cwd to inherit, and spawning a shell anywhere but the selected worktree is what
+    /// that method's own docs already forbid.
+    fn render_no_agents_empty_state(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cwd = self.current_worktree_path();
+        let colors = work_surface::action_button_colors(work_surface::ActionStyle::Outline);
+
+        div()
+            .flex()
+            .flex_1()
+            .flex_col()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap(px(14.0))
+            .child(
                 div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
                     .font(font(theme::font::SANS))
                     .text_size(px(11.5))
                     .text_color(theme::text::FAINT)
-                    .child(
-                        "no agents open in this worktree - start one with the tab strip's + menu",
-                    ),
-            ),
-        }
-        .into_any_element()
+                    .child("no agents open in this worktree"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(self.render_start_agent_button("empty-state-start-agent", cx))
+                    // Only when a real worktree is genuinely selected: with none,
+                    // `open_companion_terminal` would have nowhere to spawn, and a button that
+                    // could only no-op is exactly what this app renders disabled or not at all.
+                    .children(cwd.map(|cwd| {
+                        div()
+                            .id("empty-state-open-terminal")
+                            .debug_selector(|| "empty-state-open-terminal".to_string())
+                            .flex_none()
+                            .cursor_pointer()
+                            .h(px(20.0))
+                            .px(px(8.0))
+                            .rounded(theme::radius::BUTTON)
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.bg)
+                            .flex()
+                            .items_center()
+                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                            .child(
+                                div()
+                                    .font(font(theme::font::SANS))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(px(10.5))
+                                    .text_color(colors.fg)
+                                    .child("Open terminal"),
+                            )
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                this.open_companion_terminal(cwd.clone(), window, cx);
+                            }))
+                    })),
+            )
+            .into_any_element()
     }
 }
 
@@ -2844,6 +2891,10 @@ pub(in crate::work_surface) fn tab_settle_animation_id(
 /// The agent context bar's status pill: a coloured dot plus label in the status colour.
 pub(in crate::work_surface) fn render_status_pill(status: Status) -> impl IntoElement {
     div()
+        // Measured by `agent_pane_readout_tests` to prove the context bar really ends here
+        // (GitHub issue #295 / §4e: "identity and status only") - any re-added trailing button
+        // would push this pill left of the bar's own right padding.
+        .debug_selector(|| "agent-context-bar-status".to_string())
         .flex_none()
         .flex()
         .items_center()
@@ -5272,5 +5323,383 @@ mod select_agent_cross_repo_tests {
             );
             let _ = cx;
         });
+    }
+}
+
+/// GitHub issue #295: the agent pane's context bar is identity-only, and its bottom strip is a
+/// readout rather than an action bar (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`
+/// §4e/§4r/§4t).
+///
+/// These drive the real painted surface - real spawned child processes, real
+/// `VisualTestContext::debug_bounds` measurements of what actually reached the screen, and real
+/// simulated clicks - rather than re-asserting `footer_actions`'s pure output, which
+/// `crate::work_surface::state`'s own tests already pin. The point of measuring is that a removed
+/// button must be absent from the *paint*, not merely absent from a list.
+#[cfg(test)]
+mod agent_pane_readout_tests {
+    use super::*;
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write");
+        git(repo.path(), &["add", "base.txt"]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        repo
+    }
+
+    /// Spawns one real shell agent in `cwd` (optionally under a `shell_override` that exits by
+    /// itself) and selects it, so the centre pane really is that agent's pty surface.
+    fn spawn_and_select(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        cwd: PathBuf,
+        shell_override: Option<&'static str>,
+    ) -> AgentId {
+        let id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                cwd,
+                12.0,
+                shell_override,
+                None,
+                window,
+                cx,
+            )
+        });
+        app.update_in(cx, |app, window, cx| app.select_agent(id, window, cx));
+        cx.run_until_parked();
+        id
+    }
+
+    /// Waits for a real child process to genuinely exit - the same real-clock-plus-advance loop
+    /// `crate::sidebar::render`'s own `/bin/false` test uses, not an assumption that it has.
+    fn wait_for_exit(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, id: AgentId) {
+        for _ in 0..200 {
+            app.update(cx, |_app, cx| cx.notify());
+            cx.run_until_parked();
+            let exited = app.read_with(cx, |app, cx| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .is_some_and(|agent| !agent.pane.read(cx).is_running())
+            });
+            if exited {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+        }
+        panic!("premise: the spawned child must really have exited");
+    }
+
+    /// A real, non-bare worktree row for `path`. Seeded explicitly because a test app whose
+    /// worktree list has not loaded reads as *bare* (`AdeApp::current_worktree_is_bare`), which is
+    /// the branch that legitimately still renders `Start an agent` in the context bar - not the
+    /// branch these tests are about.
+    fn worktree_row(path: PathBuf, branch: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: branch.to_string(),
+            branch: Some(branch.to_string()),
+            is_main: true,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// §4e: the context bar "now carries identity and status only" - `Merge` and `Archive` are
+    /// **deleted**, not hidden or disabled. Both were worktree verbs sitting in an agent header:
+    /// offered twice for one two-agent worktree, offered while the agent was `Needs input`, and
+    /// gated on preconditions the header cannot show.
+    ///
+    /// Measured rather than read off the source: the status pill is now the bar's **last** child,
+    /// so its painted right edge must sit within the bar's own 12px right padding. Any re-added
+    /// trailing button pushes the pill left by that button's full width. Mutation-verified - a
+    /// re-added `Archive` button leaves the pill 83px short and fails this assertion.
+    #[gpui::test]
+    fn the_context_bar_ends_at_the_status_pill_with_no_merge_or_archive(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.worktrees = vec![worktree_row(repo.path().to_path_buf(), "main")];
+            app.select_worktree(0, window, cx);
+        });
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        // A real spawned child, relabelled to a real agent kind - `current_worktree_is_bare`
+        // counts agent *sessions*, and a plain shell leaves the worktree bare (which is the
+        // branch that legitimately keeps `Start an agent`). Same real-process-plus-relabel the
+        // Runs-section tests use.
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.current_worktree_is_bare()),
+            "premise: a real, non-bare worktree - the bare branch keeps its own `Start an agent`"
+        );
+
+        let bar = cx
+            .debug_bounds("agent-context-bar")
+            .expect("the agent context bar must really paint for a selected agent");
+        let pill = cx
+            .debug_bounds("agent-context-bar-status")
+            .expect("its status pill must really paint");
+        assert!(
+            cx.debug_bounds("context-bar-start-agent").is_none(),
+            "premise: a worktree that already has an agent renders no `Start an agent` either"
+        );
+
+        let trailing_gap = (bar.origin.x + bar.size.width) - (pill.origin.x + pill.size.width);
+        assert!(
+            trailing_gap <= px(13.0),
+            "the status pill must be the last thing in the context bar - it ends {trailing_gap:?} \
+             from the bar's right edge, more than the bar's own 12px padding, so something is \
+             painted after it. \u{a7}4e deleted `Merge` (now the git graph's job, issue #241) and \
+             `Archive` (now the rail's agent/worktree menus, issue #290)."
+        );
+    }
+
+    /// §4t: "The bar now renders whenever there is an agent, not only when there are actions - so
+    /// the finished and asking states, which §4r emptied, are useful strips again rather than
+    /// absent ones."
+    ///
+    /// A freshly spawned shell has just written its prompt, so it is `Status::Run` - the status
+    /// §4t emptied of buttons entirely (`⌃C` in the focused pty is the interrupt). The strip must
+    /// still paint, and must carry this agent's own cost readout.
+    #[gpui::test]
+    fn a_running_agents_strip_still_paints_and_carries_its_own_cost(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+
+        let status = app.read_with(cx, |app, cx| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the spawned agent");
+            app.agent_status(agent, cx)
+        });
+        assert_eq!(
+            status,
+            Status::Run,
+            "premise: a shell that just printed its prompt is `Run`, the status §4t emptied"
+        );
+        assert!(
+            work_surface::footer_actions(status).is_empty(),
+            "premise: `Run` offers no footer actions at all"
+        );
+
+        assert!(
+            cx.debug_bounds("pty-footer").is_some(),
+            "the strip must paint for an agent with no actions - that is exactly the state §4t \
+             turned from an absent bar into a readout"
+        );
+        assert!(
+            cx.debug_bounds("pty-footer-cost").is_some(),
+            "and it must carry this one agent's own `X% cpu \u{b7} Y GB`, from the same per-pid \
+             sampling the status bar's total sums (issue #283)"
+        );
+        assert!(
+            cx.debug_bounds("footer-action-Respawn").is_none()
+                && cx.debug_bounds("footer-action-DiscardWorktree").is_none(),
+            "and no action button at all may paint on a running agent"
+        );
+    }
+
+    /// §4t: the cost is "blank for an agent that is not running". Not a dimmed `...`, not a
+    /// fabricated `0% cpu` - nothing at all, which is what the `Option` return states.
+    #[gpui::test]
+    fn the_cost_readout_is_blank_for_an_agent_that_is_not_running(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.render_agent_cost_readout(false, Some(1234)).is_none(),
+                "a pid that is no longer running has no cost to report"
+            );
+            assert!(
+                app.render_agent_cost_readout(true, None).is_none(),
+                "and a pane with no pid at all has nothing to sample"
+            );
+        });
+    }
+
+    /// §4e/§4r's one surviving pair, and its two-click safety: `failed` keeps `Retry` and
+    /// `Discard worktree`, and the discard really arms before it destroys.
+    ///
+    /// Driven through the genuinely painted button (`debug_bounds` + `simulate_click`), not
+    /// through `request_discard_worktree` directly - the point is that this strip still offers
+    /// those two, and that `Open terminal` (which used to sit between them) does not paint.
+    #[gpui::test]
+    fn a_failed_run_keeps_retry_and_a_two_click_discard_and_nothing_else(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let worktree_container = tempfile::tempdir().expect("tempdir");
+        let worktree_path = worktree_container.path().join("feature-wt");
+        drop(worktree_container);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        // `/bin/false` is a real child that really exits non-zero, so `Status::Fail` is derived
+        // from a genuine `ProcessSignal::Exited { success: false }` rather than being set.
+        let id = spawn_and_select(&app, cx, worktree_path.clone(), Some("/bin/false"));
+        wait_for_exit(&app, cx, id);
+
+        let status = app.read_with(cx, |app, cx| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the spawned agent");
+            app.agent_status(agent, cx)
+        });
+        assert_eq!(status, Status::Fail, "premise: the run really failed");
+
+        assert!(
+            cx.debug_bounds("footer-action-Respawn").is_some(),
+            "a failed run keeps its `Retry`"
+        );
+        let discard = cx
+            .debug_bounds("footer-action-DiscardWorktree")
+            .expect("and its two-click `Discard worktree`");
+
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.discard_confirm_armed),
+            Some(id),
+            "the first click must only arm - this is the one irreversible thing in the pane"
+        );
+        assert!(
+            worktree_path.exists(),
+            "and an armed-but-unconfirmed discard must not have touched the real worktree"
+        );
+    }
+
+    /// §4t, verbatim: "The empty-worktree case keeps its buttons: with no agent there is no
+    /// keystroke to duplicate and no readout to show." `Open terminal` survives here and nowhere
+    /// else in this pane (§4e: "the legitimate secondary CTA"), and it really spawns a shell.
+    #[gpui::test]
+    fn the_no_agent_empty_state_really_starts_a_terminal(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Close whatever the app opened on startup, so the centre pane really is the empty state.
+        let startup: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        app.update_in(cx, |app, window, cx| {
+            for id in startup {
+                app.close_agent(id, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.iter().count()),
+            0,
+            "premise: no agents left, so the empty state is what paints"
+        );
+
+        assert!(
+            cx.debug_bounds("empty-state-start-agent").is_some(),
+            "the empty state keeps its primary `Start an agent` CTA"
+        );
+        let open_terminal = cx
+            .debug_bounds("empty-state-open-terminal")
+            .expect("and its secondary `Open terminal` CTA - §4e's one surviving home for it");
+
+        cx.simulate_click(open_terminal.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.iter().count(),
+                1,
+                "clicking it must really spawn a shell, not decorate the empty state"
+            );
+            assert!(
+                app.agents
+                    .iter()
+                    .all(|agent| agent.kind == ProcessKind::Shell),
+                "and that spawn is a terminal, which is what the button says"
+            );
+        });
+    }
+
+    /// Revision R12 §3's one context-bar button that #295 does *not* remove: a bare worktree has
+    /// no agent, so it has no agent verbs to offer and no worktree verbs to misplace - just the
+    /// primary CTA that gives it one.
+    #[gpui::test]
+    fn a_bare_worktree_keeps_its_start_an_agent_button(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+
+        // A real bare worktree row, selected - the exact condition
+        // `AdeApp::current_worktree_is_bare` reads.
+        app.update_in(cx, |app, window, cx| {
+            app.worktrees = vec![WorktreeItem {
+                path: repo.path().to_path_buf(),
+                label: "bare".to_string(),
+                branch: None,
+                is_main: true,
+                is_bare: true,
+                is_detached: false,
+                short_sha: None,
+                is_locked: false,
+                lock_reason: None,
+                is_broken: false,
+                broken_reason: None,
+                error: None,
+            }];
+            app.select_worktree(0, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("context-bar-start-agent").is_some(),
+            "a bare worktree's context bar keeps `Start an agent` - it is not one of the \
+             worktree verbs §4e removed"
+        );
     }
 }
