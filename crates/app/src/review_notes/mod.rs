@@ -165,11 +165,15 @@ impl ReviewNote {
         self.text.trim().is_empty()
     }
 
-    /// The card's mark. `sent` **only** while the delivered wording and the current wording are
-    /// the same string.
+    /// The card's mark. `sent` **only** while what was delivered still says what this note says.
+    ///
+    /// Compared through [`delivered_form`] rather than by raw string equality, because the batch
+    /// does not deliver the buffer verbatim - it collapses control characters and whitespace runs
+    /// (`crate::review_notes::prompt`). Without that, a note containing a tab or a double space
+    /// would come back reading `draft` the instant it was sent, having changed not at all.
     pub fn mark(&self) -> NoteMark {
         match self.sent.as_deref() {
-            Some(sent) if sent == self.text => NoteMark::Sent,
+            Some(sent) if sent == delivered_form(&self.text) => NoteMark::Sent,
             _ => NoteMark::Draft,
         }
     }
@@ -178,10 +182,19 @@ impl ReviewNote {
     /// honest half of the draft/sent history, surfaced as the card's tooltip.
     pub fn superseded_text(&self) -> Option<&str> {
         match self.sent.as_deref() {
-            Some(sent) if sent != self.text => Some(sent),
+            Some(sent) if sent != delivered_form(&self.text) => Some(sent),
             _ => None,
         }
     }
+}
+
+/// How a note's text reads once the batch has composed it - the one place the model and
+/// [`prompt`] agree on what "the same note" means.
+///
+/// Re-exported from [`prompt`] rather than reimplemented, so [`ReviewNote::mark`]'s comparison and
+/// the string actually delivered can never drift apart.
+pub fn delivered_form(text: &str) -> String {
+    prompt::sanitize(text.trim())
 }
 
 /// One note's address inside a worktree: which file, and which line of it.
@@ -314,6 +327,9 @@ impl NoteStore {
     ///
     /// Blank cards are deliberately skipped rather than marked: nothing about them went down the
     /// pty, so nothing about them may claim to have.
+    ///
+    /// Real sends go through [`Self::mark_sent_as`] instead - see its docs for why the *delivered*
+    /// wording, not the buffer, is what belongs in [`ReviewNote::sent`].
     pub fn mark_sent(&mut self, worktree: &Path, path: &Path) -> usize {
         let Some(file) = self
             .worktrees
@@ -328,6 +344,40 @@ impl NoteStore {
                 continue;
             }
             note.sent = Some(note.text.clone());
+            marked += 1;
+        }
+        marked
+    }
+
+    /// The same, but recording **what the agent actually received** for each anchor.
+    ///
+    /// [`ReviewNote::sent`] is documented, here and in the persisted file, as *the exact text that
+    /// was delivered*, and the batched prompt does not deliver the buffer verbatim: it sanitises
+    /// control characters and collapses whitespace runs
+    /// (`crate::review_notes::prompt`). Marking with the buffer would make the card's own
+    /// "sent earlier, and since edited" tooltip quote wording the agent never saw - which is
+    /// precisely the dishonesty keeping the delivered wording exists to prevent.
+    ///
+    /// An anchor with no delivered entry is left alone: nothing about it went down the pty.
+    pub fn mark_sent_as(
+        &mut self,
+        worktree: &Path,
+        path: &Path,
+        delivered: &[(NoteAnchor, String)],
+    ) -> usize {
+        let Some(file) = self
+            .worktrees
+            .get_mut(worktree)
+            .and_then(|files| files.get_mut(path))
+        else {
+            return 0;
+        };
+        let mut marked = 0;
+        for (anchor, text) in delivered {
+            let Some(note) = file.get_mut(anchor) else {
+                continue;
+            };
+            note.sent = Some(text.clone());
             marked += 1;
         }
         marked

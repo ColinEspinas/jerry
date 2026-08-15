@@ -157,7 +157,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 // Only `#[cfg(unix)]` code below (the process-tree kill path, and the two grace-period
 // consts) uses `Duration` outside of `#[cfg(test)]`; the test module below imports it
@@ -434,6 +436,9 @@ pub struct PtySession {
     output_rx: Receiver<Vec<u8>>,
     reader_thread: Option<JoinHandle<()>>,
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Raised by [`run_writer_loop`] when a real write to the pty fails, so
+    /// [`PtySession::write_input`] stops reporting success into a broken pipe. See its docs.
+    writer_failed: Arc<AtomicBool>,
     writer_thread: Option<JoinHandle<()>>,
     shutdown_write: Option<filedescriptor::FileDescriptor>,
 }
@@ -517,8 +522,12 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     };
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
-    let writer_thread = std::thread::spawn(move || {
-        run_writer_loop(writer, writer_rx);
+    let writer_failed = Arc::new(AtomicBool::new(false));
+    let writer_thread = std::thread::spawn({
+        let writer_failed = Arc::clone(&writer_failed);
+        move || {
+            run_writer_loop(writer, writer_rx, writer_failed);
+        }
     });
 
     Ok(PtySession {
@@ -528,6 +537,7 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
         output_rx,
         reader_thread: Some(reader_thread),
         writer_tx: Some(writer_tx),
+        writer_failed,
         writer_thread: Some(writer_thread),
         shutdown_write,
     })
@@ -634,12 +644,18 @@ fn run_reader_loop(mut reader: Box<dyn Read + Send>, output_tx: mpsc::SyncSender
 /// Body of the background writer thread: serializes writes from [`PtySession::write_input`]
 /// so the pty's actual (possibly blocking) `write` syscall never happens on a caller's
 /// thread. Exits once its `Sender` is dropped (channel disconnected) or a write fails.
-fn run_writer_loop(mut writer: Box<dyn Write + Send>, rx: mpsc::Receiver<Vec<u8>>) {
+///
+/// `failed` is raised on a real write/flush error before the loop exits, and is what lets
+/// [`PtySession::write_input`] stop reporting success once the pipe is genuinely broken - see
+/// that method's own docs for why "enqueued" and "written" are not the same claim.
+fn run_writer_loop(
+    mut writer: Box<dyn Write + Send>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    failed: Arc<AtomicBool>,
+) {
     while let Ok(data) = rx.recv() {
-        if writer.write_all(&data).is_err() {
-            break;
-        }
-        if writer.flush().is_err() {
+        if writer.write_all(&data).is_err() || writer.flush().is_err() {
+            failed.store(true, Ordering::SeqCst);
             break;
         }
     }
@@ -659,12 +675,34 @@ impl PtySession {
     /// user or piped in by another process). The actual write happens on a dedicated
     /// background thread, so this call does not block on pty I/O even if the child
     /// isn't currently reading its input.
+    ///
+    /// ## What `Ok` does and does not promise
+    ///
+    /// `Ok` means the bytes were handed to the writer thread, **not** that they reached the fd -
+    /// the write itself happens later, on that thread, and cannot be awaited here without
+    /// reintroducing exactly the blocking this indirection exists to avoid.
+    ///
+    /// What it *does* promise, since GitHub issue #288: the writer thread has not already died.
+    /// It used to swallow a failed `write_all`/`flush` and exit silently, so every subsequent
+    /// `write_input` kept returning `Ok` into a pipe that no longer went anywhere - and a caller
+    /// that treats `Ok` as "delivered" (issue #288's review notes flip to `sent` on it) would
+    /// then claim a delivery that never happened, with no way back. [`Self::writer_failed`] is
+    /// raised by [`run_writer_loop`] before it breaks, and checked here first.
     pub fn write_input(&self, data: &[u8]) -> Result<(), PtyError> {
+        if self.writer_failed.load(Ordering::SeqCst) {
+            return Err(PtyError::WriterClosed);
+        }
         self.writer_tx
             .as_ref()
             .ok_or(PtyError::WriterClosed)?
             .send(data.to_vec())
             .map_err(|_| PtyError::WriterClosed)
+    }
+
+    /// Whether this session's writer thread has already failed a real write to the pty - see
+    /// [`Self::write_input`]'s own docs.
+    pub fn writer_failed(&self) -> bool {
+        self.writer_failed.load(Ordering::SeqCst)
     }
 
     /// Resizes the pty. Propagates the resize down to the kernel, which will notify the
@@ -1554,6 +1592,36 @@ mod tests {
              the output channel does not appear to be backpressuring (expected growth \
              bounded by the channel capacity, well under 20MB)"
         );
+    }
+
+    /// The healthy half of GitHub issue #288's writer-health check: a live session must report a
+    /// working writer and must keep accepting writes. The check is a real gate on
+    /// `write_input`, so a version of it that were ever true by accident would silently make
+    /// every paste and every sent prompt in the app fail.
+    #[test]
+    fn a_live_session_reports_a_healthy_writer_and_keeps_accepting_writes() {
+        let session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
+        assert!(!session.writer_failed());
+        for _ in 0..3 {
+            session
+                .write_input(b"still-writing\n")
+                .expect("a healthy writer must keep accepting writes");
+        }
+        assert!(!session.writer_failed());
+        let output = drain_until_contains(&session, "still-writing", Duration::from_secs(5));
+        assert!(String::from_utf8_lossy(&output).contains("still-writing"));
+    }
+
+    /// And the closed half: once the session has been shut down there is no writer at all, so a
+    /// write must be a typed error rather than a silent success into nothing.
+    #[test]
+    fn a_shut_down_session_refuses_writes() {
+        let mut session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
+        session.shutdown().expect("shutdown");
+        assert!(matches!(
+            session.write_input(b"too late"),
+            Err(PtyError::WriterClosed)
+        ));
     }
 
     #[test]

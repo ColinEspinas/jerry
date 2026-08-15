@@ -16,6 +16,13 @@ use gpui::{Context, Window};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// How long after the last keystroke a note is written to disk.
+///
+/// Sized against the same question `crate::text_history::COALESCE_IDLE` (600ms) answers - long
+/// enough that an ordinary typing burst is one write, short enough that stepping away and closing
+/// the window cannot lose what is on screen.
+const REVIEW_NOTES_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// The one note currently open for typing, and its own text buffer.
 ///
 /// **One at a time, and deliberately.** A per-note `TextField` + `FocusHandle` would have to be
@@ -28,10 +35,27 @@ use std::time::Instant;
 /// undo history every other hand-rolled input in this app has (`crate::text_history`'s own module
 /// docs list the five; this is the sixth).
 pub(crate) struct NoteDraft {
+    /// Which **checkout** this note belongs to.
+    ///
+    /// Carried on the draft rather than re-read from [`AdeApp::diff_root`] at each store call,
+    /// and that is a correctness point: `diff_root` is reassigned wholesale on every worktree
+    /// switch (`crate::code_surface::tabs::AdeApp::load_diff`), so a draft opened in worktree A
+    /// and still open after a switch to B would otherwise have every one of its writes land under
+    /// B's key - overwriting B's own note on the same path and line, and persisting it there.
+    pub worktree: PathBuf,
     /// Which note this buffer belongs to.
     pub at: NoteRef,
     /// Its live text.
     pub field: TextField,
+}
+
+impl NoteDraft {
+    /// Whether this draft really is the one open for `worktree`'s `at` - the guard every read and
+    /// write of the draft goes through, so a draft left over from another checkout matches
+    /// nothing rather than matching by path alone.
+    pub fn is(&self, worktree: &Path, at: &NoteRef) -> bool {
+        self.worktree == worktree && &self.at == at
+    }
 }
 
 /// Who a file's review notes are going to, resolved and ready to be sent to.
@@ -124,10 +148,33 @@ impl AdeApp {
 
     /// Writes the live store back out, off-thread, merging under the shared lock.
     ///
-    /// Called at every point a note's *content* has settled - not per keystroke: a save per
-    /// character would be a real file write per character, and the draft buffer is the live
-    /// source of truth in between anyway.
+    /// Called at every point a note's content has genuinely settled - a card closing, a batch
+    /// being sent - where the write should not wait for anything.
     fn persist_review_notes(&mut self, cx: &mut Context<Self>) {
+        self.write_review_notes(None, cx);
+    }
+
+    /// The same write, debounced - what a keystroke schedules.
+    ///
+    /// A note has to survive the app closing, and "persist when the card closes" is not that: a
+    /// reviewer who types a note and then quits with the caret still in it would lose it, and
+    /// losing review text is the one failure this feature cannot have. Writing per character
+    /// instead would be a real `fsync`'d file write per character.
+    ///
+    /// So: one slot ([`AdeApp::_review_notes_persist_task`]), newest wins. Assigning a fresh task
+    /// drops - and therefore cancels - whatever earlier timer was still waiting, so only the last
+    /// keystroke's timer fires. Exactly the mechanism
+    /// `crate::code_surface::editing::AdeApp::schedule_rehighlight` already uses, and the state is
+    /// captured *inside* the task after the wait, so a coalesced write is a write of the newest
+    /// content rather than of whatever was there when the first keystroke landed.
+    fn schedule_review_notes_persist(&mut self, cx: &mut Context<Self>) {
+        self.write_review_notes(Some(REVIEW_NOTES_PERSIST_DEBOUNCE), cx);
+    }
+
+    /// Two slots, not one: a debounced write and an immediate one are different promises. Sharing
+    /// a slot would let the next keystroke's timer *cancel* an already-committed write from
+    /// `close_note_draft`/`send_review_notes` before it ran.
+    fn write_review_notes(&mut self, after: Option<std::time::Duration>, cx: &mut Context<Self>) {
         let Some(path) = self.review_notes_path.clone() else {
             return;
         };
@@ -135,9 +182,19 @@ impl AdeApp {
             .insert(crate::review::state::encode_worktree(
                 &self.review_notes_worktree(),
             ));
-        let state = ReviewNotesState::capture(&self.review_notes);
-        let owned = self.review_notes_owned.clone();
-        let task = cx.spawn(async move |_this, cx| {
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(delay) = after {
+                cx.background_executor().timer(delay).await;
+            }
+            // Captured after the wait, so a debounced write carries the newest content.
+            let Ok((state, owned)) = this.read_with(cx, |this, _| {
+                (
+                    ReviewNotesState::capture(&this.review_notes),
+                    this.review_notes_owned.clone(),
+                )
+            }) else {
+                return;
+            };
             let save_path = path.clone();
             let result = cx
                 .background_executor()
@@ -147,7 +204,10 @@ impl AdeApp {
                 log::warn!("failed to save {}: {err}", path.display());
             }
         });
-        self._review_notes_persist_task = Some(task);
+        match after {
+            Some(_) => self._review_notes_debounce_task = Some(task),
+            None => self._review_notes_persist_task = Some(task),
+        }
     }
 
     /// Clicking a diff line: pin a note beneath it, or - if the click landed on the line whose
@@ -171,12 +231,16 @@ impl AdeApp {
         };
         let at = NoteRef::new(path, anchor);
         self.note_cursor = Some(at.clone());
-        if self.note_draft.as_ref().is_some_and(|draft| draft.at == at) {
+        let worktree = self.review_notes_worktree();
+        if self
+            .note_draft
+            .as_ref()
+            .is_some_and(|draft| draft.is(&worktree, &at))
+        {
             self.close_note_draft(window, cx);
             cx.notify();
             return;
         }
-        let worktree = self.review_notes_worktree();
         self.review_notes.begin(&worktree, &at.path, anchor);
         self.open_note_draft(at, window, cx);
     }
@@ -200,6 +264,7 @@ impl AdeApp {
             .unwrap_or_default();
         self.note_cursor = Some(at.clone());
         self.note_draft = Some(NoteDraft {
+            worktree,
             at,
             field: TextField::seeded(&text),
         });
@@ -227,9 +292,9 @@ impl AdeApp {
         let Some(draft) = self.note_draft.take() else {
             return;
         };
-        let worktree = self.review_notes_worktree();
+        // The draft's own worktree, never the currently-open one - see [`NoteDraft::worktree`].
         self.review_notes
-            .discard_if_blank(&worktree, &draft.at.path, draft.at.anchor);
+            .discard_if_blank(&draft.worktree, &draft.at.path, draft.at.anchor);
         window.focus(&self.diff_notes_focus_handle, cx);
         self.persist_review_notes(cx);
     }
@@ -263,11 +328,12 @@ impl AdeApp {
         if !changed {
             return;
         }
+        let worktree = draft.worktree.clone();
         let at = draft.at.clone();
         let text = draft.field.as_str().to_string();
-        let worktree = self.review_notes_worktree();
         self.review_notes
             .set_text(&worktree, &at.path, at.anchor, &text);
+        self.schedule_review_notes_persist(cx);
         cx.notify();
         cx.stop_propagation();
     }
@@ -302,11 +368,12 @@ impl AdeApp {
         if !step(&mut draft.field) {
             return;
         }
+        let worktree = draft.worktree.clone();
         let at = draft.at.clone();
         let text = draft.field.as_str().to_string();
-        let worktree = self.review_notes_worktree();
         self.review_notes
             .set_text(&worktree, &at.path, at.anchor, &text);
+        self.schedule_review_notes_persist(cx);
         cx.notify();
     }
 
@@ -428,9 +495,9 @@ impl AdeApp {
         // A half-typed card is part of the batch too - settle it first so what is on screen and
         // what goes down the pty cannot differ.
         if let Some(draft) = self.note_draft.as_ref() {
+            let worktree = draft.worktree.clone();
             let at = draft.at.clone();
             let text = draft.field.as_str().to_string();
-            let worktree = self.review_notes_worktree();
             self.review_notes
                 .set_text(&worktree, &at.path, at.anchor, &text);
         }
@@ -463,7 +530,13 @@ impl AdeApp {
         }
 
         let worktree = self.review_notes_worktree();
-        let marked = self.review_notes.mark_sent(&worktree, &path);
+        // Marked with what was really **delivered**, not with the raw buffer: the prompt's own
+        // sanitisation collapses control characters and whitespace runs
+        // (`crate::review_notes::prompt`), so storing the buffer would have the card's own
+        // "sent earlier" tooltip quote wording the agent never received.
+        let marked = self
+            .review_notes
+            .mark_sent_as(&worktree, &path, prompt.delivered());
         self.note_send_error = None;
         self.persist_review_notes(cx);
         cx.notify();
@@ -481,8 +554,13 @@ impl AdeApp {
             return;
         };
         if let Err(err) = self.send_review_notes(path, cx) {
-            self.note_send_error = Some(err.message().to_string());
-            cx.notify();
+            // `NothingToSend` deliberately says nothing: the bar only exists once the file has a
+            // real note, so there is nowhere to show it now - and setting it would leave the
+            // message sitting in the bar the moment a note *was* written.
+            if err != NoteSendError::NothingToSend {
+                self.note_send_error = Some(err.message().to_string());
+                cx.notify();
+            }
         }
     }
 

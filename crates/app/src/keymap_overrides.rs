@@ -211,8 +211,14 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
         // reason: it is why `ToggleLineNote`'s plain `c` carries `&& !text-input` while
         // `SendReviewNotes`' `mod+enter` deliberately does not (see
         // `crate::default_key_bindings`).
-        vec!["app", "diff-view"],
-        vec!["app", "diff-view", "text-input"],
+        //
+        // Note the `"diff"` frame ahead of both: the notes container is a *descendant* of
+        // `crate::code_surface::render`'s own node, so `"diff"`-scoped bindings are live over a
+        // focused note card. Getting this wrong here is not academic - it is exactly what hid the
+        // live bug where `v` (`ToggleChangeSeen`) and `]` (`NextChangedFile`) swallowed those
+        // characters instead of letting them be typed into a note.
+        vec!["app", "diff", "diff-view"],
+        vec!["app", "diff", "diff-view", "text-input"],
         // The file tree (GitHub issue #19), built by calling the *same* function the renderer
         // calls, over both of its inputs - not by restating its literals here. See
         // [`file_tree_key_context`] for why that indirection is load-bearing rather than tidy.

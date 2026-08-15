@@ -392,6 +392,7 @@ impl AdeApp {
             _agent_status_persist_task: None,
             _line_provenance_persist_task: None,
             _review_notes_persist_task: None,
+            _review_notes_debounce_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that

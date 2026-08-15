@@ -242,7 +242,18 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
         gpui::KeyBinding::new("secondary-shift-g", root::NewGitGraph, None),
-        gpui::KeyBinding::new("]", root::NextChangedFile, Some("diff && !file-editor")),
+        // `&& !text-input` was added by GitHub issue #288, and it is a real fix rather than
+        // defensive padding: that issue puts a pinned review-note card - a genuine
+        // `"text-input"` node - *inside* the diff surface, so with the old predicate a plain `]`
+        // typed into a note would jump to the next changed file instead of being typed. It is a
+        // no-op for every stack that existed before: the only `"text-input"` node under `"diff"`
+        // was the File editor, which already carries `"file-editor"` on the same node and was
+        // therefore already excluded.
+        gpui::KeyBinding::new(
+            "]",
+            root::NextChangedFile,
+            Some("diff && !file-editor && !text-input"),
+        ),
         // GitHub issue #286 / `STAGE-A-CHANGELOG.md` §4i: "opening a file marks it seen - that is
         // what the word means - and `V` unmarks. The convention is stated in the name's own
         // tooltip", with `V mark seen` in the Changes panel's own legend.
@@ -255,7 +266,15 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // keeps it off the editable File view, where `v` is a character to type; `"diff"`'s File
         // arm adds `"file-editor"` onto the same node rather than replacing it, which is the exact
         // live bug that narrowed `"]"`'s own predicate.
-        gpui::KeyBinding::new("v", root::ToggleChangeSeen, Some("diff && !file-editor")),
+        // Same `&& !text-input` addition, same reason, and the one this was actually caught by:
+        // `v` typed into a review note used to mark the file seen instead of writing a `v`
+        // (`crate::review_notes::integration_tests`' real-file persistence test typed the word
+        // "survives" and got back "suries").
+        gpui::KeyBinding::new(
+            "v",
+            root::ToggleChangeSeen,
+            Some("diff && !file-editor && !text-input"),
+        ),
         gpui::KeyBinding::new("secondary-1", root::JumpToAgent1, None),
         gpui::KeyBinding::new("secondary-2", root::JumpToAgent2, None),
         gpui::KeyBinding::new("secondary-3", root::JumpToAgent3, None),

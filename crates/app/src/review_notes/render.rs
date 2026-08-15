@@ -79,9 +79,47 @@ impl AdeApp {
             .key_context("diff-view")
             .on_action(cx.listener(Self::handle_send_review_notes))
             .on_action(cx.listener(Self::handle_toggle_line_note))
+            .children(self.render_note_input_node(cx))
             .children(self.render_review_notes_bar(&path, cx))
             .child(hunks)
             .into_any_element()
+    }
+
+    /// The open note's real keyboard input node - zero-sized, and deliberately **not** inside the
+    /// diff's row list.
+    ///
+    /// This looks like misdirection and is the opposite. The pinned card is a row of a
+    /// `gpui::uniform_list`, which builds only the rows in its visible range: put the
+    /// `track_focus`/`key_context`/`on_key_down` on the card and scrolling the card off screen
+    /// deletes the focused node from the dispatch tree mid-sentence. GPUI then evaluates every
+    /// predicate against an **empty context stack**, where
+    /// `KeyBindingContextPredicate::eval_inner` short-circuits to `false` - so the keystrokes
+    /// stop being typed, `mod+enter` and `c` stop firing, and nothing on screen says so. That is
+    /// the exact bug class `crate::keymap_overrides::real_context_stacks` includes the empty
+    /// stack for, and it is reachable here without anyone calling
+    /// [`AdeApp::close_note_draft`].
+    ///
+    /// Anchoring the node here instead makes the input's lifetime the *draft's* lifetime rather
+    /// than the scroll position's. The card keeps the caret (which only *reads*
+    /// `FocusHandle::is_focused`, so it needs no node of its own) and the text; exactly one
+    /// element ever tracks [`AdeApp::note_focus_handle`], which is the other half of the same
+    /// rule.
+    fn render_note_input_node(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.note_draft.as_ref()?;
+        Some(
+            div()
+                .id("diff-note-input")
+                .debug_selector(|| "diff-note-input".to_string())
+                .flex_none()
+                .w(px(0.0))
+                .h(px(0.0))
+                .track_focus(&self.note_focus_handle)
+                .key_context("text-input")
+                .on_action(cx.listener(Self::handle_note_text_undo))
+                .on_action(cx.listener(Self::handle_note_text_redo))
+                .on_key_down(cx.listener(Self::handle_note_key_down))
+                .into_any_element(),
+        )
     }
 
     /// The notes bar itself. `None` - no bar at all, not an empty one - when the file carries no
@@ -411,25 +449,6 @@ impl AdeApp {
                         ),
                 );
 
-        // The text-input machinery goes on **only** the card being typed into.
-        //
-        // Not on every card, and that is a correctness point rather than a saving: two elements
-        // tracking one `FocusHandle` in the same frame put two nodes with the same `FocusId` into
-        // GPUI's dispatch tree, and which of them a keystroke resolves against is then an accident
-        // of traversal order. A pinned card that is not being edited is read-only text, and says
-        // so by not being a `"text-input"` node at all - which is also what makes
-        // `ToggleLineNote`'s `&& !text-input` conjunct mean what it says.
-        let card = if editing {
-            body.track_focus(&self.note_focus_handle)
-                .key_context("text-input")
-                .on_action(cx.listener(Self::handle_note_text_undo))
-                .on_action(cx.listener(Self::handle_note_text_redo))
-                .on_key_down(cx.listener(Self::handle_note_key_down))
-                .into_any_element()
-        } else {
-            body.into_any_element()
-        };
-
         div()
             // The slot. `rems(1.6)`, like every other item of this list, with 1px of breathing
             // room top and bottom so the card reads as a card rather than as a band.
@@ -440,7 +459,7 @@ impl AdeApp {
             .pl(px(74.0))
             .pr(px(14.0))
             .flex()
-            .child(card)
+            .child(body)
             .into_any_element()
     }
 
@@ -455,8 +474,20 @@ impl AdeApp {
         let Some(path) = self.review_notes_file() else {
             return;
         };
+        let worktree = self.review_notes_worktree();
         let at = super::NoteRef::new(path, anchor);
-        if self.note_draft.as_ref().is_some_and(|draft| draft.at == at) {
+        if self
+            .note_draft
+            .as_ref()
+            .is_some_and(|draft| draft.is(&worktree, &at))
+        {
+            // Already the open draft - but focus still has to be taken back, not left alone.
+            // `.track_focus` makes an element focus its own handle on mouse-down, and the notes
+            // container is one, so the click that got here has just moved focus off the note's
+            // input node and onto the container. Returning without this would leave the caret
+            // visibly in a card that no longer receives a single keystroke.
+            window.focus(&self.note_focus_handle, cx);
+            cx.notify();
             return;
         }
         self.open_note_draft(at, window, cx);

@@ -441,6 +441,26 @@ impl AdeApp {
             })
             .unwrap_or_default();
         let notes_enabled = notes_path.is_some();
+        // Each line's note anchor, resolved once per frame from the same
+        // `changes::hunk_line_numbers` the row plan itself uses - deliberately **not** from
+        // `diff_highlight_cache`. A line's identity is a fact about the diff, not about whether
+        // its syntax colouring has been recomputed yet: reading it off the cache would mean that
+        // every time the agent writes to the open file (invalidating the cache's full-value
+        // identity guard until the next highlight pass) every note dot vanished and no line could
+        // be clicked, with the already-pinned cards still on screen and no explanation.
+        let line_anchors: Rc<Vec<Vec<Option<NoteAnchor>>>> = Rc::new(if notes_enabled {
+            file.hunks
+                .iter()
+                .map(|hunk| {
+                    changes::hunk_line_numbers(hunk)
+                        .into_iter()
+                        .map(NoteAnchor::from_gutter)
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        });
         // The bar is built after the list, from the same resolution - one `Rc`, so the row builder
         // and the bar can never be looking at two different files.
         let notes_path: Option<Rc<PathBuf>> = notes_path.map(Rc::new);
@@ -483,6 +503,13 @@ impl AdeApp {
                 let Some(file) = surface.open_file(this) else {
                     return Vec::new();
                 };
+                // Guarded exactly like the highlight cache below: this frame's notes belong to
+                // the file the plan was built from, and if the surface has since resolved a
+                // *different* file, drawing them would put file A's notes on file B's rows - and
+                // a click would then write a note under A's path against B's line.
+                let notes_path = notes_path
+                    .as_ref()
+                    .filter(|open| open.as_path() == file.path);
                 // The real identity guard - a cache entry only counts as usable for these rows if
                 // it was built from this exact file (see this method's own "Cache identity guard"
                 // docs, and `diff_highlight_cache_for`'s own docs/tests for the pure logic).
@@ -527,24 +554,24 @@ impl AdeApp {
                                     let author = line_authors
                                         .get(hunk)
                                         .and_then(|authors| authors.get(line));
-                                    // The note channel reads its anchor from the same guarded
-                                    // gutter numbers, so a line whose identity this frame cannot
-                                    // confirm is simply not annotatable - never annotatable at a
-                                    // guessed line.
-                                    let anchor = notes_enabled
-                                        .then(|| NoteAnchor::from_gutter(numbers))
+                                    // Positional, and guarded exactly like the author bar beside
+                                    // it: a shape change between this frame's plan and this call
+                                    // means "not annotatable", never a neighbouring line's
+                                    // anchor.
+                                    let anchor = line_anchors
+                                        .get(hunk)
+                                        .and_then(|anchors| anchors.get(line))
+                                        .copied()
                                         .flatten();
-                                    let note = anchor.zip(notes_path.as_ref()).and_then(
-                                        |(anchor, path)| {
-                                            this.review_notes_store()
-                                                .note(
-                                                    &this.review_notes_worktree(),
-                                                    path.as_path(),
-                                                    anchor,
-                                                )
-                                                .map(|note| note.mark())
-                                        },
-                                    );
+                                    let note = anchor.zip(notes_path).and_then(|(anchor, path)| {
+                                        this.review_notes_store()
+                                            .note(
+                                                &this.review_notes_worktree(),
+                                                path.as_path(),
+                                                anchor,
+                                            )
+                                            .map(|note| note.mark())
+                                    });
                                     let chrome = DiffLineChrome {
                                         rendered,
                                         numbers,
@@ -557,9 +584,7 @@ impl AdeApp {
                                         notes_enabled,
                                         is_note_cursor: anchor.is_some()
                                             && this.note_cursor.as_ref().is_some_and(|cursor| {
-                                                notes_path
-                                                    .as_ref()
-                                                    .is_some_and(|path| cursor.path == **path)
+                                                notes_path.is_some_and(|path| cursor.path == **path)
                                                     && Some(cursor.anchor) == anchor
                                             }),
                                     };
@@ -568,7 +593,7 @@ impl AdeApp {
                                 None => render_blank_diff_row().into_any_element(),
                             }
                         }
-                        DiffRow::Note { anchor, note_row } => match notes_path.as_ref() {
+                        DiffRow::Note { anchor, note_row } => match notes_path {
                             Some(path) => this
                                 .render_review_note_card(
                                     path.as_ref().clone(),

@@ -1032,13 +1032,36 @@ impl TerminalPane {
             cx.notify();
             return false;
         }
+        // A prompt is only worth claiming as delivered if there is really something running to
+        // read it. `session.is_some()` alone is not that: the poll loop only clears `session`
+        // once it has *observed* EOF, which lags the child's real exit by at least a tick plus
+        // `MAX_EOF_POLL_TICKS`' grace, and in that window a write into a dead agent would return
+        // `true`. GitHub issue #288 flips every note on the file to `sent` on that `true`, with
+        // no way back, so this checks the two facts the pane already knows about the child's
+        // liveness before it writes anything.
+        if self.exit_status.is_some() || self.eof_pending {
+            self.spawn_error = Some("refused to send: this agent's process has ended".to_string());
+            cx.notify();
+            return false;
+        }
         let Some(session) = &self.session else {
             return false;
         };
-        let mut payload = paste_payload(text, bracketed).into_bytes();
+        // Two writes, deliberately, and in this order.
+        //
+        // The paste and its submit go to the pty as two separate `write_all`+`flush` calls on the
+        // writer thread rather than one, so a full-screen agent TUI gets a real read boundary
+        // between "here is a pasted blob" and "now send it". These TUIs commit a bracketed paste
+        // asynchronously (Ink debounces it), and a CR arriving inside the *same* read chunk can
+        // be consumed before the paste has been committed - which drops the submit, or submits a
+        // prefix. Ordering is still guaranteed: both go down one `mpsc` to one writer thread.
+        if let Err(err) = session.write_input(paste_payload(text, bracketed).as_bytes()) {
+            self.spawn_error = Some(format!("failed to write input: {err}"));
+            cx.notify();
+            return false;
+        }
         // The submit. One byte, once - see this method's own docs.
-        payload.push(b'\r');
-        if let Err(err) = session.write_input(&payload) {
+        if let Err(err) = session.write_input(b"\r") {
             self.spawn_error = Some(format!("failed to write input: {err}"));
             cx.notify();
             return false;

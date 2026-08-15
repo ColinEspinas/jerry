@@ -1072,10 +1072,15 @@ pub struct AdeApp {
     /// `crate::provenance::flow::AdeApp::persist_line_provenance`. One slot, newest wins: the
     /// state is captured whole at spawn time, so a newer write genuinely supersedes an older one.
     pub(crate) _line_provenance_persist_task: Option<Task<()>>,
-    /// Holds the in-flight write of [`Self::review_notes`] - see
+    /// Holds the in-flight *immediate* write of [`Self::review_notes`] - see
     /// `crate::review_notes::flow::AdeApp::persist_review_notes`. One slot, newest wins, exactly
     /// like the provenance write above it.
     pub(crate) _review_notes_persist_task: Option<Task<()>>,
+    /// Holds the in-flight **debounced** write, kept apart from the immediate one on purpose: a
+    /// `Task` cancels on drop, so one shared slot would let the next keystroke's timer cancel a
+    /// write that a closing card or a send had already committed to. See
+    /// `crate::review_notes::flow::AdeApp::schedule_review_notes_persist`.
+    pub(crate) _review_notes_debounce_task: Option<Task<()>>,
     /// The in-flight `wt_core::graph::build_graph` background load, one slot - a fresh load
     /// supersedes an older one still running, mirroring [`Self::_load_diff_task`].
     pub(crate) _load_graph_task: Option<Task<()>>,

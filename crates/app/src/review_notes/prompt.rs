@@ -40,6 +40,10 @@ const FLAT_SEPARATOR: &str = " \u{b7} ";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchedPrompt {
     lines: Vec<String>,
+    /// What each anchor's note really says **as delivered**, in the same order. This is what
+    /// `NoteStore::mark_sent_as` records, so a card can never claim to have sent wording the
+    /// agent did not receive.
+    delivered: Vec<(NoteAnchor, String)>,
     /// How many real notes went into it - what the bar counts and what the caller marks sent.
     pub note_count: usize,
 }
@@ -63,17 +67,16 @@ impl BatchedPrompt {
         }
 
         let mut lines = Vec::with_capacity(notes.len() + 2);
+        let mut delivered = Vec::with_capacity(notes.len());
         lines.push(format!(
             "Review notes on {} \u{2014} {}, one prompt, line-anchored.",
             sanitize(&path.display().to_string()),
             plural::count(notes.len(), "note", None)
         ));
         for (anchor, note) in &notes {
-            lines.push(format!(
-                "{}: {}",
-                anchor.prompt_label(),
-                sanitize(note.text.trim())
-            ));
+            let text = sanitize(note.text.trim());
+            lines.push(format!("{}: {text}", anchor.prompt_label()));
+            delivered.push((*anchor, text));
         }
         lines.push(
             "Please address every note above in one revision, then tell me what you changed."
@@ -82,8 +85,14 @@ impl BatchedPrompt {
 
         Some(BatchedPrompt {
             note_count: notes.len(),
+            delivered,
             lines,
         })
+    }
+
+    /// What each note really says as delivered - see [`Self::delivered`]'s own field docs.
+    pub fn delivered(&self) -> &[(NoteAnchor, String)] {
+        &self.delivered
     }
 
     /// The prompt's own lines, for tests and for anything that wants to show what will be sent.
@@ -115,7 +124,7 @@ impl BatchedPrompt {
 /// one thing this whole module exists to make impossible.
 ///
 /// Replaced with a space rather than removed, so two words never silently fuse into one.
-fn sanitize(text: &str) -> String {
+pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect::<String>()

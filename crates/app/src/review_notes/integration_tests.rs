@@ -6,7 +6,7 @@
 //! with a real child process on a real pty, real clicks and real keystrokes - and measured against
 //! real painted bounds and real terminal output.
 
-use super::render::{notes_bar_label, SEND_NOTES_SPEC};
+use super::render::notes_bar_label;
 use super::{FileNoteState, NoteAnchor};
 use crate::provenance::{store::ProvenanceStore, AgentKey};
 use crate::root::focus::palette_focus_tests::open_test_app;
@@ -594,10 +594,6 @@ fn the_send_shortcut_the_bar_draws_really_sends(cx: &mut TestAppContext) {
         "ctrl-enter"
     });
     cx.run_until_parked();
-    assert_eq!(
-        SEND_NOTES_SPEC, "mod+enter",
-        "the keycaps and the binding must come from one string"
-    );
 
     let state = app.read_with(cx, |app, _| {
         app.review_notes
@@ -691,6 +687,295 @@ fn a_note_on_a_removed_line_anchors_and_reads_as_removed(cx: &mut TestAppContext
             prompt.lines()[1].starts_with("removed line "),
             "and the prompt says so, so the agent looks in the right column - got {:?}",
             prompt.lines()[1]
+        );
+    });
+}
+
+/// A note has to survive the window closing, and "written when the card closes" is not that: the
+/// realistic way to lose one is to type it and then quit with the caret still in it.
+///
+/// So this types into a card, never closes it, and asserts the note really reached the real file
+/// on disk once the debounce elapsed - and, before that, that nothing was written per keystroke.
+#[gpui::test]
+fn a_note_still_being_typed_reaches_the_real_file_on_its_own(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let state_dir = TempDir::new().expect("tempdir");
+    let notes_file =
+        super::persist_state::review_notes_path_for(&state_dir.path().join("settings.toml"));
+    let (app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+    app.update(cx, |app, _| {
+        app.review_notes_path = Some(notes_file.clone());
+    });
+
+    click_line(cx, 2);
+    cx.simulate_input("survives the window closing");
+    cx.run_until_parked();
+    assert!(
+        !notes_file.exists(),
+        "nothing may be written per keystroke - that would be a real fsync'd file write per \
+         character"
+    );
+
+    // The debounce, and nothing else - the card is still open and still focused.
+    cx.background_executor
+        .advance_clock(Duration::from_millis(700));
+    cx.run_until_parked();
+
+    let mut restored = super::NoteStore::default();
+    let (ok, dropped) =
+        super::persist_state::ReviewNotesState::load_at(&notes_file).restore_into(&mut restored);
+    assert_eq!((ok, dropped), (1, 0), "the note must be on disk by itself");
+    let worktree = app.read_with(cx, |app, _| app.review_notes_worktree());
+    let anchor = restored.anchors(&worktree, Path::new(PATH));
+    assert_eq!(anchor.len(), 1);
+    assert_eq!(
+        restored
+            .note(&worktree, Path::new(PATH), anchor[0])
+            .expect("the note")
+            .text,
+        "survives the window closing"
+    );
+}
+
+/// Regression: a plain letter bound over the **diff** must not be swallowed while a note card is
+/// being typed into.
+///
+/// The note card is a real `"text-input"` node *inside* `crate::code_surface::render`'s own
+/// `"diff"` node, so `v` (`ToggleChangeSeen`) and `]` (`NextChangedFile`) - both scoped
+/// `Some("diff && !file-editor")` before GitHub issue #288 - were live over it, and GPUI
+/// dispatches a matching `KeyBinding` before any `on_key_down` listener. Typing "survives" into a
+/// note produced "suries", and pressing `]` jumped to another file mid-sentence. Both bindings
+/// now carry `&& !text-input`.
+#[gpui::test]
+fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    let seen_before = app.read_with(cx, |app, _| app.seen_files.clone());
+    click_line(cx, 2);
+    cx.simulate_input("verify v] here");
+    cx.run_until_parked();
+
+    app.read_with(cx, |app, _| {
+        let worktree = app.review_notes_worktree();
+        let anchor = app.review_notes.anchors(&worktree, Path::new(PATH))[0];
+        assert_eq!(
+            app.review_notes
+                .note(&worktree, Path::new(PATH), anchor)
+                .expect("the note")
+                .text,
+            "verify v] here",
+            "every character typed into a note must land in the note"
+        );
+        assert_eq!(
+            app.seen_files, seen_before,
+            "and `v` must not have marked the file seen behind the caret"
+        );
+        assert_eq!(
+            app.open_change.as_deref(),
+            Some(Path::new(PATH)),
+            "and `]` must not have jumped to another file mid-sentence"
+        );
+    });
+}
+
+/// **Regression for the worst failure this feature can have: input silently going nowhere.**
+///
+/// The pinned card is a row of a virtualized `uniform_list`, so it stops being built at all once
+/// it scrolls out of view. If the card were the element carrying the note's `FocusHandle`, that
+/// would delete the focused node from GPUI's dispatch tree mid-sentence - and GPUI then evaluates
+/// every predicate against an empty context stack, where they all short-circuit to `false`. Typed
+/// characters, `mod+enter` and `c` would all stop working, with nothing on screen saying so.
+///
+/// So: open a note near the top of a long diff, scroll it far out of view, and keep typing.
+#[gpui::test]
+fn typing_into_a_note_keeps_working_after_the_card_scrolls_out_of_view(cx: &mut TestAppContext) {
+    let repo = TempDir::new().expect("tempdir");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "test@example.com"]);
+    git(repo.path(), &["config", "user.name", "Test User"]);
+    std::fs::write(repo.path().join("big.rs"), "fn noop() {}\n").expect("seed");
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-m", "initial"]);
+    // Far more lines than any viewport, so the note's own row genuinely leaves the built range.
+    let mut content = String::from("fn noop() {}\n");
+    for index in 0..300 {
+        content.push_str(&format!("fn generated_{index}() -> i32 {{ {index} }}\n"));
+    }
+    std::fs::write(repo.path().join("big.rs"), &content).expect("rewrite");
+
+    let shim_dir = TempDir::new().expect("tempdir");
+    let program = agent_stand_in(shim_dir.path());
+    let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+    app.update_in(cx, |app, window, cx| {
+        app.settings.terminal.shell = Some(program);
+        app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        app.new_agent(ProcessKind::Shell, window, cx);
+        let id = app.agents.active_id().expect("the tab");
+        app.agents.set_kind_for_test(id, ProcessKind::claude());
+        app.open_change_diff(PathBuf::from("big.rs"), window, cx);
+    });
+    cx.run_until_parked();
+
+    click_line(cx, 1);
+    cx.simulate_input("before");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("diff-note-0").is_some(),
+        "precondition: the card is on screen while it is being typed into"
+    );
+
+    // A deliberately huge delta - `uniform_list` clamps to its own real maximum scroll offset.
+    let anchor = cx
+        .debug_bounds("diff-line-1")
+        .expect("the noted line must be painted before scrolling");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: anchor.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-100_000.0))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("diff-note-0").is_none(),
+        "precondition: the card really did stop being built - otherwise this test proves nothing"
+    );
+
+    cx.simulate_input(" and after");
+    cx.run_until_parked();
+
+    app.read_with(cx, |app, _| {
+        let worktree = app.review_notes_worktree();
+        let anchor = app.review_notes.anchors(&worktree, Path::new("big.rs"))[0];
+        assert_eq!(
+            app.review_notes
+                .note(&worktree, Path::new("big.rs"), anchor)
+                .expect("the note")
+                .text,
+            "before and after",
+            "keystrokes must keep reaching the note after its card scrolled out of the list"
+        );
+    });
+
+    // And the shortcuts the bar advertises must still be live, for the same reason.
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| {
+        assert!(
+            app.review_notes
+                .file_state(&app.review_notes_worktree(), Path::new("big.rs"))
+                .all_sent,
+            "`mod+enter` must still fire with the card off screen"
+        );
+    });
+}
+
+/// A send that really failed says so in the bar, and - critically - does **not** mark anything
+/// sent. Audit item I12's whole complaint about this design is that nothing in it ever fails.
+#[gpui::test]
+fn a_send_to_a_dead_agent_fails_loudly_and_marks_nothing(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (app, cx, agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    click_line(cx, 2);
+    cx.simulate_input("never delivered");
+    cx.run_until_parked();
+
+    // End the real child the way a user would - a real `Ctrl+C` down the real pty - and let the
+    // pane's own poll loop genuinely observe the exit.
+    let pane = app.read_with(cx, |app, _| {
+        app.agents
+            .iter()
+            .find(|a| a.id == agent)
+            .expect("the agent")
+            .pane
+            .clone()
+    });
+    pane.update(cx, |pane, cx| pane.interrupt(cx));
+    assert!(
+        pump_until(cx, |cx| pane
+            .read_with(cx, |pane, _| pane.exit_status().is_some())),
+        "the real child must actually have ended before this test means anything"
+    );
+
+    let send = cx.debug_bounds("diff-notes-send").expect("the send button");
+    cx.simulate_click(send.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    app.read_with(cx, |app, _| {
+        assert!(
+            !app.review_notes
+                .file_state(&app.review_notes_worktree(), Path::new(PATH))
+                .all_sent,
+            "nothing reached anybody, so nothing may claim to have been sent - and `sent` only \
+             ever reverts by editing the note, so this would be unrecoverable"
+        );
+        assert!(
+            app.note_send_error.is_some(),
+            "and the failure must be said out loud rather than swallowed"
+        );
+    });
+    assert!(
+        cx.debug_bounds("diff-notes-bar-error").is_some(),
+        "the notes bar must really paint the failure"
+    );
+    assert!(
+        cx.debug_bounds("diff-notes-bar-sent").is_none(),
+        "and must not also be showing a sent confirmation"
+    );
+}
+
+/// A draft opened in one worktree must never write into another checkout's notes.
+///
+/// `AdeApp::diff_root` is reassigned wholesale on a worktree switch, so a draft that re-read it at
+/// each store call would land every subsequent keystroke under the *new* worktree's key -
+/// overwriting its note on the same path and line, and persisting it there.
+#[gpui::test]
+fn a_draft_left_open_across_a_worktree_switch_never_writes_into_the_other_checkout(
+    cx: &mut TestAppContext,
+) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    click_line(cx, 2);
+    cx.simulate_input("belongs to the first checkout");
+    cx.run_until_parked();
+    let (first, anchor) = app.read_with(cx, |app, _| {
+        let worktree = app.review_notes_worktree();
+        let anchor = app.review_notes.anchors(&worktree, Path::new(PATH))[0];
+        (worktree, anchor)
+    });
+
+    // The switch itself, at the one field that defines "which checkout these notes belong to".
+    let second = repo.path().join("..").join("other-checkout");
+    app.update(cx, |app, cx| {
+        app.diff_root = second.clone();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.simulate_input(" - typed after the switch");
+    cx.run_until_parked();
+
+    app.read_with(cx, |app, _| {
+        assert!(
+            app.review_notes.file(&second, Path::new(PATH)).is_none(),
+            "not one character may land in the checkout the draft does not belong to"
+        );
+        assert_eq!(
+            app.review_notes
+                .note(&first, Path::new(PATH), anchor)
+                .expect("the draft's own note")
+                .text,
+            "belongs to the first checkout - typed after the switch",
+            "and the draft keeps writing where it was opened"
         );
     });
 }
