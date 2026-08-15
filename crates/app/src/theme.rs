@@ -286,6 +286,7 @@ pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("changes", changes::TOKENS),
     ("budget", budget::TOKENS),
     ("status_bar", status_bar::TOKENS),
+    ("notes", notes::TOKENS),
 ];
 
 /// Every real registered [`ColorToken`], flattened across [`TOKEN_GROUPS`] - registry order
@@ -2904,6 +2905,94 @@ pub mod status_bar {
         ("LOAD_NEUTRAL", LOAD_NEUTRAL),
         ("LOAD_ELEVATED", LOAD_ELEVATED),
         ("LOAD_CRITICAL", LOAD_CRITICAL),
+    ];
+}
+
+/// Diff-line review notes (GitHub issue #288, `STAGE-A-CHANGELOG.md` §1's two `§6.2` rows and
+/// the audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
+///
+/// Every value here is transcribed directly from `Jerry.dc.html`'s own inline styles for that
+/// surface (the `hasNotes` bar and the `l.isNote` branch of the diff row loop), not derived.
+///
+/// The one colour worth naming twice is [`EDGE`]: `#5a9ad4` is this palette's *selection* blue -
+/// the same value [`super::editor::SELECTION`] carries - and §6.2 asks for "the selection-blue
+/// left edge" on the card by name. It gets its own key rather than reusing the editor's because
+/// the two are different facts (a text selection vs. "this is your annotation"), and a re-theme
+/// that moved one has no business silently moving the other - the same reasoning
+/// [`super::status_bar::LOAD_ELEVATED`] already records for its amber.
+pub mod notes {
+    use super::{token, ColorToken};
+
+    /// The card's 2px left edge, and the 5px square that opens the notes bar - selection blue.
+    pub const EDGE: ColorToken = token("notes.edge", 0x5a9ad4);
+    /// The pinned card's fill.
+    pub const CARD_BG: ColorToken = token("notes.card_bg", 0x151a1f);
+    /// The pinned card's 1px border (the three sides that are not [`EDGE`]).
+    pub const CARD_BORDER: ColorToken = token("notes.card_border", 0x2b3d4f);
+    /// The card's own note text.
+    pub const CARD_FG: ColorToken = token("notes.card_fg", 0xc2c7cc);
+    /// The placeholder shown in an empty, still-being-typed card.
+    pub const CARD_PLACEHOLDER: ColorToken = token("notes.card_placeholder", 0x5e646a);
+
+    /// A card's `draft` mark - it has not been delivered to anyone yet.
+    pub const MARK_DRAFT: ColorToken = token("notes.mark_draft", 0x7fa9cf);
+    /// A card's `sent` mark, and the bar's own `✓ sent` confirmation.
+    pub const MARK_SENT: ColorToken = token("notes.mark_sent", 0x7fc79a);
+
+    /// The diff row's note column when a note really is pinned on that line (`●`).
+    pub const DOT: ColorToken = token("notes.dot", 0x8fbde6);
+    /// The same column's `○` - a line that is the note cursor but carries no note yet.
+    pub const DOT_EMPTY: ColorToken = token("notes.dot_empty", 0x3a3f44);
+
+    /// The notes bar's band.
+    pub const BAR_BG: ColorToken = token("notes.bar_bg", 0x141a20);
+    /// Its 1px bottom rule against the hunks below it.
+    pub const BAR_BORDER: ColorToken = token("notes.bar_border", 0x223140);
+    /// The bar's count sentence (`1 note on this file`).
+    pub const BAR_LABEL: ColorToken = token("notes.bar_label", 0xa5cdf0);
+    /// The bar's fixed explanatory line (*one prompt, line-anchored · pinned after the
+    /// revision*), deliberately recessive against [`BAR_LABEL`].
+    pub const BAR_META: ColorToken = token("notes.bar_meta", 0x5e646a);
+    /// A delivery that really failed, said out loud in the bar rather than swallowed.
+    ///
+    /// **A derivation, not a transcription** - the mock has no failure state for this surface
+    /// (audit item I12 is a whole Stage B item). It takes [`super::status::FAIL`]'s value, which
+    /// is what every other real failure in this app is already painted.
+    pub const BAR_ERROR: ColorToken = token("notes.bar_error", 0xc4726d);
+
+    /// The `Send notes to <agent>` button's fill, border, hover fill and label.
+    pub const SEND_BG: ColorToken = token("notes.send_bg", 0x18232d);
+    /// Its 1px border, and its keycaps' border.
+    pub const SEND_BORDER: ColorToken = token("notes.send_border", 0x365b78);
+    /// Its hover fill.
+    pub const SEND_HOVER_BG: ColorToken = token("notes.send_hover_bg", 0x1e2d3a);
+    /// Its label.
+    pub const SEND_FG: ColorToken = token("notes.send_fg", 0xa5cdf0);
+    /// Its `⌘⏎` keycaps' glyphs.
+    pub const SEND_CAP_FG: ColorToken = token("notes.send_cap_fg", 0x7fa9cf);
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("EDGE", EDGE),
+        ("CARD_BG", CARD_BG),
+        ("CARD_BORDER", CARD_BORDER),
+        ("CARD_FG", CARD_FG),
+        ("CARD_PLACEHOLDER", CARD_PLACEHOLDER),
+        ("MARK_DRAFT", MARK_DRAFT),
+        ("MARK_SENT", MARK_SENT),
+        ("DOT", DOT),
+        ("DOT_EMPTY", DOT_EMPTY),
+        ("BAR_BG", BAR_BG),
+        ("BAR_BORDER", BAR_BORDER),
+        ("BAR_LABEL", BAR_LABEL),
+        ("BAR_META", BAR_META),
+        ("BAR_ERROR", BAR_ERROR),
+        ("SEND_BG", SEND_BG),
+        ("SEND_BORDER", SEND_BORDER),
+        ("SEND_HOVER_BG", SEND_HOVER_BG),
+        ("SEND_FG", SEND_FG),
+        ("SEND_CAP_FG", SEND_CAP_FG),
     ];
 }
 

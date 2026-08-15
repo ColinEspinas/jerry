@@ -3,6 +3,7 @@
 
 use super::zoom::zoom_scoped;
 use super::*;
+use crate::review_notes::{NoteAnchor, NoteMark};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::plural;
@@ -40,6 +41,21 @@ enum DiffRow {
         line: usize,
         row: usize,
     },
+    /// One pinned review note (GitHub issue #288), directly beneath the diff line it is anchored
+    /// to.
+    ///
+    /// A note is a **row of this list**, not a sibling panel and not an overlay:
+    /// `STAGE-A-CHANGELOG.md` §1's own wording is *"pinned beneath the line"*, and the issue is
+    /// explicit that notes *"interleave into the existing `DiffRow` stream (adjust the enum; reuse
+    /// the diff renderer - no parallel list)"*. Being a real item is also what makes a note
+    /// virtualize, scroll and measure exactly like everything around it rather than needing its
+    /// own answer to any of those.
+    ///
+    /// It names its `anchor`, not the note's text, for the same reason every other variant here
+    /// names a position rather than content: the row builder is `'static`, so it re-resolves the
+    /// note out of `AdeApp` by (worktree, path, anchor) at build time. `note_row` is a flat
+    /// per-file counter that names this row's own `diff-note-{n}` debug selector.
+    Note { anchor: NoteAnchor, note_row: usize },
     /// The trailing `... diff truncated for this file` notice - a genuine final *item* of the
     /// list, not a sibling below it (see [`render_diff_truncated_row`]).
     Truncated,
@@ -62,11 +78,22 @@ enum DiffRow {
 /// would exceed it still contributes its header (and fold marker) before the plan stops. That is
 /// deliberately preserved rather than "cleaned up" - it is what makes the truncation notice read
 /// as sitting under a real hunk boundary instead of mid-hunk.
-fn diff_rows(file: &DiffFile) -> Vec<DiffRow> {
-    // At most one header + one fold marker per hunk, the capped line count, and the notice.
-    let mut rows: Vec<DiffRow> =
-        Vec::with_capacity(file.hunks.len() * 2 + MAX_RENDERED_DIFF_LINES_PER_FILE + 1);
+///
+/// `noted` is the set of [`NoteAnchor`]s this worktree really has a review note pinned on for this
+/// path (GitHub issue #288). A note row is appended directly after the line it is anchored to,
+/// which is what makes *"pinned beneath the line"* a fact about the row plan rather than about
+/// where something is drawn. Note rows deliberately do **not** count toward
+/// [`MAX_RENDERED_DIFF_LINES_PER_FILE`]: that cap exists to bound how much *diff* is built per
+/// frame, and a reviewer's own notes on the lines already within it are neither unbounded nor
+/// something the cap has any business hiding.
+fn diff_rows(file: &DiffFile, noted: &[NoteAnchor]) -> Vec<DiffRow> {
+    // At most one header + one fold marker per hunk, the capped line count, the notice, and one
+    // row per real note.
+    let mut rows: Vec<DiffRow> = Vec::with_capacity(
+        file.hunks.len() * 2 + MAX_RENDERED_DIFF_LINES_PER_FILE + 1 + noted.len(),
+    );
     let mut rendered_lines = 0usize;
+    let mut note_rows = 0usize;
     let mut hunks_truncated = false;
     let mut previous_header: Option<&str> = None;
     'hunks: for (hunk_index, hunk) in file.hunks.iter().enumerate() {
@@ -81,6 +108,15 @@ fn diff_rows(file: &DiffFile) -> Vec<DiffRow> {
         previous_header = Some(hunk.header.as_str());
         rows.push(DiffRow::HunkHeader(hunk_index));
 
+        // Derived here rather than read off `AdeApp::diff_highlight_cache`'s index-aligned copy:
+        // this function is pure and directly testable without a window, and that is the whole
+        // reason the row plan lives apart from the render method.
+        let numbers = if noted.is_empty() {
+            Vec::new()
+        } else {
+            changes::hunk_line_numbers(hunk)
+        };
+
         for line_index in 0..hunk.lines.len() {
             if rendered_lines >= MAX_RENDERED_DIFF_LINES_PER_FILE {
                 hunks_truncated = true;
@@ -92,6 +128,17 @@ fn diff_rows(file: &DiffFile) -> Vec<DiffRow> {
                 row: rendered_lines,
             });
             rendered_lines += 1;
+            let anchor = numbers
+                .get(line_index)
+                .copied()
+                .and_then(NoteAnchor::from_gutter);
+            if let Some(anchor) = anchor.filter(|anchor| noted.contains(anchor)) {
+                rows.push(DiffRow::Note {
+                    anchor,
+                    note_row: note_rows,
+                });
+                note_rows += 1;
+            }
         }
     }
 
@@ -99,6 +146,31 @@ fn diff_rows(file: &DiffFile) -> Vec<DiffRow> {
         rows.push(DiffRow::Truncated);
     }
     rows
+}
+
+/// Every diff line of `file` that a review note could be pinned to, in the order the diff really
+/// lays them out, top to bottom.
+///
+/// GitHub issue #288's batched prompt has to list its notes *"line-anchored"* in the order the
+/// reviewer sees them - not in whatever order a `BTreeMap` happens to hold anchors, which puts
+/// every `New` before every `Old` and so would jumble a hunk that removed and added around the
+/// same place. `crate::review_notes::flow::AdeApp::batched_review_prompt` sorts by position in
+/// this list.
+pub(crate) fn note_anchors_in_diff_order(file: &DiffFile) -> Vec<NoteAnchor> {
+    let mut anchors = Vec::new();
+    let mut rendered_lines = 0usize;
+    'hunks: for hunk in &file.hunks {
+        for numbers in changes::hunk_line_numbers(hunk) {
+            if rendered_lines >= MAX_RENDERED_DIFF_LINES_PER_FILE {
+                break 'hunks;
+            }
+            rendered_lines += 1;
+            if let Some(anchor) = NoteAnchor::from_gutter(numbers) {
+                anchors.push(anchor);
+            }
+        }
+    }
+    anchors
 }
 
 /// Which surface [`AdeApp::render_diff_file_detail`] is drawing into.
@@ -351,7 +423,30 @@ impl AdeApp {
         // file that many times per frame - most of the cost this change exists to remove.
         // It also has to exist before the list does, since `uniform_list` needs a real item count
         // up front, and both must come from the same plan.
-        let rows: Rc<Vec<DiffRow>> = Rc::new(diff_rows(file));
+        // GitHub issue #288. Resolved once per frame, like `rows` itself and for the same reason,
+        // and empty on any surface but the Uncommitted diff - see
+        // `crate::review_notes::flow::AdeApp::review_notes_file` for why notes are scoped to that
+        // one surface rather than to every place this renderer is used.
+        let notes_path: Option<PathBuf> = match surface {
+            DiffDetailSurface::Changes => {
+                self.review_notes_file().filter(|path| path == &file.path)
+            }
+            DiffDetailSurface::Review => None,
+        };
+        let noted: Vec<NoteAnchor> = notes_path
+            .as_ref()
+            .map(|path| {
+                self.review_notes_store()
+                    .anchors(&self.review_notes_worktree(), path)
+            })
+            .unwrap_or_default();
+        let notes_enabled = notes_path.is_some();
+        // The bar is built after the list, from the same resolution - one `Rc`, so the row builder
+        // and the bar can never be looking at two different files.
+        let notes_path: Option<Rc<PathBuf>> = notes_path.map(Rc::new);
+        let bar_path = notes_path.clone();
+
+        let rows: Rc<Vec<DiffRow>> = Rc::new(diff_rows(file, &noted));
         let row_count = rows.len();
 
         // GitHub issue #287's gutter attribution, resolved once per frame for the same reason
@@ -375,7 +470,7 @@ impl AdeApp {
             // same one showing new content.
             format!("{}-detail-{}", surface.id_prefix(), file.path.display()),
             row_count,
-            cx.processor(move |this: &mut Self, range: Range<usize>, _window, _cx| {
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| {
                 // Re-resolved from `this` through `surface` rather than a hardcoded field,
                 // mirroring `crate::graph_view::render::AdeApp::render_graph_rows`' identical
                 // re-resolve: the closure is `'static` and cannot borrow the `&DiffFile` this
@@ -432,20 +527,62 @@ impl AdeApp {
                                     let author = line_authors
                                         .get(hunk)
                                         .and_then(|authors| authors.get(line));
-                                    render_diff_line(
-                                        diff_line,
+                                    // The note channel reads its anchor from the same guarded
+                                    // gutter numbers, so a line whose identity this frame cannot
+                                    // confirm is simply not annotatable - never annotatable at a
+                                    // guessed line.
+                                    let anchor = notes_enabled
+                                        .then(|| NoteAnchor::from_gutter(numbers))
+                                        .flatten();
+                                    let note = anchor.zip(notes_path.as_ref()).and_then(
+                                        |(anchor, path)| {
+                                            this.review_notes_store()
+                                                .note(
+                                                    &this.review_notes_worktree(),
+                                                    path.as_path(),
+                                                    anchor,
+                                                )
+                                                .map(|note| note.mark())
+                                        },
+                                    );
+                                    let chrome = DiffLineChrome {
                                         rendered,
                                         numbers,
-                                        surface.id_prefix(),
-                                        row,
+                                        selector_prefix: surface.id_prefix(),
+                                        row_index: row,
                                         author,
-                                        author_filter.as_ref(),
-                                    )
-                                    .into_any_element()
+                                        filter: author_filter.as_ref(),
+                                        anchor,
+                                        note,
+                                        notes_enabled,
+                                        is_note_cursor: anchor.is_some()
+                                            && this.note_cursor.as_ref().is_some_and(|cursor| {
+                                                notes_path
+                                                    .as_ref()
+                                                    .is_some_and(|path| cursor.path == **path)
+                                                    && Some(cursor.anchor) == anchor
+                                            }),
+                                    };
+                                    render_diff_line(diff_line, chrome, cx).into_any_element()
                                 }
                                 None => render_blank_diff_row().into_any_element(),
                             }
                         }
+                        DiffRow::Note { anchor, note_row } => match notes_path.as_ref() {
+                            Some(path) => this
+                                .render_review_note_card(
+                                    path.as_ref().clone(),
+                                    anchor,
+                                    surface.id_prefix(),
+                                    note_row,
+                                    cx,
+                                )
+                                .into_any_element(),
+                            // Only reachable if the notes surface changed under this frame's own
+                            // row plan; an empty row of the shared height keeps the list's
+                            // geometry honest instead of drawing a note for a file it is not on.
+                            None => render_blank_diff_row().into_any_element(),
+                        },
                         DiffRow::Truncated => render_diff_truncated_row().into_any_element(),
                     })
                     .collect::<Vec<_>>()
@@ -459,7 +596,15 @@ impl AdeApp {
         // handle (`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`).
         .track_scroll(surface.scroll_handle(self));
 
-        zoom_scoped(rem_px, self.wrap_with_scrollbar(surface, list, cx))
+        let hunks = zoom_scoped(rem_px, self.wrap_with_scrollbar(surface, list, cx));
+        match bar_path {
+            // GitHub issue #288: *"A notes bar above the hunks"* - the audit's "send from the top
+            // of the diff", which is one of the three things Orca is quoted as having learned the
+            // hard way. Deliberately **outside** `zoom_scoped`: the bar is chrome, not code, and
+            // zooming the diff's text has no business resizing a button.
+            Some(path) => self.wrap_diff_with_notes(path.as_ref().clone(), hunks, cx),
+            None => hunks,
+        }
     }
 
     /// Wraps the Diff view's `uniform_list` in the real, non-scrolling `.relative()` sibling
@@ -704,15 +849,37 @@ fn render_diff_gutter_number(number: Option<usize>) -> impl IntoElement {
 /// `crate::provenance::render::FILTER_DIM_OPACITY` (the mock's 0.32). A line with no author is
 /// deliberately **not** dimmed - `Jerry.dc.html`'s own `muted = attr && who && who !== attr` - so
 /// filtering by one author never hides the context its work sits in.
+///
+/// ## The note channel (GitHub issue #288)
+///
+/// A **third** left-edge channel, and by the same discipline: *is there a note on this line* is
+/// its own fact, so it gets its own column rather than sharing one. `Jerry.dc.html` draws it as a
+/// 14px centred glyph immediately after the gutters - `●` where a note is pinned. `○` is the note
+/// **cursor**: the line `C` would toggle a note on, which in the mock is the "a note exists here
+/// but is hidden" state and here is "this is the line you are on". A line with neither draws
+/// nothing at all, following the author bar's own rule that the honest rendering of no answer is
+/// an empty column.
+///
+/// The whole row becomes clickable when - and only when - `chrome.anchor` is `Some`, i.e. when the
+/// line really has a stable file-line identity to pin a note to. A line the diff cannot name is
+/// not annotatable, and it does not pretend to be by being clickable.
 pub(in crate::code_surface) fn render_diff_line(
     line: &wt_core::diff::DiffLine,
-    rendered: Option<&code_view::RenderedLine>,
-    numbers: (Option<usize>, Option<usize>),
-    selector_prefix: &'static str,
-    row_index: usize,
-    author: Option<&crate::provenance::Author>,
-    filter: Option<&crate::provenance::Author>,
+    chrome: DiffLineChrome<'_>,
+    cx: &mut Context<AdeApp>,
 ) -> impl IntoElement {
+    let DiffLineChrome {
+        rendered,
+        numbers,
+        selector_prefix,
+        row_index,
+        author,
+        filter,
+        anchor,
+        note,
+        is_note_cursor,
+        notes_enabled,
+    } = chrome;
     // `accent` (`Some` only for Added/Removed) drives both the left-edge bar below and the sign
     // glyph's own color - [`theme::diff::ADD_FG`]/[`DEL_FG`], not the more muted `ADD_SIGN`/
     // `DEL_SIGN` (still used elsewhere, for the Changes list's +n/-n stat bar - see
@@ -742,7 +909,12 @@ pub(in crate::code_surface) fn render_diff_line(
     let author_bar = author.and_then(crate::provenance::render::author_gutter_color);
     let dimmed = crate::provenance::render::line_is_dimmed(author, filter);
 
+    let row_selector = format!("{selector_prefix}-line-{row_index}");
     let mut row = div()
+        // Stateful since GitHub issue #288: the row is the note gesture's own hit target, and
+        // `on_click`/`hover` both need a real element id. The id is the selector, so the two can
+        // never name different rows.
+        .id(gpui::SharedString::from(row_selector.clone()))
         .flex()
         .items_center()
         .font(font(theme::font::MONO))
@@ -752,7 +924,7 @@ pub(in crate::code_surface) fn render_diff_line(
         // row's painted bounds and confirm the diff view's own rows are genuinely reachable, the
         // same pattern `render_file_view_line`'s `file-view-text-row-{n}` selector already
         // establishes for the File view.
-        .debug_selector(move || format!("{selector_prefix}-line-{row_index}"));
+        .debug_selector(move || row_selector);
     if let Some(bg) = bg {
         row = row.bg(bg);
     }
@@ -817,7 +989,8 @@ pub(in crate::code_surface) fn render_diff_line(
         }
     }
 
-    row.child(render_diff_gutter_number(numbers.0))
+    row.children(notes_enabled.then(|| render_note_column(note, is_note_cursor)))
+        .child(render_diff_gutter_number(numbers.0))
         .child(render_diff_gutter_number(numbers.1))
         .child(
             div()
@@ -829,6 +1002,75 @@ pub(in crate::code_surface) fn render_diff_line(
                 .child(sign),
         )
         .child(text_row)
+        // The gesture itself, and only where a line really has an identity to pin a note to.
+        .when_some(anchor, |el, anchor| {
+            el.cursor_pointer()
+                .hover(|style| style.bg(theme::surface::ROW_HOVER))
+                .tooltip(crate::root::widgets::text_tooltip(match note {
+                    Some(_) => NOTE_LINE_TOOLTIP_EXISTING,
+                    None => NOTE_LINE_TOOLTIP_NEW,
+                }))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    this.toggle_line_note(anchor, window, cx);
+                }))
+        })
+}
+
+/// `Jerry.dc.html`'s own 14px note column: `●` for a pinned note, `○` for the note cursor, and
+/// genuinely nothing for a line that is neither.
+fn render_note_column(note: Option<NoteMark>, is_note_cursor: bool) -> impl IntoElement {
+    let (glyph, color) = match (note, is_note_cursor) {
+        (Some(_), _) => ("\u{25cf}", theme::notes::DOT),
+        (None, true) => ("\u{25cb}", theme::notes::DOT_EMPTY),
+        (None, false) => ("", theme::notes::DOT_EMPTY),
+    };
+    div()
+        .flex_none()
+        .w(px(14.0))
+        .text_center()
+        .text_size(px(9.0))
+        .text_color(color)
+        .child(glyph)
+}
+
+/// The two halves of what a click on a diff line does, as tooltips - ride-along I11's *"every
+/// icon-only or otherwise unlabelled control"*, and a whole diff row with a hover state and no
+/// label is exactly that.
+const NOTE_LINE_TOOLTIP_NEW: &str = "Click to pin a review note on this line";
+const NOTE_LINE_TOOLTIP_EXISTING: &str = "Click to edit this line's review note";
+
+/// Everything [`render_diff_line`] needs beyond the diff line itself.
+///
+/// A struct rather than eight more parameters: this row now carries four independent channels
+/// (diff kind, author, note, and the line numbers), each added by its own issue, and a
+/// nine-argument function is both unreadable and past `clippy::too_many_arguments`. Grouping them
+/// also makes the row builder's own resolution of each channel read as one block.
+pub(in crate::code_surface) struct DiffLineChrome<'a> {
+    /// This line's per-token syntax highlighting, or `None` when the cache identity guard could
+    /// not confirm the cache belongs to this file.
+    pub rendered: Option<&'a code_view::RenderedLine>,
+    /// `(old, new)` gutter numbers, same source and same guard.
+    pub numbers: (Option<usize>, Option<usize>),
+    /// `diff` or `review` - see [`DiffDetailSurface::id_prefix`].
+    pub selector_prefix: &'static str,
+    /// The flat rendered-line counter this row's selector is expressed in.
+    pub row_index: usize,
+    /// Who wrote this line (GitHub issue #287).
+    pub author: Option<&'a crate::provenance::Author>,
+    /// The per-author filter in force, if any.
+    pub filter: Option<&'a crate::provenance::Author>,
+    /// This line's review-note anchor, or `None` for a line with no stable file-line identity -
+    /// which is also what makes the row un-clickable (GitHub issue #288).
+    pub anchor: Option<NoteAnchor>,
+    /// The mark of the note pinned here, if there is one.
+    pub note: Option<NoteMark>,
+    /// Whether this is the line `C` would toggle a note on.
+    pub is_note_cursor: bool,
+    /// Whether this surface takes review notes at all. Gates the 14px note column outright, so
+    /// the Review tab - where a note can never exist - carries no permanently-blank column, while
+    /// the Uncommitted diff keeps the column on *every* row so pinning a note never shifts the
+    /// lines around it sideways.
+    pub notes_enabled: bool,
 }
 
 /// Real, render-level coverage for the Diff view's per-token syntax highlighting and its
@@ -1266,7 +1508,7 @@ mod diff_row_plan_tests {
         );
 
         assert_eq!(
-            diff_rows(&file),
+            diff_rows(&file, &[]),
             vec![
                 DiffRow::HunkHeader(0),
                 DiffRow::Line {
@@ -1314,7 +1556,7 @@ mod diff_row_plan_tests {
             false,
         );
         assert!(
-            !diff_rows(&file)
+            !diff_rows(&file, &[])
                 .iter()
                 .any(|row| matches!(row, DiffRow::FoldMarker { .. })),
             "there is no unchanged span between these two hunks, so there must be no `⋯ N \
@@ -1339,7 +1581,7 @@ mod diff_row_plan_tests {
             false,
         );
 
-        let rows = diff_rows(&file);
+        let rows = diff_rows(&file, &[]);
         let line_rows = rows
             .iter()
             .filter(|row| matches!(row, DiffRow::Line { .. }))
@@ -1368,7 +1610,130 @@ mod diff_row_plan_tests {
             }],
             true,
         );
-        assert_eq!(diff_rows(&file).last(), Some(&DiffRow::Truncated));
+        assert_eq!(diff_rows(&file, &[]).last(), Some(&DiffRow::Truncated));
+    }
+
+    /// GitHub issue #288: a note is a real row of *this* list, directly after the line it is
+    /// anchored to - the structural half of *"pinned beneath the line"* and of *"no parallel
+    /// list"*.
+    #[test]
+    fn a_note_row_interleaves_directly_beneath_the_line_it_is_anchored_to() {
+        // `@@ -4,2 +4,2 @@`: old lines 4-5, new lines 4-5. The removed line is old 4, the added
+        // line is new 4.
+        let file = file_with(
+            vec![wt_core::diff::DiffHunk {
+                header: "@@ -4,2 +4,2 @@".to_string(),
+                lines: vec![
+                    line(DiffLineKind::Removed, "old"),
+                    line(DiffLineKind::Added, "new"),
+                    line(DiffLineKind::Context, "same"),
+                ],
+            }],
+            false,
+        );
+
+        assert_eq!(
+            diff_rows(&file, &[NoteAnchor::New(4)]),
+            vec![
+                DiffRow::HunkHeader(0),
+                DiffRow::Line {
+                    hunk: 0,
+                    line: 0,
+                    row: 0
+                },
+                DiffRow::Line {
+                    hunk: 0,
+                    line: 1,
+                    row: 1
+                },
+                DiffRow::Note {
+                    anchor: NoteAnchor::New(4),
+                    note_row: 0
+                },
+                DiffRow::Line {
+                    hunk: 0,
+                    line: 2,
+                    row: 2
+                },
+            ],
+            "the note sits between its own line and the next one, and the diff's own flat `row` \
+             counter is untouched by it - a note is not a diff line and must not shift the \
+             selectors or the cap"
+        );
+    }
+
+    /// The removed-line half: `NoteAnchor::Old(4)` and `NoteAnchor::New(4)` are different lines of
+    /// the same hunk, and each pins its note under its own.
+    #[test]
+    fn a_note_on_a_removed_line_pins_under_the_removed_line() {
+        let file = file_with(
+            vec![wt_core::diff::DiffHunk {
+                header: "@@ -4,2 +4,2 @@".to_string(),
+                lines: vec![
+                    line(DiffLineKind::Removed, "old"),
+                    line(DiffLineKind::Added, "new"),
+                ],
+            }],
+            false,
+        );
+
+        let rows = diff_rows(&file, &[NoteAnchor::Old(4)]);
+        let note_at = rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::Note { .. }))
+            .expect("the note must be planned");
+        assert_eq!(
+            rows[note_at - 1],
+            DiffRow::Line {
+                hunk: 0,
+                line: 0,
+                row: 0
+            },
+            "an `Old` anchor pins under the removed line, not under the added line that happens \
+             to carry the same number on the other side of the diff"
+        );
+    }
+
+    /// An anchor naming a line this diff does not show pins nothing, rather than pinning to
+    /// whatever line is nearest.
+    #[test]
+    fn an_anchor_no_longer_in_the_diff_plans_no_note_row() {
+        let file = file_with(
+            vec![wt_core::diff::DiffHunk {
+                header: "@@ -4,1 +4,1 @@".to_string(),
+                lines: vec![line(DiffLineKind::Context, "same")],
+            }],
+            false,
+        );
+        assert!(
+            !diff_rows(&file, &[NoteAnchor::New(900)])
+                .iter()
+                .any(|row| matches!(row, DiffRow::Note { .. })),
+            "a note whose line is not on screen is simply not drawn - never drawn somewhere else"
+        );
+    }
+
+    /// The order the batched prompt lists its notes in has to be the order the reviewer sees
+    /// them, which is neither of the two orders a `BTreeMap<NoteAnchor, _>` offers.
+    #[test]
+    fn diff_order_interleaves_removed_and_added_anchors_the_way_the_hunk_does() {
+        let file = file_with(
+            vec![wt_core::diff::DiffHunk {
+                header: "@@ -4,3 +4,3 @@".to_string(),
+                lines: vec![
+                    line(DiffLineKind::Context, "context"),
+                    line(DiffLineKind::Removed, "old"),
+                    line(DiffLineKind::Added, "new"),
+                ],
+            }],
+            false,
+        );
+        assert_eq!(
+            note_anchors_in_diff_order(&file),
+            vec![NoteAnchor::New(4), NoteAnchor::Old(5), NoteAnchor::New(5),],
+            "sorting the anchors themselves would have put both `New`s before the `Old`, which is \
+             not the order the lines are on screen"
+        );
     }
 
     /// And a whole, untruncated diff must not grow a notice out of nowhere.
@@ -1381,7 +1746,7 @@ mod diff_row_plan_tests {
             }],
             false,
         );
-        assert!(!diff_rows(&file).contains(&DiffRow::Truncated));
+        assert!(!diff_rows(&file, &[]).contains(&DiffRow::Truncated));
     }
 }
 
@@ -1581,7 +1946,7 @@ mod diff_virtualization_tests {
                 file.hunks.iter().map(|h| &h.header).collect::<Vec<_>>()
             );
             assert!(
-                diff_rows(file)
+                diff_rows(file, &[])
                     .iter()
                     .any(|row| matches!(row, DiffRow::FoldMarker { .. })),
                 "precondition: the two hunks must have a real unchanged span between them"
@@ -1742,7 +2107,7 @@ mod diff_virtualization_tests {
                     .expect("the guard must accept the cache built for this very file");
 
             let mut checked_second_hunk = 0usize;
-            for row in diff_rows(file) {
+            for row in diff_rows(file, &[]) {
                 let DiffRow::Line { hunk, line, .. } = row else {
                     continue;
                 };

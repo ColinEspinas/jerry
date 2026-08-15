@@ -50,7 +50,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Meaning and state (colour carries information here)",
         &[
-            "status", "diff", "tag", "rail", "agent", "changes", "budget",
+            "status", "diff", "tag", "rail", "agent", "changes", "budget", "notes",
         ],
     ),
     (

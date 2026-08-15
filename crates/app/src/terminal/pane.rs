@@ -984,6 +984,68 @@ impl TerminalPane {
         true
     }
 
+    /// Whether the program running in this pane currently has bracketed paste on (`DECSET 2004`).
+    ///
+    /// Read live off the real terminal mode, never latched - see
+    /// [`crate::terminal::grid::TerminalGrid::bracketed_paste_enabled`]'s own docs. Exposed
+    /// because GitHub issue #288's batched review-note prompt has to *compose itself differently*
+    /// depending on the answer, not merely frame itself differently: see [`Self::send_prompt`].
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.grid.bracketed_paste_enabled()
+    }
+
+    /// Delivers `text` into this pane's real pty as **one** prompt, submitted once - the whole of
+    /// GitHub issue #288's *"Sending delivers one batched, line-anchored prompt into the target
+    /// agent's pty - never one message per note"*.
+    ///
+    /// Returns whether bytes were really written.
+    ///
+    /// ## Why this is not just `paste_from_clipboard` with a `\r` after it
+    ///
+    /// The bytes are framed by [`paste_payload`], exactly as a paste is, and then **one** `\r` -
+    /// [`keystroke_to_bytes`]' own Enter byte - is appended, in the same write, so the child sees
+    /// a paste followed by a single Enter: precisely what a human does. Nothing else in this app
+    /// submits on the user's behalf, so this is the only place that byte is written
+    /// programmatically, and it is written exactly once per call.
+    ///
+    /// The refusal below is the load-bearing part. With bracketed paste **off**, `paste_payload`
+    /// normalises every `\n` to `\r`, and `\r` is Enter: a five-line prompt would arrive as
+    /// **five** submissions. That is not a hypothetical - it is exactly the "one comment at a
+    /// time" behaviour `AUDIT-2026-08-13-competitive-v2.md` §6 top-5 #2 says *"causes the agent to
+    /// swing back and forth"*, i.e. the failure this whole feature exists to prevent, and it would
+    /// look on screen like it had worked. So a payload that could split is refused outright rather
+    /// than sent hopefully. The caller's job is to hand over a form that cannot split;
+    /// [`crate::review_notes::prompt::BatchedPrompt::for_delivery`] takes
+    /// [`Self::bracketed_paste_enabled`] and does exactly that, and this check is what makes that
+    /// contract checked rather than assumed.
+    pub fn send_prompt(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let bracketed = self.grid.bracketed_paste_enabled();
+        if !bracketed && text.contains(['\n', '\r']) {
+            self.spawn_error = Some(
+                "refused to send: this program has bracketed paste off, so a multi-line prompt \
+                 would arrive as several separate messages"
+                    .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let mut payload = paste_payload(text, bracketed).into_bytes();
+        // The submit. One byte, once - see this method's own docs.
+        payload.push(b'\r');
+        if let Err(err) = session.write_input(&payload) {
+            self.spawn_error = Some(format!("failed to write input: {err}"));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     /// Maps a window-space pointer position onto the grid cell under it, or `None` before this
     /// pane has ever painted (no measured [`Self::content_bounds`] to resolve against yet).
     ///
@@ -3434,6 +3496,182 @@ mod clipboard_tests {
         cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new())));
         let pasted = pane.update(cx, |pane, cx| pane.paste_from_clipboard(cx));
         assert!(!pasted);
+    }
+}
+
+/// GitHub issue #288's delivery mechanism, against a real pty and a real child process.
+///
+/// [`TerminalPane::send_prompt`] is the only place this app ever types on the user's behalf, and
+/// the one property the whole review-notes feature rests on is that a batch arrives as **one**
+/// message. Both halves are checked here for real: the bytes genuinely leave the app (observed
+/// through a real `cat`'s own echo, the same way `clipboard_tests` and `clear_pty_signal_tests`
+/// observe theirs), and the refusal that stops a batch from silently becoming N messages really
+/// fires.
+#[cfg(test)]
+mod send_prompt_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// A real child on a real pty. `program`/`args` are spawned as-is.
+    fn new_pane(
+        cx: &mut TestAppContext,
+        program: &str,
+        args: Vec<String>,
+    ) -> gpui::Entity<TerminalPane> {
+        cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command(program, args, std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        })
+    }
+
+    /// Pumps the real poll loop until `ready`, or gives up after a real wall-clock deadline.
+    /// Mixes virtual-clock advance with a real `sleep`, exactly as
+    /// `crate::work_surface::render`'s own `wait_for_real_pty_output` does and for the same
+    /// reason: the pty reader is a real OS thread, so a virtual-clock-only loop races it.
+    fn pump_until(
+        cx: &mut TestAppContext,
+        mut ready: impl FnMut(&mut TestAppContext) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            if ready(cx) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The real thing: a child that turns bracketed paste on (exactly as an agent's full-screen
+    /// TUI does) receives a real multi-line batch, in one write, and echoes it back.
+    #[gpui::test]
+    fn a_multi_line_batch_reaches_a_real_pty_whose_child_has_bracketed_paste_on(
+        cx: &mut TestAppContext,
+    ) {
+        // `printf` sets `DECSET 2004` on its own output, which is how the grid - and therefore
+        // `bracketed_paste_enabled` - learns about it. Nothing here is simulated: the mode really
+        // arrives over the pty from a real child, then `cat` echoes whatever is written back.
+        let pane = new_pane(
+            cx,
+            "sh",
+            vec!["-c".to_string(), "printf '\\033[?2004h'; cat".to_string()],
+        );
+        cx.run_until_parked();
+        assert!(
+            pump_until(cx, |cx| pane
+                .read_with(cx, |pane, _| pane.bracketed_paste_enabled())),
+            "precondition: the real child must have turned bracketed paste on"
+        );
+
+        let sent = pane.update(cx, |pane, cx| {
+            pane.send_prompt(
+                "Review notes on src/api/users.rs \u{2014} 1 note, one prompt, line-anchored.\n\
+                 line 13: ade-note-tenant-id",
+                cx,
+            )
+        });
+        assert!(
+            sent,
+            "a live session with bracketed paste on must accept it"
+        );
+
+        assert!(
+            pump_until(cx, |cx| {
+                pane.read_with(cx, |pane, _| {
+                    pane.visible_text_lines()
+                        .iter()
+                        .any(|line| line.contains("ade-note-tenant-id"))
+                })
+            }),
+            "the real pty's own echo of the batched prompt must appear in the grid - this is \
+             round-tripped evidence the note text genuinely left the app, not an assertion that \
+             `write_input` was called"
+        );
+    }
+
+    /// The refusal. Without bracketed paste, `paste_payload` turns every `\n` into the Enter
+    /// byte, so a multi-line batch would arrive as several separate messages - the exact "one
+    /// comment at a time" failure the audit says makes an agent swing back and forth. It must be
+    /// refused outright, and nothing may reach the child.
+    #[gpui::test]
+    fn a_multi_line_batch_is_refused_when_the_child_has_bracketed_paste_off(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = new_pane(cx, "cat", Vec::new());
+        cx.run_until_parked();
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.bracketed_paste_enabled()),
+            "precondition: a plain `cat` never turns bracketed paste on"
+        );
+
+        let sent = pane.update(cx, |pane, cx| {
+            pane.send_prompt("line 5: ade-refused-one\nline 9: ade-refused-two", cx)
+        });
+        assert!(
+            !sent,
+            "a payload that could split must be refused, not sent"
+        );
+
+        // Pumped for real, so "nothing arrived" is a measured fact rather than an assumption
+        // about timing.
+        for _ in 0..40 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        pane.read_with(cx, |pane, _| {
+            assert!(
+                !pane
+                    .visible_text_lines()
+                    .iter()
+                    .any(|line| line.contains("ade-refused")),
+                "not one byte of a refused batch may reach the child"
+            );
+            assert!(
+                pane.spawn_error.is_some(),
+                "and the refusal must be said out loud on the pane, not swallowed"
+            );
+        });
+    }
+
+    /// The other half of the same rule: the single-line delivery form
+    /// (`BatchedPrompt::for_delivery(false)`) really is accepted and really does arrive, so the
+    /// refusal above is a guard on a genuine hazard rather than a blanket block.
+    #[gpui::test]
+    fn the_single_line_form_is_delivered_to_a_child_with_bracketed_paste_off(
+        cx: &mut TestAppContext,
+    ) {
+        let pane = new_pane(cx, "cat", Vec::new());
+        cx.run_until_parked();
+
+        let sent = pane.update(cx, |pane, cx| {
+            pane.send_prompt("line 5: ade-flat-one \u{b7} line 9: ade-flat-two", cx)
+        });
+        assert!(sent);
+        assert!(
+            pump_until(cx, |cx| {
+                pane.read_with(cx, |pane, _| {
+                    pane.visible_text_lines()
+                        .iter()
+                        .any(|line| line.contains("ade-flat-two"))
+                })
+            }),
+            "the flat form must really reach the child"
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_prompt_writes_nothing(cx: &mut TestAppContext) {
+        let pane = new_pane(cx, "cat", Vec::new());
+        cx.run_until_parked();
+        assert!(!pane.update(cx, |pane, cx| pane.send_prompt("", cx)));
     }
 }
 

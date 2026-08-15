@@ -30,6 +30,11 @@ pub(crate) mod persisted_state_lock;
 pub mod provenance;
 pub mod rail;
 pub mod review;
+// GitHub issue #288: diff-line review notes - draft/sent, batched, sent to the run's
+// agent. Its own folder rather than a file inside `review`: that module answers *what has this
+// agent changed since I last looked*, which is a different question with a different base and
+// different persisted state.
+pub mod review_notes;
 pub mod root;
 pub mod settings;
 pub mod sidebar;
@@ -672,6 +677,24 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         ),
         gpui::KeyBinding::new("d", root::RebaseDropRow, Some("rebase-plan && !text-input")),
         gpui::KeyBinding::new("secondary-enter", root::RebaseStart, Some("rebase-plan")),
+        // GitHub issue #288: the notes bar draws `mod+enter` as real keycaps
+        // (`crate::review_notes::render::SEND_NOTES_SPEC`, the same string resolved here), so it
+        // has to be a real binding - ride-along I10's whole point is that a keycap is a promise.
+        //
+        // Scoped to `"diff-view"`, the key context
+        // `crate::review_notes::render::AdeApp::wrap_diff_with_notes` puts on the diff pane's own
+        // container. Deliberately **without** `&& !text-input`, exactly like `RebaseStart` above
+        // and for the same reason: the open note card *is* a `"text-input"` node inside this
+        // container, and having just finished typing a note is the single most likely moment to
+        // want to send the batch. `secondary-enter` is not a keystroke this app's single-line
+        // fields have any other use for.
+        gpui::KeyBinding::new("secondary-enter", root::SendReviewNotes, Some("diff-view")),
+        // The footer hint's `C note on line`. A plain letter, so it carries the `&& !text-input`
+        // conjunct every other plain-letter binding in this list does - without it, typing a `c`
+        // into a note card would toggle that very card shut, since GPUI dispatches a matching
+        // `KeyBinding` before any `on_key_down` listener (see the `TerminalCopy` entry above for
+        // that fact with its source references).
+        gpui::KeyBinding::new("c", root::ToggleLineNote, Some("diff-view && !text-input")),
     ];
     #[cfg(target_os = "macos")]
     bindings.push(gpui::KeyBinding::new("cmd-q", root::Quit, None));
@@ -977,6 +1000,8 @@ mod undo_scoping_matrix_tests {
              new-file prompt)",
             "the interactive-rebase plan surface, no reword field focused",
             "the interactive-rebase plan surface with one of its reword message fields focused",
+            "the diff's review-notes surface, no note card focused",
+            "the diff's review-notes surface with one of its pinned note cards focused",
             "the focused file tree, no overlay open",
             "the file tree's inline name editor (new file / new folder / rename)",
         ]
@@ -1039,7 +1064,12 @@ mod undo_scoping_matrix_tests {
             // ...but a focused `reword` message field on one of its rows is one, and this row is
             // exactly why those plain-letter bindings carry `&& !text-input`: this stack is live
             // whenever a real commit message is being typed inside the rebase surface.
-            true, // The file tree with no editor open is not a text surface.
+            true,
+            // GitHub issue #288's review-notes surface, the same shape one row up: the container
+            // itself is not a text surface (its `mod+enter` send and its `c` note-on-line live
+            // there), but a pinned note card open for typing is - and that row is exactly why
+            // `ToggleLineNote`'s plain `c` carries `&& !text-input`.
+            false, true, // The file tree with no editor open is not a text surface.
             false,
             // ...but its inline name editor *is* one. This row is the whole reason issue #19's
             // tree had to gain issue #17's `"text-input"` tag when the two branches merged:

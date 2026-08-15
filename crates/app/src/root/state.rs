@@ -157,6 +157,12 @@ impl AdeApp {
             .as_deref()
             .map(crate::provenance::persist_state::line_provenance_path_for);
 
+        // GitHub issue #288's diff-line review notes resolve the same way, and are read back at
+        // startup by `restore_review_notes` once this literal exists.
+        let review_notes_path = settings_path
+            .as_deref()
+            .map(crate::review_notes::persist_state::review_notes_path_for);
+
         // The hook side-channel starts out absent and is brought up lazily, on the first Claude
         // agent this instance spawns - see `AdeApp::hook_injection_for`. Still exactly one
         // listener per instance, shared by every Claude agent it ever spawns; just not one opened
@@ -352,6 +358,14 @@ impl AdeApp {
             change_set: crate::provenance::change_set::ChangeSet::default(),
             uncommitted_diff: crate::sidebar::sections::ScopeLoad::Loading,
             uncommitted_change_set: crate::provenance::change_set::ChangeSet::default(),
+            review_notes: crate::review_notes::NoteStore::default(),
+            review_notes_path,
+            review_notes_owned: std::collections::BTreeSet::new(),
+            note_draft: None,
+            note_cursor: None,
+            note_send_error: None,
+            note_focus_handle: cx.focus_handle(),
+            diff_notes_focus_handle: cx.focus_handle(),
             author_filter: None,
             branch_commits: crate::sidebar::sections::ScopeLoad::Loading,
             changes_sections: crate::sidebar::sections::SectionCollapse::default(),
@@ -377,6 +391,7 @@ impl AdeApp {
             _review_persist_task: None,
             _agent_status_persist_task: None,
             _line_provenance_persist_task: None,
+            _review_notes_persist_task: None,
             // Both are filled in immediately after this literal, through the same single
             // chokepoints every later change uses (`set_file_tree_root` +
             // `reload_expanded_dirs_from_fold_state`) - a second, constructor-only copy of that
@@ -763,6 +778,7 @@ impl AdeApp {
         // when nothing was ever recorded - and deliberately before the first render, so a restored
         // worktree's attribution is live from the first frame rather than appearing a poll later.
         this.restore_line_provenance();
+        this.restore_review_notes();
         // Applies the real, persisted theme selection at startup (`Self::apply_theme_selection`)
         // - if `follow_system` is also on, the real, current OS appearance takes priority over
         // whatever `theme.name` was last persisted as, matching `Self::sync_theme_to_system_

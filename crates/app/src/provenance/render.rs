@@ -446,7 +446,11 @@ impl AdeApp {
     /// the CLI tab chip already use, so a user's own icon pack (GitHub issue #5) applies here too
     /// and an agent is one recognisable mark everywhere it appears. `you` is not an agent and has
     /// no icon-pack entry, so it draws the neutral chip directly.
-    fn render_author_chip(&self, author: &Author, style: &AuthorStyle) -> gpui::AnyElement {
+    pub(crate) fn render_author_chip(
+        &self,
+        author: &Author,
+        style: &AuthorStyle,
+    ) -> gpui::AnyElement {
         if let Author::Agent(key) = author {
             if let Some(kind) = key.kind() {
                 return self.render_agent_chip_icon(ProcessKind::Agent(kind), px(13.0), px(7.5));
