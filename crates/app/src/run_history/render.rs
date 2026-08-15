@@ -450,3 +450,407 @@ impl AdeApp {
             .and_then(|item| item.branch.clone())
     }
 }
+
+/// Real-window, real-git coverage for the History surface (GitHub issue #227): the overflow row
+/// that reaches it, the rows it really paints for real persisted records, the transcript tab a
+/// row really opens, and the rail line that replaced the inline `HISTORY` section.
+///
+/// Everything here drives the same entry points the UI does - `open_history_view`,
+/// `open_run_tab`, `select_agent` - rather than poking state directly, so it proves the wiring
+/// and not just the pure model underneath it (which `crate::run_history::model`'s own tests
+/// already hold without a window).
+#[cfg(test)]
+mod history_surface_tests {
+    use super::*;
+    use crate::hooks::store::LiveRun;
+    use crate::rail::status::Status;
+    use crate::root::focus::palette_focus_tests;
+    use crate::work_surface::agents::AgentKind;
+    use crate::work_surface::state::TabRef;
+    use gpui::TestAppContext;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {dir:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    /// Files one real, *finished* run into the real status store, exactly the way
+    /// `crate::hooks::flow::AdeApp::record_agent_statuses` and
+    /// `crate::run_history::flow::AdeApp::finish_run_record` do between them, and returns its key.
+    fn record_finished_run(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        worktree: &Path,
+        spawned_at: i64,
+        title: &str,
+    ) -> String {
+        let key = crate::review::state::baseline_key(worktree, AgentKind::Claude, spawned_at);
+        app.update(cx, |app, cx| {
+            app.agent_status_state.set(
+                key.clone(),
+                LiveRun::new(worktree, "Claude", spawned_at, Status::Review)
+                    .title(title.to_owned())
+                    .session_id(format!("session-{spawned_at}")),
+                spawned_at + 100,
+            );
+            app.agent_status_state.finish(
+                &key,
+                spawned_at + 360,
+                crate::hooks::store::FinishedRun {
+                    status: Some(Status::Review),
+                    files_changed: Some(2),
+                    insertions: Some(41),
+                    deletions: Some(0),
+                },
+            );
+            // The real recorder (`crate::hooks::flow::AdeApp::record_agent_statuses`) always
+            // notifies; writing straight into the store here has to do the same or the next
+            // `run_until_parked` paints the frame before this run existed.
+            cx.notify();
+        });
+        cx.run_until_parked();
+        key
+    }
+
+    /// The `⋯` overflow's own `History` row really lands on a real, painted History body - the
+    /// only entry point §4t leaves it, so a row that switched nothing would be the whole feature
+    /// unreachable.
+    #[gpui::test]
+    fn the_overflow_history_row_really_opens_a_painted_history_view(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        record_finished_run(
+            &app,
+            cx,
+            repo.path(),
+            1_700_000_000,
+            "Reproduce the refresh race",
+        );
+
+        assert!(
+            cx.debug_bounds("sidebar-history").is_none(),
+            "premise: the sidebar starts on Worktrees"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.run_rail_menu_action(crate::rail::menu::RailMenuAction::OpenHistory, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sidebar_view),
+            crate::rail::strip::SidebarView::History
+        );
+        assert!(
+            cx.debug_bounds("sidebar-history").is_some(),
+            "the History body must really paint - \u{a7}7 rule 1: ship the affordance with the \
+             behaviour"
+        );
+        assert!(
+            cx.debug_bounds("history-scope-toggle").is_some(),
+            "\u{a7}6's all / this worktree toggle is part of the view, not an extra"
+        );
+    }
+
+    /// A real persisted record becomes a real row, and clicking it opens *that run's* transcript
+    /// as a real centre tab - §3's Explorer → editor pattern, end to end.
+    #[gpui::test]
+    fn a_real_run_row_opens_its_own_transcript_tab(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let key = record_finished_run(
+            &app,
+            cx,
+            repo.path(),
+            1_700_000_000,
+            "Move the select builder behind a trait",
+        );
+
+        let tree = app.read_with(cx, |app, _| app.history_run_tree());
+        assert_eq!(
+            tree.total(),
+            1,
+            "the real record must produce exactly one row"
+        );
+        let entry = &tree.repos[0].groups[0].runs[0];
+        assert_eq!(
+            model::run_title(&entry.run),
+            "Move the select builder behind a trait",
+            "the row's title is the run's own first prompt"
+        );
+        assert_eq!(
+            entry.outcome(),
+            model::Outcome::Done,
+            "a watched ending on Review is `done`"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_history_view(cx);
+            app.open_run_tab(repo.path().to_path_buf(), key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(app.read_with(cx, |app, _| app.run_tab_active));
+        assert!(
+            app.read_with(cx, |app, _| app.combined_tab_order())
+                .contains(&TabRef::Run),
+            "the run tab must be a real member of this worktree's strip"
+        );
+        assert!(
+            cx.debug_bounds("run-view").is_some(),
+            "and the centre pane must really be showing it"
+        );
+        for selector in [
+            "run-header",
+            "run-header-meta",
+            "run-outcome-pill",
+            "run-transcript",
+            "run-footer",
+            "run-resume",
+            "run-start-new",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "\u{a7}3's transcript tab is header + dimmed body + footer with both actions; \
+                 `{selector}` is missing"
+            );
+        }
+    }
+
+    /// §3: "One run tab per worktree; opening another replaces it." The replacement is a
+    /// replacement, not a second tab - and it does not touch another checkout's own open tab.
+    #[gpui::test]
+    fn a_second_run_replaces_the_tab_rather_than_stacking_beside_it(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let first = record_finished_run(&app, cx, repo.path(), 1_700_000_000, "first");
+        let second = record_finished_run(&app, cx, repo.path(), 1_700_001_000, "second");
+        let elsewhere = Path::new("/other/checkout");
+        let other = record_finished_run(&app, cx, elsewhere, 1_700_002_000, "elsewhere");
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(repo.path().to_path_buf(), first.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.open_run_key()), Some(first));
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(repo.path().to_path_buf(), second.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_run_key()),
+            Some(second.clone())
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.combined_tab_order())
+                .iter()
+                .filter(|tab| **tab == TabRef::Run)
+                .count(),
+            1,
+            "opening another run replaces the tab; it never stacks a second one"
+        );
+
+        // Another checkout's run tab is its own - opening one there must leave this one alone.
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(elsewhere.to_path_buf(), other, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .run_tab_by_worktree
+                .get(repo.path())
+                .cloned()),
+            Some(second),
+            "\u{a7}3 keys the tab to a worktree: opening a run in another checkout must not \
+             close the one you were reading here"
+        );
+    }
+
+    /// §7's real cost, in this app's own terms: the run tab occupies the centre pane, so
+    /// selecting an agent while it is showing must genuinely *leave* it - not merely stop drawing
+    /// it while `Window::focus` still points at a handle nothing is tracking.
+    #[gpui::test]
+    fn selecting_an_agent_really_leaves_the_run_tab(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let key = record_finished_run(&app, cx, repo.path(), 1_700_000_000, "a run");
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(repo.path().to_path_buf(), key, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.run_tab_active), "premise");
+        assert!(app.read_with(cx, |app, _| app.centre_pane_is_not_an_agent()));
+
+        let agent = app
+            .read_with(cx, |app, _| app.agents.iter().next().map(|agent| agent.id))
+            .expect("every window starts with one shell");
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.run_tab_active),
+            "the run tab must be left, so the agent tab being switched to really mounts"
+        );
+        assert!(
+            !app.read_with(cx, |app, _| app.centre_pane_is_not_an_agent()),
+            "and the one shared predicate \u{a7}7 asks for must agree"
+        );
+        assert!(
+            cx.debug_bounds("run-view").is_none(),
+            "nothing of the run surface may still be painted"
+        );
+    }
+
+    /// §6's rail line, and the deletion that came with it: a worktree with real history and **no
+    /// live agent** gets a `↺ N earlier runs` line and no disclosure caret - the caret only ever
+    /// meant "this worktree has children", and history is no longer one of them.
+    ///
+    /// The line is the *whole* rail-side surface for history now. The inline `HISTORY` section it
+    /// replaced - a label plus one `Resume`/`Reopen` row per run - is deleted, per §7 rule 5.
+    #[gpui::test]
+    fn a_worktree_with_history_and_no_agent_gets_the_earlier_runs_line(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let wt = TempDir::new().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            cx.notify();
+            app.worktrees = vec![crate::rail::worktrees::WorktreeItem {
+                path: wt.path().to_path_buf(),
+                label: "feature-a".to_string(),
+                branch: Some("feature-a".to_string()),
+                is_main: false,
+                is_bare: false,
+                is_detached: false,
+                short_sha: None,
+                is_locked: false,
+                lock_reason: None,
+                is_broken: false,
+                broken_reason: None,
+                error: None,
+            }];
+        });
+        record_finished_run(&app, cx, wt.path(), 1_700_000_000, "an earlier run");
+        cx.run_until_parked();
+
+        // `debug_bounds` takes a `&'static str`, so the selector is leaked for the test's own
+        // lifetime - the only way to look up a bounds key derived from a temp dir's real path.
+        let link: &'static str =
+            Box::leak(format!("earlier-runs-{}", wt.path().display()).into_boxed_str());
+        assert!(
+            cx.debug_bounds(link).is_some(),
+            "\u{a7}6: a worktree with no live agent carries its own `\u{21ba} N earlier runs` line"
+        );
+        assert!(
+            cx.debug_bounds("worktree-caret-0").is_some(),
+            "the caret *slot* is still reserved - it is 13px of every row's left inset"
+        );
+        // ...but history is no longer one of the row's children, so nothing about it can make the
+        // row expandable. That is the other half of the deletion: the inline `HISTORY` section
+        // used to live behind this caret, and `has_children` had to be widened for it.
+        let row = app.update(cx, |app, cx| {
+            app.build_repo_groups(cx)
+                .into_iter()
+                .flat_map(|group| group.rows)
+                .find(|row| row.path == wt.path())
+                .expect("the worktree row")
+        });
+        assert!(
+            row.agents.is_empty(),
+            "premise: no live agent in this checkout"
+        );
+        assert!(
+            !row.history.is_empty(),
+            "premise: it does have real persisted history"
+        );
+
+        // Clicking it lands on History, scoped to that checkout - §6's "switching the sidebar to
+        // History **for that worktree**".
+        app.update_in(cx, |app, window, cx| {
+            app.open_history_for_worktree(wt.path().to_path_buf(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.sidebar_view),
+            crate::rail::strip::SidebarView::History
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.history_scope),
+            HistoryScope::ThisWorktree
+        );
+        assert!(cx.debug_bounds("sidebar-history").is_some());
+    }
+
+    /// The two empty states are two different facts, and the view says which one it is - the same
+    /// pair the Problems view one module over keeps, for the same reason.
+    #[gpui::test]
+    fn no_history_and_no_match_are_two_different_notes(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, _window, cx| app.open_history_view(cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-history-note").is_some(),
+            "a window with no runs at all says so"
+        );
+        assert!(cx.debug_bounds("sidebar-history-count").is_none());
+
+        record_finished_run(&app, cx, repo.path(), 1_700_000_000, "Bump axum to 0.8");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-history-count").is_some(),
+            "one real run earns a real count line"
+        );
+
+        app.update(cx, |app, cx| {
+            app.filter_query
+                .set("nothing matches this", std::time::Instant::now());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let tree = app.read_with(cx, |app, _| app.history_run_tree());
+        assert!(tree.is_empty());
+        assert_eq!(
+            tree.unfiltered, 1,
+            "the unfiltered count is what tells 'no history' from 'no match', and the note reads \
+             off it"
+        );
+        assert_eq!(
+            model::filtered_away_note(tree.unfiltered),
+            "No match in the 1 run."
+        );
+    }
+}
