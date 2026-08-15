@@ -1,6 +1,7 @@
 //! Pure state and formatting for the git graph tab - see `super`'s module docs.
 
 use super::rebase::RebaseModeState;
+use crate::root::plural;
 use crate::root::AdeApp;
 use crate::text_history::TextField;
 use crate::theme;
@@ -104,6 +105,140 @@ pub(crate) struct GraphBranchPrompt {
     /// [`GraphTabState::status_message`] instead, git's own real error text, exactly like every
     /// other menu mutation) - cleared on the very next keystroke.
     pub error: Option<String>,
+}
+
+/// Everything [`graph_branch_merge_gate`] is allowed to look at, already resolved into plain
+/// values by its one producer (`crate::graph_view::render::AdeApp::graph_branch_merge_facts`).
+/// Keeping the decision a pure function of these - rather than reaching into `AdeApp` from inside
+/// it - is what makes every precondition below unit-testable without a GPUI window, the same split
+/// `crate::rail::state::prunable_worktree_paths` already uses for the rail's own destructive
+/// action.
+///
+/// Every field describes the **focused worktree** (`AdeApp::diff_root`), never the repository's
+/// main checkout - the branch menu's own footer rule ("check out, merge, rebase, push and delete
+/// all run in the focused worktree, never the main checkout"), and the same `diff_root` discipline
+/// every other graph mutation already follows through
+/// `crate::graph_view::render::AdeApp::run_graph_remote_op`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphBranchMergeFacts {
+    /// The branch the merge would land *in*: the focused worktree's own checked-out branch.
+    /// `None` on a detached `HEAD`, which `git merge` has no branch to merge into - the exact
+    /// state `wt_core::merge::attempt_merge_into_current` refuses with `Error::MergeTargetDetached`.
+    pub current_branch: Option<String>,
+    /// The branch the merge would take commits *from*: the one whose row the menu was opened on.
+    pub source_branch: String,
+    /// How many real uncommitted paths the focused worktree has (`wt_core::stage::dirty_paths`,
+    /// via `AdeApp::dirty_files`).
+    pub uncommitted_files: usize,
+    /// How many real agent sessions in the focused worktree are still `Run`ning or `Ask`ing.
+    pub live_agents: usize,
+    /// Whether the focused worktree has any agent tab at all for the existing conflict resolver to
+    /// render in - see [`GraphBranchMergeGate::Blocked`]'s own docs and
+    /// `crate::merge::flow::AdeApp::start_merge_from_graph_branch`.
+    pub has_agent_tab: bool,
+    /// `AdeApp::merge_flow.is_some()` - only one merge runs at a time app-wide.
+    pub merge_already_running: bool,
+}
+
+/// Whether the branch menu's "Merge into current branch…" row is live, and if not, the real
+/// reason - rendered *on the row itself*, dimmed and un-clickable, never a silent no-op (GitHub
+/// issue #241; `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1 rule 3: "disabled
+/// while anything is uncommitted, with the reason on the button itself").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphBranchMergeGate {
+    /// Every precondition holds. `current_branch` is the branch the merge would land in - the
+    /// row's own sub-label when it is live, so the row always names its real target.
+    Ready { current_branch: String },
+    /// A real, user-facing reason this merge cannot run right now.
+    Blocked(String),
+}
+
+impl GraphBranchMergeGate {
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, GraphBranchMergeGate::Ready { .. })
+    }
+
+    /// The reason string for a blocked gate - `None` when ready, so a caller can never render a
+    /// reason next to a live control.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            GraphBranchMergeGate::Ready { .. } => None,
+            GraphBranchMergeGate::Blocked(reason) => Some(reason.as_str()),
+        }
+    }
+
+    /// The row's sub-label: the real target branch while live, the real reason while blocked.
+    /// One function so the two can never be rendered together or swapped by accident.
+    pub(crate) fn sub_label(&self) -> String {
+        match self {
+            GraphBranchMergeGate::Ready { current_branch } => current_branch.clone(),
+            GraphBranchMergeGate::Blocked(reason) => reason.clone(),
+        }
+    }
+}
+
+/// The one place the graph decides whether "Merge into current branch…" may run (GitHub issue
+/// #241).
+///
+/// The two *content* preconditions and their exact wording come straight from the design's own
+/// `mergeReady`/`mergeWhy` (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`):
+/// `!uncommitted.length && !liveAgents.length`, reported as `N files still uncommitted` /
+/// `N agents still working`. The structural ones ahead of them are this app's own: they describe
+/// states in which `wt_core::merge::attempt_merge_into_current` could not do anything meaningful
+/// at all, and each mirrors a real `wt_core::Error` variant that function would otherwise return
+/// only *after* the user clicked (`MergeTargetDetached`, `MergeSourceIsCurrentBranch`,
+/// `MergeTargetDirty`) - checked here so the reason is visible on the row instead of arriving as
+/// an error in the resolver.
+///
+/// Order is deliberate: a structurally impossible merge outranks a merely blocked one, because
+/// "3 files still uncommitted" on a detached `HEAD` would imply that committing them is enough to
+/// unblock it, which is false.
+///
+/// Every reason is kept short enough to render *whole* in the row's sub-label at
+/// [`theme::graph::BRANCH_MENU_WIDTH`] - a truncated reason ("2 files still uncom…") is not a
+/// reason. The design's own two are already short; this app's own structural ones were shortened
+/// to match after measuring the real painted row, and that width was widened for the same reason
+/// (see its own docs).
+///
+/// This is a *pre-flight* gate, not the authority: `wt_core::merge` re-checks the detached-`HEAD`,
+/// same-branch and dirty-worktree preconditions against git's own ground truth immediately before
+/// running `git merge`, so a fact that goes stale between the render and the click (a background
+/// `load_diff`, an agent waking up, a file written under the worktree) can only ever cost an
+/// honest refusal in the resolver - never a merge this gate would have blocked.
+pub(crate) fn graph_branch_merge_gate(facts: &GraphBranchMergeFacts) -> GraphBranchMergeGate {
+    let Some(current_branch) = facts.current_branch.clone() else {
+        return GraphBranchMergeGate::Blocked(
+            "detached HEAD \u{2013} no current branch".to_string(),
+        );
+    };
+    if current_branch == facts.source_branch {
+        return GraphBranchMergeGate::Blocked(format!("already on {current_branch}"));
+    }
+    if facts.merge_already_running {
+        return GraphBranchMergeGate::Blocked("a merge is already running".to_string());
+    }
+    if facts.uncommitted_files > 0 {
+        return GraphBranchMergeGate::Blocked(format!(
+            "{} still uncommitted",
+            plural::count(facts.uncommitted_files, "file", None)
+        ));
+    }
+    if facts.live_agents > 0 {
+        return GraphBranchMergeGate::Blocked(format!(
+            "{} still working",
+            plural::count(facts.live_agents, "agent", None)
+        ));
+    }
+    if !facts.has_agent_tab {
+        // The conflict resolver this action hands off to renders inside an agent's own work
+        // surface (`crate::merge::render::AdeApp::render_merge_flow_surface` takes an `&Agent`,
+        // reached only from `crate::work_surface::render`'s active-agent branch), so a worktree
+        // with no agent tab at all has nowhere to show a conflicted merge. Refusing up front is
+        // the honest reading of that: the alternative is starting a merge whose conflicts would be
+        // invisible.
+        return GraphBranchMergeGate::Blocked("no agent tab to show the merge".to_string());
+    }
+    GraphBranchMergeGate::Ready { current_branch }
 }
 
 /// The graph tab's own UI state: what's loaded, which scope/panel is selected, and the row `⋯`/
@@ -359,6 +494,164 @@ pub(crate) fn relative_time(commit_unix_seconds: i64, now_unix_seconds: i64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fully-mergeable set of facts - every test below changes exactly one field, so a failure
+    /// names the one precondition it is about rather than a whole hand-built struct.
+    fn ready_merge_facts() -> GraphBranchMergeFacts {
+        GraphBranchMergeFacts {
+            current_branch: Some("main".to_string()),
+            source_branch: "feature".to_string(),
+            uncommitted_files: 0,
+            live_agents: 0,
+            has_agent_tab: true,
+            merge_already_running: false,
+        }
+    }
+
+    #[test]
+    fn merge_gate_is_ready_and_names_the_branch_it_would_merge_into() {
+        let gate = graph_branch_merge_gate(&ready_merge_facts());
+        assert_eq!(
+            gate,
+            GraphBranchMergeGate::Ready {
+                current_branch: "main".to_string()
+            }
+        );
+        assert!(gate.is_ready());
+        assert_eq!(
+            gate.reason(),
+            None,
+            "a live control must never carry a blocked reason"
+        );
+        assert_eq!(
+            gate.sub_label(),
+            "main",
+            "the live row's sub-label names its real target branch"
+        );
+    }
+
+    #[test]
+    fn merge_gate_blocks_a_detached_head_because_there_is_no_branch_to_merge_into() {
+        let facts = GraphBranchMergeFacts {
+            current_branch: None,
+            ..ready_merge_facts()
+        };
+        let gate = graph_branch_merge_gate(&facts);
+        assert!(!gate.is_ready());
+        assert_eq!(
+            gate.reason(),
+            Some("detached HEAD \u{2013} no current branch")
+        );
+        assert_eq!(gate.sub_label(), "detached HEAD \u{2013} no current branch");
+    }
+
+    #[test]
+    fn merge_gate_blocks_merging_a_branch_into_itself() {
+        let facts = GraphBranchMergeFacts {
+            source_branch: "main".to_string(),
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&facts).reason(),
+            Some("already on main")
+        );
+    }
+
+    #[test]
+    fn merge_gate_blocks_while_another_merge_is_already_running() {
+        let facts = GraphBranchMergeFacts {
+            merge_already_running: true,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&facts).reason(),
+            Some("a merge is already running")
+        );
+    }
+
+    #[test]
+    fn merge_gate_blocks_on_uncommitted_files_in_the_designs_own_wording() {
+        // The design's own `mergeWhy`: `this.n(uncommitted.length, 'file') + ' still uncommitted'`.
+        let one = GraphBranchMergeFacts {
+            uncommitted_files: 1,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&one).reason(),
+            Some("1 file still uncommitted")
+        );
+        let many = GraphBranchMergeFacts {
+            uncommitted_files: 3,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&many).reason(),
+            Some("3 files still uncommitted")
+        );
+    }
+
+    #[test]
+    fn merge_gate_blocks_on_live_agents_in_the_designs_own_wording() {
+        // The design's own `mergeWhy`: `this.n(liveAgents.length, 'agent') + ' still working'`.
+        let one = GraphBranchMergeFacts {
+            live_agents: 1,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&one).reason(),
+            Some("1 agent still working")
+        );
+        let many = GraphBranchMergeFacts {
+            live_agents: 2,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&many).reason(),
+            Some("2 agents still working")
+        );
+    }
+
+    #[test]
+    fn merge_gate_blocks_when_there_is_no_agent_tab_to_show_a_conflict_in() {
+        let facts = GraphBranchMergeFacts {
+            has_agent_tab: false,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&facts).reason(),
+            Some("no agent tab to show the merge")
+        );
+    }
+
+    #[test]
+    fn merge_gate_reports_the_structural_refusal_first_when_several_hold_at_once() {
+        // A detached HEAD with uncommitted files must not claim that committing them unblocks the
+        // merge - it does not.
+        let facts = GraphBranchMergeFacts {
+            current_branch: None,
+            uncommitted_files: 3,
+            live_agents: 2,
+            has_agent_tab: false,
+            merge_already_running: true,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&facts).reason(),
+            Some("detached HEAD \u{2013} no current branch")
+        );
+
+        // Uncommitted files outrank live agents: committing is the first thing to do, and the
+        // agents may well be what is about to commit them.
+        let dirty_and_busy = GraphBranchMergeFacts {
+            uncommitted_files: 1,
+            live_agents: 1,
+            ..ready_merge_facts()
+        };
+        assert_eq!(
+            graph_branch_merge_gate(&dirty_and_busy).reason(),
+            Some("1 file still uncommitted")
+        );
+    }
 
     #[test]
     fn relative_time_formats_each_bucket() {

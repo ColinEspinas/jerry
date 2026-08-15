@@ -418,12 +418,22 @@ impl AdeApp {
         // (the File/Diff views included) instead of a merge-view-specific override, and gets
         // both columns to the same real legibility - neither has text sitting on a color wash.
         let (agent_fg, _) = work_surface::agent_tint(agent.kind);
-        let agent_branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.path == agent.cwd)
-            .and_then(|item| item.branch.clone())
-            .unwrap_or_else(|| hunk.theirs_label.clone());
+        // The incoming side's real branch, taken from git's own conflict marker
+        // (`>>>>>>> <branch>`) rather than from the agent's worktree (GitHub issue #241).
+        //
+        // Looking it up by `agent.cwd` was right only while every merge went the one direction the
+        // context bar's `Merge` button starts - the agent's own branch into the base - where the
+        // agent's worktree branch and git's `theirs` label are the same string. The graph Branches
+        // panel's "Merge into current branch…" merges an arbitrary branch *into* the focused
+        // worktree, so that lookup returned the focused worktree's branch: the **target**, printed
+        // on the **incoming** column. Live-reproduced in a real X11 build merging `conflict-x` into
+        // `main` - both columns read `main`, on the one screen whose whole job is telling the two
+        // sides apart before the user picks one.
+        //
+        // `theirs_label` is git's own answer for both directions (`git merge <branch>` writes
+        // `<branch>` into the marker), so this is strictly more accurate than what it replaces,
+        // never merely different.
+        let incoming_branch = hunk.theirs_label.clone();
 
         let rem_px = self.effective_code_rem_px();
         let (ours_rendered, theirs_rendered): (
@@ -615,7 +625,7 @@ impl AdeApp {
                     .child(column(
                         "theirs",
                         agent.kind.label().to_string(),
-                        agent_branch,
+                        incoming_branch,
                         &hunk.theirs,
                         theirs_rendered,
                         hunk.theirs_start_line,

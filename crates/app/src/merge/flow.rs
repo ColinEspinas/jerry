@@ -163,17 +163,21 @@ impl AdeApp {
     /// is shown in - and every agent this picks between shares that one worktree by construction
     /// (`Agents::iter_for_cwd`).
     ///
-    /// Two real refusals, both reported honestly through the graph tab's own status line rather
-    /// than silently dropped:
-    /// - a merge flow is already in progress (two concurrent `git merge` invocations would race
-    ///   over the same worktree - the same single-flight rule [`Self::start_merge`] applies);
-    /// - the focused worktree has no agent tab at all, so there is genuinely nowhere to show the
-    ///   resolver. Nothing is started in that case; no merge is left half-run.
+    /// Every precondition is [`crate::graph_view::graph_branch_merge_gate`]'s - the *same* pure
+    /// gate the row that was just clicked rendered itself from, so what the row said and what this
+    /// does can never disagree. Re-checked here rather than trusted from that render: the frame
+    /// that drew a live row and the click that lands on it are separate frames, and a background
+    /// `load_diff`, an agent waking up, or another merge starting in between can genuinely
+    /// invalidate it - the same "re-check rather than trust a UI-level belief" discipline
+    /// `wt_core::merge::complete_merge` already applies one layer down. A gate that refuses is
+    /// reported on the graph tab's own status line with the very string the row was showing, never
+    /// silently dropped.
     ///
-    /// Everything else - a detached `HEAD`, a dirty worktree, merging a branch into itself, a
-    /// branch that doesn't exist - is `wt_core::merge`'s own precondition to refuse, and surfaces
-    /// as a real [`merge::MergeFlowState::Error`] in the resolver with git's (or that module's)
-    /// own real message.
+    /// The gate is a pre-flight, not the authority: `wt_core::merge::attempt_merge_into_current`
+    /// re-checks the detached-`HEAD`, same-branch and dirty-worktree preconditions against git's
+    /// own ground truth, and a branch that doesn't exist is git's own refusal. Each surfaces as a
+    /// real [`merge::MergeFlowState::Error`] in the resolver with that module's (or git's) own real
+    /// message.
     pub(crate) fn start_merge_from_graph_branch(
         &mut self,
         source_branch: String,
@@ -182,9 +186,11 @@ impl AdeApp {
     ) {
         self.graph_state.branch_menu_open = None;
         self.graph_state.delete_branch_confirm_armed = None;
-        if self.merge_flow.is_some() {
-            self.graph_state.status_message =
-                Some("a merge is already in progress; finish or abort it first".to_string());
+        let gate = crate::graph_view::graph_branch_merge_gate(
+            &self.graph_branch_merge_facts(source_branch.clone(), cx),
+        );
+        if let Some(reason) = gate.reason() {
+            self.graph_state.status_message = Some(reason.to_string());
             cx.notify();
             return;
         }
@@ -194,10 +200,9 @@ impl AdeApp {
             .map(|agent| agent.id)
             .next()
         else {
-            self.graph_state.status_message = Some(
-                "this worktree has no agent tab to show the merge in; open one first".to_string(),
-            );
-            cx.notify();
+            // Unreachable while the gate above returned `Ready` (its `has_agent_tab` is derived
+            // from this same iterator), handled rather than `expect`ed - never a panic for a state
+            // a background agent-close could genuinely change out from under this.
             return;
         };
 

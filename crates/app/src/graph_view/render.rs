@@ -941,6 +941,61 @@ impl AdeApp {
         });
     }
 
+    /// Everything [`graph_branch_merge_gate`] needs for the branch menu's "Merge into current
+    /// branch…" row, read off real app state for the **focused worktree** - never the repository's
+    /// main checkout (the branch menu's own footer rule; see [`Self::run_graph_remote_op`] for the
+    /// same `diff_root` discipline every other graph mutation already follows).
+    ///
+    /// Every field is a fact this app has already loaded for that worktree, so this performs no
+    /// blocking I/O and is safe to call from a render path: the current branch comes from
+    /// [`AdeApp::worktrees`] (`wt_core::list_worktrees`), the uncommitted count from
+    /// [`AdeApp::dirty_files`] (`wt_core::stage::dirty_paths`), and the agent counts from the live
+    /// [`AdeApp::agents`] plus [`Self::agent_status`] - the single status source the rail and the
+    /// work surface already share, so this can never disagree with them about which agents are
+    /// working.
+    ///
+    /// A `dirty_files` that hasn't landed yet reads as zero rather than as "blocked": `None` there
+    /// means *unknown*, and blocking a real merge on an answer that simply hasn't arrived would be
+    /// a reason the user cannot act on. `wt_core::merge::attempt_merge_into_current` re-checks
+    /// dirtiness against git itself immediately before merging, so an unknown-then-dirty worktree
+    /// costs an honest `MergeTargetDirty` refusal in the resolver, never a merge onto dirty state.
+    pub(crate) fn graph_branch_merge_facts(
+        &self,
+        source_branch: String,
+        cx: &gpui::App,
+    ) -> GraphBranchMergeFacts {
+        let current_branch = self
+            .worktrees
+            .iter()
+            .find(|item| item.path == self.diff_root)
+            .and_then(|item| item.branch.clone());
+        let uncommitted_files = self
+            .dirty_files
+            .as_ref()
+            .map(|files| files.len())
+            .unwrap_or(0);
+        let worktree_agents: Vec<&crate::work_surface::agents::Agent> =
+            self.agents.iter_for_cwd(self.diff_root.clone()).collect();
+        let live_agents = worktree_agents
+            .iter()
+            .filter(|agent| agent.kind.is_agent_session())
+            .filter(|agent| {
+                matches!(
+                    self.agent_status(agent, cx),
+                    crate::rail::status::Status::Run | crate::rail::status::Status::Ask
+                )
+            })
+            .count();
+        GraphBranchMergeFacts {
+            current_branch,
+            source_branch,
+            uncommitted_files,
+            live_agents,
+            has_agent_tab: !worktree_agents.is_empty(),
+            merge_already_running: self.merge_flow.is_some(),
+        }
+    }
+
     /// The branch menu's "Push Branch…" action (GitHub issue #241) - a plain, never-forced push
     /// of that specific branch (`wt_core::remote::push_branch`), regardless of what is checked
     /// out in the focused worktree.
@@ -977,6 +1032,7 @@ impl AdeApp {
     /// up front keeps the arm intact, so the click the user is about to repeat still counts.
     pub(crate) fn request_graph_delete_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         if self.graph_state.remote_op_in_flight {
+            self.report_graph_op_in_flight(cx);
             return;
         }
         if self.graph_state.delete_branch_confirm_armed.as_deref() != Some(branch.as_str()) {
@@ -1018,6 +1074,7 @@ impl AdeApp {
         // this ordering closes. Soft/Mixed behave exactly as before either way (they arm nothing,
         // and `run_graph_remote_op` would have refused them at the far end regardless).
         if self.graph_state.remote_op_in_flight {
+            self.report_graph_op_in_flight(cx);
             return;
         }
         if mode == ResetMode::Hard
@@ -1040,6 +1097,18 @@ impl AdeApp {
         });
     }
 
+    /// The one refusal every graph action's single-flight guard reports, so a click that lands
+    /// while another graph operation is still running says so instead of doing nothing visible
+    /// (GitHub issue #241). Deliberately does *not* dismiss the menu or disarm any confirmation:
+    /// the click did not count, so the surface it came from must stay exactly as it was for the
+    /// user to repeat it - see [`Self::request_graph_delete_branch`]'s own docs on why disarming
+    /// before this check was a real bug.
+    fn report_graph_op_in_flight(&mut self, cx: &mut Context<Self>) {
+        self.graph_state.status_message =
+            Some("another git operation is still running".to_string());
+        cx.notify();
+    }
+
     /// Shared plumbing behind [`Self::request_graph_fetch`]/[`Self::request_graph_pull`]/
     /// [`Self::request_graph_push`]: guards against a double-click starting a second, overlapping
     /// git subprocess (`GraphTabState::remote_op_in_flight`), runs `op` on the background
@@ -1047,6 +1116,11 @@ impl AdeApp {
     /// real success or a real git error message and reloads the graph either way - a fetch/pull/
     /// push always changes what the graph/ahead-behind counts should show, success or not (a
     /// failed pull can still have fetched new remote-tracking data, for one).
+    ///
+    /// A click that arrives while another graph operation is still in flight is **refused out
+    /// loud**, on the same status line every other outcome uses (GitHub issue #241's own rule for
+    /// this menu: never a silent no-op). It used to return in silence, which read as a dead click:
+    /// nothing happened, nothing was said, and the menu the click came from stayed open.
     fn run_graph_remote_op(
         &mut self,
         action: &'static str,
@@ -1054,6 +1128,7 @@ impl AdeApp {
         op: impl FnOnce(std::path::PathBuf) -> Result<(), wt_core::Error> + Send + 'static,
     ) {
         if self.graph_state.remote_op_in_flight {
+            self.report_graph_op_in_flight(cx);
             return;
         }
         let root = self.diff_root.clone();
@@ -1553,9 +1628,11 @@ impl AdeApp {
     }
 
     /// Toolbar (design spec §4): `HEAD` branch/chip/counts, the `All | Worktrees | Current` scope
-    /// segment, and the Fetch/Pull/Push button group. None of Fetch/Pull/Push perform a real git
-    /// operation yet (see `super`'s module docs) - clicking any of them calls
-    /// [`AdeApp::graph_action_not_yet_wired`], a real, honest, visible response.
+    /// segment, and the Fetch/Pull/Push button group. Fetch and Pull run real `wt_core::remote`
+    /// operations ([`Self::request_graph_fetch`]/[`Self::request_graph_pull`]); `Push ▾` opens
+    /// [`Self::render_graph_push_menu`], whose three rows are real too. (An earlier revision
+    /// shipped all three inert; that is no longer true, and this doc used to say so - see phase
+    /// (c) in `super`'s module docs.)
     fn render_graph_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let branch = self
             .worktrees
@@ -1664,8 +1741,10 @@ impl AdeApp {
     }
 
     /// `Push ↑N ▾` - opens the Push menu (design spec §4: 268-wide, Push / Force with lease /
-    /// Force). Every entry mutates the remote, so every entry is disabled - see `super`'s module
-    /// docs.
+    /// Force). All three entries are real `wt_core::remote::push` calls
+    /// ([`Self::request_graph_push`]); the two force postures sit behind the two-click
+    /// confirmation [`state::GraphTabState::push_force_confirm_armed`] documents. (Phase (a)
+    /// shipped them disabled, and this doc used to say so.)
     fn render_graph_push_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // `None` (no configured upstream, or still loading) renders as a bare "Push", never a
         // fabricated "↑0" - matching `wt_core::graph::ahead_behind_against_upstream`'s own "no
@@ -2166,7 +2245,9 @@ impl AdeApp {
     }
 
     /// The row `⋯` context menu (design spec §4): grouped Branch / Apply / Reset / Copy. Every
-    /// entry that would perform a real git mutation is disabled - only Copy's entries are wired.
+    /// entry is real (`wt_core::checkout`/`wt_core::rewrite`/the `wt_core::rebase`-backed rebase
+    /// mode/the clipboard), and `Hard` carries its own two-click confirmation. (Phase (a) shipped
+    /// every mutating entry disabled with only Copy wired, and this doc used to say so.)
     /// Anchored to [`GraphRowMenu::origin_x`]/`origin_y` - the real position it was opened at
     /// (either a right-click's own `event.position`, or the `⋯` button's own captured bounds via
     /// `AdeApp::graph_state.row_menu_bounds`, the same `gpui::canvas`-bounds-capture mechanism
@@ -2497,14 +2578,13 @@ impl AdeApp {
         let branch = menu.branch.clone();
         let delete_armed =
             self.graph_state.delete_branch_confirm_armed.as_deref() == Some(branch.as_str());
-        // The branch the merge would land in, read off the same real `wt_core::list_worktrees`
-        // data the rest of the app uses for the focused worktree - never a guess, and honestly
-        // absent (no sub-label at all) when the worktree is on a detached `HEAD`.
-        let current_branch = self
-            .worktrees
-            .iter()
-            .find(|item| item.path == self.diff_root)
-            .and_then(|item| item.branch.clone());
+        // Whether this merge can really run right now, and if not, the real reason - decided by
+        // the one pure gate `AdeApp::start_merge_from_graph_branch` re-checks on the click, so the
+        // row can never look live for a merge the action would refuse (or dead for one it would
+        // run). See `graph_branch_merge_gate`'s own docs for where each precondition comes from.
+        let merge_gate =
+            graph_branch_merge_gate(&self.graph_branch_merge_facts(branch.clone(), cx));
+        let merge_ready = merge_gate.is_ready();
 
         div()
             .id("graph-branch-menu-scrim")
@@ -2600,23 +2680,32 @@ impl AdeApp {
                     })),
                 )
                 .child(render_graph_row_menu_header("Integrate"))
-                .child(
-                    render_dropdown_menu_row(
+                .child({
+                    // A blocked merge renders as a real disabled row carrying its own reason
+                    // (GitHub issue #241: "never a silent no-op"), and gets no `on_click` at all -
+                    // `render_dropdown_menu_row`'s own enabled/disabled contract, which controls
+                    // the row's look but never whether it is wired up.
+                    let row = render_dropdown_menu_row(
                         "\u{2193}",
                         theme::button::BLUE_FG.into(),
                         theme::surface::CHIP_NEUTRAL.into(),
                         "Merge into current branch\u{2026}",
-                        current_branch.clone().unwrap_or_default(),
+                        merge_gate.sub_label(),
                         Vec::new(),
-                        true,
-                    )
-                    .on_click(cx.listener({
-                        let branch = branch.clone();
-                        move |this, _event: &ClickEvent, window, cx| {
-                            this.start_merge_from_graph_branch(branch.clone(), window, cx);
-                        }
-                    })),
-                )
+                        merge_ready,
+                    );
+                    if merge_ready {
+                        row.on_click(cx.listener({
+                            let branch = branch.clone();
+                            move |this, _event: &ClickEvent, window, cx| {
+                                this.start_merge_from_graph_branch(branch.clone(), window, cx);
+                            }
+                        }))
+                        .into_any_element()
+                    } else {
+                        row.into_any_element()
+                    }
+                })
                 .child(
                     render_dropdown_menu_row(
                         "\u{2191}",
@@ -8806,6 +8895,166 @@ mod graph_branch_menu_tests {
             );
         });
     }
+
+    /// The design's own first content precondition (`mergeReady: … && !uncommitted.length`), as a
+    /// real disabled row: a dirty worktree must show the reason *on the row* and the row must
+    /// genuinely have no click handler at all, not one that silently no-ops.
+    ///
+    /// This is also the one precondition that would otherwise only be discovered after the click:
+    /// `wt_core::merge::attempt_merge_into_current` refuses a dirty target with
+    /// `Error::MergeTargetDirty`, which would land in the resolver as a failed merge rather than
+    /// on the control the user is looking at.
+    #[gpui::test]
+    fn merge_row_is_disabled_with_the_designs_own_reason_while_the_worktree_is_dirty(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        seed_three_branches(repo.path());
+        // Two real uncommitted files, present before the app ever opens, so the app's own real
+        // `wt_core::stage::dirty_paths` read is what fills `dirty_files` - never a hand-set field.
+        std::fs::write(repo.path().join("dirty-one.txt"), "uncommitted\n").expect("write");
+        std::fs::write(repo.path().join("dirty-two.txt"), "uncommitted\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.set_graph_right_panel(GraphRightPanel::Branches, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.dirty_files.as_ref().map(|files| files.len()),
+                Some(2),
+                "premise: the app's own real dirty-path read must have found both files"
+            );
+            let gate =
+                graph_branch_merge_gate(&app.graph_branch_merge_facts("feature-a".to_string(), cx));
+            assert_eq!(
+                gate.reason(),
+                Some("2 files still uncommitted"),
+                "the reason must be the design's own mergeWhy wording"
+            );
+            assert_eq!(
+                gate.sub_label(),
+                "2 files still uncommitted",
+                "and it must be what the row itself renders, in place of the target branch"
+            );
+        });
+
+        // The real, painted row - clicked for real. A disabled row gets no `on_click` at all, so
+        // this must do nothing whatsoever.
+        open_menu_at(cx, "graph-branch-row-feature-a");
+        click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.merge_flow.is_none(),
+                "a blocked merge row must start no merge flow at all"
+            );
+            assert_eq!(
+                app.graph_state.status_message, None,
+                "and must not even reach the action - a disabled row carries no click handler, so \
+                 there is nothing to report"
+            );
+        });
+        assert!(
+            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "and no real git merge must have been run in the worktree"
+        );
+    }
+
+    /// Merging the branch that is already checked out into itself is a guaranteed no-op
+    /// (`wt_core::Error::MergeSourceIsCurrentBranch`) - refused on the row rather than after the
+    /// click, and phrased as the state it really is rather than as something the user could fix by
+    /// committing.
+    #[gpui::test]
+    fn merge_row_is_disabled_on_the_branch_that_is_already_checked_out(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+        assert_eq!(
+            git_output(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main",
+            "premise: the focused worktree really is on main"
+        );
+
+        app.read_with(cx, |app, cx| {
+            let gate =
+                graph_branch_merge_gate(&app.graph_branch_merge_facts("main".to_string(), cx));
+            assert_eq!(gate.reason(), Some("already on main"));
+        });
+
+        open_menu_at(cx, "graph-branch-row-main");
+        click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.merge_flow.is_none(),
+                "merging main into main must not even start"
+            );
+            assert_eq!(
+                app.graph_state.status_message, None,
+                "and the row must genuinely be disabled - a click that reached the action would \
+                 have reported the gate's refusal on the status line instead"
+            );
+        });
+        assert!(
+            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "and must have run no real git merge"
+        );
+    }
+
+    /// The other half of the gate: the facts it decides from must really be read off this app's
+    /// own loaded state for the **focused worktree**, not from constants. The pure decision itself
+    /// is covered branch-by-branch in `super::state`'s own unit tests; this pins the reading.
+    #[gpui::test]
+    fn merge_facts_are_read_from_the_focused_worktrees_own_real_state(cx: &mut TestAppContext) {
+        let (repo, app, cx) = open_seeded_branches_panel(cx);
+
+        app.read_with(cx, |app, cx| {
+            let facts = app.graph_branch_merge_facts("feature-a".to_string(), cx);
+            assert_eq!(
+                facts.current_branch.as_deref(),
+                Some("main"),
+                "the target branch must come from the real worktree listing"
+            );
+            assert_eq!(facts.source_branch, "feature-a");
+            assert_eq!(
+                facts.uncommitted_files, 0,
+                "premise: this fixture's worktree is really clean"
+            );
+            assert_eq!(
+                facts.live_agents, 0,
+                "the fixture's one tab is a shell, which is not an agent session"
+            );
+            assert!(
+                facts.has_agent_tab,
+                "but it is still a real tab the resolver could render in"
+            );
+            assert!(!facts.merge_already_running);
+            assert!(graph_branch_merge_gate(&facts).is_ready());
+        });
+
+        // A real merge really running is a real fact, read the same way.
+        app.update_in(cx, |app, window, cx| {
+            app.start_merge_from_graph_branch("feature-a".to_string(), window, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, cx| {
+            let facts = app.graph_branch_merge_facts("feature-b".to_string(), cx);
+            assert!(
+                facts.merge_already_running,
+                "premise: the first merge really is live"
+            );
+            assert_eq!(
+                graph_branch_merge_gate(&facts).reason(),
+                Some("a merge is already running")
+            );
+        });
+        assert!(
+            wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
+            "and that really was a real git merge, left in progress for the resolver"
+        );
+    }
 }
 
 /// GitHub issue #241: what each of the branch context menu's seven actions really does, end to
@@ -9163,11 +9412,21 @@ mod graph_branch_action_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("Fetch\u{2026}".to_string()),
-            "and must not overwrite the in-flight operation's own status line with a \
-             confirmation prompt it will not honour"
+            Some("another git operation is still running".to_string()),
+            "and must say why the click did nothing, rather than either silently doing nothing \
+             (the dead click GitHub issue #241's sweep found) or posting a confirmation prompt it \
+             will not honour. The in-flight operation's own line is not lost: its completion \
+             handler writes the real result over this a moment later, as the run below proves."
         );
         cx.run_until_parked();
+        let after = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
+        assert!(
+            after
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Fetch")),
+            "the refused click's reason must give way to the real operation's own real outcome \
+             (success or git's own failure) - got {after:?}"
+        );
 
         // The user's next click is, to them, a first click - so it must arm, not delete.
         app.update_in(cx, |app, _window, cx| {
@@ -9490,6 +9749,29 @@ mod graph_branch_action_tests {
                          resolver's own file list"
                     );
                     assert_eq!(files[0].relative_path(), std::path::Path::new("shared.txt"));
+
+                    // The two strings the resolver's own columns are labelled with
+                    // (`crate::merge::render::AdeApp::render_conflict_columns`). The incoming
+                    // column must name the branch that was *merged in*, never the branch the
+                    // worktree is already on: deriving it from the agent's worktree instead of
+                    // git's own marker made both columns read `main` for this merge direction -
+                    // on the one screen whose job is telling the two sides apart.
+                    let wt_core::merge::ConflictedPath::Text(file) = &files[0] else {
+                        panic!("a real text conflict, not an unmergeable path");
+                    };
+                    let hunk = file
+                        .segments
+                        .iter()
+                        .find_map(|segment| match segment {
+                            wt_core::merge::ConflictSegment::Conflict(hunk) => Some(hunk),
+                            _ => None,
+                        })
+                        .expect("a real conflict hunk");
+                    assert_eq!(hunk.ours_label, "HEAD", "the target side is HEAD");
+                    assert_eq!(
+                        hunk.theirs_label, "feature",
+                        "and the incoming side is the branch that was really merged in"
+                    );
                 }
                 other => panic!(
                     "expected a real conflicted merge state, got {}",
@@ -9538,12 +9820,11 @@ mod graph_branch_action_tests {
                 "no merge flow must have been started at all"
             );
             let status = app.graph_state.status_message.clone();
-            assert!(
-                status
-                    .as_deref()
-                    .is_some_and(|text| text.contains("no agent tab")),
-                "and the refusal must say why, rather than looking like a dead click - got \
-                 {status:?}"
+            assert_eq!(
+                status.as_deref(),
+                Some("no agent tab to show the merge"),
+                "and the refusal must say why, in the very words the disabled row itself carries \
+                 (`graph_branch_merge_gate`), rather than looking like a dead click"
             );
         });
         assert!(
@@ -9585,11 +9866,11 @@ mod graph_branch_action_tests {
         cx.run_until_parked();
 
         let status = app.read_with(cx, |app, _| app.graph_state.status_message.clone());
-        assert!(
-            status
-                .as_deref()
-                .is_some_and(|text| text.contains("already in progress")),
-            "a second merge while one is live must be refused with a real reason - got {status:?}"
+        assert_eq!(
+            status.as_deref(),
+            Some("a merge is already running"),
+            "a second merge while one is live must be refused with the very reason the row itself \
+             would have carried (`graph_branch_merge_gate`)"
         );
         assert_eq!(
             app.read_with(cx, |app, _| app
