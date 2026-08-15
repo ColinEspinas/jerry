@@ -261,7 +261,10 @@ impl AdeApp {
                             .bg(theme::surface::SEGMENT_TRACK)
                             .flex()
                             .items_center()
-                            .gap(px(2.0))
+                            // No decorative gap before the caret - see
+                            // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                            // comment for why (live report: it read as a gap between the
+                            // typed text and where it's actually being typed).
                             .font(font(theme::font::MONO))
                             .text_size(px(11.5))
                             .text_color(theme::text::BODY)
