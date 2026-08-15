@@ -142,13 +142,44 @@ const REPLY_WRITE_FLOOR: Duration = Duration::from_millis(500);
 /// the least accurate of the queue. Dropping it costs the least truth.
 const MAX_PENDING_EDITS: usize = 4096;
 
-/// One agent's most recent hook fact, as stored for the rail to read.
+/// One agent's most recent hook fact, as stored for the rail to read, plus the two facts about
+/// the *run as a whole* that a single latest-wins report structurally cannot carry (GitHub issue
+/// #227).
 #[derive(Debug, Clone)]
 pub struct HookRecord {
     /// The parsed event - see [`crate::hooks::event::parse`].
     pub report: HookReport,
     /// When it arrived, for the freshness check in [`crate::rail::status::HookSignal`].
     pub received_at: Instant,
+    /// How many turns this agent has really completed - one per `Stop`
+    /// ([`HookFact::TurnEnded`]) it has reported.
+    ///
+    /// Accumulated here rather than derived from the stored report, because "latest wins" is the
+    /// whole design of [`HookInbox`] (see its docs) and a count is by definition not a latest.
+    /// It is the real number GitHub issue #227's transcript header prints (`21 turns`); nothing
+    /// estimates it from elapsed time or from output volume.
+    pub turns: u32,
+    /// The first prompt this agent's human typed, latched once and never overwritten - the run's
+    /// **title** (`crate::hooks::event::HookReport::prompt`).
+    ///
+    /// *First*, not latest, and that is the whole point: a run is named by the task it was
+    /// started for. Taking the latest would rename a run in the history list every time the user
+    /// typed a follow-up ("yes", "try again"), which describes a moment rather than the run.
+    pub first_prompt: Option<String>,
+}
+
+/// What an agent's hooks have said about its **run**, as opposed to about its current state
+/// (GitHub issue #227) - see [`HookRecord::turns`] and [`HookRecord::first_prompt`].
+///
+/// A named struct rather than a tuple because both halves end up persisted, side by side, in
+/// [`crate::hooks::store::PersistedAgentStatus`], and a `(u32, Option<String>)` at that call site
+/// would be two anonymous values in the wrong order waiting to happen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunFacts {
+    /// Completed turns - one per `Stop`.
+    pub turns: u32,
+    /// The run's title: the first prompt its human typed, if hooks caught one.
+    pub title: Option<String>,
 }
 
 /// Every agent's latest hook fact, shared between the listener thread and the UI thread.
@@ -196,6 +227,22 @@ impl HookInbox {
     /// the real agents - the ones actually emitting events - and sheds invented ids that never
     /// report again.
     pub fn record(&mut self, id: AgentId, report: HookReport) {
+        // GitHub issue #227's run-level accumulation, taken from the *incoming* payload before
+        // any nudge merging: a turn really ended if this payload said so, and the first prompt is
+        // whichever `UserPromptSubmit` arrived first. Both are carried forward from whatever this
+        // agent already had - unlike the report itself, neither is ever replaced by a later
+        // event, and neither is subject to the TTL below (a run's turn count does not become
+        // untrue because the agent went quiet for half an hour).
+        let previous_run_facts = self
+            .latest
+            .get(&id)
+            .map(|record| (record.turns, record.first_prompt.clone()));
+        let (previous_turns, previous_prompt) = previous_run_facts.unwrap_or((0, None));
+        let turns = previous_turns.saturating_add(u32::from(
+            report.kind == event::EventKind::Transition && report.fact == HookFact::TurnEnded,
+        ));
+        let first_prompt = previous_prompt.or_else(|| report.prompt.clone());
+
         // Only a *fresh* previous record is worth folding into: past the TTL the rail has already
         // stopped believing it (see `crate::rail::status::HookSignal::fresh`), so a nudge is then
         // the only real evidence there is and must stand on its own.
@@ -220,6 +267,8 @@ impl HookInbox {
             HookRecord {
                 report,
                 received_at: Instant::now(),
+                turns,
+                first_prompt,
             },
         );
     }
@@ -362,6 +411,12 @@ fn merge_nudge(previous: &HookReport, incoming: HookReport) -> HookReport {
         // appended to [`EditLog`] straight off the wire, before any merging - but a stored report
         // whose `edit` disagreed with the rest of it would be a trap for the next reader.
         edit: previous.edit.clone(),
+        // Same reasoning as `edit`: only a `UserPromptSubmit` ever carries a prompt, and a nudge
+        // is never one, so this restores what the kept fact already said rather than blanking it.
+        // The run title itself does not depend on this field surviving here either - see
+        // [`HookRecord::first_prompt`], which latches the first prompt once and never re-reads
+        // the stored report.
+        prompt: previous.prompt.clone(),
     }
 }
 
@@ -556,6 +611,26 @@ impl HookListener {
     pub fn session_id_for(&self, id: AgentId) -> Option<String> {
         let inbox = self.inbox.lock().ok()?;
         inbox.get(id)?.report.session_id.clone()
+    }
+
+    /// This agent's real run-level facts - its completed-turn count and the first prompt its human
+    /// typed (GitHub issue #227). `RunFacts::default()` for an agent that has never reported a
+    /// hook, or if the lock is poisoned.
+    ///
+    /// Ungated by [`event::HOOK_SIGNAL_TTL`] for exactly the reason [`Self::session_id_for`] is:
+    /// these describe the run, not the present. A run that completed nine turns completed nine
+    /// turns whether or not it has said anything in the last half hour.
+    pub fn run_facts_for(&self, id: AgentId) -> RunFacts {
+        let Ok(inbox) = self.inbox.lock() else {
+            return RunFacts::default();
+        };
+        match inbox.get(id) {
+            Some(record) => RunFacts {
+                turns: record.turns,
+                title: record.first_prompt.clone(),
+            },
+            None => RunFacts::default(),
+        }
     }
 }
 
@@ -1566,6 +1641,102 @@ mod tests {
         );
         assert_eq!(listener.signal_for(7).fact, Some(HookFact::Working));
         assert_eq!(listener.text_for(7).1, None);
+    }
+
+    /// GitHub issue #227's run-level facts, over a real socket: the title is the **first** prompt
+    /// the human typed (not the latest), and the turn count is one per real `Stop`.
+    #[test]
+    fn a_runs_title_and_turn_count_come_off_its_own_real_hook_stream() {
+        let listener = HookListener::start().expect("listener must start");
+        let port = listener.port();
+        let token = listener.token().to_owned();
+
+        assert_eq!(
+            listener.run_facts_for(11),
+            crate::hooks::server::RunFacts::default(),
+            "an agent that has reported nothing has no run facts at all"
+        );
+
+        post(
+            port,
+            &token,
+            "event=UserPromptSubmit&agent=11",
+            r#"{"session_id":"s-11","hook_event_name":"UserPromptSubmit","prompt":"Reproduce the refresh race in a test"}"#,
+        );
+        assert_eq!(
+            listener.run_facts_for(11).title.as_deref(),
+            Some("Reproduce the refresh race in a test")
+        );
+        assert_eq!(listener.run_facts_for(11).turns, 0);
+
+        post(
+            port,
+            &token,
+            "event=Stop&agent=11",
+            r#"{"session_id":"s-11","hook_event_name":"Stop"}"#,
+        );
+        post(
+            port,
+            &token,
+            "event=Stop&agent=11",
+            r#"{"session_id":"s-11","hook_event_name":"Stop"}"#,
+        );
+        assert_eq!(
+            listener.run_facts_for(11).turns,
+            2,
+            "each real Stop is one completed turn"
+        );
+
+        // A follow-up prompt renames nothing: a run is named by the task it was started for.
+        post(
+            port,
+            &token,
+            "event=UserPromptSubmit&agent=11",
+            r#"{"session_id":"s-11","hook_event_name":"UserPromptSubmit","prompt":"yes"}"#,
+        );
+        assert_eq!(
+            listener.run_facts_for(11).title.as_deref(),
+            Some("Reproduce the refresh race in a test"),
+            "the title is the first prompt, never the latest one"
+        );
+
+        // An idle nudge is not a turn boundary, however much it looks like the end of one.
+        post(
+            port,
+            &token,
+            "event=Notification&agent=11",
+            r#"{"session_id":"s-11","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}"#,
+        );
+        assert_eq!(listener.run_facts_for(11).turns, 2);
+    }
+
+    /// Forgetting an agent must drop its run facts too, for exactly the reason it drops its
+    /// status: a recycled id must not inherit a dead run's turn count or title.
+    #[test]
+    fn forgetting_an_agent_drops_its_run_facts_as_well_as_its_status() {
+        let listener = HookListener::start().expect("listener must start");
+        let port = listener.port();
+        let token = listener.token().to_owned();
+
+        post(
+            port,
+            &token,
+            "event=UserPromptSubmit&agent=12",
+            r#"{"session_id":"s-12","hook_event_name":"UserPromptSubmit","prompt":"Port the planner tests"}"#,
+        );
+        post(
+            port,
+            &token,
+            "event=Stop&agent=12",
+            r#"{"session_id":"s-12","hook_event_name":"Stop"}"#,
+        );
+        assert_eq!(listener.run_facts_for(12).turns, 1);
+
+        listener.forget(12);
+        assert_eq!(
+            listener.run_facts_for(12),
+            crate::hooks::server::RunFacts::default()
+        );
     }
 
     #[test]

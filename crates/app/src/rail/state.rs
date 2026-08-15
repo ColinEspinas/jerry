@@ -1425,6 +1425,10 @@ mod tests {
             question: None,
             updated_at_unix: 100,
             session_id: None,
+            title: None,
+            turns: 0,
+            ended_at_unix: None,
+            diffstat: None,
         };
 
         let rows = build_worktree_rows_with_history(&worktrees, &[], std::slice::from_ref(&past));

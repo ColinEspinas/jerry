@@ -2578,6 +2578,7 @@ mod prune_regression_tests {
 #[cfg(test)]
 mod rail_row_tests {
     use super::*;
+    use crate::hooks::store::LiveRun;
     use crate::rail::worktrees::WorktreeItem;
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
@@ -3103,13 +3104,9 @@ mod rail_row_tests {
             // own hook-status poll uses (`crate::hooks::flow::AdeApp::record_agent_statuses`).
             app.agent_status_state.set(
                 closed_key.clone(),
-                wt.path(),
-                "Claude",
-                1_700_000_000,
-                Status::Review,
-                Some("Edit: src/auth.rs".to_owned()),
-                None,
-                Some("session-closed".to_owned()),
+                LiveRun::new(wt.path(), "Claude", 1_700_000_000, Status::Review)
+                    .activity("Edit: src/auth.rs".to_owned())
+                    .session_id("session-closed".to_owned()),
                 1_700_000_500,
             );
             // A record for an agent that is *also* still open right now - the real case
@@ -3117,13 +3114,7 @@ mod rail_row_tests {
             // fresh hook fact, not just closed ones). It must not show up twice.
             app.agent_status_state.set(
                 live_key.clone(),
-                wt.path(),
-                "Claude",
-                live_spawned_at,
-                Status::Run,
-                None,
-                None,
-                None,
+                LiveRun::new(wt.path(), "Claude", live_spawned_at, Status::Run),
                 1_700_000_600,
             );
         });
@@ -3165,13 +3156,8 @@ mod rail_row_tests {
         app.update(cx, |app, _cx| {
             app.agent_status_state.set(
                 key.clone(),
-                wt.path(),
-                "Claude",
-                1,
-                Status::Idle,
-                None,
-                None,
-                Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+                LiveRun::new(wt.path(), "Claude", 1, Status::Idle)
+                    .session_id("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
                 2,
             );
         });
@@ -3231,13 +3217,7 @@ mod rail_row_tests {
         app.update(cx, |app, _cx| {
             app.agent_status_state.set(
                 key.clone(),
-                wt.path(),
-                "Codex",
-                1,
-                Status::Idle,
-                None,
-                None,
-                None,
+                LiveRun::new(wt.path(), "Codex", 1, Status::Idle),
                 2,
             );
         });

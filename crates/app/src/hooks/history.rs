@@ -42,6 +42,30 @@ pub struct PastAgent {
     /// --resume <session_id>` was verified to use it. `None` covers a Codex agent (no hooks exist
     /// for Codex at all) and a Claude agent that closed before any hook reported one.
     pub session_id: Option<String>,
+    /// The run's title - see [`crate::hooks::store::PersistedAgentStatus::title`].
+    pub title: Option<String>,
+    /// Completed turns - see [`crate::hooks::store::PersistedAgentStatus::turns`].
+    pub turns: u32,
+    /// When this run really ended, if Jerry watched it end - see
+    /// [`crate::hooks::store::PersistedAgentStatus::ended_at_unix`]. This is what separates a
+    /// `done`/`interrupted`/`failed` run from an `abandoned` one
+    /// (`crate::run_history::model::Outcome::of`).
+    pub ended_at_unix: Option<i64>,
+    /// What this run really changed, measured when it ended - see
+    /// [`crate::hooks::store::PersistedAgentStatus::files_changed`]. `None` when it could not be
+    /// measured; never a fabricated zero.
+    pub diffstat: Option<RunDiffstat>,
+}
+
+/// What a run really changed, measured against its own review baseline at the moment it ended.
+///
+/// One struct rather than three loose `Option<u32>`s on [`PastAgent`], because the three are one
+/// measurement: a header printing `6 files` beside `+0 −0` would be reporting half a fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunDiffstat {
+    pub files: u32,
+    pub insertions: u32,
+    pub deletions: u32,
 }
 
 impl PastAgent {
@@ -63,6 +87,21 @@ impl PastAgent {
             question: record.question.clone(),
             updated_at_unix: record.updated_at_unix,
             session_id: record.session_id.clone(),
+            title: record.title.clone(),
+            turns: record.turns,
+            ended_at_unix: record.ended_at_unix,
+            // All three or none - the persisted fields are written together (see
+            // `PersistedAgentStatus::files_changed`), and a half-present triple here would be a
+            // record hand-edited or written by a future release, which this treats as "not
+            // measured" rather than filling the gaps with zeros.
+            diffstat: match (record.files_changed, record.insertions, record.deletions) {
+                (Some(files), Some(insertions), Some(deletions)) => Some(RunDiffstat {
+                    files,
+                    insertions,
+                    deletions,
+                }),
+                _ => None,
+            },
         })
     }
 }
@@ -117,6 +156,7 @@ pub fn find(state: &AgentStatusState, key: &str) -> Option<PastAgent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::store::LiveRun;
 
     fn key_for(worktree: &str, spawned: i64) -> String {
         crate::review::state::baseline_key(Path::new(worktree), AgentKind::Claude, spawned)
@@ -134,13 +174,14 @@ mod tests {
         let mut state = AgentStatusState::default();
         state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            1_700_000_000,
-            Status::Review,
-            Some("Edit: src/auth.rs".to_owned()),
-            None,
-            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+            LiveRun::new(
+                Path::new("/repo/wt-a"),
+                "Claude",
+                1_700_000_000,
+                Status::Review,
+            )
+            .activity("Edit: src/auth.rs".to_owned())
+            .session_id("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
             1_700_000_500,
         );
         state
@@ -170,24 +211,12 @@ mod tests {
         let mut state = AgentStatusState::default();
         state.set(
             key_for("/repo/wt-old", 1),
-            Path::new("/repo/wt-old"),
-            "Claude",
-            1,
-            Status::Idle,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-old"), "Claude", 1, Status::Idle),
             100,
         );
         state.set(
             key_for("/repo/wt-new", 2),
-            Path::new("/repo/wt-new"),
-            "Codex",
-            2,
-            Status::Idle,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-new"), "Codex", 2, Status::Idle),
             999,
         );
         let agents = past_agents(&state);
@@ -213,6 +242,7 @@ mod tests {
                 question: None,
                 updated_at_unix: 1,
                 session_id: None,
+                ..PersistedAgentStatus::default()
             },
         );
         assert!(past_agents(&state).is_empty());
@@ -233,6 +263,7 @@ mod tests {
                 question: None,
                 updated_at_unix: 1,
                 session_id: None,
+                ..PersistedAgentStatus::default()
             },
         );
         assert!(past_agents(&state).is_empty());
@@ -251,13 +282,7 @@ mod tests {
         ] {
             state.set(
                 key,
-                Path::new(worktree),
-                "Claude",
-                spawned,
-                Status::Idle,
-                None,
-                None,
-                None,
+                LiveRun::new(Path::new(worktree), "Claude", spawned, Status::Idle),
                 spawned,
             );
         }
@@ -282,13 +307,8 @@ mod tests {
         let key = key_for("/repo/wt-a", 1);
         state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            1,
-            Status::Idle,
-            None,
-            None,
-            Some("session-abc".to_owned()),
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 1, Status::Idle)
+                .session_id("session-abc".to_owned()),
             10,
         );
         let found = find(&state, &key).expect("the record must be found");

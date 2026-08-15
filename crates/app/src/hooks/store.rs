@@ -87,6 +87,121 @@ pub struct PersistedAgentStatus {
     /// agent (no hooks exist for it at all) or a Claude agent whose hooks never fired before this
     /// field started being captured.
     pub session_id: Option<String>,
+    /// The run's **title** - the first prompt its human typed, off a real `UserPromptSubmit`
+    /// payload (GitHub issue #227, `crate::hooks::event::HookReport::prompt`).
+    ///
+    /// `None` for a run whose hooks never caught one, which History renders as the honest
+    /// fallback rather than inventing a task description - see
+    /// `crate::run_history::model::RunRecord::title_line`.
+    pub title: Option<String>,
+    /// How many turns this run really completed - one per `Stop`
+    /// (`crate::hooks::server::HookRecord::turns`). `0` for a run that ended inside its first
+    /// turn, and for every record written before this field existed; the reader treats zero as
+    /// "not known" rather than printing `0 turns`.
+    #[serde(default)]
+    pub turns: u32,
+    /// When this run really **ended**, as seconds since the Unix epoch - set once, by
+    /// `crate::run_history::flow::AdeApp::finish_run_record`, at the moment the agent's pane was
+    /// actually closed in this app.
+    ///
+    /// This is the field that distinguishes the two genuinely different endings a record can
+    /// have, and the whole reason `abandoned` is a real outcome rather than a guess: `Some` means
+    /// Jerry watched the run end and knows how it ended; `None` means the record simply stopped
+    /// being updated - the app quit, the machine slept, the hooks stopped firing - and nobody
+    /// ever saw it finish. See `crate::run_history::model::Outcome::of`.
+    pub ended_at_unix: Option<i64>,
+    /// The real review diffstat measured against this run's own baseline at the moment it ended
+    /// (`wt_core::review::diff_against_tree` through
+    /// `crate::run_history::flow::AdeApp::finish_run_record`) - what *this run* changed, not what
+    /// the worktree currently contains.
+    ///
+    /// All three are `Some` together or `None` together: they come from one measurement, and a
+    /// header printing a file count beside a blank diffstat would be reporting half of one fact.
+    /// `None` whenever that measurement could not be made - no baseline was captured, or the
+    /// `git diff` failed - which the transcript header renders by omitting the diffstat rather
+    /// than by printing zeros.
+    pub files_changed: Option<u32>,
+    pub insertions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+/// One live agent's currently-known state, as [`AgentStatusState::set`] takes it.
+///
+/// A struct rather than nine positional parameters (which is what this was, complete with an
+/// `#[allow(clippy::too_many_arguments)]`): GitHub issue #227 added two more fields to it, and at
+/// eleven positional arguments - four of them `Option<String>` - a caller swapping `activity` and
+/// `question`, or `title` and `session_id`, would compile silently and write the wrong thing to
+/// disk forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRun<'a> {
+    pub worktree: &'a Path,
+    /// `crate::work_surface::agents::AgentKind::label`.
+    pub kind: &'a str,
+    pub spawned_at_unix: i64,
+    pub status: Status,
+    pub activity: Option<String>,
+    pub question: Option<String>,
+    pub session_id: Option<String>,
+    /// See [`PersistedAgentStatus::title`].
+    pub title: Option<String>,
+    /// See [`PersistedAgentStatus::turns`].
+    pub turns: u32,
+}
+
+impl<'a> LiveRun<'a> {
+    /// A run described by only the four things every recordable agent always has: where it runs,
+    /// what it is, when it started, and what it is doing now. Everything else is optional
+    /// hook-derived detail, added through the builders below.
+    pub fn new(worktree: &'a Path, kind: &'a str, spawned_at_unix: i64, status: Status) -> Self {
+        LiveRun {
+            worktree,
+            kind,
+            spawned_at_unix,
+            status,
+            activity: None,
+            question: None,
+            session_id: None,
+            title: None,
+            turns: 0,
+        }
+    }
+
+    pub fn activity(mut self, activity: impl Into<String>) -> Self {
+        self.activity = Some(activity.into());
+        self
+    }
+
+    pub fn question(mut self, question: impl Into<String>) -> Self {
+        self.question = Some(question.into());
+        self
+    }
+
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub fn turns(mut self, turns: u32) -> Self {
+        self.turns = turns;
+        self
+    }
+}
+
+/// How a run really ended, as [`AgentStatusState::finish`] takes it (GitHub issue #227).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinishedRun {
+    /// The run's status at the moment it ended - what
+    /// `crate::run_history::model::Outcome::of` reads.
+    pub status: Option<Status>,
+    /// See [`PersistedAgentStatus::files_changed`]. All three are supplied together or not at all.
+    pub files_changed: Option<u32>,
+    pub insertions: Option<u32>,
+    pub deletions: Option<u32>,
 }
 
 impl PersistedAgentStatus {
@@ -211,32 +326,32 @@ impl AgentStatusState {
 
     /// Records one agent's real, current hook-derived state. Returns whether anything actually
     /// changed, so a caller can skip an otherwise pointless disk write on every render.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set(
-        &mut self,
-        key: String,
-        worktree: &Path,
-        kind: &str,
-        spawned_at_unix: i64,
-        status: Status,
-        activity: Option<String>,
-        question: Option<String>,
-        session_id: Option<String>,
-        now_unix: i64,
-    ) -> bool {
+    ///
+    /// The end-of-run half of the record ([`PersistedAgentStatus::ended_at_unix`] and the
+    /// diffstat) is deliberately carried over from whatever is already stored rather than reset:
+    /// this function only ever describes a *live* agent, and it must never be able to un-finish a
+    /// run that really finished.
+    pub fn set(&mut self, key: String, run: LiveRun<'_>, now_unix: i64) -> bool {
+        let existing = self.agents.get(&key);
         let record = PersistedAgentStatus {
-            worktree: crate::review::state::encode_worktree(worktree),
-            kind: kind.to_owned(),
-            spawned_at_unix,
-            status: status_key(status).to_owned(),
-            activity,
-            question,
+            worktree: crate::review::state::encode_worktree(run.worktree),
+            kind: run.kind.to_owned(),
+            spawned_at_unix: run.spawned_at_unix,
+            status: status_key(run.status).to_owned(),
+            activity: run.activity,
+            question: run.question,
             updated_at_unix: now_unix,
-            session_id,
+            session_id: run.session_id,
+            title: run.title,
+            turns: run.turns,
+            ended_at_unix: existing.and_then(|existing| existing.ended_at_unix),
+            files_changed: existing.and_then(|existing| existing.files_changed),
+            insertions: existing.and_then(|existing| existing.insertions),
+            deletions: existing.and_then(|existing| existing.deletions),
         };
         // Compare on everything except the timestamp: a status that hasn't changed must not
         // rewrite the file (and re-fsync) purely because time passed.
-        let unchanged = self.agents.get(&key).is_some_and(|existing| {
+        let unchanged = existing.is_some_and(|existing| {
             existing.worktree == record.worktree
                 && existing.kind == record.kind
                 && existing.spawned_at_unix == record.spawned_at_unix
@@ -244,12 +359,57 @@ impl AgentStatusState {
                 && existing.activity == record.activity
                 && existing.question == record.question
                 && existing.session_id == record.session_id
+                && existing.title == record.title
+                && existing.turns == record.turns
         });
         if unchanged {
             return false;
         }
         self.agents.insert(key, record);
         true
+    }
+
+    /// Marks an already-recorded run as really **ended**, at `ended_at_unix`, with whatever was
+    /// measured about it at that moment (GitHub issue #227). Returns whether anything changed.
+    ///
+    /// A no-op returning `false` for a key this state has never recorded, and that is the
+    /// contract, not a shortcut: [`crate::hooks::flow::AdeApp::record_agent_statuses`] only ever
+    /// records agents that produced a real hook fact (see its own docs on why a status inferred
+    /// from pty silence is not worth persisting), so an agent with no record here is one Jerry
+    /// never knew anything real about. Inventing an entry for it at close time would put a run in
+    /// History whose every field was a guess.
+    pub fn finish(&mut self, key: &str, ended_at_unix: i64, run: FinishedRun) -> bool {
+        let Some(record) = self.agents.get_mut(key) else {
+            return false;
+        };
+        let mut changed = false;
+        if record.ended_at_unix != Some(ended_at_unix) {
+            record.ended_at_unix = Some(ended_at_unix);
+            record.updated_at_unix = ended_at_unix;
+            changed = true;
+        }
+        if let Some(status) = run.status {
+            let status = status_key(status).to_owned();
+            if record.status != status {
+                record.status = status;
+                changed = true;
+            }
+        }
+        // The three diffstat fields move together or not at all - see
+        // [`PersistedAgentStatus::files_changed`]. A `FinishedRun` carrying no measurement leaves
+        // whatever was already there alone rather than blanking it.
+        if run.files_changed.is_some() {
+            if record.files_changed != run.files_changed
+                || record.insertions != run.insertions
+                || record.deletions != run.deletions
+            {
+                changed = true;
+            }
+            record.files_changed = run.files_changed;
+            record.insertions = run.insertions;
+            record.deletions = run.deletions;
+        }
+        changed
     }
 
     /// One recorded agent, if present and readable.
@@ -312,13 +472,14 @@ mod tests {
         let key = key_for("/repo/wt-a", 1_700_000_000);
         assert!(state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            1_700_000_000,
-            Status::Review,
-            Some("Edit: src/auth.rs".to_owned()),
-            None,
-            Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+            LiveRun::new(
+                Path::new("/repo/wt-a"),
+                "Claude",
+                1_700_000_000,
+                Status::Review
+            )
+            .activity("Edit: src/auth.rs".to_owned())
+            .session_id("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
             1_700_000_500,
         ));
 
@@ -346,27 +507,16 @@ mod tests {
         // `set` is called from a render-frequency path; without this it would fsync constantly.
         let mut state = AgentStatusState::default();
         let key = key_for("/repo/wt-a", 10);
-        let args = |now| {
-            (
-                key.clone(),
-                Path::new("/repo/wt-a"),
-                "Claude",
-                10i64,
-                Status::Run,
-                Some("Bash: cargo test".to_owned()),
-                None,
-                None,
-                now,
-            )
+        let run = || {
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 10, Status::Run)
+                .activity("Bash: cargo test")
         };
-        let (k, w, kind, spawned, status, activity, question, session_id, now) = args(100);
         assert!(
-            state.set(k, w, kind, spawned, status, activity, question, session_id, now),
+            state.set(key.clone(), run(), 100),
             "the first record is a real change"
         );
-        let (k, w, kind, spawned, status, activity, question, session_id, now) = args(999);
         assert!(
-            !state.set(k, w, kind, spawned, status, activity, question, session_id, now),
+            !state.set(key.clone(), run(), 999),
             "only the timestamp differs - this must not count as a change"
         );
 
@@ -374,13 +524,8 @@ mod tests {
         let key2 = key.clone();
         assert!(state.set(
             key2,
-            Path::new("/repo/wt-a"),
-            "Claude",
-            10,
-            Status::Review,
-            Some("Bash: cargo test".to_owned()),
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 10, Status::Review)
+                .activity("Bash: cargo test".to_owned()),
             1000,
         ));
     }
@@ -394,25 +539,14 @@ mod tests {
         let key = key_for("/repo/wt-a", 20);
         assert!(state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            20,
-            Status::Run,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 20, Status::Run),
             100,
         ));
         assert!(
             state.set(
                 key.clone(),
-                Path::new("/repo/wt-a"),
-                "Claude",
-                20,
-                Status::Run,
-                None,
-                None,
-                Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+                LiveRun::new(Path::new("/repo/wt-a"), "Claude", 20, Status::Run)
+                    .session_id("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
                 101,
             ),
             "a real session id appearing where there was none must count as a change"
@@ -433,13 +567,7 @@ mod tests {
         let mut other = AgentStatusState::default();
         other.set(
             other_key.clone(),
-            Path::new("/repo/other"),
-            "Claude",
-            1,
-            Status::Run,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/other"), "Claude", 1, Status::Run),
             5,
         );
         other
@@ -450,13 +578,8 @@ mod tests {
         let mut mine = AgentStatusState::default();
         mine.set(
             mine_key.clone(),
-            Path::new("/repo/mine"),
-            "Claude",
-            2,
-            Status::Ask,
-            None,
-            Some("Bash needs permission: rm -rf /".to_owned()),
-            None,
+            LiveRun::new(Path::new("/repo/mine"), "Claude", 2, Status::Ask)
+                .question("Bash needs permission: rm -rf /".to_owned()),
             6,
         );
         mine.save_merged_at(&path, &std::iter::once(mine_key.clone()).collect())
@@ -481,13 +604,7 @@ mod tests {
         let mut state = AgentStatusState::default();
         state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            3,
-            Status::Review,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 3, Status::Review),
             7,
         );
         let owned: BTreeSet<String> = std::iter::once(key.clone()).collect();
@@ -503,6 +620,151 @@ mod tests {
         );
     }
 
+    /// GitHub issue #227: the end-of-run half of a record survives a real file round trip, and
+    /// carries exactly what was measured - no fabricated zeros for what was not.
+    #[test]
+    fn a_finished_run_really_round_trips_with_its_ending_and_its_diffstat() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(AGENT_STATUS_FILE_NAME);
+        let key = key_for("/repo/wt-a", 1_700_000_000);
+
+        let mut state = AgentStatusState::default();
+        state.set(
+            key.clone(),
+            LiveRun::new(
+                Path::new("/repo/wt-a"),
+                "Claude",
+                1_700_000_000,
+                Status::Run,
+            )
+            .title("Reproduce the refresh race in a test")
+            .turns(9),
+            1_700_000_400,
+        );
+        assert!(
+            state.finish(
+                &key,
+                1_700_000_960,
+                FinishedRun {
+                    status: Some(Status::Review),
+                    files_changed: Some(2),
+                    insertions: Some(41),
+                    deletions: Some(0),
+                },
+            ),
+            "recording a real ending is a real change"
+        );
+
+        state
+            .save_merged_at(&path, &std::iter::once(key.clone()).collect())
+            .expect("must save");
+        let record = AgentStatusState::load_at(&path)
+            .get(&key)
+            .cloned()
+            .expect("the record must survive");
+
+        assert_eq!(
+            record.title.as_deref(),
+            Some("Reproduce the refresh race in a test")
+        );
+        assert_eq!(record.turns, 9);
+        assert_eq!(record.ended_at_unix, Some(1_700_000_960));
+        assert_eq!(
+            record.updated_at_unix, 1_700_000_960,
+            "the record's last-updated moment is when it ended"
+        );
+        assert_eq!(
+            status_from_key(&record.status),
+            Some(Status::Review),
+            "the ending status replaces the last live one"
+        );
+        assert_eq!(record.files_changed, Some(2));
+        assert_eq!(record.insertions, Some(41));
+        assert_eq!(record.deletions, Some(0));
+    }
+
+    /// The contract that keeps History honest: an agent Jerry never learned anything real about
+    /// gets no record at close time either - `finish` refuses to invent one.
+    #[test]
+    fn finishing_a_run_that_was_never_recorded_invents_nothing() {
+        let mut state = AgentStatusState::default();
+        assert!(!state.finish(
+            &key_for("/repo/wt-a", 1),
+            1_700_000_000,
+            FinishedRun {
+                status: Some(Status::Idle),
+                ..FinishedRun::default()
+            },
+        ));
+        assert!(
+            state.agents.is_empty(),
+            "no entry may be conjured for an agent that reported nothing"
+        );
+    }
+
+    /// A later live poll must never be able to un-finish a run that really finished, nor lose the
+    /// measurement taken when it did.
+    #[test]
+    fn a_later_live_record_cannot_erase_a_runs_real_ending() {
+        let mut state = AgentStatusState::default();
+        let key = key_for("/repo/wt-a", 1);
+        state.set(
+            key.clone(),
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 1, Status::Run),
+            100,
+        );
+        state.finish(
+            &key,
+            200,
+            FinishedRun {
+                status: Some(Status::Review),
+                files_changed: Some(3),
+                insertions: Some(10),
+                deletions: Some(4),
+            },
+        );
+
+        state.set(
+            key.clone(),
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 1, Status::Run).activity("Bash: ls"),
+            300,
+        );
+
+        let record = state.get(&key).expect("the record must still exist");
+        assert_eq!(record.ended_at_unix, Some(200));
+        assert_eq!(record.files_changed, Some(3));
+        assert_eq!(record.insertions, Some(10));
+        assert_eq!(record.deletions, Some(4));
+    }
+
+    /// A file written before GitHub issue #227 added these fields must still load, with the new
+    /// fields reading as "not known" rather than as zeros that would render as real facts.
+    #[test]
+    fn a_file_written_before_the_run_fields_existed_still_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(AGENT_STATUS_FILE_NAME);
+        let key = key_for("/repo/wt-a", 1_700_000_000);
+        let legacy = format!(
+            "[agents.\"{}\"]\n\
+             worktree = \"utf8:/repo/wt-a\"\n\
+             kind = \"Claude\"\n\
+             spawned_at_unix = 1700000000\n\
+             status = \"idle\"\n\
+             updated_at_unix = 1700000500\n",
+            key.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        std::fs::write(&path, legacy).expect("write the legacy file");
+
+        let record = AgentStatusState::load_at(&path)
+            .get(&key)
+            .cloned()
+            .expect("a pre-#227 record must still load");
+        assert_eq!(record.title, None);
+        assert_eq!(record.turns, 0);
+        assert_eq!(record.ended_at_unix, None);
+        assert_eq!(record.files_changed, None);
+    }
+
     #[test]
     fn the_record_is_capped_keeping_the_most_recent_agents() {
         // This file never deletes a key on its own (it is history), which without a cap means it
@@ -512,13 +774,12 @@ mod tests {
             let key = key_for(&format!("/repo/wt-{index}"), index);
             state.set(
                 key,
-                Path::new(&format!("/repo/wt-{index}")),
-                "Claude",
-                index,
-                Status::Idle,
-                None,
-                None,
-                None,
+                LiveRun::new(
+                    Path::new(&format!("/repo/wt-{index}")),
+                    "Claude",
+                    index,
+                    Status::Idle,
+                ),
                 index, // updated_at_unix ascending, so higher index == more recent
             );
         }
@@ -547,13 +808,7 @@ mod tests {
         let key = key_for("/repo/wt-a", 1);
         state.set(
             key.clone(),
-            Path::new("/repo/wt-a"),
-            "Claude",
-            1,
-            Status::Run,
-            None,
-            None,
-            None,
+            LiveRun::new(Path::new("/repo/wt-a"), "Claude", 1, Status::Run),
             10,
         );
         let before = state.clone();

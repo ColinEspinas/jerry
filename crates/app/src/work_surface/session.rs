@@ -353,6 +353,7 @@ impl AdeApp {
 #[cfg(test)]
 mod session_restore_tests {
     use super::*;
+    use crate::hooks::store::LiveRun;
     use crate::rail::status::Status;
     use crate::settings::store as settings_store;
     use gpui::TestAppContext;
@@ -732,13 +733,8 @@ mod session_restore_tests {
                     crate::review::state::baseline_key(&cwd, AgentKind::Claude, spawned_at_unix);
                 app.agent_status_state.set(
                     key,
-                    &cwd,
-                    "Claude",
-                    spawned_at_unix,
-                    Status::Idle,
-                    None,
-                    None,
-                    Some(session_id.to_owned()),
+                    LiveRun::new(&cwd, "Claude", spawned_at_unix, Status::Idle)
+                        .session_id(session_id.to_owned()),
                     spawned_at_unix,
                 );
                 app.record_worktree_session(cx);
