@@ -25,7 +25,8 @@ const METER_HEIGHT: f32 = 3.0;
 
 impl AdeApp {
     /// §4t's per-agent provider budget, right-aligned in the pane's readout strip:
-    /// `claude 5h ▓▓▓▓▓▓░ 81% 7d ▓▓▓▓░░░ 40%`, for **this** agent's provider.
+    /// `claude 5h ▓░░░░░░ 19% 7d ▓▓▓▓░░░ 60%`, for **this** agent's provider - each meter filling
+    /// with what has been *spent* (`super::state`'s "Used, not left").
     ///
     /// `None` - nothing at all, not a dimmed placeholder - for a pane that spends no provider.
     /// §4t words that as "a local model shows nothing, correctly"; in this build the pane that
@@ -44,7 +45,9 @@ impl AdeApp {
     /// # Window label before the value
     ///
     /// §4c, verbatim: "`92% 5h` parsed as '92% for 5 hours'; `5h 92%` parses as '5-hour window,
-    /// 92% left'". Every string and every element order here puts the label first.
+    /// 92% left'". Every string and every element order here puts the label first - an argument
+    /// about which half of the pair leads, which the flip from `% left` to `% used`
+    /// (`super::state`'s "Used, not left") leaves exactly as it was.
     ///
     /// # Why a not-connected provider still renders a (bare) cluster
     ///
@@ -81,7 +84,7 @@ impl AdeApp {
             })
             .tooltip(text_tooltip(match budget.readout(now) {
                 ProviderReadout::Numbers(_) => format!(
-                    "How much of {}'s rate limit is left - click for every window and provider",
+                    "How much of {}'s rate limit is used - click for every window and provider",
                     provider.label()
                 ),
                 _ => format!("{}'s rate limit - click for details", provider.label()),
@@ -311,7 +314,7 @@ impl AdeApp {
     /// the two together in one sentence ("`Updated 3m ago` and a `Refresh` that sets `Updated just
     /// now`"), but `Jerry.dc.html` - the newest state of the bundle, and the build §4u′ describes -
     /// puts `Refresh` at the head opposite the title and leaves the foot to `Updated N ago` and the
-    /// `counts headroom, not spend` footnote. That is also the better reading of the same sentence:
+    /// `counts spend, not headroom` footnote. That is also the better reading of the same sentence:
     /// it fixes what `Refresh` *does* to the foot line, not where it is drawn. The mock wins on
     /// placement; the prose's actual claim - that the foot line is derived from a real read - is
     /// what [`Self::render_budget_popover_footer`] implements.
@@ -411,7 +414,7 @@ impl AdeApp {
         section.into_any_element()
     }
 
-    /// One window inside the lead block: `5h · 92% left · resets in 4h 53m`, over its own meter.
+    /// One window inside the lead block: `5h · 8% used · resets in 4h 53m`, over its own meter.
     ///
     /// The window label leads here too (§4c), and it is a real duration token (`5h`/`7d`) rather
     /// than a word, so the two rows read as a series.
@@ -526,6 +529,17 @@ impl AdeApp {
             )
     }
 
+    /// One provider's row. The `refresh failed` / `last read <age>` text carries the **real
+    /// reason** the last attempt failed as its tooltip.
+    ///
+    /// `refresh failed` on its own says only that something went wrong; the difference between
+    /// "the provider answered 401" (the CLI's stored token has expired - re-authenticate *there*,
+    /// Jerry does not log anyone in) and "the provider answered 429" (the endpoint's own limiter -
+    /// wait, do not keep clicking `Retry`) is the whole of what a reader can act on, and it was
+    /// already being carried all the way here in [`super::state::ProviderBudget::last_error`] only
+    /// to be dropped one line short of the screen. It hangs off the state text rather than the
+    /// whole row so it points at the thing it explains, and it sits beside the `Retry` the same
+    /// failure earns.
     fn render_budget_other_row(
         &self,
         provider: Provider,
@@ -534,6 +548,15 @@ impl AdeApp {
     ) -> impl IntoElement {
         let budget = self.budget.get(provider);
         let readout = budget.readout(now);
+        // Only for a state the failure actually explains: a provider showing real, fresh numbers
+        // may still hold a `last_error` from a newer attempt that failed, and hanging "the
+        // provider answered 429" off numbers that are correct would read as though they were not.
+        let failure_reason = match &readout {
+            ProviderReadout::RefreshFailed | ProviderReadout::LastRead(_) => {
+                budget.last_error.clone()
+            }
+            _ => None,
+        };
         let (state_text, state_color) = match &readout {
             ProviderReadout::Numbers(snapshot) => (
                 snapshot.summary_label(),
@@ -571,11 +594,19 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .id(match provider {
+                        Provider::Claude => "budget-popover-state-claude",
+                        Provider::Codex => "budget-popover-state-codex",
+                    })
+                    .debug_selector(move || format!("budget-popover-state-{}", provider.id()))
                     .flex_none()
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(state_color)
-                    .child(state_text),
+                    .child(state_text)
+                    .when_some(failure_reason, |el, reason| {
+                        el.tooltip(text_tooltip(reason))
+                    }),
             )
             .when(can_retry, |el| {
                 el.child(
@@ -610,7 +641,9 @@ impl AdeApp {
         }
     }
 
-    /// §4c's foot: `Updated 3m ago` and the footnote `counts headroom, not spend`.
+    /// §4c's foot: `Updated 3m ago` and the footnote `counts spend, not headroom` - the design
+    /// bundle's own `counts headroom, not spend`, inverted along with the numbers it describes
+    /// (`super::state`'s "Used, not left").
     ///
     /// The age comes from the real instant a real result last landed
     /// ([`super::state::BudgetState::last_read_at`]), through the *same* formatter the Resources
@@ -640,7 +673,7 @@ impl AdeApp {
                     .font(font(theme::font::SANS))
                     .text_size(self.ui_text_size(10.0))
                     .text_color(theme::text::HINT)
-                    .child("counts headroom, not spend"),
+                    .child("counts spend, not headroom"),
             )
     }
 }

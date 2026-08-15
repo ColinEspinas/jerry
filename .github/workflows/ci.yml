@@ -7,6 +7,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # GitHub issue #294's provider rate-limit poll reads an OAuth credential off disk and sends it
+  # to a real provider usage endpoint. `crate::budget::state::POLLING_ENABLED` already turns that
+  # off for `cargo test -p app --lib` (where `cfg(test)` is true of the `app` crate itself), but a
+  # `cfg` does not survive a crate boundary: an integration test under `crates/app/tests/` would
+  # link `app` as an ordinary dependency with the gate re-armed. Set here, for every job, so that
+  # holds for whatever this workflow grows to run - see
+  # `crate::budget::state::DISABLE_PROVIDER_POLL_ENV`.
+  JERRY_DISABLE_PROVIDER_POLL: "1"
 
 jobs:
   # Build-only signal on Linux, matching macOS/Windows below - deliberately narrowed

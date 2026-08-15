@@ -36,13 +36,24 @@
 //! which is the honest statement: we have nothing, and nothing is broken.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use super::state::{window_label, BudgetWindow, Provider, ProviderSnapshot};
 
 /// How long a single usage request may take before it is a failure. Short on purpose - this is a
 /// background readout, and the Claude CLI's own call to the same endpoint uses a 5s timeout.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The single-flight guard's own age-out ([`super::state::IN_FLIGHT_STALE_AFTER`]) is only
+/// meaningful if it is comfortably longer than a request that is merely slow - otherwise a poll
+/// that is still legitimately running would be declared stale and raced by a second one. Asserted
+/// at compile time rather than left as a comment, because the two constants live in different
+/// modules and nothing else would notice one of them moving.
+const _: () = assert!(
+    super::state::IN_FLIGHT_STALE_AFTER.as_secs() >= REQUEST_TIMEOUT.as_secs() * 3,
+    "the in-flight age-out must be several request timeouts long, or a slow poll gets raced"
+);
 
 /// The result of one real attempt to read one provider.
 ///
@@ -53,7 +64,9 @@ pub enum ProviderRead {
     /// No credential for this provider on this machine - nothing was sent anywhere.
     NotConnected,
     Ok(ProviderSnapshot),
-    /// The reason, for the popover's tooltip and the log. Never rendered as a number.
+    /// The reason, for the popover's own tooltip
+    /// (`crate::budget::render::AdeApp::render_budget_other_row` hangs it off the failing row's
+    /// state text) and the log. Never rendered as a number.
     Failed(String),
 }
 
@@ -210,12 +223,81 @@ pub fn read_provider(provider: Provider) -> ProviderRead {
     }
 }
 
+/// The message a panicked read reports. Deliberately fixed text rather than the panic payload:
+/// this whole module runs with a live OAuth bearer token in scope, and a payload is arbitrary
+/// text formatted by whatever code panicked - the same reasoning that made [`Credential`]'s
+/// `Debug` redacting applies to a string that is about to be written into a log line and a
+/// tooltip. The real panic (message, location and backtrace) still reaches stderr through the
+/// process's own panic hook, which is where a developer looks for it anyway.
+pub const PANICKED_READ_REASON: &str = "the read failed unexpectedly";
+
+/// Runs one provider read so that a panic inside it becomes a reported failure instead of a
+/// silently wedged poll.
+///
+/// # Why this exists at all
+///
+/// [`super::state::ProviderBudget::in_flight`] is set before the read starts and cleared when its
+/// result lands. A panic on the way - and everything this parses is a *remote* server's
+/// choice of bytes - would leave that guard set with nothing to clear it, and
+/// [`super::state::ProviderBudget::may_poll_now`] then refuses the background loop **and** every
+/// `Refresh`/`Retry` click for the rest of the process's life: the popover sticks on `checking…`
+/// with dead buttons and no error to show. That is a strictly worse outcome than the panic
+/// itself, and it is not hypothetical - a hostile `reset_after_seconds` really did panic
+/// [`codex_reset_instant`] before that function learned to check its arithmetic.
+///
+/// Catching the unwind here, on the background thread that runs the read, is deliberate rather
+/// than relying on a `Drop` guard: this closure is handed to `cx.background_executor()`, and a
+/// future that panics inside an executor does not necessarily unwind back through the awaiting
+/// task at all - the awaited result may simply never arrive. A value that is *returned* always
+/// arrives.
+///
+/// Nothing captured here is state a panic could leave half-written: [`Provider`] is a `Copy` tag
+/// and the read owns everything else it touches, so the unwind-safety this asserts nothing about
+/// is genuinely trivial rather than papered over.
+pub fn read_provider_catching_panics(provider: Provider) -> ProviderRead {
+    catching_panics(move || read_provider(provider))
+}
+
+/// The pure half of [`read_provider_catching_panics`], so the "a panic becomes a failure" rule is
+/// testable without a provider, a credential or a network.
+pub fn catching_panics(
+    read: impl FnOnce() -> ProviderRead + std::panic::UnwindSafe,
+) -> ProviderRead {
+    std::panic::catch_unwind(read)
+        .unwrap_or_else(|_| ProviderRead::Failed(PANICKED_READ_REASON.to_string()))
+}
+
+/// The one HTTP client this module uses, built once for the life of the process.
+///
+/// Built once rather than per request because a fresh `reqwest::blocking::Client` builds a whole
+/// new connection pool and TLS configuration each time, and this module makes the same two
+/// requests against the same two hosts forever.
+///
+/// # Redirects are refused outright
+///
+/// `reqwest` strips `Authorization` when a redirect crosses to another host, but it has no way to
+/// know that Codex's `ChatGPT-Account-Id` is equally sensitive - a custom header follows the
+/// redirect verbatim. A *usage* endpoint has no legitimate reason to redirect anywhere, so the
+/// policy is `none`: a 3xx becomes an ordinary non-2xx failure with its status in the reason,
+/// which is both the honest report and the one that cannot leak a header to a host we never
+/// chose to talk to.
+fn usage_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|err| format!("could not build an HTTP client: {err}"))
+        })
+        .as_ref()
+        .map_err(|err| err.clone())
+}
+
 /// The real HTTP call, with each provider's own required headers.
 fn http_get_usage(provider: Provider, credential: &Credential) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|err| format!("could not build an HTTP client: {err}"))?;
+    let client = usage_client()?;
 
     let mut request = client
         .get(usage_url(provider))
@@ -251,7 +333,8 @@ fn http_get_usage(provider: Provider, credential: &Credential) -> Result<String,
         .map_err(|err| format!("the response could not be read: {err}"))
 }
 
-/// Parses one provider's usage payload into windows of *headroom*.
+/// Parses one provider's usage payload into windows of *usage* - the figure each API already
+/// reports, carried through unconverted (`crate::budget::state`'s "Used, not left").
 pub fn parse_usage(provider: Provider, body: &str) -> Result<ProviderSnapshot, String> {
     match provider {
         Provider::Claude => parse_claude_usage(body),
@@ -259,11 +342,15 @@ pub fn parse_usage(provider: Provider, body: &str) -> Result<ProviderSnapshot, S
     }
 }
 
-/// Percent used -> percent left, clamped to the real 0-100 range an over-quota account can
-/// otherwise leave (a `utilization` above 100 is possible and would otherwise render as a
-/// negative meter).
-fn headroom_from_utilization(utilization: f64) -> f32 {
-    (100.0 - utilization).clamp(0.0, 100.0) as f32
+/// A provider's own "percent used" figure, clamped to the real 0-100 range an over-quota account
+/// can otherwise leave (a `utilization` above 100 is possible, and would otherwise render as a
+/// meter overflowing its own track).
+///
+/// Clamped but **not** converted: the number every surface prints is the one the API sent - see
+/// `crate::budget::state`'s own docs for why this build shows `% used` rather than the design
+/// bundle's `% left`.
+fn used_percent_from(utilization: f64) -> f32 {
+    utilization.clamp(0.0, 100.0) as f32
 }
 
 /// Anthropic's `GET /api/oauth/usage`.
@@ -293,7 +380,7 @@ pub fn parse_claude_usage(body: &str) -> Result<ProviderSnapshot, String> {
         };
         windows.push(BudgetWindow {
             label: label.to_string(),
-            headroom_percent: headroom_from_utilization(utilization),
+            used_percent: used_percent_from(utilization),
             resets_at: entry
                 .get("resets_at")
                 .and_then(|value| value.as_str())
@@ -344,7 +431,7 @@ pub fn parse_codex_usage(body: &str) -> Result<ProviderSnapshot, String> {
             .unwrap_or(0);
         windows.push(BudgetWindow {
             label: window_label(seconds),
-            headroom_percent: headroom_from_utilization(used),
+            used_percent: used_percent_from(used),
             resets_at: codex_reset_instant(entry),
         });
     }
@@ -359,21 +446,49 @@ pub fn parse_codex_usage(body: &str) -> Result<ProviderSnapshot, String> {
 /// wins when it is genuinely an epoch timestamp; otherwise the relative one is added to the
 /// current clock, so a payload that only carries the relative form still produces a real
 /// countdown instead of none.
+///
+/// # Both numbers are a remote server's choice, and are treated as one
+///
+/// Every value here arrives from the network, so neither is trusted to be sane before it is used
+/// in arithmetic:
+///
+/// - **Range first.** A reset instant outside [`PLAUSIBLE_EPOCH_FLOOR`]..=[`PLAUSIBLE_EPOCH_CEILING`],
+///   or a countdown longer than [`MAX_RESET_AFTER_SECONDS`], is not a rate-limit window - it is a
+///   malformed field, and it is dropped for the same reason a `used_percent` that is not a number
+///   is dropped. Without this a technically-addable value (say 10<sup>12</sup> seconds) would
+///   render a perfectly confident `resets in 11574074d 0h`.
+/// - **Then checked arithmetic.** `SystemTime + Duration` *panics* on overflow, and near
+///   `i64::MAX` both of these additions really do overflow - a provider (or anything able to
+///   answer as one) could otherwise crash the poll with a single JSON number. Reproduced before
+///   this guard existed; see this module's `a_hostile_reset_field_cannot_panic_the_poll` test.
+///
+/// Either rejection lands as `None`, which is the same "the provider did not send a usable reset
+/// instant" the parser already reports for a missing field, and which the render side draws as no
+/// countdown at all rather than as a fabricated one. The window's *headroom* - the number the
+/// reader actually came for - is unaffected either way.
 fn codex_reset_instant(entry: &serde_json::Value) -> Option<SystemTime> {
-    // Anything below this is not a plausible epoch second (it would be 2001), so it is a
-    // relative value in a field named as though it were absolute.
+    /// Anything below this is not a plausible epoch second (it would be 2001), so it is a
+    /// relative value in a field named as though it were absolute.
     const PLAUSIBLE_EPOCH_FLOOR: i64 = 1_000_000_000;
+    /// And anything above it is not one either: 2100-01-01, well past the lifetime of any rate
+    /// limit window, and far enough below `i64::MAX` that the addition below cannot overflow.
+    const PLAUSIBLE_EPOCH_CEILING: i64 = 4_102_444_800;
+    /// Roughly 400 days - longer than any rate-limit window either provider documents (the
+    /// longest is a week) by a wide enough margin to be a sanity ceiling rather than a policy.
+    const MAX_RESET_AFTER_SECONDS: i64 = 60 * 60 * 24 * 400;
 
-    if let Some(reset_at) = entry.get("reset_at").and_then(|v| v.as_i64()) {
-        if reset_at >= PLAUSIBLE_EPOCH_FLOOR {
-            return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(reset_at as u64));
-        }
+    let absolute = entry
+        .get("reset_at")
+        .and_then(|value| value.as_i64())
+        .filter(|at| (PLAUSIBLE_EPOCH_FLOOR..=PLAUSIBLE_EPOCH_CEILING).contains(at));
+    if let Some(reset_at) = absolute {
+        return SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(reset_at as u64));
     }
     let after = entry
         .get("reset_after_seconds")
-        .and_then(|v| v.as_i64())
-        .filter(|seconds| *seconds >= 0)?;
-    Some(SystemTime::now() + Duration::from_secs(after as u64))
+        .and_then(|value| value.as_i64())
+        .filter(|seconds| (0..=MAX_RESET_AFTER_SECONDS).contains(seconds))?;
+    SystemTime::now().checked_add(Duration::from_secs(after as u64))
 }
 
 /// The narrow slice of RFC 3339 the Anthropic payload actually uses:
@@ -429,7 +544,12 @@ pub fn parse_rfc3339(raw: &str) -> Option<SystemTime> {
     if epoch_seconds < 0 {
         return None;
     }
-    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(epoch_seconds as u64))
+    // `checked_add` for the same reason `codex_reset_instant` uses it: a plain `+` on a
+    // `SystemTime` panics on overflow, and every digit that reaches this line came off the
+    // network. A four-digit year cannot reach that far today, which is exactly why this is
+    // written as arithmetic that cannot panic if the shape of the input ever changes rather
+    // than as a comment asserting that it will not.
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(epoch_seconds as u64))
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date - Howard Hinnant's `days_from_civil`, the
@@ -483,10 +603,11 @@ mod budget_fetch_tests {
       }
     }"#;
 
-    /// The one direction rule the whole feature rests on: the API reports *used*, every value in
-    /// Jerry is *left*. `19% used` must become `81% left`, never `19%`.
+    /// The one direction rule the whole feature rests on: the API reports *used*, and so does
+    /// every value in Jerry. `19% used` stays `19%`, and is never quietly flipped to the `81%
+    /// left` this build shipped first.
     #[test]
-    fn the_claude_payload_parses_into_two_windows_of_headroom_not_spend() {
+    fn the_claude_payload_parses_into_two_windows_of_usage_not_headroom() {
         let snapshot = parse_claude_usage(CLAUDE_LIVE_PAYLOAD).expect("a real payload parses");
         assert_eq!(
             snapshot.windows.len(),
@@ -495,11 +616,16 @@ mod budget_fetch_tests {
         );
         assert_eq!(snapshot.windows[0].label, "5h");
         assert_eq!(
-            snapshot.windows[0].headroom_percent, 81.0,
-            "19% used is 81% left - the popover's footnote promises headroom, not spend"
+            snapshot.windows[0].used_percent, 19.0,
+            "the payload's own `utilization: 19.0`, carried through rather than converted"
+        );
+        assert_eq!(
+            snapshot.windows[0].headroom_percent(),
+            81.0,
+            "and its complement is still derivable, because that is what the hue keys off"
         );
         assert_eq!(snapshot.windows[1].label, "7d");
-        assert_eq!(snapshot.windows[1].headroom_percent, 40.0);
+        assert_eq!(snapshot.windows[1].used_percent, 60.0);
         assert_eq!(
             snapshot.tightest().map(|w| w.label.clone()),
             Some("7d".to_string()),
@@ -548,13 +674,17 @@ mod budget_fetch_tests {
             snapshot.windows[0].label, "5h",
             "the label comes from `limit_window_seconds`, not from an assumption"
         );
-        assert_eq!(snapshot.windows[0].headroom_percent, 99.0);
+        assert_eq!(
+            snapshot.windows[0].used_percent, 1.0,
+            "the payload's own `used_percent: 1`, printed as the 1% it is"
+        );
         assert_eq!(snapshot.windows[1].label, "7d");
-        assert_eq!(snapshot.windows[1].headroom_percent, 88.0);
+        assert_eq!(snapshot.windows[1].used_percent, 12.0);
         assert_eq!(
             snapshot.summary_label(),
-            "5h 99%  \u{b7}  7d 88%",
-            "window label before the value, on this provider too"
+            "5h 1%  \u{b7}  7d 12%",
+            "window label before the value, on this provider too - and the value is what has been \
+             spent, not what is left"
         );
     }
 
@@ -576,6 +706,130 @@ mod budget_fetch_tests {
             snapshot.windows[0].resets_at.is_some(),
             "a `reset_at` of 0 is not an epoch instant, so the relative `reset_after_seconds` must \
              be used instead of dropping the countdown"
+        );
+    }
+
+    /// One `codex` window, with whatever reset fields the caller wants to put in it.
+    fn codex_window_with(reset_fields: &str) -> String {
+        format!(
+            r#"{{"rate_limit": {{"allowed": true, "limit_reached": false,
+                "primary_window": {{"used_percent": 25, "limit_window_seconds": 18000,
+                                    {reset_fields}}}}}}}"#
+        )
+    }
+
+    /// **The panic this test exists for was real, not theoretical.** `SystemTime + Duration`
+    /// panics on overflow ("overflow when adding duration to instant"), and both reset fields are
+    /// a remote server's free choice of `i64`, filtered only for a sign before this fix. A single
+    /// JSON number was enough to bring down the poll - and, because the single-flight guard is set
+    /// before the read starts, to wedge every subsequent poll *and* every `Refresh`/`Retry` click
+    /// for the rest of the session with it.
+    ///
+    /// The contract asserted here is the whole fix: the window still parses, its percentage - the
+    /// number the reader actually came for - is still real, and only the unusable reset instant is
+    /// dropped.
+    #[test]
+    fn a_hostile_reset_field_cannot_panic_the_poll() {
+        for hostile in [
+            // The exact input the adversarial review reproduced a panic with, in both fields and
+            // in each of them alone.
+            format!(r#""reset_after_seconds": {}"#, i64::MAX),
+            format!(r#""reset_at": {}"#, i64::MAX),
+            format!(
+                r#""reset_at": {}, "reset_after_seconds": {}"#,
+                i64::MAX,
+                i64::MAX
+            ),
+            format!(r#""reset_after_seconds": {}"#, i64::MIN),
+            format!(r#""reset_at": {}"#, i64::MIN),
+            format!(r#""reset_at": {}, "reset_after_seconds": -1"#, i64::MAX),
+        ] {
+            let snapshot = parse_codex_usage(&codex_window_with(&hostile))
+                .unwrap_or_else(|err| panic!("{hostile} must still parse a window, got {err}"));
+            assert_eq!(
+                snapshot.windows[0].used_percent, 25.0,
+                "{hostile}: the usage is still a real number - only the reset instant is unusable"
+            );
+            assert_eq!(
+                snapshot.windows[0].resets_at, None,
+                "{hostile}: an unusable reset field must fall back to `no countdown`, the same \
+                 way a missing one already did"
+            );
+        }
+
+        // And an overflowing *absolute* field still lets the relative one answer, rather than
+        // taking the whole countdown down with it: the two fields are checked independently.
+        let mixed = parse_codex_usage(&codex_window_with(&format!(
+            r#""reset_at": {}, "reset_after_seconds": 600"#,
+            i64::MAX
+        )))
+        .expect("parses");
+        assert!(
+            mixed.windows[0].resets_at.is_some(),
+            "a usable `reset_after_seconds` beside a hostile `reset_at` is still a real countdown"
+        );
+    }
+
+    /// The other half of the same guard: a value that would *not* overflow but is still not a
+    /// rate-limit window. Left unbounded, `reset_after_seconds` of ten billion renders a
+    /// confident `resets in 115740d 17h` - a fabricated fact dressed as a measured one, which is
+    /// the one thing this whole module refuses to do.
+    #[test]
+    fn an_implausible_but_addable_reset_is_rejected_rather_than_rendered() {
+        let nonsense = parse_codex_usage(&codex_window_with(
+            r#""reset_after_seconds": 10000000000, "reset_at": 0"#,
+        ))
+        .expect("parses");
+        assert_eq!(nonsense.windows[0].resets_at, None);
+
+        let far_future_absolute =
+            parse_codex_usage(&codex_window_with(r#""reset_at": 99999999999"#)).expect("parses");
+        assert_eq!(
+            far_future_absolute.windows[0].resets_at, None,
+            "an epoch second in the year 5138 is not a rate limit resetting"
+        );
+
+        // And the boundary from the other side: a long-but-real countdown is still honoured, so
+        // the ceiling is a sanity check rather than a new limit on what a provider may say.
+        let plausible = parse_codex_usage(&codex_window_with(
+            r#""reset_after_seconds": 604800, "reset_at": 0"#,
+        ))
+        .expect("parses");
+        let resets_at = plausible.windows[0]
+            .resets_at
+            .expect("a one-week countdown is a real reset instant");
+        let remaining = resets_at
+            .duration_since(SystemTime::now())
+            .expect("in the future");
+        assert!(
+            remaining.as_secs() > 604_700 && remaining.as_secs() <= 604_800,
+            "a real relative reset still counts down from now, got {remaining:?}"
+        );
+    }
+
+    /// A panic anywhere under a read must come back as a *reported* failure. Without this the
+    /// single-flight guard would never be cleared and the provider's polling would be wedged for
+    /// the rest of the process's life - see [`read_provider_catching_panics`]'s own docs.
+    #[test]
+    fn a_panicking_read_becomes_a_reported_failure_rather_than_a_lost_result() {
+        let read = catching_panics(|| panic!("overflow when adding duration to instant"));
+        assert_eq!(read, ProviderRead::Failed(PANICKED_READ_REASON.to_string()));
+
+        // A credential could be anywhere in scope when something panics, so the payload itself is
+        // never what gets reported.
+        let read = catching_panics(|| panic!("sk-ant-oat01-super-secret"));
+        match read {
+            ProviderRead::Failed(reason) => assert!(
+                !reason.contains("super-secret"),
+                "a panic payload must never become the user-visible reason, got {reason}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        // And the ordinary path is untouched - the wrapper only catches, it never invents.
+        assert_eq!(
+            catching_panics(|| ProviderRead::NotConnected),
+            ProviderRead::NotConnected
         );
     }
 
