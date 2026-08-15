@@ -89,7 +89,6 @@ impl AdeApp {
         state: &BodyState,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let icons = IconRow::new(&self.settings.icon_pack, IconSize::Control);
         div()
             .flex_none()
             .flex()
@@ -99,14 +98,7 @@ impl AdeApp {
             .child(
                 self.search_input_row(SearchField::Query, cx)
                     .h(theme::band::FILTER_ROW)
-                    .child(
-                        // The leading mark. A real magnifying glass rather than the mock's
-                        // hand-drawn `/`: this row is what the panel's own tab icon points at, and
-                        // `REVISION-2026-08-14.md` §8 moved every glyph in this window to Phosphor.
-                        icons
-                            .draw(Icon::MagnifyingGlass, theme::text::DISABLED)
-                            .flex_none(),
-                    )
+                    .child(render_search_row_mark("/", self.ui_text_size(10.0)))
                     .child(self.render_search_field(SearchField::Query, "search this worktree"))
                     .children(
                         SearchModifier::ALL
@@ -120,11 +112,7 @@ impl AdeApp {
                         .h(theme::band::SEARCH_REPLACE_ROW)
                         .border_t_1()
                         .border_color(theme::border::ROW)
-                        .child(
-                            icons
-                                .draw(Icon::ArrowsLeftRight, theme::text::DISABLED)
-                                .flex_none(),
-                        )
+                        .child(render_search_row_mark("\u{21c4}", self.ui_text_size(10.0)))
                         .child(
                             self.render_search_field(SearchField::Replace, "replace with\u{2026}"),
                         )
@@ -414,13 +402,16 @@ impl AdeApp {
                     cx.notify();
                 },
             ))
-            .child(
+            // The 1px rule exists to separate the two field toggles from fold-all. With fold-all
+            // gone there is nothing on its far side, and a divider dividing something from nothing
+            // is a stray mark - so it is gated on the same flag the control it separates is.
+            .children(state.has_results().then(|| {
                 div()
                     .flex_none()
                     .w(px(1.0))
                     .h(px(11.0))
-                    .bg(theme::border::DIVIDER),
-            )
+                    .bg(theme::border::DIVIDER)
+            }))
             // Rule 2 again: with no results there is nothing to fold, and a caret offering to
             // expand nothing is exactly what §4w records removing.
             .children(state.has_results().then(|| {
@@ -671,10 +662,16 @@ impl AdeApp {
                             .text_color(theme::text::GHOSTER)
                             .child(file.directory().to_string()),
                     )
-                    // Per-file replace, revealed on hover and only while the replace row is open -
-                    // acting on a field the user cannot see would be a control with no visible
-                    // subject. The mock has no such button; the issue's acceptance criterion names
-                    // per-file replace explicitly, so it is here rather than nowhere.
+                    // Per-file replace, shown only while the replace row is open - acting on a
+                    // field the user cannot see would be a control with no visible subject. The
+                    // mock has no such button; the issue's acceptance criterion names per-file
+                    // replace explicitly, so it is here rather than nowhere.
+                    //
+                    // Always present rather than hover-only, following the file tree's own
+                    // per-directory `+`: "this project has no established 'hidden until row hover'
+                    // mechanism yet, and a subtle-but-always-there affordance beats an invented
+                    // one" (`crate::sidebar::render::AdeApp::render_file_tree_row`). It is also
+                    // the difference between a control a test can click and one it cannot.
                     .when(self.search.replace_open, |el| {
                         let group = SharedString::from(format!("search-file-group-{index}"));
                         el.child(
@@ -688,9 +685,8 @@ impl AdeApp {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .invisible()
-                                .group_hover(group, |el| el.visible())
-                                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                                .group_hover(group, |el| el.bg(theme::surface::ROW_HOVER_ALT))
+                                .hover(|el| el.bg(theme::surface::SEGMENT_ACTIVE))
                                 .tooltip(text_tooltip(format!(
                                     "Replace {} in {}",
                                     plural::count(count, "match", Some("matches")),
@@ -834,6 +830,24 @@ impl AdeApp {
             }))
             .into_any_element()
     }
+}
+
+/// A field row's leading mark - the `/` of the query row and the `⇄` of the replace row.
+///
+/// Deliberately **text**, not an icon, and deliberately not a magnifying glass. The panel's own
+/// tab, 30px directly above this row, already *is* a magnifying glass, and
+/// `REVISION-2026-08-14.md` §7 rule 8 is exactly about that: "Before adding an icon, check what it
+/// sits beside. Two marks from the same family one divider apart are one mark with a rendering
+/// bug, as far as the eye is concerned." Caught on the first real screenshot of this panel, where
+/// the two magnifiers read as one control drawn twice. `/` is also what the rail's own filter row
+/// uses, so the two filter fields in this window speak one language.
+fn render_search_row_mark(mark: &'static str, text_size: gpui::Pixels) -> impl IntoElement {
+    div()
+        .flex_none()
+        .font(font(theme::font::MONO))
+        .text_size(text_size)
+        .text_color(theme::text::DISABLED)
+        .child(mark)
 }
 
 /// `▾` open / `▸` closed - the file tree's own caret glyphs, reused verbatim so the two trees in
@@ -1173,6 +1187,518 @@ mod tests {
         assert_eq!(
             replace_notice(&outcome),
             "Replaced 4 matches in 2 files; 1 file failed to write."
+        );
+    }
+}
+
+/// The panel driven the way a user drives it: a real window, real keystrokes into the real
+/// fields, real clicks on the real controls, and - for replace - real files on disk that really
+/// change.
+///
+/// These sit beside `crate::search::state`'s pure tests rather than replacing them: those pin the
+/// three-state gate's *decisions*, these pin that the gate is really what the panel reads, that
+/// the four fields are really editable, and that `Replace all` really writes.
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::search::state::SearchField;
+    use gpui::TestAppContext;
+    use tempfile::TempDir;
+
+    /// A real worktree on disk with `refresh_token` across four files - the same corpus
+    /// `Jerry.dc.html`'s own search fixture uses, so what these tests see is what the design was
+    /// drawn against.
+    fn fixture_repo() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        let write = |relative: &str, content: &str| {
+            let path = repo.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, content).expect("write");
+        };
+        write(
+            "src/auth/session.rs",
+            "let refresh_token = store.issue(&sid)?;\nif self.refresh_token.is_expired(now) {}\n",
+        );
+        write(
+            "src/auth/store.rs",
+            "fn refresh_token(&self, sid: &SessionId) -> Option<Token>;\n",
+        );
+        write("src/api/users.rs", "let t = auth.refresh_token(&sid)?;\n");
+        write("tests/auth_race.rs", "let a = svc.refresh_token(sid);\n");
+        write("README.md", "nothing to find here\n");
+        repo
+    }
+
+    fn open_search<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| app.open_search_panel(window, cx));
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    /// Types into whichever field is focused and lets the debounced search really finish.
+    fn type_and_settle(cx: &mut gpui::VisualTestContext, text: &str) {
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        // The search itself is behind a real `SEARCH_DEBOUNCE` timer on the background executor.
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("`{selector}` must really paint"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn mod_shift_f_opens_the_panel_with_the_query_focused(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.dispatch_action(SearchInWorktree);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.right_sidebar_view, RightSidebarView::Search);
+        });
+        let (focused, query_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.search.query_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&query_handle),
+            "the issue's own wording: \"opens the panel focused in the query\""
+        );
+    }
+
+    #[gpui::test]
+    fn typing_a_real_query_really_searches_the_worktree_and_builds_the_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.body_state(), BodyState::NotSearched);
+            assert_eq!(app.search.count_label(), "");
+        });
+        assert!(
+            cx.debug_bounds("search-fold-all").is_none(),
+            "a control that acts on results does not exist when there are none"
+        );
+
+        type_and_settle(cx, "refresh_token");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.query.as_str(), "refresh_token");
+            assert_eq!(app.search.body_state(), BodyState::Results);
+            assert_eq!(
+                app.search.count_label(),
+                "5 results in 4 files",
+                "a real walk of a real worktree, not a fixture handed to the panel"
+            );
+        });
+        assert!(
+            cx.debug_bounds("search-file-0").is_some(),
+            "the tree's first file row must really paint"
+        );
+        assert!(
+            cx.debug_bounds("search-fold-all").is_some(),
+            "and now that there are results, so must fold-all"
+        );
+    }
+
+    #[gpui::test]
+    fn clearing_the_query_returns_to_the_not_searched_state(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.body_state(), BodyState::Results)
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.search.body_state(),
+                BodyState::NotSearched,
+                "the acceptance criterion: \"clearing the query returns to the not-searched state\""
+            );
+            assert_eq!(app.search.count_label(), "");
+        });
+        assert!(cx.debug_bounds("search-fold-all").is_none());
+    }
+
+    #[gpui::test]
+    fn the_match_case_button_really_changes_the_result_set(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        std::fs::write(repo.path().join("src/Cased.rs"), "Refresh_Token\n").expect("write");
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "Refresh_Token");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.search.count_label(),
+                "6 results in 5 files",
+                "case-insensitive by default"
+            );
+        });
+
+        click(cx, "search-modifier-case");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(app.search.options.match_case);
+            assert_eq!(
+                app.search.count_label(),
+                "1 result in 1 file",
+                "`Aa` changes results - the acceptance criterion says so in as many words"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn all_four_fields_are_really_editable_and_the_globs_really_narrow_the_search(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.count_label(), "5 results in 4 files")
+        });
+
+        // The funnel reveals the two glob rows and focuses the first, so the very next keystroke
+        // lands in a field the user can see.
+        click(cx, "search-toggle-globs");
+        app.read_with(cx, |app, _| {
+            assert!(app.search.globs_open);
+            assert_eq!(app.search.focused_field, SearchField::Include);
+        });
+        type_and_settle(cx, "src/**");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.include.as_str(), "src/**");
+            assert_eq!(
+                app.search.count_label(),
+                "4 results in 3 files",
+                "the include glob really dropped `tests/auth_race.rs`"
+            );
+        });
+
+        // Tab walks to exclude, which is a real, separate field.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.focused_field, SearchField::Exclude)
+        });
+        type_and_settle(cx, "**/store.rs");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.exclude.as_str(), "**/store.rs");
+            assert_eq!(
+                app.search.include.as_str(),
+                "src/**",
+                "and it is a *separate* field"
+            );
+            assert_eq!(app.search.count_label(), "3 results in 2 files");
+        });
+
+        // The fourth field, behind `⇄`.
+        click(cx, "search-toggle-replace");
+        app.read_with(cx, |app, _| {
+            assert!(app.search.replace_open);
+            assert_eq!(app.search.focused_field, SearchField::Replace);
+        });
+        cx.simulate_input("rotate_token");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.replace.as_str(), "rotate_token");
+            assert_eq!(
+                app.search.query.as_str(),
+                "refresh_token",
+                "typing into replace must not touch the query - four fields, four values"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_query_field_has_a_real_caret_that_can_be_moved_back_into_the_text(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        cx.simulate_input("refresh_token");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("left left left left left left");
+        cx.run_until_parked();
+        cx.simulate_input("ed");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.search.query.as_str(),
+                "refreshed_token",
+                "a real editable field, not append/backspace-only - `REVISION-2026-08-14.md` §5"
+            );
+        });
+        assert!(
+            cx.debug_bounds("search-query-caret").is_some(),
+            "and it paints a real caret while focused"
+        );
+    }
+
+    #[gpui::test]
+    fn fold_all_really_collapses_and_expands_every_file_row(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        assert!(
+            cx.debug_bounds("search-match-0-1-0").is_some(),
+            "a match row must really paint before it can be folded away"
+        );
+
+        click(cx, "search-fold-all");
+        app.read_with(cx, |app, _| assert!(app.search.all_collapsed()));
+        assert!(
+            cx.debug_bounds("search-match-0-1-0").is_none(),
+            "collapsing must really remove the match rows, not just recolour a caret"
+        );
+        assert!(
+            cx.debug_bounds("search-file-0").is_some(),
+            "the file rows themselves stay"
+        );
+
+        click(cx, "search-fold-all");
+        app.read_with(cx, |app, _| assert!(!app.search.all_collapsed()));
+        assert!(cx.debug_bounds("search-match-0-1-0").is_some());
+    }
+
+    #[gpui::test]
+    fn clicking_one_file_row_collapses_only_that_file(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+
+        click(cx, "search-file-0");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.collapsed.len(), 1);
+            assert!(!app.search.all_collapsed());
+        });
+        assert!(
+            cx.debug_bounds("search-fold-all").is_some(),
+            "one file closed still leaves results, so fold-all still exists"
+        );
+    }
+
+    #[gpui::test]
+    fn replace_all_really_rewrites_the_files_on_disk_and_reports_what_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let session = repo.path().join("src/auth/session.rs");
+        let readme = repo.path().join("README.md");
+        let readme_before = std::fs::read_to_string(&readme).expect("read");
+
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        click(cx, "search-toggle-replace");
+        cx.simulate_input("rotate_token");
+        cx.run_until_parked();
+
+        click(cx, "search-replace-all");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 4);
+        cx.run_until_parked();
+
+        let after = std::fs::read_to_string(&session).expect("read back");
+        assert!(
+            !after.contains("refresh_token"),
+            "the file on disk must really have changed: {after}"
+        );
+        assert!(after.contains("rotate_token"));
+        assert!(
+            after.contains("store.issue(&sid)?;"),
+            "every untouched part of the line must survive verbatim"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readme).expect("read back"),
+            readme_before,
+            "a file with no matches must be byte-identical - a replace touches what it found"
+        );
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.search.notice.as_deref(),
+                Some("Replaced 5 matches in 4 files."),
+                "\"perform real edits and report what changed\""
+            );
+            assert_eq!(
+                app.search.body_state(),
+                BodyState::NoMatch,
+                "and the tree really re-ran against what the files now hold"
+            );
+        });
+        assert!(
+            cx.debug_bounds("search-notice").is_some(),
+            "the report must really be on screen, not only in state"
+        );
+    }
+
+    #[gpui::test]
+    fn a_per_file_replace_touches_only_that_file(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        click(cx, "search-toggle-replace");
+        cx.simulate_input("rotate_token");
+        cx.run_until_parked();
+
+        // Which file row index 0 is, read off the real results rather than assumed - the walk
+        // sorts by path, and an assumption here would make this test's subject drift with the
+        // fixture.
+        let first = app.read_with(cx, |app, _| {
+            app.search
+                .results()
+                .expect("results")
+                .files
+                .first()
+                .expect("a file")
+                .path
+                .clone()
+        });
+        let others: Vec<PathBuf> = app.read_with(cx, |app, _| {
+            app.search
+                .results()
+                .expect("results")
+                .files
+                .iter()
+                .skip(1)
+                .map(|file| file.path.clone())
+                .collect()
+        });
+
+        click(cx, "search-file-replace-0");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 4);
+        cx.run_until_parked();
+
+        assert!(!std::fs::read_to_string(&first)
+            .expect("read")
+            .contains("refresh_token"));
+        for other in &others {
+            assert!(
+                std::fs::read_to_string(other)
+                    .expect("read")
+                    .contains("refresh_token"),
+                "a per-file replace is per file: {} was touched too",
+                other.display()
+            );
+        }
+        app.read_with(cx, |app, _| {
+            assert!(app
+                .search
+                .notice
+                .as_deref()
+                .expect("a notice")
+                .starts_with("Replaced"));
+        });
+    }
+
+    #[gpui::test]
+    fn a_file_open_in_the_editor_with_unsaved_edits_is_refused_and_named(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let session = repo.path().join("src/auth/session.rs");
+        let before = std::fs::read_to_string(&session).expect("read");
+        let (app, cx) = open_search(cx, &repo);
+
+        // A real, dirty `EditBuffer` for that file - the same shape opening it in the File view
+        // and typing produces.
+        app.update(cx, |app, _cx| {
+            let metadata = std::fs::metadata(&session).expect("the file really exists");
+            let mut buffer = crate::code_surface::edit_buffer::EditBuffer::new(
+                session.clone(),
+                before.clone(),
+                Some("rs".to_string()),
+                metadata.modified().ok(),
+                metadata.len(),
+            );
+            buffer.content.push_str("// an unsaved edit\n");
+            assert!(buffer.is_dirty(), "premise: this buffer really is dirty");
+            let root = app.file_tree_root.clone();
+            app.insert_edit_buffer_at(root, session.clone(), buffer);
+        });
+
+        type_and_settle(cx, "refresh_token");
+        click(cx, "search-toggle-replace");
+        cx.simulate_input("rotate_token");
+        cx.run_until_parked();
+        click(cx, "search-replace-all");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 4);
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&session).expect("read back"),
+            before,
+            "writing this file would destroy edits the editor still believes it owns"
+        );
+        app.read_with(cx, |app, _| {
+            let notice = app.search.notice.as_deref().expect("a notice");
+            assert!(
+                notice.contains("1 file skipped"),
+                "refusing silently is the failure this exists to prevent: {notice}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_invalid_regex_reports_itself_rather_than_claiming_the_worktree_is_empty(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        click(cx, "search-modifier-regex");
+        type_and_settle(cx, "(unclosed");
+
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.search.body_state(),
+                BodyState::InvalidQuery(_)
+            ));
+            assert_eq!(app.search.count_label(), "invalid pattern");
+        });
+        assert!(
+            cx.debug_bounds("search-fold-all").is_none(),
+            "there are no results to fold"
+        );
+    }
+
+    #[gpui::test]
+    fn leaving_the_search_tab_never_strands_focus_on_an_unrendered_field(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        cx.simulate_input("refresh");
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Files, window, cx);
+        });
+        cx.run_until_parked();
+
+        let (focused, query_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.search.query_focus_handle.clone())
+        });
+        assert_ne!(
+            focused.as_ref(),
+            Some(&query_handle),
+            "a `FocusId` no rendered frame can resolve silently kills every context-scoped \
+             binding until the next click"
         );
     }
 }
