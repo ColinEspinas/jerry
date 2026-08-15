@@ -1385,10 +1385,16 @@ fn render_rebase_button(
 /// the graph's merge elbows**."
 ///
 /// That last sentence is why this is a real drawn box rather than the mono `└` glyph it replaced:
-/// `crate::graph_view::render`'s own merge connectors are `border_l_1() + border_b_1() +
+/// `crate::graph_view::render`'s own merge connectors are `border_l + border_b +
 /// rounded_bl(theme::graph::ELBOW_RADIUS)` boxes, and this reuses exactly that construction (and
 /// exactly that radius constant) so a fold really does read as the same kind of mark as a merge,
 /// not as a lookalike drawn a second way.
+///
+/// One deliberate deviation from §1.4's literal "1px": the stroke is
+/// [`theme::graph::LINE_WIDTH`], the same width the graph's own elbows moved to for GitHub issue
+/// #346 (1px borders render broken/dimmed at fractional display scale factors - see that
+/// constant's docs). The spec's own "same vocabulary as the graph's merge elbows" is the clause
+/// that has to win when the two conflict.
 ///
 /// A non-folding row gets a **zero-width** slot, not an empty fixed one - that is what makes a
 /// `squash`/`fixup` row genuinely indent 20 under the commit it folds into (§4's checklist item),
@@ -1416,8 +1422,8 @@ fn render_rebase_fold_elbow(
                 .right(theme::graph::REBASE_FOLD_ELBOW_INSET_X)
                 .top(theme::graph::REBASE_FOLD_ELBOW_TOP)
                 .bottom(theme::graph::REBASE_FOLD_ELBOW_BOTTOM)
-                .border_l_1()
-                .border_b_1()
+                .border_l(theme::graph::LINE_WIDTH)
+                .border_b(theme::graph::LINE_WIDTH)
                 .border_color(action_fg)
                 .rounded_bl(theme::graph::ELBOW_RADIUS),
         );
@@ -2676,7 +2682,7 @@ mod rebase_flow_tests {
     // --- Design spec §1.3/§1.4/§1.5's real geometry (GitHub issues #303, #304) ---------------
 
     /// GitHub issue #303, both halves: a `squash`/`fixup` row really indents 20 under the commit
-    /// it folds into, and the mark it carries is a real 1px drawn elbow, not a mono `└` glyph
+    /// it folds into, and the mark it carries is a real drawn elbow, not a mono `└` glyph
     /// sitting in a slot every row shares.
     ///
     /// Measured against the *same* row before and after a real action change, the way
@@ -2735,8 +2741,8 @@ mod rebase_flow_tests {
         assert_eq!(
             f32::from(elbow.bottom_left().y - row.origin.y),
             15.0,
-            "§1.4's `bottom:13` on a 28-high row puts the elbow's own 1px bottom border on \
-             14..15 - the centreline of an 18-high chip centred in 28"
+            "§1.4's `bottom:13` on a 28-high row puts the elbow's own inside-painted bottom \
+             border just above 15 - the centreline of an 18-high chip centred in 28"
         );
         assert_eq!(
             f32::from(folded.center().y - row.origin.y),

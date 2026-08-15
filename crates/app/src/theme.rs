@@ -3012,6 +3012,28 @@ pub mod graph {
     /// A lane's vertical sits at `x = 9 + lane * 14` (§2).
     pub const LANE_X_BASE: Pixels = px(9.0);
     pub const LANE_STEP: Pixels = px(14.0);
+    /// Stroke width of every line the commit graph draws: the lane verticals, the elbow bridge,
+    /// and both elbow curves' borders (plus the rebase surface's fold elbow, which deliberately
+    /// shares the graph's visual vocabulary).
+    ///
+    /// 2px rather than the spec's original 1px, and that is a correctness decision, not only a
+    /// visual one (GitHub issue #346). GPUI snaps every painted quad to integer *device* pixels
+    /// independently per primitive: box edges via `Window::snap_bounds` (round-half-toward-zero
+    /// per edge) and border widths via `Window::snap_stroke` (rounded as a length, minimum one
+    /// device pixel). At an integer scale factor every integer logical coordinate lands exactly
+    /// on the device grid and all of those roundings agree. At a **fractional** scale factor
+    /// (1.25x, 1.5x - issue #216's `GPUI_X11_SCALE_FACTOR` override, or any fractional-DPI
+    /// monitor) logically coincident edges land on half-device-pixel boundaries where two
+    /// *different* primitives can legally round one device pixel apart - measured for real at
+    /// scale 1.5: a lane vertical snapped to device column `[469, 470)` while the elbow curve
+    /// continuing it snapped its border stroke to `[470, 471)`. With 1-logical-px strokes that
+    /// disagreement is a 100% visual break exactly at the elbow (the twice-reported "lines are
+    /// jagged when coming to an elbow ... on some screens it is fine and on other it breaks").
+    /// At 2 logical px every snapped stroke is at least 2 device pixels at every scale >= 1.0,
+    /// so the worst-case one-device-pixel disagreement still leaves the strokes overlapping and
+    /// the line reads continuous - pinned by `crate::graph_view::render`'s
+    /// `elbow_fractional_scale_tests`, which emulate GPUI's own snapping arithmetic.
+    pub const LINE_WIDTH: Pixels = px(2.0);
     /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
     /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
     /// GPUI's inside-painted bottom border lands on the waist row rather than one row above it -
