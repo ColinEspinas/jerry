@@ -6,6 +6,9 @@ publish = { workspace = true }
 license = { workspace = true }
 description = "Real PTY process spawning, I/O streaming, resizing, and process-tree teardown for the ade agent development environment"
 
+[lints]
+workspace = true
+
 [dependencies]
 portable-pty = "0.9.0"
 thiserror = { workspace = true }

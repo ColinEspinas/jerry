@@ -958,6 +958,7 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
+        #[allow(clippy::expect_used)]
         let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         let entries: Vec<RebasePlanEntry> = rebase_state
             .plan
@@ -989,6 +990,7 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
+        #[allow(clippy::expect_used)]
         let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         // Real, load-bearing gap `wt_core::rebase`'s own module docs call out: the reword-message
         // queue its `GIT_EDITOR` script reads from is fixed at `start_interactive_rebase` time -

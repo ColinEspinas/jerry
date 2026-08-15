@@ -62,5 +62,10 @@ fn apply_display_scale_override() {
     // only `set_var` call in this workspace; every other place that needed a custom environment
     // (see `pty_core::resolve_in_path_var` and `lsp_core::client`'s injected resolvers) passes
     // the value as an argument specifically to avoid mutating the real one.
-    unsafe { env::set_var(app::GPUI_X11_SCALE_FACTOR_ENV, value) };
+    // The one standing exception to CLAUDE.md's "no unsafe" rule - see this function's own
+    // SAFETY comment above for why it's sound here.
+    #[allow(unsafe_code)]
+    unsafe {
+        env::set_var(app::GPUI_X11_SCALE_FACTOR_ENV, value)
+    };
 }

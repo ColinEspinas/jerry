@@ -38,6 +38,11 @@
 //! `lsp-types` defines at all (it only defines the request/notification payload shapes) - see
 //! [`transport`] for that hand-rolled piece.
 
+// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
+// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
+// `expect_used`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod client;
 // Unix-only: `crate::proc`'s `/proc`-walk and `nix` signal calls are unix-specific end to
 // end (`nix` itself is only a dependency at all under `[target.'cfg(unix)'.dependencies]`

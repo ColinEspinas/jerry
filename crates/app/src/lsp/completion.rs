@@ -769,6 +769,7 @@ pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch>
     }
 
     let start = positions[0];
+    #[allow(clippy::expect_used)]
     let end = *positions
         .last()
         .expect("a non-empty query matched at least one char");

@@ -17,23 +17,16 @@ env:
   JERRY_DISABLE_PROVIDER_POLL: "1"
 
 jobs:
-  # Build-only signal on Linux, matching macOS/Windows below - deliberately narrowed
-  # from a prior "build, test, clippy, fmt" job. That job's own real fmt/clippy/test
-  # steps were sound in isolation (they'd passed repeatedly before), but a real,
-  # separate CI-environment gap surfaced through them: `wt-core`'s
-  # `discard_worktree_refuses_when_stash_push_captures_nothing_and_an_unrelated_stash_
-  # already_exists` test creates a real git repo with a submodule and commits inside
-  # it, and a fresh GitHub Actions runner has no global `git config user.email`/
-  # `user.name` the way a real developer machine does - `git commit` inside that test
-  # fixture failed with "Author identity unknown" (real error text from a real CI run,
-  # not hypothetical). Narrowing to build-only sidesteps that gap and the handful of
-  # other environment-specific flakes this job's own comments already documented
-  # (`diff_render_tests`' known cache flake, live-LSP-server test flakiness) rather
-  # than chasing each one individually right now. Fuller CI (fmt/clippy/test, and a
-  # real fix for the git-identity gap) is real follow-up work, not abandoned - see
-  # this repo's own issues for the tracked follow-up.
+  # Full gate on Linux: build, the workspace's own [workspace.lints]-backed clippy check,
+  # fmt, and the test suite - restored after being narrowed to build-only. The original
+  # narrowing was to work around a fresh runner having no global `git config user.email`/
+  # `user.name`, which made a `wt-core` test's own submodule commit fail with "Author
+  # identity unknown"; the `git config --global` step below is the actual fix. The one test
+  # confirmed flaky under this runner's parallelism (GitHub issue #320, an ETXTBSY race, not
+  # a timing threshold to tune) is `#[ignore]`'d at its definition rather than worked around
+  # here.
   linux:
-    name: Linux (build only)
+    name: Linux (build, test, clippy, fmt)
     runs-on: ubuntu-latest
     # System libraries GPUI's Linux backend (both the `wayland` and `x11`
     # gpui_platform features are compiled in, Revision R12 - see that file's own
@@ -89,26 +82,36 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: rustfmt, clippy
 
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 
+      # Fixes the "Author identity unknown" gap the job header comment above describes -
+      # a fresh runner has no user.email/user.name, and wt-core's own git-fixture tests
+      # (e.g. the submodule-commit test in undo.rs) need one to exist somewhere.
+      - name: Configure git identity for test fixtures
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+
       - name: cargo build --workspace
         run: cargo build --workspace
 
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
   # Build-only signal on macOS and Windows, as two separate jobs (not a matrix) so all
   # three platforms read as peers in the Actions UI, rather than Linux standing alone
-  # against one oddly-combined "the other two" job. This project's own dev environment
-  # is Linux/WSL2-only (see BUILD-LOG.md and README.md), so these two jobs are the
-  # actual, only real verification that the workspace even compiles on those platforms
-  # going forward - nobody working on this repo can check that locally today (this
-  # sandbox included - Revision R11, which added the real per-target Cargo.toml sections
-  # below, verified them with `cargo check`/`cargo clippy --target x86_64-pc-windows-gnu`
-  # and `--target aarch64-apple-darwin` for `pty-core`/`wt-core`, and `cargo check
-  # --target x86_64-pc-windows-gnu` got well into `app`'s own real dependency tree before
-  # hitting an unrelated missing system `x86_64-w64-mingw32-gcc` cross-compiler this
-  # sandbox has no passwordless `sudo` to install - see BUILD-LOG.md's Revision R11 entry
-  # for exactly how far that verification reached and what it could not reach).
+  # against one oddly-combined "the other two" job. Not every contributor can build and
+  # run the full test suite on both of these platforms locally, so these two jobs are the
+  # real verification that the workspace compiles there at all.
   #
   # `crates/app/Cargo.toml` has real per-target `[target.'cfg(target_os =
   # "...")'.dependencies]` sections for `gpui_platform` (Revision R11, extended in R12):

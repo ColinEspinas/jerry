@@ -19,6 +19,11 @@
 //! exists to back one) must offload calls to a background thread/executor rather than
 //! invoking them from a UI main thread.
 
+// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
+// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
+// `expect_used`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod blame;
 pub mod checkout;
 pub mod diff;

@@ -184,6 +184,7 @@ impl PathProvenance {
                 if mark.at > change_start {
                     break;
                 }
+                #[allow(clippy::expect_used)]
                 let mark = ledger.next().expect("peeked");
                 removals.push(RemovalMark {
                     at: unchanged_new_start + (mark.at - old_cursor),

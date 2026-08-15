@@ -6,6 +6,9 @@ publish = { workspace = true }
 license = { workspace = true }
 description = "Real LSP client (spawns and speaks the Language Server Protocol to rust-analyzer) for the ade agent development environment"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Real, correct LSP protocol type definitions (InitializeParams, PublishDiagnosticsParams,
 # Position, Range, Diagnostic, DiagnosticSeverity, Uri, ...) - the actual, permissively

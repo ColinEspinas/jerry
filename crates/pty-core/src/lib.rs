@@ -149,6 +149,11 @@
 //! caller-supplied cwd is an existing directory before handing it to `CommandBuilder`,
 //! returning [`PtyError::InvalidCwd`] otherwise.
 
+// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
+// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
+// `expect_used`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
 use std::collections::HashSet;

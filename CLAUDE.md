@@ -19,10 +19,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-All four together are the pre-commit gate — run them as `/check`, or via the
-`.claude/hooks/pre-commit-check.sh` hook, before any commit. None are optional; a PR that needs
-`#[allow(...)]` to silence a lint either fixes the underlying issue or justifies the allow with a
-one-line comment.
+All four together are the pre-commit gate — run them as `/check` before considering anything done.
+`.claude/hooks/pre-commit-check.sh` runs the fast half (fmt + clippy) automatically before any
+`git commit`, as a safety net; it deliberately skips the full test suite, which takes minutes, so
+`/check` — not the hook alone — is what "done" means. None of the four are optional; a PR that
+needs `#[allow(...)]` to silence a lint either fixes the underlying issue or justifies the allow
+with a one-line comment.
 
 Run the app with `cargo run --release -p app [repo-path]`. Use `--release` unless you're actively
 recompiling every few seconds: a debug-profile GPUI build is commonly 5–20× slower for the per-frame
@@ -58,10 +60,13 @@ touches the file for another reason.
 - **No `unwrap()`/`expect()` outside `#[cfg(test)]` code.** Every fallible operation in non-test
   code returns a `Result`. Test modules use `.expect("...")` freely, with a message describing what's
   being asserted.
-- **No `unsafe`**, with one standing exception: `crates/app/src/main.rs`'s single `env::set_var`
-  call, justified by its own `SAFETY` comment (no other thread exists yet when it runs). Any new
-  `unsafe` needs the same treatment — a safe alternative checked first, and if there truly isn't one,
-  flagged for discussion rather than added quietly.
+- **`unsafe` only for justified FFI**, each site with its own `#[allow(unsafe_code)]` and a `SAFETY`
+  comment explaining why it's sound: `main.rs`'s one `env::set_var` call, and the libc/Win32 process
+  liveness/sampling calls in `hooks/settings_file.rs` and `status_bar/process_stats/{macos,windows}.rs`
+  (there's no safe way to ask the OS for another process's CPU/memory or existence). `wt-core`,
+  `pty-core`, and `lsp-core` have none, and shouldn't gain any. Any new `unsafe` needs the same
+  treatment — a safe alternative checked first, and if there truly isn't one, flagged for discussion
+  rather than added quietly.
 - **`PathBuf`/`&Path`, never `String`, for filesystem paths.** Not stringly-typed and re-parsed at
   call sites.
 - **Every git invocation is a real argument vector, never an interpolated shell string.** `wt-core`

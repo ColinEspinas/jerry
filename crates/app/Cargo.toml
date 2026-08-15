@@ -6,6 +6,9 @@ publish = { workspace = true }
 license = { workspace = true }
 description = "ade (\"Jerry\"): a GPUI desktop app for supervising coding agents across parallel git worktrees"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "app"
 path = "src/main.rs"
