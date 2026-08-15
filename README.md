@@ -3,8 +3,6 @@
 A desktop app, built with [GPUI](https://www.gpui.rs/) (Zed's UI framework), for supervising
 several AI coding agents (Claude Code, Codex, ...) at once, each running in its own git worktree.
 
-![Jerry, editing a Rust file under the Jerry Dark theme](docs/screenshots/jerry-dark-rust.png)
-
 The UI is three fixed zones:
 
 - **Session rail** (left) — one row per session (one agent, one worktree, one task), with status
@@ -19,7 +17,7 @@ The UI is three fixed zones:
 
 There's also a command palette (with a "History" group for undoing/redoing worktree-level actions
 like committing or discarding a session's changes) and a settings surface (Keybindings, Language
-Servers, Themes). More screenshots: [`docs/screenshots/`](docs/screenshots/).
+Servers, Themes).
 
 ## Status
 

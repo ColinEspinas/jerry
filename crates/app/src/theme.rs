@@ -1622,7 +1622,7 @@ pub mod syntax {
     /// force-fittable onto an existing bucket - see this module's own fallback-chain docs above),
     /// so they get their own honestly-named [`crate::code_surface::code_view::HighlightKind`]
     /// variants and real, distinct hues rather than a confusing reuse of e.g. `KEYWORD` for a
-    /// heading. Verified in a real rendered window - see `docs/screenshots/jerry-dark-markdown.png`.
+    /// heading. Verified in a real rendered window.
     pub const HEADING: ColorToken = token("syntax.heading", 0xc7a356);
     /// `text.uri`/`text.reference` (a link's destination and its visible label/text) - reuses
     /// [`FUNCTION`]'s own blue as its default, the conventional "this is a link" hue in most

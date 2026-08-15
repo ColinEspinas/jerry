@@ -52,12 +52,7 @@ rather than looping on garbage images and drawing conclusions from them.
 7. **Iterate**: fix → rebuild → recapture. GPUI rebuilds run into minutes even in debug, so batch
    several related edits into one recompile rather than recapturing after every single change.
 
-8. **Attach the final capture** to the PR (`implement`'s step 9) instead of describing the result
-   in prose — the whole point of this skill is replacing "should look right" with a real image.
-
-## Existing captures are Linux-only
-
-`docs/screenshots/` holds real captures taken via X11 `XGetImage` on Linux — a different mechanism
-from this skill's `screencapture`-based one, and not reproducible on macOS. Don't treat a mismatch
-between a new `screencapture` capture and an old X11 one as a regression without checking whether
-the difference is platform rendering (font hinting, subpixel AA) rather than an actual bug.
+8. **Attach the final capture** to the PR (`ship`'s step 2) instead of describing the result in
+   prose — the whole point of this skill is replacing "should look right" with a real image.
+   Captures are never committed to the repo on their own — `.claude/scratch/` is gitignored, and a
+   PR attachment or an inline verification in this session is the only place one belongs.
