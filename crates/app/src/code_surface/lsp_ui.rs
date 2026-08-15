@@ -10,6 +10,7 @@ use super::*;
 use crate::lsp::client::LspClientState;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use crate::root::scrollbar;
 use crate::root::widgets::render_keycap;
 use std::time::Duration;
 
@@ -1339,7 +1340,7 @@ impl AdeApp {
                         .flex_1()
                         .min_h_0()
                         .child(scroll_body)
-                        .children(self.render_vertical_scrollbar(
+                        .children(scrollbar::render_vertical_scrollbar(
                             "hover-card-scrollbar",
                             &self.hover_card_scroll_handle,
                             &[],

@@ -35,12 +35,44 @@
 //!   `point.column` ranges `0..columns`) - not the whole scrollback. `Cell`'s real fields are
 //!   `c: char, fg: Color, bg: Color, flags: Flags, extra: ...` (`term/cell.rs:134`).
 //!
-//! ## Scope cut: no scrollback UI
+//! ## Scrollback (GitHub issue #331)
 //!
-//! `Term` retains scrollback history (`Config::scrolling_history`, default 10000 lines), but
-//! `display_iter` at `display_offset == 0` only ever exposes the live viewport -
-//! `Term::scroll_display` (mouse-wheel/PageUp scrolling into history) isn't wired up here. Not
-//! an oversight - a natural following step.
+//! `Term` retains scrollback history (`Config::scrolling_history`, default 10000 lines) - this
+//! used to go entirely unused: `display_iter` was only ever read at `display_offset == 0` (the
+//! live viewport), and nothing here ever called `Term::scroll_display`. [`TerminalGrid::
+//! scroll_display`] is the real fix: a thin wrapper over it, taking this module's own
+//! [`ScrollAmount`] rather than leaking `alacritty_terminal::grid::Scroll` across the module
+//! boundary (the same convention [`CellSide`]/[`CellPosition`] already follow).
+//! `crate::terminal::pane` drives it from a real `on_scroll_wheel` handler and PageUp/PageDown
+//! keys - see that module's own docs for the input side.
+//!
+//! `display_iter` itself needed no change for this: `Grid::display_iter` already yields
+//! `Indexed<Point>`s whose `point.line` is relative to the *viewport*, not the underlying grid -
+//! at `display_offset > 0` those points simply run negative for the (now-visible) history rows
+//! above the live screen. [`Self::visible_rows`] shifts every yielded `point.line` by the real
+//! `display_offset` (`RenderableContent::display_offset`, `Term`'s own field, never a second
+//! copy) before indexing into the row `Vec`, which is the one line that changed there - verified
+//! against the real, pinned rev's source at `grid/mod.rs:422-427`'s own `display_iter` doc
+//! comment ("Iterate over all visible cells").
+//!
+//! **Staying put when new output arrives while scrolled back** needs no bookkeeping here either:
+//! `alacritty_terminal`'s own `Grid::scroll_up` (the internal call every newline past the bottom
+//! row makes) already increments `display_offset` by the same number of lines the screen just
+//! scrolled by, *whenever* `display_offset != 0` (`grid/mod.rs:262-265`, verified against the
+//! pinned rev) - so a caller sitting in history keeps looking at the exact same historical lines
+//! as new output arrives underneath, rather than being yanked back to the live tail. This is the
+//! same convention every real terminal emulator (iTerm2, Alacritty itself, Windows Terminal)
+//! follows, and it falls out of not fighting `Term`'s own state rather than anything this module
+//! added.
+//!
+//! **The alt screen has no scrollback of its own.** `Term::swap_alt` (entering `vim`/`less`/an
+//! agent CLI's full-screen UI) swaps in a second `Grid` constructed with `history_size: 0`
+//! (`Term::new`, `term/mod.rs:412-413` - see this module's own "API surface" section above), so
+//! [`Self::scroll_history_len`] is naturally `0` there and [`Self::scroll_display`] is a
+//! real no-op: a mouse-wheel/PageUp that reaches a full-screen program does nothing to this
+//! app's own view, exactly as if scrollback genuinely didn't exist for the duration of the alt
+//! screen - no special-casing needed, since `alacritty_terminal`'s own `Scroll::Delta`/`PageUp`/
+//! `PageDown` clamp to `history_size()` internally (`grid/mod.rs:163-172`).
 //!
 //! ## Scope cut: no OSC 4/10/11 customization
 //!
@@ -108,7 +140,7 @@
 
 use crate::terminal::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell as AlacCell, Flags};
@@ -298,12 +330,40 @@ pub struct CellPosition {
 }
 
 impl CellPosition {
-    /// Valid only while `display_offset == 0`, which is always the case here - this module
-    /// never calls `Term::scroll_display` (see the module docs' "no scrollback UI" scope cut),
-    /// so a viewport row index *is* the grid `Line` index.
-    fn to_alacritty(self) -> AlacPoint {
-        AlacPoint::new(Line(self.row as i32), Column(self.column))
+    /// `display_offset` is `Term`'s own current scroll position (GitHub issue #331 -
+    /// [`TerminalGrid::scroll_display`]'s docs), needed here because a viewport row index is
+    /// only ever the grid `Line` index at `display_offset == 0`: at any other offset the two
+    /// diverge by exactly that many lines, the same shift [`TerminalGrid::visible_rows`] applies
+    /// in the opposite direction when reading cells back out. Selecting text while scrolled back
+    /// therefore still anchors on the real historical line the pointer is over, not on
+    /// whatever's currently live at that same screen row.
+    fn to_alacritty(self, display_offset: usize) -> AlacPoint {
+        AlacPoint::new(
+            Line(self.row as i32 - display_offset as i32),
+            Column(self.column),
+        )
     }
+}
+
+/// How far, and by what unit, to move the viewport into (or back out of) retained scrollback
+/// history (GitHub issue #331) - [`TerminalGrid::scroll_display`]'s argument. Mirrors
+/// `alacritty_terminal::grid::Scroll` rather than re-exporting it, matching this module's
+/// [`CellSide`]/[`CellPosition`] convention of never leaking `alacritty_terminal` types across
+/// its own boundary into `crate::terminal::pane`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAmount {
+    /// A relative move by `count` grid lines: positive scrolls up into history, negative scrolls
+    /// back down toward the live tail. What a mouse-wheel notch or an accumulated trackpad delta
+    /// becomes once `crate::terminal::pane` converts pixels to whole lines.
+    Lines(i32),
+    /// One screenful up into history - a `PageUp` keystroke.
+    PageUp,
+    /// One screenful back down toward the live tail - a `PageDown` keystroke.
+    PageDown,
+    /// All the way back to the oldest retained line.
+    Top,
+    /// All the way back to the live tail - the "jump to bottom" affordance.
+    Bottom,
 }
 
 /// Every real colour a terminal grid resolves against, already reduced to concrete RGB - the whole
@@ -616,18 +676,24 @@ impl TerminalGrid {
         let cursor_point =
             (content.cursor.shape != CursorShape::Hidden).then_some(content.cursor.point);
         let selection = content.selection;
+        // GitHub issue #331: `display_iter`'s own `point.line` is viewport-relative, running
+        // negative for history rows once `display_offset > 0` - see the module docs' scrollback
+        // section for why shifting by `display_offset` here is the one change scrolling needed.
+        let display_offset = content.display_offset as i32;
 
         let mut rows: Vec<Vec<GridCell>> = (0..self.size.rows)
             .map(|_| Vec::with_capacity(self.size.cols))
             .collect();
 
         for indexed in content.display_iter {
-            if indexed.point.line.0 < 0 {
-                // Shouldn't happen at `display_offset == 0` (see the module docs), but guard
-                // defensively rather than panicking on an unexpected negative index.
+            let line = indexed.point.line.0 + display_offset;
+            if line < 0 {
+                // Shouldn't happen - `display_iter` never yields more than `screen_lines` rows
+                // above the viewport top - but guard defensively rather than panicking on an
+                // unexpected negative index.
                 continue;
             }
-            let Some(row) = rows.get_mut(indexed.point.line.0 as usize) else {
+            let Some(row) = rows.get_mut(line as usize) else {
                 continue;
             };
             let is_cursor = cursor_point == Some(indexed.point);
@@ -643,6 +709,60 @@ impl TerminalGrid {
         rows
     }
 
+    // -------------------------------------------------------------- scrollback (issue #331)
+
+    /// Scrolls the viewport into (or back out of) retained scrollback history. A thin wrapper
+    /// over `Term::scroll_display` - see the module docs' scrollback section for why no
+    /// "don't yank the user back to the bottom while new output arrives" bookkeeping is needed
+    /// here: `alacritty_terminal`'s own `Grid::scroll_up` already keeps `display_offset` pinned
+    /// to the same historical lines whenever it isn't `0`.
+    pub fn scroll_display(&mut self, amount: ScrollAmount) {
+        let scroll = match amount {
+            ScrollAmount::Lines(count) => AlacScroll::Delta(count),
+            ScrollAmount::PageUp => AlacScroll::PageUp,
+            ScrollAmount::PageDown => AlacScroll::PageDown,
+            ScrollAmount::Top => AlacScroll::Top,
+            ScrollAmount::Bottom => AlacScroll::Bottom,
+        };
+        self.term.scroll_display(scroll);
+    }
+
+    /// Scrolls directly to an absolute `display_offset` (clamped to
+    /// `0..=Self::scroll_history_len`) - `crate::terminal::pane`'s scrollbar click/drag, which
+    /// already computes a target line count from where the pointer landed on the track rather
+    /// than a relative delta. Implemented as a `Delta` of the difference from
+    /// [`Self::scroll_offset`] so `alacritty_terminal`'s own clamping (`grid/mod.rs:163-172`)
+    /// stays the single place that enforces the valid range, rather than a second copy of it
+    /// here.
+    pub fn set_scroll_offset(&mut self, target: usize) {
+        // `target`/`Self::scroll_offset` are both bounded by real scrollback line counts (at
+        // most `Config::scrolling_history`, 10000, plus a screenful) - nowhere near overflowing
+        // an `i32` delta between them.
+        let delta = target as i32 - self.scroll_offset() as i32;
+        self.scroll_display(ScrollAmount::Lines(delta));
+    }
+
+    /// How many lines back into scrollback the viewport currently is - `0` means live (the
+    /// normal, unscrolled state), matching `Term`'s own `Grid::display_offset`. Read live, never
+    /// mirrored, so it can't drift from what [`Self::visible_rows`] actually painted.
+    pub fn scroll_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// How many lines of real scrollback are currently retained - `0` on the alt screen (see the
+    /// module docs' alt-screen note), otherwise growing up to `Config::scrolling_history`
+    /// (10000) as output accumulates. Backs the scrollbar's `max_scroll_offset` and the
+    /// "is there anything to scroll to at all" checks.
+    pub fn scroll_history_len(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// `true` once [`Self::scroll_offset`] is anything other than live - i.e. the pane is
+    /// genuinely showing scrollback rather than the live tail right now.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scroll_offset() > 0
+    }
+
     // ------------------------------------------------------------------ selection (issue #158)
 
     /// Anchors a new selection at `position`, discarding any previous one - what a real
@@ -651,9 +771,10 @@ impl TerminalGrid {
     /// `None` for it: a plain click therefore clears the selection rather than selecting one
     /// stray character, without this needing a "was it a drag?" flag of its own.
     pub fn start_selection(&mut self, position: CellPosition) {
+        let display_offset = self.scroll_offset();
         self.term.selection = Some(Selection::new(
             SelectionType::Simple,
-            position.to_alacritty(),
+            position.to_alacritty(display_offset),
             position.side.to_alacritty(),
         ));
     }
@@ -662,8 +783,12 @@ impl TerminalGrid {
     /// `selection.rs:133`) - what a real mouse-drag does. A no-op when nothing is anchored, so
     /// an ordinary hover can never conjure a selection out of nothing.
     pub fn update_selection(&mut self, position: CellPosition) {
+        let display_offset = self.scroll_offset();
         if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(position.to_alacritty(), position.side.to_alacritty());
+            selection.update(
+                position.to_alacritty(display_offset),
+                position.side.to_alacritty(),
+            );
         }
     }
 
@@ -995,6 +1120,208 @@ mod tests {
         assert!(!grid.ended);
         grid.mark_ended();
         assert!(grid.ended);
+    }
+
+    /// Pushes `count` numbered lines (`"line 0\r\n"`, `"line 1\r\n"`, ...) through a real grid -
+    /// the shared fixture the scrollback tests below build on. Each line is short and
+    /// distinguishable by its own number, so a test can assert exactly which lines are on
+    /// screen at a given scroll position rather than just that *something* rendered.
+    fn grid_with_numbered_lines(rows: u16, cols: u16, count: usize) -> TerminalGrid {
+        let mut grid = TerminalGrid::new(rows, cols);
+        for i in 0..count {
+            grid.append_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        grid
+    }
+
+    mod scrollback_tests {
+        use super::*;
+
+        /// The core of GitHub issue #331: scrolling up must actually reveal lines that were
+        /// pushed off the top of the visible screen into history, not just move a cursor over
+        /// the same five lines that were always on screen.
+        #[test]
+        fn scrolling_up_reveals_lines_pushed_into_history() {
+            // A 5-row screen, 30 lines written - the first 25 are pushed into scrollback, and
+            // the live viewport shows lines 25..30.
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            assert_eq!(grid.scroll_offset(), 0, "sanity check: starts live");
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 26"
+            );
+
+            // One page up (5 rows, matching the screen height) must reveal the five lines
+            // immediately above what was on screen.
+            grid.scroll_display(ScrollAmount::PageUp);
+            assert_eq!(grid.scroll_offset(), 5);
+            let rows = grid.visible_rows(&TerminalPalette::default());
+            assert_eq!(row_text(&rows[0]).trim(), "line 21");
+            assert_eq!(row_text(&rows[4]).trim(), "line 25");
+        }
+
+        /// `Scroll::Top`/`Scroll::Bottom` reach the real extremes: the oldest retained line, and
+        /// back to the live tail - proof the whole retained history is really reachable, not
+        /// just the one page `PageUp` moves by.
+        #[test]
+        fn top_and_bottom_reach_the_real_extremes() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+
+            grid.scroll_display(ScrollAmount::Top);
+            assert_eq!(
+                grid.scroll_offset(),
+                grid.scroll_history_len(),
+                "Top must land exactly on the oldest retained line, not short of it"
+            );
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 0"
+            );
+
+            grid.scroll_display(ScrollAmount::Bottom);
+            assert_eq!(grid.scroll_offset(), 0);
+            assert!(!grid.is_scrolled_back());
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 26"
+            );
+        }
+
+        /// The real "stay put" behavior GitHub issue #331 asks for: new output arriving while
+        /// scrolled back must not yank the viewport back to the live tail - the same historical
+        /// lines stay on screen, only the retained-history count grows underneath. Exercised
+        /// through the exact same `TerminalGrid::append_bytes` path live pty output takes, not a
+        /// synthetic offset write - see the module docs' scrollback section for why this falls
+        /// out of `alacritty_terminal`'s own `Grid::scroll_up` rather than needing code here.
+        #[test]
+        fn new_output_while_scrolled_back_does_not_move_the_viewport() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            grid.scroll_display(ScrollAmount::PageUp); // offset 5, viewing lines 20..25
+            let before = grid.visible_rows(&TerminalPalette::default());
+            assert_eq!(row_text(&before[0]).trim(), "line 21");
+
+            // Ten more lines of real output arrive - as if the shell kept printing while the
+            // human was scrolled back reading history.
+            for i in 30..40 {
+                grid.append_bytes(format!("line {i}\r\n").as_bytes());
+            }
+
+            let after = grid.visible_rows(&TerminalPalette::default());
+            assert_eq!(
+                row_text(&after[0]).trim(),
+                "line 21",
+                "new output while scrolled back must not move the viewport off the line the \
+                 user was looking at"
+            );
+            assert_eq!(row_text(&after[4]).trim(), "line 25");
+            assert!(
+                grid.is_scrolled_back(),
+                "must still genuinely be scrolled back, not silently reset to live"
+            );
+            assert!(
+                grid.scroll_history_len() > 30,
+                "the ten new lines must still have landed in real retained history underneath, \
+                 not been dropped: {}",
+                grid.scroll_history_len()
+            );
+        }
+
+        /// [`TerminalGrid::set_scroll_offset`] - the scrollbar's click/drag path, which computes
+        /// an absolute target line count from where the pointer landed rather than a relative
+        /// delta.
+        #[test]
+        fn set_scroll_offset_jumps_directly_to_an_absolute_target() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            let history_len = grid.scroll_history_len();
+
+            grid.set_scroll_offset(history_len);
+            assert_eq!(grid.scroll_offset(), history_len);
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 0"
+            );
+
+            grid.set_scroll_offset(0);
+            assert_eq!(grid.scroll_offset(), 0);
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 26"
+            );
+        }
+
+        /// `ScrollAmount::Lines` must clamp at both ends rather than under/overflowing - `Delta`
+        /// past the top must stop at the oldest retained line, and a `Delta` back down past live
+        /// must stop at `0`, matching `alacritty_terminal`'s own real clamping.
+        #[test]
+        fn scroll_amount_lines_clamps_at_both_ends() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            let history_len = grid.scroll_history_len();
+
+            grid.scroll_display(ScrollAmount::Lines(history_len as i32 + 1_000));
+            assert_eq!(grid.scroll_offset(), history_len);
+
+            grid.scroll_display(ScrollAmount::Lines(-1_000_000));
+            assert_eq!(grid.scroll_offset(), 0);
+        }
+
+        /// A selection anchored while scrolled back must land on the real historical cell the
+        /// pointer is over - not on whatever is currently live at that same on-screen row (the
+        /// bug the module docs' `CellPosition::to_alacritty` update exists to prevent).
+        #[test]
+        fn a_selection_anchored_while_scrolled_back_selects_the_real_historical_line() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            grid.scroll_display(ScrollAmount::PageUp); // offset 5, viewing lines 20..25
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 21"
+            );
+
+            // Select across the whole first on-screen row (viewport row 0 = the real "line 21").
+            grid.start_selection(CellPosition {
+                row: 0,
+                column: 0,
+                side: CellSide::Left,
+            });
+            grid.update_selection(CellPosition {
+                row: 0,
+                column: 6,
+                side: CellSide::Right,
+            });
+
+            assert_eq!(
+                grid.selected_text().as_deref().map(str::trim),
+                Some("line 21"),
+                "the selection must follow the real scrolled-to line, not whatever is live at \
+                 viewport row 0 right now (which is \"line 25\")"
+            );
+        }
+
+        /// The alt screen keeps no scrollback of its own (see the module docs) - entering it
+        /// (`\x1b[?1049h`, real `smcup`, what `vim`/`less`/full-screen agent CLIs send) must make
+        /// [`TerminalGrid::scroll_history_len`] genuinely `0`, and a scroll attempt while inside
+        /// it a real no-op rather than silently doing nothing for some other, wrong reason.
+        #[test]
+        fn the_alt_screen_reports_no_scrollback_and_a_scroll_attempt_is_a_real_no_op() {
+            let mut grid = grid_with_numbered_lines(5, 20, 30);
+            assert!(
+                grid.scroll_history_len() > 0,
+                "sanity check: real history exists first"
+            );
+
+            grid.append_bytes(b"\x1b[?1049h"); // enter the alt screen
+            assert_eq!(
+                grid.scroll_history_len(),
+                0,
+                "the alt screen's own grid must report zero scrollback"
+            );
+
+            grid.scroll_display(ScrollAmount::PageUp);
+            assert_eq!(
+                grid.scroll_offset(),
+                0,
+                "a scroll attempt on the alt screen must not move it into a history it doesn't have"
+            );
+        }
     }
 
     /// End-to-end through a genuinely spawned process on a real pty (via `pty_core::spawn`)

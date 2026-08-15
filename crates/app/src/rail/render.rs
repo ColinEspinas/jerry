@@ -1,5 +1,6 @@
 use super::*;
 use crate::root::plural;
+use crate::root::scrollbar;
 use crate::root::widgets::{render_disclosure_caret, text_tooltip, SimpleInput};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -851,7 +852,7 @@ impl AdeApp {
                             .track_scroll(&self.rail_scroll_handle)
                             .child(self.render_sidebar_body(view, &groups, &problems, cx)),
                     )
-                    .children(self.render_vertical_scrollbar(
+                    .children(scrollbar::render_vertical_scrollbar(
                         "rail-scrollbar",
                         &self.rail_scroll_handle,
                         &[],

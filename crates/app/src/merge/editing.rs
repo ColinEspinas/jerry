@@ -46,6 +46,7 @@ use gpui::{canvas, fill, point, Bounds, ElementInputHandler, Entity, TextRun};
 use super::*;
 use crate::code_surface::editing::split_runs_for_marked_range;
 use crate::code_surface::zoom::zoom_scoped;
+use crate::root::scrollbar;
 use crate::settings::store as settings_store;
 
 impl AdeApp {
@@ -287,7 +288,7 @@ impl AdeApp {
                     .flex_1()
                     .min_h_0()
                     .child(code)
-                    .children(self.render_vertical_scrollbar(
+                    .children(scrollbar::render_vertical_scrollbar(
                         "merge-edit-scrollbar",
                         &self.merge_edit_scroll_handle,
                         &[],

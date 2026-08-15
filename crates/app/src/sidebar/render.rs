@@ -912,7 +912,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(list)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "file-tree-scrollbar",
                 &self.file_tree_scroll_handle,
                 &[],
@@ -2215,7 +2215,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(list)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "changes-sections-scrollbar",
                 &self.changes_sections_list,
                 &[],

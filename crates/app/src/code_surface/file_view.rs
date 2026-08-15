@@ -11,6 +11,7 @@ use crate::lsp::client::{lsp_file_status, LspFileStatus};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::plural;
+use crate::root::scrollbar;
 use crate::root::widgets::render_sidebar_message;
 use std::collections::HashSet;
 
@@ -867,7 +868,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(code)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "file-view-scrollbar",
                 &self.file_view_scroll_handle,
                 &marks,

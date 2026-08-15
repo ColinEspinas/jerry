@@ -1,5 +1,6 @@
 use super::*;
 use crate::root::plural;
+use crate::root::scrollbar;
 use crate::root::widgets::{
     hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
     SimpleInput,
@@ -263,7 +264,7 @@ impl AdeApp {
                                 )
                             })),
                     )
-                    .children(self.render_vertical_scrollbar(
+                    .children(scrollbar::render_vertical_scrollbar(
                         "settings-nav-scrollbar",
                         &self.settings_nav_scroll_handle,
                         &[],
@@ -508,7 +509,7 @@ impl AdeApp {
                                     }),
                             ),
                     )
-                    .children(self.render_vertical_scrollbar(
+                    .children(scrollbar::render_vertical_scrollbar(
                         "settings-content-scrollbar",
                         &self.settings_content_scroll_handle,
                         &[],

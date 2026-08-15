@@ -7,6 +7,7 @@ use crate::review_notes::{NoteAnchor, NoteMark};
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
 use crate::root::plural;
+use crate::root::scrollbar;
 use crate::root::widgets::render_sidebar_message;
 use std::rc::Rc;
 
@@ -656,7 +657,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(content)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 surface.scrollbar_id(),
                 surface.scroll_handle(self),
                 &[],

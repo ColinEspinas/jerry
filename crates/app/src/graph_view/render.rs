@@ -4,6 +4,7 @@
 //! docs for scope.
 
 use super::*;
+use crate::root::scrollbar;
 use crate::root::widgets::{
     menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter, SimpleInput,
 };
@@ -1995,7 +1996,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(list)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "graph-rows-scrollbar",
                 &self.graph_state.rows_scroll_handle,
                 &[],
@@ -2972,7 +2973,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(panel)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "graph-commit-panel-scrollbar",
                 &self.graph_state.commit_panel_scroll_handle,
                 &[],
@@ -3030,7 +3031,7 @@ impl AdeApp {
                             })),
                     )
                     // GitHub issue #142.
-                    .children(self.render_vertical_scrollbar(
+                    .children(scrollbar::render_vertical_scrollbar(
                         "graph-branches-scrollbar",
                         &self.graph_state.branches_scroll_handle,
                         &[],

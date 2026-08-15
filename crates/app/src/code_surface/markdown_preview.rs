@@ -519,6 +519,7 @@ use gpui::{
 
 use super::code_view;
 use super::zoom::zoom_scoped;
+use crate::root::scrollbar;
 use crate::root::AdeApp;
 use crate::theme;
 
@@ -589,7 +590,7 @@ impl AdeApp {
             .min_h_0()
             .bg(theme::surface::CENTER)
             .child(content)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "markdown-preview-scrollbar",
                 &self.markdown_preview_scroll_handle,
                 &[],
