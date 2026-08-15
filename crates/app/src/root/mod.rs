@@ -1434,6 +1434,17 @@ pub struct AdeApp {
     /// `gpui::canvas` idiom [`Self::plus_button_bounds`] uses, so the Resources popover can be
     /// positioned off the control that opens it.
     pub(crate) resources_readout_bounds: gpui::Bounds<Pixels>,
+    /// Every provider's real rate-limit budget (GitHub issue #294) - what the agent pane strip's
+    /// cluster and the budget popover both read. Written only by
+    /// `crate::budget::flow::AdeApp::apply_budget_poll_result`, from real poll results.
+    pub(crate) budget: crate::budget::state::BudgetState,
+    /// Whether the agent pane's rate-limit budget popover is open (GitHub issue #294) - one of
+    /// the [`menus::MenuSurface`]s, so it obeys the app's one-menu-at-a-time invariant.
+    pub(crate) budget_popover_open: bool,
+    /// The pane strip's budget cluster's real painted bounds, captured through the same
+    /// `gpui::canvas` idiom [`Self::resources_readout_bounds`] uses, so the popover opens
+    /// directly above the control that opened it (§4u′).
+    pub(crate) budget_readout_bounds: gpui::Bounds<Pixels>,
     /// Real, bounded disk-usage total across every listed worktree (see
     /// `crate::rail::state::disk_usage_bytes`'s docs for the real `std::fs` walk and its cap),
     /// recomputed whenever the worktree list reloads. `None` while the very first
@@ -1674,6 +1685,12 @@ pub struct AdeApp {
     /// docs), keyed off [`Self::update_state`] itself rather than a separate bool, since
     /// `Downloading` already is that "one is in flight" signal.
     pub(crate) _update_download_task: Option<Task<()>>,
+    /// The per-provider rate-limit budget poll loop (GitHub issue #294,
+    /// `crate::budget::flow::AdeApp::start_budget_poll_loop`) - kept alive here for the same
+    /// reason [`Self::_update_check_task`] is, and reserved to the loop alone: an individual
+    /// provider read detaches its own task rather than reassigning this field, so a manual
+    /// `Refresh` can never cancel the loop out from under itself.
+    pub(crate) _budget_poll_task: Option<Task<()>>,
     pub(crate) _agent_rows_task: Option<Task<()>>,
     pub(crate) _merge_task: Option<Task<()>>,
     /// `Self::clear_merge_flow_for_closed_agent`'s best-effort abort - kept separate from
@@ -3249,6 +3266,15 @@ impl Render for AdeApp {
             // must stay reachable there too.
             .when(self.resources_popover_open, |el| {
                 el.child(self.render_resources_popover(cx))
+            })
+            // The agent pane strip's rate-limit budget popover (GitHub issue #294) - a
+            // window-positioned overlay for exactly the same reason the Resources one above it
+            // is: it is placed off its readout's `gpui::canvas`-captured *window-space* bounds,
+            // so `.absolute()` positioning built from them is only correct as a direct child of
+            // this root element. Nesting it inside the pane strip would additionally clip it to
+            // an 18px-high row.
+            .when(self.budget_popover_open, |el| {
+                el.child(self.render_budget_popover(window, cx))
             })
             // The git graph tab's Push `▾` menu and row `⋯` menu (GitHub issue #1, phase (a)) -
             // window-positioned overlays for the same reason `render_plus_menu` is a sibling here

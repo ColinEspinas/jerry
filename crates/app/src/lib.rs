@@ -8,6 +8,7 @@
 //! and `crate::terminal::grid` for the interesting design decisions (entity/state model,
 //! blocking-call offloading, terminal grid rendering).
 
+pub mod budget;
 pub mod code_surface;
 pub mod env_info;
 pub mod fonts;
