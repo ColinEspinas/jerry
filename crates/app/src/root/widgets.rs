@@ -463,14 +463,25 @@ fn simple_input_caret_opacity(is_focused: bool, blink_visible: bool) -> Option<f
 }
 
 impl AdeApp {
-    /// One agent-kind chip (GitHub issue #5's "custom icon packs"): a real, user-supplied SVG
+    /// One agent-kind chip (GitHub issue #5's "custom icon packs"): a real, user-supplied image
     /// from the active icon pack (`crate::icon_pack::resolve_icon`) if one exists for `kind`, at
     /// its own real colors (no theme tint - see `crate::icon_pack`'s own module docs on why),
     /// else this app's existing default look (a `size`-square rounded chip, tinted per
     /// `work_surface::agent_tint`, showing `work_surface::agent_initial`'s single letter) -
-    /// unchanged from before this feature existed. `size` is also the SVG's real width/height,
+    /// unchanged from before this feature existed. `size` is also the image's real width/height,
     /// so a pack icon fills exactly the same box the default chip already occupies at every one
     /// of this helper's real call sites, rather than needing per-call-site size plumbing.
+    ///
+    /// Painted with `gpui::img()`, not `gpui::svg()` (GitHub issue #309): `svg()` rasterises to
+    /// an alpha mask and paints it tinted with the element's own `style.text.color`
+    /// (`vendor/zed/crates/gpui/src/elements/svg.rs`'s `paint` zips the path with that color and
+    /// skips painting entirely when it's `None`), so a full-color pack icon drawn through `svg()`
+    /// with no `.text_color()` set - the case this branch was in before this fix - painted
+    /// nothing at all, an empty box, regardless of what colors the pack's own file defined.
+    /// `img()`'s `paint` (`elements/img.rs`) never consults `style.text.color`; it decodes the
+    /// source's own real pixels (raster or SVG - `Img::extensions()` covers both) and paints them
+    /// as a full-color `PolychromeSprite`, which is what "keeps its own colours" actually
+    /// requires in this GPUI version.
     pub(crate) fn render_agent_chip_icon(
         &self,
         kind: ProcessKind,
@@ -481,12 +492,11 @@ impl AdeApp {
             &self.settings.icon_pack,
             work_surface::agent_icon_name(kind),
         ) {
-            return gpui::svg()
-                .external_path(icon_path.to_string_lossy().into_owned())
+            return gpui::img(icon_path)
                 .flex_none()
                 .w(size)
                 .h(size)
-                .debug_selector(|| "agent-chip-icon-pack-svg".to_string())
+                .debug_selector(|| "agent-chip-icon-pack-image".to_string())
                 .into_any_element();
         }
         let (chip_fg, chip_bg) = work_surface::agent_tint(kind);
