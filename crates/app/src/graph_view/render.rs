@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::root::widgets::{
-    menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_tag_pill,
+    menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter,
 };
 use crate::settings::widgets;
 use crate::sidebar::changes;
@@ -3079,16 +3079,32 @@ fn render_graph_footer_action_button(
         .child(label)
 }
 
-/// One "Files changed" row - the change-row visual's spirit (path + status pill), simplified
-/// since a historical commit has no review checkbox or per-file stat counts to show.
+/// One "Files changed" row - the change-row visual's spirit (git's own status letter + path),
+/// simplified since a historical commit has no review checkbox or per-file stat counts to show.
+///
+/// The commit file list is the third of the three places `STAGE-A-CHANGELOG.md` §4j names as
+/// having carried the old word badge, and like the Uncommitted rows it is a *list*, so the letter
+/// sits in its fixed column ahead of the directory and every filename below it starts on the same
+/// x - `Jerry.dc.html`'s own `gFiles` rows, in that order.
 fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoElement {
     let (dir, name) = changes::split_dir_name(&file.path);
-    let tag = changes::change_tag(file.status);
+    let letter = changes::status_letter(file.status);
     div()
         .flex()
         .items_center()
         .gap(px(6.0))
         .h(theme::band::CHANGE_ROW)
+        .child(
+            render_status_letter(
+                gpui::SharedString::from(format!("graph-file-status-{}", file.path.display())),
+                letter,
+                px(10.0),
+            )
+            .debug_selector({
+                let path = file.path.clone();
+                move || format!("graph-file-status-{}-{}", path.display(), letter.glyph())
+            }),
+        )
         .when(!dir.is_empty(), |el| {
             el.child(
                 div()
@@ -3100,12 +3116,15 @@ fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoEle
         })
         .child(
             div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .truncate()
                 .font(font(theme::font::MONO))
                 .text_size(px(11.5))
                 .text_color(theme::text::STRONG)
                 .child(name),
         )
-        .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
 }
 
 /// One Branches-panel row (design spec §5): a lane-coloured dot, the branch name, and a `HEAD`
@@ -6038,6 +6057,29 @@ mod graph_selection_render_tests {
         });
         cx.run_until_parked();
         (repo, app, cx)
+    }
+
+    /// `STAGE-A-CHANGELOG.md` §4j's third site: "Applied in all three places that carried a
+    /// badge: the Uncommitted rows, the file header above the diff, and **the commit file list**."
+    /// The selected commit here really touched `a.txt` and nothing else, so its one row must
+    /// carry git's own `M`.
+    #[gpui::test]
+    fn the_commit_file_list_carries_gits_own_status_letter(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        // Row 0 is the newest commit (`second`), which modified `a.txt`.
+        assert_eq!(
+            app.read_with(cx, |app, _| app.graph_state.selected_row),
+            Some(0),
+            "premise: the newest commit is selected on load"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("graph-file-status-a.txt-M").is_some(),
+            "the commit's own file list states what git did to that file, in the same fixed \
+             column the Uncommitted rows use - not the `new`/`del` word pill it replaced"
+        );
     }
 
     #[gpui::test]

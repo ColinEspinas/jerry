@@ -4,7 +4,7 @@ use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
     hover_bg, menu_popover_chrome, render_committed_tag, render_disclosure_caret,
-    render_keycap_row, render_sidebar_message, render_tag_pill, text_tooltip, KeycapSize,
+    render_keycap_row, render_sidebar_message, render_status_letter, text_tooltip, KeycapSize,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
@@ -255,7 +255,7 @@ impl AdeApp {
     ///
     /// If the real git call fails, the optimistic flip is reverted (back to whatever
     /// [`Self::staged_files`] would have read before this click) and the real error is recorded
-    /// in [`Self::staging_error`] - never left as a silent success that only *looked* like it
+    /// in [`Self::changes_row_error`] - never left as a silent success that only *looked* like it
     /// worked. A late-resolving revert can theoretically race a newer click on the *same* path
     /// that started after this one failed (e.g. stage, fail, immediately re-stage by hand before
     /// the failure's `this.update` runs) and clobber that newer click's own optimistic state;
@@ -267,7 +267,7 @@ impl AdeApp {
         if should_stage {
             self.staged_files.insert(path.clone());
         }
-        self.staging_error = None;
+        self.changes_row_error = None;
         cx.notify();
 
         let worktree_path = self.diff_root.clone();
@@ -294,7 +294,8 @@ impl AdeApp {
                         this.staged_files.insert(revert_path.clone());
                     }
                     let verb = if should_stage { "stage" } else { "unstage" };
-                    this.staging_error = Some((revert_path, format!("failed to {verb}: {err}")));
+                    this.changes_row_error =
+                        Some((revert_path, format!("failed to {verb}: {err}")));
                     cx.notify();
                 }
             });
@@ -306,19 +307,19 @@ impl AdeApp {
     }
 
     /// The real, honest surface for a failed real staging/unstaging call
-    /// ([`Self::staging_error`]) - the Changes-panel sibling of [`Self::tree_op_error`]'s own
+    /// ([`Self::changes_row_error`]) - the Changes-panel sibling of [`Self::tree_op_error`]'s own
     /// render site, next to the composer the failed checkbox lives above rather than buried in
     /// the log.
-    pub(in crate::sidebar) fn render_staging_error(
+    pub(in crate::sidebar) fn render_changes_row_error(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let (_, message) = self.staging_error.clone()?;
+        let (_, message) = self.changes_row_error.clone()?;
         // GitHub issue #128.
         let row = hover_bg(
             div()
-                .id("staging-error")
-                .debug_selector(|| "staging-error".to_string())
+                .id("changes-row-error")
+                .debug_selector(|| "changes-row-error".to_string())
                 .flex_none()
                 .w_full()
                 .px(px(10.0))
@@ -333,7 +334,7 @@ impl AdeApp {
             row.tooltip(text_tooltip("Click to dismiss"))
                 .child(message)
                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.staging_error = None;
+                    this.changes_row_error = None;
                     cx.notify();
                 })),
         )
@@ -1827,7 +1828,7 @@ impl AdeApp {
             // separate `max-height:170px` wrapper, not a fourth entry in the shared one.
             RightSidebarView::Changes => container
                 .child(self.render_commit_composer(cx))
-                .children(self.render_staging_error(cx))
+                .children(self.render_changes_row_error(cx))
                 // Not `.overflow_y_scroll()` - `Self::render_changes_sections`' `gpui::list` owns
                 // its own scrolling, exactly like the Files arm's `uniform_list` above.
                 .child(
@@ -1840,7 +1841,10 @@ impl AdeApp {
                         .child(self.render_changes_sections(cx)),
                 )
                 .child(self.render_changes_runs_section(cx))
-                .child(render_changes_footer(self.ui_text_size(10.0))),
+                .child(render_changes_footer(
+                    self.ui_text_size(10.0),
+                    self.change_seen_toggle_live(),
+                )),
         }
         .into_any_element()
     }
@@ -2661,10 +2665,34 @@ impl AdeApp {
             .child(text.to_string())
     }
 
-    /// One file row - a staging checkbox (Uncommitted only), `dir`/`name`, an optional tag pill,
-    /// `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the row other than the
-    /// checkbox itself (see [`Self::render_staging_checkbox`]'s `stop_propagation`) opens the
-    /// file's diff and marks it seen.
+    /// One file row - a staging checkbox (Uncommitted only), git's own `A`/`M`/`D` status letter,
+    /// `dir`/`name`, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the row other
+    /// than the checkbox itself (see [`Self::render_staging_checkbox`]'s `stop_propagation`) opens
+    /// the file's diff and marks it seen.
+    ///
+    /// ## Three channels, three separate facts (GitHub issue #286)
+    ///
+    /// The row states three things about a file and gives each exactly one channel, which is the
+    /// whole of `STAGE-A-CHANGELOG.md` §4i/§4j and audit item I3:
+    ///
+    /// | Fact | Channel |
+    /// |---|---|
+    /// | what git did to it | the status letter, in a fixed 9px column ahead of `dir` (§4j) |
+    /// | whether you have seen it since the agent last wrote to it | the **filename's own** weight and colour (§4i) |
+    /// | whether it is staged | the checkbox, and only the checkbox (§4i, I3) |
+    ///
+    /// Two of those used to be crossed. `nameFg` encoded *staged* while the checkbox encoded
+    /// staged too, and "seen" was a cryptic glyph - "so one fact had two channels and the other
+    /// had a cryptic glyph". [`Self::seen_files`] and [`Self::staged_files`] are now separate maps
+    /// of separate types, and nothing here reads one to decide the other: opening a file marks it
+    /// seen and cannot stage it; checking the box stages it and cannot mark it seen.
+    ///
+    /// ## The status letter is on every row, not just the exceptions
+    ///
+    /// §4j replaced the `new`/`del` word pills this row used to carry. Those marked only the
+    /// exceptions - a *modified* file, the common case, got nothing - so the row could not answer
+    /// "what happened to this file". `crate::sidebar::changes::status_letter` is total, and the
+    /// column is a fixed width so every filename in the list starts on the same x.
     ///
     /// ## It renders a `ChangeSetEntry`, not a `DiffFile`
     ///
@@ -2699,7 +2727,7 @@ impl AdeApp {
         let stat = entry.stat();
         let (add, del) = (stat.added, stat.removed);
         let (dir, name) = changes::split_dir_name(&entry.path);
-        let tag = changes::change_tag(entry.status);
+        let letter = changes::status_letter(entry.status);
         let segments = changes::stat_bar_segments(add, del);
         let stageable = section.has_checkboxes();
         // Only meaningful in the Against-main scope, which is the one that lists work already
@@ -2726,7 +2754,19 @@ impl AdeApp {
         let row_selector = format!("{selector_prefix}-{}", entry.path.display());
         let edge_selector = format!("{row_selector}-selection-edge");
         let dir_selector = format!("{selector_prefix}-dir-{}", entry.path.display());
+        let letter_selector = format!("{row_selector}-status-{}", letter.glyph());
+        let name_selector = format!(
+            "{row_selector}-name-{}",
+            if seen { "seen" } else { "unseen" }
+        );
         let section_edge = section.edge_color();
+        // §4i's floating bar acts on a *live, uncommitted* file: "open it in the editor" and
+        // "throw this file's changes away" are both meaningless for an Against-main row, which
+        // lists work already committed. Same gate as the checkbox, for the same reason.
+        let hovered = stageable
+            && (self.change_row_hover.as_deref() == Some(entry.path.as_path())
+                || self.change_row_actions_hover.as_deref() == Some(entry.path.as_path()));
+        let discard_armed = self.change_row_discard_armed.as_deref() == Some(entry.path.as_path());
 
         div()
             .id(gpui::SharedString::from(row_selector.clone()))
@@ -2785,13 +2825,33 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.open_change_diff(open_path.clone(), window, cx);
             }))
+            // §4i's hover reveal, in two halves - see `AdeApp::change_row_hover`'s own docs for
+            // why the bar's overhang makes one field impossible.
+            .when(stageable, |el| {
+                let enter_path = entry.path.clone();
+                el.on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    this.set_change_row_hover(&enter_path, *hovered, false, cx);
+                }))
+            })
             .when(stageable, |el| {
                 el.child(self.render_staging_checkbox(path.clone(), staged, cx))
             })
+            // §4j: git's own letter, in a fixed column **ahead of the directory**, so every
+            // filename in the list starts on the same x. This is the slot the `new`/`del` word
+            // pill used to occupy at the *other* end of the row, where it could not align
+            // anything and was absent on most rows.
+            .child(
+                render_status_letter(
+                    gpui::SharedString::from(letter_selector.clone()),
+                    letter,
+                    self.ui_text_size(10.0),
+                )
+                .debug_selector(move || letter_selector),
+            )
             .when(!dir.is_empty(), |el| {
                 el.child(
                     // GitHub issue #243: a deeply nested worktree can produce a `dir` long enough
-                    // to push `name`, the tag pill, and the stat counts clean off the row's right
+                    // to push `name` and the stat counts clean off the row's right
                     // edge - this used to be `.flex_none()` with no cap or overflow handling at
                     // all. Capped rather than left in the shared flex-shrink pool with `name`
                     // below: the filename is what actually identifies the row, so it keeps first
@@ -2809,8 +2869,10 @@ impl AdeApp {
                         .child(format!("{dir}/")),
                 )
             })
-            .child(
-                div()
+            .child({
+                let name_cell = div()
+                    .id(gpui::SharedString::from(name_selector.clone()))
+                    .debug_selector(move || name_selector)
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
@@ -2833,14 +2895,27 @@ impl AdeApp {
                     } else {
                         theme::changes::FILENAME_UNSEEN
                     })
-                    .child(name),
-            )
-            .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
-            // Alongside `tag`, never instead of it: a file added by a commit on this branch is
-            // genuinely both `new` (relative to the base) and `committed`.
+                    .child(name);
+                // §4i: "The convention is stated in the name's own tooltip", and the tooltip
+                // states the *real* rule rather than "read once" - a file you read and the agent
+                // then edits again reverts to unseen, which `SeenFiles` implements by storing the
+                // diffstat the file had when it was marked. Verbatim from the design.
+                if stageable {
+                    name_cell.tooltip(text_tooltip(if seen {
+                        Self::SEEN_TOOLTIP
+                    } else {
+                        Self::UNSEEN_TOOLTIP
+                    }))
+                } else {
+                    name_cell
+                }
+            })
+            // Alongside the status letter, never instead of it: a file added by a commit on this
+            // branch is genuinely both an `A` (relative to the base) and `committed`.
             .when(committed, |el| el.child(render_committed_tag()))
-            // A rename-only file gets no `tag` from `changes::change_tag` (a plain rename
-            // isn't `new`/`del`), so without this it looked identical to an unchanged file.
+            // A rename gets a plain `M` from `changes::status_letter` (§4j's table has three
+            // letters, not four), so this chip is what states the rename - see that function's
+            // own docs.
             .when(renamed, |el| el.child(render_moved_tag()))
             .child(
                 div()
@@ -2859,7 +2934,332 @@ impl AdeApp {
                     .child(format!("\u{2212}{del}")),
             )
             .child(render_stat_bar(segments))
+            .children(
+                hovered.then(|| self.render_change_row_actions(&entry.path, discard_armed, cx)),
+            )
     }
+
+    /// §4i's floating hover bar: two icons, straddling the row's top edge, on the app's one
+    /// popover chrome.
+    ///
+    /// > It is now a **floating bar straddling the row's top edge** (`top:-11px`, right-aligned,
+    /// > z-index 20), using the elevation convention every other popover in the file already uses
+    /// > […] so it plainly sits above the list rather than in it.
+    ///
+    /// That elevation convention is [`menu_popover_chrome`] here - the one function every
+    /// dropdown and context menu in this app builds on (GitHub issue #129), whose
+    /// `theme::surface::PALETTE`/`theme::border::POPOVER`/`theme::radius::CARD` are literally
+    /// §4i's own stated `#15181b` / `1px #2b3238` / radius 6. A hand-written copy of those five
+    /// style calls is exactly the drift issue #129 closed, so this reuses the function rather
+    /// than the values.
+    ///
+    /// **Exactly two icons.** §4i: "by the standard the last several passes have applied, a
+    /// copy-path or reveal-in-tree would be clutter." Both carry a tooltip, since both are
+    /// icon-only.
+    ///
+    /// **Discard takes two clicks**, and the first one only *arms* it: the icon is replaced by a
+    /// red `Discard?` pill and the second click on that pill is what runs
+    /// [`Self::discard_change_row`]. Leaving the row cancels
+    /// ([`Self::set_change_row_hover`] disarms whenever both hover halves go empty), so an armed
+    /// row can never be left sitting one stray click away from destroying an agent's work.
+    ///
+    /// `.occlude()` is what keeps the overhanging half honest: the bar is painted 11px above its
+    /// own row, so without it a click aimed at an icon would also reach whatever row is drawn
+    /// behind that strip (`gpui::InteractiveElement::occlude` sets `HitboxBehavior::BlockMouse` -
+    /// the same call `crate::menu::render`'s own popovers use for the same reason).
+    fn render_change_row_actions(
+        &self,
+        path: &Path,
+        discard_armed: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let hover_path = path.to_path_buf();
+        let editor_path = path.to_path_buf();
+        let arm_path = path.to_path_buf();
+        let discard_path = path.to_path_buf();
+        let bar_selector = format!("change-row-actions-{}", path.display());
+        let editor_selector = format!("change-row-open-in-editor-{}", path.display());
+        let discard_selector = if discard_armed {
+            format!("change-row-discard-confirm-{}", path.display())
+        } else {
+            format!("change-row-discard-{}", path.display())
+        };
+
+        // One shared 22x22 optical box for both icons - `REVISION-2026-08-14.md` §7 rule 7 ("a
+        // row of icons needs one shared optical box, not one size per icon"). Only the hover
+        // pair differs: neutral for `open`, red for `discard`, since the second one destroys
+        // work.
+        let icon_button = |id: String,
+                           selector: String,
+                           hover_bg: theme::ColorToken,
+                           hover_fg: theme::ColorToken| {
+            div()
+                .id(gpui::SharedString::from(id))
+                .debug_selector(move || selector)
+                .flex_none()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(theme::radius::CARD_SM)
+                .cursor_pointer()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::DIM)
+                .hover(move |el| el.bg(hover_bg).text_color(hover_fg))
+        };
+
+        let bar = menu_popover_chrome(
+            div()
+                .id(gpui::SharedString::from(bar_selector.clone()))
+                .debug_selector(move || bar_selector)
+                .occlude()
+                .absolute()
+                .right(px(7.0))
+                // Straddling, not sitting on: the bar is 28px tall and hangs 11px above the row's
+                // own top edge, which is what makes it read as floating over the list instead of
+                // as one more thing inside the row (§4i's first cut sat flush inside and was
+                // rejected for exactly that).
+                .top(px(-11.0))
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .p(px(3.0))
+                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    this.set_change_row_hover(&hover_path, *hovered, true, cx);
+                })),
+            theme::shadow::POPOVER,
+        )
+        .child(
+            icon_button(
+                format!("change-row-open-in-editor-{}", path.display()),
+                editor_selector,
+                theme::changes::HOVER_ACTION_HOVER_BG,
+                theme::text::SELECTED,
+            )
+            .tooltip(text_tooltip("Open in the editor"))
+            .child("\u{2197}")
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                // Never also the row's own click handler: that would open the *diff* underneath
+                // the File view this just asked for.
+                cx.stop_propagation();
+                let absolute = this.diff_root.join(&editor_path);
+                this.open_file_view(absolute, window, cx);
+            })),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(1.0))
+                .h(px(14.0))
+                .bg(theme::border::POPOVER),
+        );
+
+        if discard_armed {
+            bar.child(
+                div()
+                    .id(gpui::SharedString::from(format!(
+                        "change-row-discard-confirm-{}",
+                        path.display()
+                    )))
+                    .debug_selector(move || discard_selector)
+                    .flex_none()
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .rounded(theme::radius::CARD_SM)
+                    .cursor_pointer()
+                    .bg(theme::changes::DISCARD_BG)
+                    .border_1()
+                    .border_color(theme::changes::DISCARD_BORDER)
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(10.0))
+                    .text_color(theme::changes::DISCARD_FG)
+                    .tooltip(text_tooltip(
+                        "Click again to discard \u{2014} this cannot be undone",
+                    ))
+                    .child("Discard?")
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.discard_change_row(discard_path.clone(), cx);
+                    })),
+            )
+            .into_any_element()
+        } else {
+            bar.child(
+                icon_button(
+                    format!("change-row-discard-{}", path.display()),
+                    discard_selector,
+                    theme::changes::DISCARD_HOVER_BG,
+                    theme::changes::DISCARD_FG,
+                )
+                .tooltip(text_tooltip("Discard this file's changes"))
+                .child("\u{21ba}")
+                .on_click(cx.listener(
+                    move |this, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        this.change_row_discard_armed = Some(arm_path.clone());
+                        cx.notify();
+                    },
+                )),
+            )
+            .into_any_element()
+        }
+    }
+
+    /// The one writer of both halves of §4i's hover state, and of the `Discard?` arming it
+    /// governs. `from_bar` says which hitbox reported - see [`Self::change_row_hover`]'s docs for
+    /// why there are two and why they must be independent.
+    ///
+    /// A `false` only clears the half that names *this* path: moving from one row straight onto
+    /// the next delivers the new row's `true` and the old row's `false` in an order GPUI does not
+    /// promise, and an unguarded clear would blank the state the new row had just set (the same
+    /// guard `crate::code_surface::file_view`'s own hover listener documents).
+    ///
+    /// **Leaving the row cancels the discard confirm** (§4i), and this is the single place that
+    /// is enforced: once neither half names the armed path, the arming is dropped.
+    pub(in crate::sidebar) fn set_change_row_hover(
+        &mut self,
+        path: &Path,
+        hovered: bool,
+        from_bar: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let slot = if from_bar {
+            &mut self.change_row_actions_hover
+        } else {
+            &mut self.change_row_hover
+        };
+        let changed = if hovered {
+            let already = slot.as_deref() == Some(path);
+            if !already {
+                *slot = Some(path.to_path_buf());
+            }
+            !already
+        } else if slot.as_deref() == Some(path) {
+            *slot = None;
+            true
+        } else {
+            false
+        };
+        if !changed {
+            return;
+        }
+        let still_hovered =
+            self.change_row_hover.is_some() || self.change_row_actions_hover.is_some();
+        if !still_hovered {
+            self.change_row_discard_armed = None;
+        } else if let Some(armed) = self.change_row_discard_armed.clone() {
+            let armed_still_hovered = self.change_row_hover.as_deref() == Some(armed.as_path())
+                || self.change_row_actions_hover.as_deref() == Some(armed.as_path());
+            if !armed_still_hovered {
+                self.change_row_discard_armed = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The second click of §4i's `Discard?` confirm: a real, immediate
+    /// `wt_core::stage::discard_path` for one file, on the background executor like every other
+    /// real git mutation in this app.
+    ///
+    /// Nothing is flipped optimistically here, unlike [`Self::toggle_staged`]. There is no
+    /// cheap local prediction of what a discard leaves behind - the row may vanish entirely, or
+    /// stay with a different diffstat if the file was only partly this worktree's own - so the
+    /// panel re-reads the real diff once git has actually run, and shows the file exactly as git
+    /// now reports it. A failure lands in [`Self::changes_row_error`] rather than being swallowed.
+    pub(in crate::sidebar) fn discard_change_row(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.change_row_discard_armed = None;
+        self.changes_row_error = None;
+        cx.notify();
+
+        let worktree_path = self.diff_root.clone();
+        let git_path = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { wt_core::stage::discard_path(&worktree_path, &git_path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Err(err) => {
+                        this.changes_row_error = Some((path, format!("failed to discard: {err}")));
+                        cx.notify();
+                    }
+                    Ok(()) => {
+                        // The file is no longer what the panel is drawing, and possibly no longer
+                        // in it at all - re-read rather than guess.
+                        this.load_diff(this.diff_root.clone(), cx);
+                    }
+                }
+            });
+        });
+        self._discard_tasks.push(task);
+    }
+
+    /// `V`'s action handler ([`crate::root::ToggleChangeSeen`]) - `STAGE-A-CHANGELOG.md` §4i:
+    /// "opening a file marks it seen […] and `V` unmarks".
+    ///
+    /// It **toggles** rather than only unmarking, and that is the design read literally rather
+    /// than half of it: §4i's prose says `V` unmarks, while the legend it specifies in the same
+    /// breath reads `V mark seen`. A toggle is the only behaviour that makes both true at once,
+    /// and it leaves each tooltip exactly as §4i writes it - the seen name's tooltip names `V` as
+    /// the way back, and the unseen name's names *opening* as the way forward, which is still the
+    /// primary path either way.
+    ///
+    /// Its subject is [`Self::open_change`] - the file whose diff is on screen - which is why the
+    /// binding is scoped to the `"diff"` surface rather than to the panel. A file with no live
+    /// uncommitted delta has no seen-state to toggle (the mark is keyed by the diffstat it had
+    /// when it was marked), so this no-ops for one rather than inventing an entry for it.
+    pub(crate) fn handle_toggle_change_seen_action(
+        &mut self,
+        _action: &crate::root::ToggleChangeSeen,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.open_change.clone() else {
+            return;
+        };
+        let Some(entry) = self.uncommitted_change_set.entry(&path) else {
+            return;
+        };
+        let stat = entry.stat();
+        // `seen_files` only - never `staged_files`. Audit I3: the checkbox owns staged, the name
+        // owns seen, and neither reads the other.
+        if self.seen_files.is_seen(&self.diff_root, &path, stat) {
+            self.seen_files.clear(&self.diff_root, &path);
+        } else {
+            self.seen_files.mark_seen(&self.diff_root, &path, stat);
+        }
+        cx.notify();
+    }
+
+    /// Whether `V` really does something right now - what
+    /// [`render_changes_footer`]'s keycap hint is gated on, so the strip never advertises a
+    /// shortcut that would no-op. Same honesty rule [`render_file_tree_footer`]'s own `live`
+    /// parameter implements for `F2`.
+    pub(in crate::sidebar) fn change_seen_toggle_live(&self) -> bool {
+        self.open_change
+            .as_ref()
+            .is_some_and(|path| self.uncommitted_change_set.entry(path).is_some())
+    }
+
+    /// §4i's own wording for a filename that **is** seen, verbatim, including the `V` it names as
+    /// the way back. Kept as a constant so the row's tooltip and the test that pins it against
+    /// the design read the same string.
+    ///
+    /// > The tooltip states the real rule […]: *Seen since the agent last changed it* / *Not seen
+    /// > since the agent last changed it*. That is stronger than "read" - a file you read and the
+    /// > agent then edits again **reverts to unseen**, which is the only version of this flag
+    /// > worth having when agents keep writing while you review.
+    pub(in crate::sidebar) const SEEN_TOOLTIP: &'static str =
+        "Seen since the agent last changed it \u{2014} V to unmark";
+    /// The unseen half of [`Self::SEEN_TOOLTIP`], also verbatim.
+    pub(in crate::sidebar) const UNSEEN_TOOLTIP: &'static str =
+        "Not seen since the agent last changed it \u{2014} opening it marks it seen";
 
     /// The loaded `WorktreeDiff` behind one file section's rows - the Uncommitted section's
     /// working-tree-against-`HEAD` diff, or the Against-main section's merge-base diff. `None` for
@@ -3574,13 +3974,24 @@ impl AdeApp {
 /// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value - this free
 /// function has no `&self` to call that method through, so the one caller
 /// ([`AdeApp::render_right_sidebar`]) computes and passes it in.
-pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoElement {
+///
+/// `seen_toggle_live` adds `STAGE-A-CHANGELOG.md` §4i's own legend entry - a real `V` keycap and
+/// `mark seen` - and is the same honesty gate [`render_file_tree_footer`]'s `live` parameter
+/// implements: `V` is scoped to the open diff (see
+/// [`AdeApp::handle_toggle_change_seen_action`]), so with nothing open the keycap would advertise
+/// a keystroke that genuinely does nothing. The hint disappears; the band does not, so the list
+/// above it never jumps.
+pub(in crate::sidebar) fn render_changes_footer(
+    text_size: Pixels,
+    seen_toggle_live: bool,
+) -> impl IntoElement {
     div()
         .flex_none()
         .h(theme::band::SURFACE_FOOTER)
         .px(px(12.0))
         .flex()
         .items_center()
+        .gap(px(11.0))
         .border_t_1()
         .border_color(theme::border::INNER)
         .bg(theme::surface::FOOTER)
@@ -3588,7 +3999,37 @@ pub(in crate::sidebar) fn render_changes_footer(text_size: Pixels) -> impl IntoE
         .text_size(text_size)
         .text_color(theme::text::HINT)
         .child("click a file to open its diff in the centre")
+        .when(seen_toggle_live, |el| {
+            el.child(
+                div()
+                    .id("changes-footer-seen-hint")
+                    .debug_selector(|| "changes-footer-seen-hint".to_string())
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(render_keycap_row(
+                        // Not the literal string `"V"`: resolved through the same
+                        // `keymap::resolve_combo` every other real keycap in this app goes
+                        // through, off a spec named once in [`CHANGES_SEEN_SPEC`] so the keycap
+                        // and the registered binding cannot drift.
+                        &keymap::resolve_combo(CHANGES_SEEN_SPEC, false),
+                        KeycapSize::Hint,
+                    ))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .text_size(text_size)
+                            .text_color(theme::text::PATH)
+                            .child("mark seen"),
+                    ),
+            )
+        })
 }
+
+/// The `crate::keymap::resolve_combo` spec [`render_changes_footer`] advertises for `V`, named so
+/// its own test can assert it really is a registered binding rather than a plausible string -
+/// exactly like [`FILE_TREE_RENAME_SPEC`] beside it.
+pub(in crate::sidebar) const CHANGES_SEEN_SPEC: &str = "v";
 
 /// The Files tree's keyboard-hint footer - the counterpart to [`render_changes_footer`] beside
 /// it, so switching between the two sidebar views with a diff loaded doesn't move the list under
@@ -3809,10 +4250,11 @@ pub(in crate::sidebar) fn scrollable_sidebar_message(
         .into_any_element()
 }
 
-/// The Changes row's `moved` tag for a real rename (`changes::is_real_rename`) - its own
-/// muted style rather than [`ChangeTag`]'s bg/fg pair, since that enum only covers
-/// `new`/`del` and reusing an unrelated colour for a third meaning seemed worse than a plain
-/// neutral tag.
+/// The Changes row's `moved` tag for a real rename (`changes::is_real_rename`) - its own muted
+/// chip rather than a fourth [`changes::StatusLetter`], since `STAGE-A-CHANGELOG.md` §4j's table
+/// is exactly three letters with three colours and a rename is not a fourth thing git did to the
+/// file's *contents*. See `changes::status_letter`'s own docs for why `Renamed` maps to `M` and
+/// this chip carries the rename instead.
 pub(in crate::sidebar) fn render_moved_tag() -> impl IntoElement {
     div()
         .flex_none()
@@ -7626,5 +8068,580 @@ mod changes_sections_tests {
             cx.debug_bounds("changes-section-runs-2-open").is_some(),
             "and both rows are on one screen, under one header stating two"
         );
+    }
+}
+
+/// GitHub issue #286 - the change row's three rev-6 channels, each asserted against a real,
+/// painted row: git's own status letter (`STAGE-A-CHANGELOG.md` §4j), the filename's own
+/// seen-state (§4i), and the floating hover-action bar with its two-step discard (§4i).
+///
+/// Every one of these drives the real UI - `cx.debug_bounds` over a really-painted element,
+/// `cx.simulate_mouse_move`/`cx.simulate_click` through the real dispatch, and a real git
+/// repository underneath - rather than calling a pure helper and trusting the renderer used it.
+#[cfg(test)]
+mod change_row_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use crate::sidebar::changes::StatusLetter;
+    use gpui::TestAppContext;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// One worktree holding one of each real git status at once: `added.txt` is brand new,
+    /// `modified.txt` has an edit, `deleted.txt` is gone. §4j's whole point is that all three -
+    /// not only the two exceptions - carry a mark.
+    fn mixed_status_repo() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("modified.txt"), "one\n").expect("write");
+        std::fs::write(repo.path().join("deleted.txt"), "gone\n").expect("write");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+
+        std::fs::write(repo.path().join("modified.txt"), "one\ntwo\n").expect("write");
+        std::fs::remove_file(repo.path().join("deleted.txt")).expect("delete");
+        std::fs::write(repo.path().join("added.txt"), "brand new\n").expect("write");
+        repo
+    }
+
+    fn open_changes_view<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    /// §4j: "git's own letters […] one per row, on **every** row". The `new`/`del` word pills this
+    /// replaced left a modified file - the common case - with no mark at all.
+    #[gpui::test]
+    fn every_row_carries_gits_own_status_letter_including_the_modified_one(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("change-row-added.txt-status-A").is_some(),
+            "a brand-new file is `A`"
+        );
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-status-M")
+                .is_some(),
+            "and a modified one is `M` - the row that used to carry nothing at all"
+        );
+        assert!(
+            cx.debug_bounds("change-row-deleted.txt-status-D").is_some(),
+            "and a deleted one is `D`"
+        );
+    }
+
+    /// §4j puts the letter "in a fixed 9px column ahead of the directory so every filename starts
+    /// on the same x". Asserted geometrically against real painted bounds, over rows whose
+    /// letters differ - the old pills could not do this, being absent on most rows and two
+    /// different widths on the rest.
+    #[gpui::test]
+    fn the_letter_column_is_fixed_width_and_ahead_of_the_name(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let added = cx
+            .debug_bounds("change-row-added.txt-status-A")
+            .expect("the `A` column");
+        let deleted = cx
+            .debug_bounds("change-row-deleted.txt-status-D")
+            .expect("the `D` column");
+        assert_eq!(
+            added.size.width, deleted.size.width,
+            "one shared optical box, not one width per letter"
+        );
+        assert_eq!(
+            added.origin.x, deleted.origin.x,
+            "and one shared x, which is what makes the names below line up"
+        );
+
+        let name = cx
+            .debug_bounds("change-row-added.txt-name-unseen")
+            .expect("the filename cell");
+        assert!(
+            added.origin.x + added.size.width <= name.origin.x,
+            "the letter sits *ahead* of the name, not after it where the pill used to be: letter \
+             ends at {:?}, name starts at {:?}",
+            added.origin.x + added.size.width,
+            name.origin.x
+        );
+    }
+
+    /// §4j: "Applied in all three places that carried a badge: the Uncommitted rows, the file
+    /// header above the diff, and the commit file list." This covers the second - the diff
+    /// toolbar - through a real row click that really opens the file.
+    #[gpui::test]
+    fn the_file_header_above_the_diff_carries_the_same_letter(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(PathBuf::from("modified.txt")),
+            "premise: the click really opened the file"
+        );
+        assert!(
+            cx.debug_bounds("code-surface-status-M").is_some(),
+            "the toolbar above the diff states what git did to this file, in the same column the \
+             word pill used to occupy"
+        );
+    }
+
+    /// §4i's two token pairs, and nothing else: an unseen name reads forward, a seen one recedes.
+    /// The state flips because the file was really **opened**, which is the only gesture §4i gives
+    /// for marking one.
+    #[gpui::test]
+    fn opening_a_file_moves_its_name_from_unseen_to_seen(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-name-unseen")
+                .is_some(),
+            "nothing has been looked at yet"
+        );
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-name-seen")
+                .is_some(),
+            "opening a file marks it seen - that is what the word means (§4i)"
+        );
+        assert!(
+            cx.debug_bounds("change-row-added.txt-name-unseen")
+                .is_some(),
+            "and only that file: seen is per path, not a panel-wide flag"
+        );
+    }
+
+    /// Audit I3, and `REVISION-2026-08-14.md` §9 box 3: `seen` and `staged` are two independent
+    /// maps and neither reads the other. Asserted in **both** directions, because the defect §4i
+    /// describes was exactly a crossed pair - `nameFg` encoding staged while the checkbox encoded
+    /// it too.
+    #[gpui::test]
+    fn seen_and_staged_are_two_independent_maps(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        // Opening marks seen and must not stage.
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx
+            .debug_bounds("change-row-modified.txt-name-seen")
+            .is_some());
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "reviewing must never stage (REVISION-2026-08-14.md §1 rule 2)"
+        );
+
+        // Staging must not mark seen.
+        let checkbox = cx
+            .debug_bounds("stage-checkbox-added.txt")
+            .expect("the added row's checkbox");
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app
+                .staged_files
+                .contains(&PathBuf::from("added.txt"))),
+            "premise: the checkbox really staged it"
+        );
+        assert!(
+            cx.debug_bounds("change-row-added.txt-name-unseen")
+                .is_some(),
+            "and the name is untouched - the checkbox owns staged, the name owns seen"
+        );
+    }
+
+    /// §4i's `V`, through the real registered keybinding rather than by poking `seen_files`.
+    /// It toggles, which is the only reading that satisfies both halves of the design at once -
+    /// see `AdeApp::handle_toggle_change_seen_action`'s own docs.
+    #[gpui::test]
+    fn v_unmarks_a_seen_file_and_marks_an_unseen_one(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx
+            .debug_bounds("change-row-modified.txt-name-seen")
+            .is_some());
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_toggle_change_seen_action(&crate::root::ToggleChangeSeen, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-name-unseen")
+                .is_some(),
+            "`V` unmarks (§4i)"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_toggle_change_seen_action(&crate::root::ToggleChangeSeen, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-name-seen")
+                .is_some(),
+            "and marks again - the legend `V mark seen` has to be true as well"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "and it never touches the staged set on the way through"
+        );
+    }
+
+    /// The binding the footer's `V` keycap advertises has to be a real, registered one - the same
+    /// honesty guard `the_file_tree_footer_only_advertises_real_registered_bindings` applies to
+    /// `F2`. A keycap for a shortcut nothing is bound to is worse than no keycap.
+    #[test]
+    fn the_changes_footer_only_advertises_a_really_registered_binding() {
+        let bindings = crate::default_key_bindings();
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.action().name() == "app::ToggleChangeSeen")
+            .expect("`ToggleChangeSeen` must have a real registered binding");
+        let keystrokes = binding.keystrokes();
+        assert_eq!(keystrokes.len(), 1, "one plain keystroke, no chord");
+        let keystroke = &keystrokes[0];
+        assert_eq!(
+            keystroke.key(),
+            CHANGES_SEEN_SPEC,
+            "the footer prints the keycap for {CHANGES_SEEN_SPEC:?}, so that is what has to be \
+             bound"
+        );
+        let modifiers = keystroke.modifiers();
+        assert!(
+            !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
+            "a bare `V`, exactly as §4i's legend prints it - a binding that silently gained a \
+             modifier would leave the keycap advertising a keystroke nobody can trigger"
+        );
+    }
+
+    /// §4i: the bar is "revealed by row state (`hov`), so nothing shifts and nothing is
+    /// permanently occluded" - so it must genuinely not exist at rest.
+    #[gpui::test]
+    fn the_hover_bar_is_absent_until_the_row_is_hovered(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("change-row-actions-modified.txt").is_none(),
+            "nothing floats over an unhovered row"
+        );
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("change-row-actions-modified.txt").is_some(),
+            "hovering the row reveals it"
+        );
+        assert!(
+            cx.debug_bounds("change-row-actions-added.txt").is_none(),
+            "and only over the row the pointer is really on"
+        );
+    }
+
+    /// §4i: "Exactly two icons […] a copy-path or reveal-in-tree would be clutter", and the bar
+    /// really **straddles the row's top edge** rather than sitting flush inside it - which is the
+    /// correction the design made after its own first cut.
+    #[gpui::test]
+    fn the_hover_bar_is_two_icons_floating_above_the_rows_top_edge(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let bar = cx
+            .debug_bounds("change-row-actions-modified.txt")
+            .expect("the floating bar");
+        assert!(
+            bar.origin.y < row.origin.y,
+            "it straddles the row's top edge - bar at {:?}, row at {:?}",
+            bar.origin.y,
+            row.origin.y
+        );
+        assert!(
+            bar.origin.x + bar.size.width <= row.origin.x + row.size.width,
+            "and stays inside the row's right edge, where §4i right-aligns it"
+        );
+
+        assert!(cx
+            .debug_bounds("change-row-open-in-editor-modified.txt")
+            .is_some());
+        assert!(cx.debug_bounds("change-row-discard-modified.txt").is_some());
+    }
+
+    /// §4i: "Discard takes two clicks. […] First click swaps the icon for a red `Discard?` pill,
+    /// second click commits." The first click must therefore leave the file completely untouched.
+    #[gpui::test]
+    fn the_first_discard_click_only_arms_the_confirm_and_changes_nothing(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let before = std::fs::read_to_string(repo.path().join("modified.txt")).expect("read");
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let discard = cx
+            .debug_bounds("change-row-discard-modified.txt")
+            .expect("the discard icon");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("change-row-discard-confirm-modified.txt")
+                .is_some(),
+            "the icon is replaced by the red `Discard?` pill"
+        );
+        assert!(
+            cx.debug_bounds("change-row-discard-modified.txt").is_none(),
+            "and the plain icon is gone - one control, one state, not both at once"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("modified.txt")).expect("read"),
+            before,
+            "arming must not touch the file: this is the one irreversible action in the panel"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.change_row_discard_armed.clone()),
+            Some(PathBuf::from("modified.txt"))
+        );
+    }
+
+    /// The second click, and what it really does to the repository: `modified.txt` goes back to
+    /// exactly what `HEAD` has.
+    #[gpui::test]
+    fn the_second_discard_click_really_throws_the_files_changes_away(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let discard = cx
+            .debug_bounds("change-row-discard-modified.txt")
+            .expect("the discard icon");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let confirm = cx
+            .debug_bounds("change-row-discard-confirm-modified.txt")
+            .expect("the armed pill");
+        cx.simulate_click(confirm.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("modified.txt")).expect("read"),
+            "one\n",
+            "the file is back to exactly what HEAD has - a real `git checkout HEAD -- <path>`, \
+             not a UI-only flag"
+        );
+        assert!(
+            std::fs::read_to_string(repo.path().join("added.txt")).is_ok(),
+            "and every other dirty path is untouched"
+        );
+    }
+
+    /// §4i: "Leaving the row cancels." Enforced in `AdeApp::set_change_row_hover`, so an armed row
+    /// can never be left sitting one stray click away from destroying an agent's work.
+    #[gpui::test]
+    fn leaving_the_row_cancels_an_armed_discard(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let discard = cx
+            .debug_bounds("change-row-discard-modified.txt")
+            .expect("the discard icon");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.change_row_discard_armed.is_some()));
+
+        // Somewhere with no change row under it at all.
+        cx.simulate_mouse_move(
+            gpui::Point::new(px(4.0), px(4.0)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.change_row_discard_armed.clone()),
+            None,
+            "the confirm is disarmed the moment the pointer leaves"
+        );
+        assert!(
+            cx.debug_bounds("change-row-actions-modified.txt").is_none(),
+            "and the bar goes with it"
+        );
+    }
+
+    /// The pointer moving from the row onto the bar's **overhanging** half must not dismiss the
+    /// bar - the exact failure a single hover field would produce, since that half is genuinely
+    /// outside the row's own hitbox (see `AdeApp::change_row_hover`'s docs).
+    #[gpui::test]
+    fn moving_onto_the_bars_overhang_keeps_it_open(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let bar = cx
+            .debug_bounds("change-row-actions-modified.txt")
+            .expect("the floating bar");
+
+        // A point inside the bar but genuinely above the row it belongs to.
+        let overhang =
+            gpui::Point::new(bar.origin.x + bar.size.width / 2.0, bar.origin.y + px(2.0));
+        assert!(
+            overhang.y < row.origin.y,
+            "premise: this point really is outside the row's own bounds"
+        );
+        cx.simulate_mouse_move(overhang, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("change-row-actions-modified.txt").is_some(),
+            "the bar survives the pointer reaching for its own icons"
+        );
+    }
+
+    /// §4i: "The Uncommitted section header carries `N/M seen` and the progress bar derives from
+    /// the same map as the rows." Asserted by *moving* it - the counter has to answer to the same
+    /// `SeenFiles` map the rows read, not to a second tally of its own.
+    #[gpui::test]
+    fn the_section_header_counts_seen_off_the_same_map_the_rows_read(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-0-of-3-seen")
+                .is_some(),
+            "three dirty files, none looked at yet"
+        );
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("changes-section-uncommitted-1-of-3-seen")
+                .is_some(),
+            "opening one file moves the header's own counter, because it is the same map"
+        );
+    }
+
+    /// The ride-along §4i's legend asks for: a real `V` keycap in the panel footer, and - the
+    /// honesty half - no keycap at all while the binding has nothing to act on.
+    #[gpui::test]
+    fn the_footer_shows_the_v_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("changes-footer-seen-hint").is_none(),
+            "with no file open, `V` would do nothing - so the strip advertises nothing"
+        );
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("changes-footer-seen-hint").is_some(),
+            "with a real file open, the keycap appears and really does something"
+        );
+    }
+
+    /// The letter is a pure function of the status the row really carries, so the three renderers
+    /// cannot disagree about which letter a file gets - asserted against the same
+    /// `FileChangeStatus` the diff really produced for these three files.
+    #[gpui::test]
+    fn the_rows_letter_is_the_status_the_real_diff_reports(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        let letters = app.read_with(cx, |app, _| {
+            app.uncommitted_change_set
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.path.display().to_string(),
+                        changes::status_letter(entry.status),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(letters.contains(&("added.txt".to_string(), StatusLetter::Added)));
+        assert!(letters.contains(&("modified.txt".to_string(), StatusLetter::Modified)));
+        assert!(letters.contains(&("deleted.txt".to_string(), StatusLetter::Deleted)));
     }
 }

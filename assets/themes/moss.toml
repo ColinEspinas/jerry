@@ -157,16 +157,13 @@ stat_del   = "#94625d"  # "-8" label
 stat_empty = "#232528"  # unused segment of the 5-bar
 git_gutter = "#315742"  # 3px agent-touched marker
 
-# Small status tags and the file tree's own A/M change marks.
+# Git's own A/M/D status letters on a file row, and the file tree's own A/M change marks.
 [tag]
-"new.fg"      = "#76aa8b"
-"new.bg"      = "#22372b"
-"deleted.fg"  = "#af7d78"
-"deleted.bg"  = "#35201f"
-"conflict.fg" = "#bb9c65"
-"conflict.bg" = "#352b1a"
-tree_added    = "#5b876e"  # "A" mark
-tree_modified = "#8a7847"  # "M" mark
+status_added    = "#5b876e"  # A - a file git reports as added (STAGE-A-CHANGELOG.md §4j).
+status_modified = "#696e73"  # M - a file git reports as modified.
+status_deleted  = "#94625d"  # D
+tree_added      = "#5b876e"  # "A" mark
+tree_modified   = "#8a7847"  # "M" mark
 
 # Tokens used only by the Revision R12 rail rewrite (design_handoff_jerry_ade/revision 3/
 # REVISION-2026-07-31.md §2) that have no exact match elsewhere in this module - every other
@@ -196,21 +193,23 @@ repo_fail_count    = "#a46963"  # The repo header's red urgency **count**
 # (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §1), plus the file row's own
 # seen/unseen and discard states (STAGE-A-CHANGELOG.md §4i).
 [changes]
-edge_uncommitted  = "#3f5264"  # UNCOMMITTED's 2px left edge - what is dirty in the checkout.
-edge_neutral      = "#232528"  # COMMITS' 2px left edge.
-edge_against_main = "#ab80a1"  # AGAINST MAIN's 2px left edge
-section_label     = "#878c91"  # Section header label - 9.5px/600 uppercase, .09em tracking.
-section_count     = "#45494e"  # Section header count
-section_caret     = "#7b7f83"  # The section header's own disclosure caret (▾/▸).
-run_meta_live     = "#766949"
-run_meta_ended    = "#55595e"  # A run row's meta line once the run has ended
-section_stat_add  = "#76aa8b"  # The right-aligned per-section diffstat's +N, 10px mono.
-section_stat_del  = "#a46963"  # The right-aligned per-section diffstat's −N, 10px mono.
-filename_unseen   = "#bec2c6"  # A filename not seen since the agent last changed it
-filename_seen     = "#696e73"  # A filename seen since the agent last changed it
-discard_bg        = "#281a1b"  # The armed Discard? pill's fill.
-discard_border    = "#422623"  # The armed Discard? pill's 1px border.
-discard_fg        = "#ba7972"  # The armed Discard? pill's label.
+edge_uncommitted      = "#3f5264"  # UNCOMMITTED's 2px left edge - what is dirty in the checkout.
+edge_neutral          = "#232528"  # COMMITS' 2px left edge.
+edge_against_main     = "#ab80a1"  # AGAINST MAIN's 2px left edge
+section_label         = "#878c91"  # Section header label - 9.5px/600 uppercase, .09em tracking.
+section_count         = "#45494e"  # Section header count
+section_caret         = "#7b7f83"  # The section header's own disclosure caret (▾/▸).
+run_meta_live         = "#766949"
+run_meta_ended        = "#55595e"  # A run row's meta line once the run has ended
+section_stat_add      = "#76aa8b"  # The right-aligned per-section diffstat's +N, 10px mono.
+section_stat_del      = "#a46963"  # The right-aligned per-section diffstat's −N, 10px mono.
+filename_unseen       = "#bec2c6"  # A filename not seen since the agent last changed it
+filename_seen         = "#696e73"  # A filename seen since the agent last changed it
+discard_bg            = "#281a1b"  # The armed Discard? pill's fill.
+discard_border        = "#422623"  # The armed Discard? pill's 1px border.
+discard_fg            = "#ba7972"  # The armed Discard? pill's label.
+hover_action_hover_bg = "#24282d"
+discard_hover_bg      = "#2f1c1c"  # The discard button's hover fill
 
 # Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
 # (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §2).

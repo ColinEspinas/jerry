@@ -107,7 +107,7 @@ use crate::settings::state as settings;
 #[cfg(test)]
 use crate::settings::state::SettingsPage;
 use crate::settings::store::{self as settings_store, CfgFormat, Settings};
-use crate::sidebar::changes::{self, ChangeTag};
+use crate::sidebar::changes;
 use crate::sidebar::file_tree;
 use crate::sidebar::fold_state;
 use crate::sidebar::sections;
@@ -173,6 +173,7 @@ actions!(
         NewAgentPane,
         NewGitGraph,
         NextChangedFile,
+        ToggleChangeSeen,
         JumpToAgent1,
         JumpToAgent2,
         JumpToAgent3,
@@ -770,14 +771,19 @@ pub struct AdeApp {
     /// falls back to the ordinary stageable presentation while it is `None`, rather than claiming
     /// files are committed on the strength of an answer that hasn't arrived.
     pub(crate) dirty_files: Option<HashSet<PathBuf>>,
-    /// The most recent real staging/unstaging failure from [`Self::toggle_staged`] - `(path,
-    /// message)`. Surfaced next to the commit composer (`Self::render_staging_error`) the same
-    /// honest way [`Self::tree_op_error`] surfaces a failed tree operation, rather than silently
-    /// swallowing a real `git add`/`git reset` failure behind an optimistic UI update that
-    /// quietly reverts. Cleared on dismiss, on the next successful toggle of the same path, and
-    /// (implicitly, since it names a worktree-relative path) whenever a worktree switch clears
-    /// [`Self::staged_files`] out from under it.
-    pub(crate) staging_error: Option<(PathBuf, String)>,
+    /// The most recent real git failure from one Changes row's own controls - `(path, message)`.
+    /// Two writers today: [`Self::toggle_staged`]'s `git add`/`git reset`, and
+    /// [`Self::discard_change_row`]'s `git checkout HEAD -- <path>` (GitHub issue #286's floating
+    /// hover bar). One channel rather than one per action, because it is one place on screen: the
+    /// row acted, the row's action failed, and the panel says so once, immediately under the
+    /// composer.
+    ///
+    /// Surfaced by `Self::render_changes_row_error` the same honest way [`Self::tree_op_error`]
+    /// surfaces a failed tree operation, rather than silently swallowing a real failure behind an
+    /// optimistic UI update that quietly reverts. Cleared on dismiss, on the next successful
+    /// action on the same path, and (implicitly, since it names a worktree-relative path)
+    /// whenever a worktree switch clears [`Self::staged_files`] out from under it.
+    pub(crate) changes_row_error: Option<(PathBuf, String)>,
     /// Every in-flight [`Self::toggle_staged`] background `git add`/`git reset` - a [`TaskPool`],
     /// not a single slot, for the same "independent operations" reason as
     /// [`Self::_merge_write_tasks`]: two different Changes rows' checkboxes clicked in quick
@@ -785,6 +791,36 @@ pub struct AdeApp {
     /// would silently cancel (and so leave un-applied) whichever one didn't win the race for the
     /// slot.
     pub(crate) _stage_tasks: TaskPool,
+    /// Which Uncommitted row's own 27px band the pointer is inside, if any - one half of what
+    /// reveals `STAGE-A-CHANGELOG.md` §4i's floating hover bar.
+    ///
+    /// Two fields rather than one because the bar deliberately **straddles the row's top edge**
+    /// (§4i: "a floating bar straddling the row's top edge … so it plainly sits above the list
+    /// rather than in it"), which means part of it is genuinely outside the row's own hitbox.
+    /// In the HTML mock that costs nothing - the bar is a DOM descendant, so `mouseleave` never
+    /// fires for it - but GPUI's `on_hover` is purely bounds-based, so a single field would see
+    /// the row report `false` the instant the pointer crossed onto the overhanging part and the
+    /// bar would vanish out from under the click it was reaching for.
+    ///
+    /// The pair is also *order-independent*, which a single field could not be: moving between
+    /// the two hitboxes delivers one `false` and one `true` in an order GPUI does not promise
+    /// (the same fact `crate::code_surface::file_view`'s own hover listener guards against), and
+    /// two separate fields OR'd together give the same answer whichever arrives first.
+    pub(crate) change_row_hover: Option<PathBuf>,
+    /// The other half of [`Self::change_row_hover`] - the floating bar's own hitbox, including
+    /// the part of it that hangs above the row. See that field's docs.
+    pub(crate) change_row_actions_hover: Option<PathBuf>,
+    /// The row whose `Discard` button is **armed**: its icon has been clicked once and swapped
+    /// for the red `Discard?` pill, and a second click really discards.
+    ///
+    /// §4i: "Discard takes two clicks. It destroys an agent's work with no git object behind it
+    /// to recover from - the one irreversible action in the panel. […] Leaving the row cancels."
+    /// The cancel is enforced in [`Self::set_change_row_hover`], the one writer of both hover
+    /// fields, so there is no path that can leave a row armed once the pointer is gone.
+    pub(crate) change_row_discard_armed: Option<PathBuf>,
+    /// Every in-flight [`Self::discard_change_row`] background `git checkout`/`git rm` - a
+    /// [`TaskPool`] for the same reason [`Self::_stage_tasks`] is one.
+    pub(crate) _discard_tasks: TaskPool,
     /// Whether the commit composer's `▾` split-button popover (Revision R12 §5: *Commit and
     /// push* / *Commit all N files* / *Amend last commit* / *Stash staged files*) is open. Closed
     /// on every worktree switch (`Self::select_worktree`) since it targets that worktree's own
@@ -3053,6 +3089,7 @@ impl Render for AdeApp {
             })
             .on_action(cx.listener(Self::handle_new_git_graph_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
+            .on_action(cx.listener(Self::handle_toggle_change_seen_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_2_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_3_action))

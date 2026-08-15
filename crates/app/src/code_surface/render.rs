@@ -5,7 +5,7 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
-use crate::root::widgets::render_tag_pill;
+use crate::root::widgets::render_status_letter;
 use crate::settings::widgets::ChoiceOption;
 
 impl AdeApp {
@@ -53,7 +53,12 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (dir, name) = changes::split_dir_name(relative_path);
-        let tag = diff_file.and_then(|file| changes::change_tag(file.status));
+        // `STAGE-A-CHANGELOG.md` §4j applies this letter in "all three places that carried the
+        // badge", and this toolbar is one of them. Unlike the Changes rows, it keeps the slot the
+        // word pill had - after the name rather than ahead of the directory - because a single
+        // header line has no column of siblings to align with, which is exactly what the fixed
+        // column exists for. That is `Jerry.dc.html`'s own diff toolbar order too.
+        let letter = diff_file.map(|file| changes::status_letter(file.status));
         let stats = diff_file.map(changes::diff_file_stats);
         let rename_label = diff_file.and_then(changes::rename_label);
         let has_diff = diff_file.is_some();
@@ -98,7 +103,12 @@ impl AdeApp {
                     .text_color(theme::text::HEADING)
                     .child(name),
             )
-            .when_some(tag, |el, tag| el.child(render_tag_pill(tag)))
+            .when_some(letter, |el, letter| {
+                el.child(
+                    render_status_letter("code-surface-status-letter", letter, px(10.0))
+                        .debug_selector(move || format!("code-surface-status-{}", letter.glyph())),
+                )
+            })
             .when_some(stats, |el, (add, del)| {
                 el.child(
                     div()
