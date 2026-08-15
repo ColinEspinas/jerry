@@ -979,3 +979,59 @@ fn a_draft_left_open_across_a_worktree_switch_never_writes_into_the_other_checko
         );
     });
 }
+
+/// A second window's notes must survive this one saving.
+///
+/// `save_merged_at` rewrites every worktree key this window claims **ownership** of, from its own
+/// in-memory snapshot. Claiming the whole file at startup (which is what `crate::provenance` does,
+/// and what this used to copy) makes that a real loss path: launch, let another window add a note
+/// elsewhere, then save anything at all and the other window's note is overwritten by a
+/// launch-time copy. Ownership is now taken per worktree, only where this window really wrote.
+#[gpui::test]
+fn saving_does_not_overwrite_a_worktree_this_window_only_read(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let state_dir = TempDir::new().expect("tempdir");
+    let notes_file =
+        super::persist_state::review_notes_path_for(&state_dir.path().join("settings.toml"));
+
+    // Another window's worktree, already on disk before this one launches.
+    let other = PathBuf::from("/repo/another-window");
+    let mut theirs = super::NoteStore::default();
+    theirs.set_text(&other, Path::new(PATH), NoteAnchor::New(1), "theirs");
+    super::persist_state::ReviewNotesState::capture(&theirs)
+        .save_at(&notes_file)
+        .expect("seed the other window's notes");
+
+    let (app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+    app.update(cx, |app, _| {
+        app.review_notes_path = Some(notes_file.clone());
+        // Exactly what a launch does: read the whole file into memory.
+        app.restore_review_notes();
+    });
+    cx.run_until_parked();
+
+    // Now write in *this* window's own worktree, and let the save land.
+    click_line(cx, 2);
+    cx.simulate_input("ours");
+    cx.run_until_parked();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(700));
+    cx.run_until_parked();
+
+    let mut merged = super::NoteStore::default();
+    super::persist_state::ReviewNotesState::load_at(&notes_file).restore_into(&mut merged);
+    assert_eq!(
+        merged
+            .note(&other, Path::new(PATH), NoteAnchor::New(1))
+            .map(|note| note.text.as_str()),
+        Some("theirs"),
+        "a worktree this window only read must come back untouched"
+    );
+    let worktree = app.read_with(cx, |app, _| app.review_notes_worktree());
+    assert_eq!(
+        merged.file_state(&worktree, Path::new(PATH)).count,
+        1,
+        "and this window's own note must really have been written"
+    );
+}
