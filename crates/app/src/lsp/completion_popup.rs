@@ -51,6 +51,7 @@ use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
 use crate::keymap;
 use crate::lsp::completion as completion_view;
+use crate::root::scrollbar;
 use crate::root::widgets::{render_hint_pair, render_hint_row};
 use crate::theme;
 use gpui::{BoxShadow, EntityInputHandler};
@@ -836,7 +837,7 @@ impl AdeApp {
                         // regardless of how tall the detail pane makes the row.
                         .flex_1()
                         .child(list)
-                        .children(self.render_vertical_scrollbar(
+                        .children(scrollbar::render_vertical_scrollbar(
                             "completions-scrollbar",
                             &self.completions_scroll_handle,
                             &[],
@@ -1214,7 +1215,7 @@ impl AdeApp {
                 .flex_1()
                 .min_h_0()
                 .child(scroll_body)
-                .children(self.render_vertical_scrollbar(
+                .children(scrollbar::render_vertical_scrollbar(
                     "completions-detail-scrollbar",
                     &self.completions_detail_scroll_handle,
                     &[],

@@ -1,5 +1,6 @@
 use super::*;
 use crate::root::plural;
+use crate::root::scrollbar;
 use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
 use crate::settings::widgets::ChoiceOption;
 use crate::sidebar::render::RightSidebarView;
@@ -962,7 +963,7 @@ impl AdeApp {
             .flex_1()
             .min_h_0()
             .child(container)
-            .children(self.render_vertical_scrollbar(
+            .children(scrollbar::render_vertical_scrollbar(
                 "palette-results-scrollbar",
                 &self.palette_results_scroll_handle,
                 &[],

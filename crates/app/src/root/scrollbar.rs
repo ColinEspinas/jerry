@@ -253,133 +253,141 @@ impl gpui::Render for ScrollbarDrag {
     }
 }
 
-impl AdeApp {
-    /// A real vertical overlay scrollbar for `handle`'s region - `None` when the region doesn't
-    /// currently overflow vertically (nothing to draw, nothing to hit-test). `id` must be a
-    /// literal unique to this call site (see this module's own docs on why `on_drag_move`
-    /// dispatch needs it). `marks` are the editor's real decoration ticks (empty for every other
-    /// region - see [`ScrollbarMark`]'s own docs).
-    pub(crate) fn render_vertical_scrollbar<H: ScrollableHandle>(
-        &self,
-        id: &'static str,
-        handle: &H,
-        marks: &[ScrollbarMark],
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let bounds = handle.viewport_bounds();
-        let viewport = bounds.size.height.as_f32();
-        let max_offset = handle.max_scroll_offset().y.as_f32();
-        if viewport <= 0.0 || max_offset <= 0.5 {
-            return None;
-        }
-        let scrolled = (-handle.scroll_offset().y.as_f32()).clamp(0.0, max_offset);
-        let thumb_len = geometry::thumb_length(viewport, max_offset);
-        let thumb_top = geometry::thumb_position(viewport, max_offset, scrolled);
-
-        let jump_handle = handle.clone();
-        let drag_handle = handle.clone();
-
-        Some(
-            div()
-                .id(id)
-                // Test-only (a no-op outside test builds, like every other `debug_selector` in
-                // this codebase) - lets a real render test read the track's own painted bounds
-                // back with `VisualTestContext::debug_bounds` to assert genuine geometric
-                // clearance (see `crate::sidebar::render`'s tests), rather than trusting a
-                // padding value's *number* changed without proving what it actually clears.
-                .debug_selector(move || id.to_string())
-                .absolute()
-                .top_0()
-                .right_0()
-                .h_full()
-                .w(px(SCROLLBAR_SIZE))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_this, event: &MouseDownEvent, _window, cx| {
-                        let viewport = jump_handle.viewport_bounds().size.height.as_f32();
-                        let max_offset = jump_handle.max_scroll_offset().y.as_f32();
-                        let track_top = jump_handle.viewport_bounds().origin.y.as_f32();
-                        let new_scrolled = geometry::offset_for_pointer(
-                            viewport,
-                            max_offset,
-                            track_top,
-                            event.position.y.as_f32(),
-                        );
-                        let current = jump_handle.scroll_offset();
-                        jump_handle.set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
-                        cx.notify();
-                    }),
-                )
-                .children(marks.iter().map(|mark| {
-                    let top = (mark.fraction * viewport).clamp(0.0, (viewport - 2.0).max(0.0));
-                    div()
-                        .absolute()
-                        .top(px(top))
-                        .right_0()
-                        .w(px(SCROLLBAR_SIZE))
-                        .h(px(2.0))
-                        .bg(mark.color)
-                }))
-                .child(
-                    div()
-                        .id(format!("{id}-thumb"))
-                        .absolute()
-                        .top(px(thumb_top + THUMB_INSET))
-                        // STAGE-A-CHANGELOG.md §4p: the thumb carries "a 2px transparent border
-                        // and `background-clip:content-box` so it floats 2px clear of the edge".
-                        // Drawn directly rather than in CSS, that transparent border is simply an
-                        // inset on every edge - so the thumb is `WIDTH - 2 * INSET` wide and sits
-                        // `INSET` in from the track's own edges. The track keeps its full
-                        // `SCROLLBAR_SIZE` width and its own click-to-jump handler, so the region
-                        // the pointer can act on is unchanged; only the painted bar is slimmer.
-                        .right(theme::scrollbar::THUMB_INSET)
-                        .w(px(SCROLLBAR_SIZE - 2.0 * THUMB_INSET))
-                        .h(px(thumb_len - 2.0 * THUMB_INSET))
-                        .rounded(theme::scrollbar::THUMB_RADIUS)
-                        // Painted at full strength: §4p's `#2b3137` is already quieter than the
-                        // greys these values replaced, so the old opacity multiplier would land
-                        // somewhere the spec did not ask for.
-                        .bg(theme::scrollbar::THUMB)
-                        .hover(|el| el.bg(theme::scrollbar::THUMB_HOVER))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
-                                // Swallows the mouse-down so it never also bubbles to the
-                                // track's own handler above and jumps the view right before
-                                // the drag below takes over - the same idiom
-                                // `crate::root::resize::AdeApp::render_resize_handle` uses for
-                                // its splitter.
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .on_drag(ScrollbarDrag { id }, move |drag, _offset, _window, cx| {
-                            cx.new(|_| *drag)
-                        })
-                        .on_drag_move(cx.listener(
-                            move |_this, event: &DragMoveEvent<ScrollbarDrag>, _window, cx| {
-                                let drag = event.drag(cx);
-                                if drag.id != id {
-                                    return;
-                                }
-                                let viewport = drag_handle.viewport_bounds().size.height.as_f32();
-                                let max_offset = drag_handle.max_scroll_offset().y.as_f32();
-                                let track_top = drag_handle.viewport_bounds().origin.y.as_f32();
-                                let new_scrolled = geometry::offset_for_pointer(
-                                    viewport,
-                                    max_offset,
-                                    track_top,
-                                    event.event.position.y.as_f32(),
-                                );
-                                let current = drag_handle.scroll_offset();
-                                drag_handle
-                                    .set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
-                                cx.notify();
-                            },
-                        )),
-                )
-                .into_any_element(),
-        )
+/// A real vertical overlay scrollbar for `handle`'s region - `None` when the region doesn't
+/// currently overflow vertically (nothing to draw, nothing to hit-test). `id` must be a
+/// literal unique to this call site (see this module's own docs on why `on_drag_move`
+/// dispatch needs it). `marks` are the editor's real decoration ticks (empty for every other
+/// region - see [`ScrollbarMark`]'s own docs).
+///
+/// A free function generic over `Context<T>` rather than an `AdeApp` method (GitHub issue
+/// #331): every call site until that issue happened to be a method on `AdeApp` itself, so it
+/// was originally written as one, taking an unused `&self` purely to be callable as
+/// `scrollbar::render_vertical_scrollbar(...)` from those sites. `crate::terminal::pane::
+/// TerminalPane` is a genuinely separate `Entity<TerminalPane>` with its own `Context<TerminalPane>`
+/// - it has no `AdeApp` to call this through - and the body never actually touched `self` (both
+/// `cx.listener` closures below take `_this`, unused), so generalizing the signature is a real
+/// behavior-preserving mechanical change, not a rework: every existing `AdeApp` call site
+/// still type-checks unchanged (`T` is inferred from `cx`'s own type), just spelled as a plain
+/// function call instead of a method call.
+pub(crate) fn render_vertical_scrollbar<T: 'static, H: ScrollableHandle>(
+    id: &'static str,
+    handle: &H,
+    marks: &[ScrollbarMark],
+    cx: &mut Context<T>,
+) -> Option<AnyElement> {
+    let bounds = handle.viewport_bounds();
+    let viewport = bounds.size.height.as_f32();
+    let max_offset = handle.max_scroll_offset().y.as_f32();
+    if viewport <= 0.0 || max_offset <= 0.5 {
+        return None;
     }
+    let scrolled = (-handle.scroll_offset().y.as_f32()).clamp(0.0, max_offset);
+    let thumb_len = geometry::thumb_length(viewport, max_offset);
+    let thumb_top = geometry::thumb_position(viewport, max_offset, scrolled);
+
+    let jump_handle = handle.clone();
+    let drag_handle = handle.clone();
+
+    Some(
+        div()
+            .id(id)
+            // Test-only (a no-op outside test builds, like every other `debug_selector` in
+            // this codebase) - lets a real render test read the track's own painted bounds
+            // back with `VisualTestContext::debug_bounds` to assert genuine geometric
+            // clearance (see `crate::sidebar::render`'s tests), rather than trusting a
+            // padding value's *number* changed without proving what it actually clears.
+            .debug_selector(move || id.to_string())
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(px(SCROLLBAR_SIZE))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_this, event: &MouseDownEvent, _window, cx| {
+                    let viewport = jump_handle.viewport_bounds().size.height.as_f32();
+                    let max_offset = jump_handle.max_scroll_offset().y.as_f32();
+                    let track_top = jump_handle.viewport_bounds().origin.y.as_f32();
+                    let new_scrolled = geometry::offset_for_pointer(
+                        viewport,
+                        max_offset,
+                        track_top,
+                        event.position.y.as_f32(),
+                    );
+                    let current = jump_handle.scroll_offset();
+                    jump_handle.set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
+                    cx.notify();
+                }),
+            )
+            .children(marks.iter().map(|mark| {
+                let top = (mark.fraction * viewport).clamp(0.0, (viewport - 2.0).max(0.0));
+                div()
+                    .absolute()
+                    .top(px(top))
+                    .right_0()
+                    .w(px(SCROLLBAR_SIZE))
+                    .h(px(2.0))
+                    .bg(mark.color)
+            }))
+            .child(
+                div()
+                    .id(format!("{id}-thumb"))
+                    .absolute()
+                    .top(px(thumb_top + THUMB_INSET))
+                    // STAGE-A-CHANGELOG.md §4p: the thumb carries "a 2px transparent border
+                    // and `background-clip:content-box` so it floats 2px clear of the edge".
+                    // Drawn directly rather than in CSS, that transparent border is simply an
+                    // inset on every edge - so the thumb is `WIDTH - 2 * INSET` wide and sits
+                    // `INSET` in from the track's own edges. The track keeps its full
+                    // `SCROLLBAR_SIZE` width and its own click-to-jump handler, so the region
+                    // the pointer can act on is unchanged; only the painted bar is slimmer.
+                    .right(theme::scrollbar::THUMB_INSET)
+                    .w(px(SCROLLBAR_SIZE - 2.0 * THUMB_INSET))
+                    .h(px(thumb_len - 2.0 * THUMB_INSET))
+                    .rounded(theme::scrollbar::THUMB_RADIUS)
+                    // Painted at full strength: §4p's `#2b3137` is already quieter than the
+                    // greys these values replaced, so the old opacity multiplier would land
+                    // somewhere the spec did not ask for.
+                    .bg(theme::scrollbar::THUMB)
+                    .hover(|el| el.bg(theme::scrollbar::THUMB_HOVER))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
+                            // Swallows the mouse-down so it never also bubbles to the
+                            // track's own handler above and jumps the view right before
+                            // the drag below takes over - the same idiom
+                            // `crate::root::resize::AdeApp::render_resize_handle` uses for
+                            // its splitter.
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_drag(ScrollbarDrag { id }, move |drag, _offset, _window, cx| {
+                        cx.new(|_| *drag)
+                    })
+                    .on_drag_move(cx.listener(
+                        move |_this, event: &DragMoveEvent<ScrollbarDrag>, _window, cx| {
+                            let drag = event.drag(cx);
+                            if drag.id != id {
+                                return;
+                            }
+                            let viewport = drag_handle.viewport_bounds().size.height.as_f32();
+                            let max_offset = drag_handle.max_scroll_offset().y.as_f32();
+                            let track_top = drag_handle.viewport_bounds().origin.y.as_f32();
+                            let new_scrolled = geometry::offset_for_pointer(
+                                viewport,
+                                max_offset,
+                                track_top,
+                                event.event.position.y.as_f32(),
+                            );
+                            let current = drag_handle.scroll_offset();
+                            drag_handle
+                                .set_scroll_offset(gpui::point(current.x, px(-new_scrolled)));
+                            cx.notify();
+                        },
+                    )),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Pins this module's plain-`f32` geometry constants to the design tokens they mirror.
