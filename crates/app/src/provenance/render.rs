@@ -125,6 +125,14 @@ fn agent_style(key: &AgentKey) -> Option<AuthorStyle> {
     })
 }
 
+/// This agent's `(fg, bg)` from [`crate::theme::agent`]'s pool - the colour half of
+/// [`agent_style`], without the owned label, for the paths that run per diff line per frame.
+fn agent_tint_of(key: &AgentKey) -> Option<(Rgba, Rgba)> {
+    Some(work_surface::state::agent_tint(ProcessKind::Agent(
+        key.kind()?,
+    )))
+}
+
 /// The colour of `author`'s gutter bar, or `None` for a line that carries no bar at all.
 ///
 /// `you` deliberately does **not** take [`AuthorStyle::fg`] here: the chip's glyph has to read
@@ -134,7 +142,8 @@ fn agent_style(key: &AgentKey) -> Option<AuthorStyle> {
 pub fn author_gutter_color(author: &Author) -> Option<Rgba> {
     match author {
         Author::You => Some(theme::changes::HAND_EDIT_GUTTER.into()),
-        other => author_style(other).map(|style| style.fg),
+        Author::Agent(key) => agent_tint_of(key).map(|(fg, _)| fg),
+        Author::Unattributed => None,
     }
 }
 
@@ -163,10 +172,10 @@ pub fn author_tooltip(author: &Author) -> Option<String> {
 ///   lines exactly the set the toolbar's `<agent> only` indicator claims they are.
 pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool {
     match (author, filter) {
-        // `author_style(author).is_some()` rather than `author.is_some()`: a context or
-        // unattributed line arrives as `Some(Author::Unattributed)`, which is the absence of an
-        // answer, and an absent answer is nobody's line to dim.
-        (Some(author), Some(filter)) => author_style(author).is_some() && author != filter,
+        // `is_drawable(author)` rather than `author.is_some()`: a context or unattributed line
+        // arrives as `Some(Author::Unattributed)`, which is the absence of an answer, and an
+        // absent answer is nobody's line to dim.
+        (Some(author), Some(filter)) => is_drawable(author) && author != filter,
         _ => false,
     }
 }
