@@ -441,11 +441,17 @@ impl AdeApp {
     /// focused-but-blinked-off, or simply unfocused - paints nothing at all.
     pub(crate) fn render_simple_input_caret(
         &self,
-        selector: &'static str,
+        selector: impl Into<gpui::SharedString>,
         focus_handle: &FocusHandle,
     ) -> impl IntoElement {
         let caret_blink_visible = self.caret_blink_visible;
         let focus_handle = focus_handle.clone();
+        // `impl Into<SharedString>` rather than `&'static str`: a caret that belongs to a *row of
+        // a list* has one selector per row (`diff-note-3-caret`), and `debug_bounds` is a map
+        // keyed by selector - two rows sharing one name would collapse to whichever painted last,
+        // which is exactly the ambiguity `only_the_card_being_typed_into_paints_a_caret` has to be
+        // able to see through.
+        let selector = selector.into();
         div()
             .flex_none()
             .w(px(1.5))
@@ -468,6 +474,125 @@ impl AdeApp {
                 .size_full(),
             )
     }
+
+    /// **The** caret+text row every hand-rolled single-line input in this app should be built
+    /// from - the complete structure, not just the caret glyph.
+    ///
+    /// ## Why this exists (a live report, three times over)
+    ///
+    /// [`Self::render_simple_input_caret`] has been shared since GitHub issue #27, but it only
+    /// ever returned the 1.5px blinking bar. Every one of the app's ~nine simple inputs still
+    /// hand-assembled the *row around it* - where `flex_1`/`min_w_0` go, whether the row centres
+    /// its items, whether the caret is drawn before the placeholder or after the text - and that
+    /// surrounding structure is exactly what kept being got wrong, one field at a time, with a
+    /// separate live bug report each time.
+    ///
+    /// The failure is always the same one, and it is not obvious by reading a single call site:
+    /// putting `.flex_1().min_w_0()` on the **text** element makes that element's layout box
+    /// stretch across all the row's remaining width whatever the text actually says, so the
+    /// `flex_none` caret that follows it is pushed to the far right edge of the field instead of
+    /// sitting against the last glyph. It looks correct in any field narrow enough that the text
+    /// fills it, and wrong in every other one - which is why it kept shipping.
+    ///
+    /// So the rule this encodes is: **`flex_1`/`min_w_0` belong on the wrapper that holds both
+    /// the caret and the text, never on the text itself.** The text is intrinsically sized and
+    /// merely allowed to shrink and clip; the caret sits immediately after it.
+    ///
+    /// The second rule it encodes is GitHub issue #45's own: an empty field's real cursor
+    /// position is 0, so the caret is drawn **before** the placeholder while the field is blank
+    /// and **after** the text once there is any - never appended past whatever placeholder string
+    /// happens to be rendering. And there is deliberately no gap between the text and the caret:
+    /// a cursor sits flush against the last glyph (`crate::rail::render`'s own live report).
+    ///
+    /// The caller still owns the box *around* this row - its border, padding, height and
+    /// background - because that genuinely differs per field. What it no longer owns is the part
+    /// that was never supposed to differ.
+    pub(crate) fn render_simple_input_row(&self, input: SimpleInput<'_>) -> impl IntoElement {
+        let SimpleInput {
+            caret_selector,
+            text_selector,
+            focus_handle,
+            text,
+            placeholder,
+            font: font_name,
+            text_size,
+            text_color,
+            placeholder_color,
+        } = input;
+        // "Blank" by the same rule every caller used: nothing typed at all. A field holding only
+        // spaces is holding real text and shows it, with the caret after it.
+        let is_blank = text.is_empty();
+        let shown = if is_blank { placeholder } else { text }.to_string();
+        // `None` is a genuinely read-only row - a pinned note card that is not the one being
+        // typed into, say. It cannot be expressed by passing a handle that happens to be
+        // unfocused: several of these rows can be on screen sharing *one* focus handle (only one
+        // draft is ever open), and a caret keyed on that shared handle would paint in every one
+        // of them the moment any of them was focused.
+        let caret = |el: gpui::Div| match focus_handle {
+            Some(handle) => {
+                el.child(self.render_simple_input_caret(caret_selector.clone(), handle))
+            }
+            None => el,
+        };
+        div()
+            // On the wrapper, which is the whole point - see this method's own docs.
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .when(is_blank, caret)
+            .child(
+                div()
+                    .debug_selector(move || text_selector.to_string())
+                    // Intrinsically sized, and allowed to shrink and clip rather than to wrap or
+                    // to push the caret out of the row: `min_w_0` here is a *floor* of zero on an
+                    // auto-sized box, which is a different thing from the `flex_1` that used to
+                    // sit beside it and is what makes a field narrower than its own text degrade
+                    // to a clipped line instead of a two-line row.
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .font(font(font_name))
+                    .text_size(text_size)
+                    .text_color(if is_blank {
+                        placeholder_color
+                    } else {
+                        text_color
+                    })
+                    .child(shown),
+            )
+            .when(!is_blank, caret)
+    }
+}
+
+/// One [`AdeApp::render_simple_input_row`] field: what it holds, what it says while empty, and
+/// how it is painted.
+///
+/// A struct rather than eight positional parameters, for the same reason
+/// `crate::code_surface::diff_view::DiffLineChrome` is one: past `clippy::too_many_arguments`, and
+/// four of these are `&str`/colour pairs that would be trivially transposable at a call site.
+pub(crate) struct SimpleInput<'a> {
+    /// The caret element's own `debug_selector`, so a render test can assert *where* it painted.
+    /// A [`SharedString`] for the same reason [`Self::text_selector`] is one.
+    pub caret_selector: gpui::SharedString,
+    /// The text element's `debug_selector`, for the same reason. A [`SharedString`] rather than a
+    /// `&'static str` because a field that is a *row of a list* has one selector per row.
+    pub text_selector: gpui::SharedString,
+    /// The handle the caret watches - it paints only while this one is really focused. `None`
+    /// draws no caret at all, which is what a read-only row of an otherwise-editable list is.
+    pub focus_handle: Option<&'a FocusHandle>,
+    /// What the field holds right now.
+    pub text: &'a str,
+    /// What it says while that is empty.
+    pub placeholder: &'a str,
+    /// The font family, as a `crate::theme::font` name.
+    pub font: &'static str,
+    /// Already scaled by the caller's own `AdeApp::ui_text_size` where that applies.
+    pub text_size: Pixels,
+    /// The colour of real typed text.
+    pub text_color: theme::ColorToken,
+    /// The (usually dimmer) colour of the placeholder.
+    pub placeholder_color: theme::ColorToken,
 }
 
 /// [`AdeApp::render_simple_input_caret`]'s paint decision, pulled out as a pure function so it's

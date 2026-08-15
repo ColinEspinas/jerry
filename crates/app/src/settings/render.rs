@@ -2,6 +2,7 @@ use super::*;
 use crate::root::plural;
 use crate::root::widgets::{
     hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
+    SimpleInput,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::sound::SoundEventKind;
@@ -1120,36 +1121,24 @@ impl AdeApp {
                     .border_1()
                     .border_color(theme::border::CARD_FIELD)
                     .bg(theme::surface::CARD_SUNK)
-                    // The caret sits before the placeholder (real cursor position 0) while the
-                    // field is empty, never appended after it - same fix as every other simple
-                    // input in this app (GitHub issue #45).
-                    .when(!has_shell, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-shell-caret",
-                            &self.shell_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(10.5))
-                            .text_color(if has_shell {
-                                theme::text::BODY
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_shell { shell } else { placeholder })
-                            .debug_selector(|| "settings-shell-text".to_string()),
-                    )
-                    .when(has_shell, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-shell-caret",
-                            &self.shell_focus_handle,
-                        ))
-                    }),
+                    // Caret placement and text sizing both through
+                    // `AdeApp::render_simple_input_row`, which owns that structure for every
+                    // simple input in this app. This field was the *second* live instance of the
+                    // bug that helper exists to make unrepeatable: `.flex_1().min_w_0()` sat on
+                    // the text element, so inside this fixed 168px box the text's layout box
+                    // filled the whole field whatever the shell path said, and the caret after it
+                    // sat pinned to the right-hand border instead of against the last character.
+                    .child(self.render_simple_input_row(SimpleInput {
+                        caret_selector: "settings-shell-caret".into(),
+                        text_selector: "settings-shell-text".into(),
+                        focus_handle: Some(&self.shell_focus_handle),
+                        text: if has_shell { &shell } else { "" },
+                        placeholder: &placeholder,
+                        font: theme::font::MONO,
+                        text_size: self.ui_text_size(10.5),
+                        text_color: theme::text::BODY,
+                        placeholder_color: theme::text::GHOST,
+                    })),
             )
     }
 
@@ -2608,8 +2597,6 @@ impl AdeApp {
         total: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = !self.settings_keymap_filter.is_empty();
-
         div()
             .id("settings-keymap-filter")
             .track_focus(&self.settings_keymap_filter_focus_handle)
@@ -2651,34 +2638,17 @@ impl AdeApp {
                     // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
                     // before the placeholder (real cursor position 0) while the filter is empty,
                     // never appended after it.
-                    .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-keymap-filter-caret",
-                            &self.settings_keymap_filter_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(px(11.0))
-                            .text_color(if has_query {
-                                theme::text::DIM
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_query {
-                                self.settings_keymap_filter.as_str().to_string()
-                            } else {
-                                format!("filter {}", plural::count(total, "binding", None))
-                            })
-                            .debug_selector(|| "settings-keymap-filter-text".to_string()),
-                    )
-                    .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-keymap-filter-caret",
-                            &self.settings_keymap_filter_focus_handle,
-                        ))
-                    }),
+                    .child(self.render_simple_input_row(SimpleInput {
+                        caret_selector: "settings-keymap-filter-caret".into(),
+                        text_selector: "settings-keymap-filter-text".into(),
+                        focus_handle: Some(&self.settings_keymap_filter_focus_handle),
+                        text: self.settings_keymap_filter.as_str(),
+                        placeholder: &format!("filter {}", plural::count(total, "binding", None)),
+                        font: theme::font::SANS,
+                        text_size: px(11.0),
+                        text_color: theme::text::DIM,
+                        placeholder_color: theme::text::GHOST,
+                    })),
             )
             .child(
                 div()
@@ -6048,6 +6018,71 @@ mod settings_keymap_filter_caret_tests {
              real text) - got {:?} vs {:?}",
             empty_caret.origin.x,
             typed_caret.origin.x,
+        );
+    }
+
+    /// **The second live instance of the same structural caret bug**, found by auditing every
+    /// hand-rolled input in this app after the review-note card's own report (*"Caret is not
+    /// right, does not follow the typing of the user and just stays on the right side"*).
+    ///
+    /// This field used to carry `.flex_1().min_w_0()` on its **text** element. The field itself is
+    /// a fixed 168px box, so the text's layout box filled the whole of it whatever the shell path
+    /// said, and the caret - a `flex_none` sibling *after* that box - was pinned against the
+    /// field's right-hand border rather than sitting after the last character typed.
+    ///
+    /// Both this field and the review-note card now build their caret+text row through
+    /// `AdeApp::render_simple_input_row`, which is where that placement lives now.
+    #[gpui::test]
+    fn the_shell_fields_caret_follows_the_text_rather_than_pinning_to_the_fields_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.settings_page = crate::settings::SettingsPage::General;
+            window.focus(&app.shell_focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let field = cx
+            .debug_bounds("settings-shell-input")
+            .expect("the shell field must really paint");
+        let empty_caret = cx
+            .debug_bounds("settings-shell-caret")
+            .expect("and its caret, with the field empty");
+        let placeholder = cx
+            .debug_bounds("settings-shell-text")
+            .expect("and its placeholder");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "an empty field's real cursor position is 0 - got caret {empty_caret:?} vs \
+             placeholder {placeholder:?}"
+        );
+
+        cx.simulate_input("/bin/sh");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.shell_input.as_str().to_string()),
+            "/bin/sh",
+            "sanity check: the field really took the typed text"
+        );
+
+        let text = cx
+            .debug_bounds("settings-shell-text")
+            .expect("the typed text must really paint");
+        let caret = cx
+            .debug_bounds("settings-shell-caret")
+            .expect("and so must its caret");
+        assert!(
+            caret.origin.x >= text.origin.x + text.size.width - gpui::px(1.0)
+                && caret.origin.x < text.origin.x + text.size.width + gpui::px(4.0),
+            "the caret must sit flush against the last glyph - got caret {caret:?} vs text {text:?}"
+        );
+        assert!(
+            caret.origin.x + caret.size.width < field.origin.x + field.size.width - gpui::px(20.0),
+            "and nowhere near the field's own right border, which is where a `flex_1` on the text \
+             element used to put it - got caret {caret:?} in field {field:?}"
         );
     }
 

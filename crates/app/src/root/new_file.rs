@@ -252,8 +252,7 @@ impl AdeApp {
                             .text_color(theme::text::FAINTER)
                             .child(parent_label),
                     )
-                    .child({
-                        let has_name = !name.is_empty();
+                    .child(
                         div()
                             .px(px(8.0))
                             .py(px(5.0))
@@ -261,42 +260,27 @@ impl AdeApp {
                             .bg(theme::surface::SEGMENT_TRACK)
                             .flex()
                             .items_center()
-                            // No decorative gap before the caret - see
-                            // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                            // comment for why (live report: it read as a gap between the
-                            // typed text and where it's actually being typed).
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.5))
-                            .text_color(theme::text::BODY)
                             // GitHub issue #45 / live report: this prompt had no caret element
                             // at all before this - just the typed name or its placeholder, no
                             // insertion-point indicator, and `new_file_focus_handle` was never
                             // wired into `crate::root::caret_blink` either (see
-                            // `Self::new_with_settings`'s own comment on the fix). Same
-                            // before-placeholder / after-text placement as
-                            // `crate::rail::render::AdeApp::render_rail_filter_row`.
-                            .when(!has_name, |el| {
-                                el.child(self.render_simple_input_caret(
-                                    "new-file-caret",
-                                    &self.new_file_focus_handle,
-                                ))
-                            })
-                            .child(
-                                div()
-                                    .debug_selector(|| "new-file-name-text".to_string())
-                                    .child(if has_name {
-                                        name
-                                    } else {
-                                        "file-name.ext".to_string()
-                                    }),
-                            )
-                            .when(has_name, |el| {
-                                el.child(self.render_simple_input_caret(
-                                    "new-file-caret",
-                                    &self.new_file_focus_handle,
-                                ))
-                            })
-                    })
+                            // `Self::new_with_settings`'s own comment on the fix). The caret and
+                            // the text around it now come from the one helper that owns that
+                            // structure - see `AdeApp::render_simple_input_row`.
+                            .child(self.render_simple_input_row(widgets::SimpleInput {
+                                caret_selector: "new-file-caret".into(),
+                                text_selector: "new-file-name-text".into(),
+                                focus_handle: Some(&self.new_file_focus_handle),
+                                text: &name,
+                                placeholder: "file-name.ext",
+                                font: theme::font::MONO,
+                                text_size: px(11.5),
+                                // One colour for both: this prompt has never dimmed its
+                                // placeholder, and the migration is not the place to change that.
+                                text_color: theme::text::BODY,
+                                placeholder_color: theme::text::BODY,
+                            })),
+                    )
                     .when_some(self.new_file_error.clone(), |el, error| {
                         el.child(
                             div()

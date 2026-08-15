@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::root::widgets::{
-    menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter,
+    menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter, SimpleInput,
 };
 use crate::settings::widgets;
 use crate::sidebar::changes;
@@ -2953,7 +2953,6 @@ impl AdeApp {
         count: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = !self.graph_state.branches_filter.is_empty();
         div()
             .id("graph-branches-filter")
             .track_focus(&self.graph_state.branches_filter_focus_handle)
@@ -2979,51 +2978,20 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child("/"),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    // GitHub issue #45 / live report: this filter row had *no* caret element at
-                    // all - `branches_filter_focus_handle` was never threaded into
-                    // `AdeApp::wire_caret_blink` (see `Self::new_with_settings`'s own comment on
-                    // why it's wired separately, after `graph_state` exists), so there was
-                    // nothing to paint here regardless. Now matches
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own fixed
-                    // before-placeholder / after-text placement.
-                    .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "graph-branches-filter-caret",
-                            &self.graph_state.branches_filter_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(10.5))
-                            .text_color(if has_query {
-                                theme::text::DIM
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_query {
-                                self.graph_state.branches_filter.as_str().to_string()
-                            } else {
-                                "filter branches".to_string()
-                            })
-                            .debug_selector(|| "graph-branches-filter-text".to_string()),
-                    )
-                    .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "graph-branches-filter-caret",
-                            &self.graph_state.branches_filter_focus_handle,
-                        ))
-                    }),
-            )
+            // Caret placement, the empty/typed ordering and the flex structure around them all
+            // through the one helper that owns them - see
+            // `AdeApp::render_simple_input_row`'s own docs.
+            .child(self.render_simple_input_row(SimpleInput {
+                caret_selector: "graph-branches-filter-caret".into(),
+                text_selector: "graph-branches-filter-text".into(),
+                focus_handle: Some(&self.graph_state.branches_filter_focus_handle),
+                text: self.graph_state.branches_filter.as_str(),
+                placeholder: "filter branches",
+                font: theme::font::MONO,
+                text_size: px(10.5),
+                text_color: theme::text::DIM,
+                placeholder_color: theme::text::GHOST,
+            }))
             .child(
                 div()
                     .font(font(theme::font::MONO))

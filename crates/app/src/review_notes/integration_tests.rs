@@ -497,6 +497,141 @@ fn a_worktree_whose_only_tab_is_a_shell_offers_no_send_target(cx: &mut TestAppCo
         cx.debug_bounds("diff-notes-send").is_none(),
         "but there is no send button, rather than one naming an agent that is not there"
     );
+    assert!(
+        cx.debug_bounds("diff-notes-send-unavailable").is_some(),
+        "the control is still drawn, muted and naming what is missing - see \
+         `the_send_control_says_why_it_cannot_send_rather_than_vanishing`"
+    );
+}
+
+/// **Live report: *"I can't really submit the comments, maybe there is something I don't
+/// understand"*.**
+///
+/// There was nothing to understand. The bar drew its send button only once
+/// [`AdeApp::review_note_target`] resolved a live agent session in the worktree, and drew nothing
+/// whatsoever otherwise - so a reviewer who opened a diff before starting an agent (the ordinary
+/// order: read the change, *then* ask for the revision) saw a bar that counted their notes,
+/// promised they would go out as one prompt, and offered no control, no keycaps and no
+/// explanation. `mod+enter` was bound the whole time, but the only place that shortcut is ever
+/// advertised is inside the button that was not being drawn.
+///
+/// So this asserts the two halves that were missing, in the state that produced the report - a
+/// real note on a real diff in a worktree with no agent at all:
+///
+/// 1. a send control is really painted, and
+/// 2. it says what is missing, rather than naming an agent that is not there.
+///
+/// And it asserts the recovery: the moment a real agent session exists, the same slot becomes the
+/// real button.
+#[gpui::test]
+fn the_send_control_says_why_it_cannot_send_rather_than_vanishing(cx: &mut TestAppContext) {
+    let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let program = agent_stand_in(shim_dir.path());
+    let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+    app.update_in(cx, |app, window, cx| {
+        app.settings.terminal.shell = Some(program);
+        app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        app.open_change_diff(PathBuf::from(PATH), window, cx);
+    });
+    cx.run_until_parked();
+
+    click_line(cx, 2);
+    cx.simulate_input("this needs a tenant id");
+    cx.run_until_parked();
+
+    let unavailable = cx.debug_bounds("diff-notes-send-unavailable").expect(
+        "with no agent in the worktree the send control must still be drawn - a bar that counts \
+         notes and offers nothing to do with them is the whole of the live report",
+    );
+    assert!(
+        unavailable.size.width > gpui::px(0.0),
+        "and it must be a real, measurable control rather than a zero-width placeholder"
+    );
+    assert!(
+        cx.debug_bounds("diff-notes-send-unavailable-label")
+            .is_some(),
+        "carrying its own label, which is what says *why* it cannot send"
+    );
+    assert!(
+        super::render::SEND_UNAVAILABLE_LABEL.contains("no agent"),
+        "and that label names the missing thing rather than an agent that is not there - got {:?}",
+        super::render::SEND_UNAVAILABLE_LABEL
+    );
+    assert!(
+        cx.debug_bounds("diff-notes-send").is_none(),
+        "the real button stays absent while there is genuinely nobody to send to"
+    );
+
+    // The recovery: one real agent session, and the same slot becomes the real button.
+    app.update_in(cx, |app, window, cx| {
+        app.new_agent(ProcessKind::Shell, window, cx);
+        let id = app.agents.active_id().expect("the tab we just spawned");
+        app.agents.set_kind_for_test(id, ProcessKind::claude());
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("diff-notes-send").is_some(),
+        "the moment a real agent session exists the send button must appear"
+    );
+    assert!(
+        cx.debug_bounds("diff-notes-send-unavailable").is_none(),
+        "and the muted stand-in must go, rather than both being drawn"
+    );
+}
+
+/// A `NoTarget` failure is a statement about the worktree, and starting an agent makes it false.
+///
+/// Observed on a real window while reproducing this feature's other reports: pressing `mod+enter`
+/// with no agent open left `no agent open in this worktree to send to` sitting in the bar, in red,
+/// where it stayed after an agent was started - directly beside the live `Send notes to Claude`
+/// button it was contradicting. The bar now filters the recorded failure against what is true at
+/// render time, which is why `AdeApp::note_send_error` holds the error rather than its sentence.
+#[gpui::test]
+fn a_no_target_failure_stops_being_shown_once_an_agent_really_is_open(cx: &mut TestAppContext) {
+    let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let program = agent_stand_in(shim_dir.path());
+    let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+    app.update_in(cx, |app, window, cx| {
+        app.settings.terminal.shell = Some(program);
+        app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        app.open_change_diff(PathBuf::from(PATH), window, cx);
+    });
+    cx.run_until_parked();
+
+    click_line(cx, 2);
+    cx.simulate_input("no one is listening yet");
+    cx.run_until_parked();
+    // The same spec string the keycaps are rendered from, as a real keystroke.
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        app.read_with(cx, |app, _| app.note_send_error),
+        Some(super::flow::NoteSendError::NoTarget),
+        "the keystroke is bound and really reports the failure rather than doing nothing"
+    );
+    assert!(
+        cx.debug_bounds("diff-notes-bar-error").is_some(),
+        "and while it is still true, the bar says it out loud"
+    );
+
+    app.update_in(cx, |app, window, cx| {
+        app.new_agent(ProcessKind::Shell, window, cx);
+        let id = app.agents.active_id().expect("the tab we just spawned");
+        app.agents.set_kind_for_test(id, ProcessKind::claude());
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("diff-notes-bar-error").is_none(),
+        "once a real target exists the bar must stop claiming there is none, rather than leaving \
+         a red contradiction beside a live send button"
+    );
 }
 
 /// *"Notes are keyed per worktree + path + line and survive scrolling/reopening."* Opening another
@@ -1042,4 +1177,211 @@ fn saving_does_not_overwrite_a_worktree_this_window_only_read(cx: &mut TestAppCo
         1,
         "and this window's own note must really have been written"
     );
+}
+
+/// **Live report: *"when clicking on the line the comment popover is changing width strangely"*.**
+///
+/// It really was. A `gpui::uniform_list` lays each item out through `Drawable::layout_as_root`,
+/// which - unlike the *window* root, the only node `TaffyLayoutEngine::stretch_auto_size_to_fill`
+/// is ever applied to - leaves an `auto` width sized to the item's own **content**. So the card's
+/// `flex_1` body resolved against the note's text rather than against the pane: the card grew a
+/// few pixels per keystroke, and jumped to a different width on every line clicked.
+///
+/// Measured against the diff's own rows rather than against a hardcoded number, because "the
+/// pane's width" is the actual claim: a card is the row's width less the mock's own
+/// `margin: … 14px … 74px` inset, whatever the note says.
+#[gpui::test]
+fn a_note_card_is_the_panes_width_whatever_the_note_says(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (_app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    let row = cx
+        .debug_bounds("diff-line-2")
+        .expect("a real diff row to measure the pane against");
+
+    click_line(cx, 2);
+    let blank = cx
+        .debug_bounds("diff-note-0")
+        .expect("the card must paint as soon as the line is clicked");
+
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    let short = cx.debug_bounds("diff-note-0").expect("still painted");
+
+    cx.simulate_input(" and then a great deal more text than that, several times over");
+    cx.run_until_parked();
+    let long = cx.debug_bounds("diff-note-0").expect("still painted");
+
+    assert_eq!(
+        (blank.size.width, short.size.width),
+        (long.size.width, long.size.width),
+        "an empty card, a one-character card and a long one must all be exactly the same width - \
+         the width the *pane* gives them, not the width their own text happens to want"
+    );
+    // 74px inset on the left, 14px on the right (the mock's own margins), and a 1px border on
+    // each side of the row's own content box.
+    let expected = row.size.width - gpui::px(74.0 + 14.0);
+    assert!(
+        (long.size.width - expected).abs() <= gpui::px(1.0),
+        "and that width is the row's own width less the card's inset - expected about {expected:?}, \
+         got {:?} against a {:?}-wide row",
+        long.size.width,
+        row.size.width,
+    );
+}
+
+/// **Live report: *"Caret is not right, does not follow the typing of the user and just stays on
+/// the right side"*.**
+///
+/// The third caret defect this one field shipped, and the second one of a class that has now hit
+/// nine hand-rolled inputs in this app: `.flex_1().min_w_0()` sat on the note's **text** element,
+/// so that element's box stretched across the whole card whatever the text said, and the
+/// `flex_none` caret after it was pushed to the card's far right edge - beside the `draft` mark,
+/// not against the last glyph. It is invisible in any field narrow enough for the text to fill it,
+/// which is why it kept shipping; it became unmissable here the moment the card above was given
+/// its real, full pane width.
+///
+/// The structure now comes from `AdeApp::render_simple_input_row`, which owns that placement in
+/// one place. This measures the result the same way `rail::render::rail_filter_caret_tests` does:
+/// against real painted bounds, in both the empty state (caret at position 0, before the
+/// placeholder) and the typed state (caret against the text, nowhere near the card's edge).
+#[gpui::test]
+fn the_note_caret_sits_against_the_text_not_at_the_far_edge_of_the_card(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (_app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    click_line(cx, 2);
+    let empty_caret = cx
+        .debug_bounds("diff-note-0-caret")
+        .expect("a card being typed into paints a real caret");
+    let placeholder = cx
+        .debug_bounds("diff-note-0-text")
+        .expect("the placeholder must really paint");
+    assert!(
+        empty_caret.origin.x <= placeholder.origin.x,
+        "an empty note's real cursor position is 0, so its caret sits before the placeholder - \
+         got caret {empty_caret:?} vs placeholder {placeholder:?}"
+    );
+
+    cx.simulate_input("tenant id");
+    cx.run_until_parked();
+
+    let card = cx.debug_bounds("diff-note-0").expect("the card");
+    let text = cx
+        .debug_bounds("diff-note-0-text")
+        .expect("the typed text must really paint");
+    let caret = cx.debug_bounds("diff-note-0-caret").expect("and its caret");
+    assert!(
+        caret.origin.x >= text.origin.x + text.size.width - gpui::px(1.0),
+        "the caret must sit at the typed text's own right edge - got caret {caret:?} vs text \
+         {text:?}"
+    );
+    assert!(
+        caret.origin.x < text.origin.x + text.size.width + gpui::px(4.0),
+        "and *against* it, with no gap: a cursor sits flush against the last glyph - got caret \
+         {caret:?} vs text {text:?}"
+    );
+    let mark = cx
+        .debug_bounds("diff-note-0-mark")
+        .expect("the draft/sent mark");
+    assert!(
+        caret.origin.x + caret.size.width < mark.origin.x - gpui::px(8.0),
+        "which is nowhere near the card's own right edge, where it used to sit next to the \
+         `draft` mark - got caret {caret:?}, mark {mark:?}, card {card:?}"
+    );
+}
+
+/// Exactly one card carries a caret: the one being typed into.
+///
+/// There is one `note_focus_handle` for the whole feature (one draft at a time - see
+/// `crate::review_notes::flow::NoteDraft`'s own docs), so a card that rendered the shared caret
+/// unconditionally would paint one in *every* pinned card the moment any of them was focused.
+/// `AdeApp::render_simple_input_row` takes an `Option<&FocusHandle>` rather than a handle plus a
+/// hope for exactly this reason.
+#[gpui::test]
+fn only_the_card_being_typed_into_paints_a_caret(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (_app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    click_line(cx, 2);
+    cx.simulate_input("first");
+    cx.run_until_parked();
+    click_line(cx, 3);
+    cx.simulate_input("second");
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("diff-note-0").is_some() && cx.debug_bounds("diff-note-1").is_some(),
+        "both cards must really be pinned for this to be measuring anything"
+    );
+    assert!(
+        cx.debug_bounds("diff-note-0-caret").is_none(),
+        "the card that is merely pinned must paint no caret at all - it is read-only text"
+    );
+    let caret = cx
+        .debug_bounds("diff-note-1-caret")
+        .expect("the open draft's own caret");
+    let open = cx
+        .debug_bounds("diff-note-1")
+        .expect("the card that is being typed into");
+    assert!(
+        open.contains(&caret.center()),
+        "and the one caret there is must be inside that card - got caret {caret:?} against card \
+         {open:?}"
+    );
+}
+
+/// A click in the empty space to the right of a short diff line must pin a note.
+///
+/// Found while reproducing the two reports above, on a real window: it did nothing at all. The
+/// diff row is the note gesture's hit target, and a `uniform_list` item with an `auto` width is
+/// laid out at its *content* width (the same mechanism as
+/// [`a_note_card_is_the_panes_width_whatever_the_note_says`]), so the hit box, the hover lift and
+/// the add/remove tint all stopped at the last glyph of the line - several hundred pixels short of
+/// the pane on a short line, with nothing on screen saying where the clickable part ended.
+#[gpui::test]
+fn a_click_past_the_end_of_a_short_line_still_pins_a_note(cx: &mut TestAppContext) {
+    let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
+    let shim_dir = TempDir::new().expect("tempdir");
+    let (app, cx, _agent) = open_review(cx, &repo, &shim_dir, store, 1_700_000_000);
+
+    // The reference is the *longest* row in this diff, not the one being clicked: measuring a
+    // content-width row against itself can never see this bug, because its own right edge moves
+    // with its text. The x below is far beyond the short row's own last glyph and still well
+    // inside the pane.
+    let long = cx
+        .debug_bounds("diff-line-2")
+        .expect("the rewritten `QueryBuilder` line - the longest real row in this diff");
+    let short = cx
+        .debug_bounds("diff-line-4")
+        .expect("the closing `}` line - one of the shortest");
+    assert!(
+        long.size.width > short.size.width + gpui::px(80.0)
+            || (short.size.width - long.size.width).abs() <= gpui::px(1.0),
+        "sanity: either the rows are content-width (and genuinely differ) or they are already          uniform - got long {long:?} vs short {short:?}"
+    );
+    let past_the_text = gpui::point(
+        long.origin.x + long.size.width - gpui::px(6.0),
+        short.center().y,
+    );
+    cx.simulate_click(past_the_text, gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("diff-note-0").is_some(),
+        "a click in the blank space to the right of a short line must pin a card, exactly as a \
+         click on its text does - the whole row is the gesture's target"
+    );
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.review_notes
+                .anchors(&app.review_notes_worktree(), Path::new(PATH))
+                .len(),
+            1,
+            "and it must pin exactly one, on the line that was really clicked"
+        );
+    });
 }

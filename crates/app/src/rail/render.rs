@@ -1,6 +1,6 @@
 use super::*;
 use crate::root::plural;
-use crate::root::widgets::{render_disclosure_caret, text_tooltip};
+use crate::root::widgets::{render_disclosure_caret, text_tooltip, SimpleInput};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -939,8 +939,6 @@ impl AdeApp {
         view: rail_strip::SidebarView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = !self.filter_query.is_empty();
-
         div()
             .id("rail-filter-row")
             .track_focus(&self.filter_focus_handle)
@@ -969,58 +967,20 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child("/"),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    // Live report: a decorative gap between the real text and its own caret
-                    // reads as "there's a space between the char and where it's typed" - a
-                    // cursor sits flush against the last glyph, it doesn't float clear of it.
-                    // Removed here and everywhere else this same caret+text pair appears.
-                    // GitHub issue #45 / live report: the caret used to be a fixed trailing
-                    // child, which put it visually *after* the placeholder text whenever
-                    // `filter_query` was empty. It now sits before the placeholder (the real
-                    // cursor position, 0, for an empty field - matching
-                    // `crate::palette::render::AdeApp::render_palette_caret`'s own empty-query
-                    // placement) and after the real typed text once there is any, never
-                    // appended past whatever placeholder string happens to render.
-                    .when(!has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "rail-filter-caret",
-                            &self.filter_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(10.5))
-                            .text_color(if has_query {
-                                theme::text::DIM
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_query {
-                                self.filter_query.as_str().to_string()
-                            } else {
-                                match view {
-                                    rail_strip::SidebarView::Worktrees => {
-                                        "filter worktrees and agents"
-                                    }
-                                    rail_strip::SidebarView::Problems => "filter problems",
-                                }
-                                .to_string()
-                            })
-                            .debug_selector(|| "rail-filter-text".to_string()),
-                    )
-                    .when(has_query, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "rail-filter-caret",
-                            &self.filter_focus_handle,
-                        ))
-                    }),
-            )
+            .child(self.render_simple_input_row(SimpleInput {
+                caret_selector: "rail-filter-caret".into(),
+                text_selector: "rail-filter-text".into(),
+                focus_handle: Some(&self.filter_focus_handle),
+                text: self.filter_query.as_str(),
+                placeholder: match view {
+                    rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
+                    rail_strip::SidebarView::Problems => "filter problems",
+                },
+                font: theme::font::MONO,
+                text_size: self.ui_text_size(10.5),
+                text_color: theme::text::DIM,
+                placeholder_color: theme::text::GHOST,
+            }))
     }
 
     /// Builds this rail's repo groups fresh from live state every render (cheap: no I/O, just

@@ -581,7 +581,11 @@ pub struct AdeApp {
     pub(crate) note_cursor: Option<crate::review_notes::NoteRef>,
     /// Why the last send failed, if it did. Shown in the notes bar rather than swallowed: a review
     /// note that silently reached nobody is the worst outcome this feature has.
-    pub(crate) note_send_error: Option<String>,
+    ///
+    /// The error itself, not its rendered sentence, so the bar can tell whether it is still
+    /// *true*: a `NoTarget` recorded before an agent was started must stop being shown the moment
+    /// one is, and a `String` has no way to know which failure it came from.
+    pub(crate) note_send_error: Option<crate::review_notes::flow::NoteSendError>,
     /// Focus for the open note card's own hand-rolled single-line input.
     pub(crate) note_focus_handle: FocusHandle,
     /// Focus for the diff pane's notes container, which is what makes its `"diff-view"` key

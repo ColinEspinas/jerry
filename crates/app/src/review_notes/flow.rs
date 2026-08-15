@@ -82,7 +82,7 @@ impl NoteTarget {
 /// swallowed - audit item I12's whole complaint about this design is that nothing in it ever
 /// fails, and a review note that silently never reached anyone is the worst possible version of
 /// that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoteSendError {
     /// Nothing real to send.
     NothingToSend,
@@ -538,7 +538,7 @@ impl AdeApp {
             pane.send_prompt(&text, cx)
         });
         if !delivered {
-            self.note_send_error = Some(NoteSendError::DeliveryFailed.message().to_string());
+            self.note_send_error = Some(NoteSendError::DeliveryFailed);
             cx.notify();
             return Err(NoteSendError::DeliveryFailed);
         }
@@ -572,7 +572,7 @@ impl AdeApp {
             // real note, so there is nowhere to show it now - and setting it would leave the
             // message sitting in the bar the moment a note *was* written.
             if err != NoteSendError::NothingToSend {
-                self.note_send_error = Some(err.message().to_string());
+                self.note_send_error = Some(err);
                 cx.notify();
             }
         }
