@@ -283,6 +283,16 @@ resume_bg_hover    = "#253f20"
 resume_border      = "#345129"
 resume_fg          = "#7b9f6f"
 
+# The right panel's Search tab (GitHub issue #162, REVISION-2026-08-14.md §5 /
+# STAGE-A-CHANGELOG.md §4v) - real hex values transcribed directly from those sections, not
+# paraphrased.
+[search]
+modifier_on_bg = "#0f2c36"  # A modifier button's active fill
+modifier_on_fg = "#6599ae"  # That button's glyph while it is on.
+match_bg       = "#1a333f"
+match_fg       = "#6599ae"  # The matched text itself.
+line           = "#555e63"
+
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 # The code surface
