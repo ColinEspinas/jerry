@@ -742,11 +742,15 @@ fn a_note_still_being_typed_reaches_the_real_file_on_its_own(cx: &mut TestAppCon
 /// being typed into.
 ///
 /// The note card is a real `"text-input"` node *inside* `crate::code_surface::render`'s own
-/// `"diff"` node, so `v` (`ToggleChangeSeen`) and `]` (`NextChangedFile`) - both scoped
-/// `Some("diff && !file-editor")` before GitHub issue #288 - were live over it, and GPUI
-/// dispatches a matching `KeyBinding` before any `on_key_down` listener. Typing "survives" into a
-/// note produced "suries", and pressing `]` jumped to another file mid-sentence. Both bindings
+/// `"diff"` node, so `v` (`ToggleChangeSeen`), `]` (`NextChangedFile`) and `space`
+/// (`ToggleChangeStaged`) - all scoped `Some("diff && !file-editor")` before GitHub issue #288 -
+/// were live over it, and GPUI dispatches a matching `KeyBinding` before any `on_key_down`
+/// listener. Typing "survives" into a note produced "suries", `]` jumped to another file
+/// mid-sentence, and a space staged the file instead of separating two words. All three bindings
 /// now carry `&& !text-input`.
+///
+/// The typed string below is chosen to exercise every one of them: it contains a `v`, a `]`, and
+/// real spaces.
 #[gpui::test]
 fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -777,6 +781,10 @@ fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mu
             app.open_change.as_deref(),
             Some(Path::new(PATH)),
             "and `]` must not have jumped to another file mid-sentence"
+        );
+        assert!(
+            app.staged_files.is_empty(),
+            "and a space must not have staged the file instead of separating two words"
         );
     });
 }

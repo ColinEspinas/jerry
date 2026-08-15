@@ -174,6 +174,7 @@ actions!(
         NewGitGraph,
         NextChangedFile,
         ToggleChangeSeen,
+        ToggleChangeStaged,
         JumpToAgent1,
         JumpToAgent2,
         JumpToAgent3,
@@ -3140,6 +3141,7 @@ impl Render for AdeApp {
             .on_action(cx.listener(Self::handle_new_git_graph_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
             .on_action(cx.listener(Self::handle_toggle_change_seen_action))
+            .on_action(cx.listener(Self::handle_toggle_change_staged_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_1_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_2_action))
             .on_action(cx.listener(Self::handle_jump_to_agent_3_action))

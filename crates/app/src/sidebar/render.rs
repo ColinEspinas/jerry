@@ -1843,6 +1843,7 @@ impl AdeApp {
                 .child(self.render_changes_runs_section(cx))
                 .child(render_changes_footer(
                     self.ui_text_size(10.0),
+                    self.change_stage_toggle_live(),
                     self.change_seen_toggle_live(),
                     self.window_controls_style().is_macos(),
                     self.change_author_filter_live(),
@@ -3254,7 +3255,7 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.open_change.clone() else {
+        let Some(path) = self.open_uncommitted_change().cloned() else {
             return;
         };
         let Some(entry) = self.uncommitted_change_set.entry(&path) else {
@@ -3271,14 +3272,74 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// The open file ([`Self::open_change`]) *as an Uncommitted-section row*, or `None` when
+    /// nothing is open or what is open has no live uncommitted delta.
+    ///
+    /// The one condition behind both of the Changes footer's keyboard hints and both of the
+    /// actions they advertise ([`Self::handle_toggle_change_seen_action`],
+    /// [`Self::handle_toggle_change_staged_action`]), written once so a hint and its keystroke
+    /// cannot come to disagree about when they are live. Both states this row can carry - seen and
+    /// staged - belong to the Uncommitted scope: it is the only section with checkboxes
+    /// (`crate::sidebar::sections::ChangesSection`'s own table) and the only one whose files have a
+    /// working-tree delta for a seen mark to be keyed by.
+    pub(in crate::sidebar) fn open_uncommitted_change(&self) -> Option<&PathBuf> {
+        let path = self.open_change.as_ref()?;
+        self.uncommitted_change_set
+            .entry(path)
+            .is_some()
+            .then_some(path)
+    }
+
     /// Whether `V` really does something right now - what
     /// [`render_changes_footer`]'s keycap hint is gated on, so the strip never advertises a
     /// shortcut that would no-op. Same honesty rule [`render_file_tree_footer`]'s own `live`
     /// parameter implements for `F2`.
     pub(in crate::sidebar) fn change_seen_toggle_live(&self) -> bool {
-        self.open_change
-            .as_ref()
-            .is_some_and(|path| self.uncommitted_change_set.entry(path).is_some())
+        self.open_uncommitted_change().is_some()
+    }
+
+    /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind
+    /// `Jerry.dc.html`'s `changesHints` first hint, `space stage` (line 4548).
+    ///
+    /// Its subject is [`Self::open_change`], exactly like [`Self::handle_toggle_change_seen_action`]
+    /// beside it, and for the same reason: that path is *both* the file whose diff is on screen
+    /// (which is why the binding is scoped to the `"diff"` surface) *and* the row
+    /// [`Self::render_change_row`] paints as `selected`. The Changes list therefore already has one
+    /// real, visible, keyboard-reachable "current row", and both footer hints act on it. A second,
+    /// separate cursor for this list would mean two differently-highlighted current rows on screen
+    /// at once, with the two hints in one strip disagreeing about which one they mean.
+    ///
+    /// Delegates to the *same* [`Self::toggle_staged`] the row's checkbox click calls - the
+    /// optimistic flip, the real background `git add`/`git reset`, the revert-on-failure and the
+    /// [`Self::changes_row_error`] surfacing all come along, rather than a second, parallel
+    /// staging path that could drift from the checkbox's.
+    ///
+    /// Gated on [`Self::uncommitted_change_set`], not merely on something being open: staging is
+    /// the Uncommitted section's affordance and only its rows carry checkboxes
+    /// (`crate::sidebar::sections::ChangesSection`'s own table - "Checkboxes: never / yes / no /
+    /// no"), so with a Commits or Against-main file open this no-ops rather than `git add`-ing a
+    /// path the panel offers no way to unstage.
+    pub(crate) fn handle_toggle_change_staged_action(
+        &mut self,
+        _action: &crate::root::ToggleChangeStaged,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.open_uncommitted_change().cloned() else {
+            return;
+        };
+        // `staged_files` only - never `seen_files`. Audit I3, the same rule
+        // `handle_toggle_change_seen_action` states from the other side: the checkbox owns staged,
+        // the name owns seen, and neither reads the other.
+        self.toggle_staged(path, cx);
+    }
+
+    /// Whether `space` really does something right now - the gate on [`render_changes_footer`]'s
+    /// `space stage` hint, and the same honesty rule [`Self::change_seen_toggle_live`] implements
+    /// for `V`. Reads the same [`Self::open_uncommitted_change`] the action itself does, so the
+    /// hint is on screen exactly when the keystroke would really stage or unstage something.
+    pub(in crate::sidebar) fn change_stage_toggle_live(&self) -> bool {
+        self.open_uncommitted_change().is_some()
     }
 
     /// Whether `alt`+click really has something to act on right now - the gate on
@@ -4017,27 +4078,60 @@ impl AdeApp {
     }
 }
 
-/// The Changes list's footer 29. The README's spec text also mentions `] next file`, dropped
-/// here since `]` isn't actually bound to anything (only `secondary-n` is - see
-/// `crate::default_key_bindings`); advertising a dead shortcut is worse than a shorter,
-/// accurate footer.
+/// The Changes list's footer 29 - **three keycap hints and no prose at all**, exactly as
+/// `design_handoff_jerry_ade/revision 5/Jerry.dc.html` line 4548 declares it:
+/// `changesHints: this.mkHints([['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by
+/// author']])`, rendered through the same `diffHints` hint-row template (line 842) that is purely a
+/// loop over keycap+label pairs. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same strip.
+///
+/// This band used to open with the sentence `click a file to open its diff in the centre` as a
+/// shrinkable lead-in. That string comes from `README.md`'s Changes section - a *superseded*
+/// description of the pre-`#285`/`#286` panel (its "review checkbox", "tag pill" and `3 reviewed`
+/// header are all things those two issues replaced), and the mock has no prose slot in this footer
+/// at all. Revisions 1-4's own mocks did carry it, as a hint with an empty keycap list; revision 5
+/// dropped it deliberately in favour of `space stage`. The mock outranks `README.md` as a design
+/// source, so the sentence is gone rather than kept "for layout" - with every child now
+/// `flex:none`, there is nothing left in the row to shrink and nothing that can push a hint off
+/// the panel's right edge.
 ///
 /// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value - this free
 /// function has no `&self` to call that method through, so the one caller
 /// ([`AdeApp::render_right_sidebar`]) computes and passes it in.
 ///
-/// `seen_toggle_live` adds `STAGE-A-CHANGELOG.md` §4i's own legend entry - a real `V` keycap and
-/// `mark seen` - and is the same honesty gate [`render_file_tree_footer`]'s `live` parameter
-/// implements: `V` is scoped to the open diff (see
-/// [`AdeApp::handle_toggle_change_seen_action`]), so with nothing open the keycap would advertise
-/// a keystroke that genuinely does nothing. The hint disappears; the band does not, so the list
-/// above it never jumps.
+/// Each of the three `*_live` flags is the same honesty gate [`render_file_tree_footer`]'s `live`
+/// parameter implements: all three hints name something scoped to the open diff or to an on-screen
+/// author chip, so with nothing open a keycap would advertise a keystroke that genuinely does
+/// nothing. The hint disappears; the band does not, so the list above it never jumps. See
+/// [`AdeApp::change_stage_toggle_live`], [`AdeApp::change_seen_toggle_live`] and
+/// [`AdeApp::change_author_filter_live`] for what each really tests.
 pub(in crate::sidebar) fn render_changes_footer(
     text_size: Pixels,
+    stage_toggle_live: bool,
     seen_toggle_live: bool,
     macos: bool,
     author_filter_live: bool,
 ) -> impl IntoElement {
+    // One hint, the mock's own `[keycaps] label` pair - the shape `render_file_tree_footer`'s
+    // identical local `hint` closure builds beside it, rather than three near-copies of the same
+    // eleven lines.
+    let hint = move |selector: &'static str, parts: Vec<String>, label: &'static str| {
+        div()
+            .id(selector)
+            .debug_selector(move || selector.to_string())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .child(render_keycap_row(&parts, KeycapSize::Hint))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(text_size)
+                    .text_color(theme::text::PATH)
+                    .child(label),
+            )
+    };
+
     div()
         .debug_selector(|| "changes-footer".to_string())
         .flex_none()
@@ -4052,77 +4146,47 @@ pub(in crate::sidebar) fn render_changes_footer(
         .font(font(theme::font::MONO))
         .text_size(text_size)
         .text_color(theme::text::HINT)
-        // **The only shrinkable thing in the row** - `REVISION-2026-08-14.md` §4's own rule for
-        // the rail's repo header, which is the same shape of problem: a fixed-width band holding
-        // one prose lead-in and N `flex:none` readouts. The keycaps are what this strip is *for*
-        // (`STAGE-A-CHANGELOG.md` §2 lists exactly three of them and no prose at all), so the
-        // sentence ellipsizes and every hint stays whole, rather than the third hint being pushed
-        // off the panel's right edge the moment it appears.
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .truncate()
-                .child("click a file to open its diff in the centre"),
-        )
-        .when(seen_toggle_live, |el| {
-            el.child(
-                div()
-                    .id("changes-footer-seen-hint")
-                    .debug_selector(|| "changes-footer-seen-hint".to_string())
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .child(render_keycap_row(
-                        // Not the literal string `"V"`: resolved through the same
-                        // `keymap::resolve_combo` every other real keycap in this app goes
-                        // through, off a spec named once in [`CHANGES_SEEN_SPEC`] so the keycap
-                        // and the registered binding cannot drift.
-                        &keymap::resolve_combo(CHANGES_SEEN_SPEC, false),
-                        KeycapSize::Hint,
-                    ))
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(text_size)
-                            .text_color(theme::text::PATH)
-                            .child("mark seen"),
-                    ),
-            )
+        // The mock's first hint. Gated on there being an Uncommitted row open to stage - see
+        // `AdeApp::handle_toggle_change_staged_action` for why that scope and not merely "a file
+        // is open".
+        .when(stage_toggle_live, |el| {
+            el.child(hint(
+                "changes-footer-stage-hint",
+                // Not the literal string `"space"`: resolved through the same
+                // `keymap::resolve_combo` every other real keycap in this app goes through, off a
+                // spec named once in [`CHANGES_STAGE_SPEC`] so the keycap and the registered
+                // binding cannot drift.
+                keymap::resolve_combo(CHANGES_STAGE_SPEC, macos),
+                "stage",
+            ))
         })
-        // `STAGE-A-CHANGELOG.md` §2's third hint on this strip, `⌥click filter by author`, as real
-        // keycaps rather than the prose `alt+click` (ride-along I10). Gated on the affordance
-        // genuinely being on screen: `alt`+click filters by clicking an *author chip*, and chips
-        // only exist in a multi-agent worktree (`REVISION-2026-07-31.md` §4), so in a one-agent
-        // worktree this would advertise a gesture with nothing to perform it on - the same honesty
-        // rule `seen_toggle_live` above and `render_file_tree_footer`'s `live` already implement.
+        // The mock's second hint, and `STAGE-A-CHANGELOG.md` §4i's own legend entry.
+        .when(seen_toggle_live, |el| {
+            el.child(hint(
+                "changes-footer-seen-hint",
+                keymap::resolve_combo(CHANGES_SEEN_SPEC, macos),
+                "mark seen",
+            ))
+        })
+        // The mock's third hint, `⌥click filter by author`, as real keycaps rather than the prose
+        // `alt+click` (ride-along I10). Gated on the affordance genuinely being on screen:
+        // `alt`+click filters by clicking an *author chip*, and chips only exist in a multi-agent
+        // worktree (`REVISION-2026-07-31.md` §4), so in a one-agent worktree this would advertise
+        // a gesture with nothing to perform it on.
         .when(author_filter_live, |el| {
-            el.child(
-                div()
-                    .id("changes-footer-author-filter-hint")
-                    .debug_selector(|| "changes-footer-author-filter-hint".to_string())
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .child(render_keycap_row(
-                        &keymap::resolve_combo(
-                            crate::provenance::render::AUTHOR_FILTER_SPEC,
-                            macos,
-                        ),
-                        KeycapSize::Hint,
-                    ))
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(text_size)
-                            .text_color(theme::text::PATH)
-                            .child("filter by author"),
-                    ),
-            )
+            el.child(hint(
+                "changes-footer-author-filter-hint",
+                keymap::resolve_combo(crate::provenance::render::AUTHOR_FILTER_SPEC, macos),
+                "filter by author",
+            ))
         })
 }
+
+/// The `crate::keymap::resolve_combo` spec [`render_changes_footer`] advertises for `space`, named
+/// so its own test can assert it really is a registered binding rather than a plausible string -
+/// exactly like [`CHANGES_SEEN_SPEC`] and [`FILE_TREE_RENAME_SPEC`] beside it. Passes through
+/// `resolve_token` unchanged on both platforms, which is what the mock prints: a `space` keycap.
+pub(in crate::sidebar) const CHANGES_STAGE_SPEC: &str = "space";
 
 /// The `crate::keymap::resolve_combo` spec [`render_changes_footer`] advertises for `V`, named so
 /// its own test can assert it really is a registered binding rather than a plausible string -
@@ -8715,6 +8779,238 @@ mod change_row_tests {
         assert!(
             cx.debug_bounds("changes-footer-seen-hint").is_some(),
             "with a real file open, the keycap appears and really does something"
+        );
+    }
+
+    /// The same honesty half for `Jerry.dc.html`'s *first* `changesHints` entry, `space stage`.
+    #[gpui::test]
+    fn the_footer_shows_the_space_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("changes-footer-stage-hint").is_none(),
+            "with no file open, `space` would do nothing - so the strip advertises nothing"
+        );
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("changes-footer-stage-hint").is_some(),
+            "with a real uncommitted file open, the keycap appears and really does something"
+        );
+    }
+
+    /// The live bug this fixes: the footer used to open with the sentence `click a file to open
+    /// its diff in the centre` - `README.md`'s wording for the *superseded* pre-`#285` panel -
+    /// ahead of the keycaps, so a user saw truncated prose where `Jerry.dc.html` line 4548's
+    /// `changesHints` specifies three chips and nothing else.
+    ///
+    /// Asserted geometrically rather than by hunting for a string, because that is what actually
+    /// pins the design: the mock's strip is `padding:0 12px` with the hints as its first child, so
+    /// the `space` keycap must begin exactly at the band's own left padding. Any prose lead-in
+    /// reintroduced ahead of it - shrinkable or not - pushes that origin right and fails here.
+    #[gpui::test]
+    fn the_footers_first_child_is_the_stage_keycap_at_the_bands_own_left_padding(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = mixed_status_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let footer = cx.debug_bounds("changes-footer").expect("the footer band");
+        let stage = cx
+            .debug_bounds("changes-footer-stage-hint")
+            .expect("the `space stage` hint");
+        let seen = cx
+            .debug_bounds("changes-footer-seen-hint")
+            .expect("the `V mark seen` hint");
+
+        assert!(
+            (stage.origin.x - (footer.origin.x + px(12.0))).abs() < px(1.0),
+            "the first hint must start at the band's own 12px padding - it started at {:?} \
+             against a band at {:?}, which means something (prose) is sitting ahead of it",
+            stage.origin.x,
+            footer.origin.x
+        );
+        assert!(
+            seen.origin.x > stage.origin.x,
+            "and `V mark seen` follows `space stage`, the mock's own order"
+        );
+    }
+
+    /// `space` really stages and unstages the open change, through the real registered binding and
+    /// a real simulated keystroke - not by calling `toggle_staged` directly. Clicking the row is
+    /// what puts focus on the Diff surface, which is what makes the `"diff && !file-editor"`
+    /// binding reachable at all, exactly as `crate::root::focus`' own `]` test establishes.
+    #[gpui::test]
+    fn space_stages_and_unstages_the_open_change_through_the_real_key_binding(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = mixed_status_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+
+        let row = cx
+            .debug_bounds("change-row-modified.txt")
+            .expect("the modified row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.open_change.clone()),
+            Some(PathBuf::from("modified.txt")),
+            "premise: the click really opened that file's diff"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "premise: opening a file never stages it (REVISION-2026-08-14.md §1 rule 2)"
+        );
+
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app
+                .staged_files
+                .contains(&PathBuf::from("modified.txt"))),
+            "a real `space` keystroke stages the open row - `Jerry.dc.html`'s `space stage`"
+        );
+        assert!(
+            cx.debug_bounds("stage-checkbox-modified.txt").is_some(),
+            "and it acted on the row that really carries a checkbox - staging is the Uncommitted \
+             section's affordance"
+        );
+
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "and it toggles back off, the same way the checkbox does"
+        );
+        assert!(
+            cx.debug_bounds("change-row-modified.txt-name-seen")
+                .is_some(),
+            "throughout, `space` never touches the name's seen-state - the checkbox owns staged, \
+             the name owns seen (audit I3)"
+        );
+    }
+
+    /// GitHub issue #220's fixture, reused for the other half of `space`'s honesty: a file whose
+    /// only difference from `main` is already inside a real commit has no Uncommitted row and no
+    /// checkbox (`ChangesSection`'s own table - checkboxes exist in exactly one section), so
+    /// opening its diff must leave `space` inert rather than `git add`-ing a path the panel offers
+    /// no way to unstage. The keystroke and the hint read the same
+    /// `AdeApp::open_uncommitted_change`, so a hidden hint and a dead keystroke are one condition
+    /// rather than two that can drift.
+    #[gpui::test]
+    fn space_does_nothing_for_a_file_with_no_uncommitted_row(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("dirty.txt"), "one\n").expect("write");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        git(repo.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo.path().join("committed.txt"), "committed\n").expect("write");
+        git(repo.path(), &["add", "committed.txt"]);
+        git(
+            repo.path(),
+            &["commit", "-m", "a real commit on the feature branch"],
+        );
+        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\n").expect("modify");
+
+        let (app, cx) = open_changes_view(cx, &repo);
+        assert!(
+            cx.debug_bounds("change-row-dirty.txt").is_some(),
+            "premise: the genuinely uncommitted file really is an Uncommitted row"
+        );
+        assert!(
+            cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
+            "premise: the committed-clean file has no checkbox anywhere (issue #220)"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_change_diff(PathBuf::from("committed.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.change_stage_toggle_live()),
+            "so the hint is hidden - nothing is advertised"
+        );
+        assert!(
+            cx.debug_bounds("changes-footer-stage-hint").is_none(),
+            "and really not painted, not just reported hidden"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.handle_toggle_change_staged_action(&crate::root::ToggleChangeStaged, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "and the keystroke itself is inert too - no invented entry for a file with no \
+             uncommitted delta"
+        );
+    }
+
+    /// The binding the footer's `space` keycap advertises has to be a real, registered one, with
+    /// the *same* scope `V` beside it carries - read off `V`'s own binding rather than restated,
+    /// so the two hints in one strip cannot come to mean different surfaces. The `!file-editor`
+    /// conjunct is load-bearing in a way it is not for `V`: in the editable File view a space is
+    /// a character to type.
+    #[test]
+    fn the_changes_footers_space_hint_only_advertises_a_really_registered_binding() {
+        let bindings = crate::default_key_bindings();
+        let find = |name: &str| {
+            bindings
+                .iter()
+                .find(|binding| binding.action().name() == name)
+                .unwrap_or_else(|| panic!("`{name}` must have a real registered binding"))
+        };
+        let stage = find("app::ToggleChangeStaged");
+        let seen = find("app::ToggleChangeSeen");
+
+        let keystrokes = stage.keystrokes();
+        assert_eq!(keystrokes.len(), 1, "one plain keystroke, no chord");
+        let keystroke = &keystrokes[0];
+        assert_eq!(
+            keystroke.key(),
+            CHANGES_STAGE_SPEC,
+            "the footer prints the keycap for {CHANGES_STAGE_SPEC:?}, so that is what has to be \
+             bound"
+        );
+        let modifiers = keystroke.modifiers();
+        assert!(
+            !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
+            "a bare `space`, exactly as `Jerry.dc.html`'s `changesHints` prints it"
+        );
+        let predicate = |binding: &gpui::KeyBinding| {
+            binding
+                .predicate()
+                .map(|predicate| predicate.to_string())
+                .expect("a real, scoped predicate - never global")
+        };
+        assert_eq!(
+            predicate(stage),
+            "diff && !file-editor && !text-input",
+            "`!file-editor` keeps a typed space out of this binding's hands in the File view, and \
+             `!text-input` does the same for GitHub issue #288's pinned review-note card - a real \
+             text input *inside* the `\"diff\"` node that `\"file-editor\"` does not cover, where \
+             a bare space would otherwise stage the file instead of separating two words"
+        );
+        assert_eq!(
+            predicate(stage),
+            predicate(seen),
+            "and both hints in the one strip name the same real surface"
         );
     }
 
