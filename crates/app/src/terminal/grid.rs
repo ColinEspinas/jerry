@@ -635,12 +635,18 @@ impl TerminalGrid {
     /// (see `crate::terminal::pane::maybe_resize_pty`) - the two are separate resizes that need
     /// to stay in sync, or the rendered grid's geometry would diverge from what the child
     /// process believes its terminal size is.
+    ///
+    /// Ends by re-establishing [`Self::discard_blank_scrollback`]'s invariant (GitHub issue
+    /// #368): a resize is the one thing that can push a line the human never watched scroll
+    /// past into retained history, and when that line is *blank* the result is a visibly empty
+    /// pane that still scrolls.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.size = GridSize {
             rows: rows.max(1) as usize,
             cols: cols.max(1) as usize,
         };
         self.term.resize(self.size);
+        self.discard_blank_scrollback();
     }
 
     pub fn mark_ended(&mut self) {
@@ -765,20 +771,84 @@ impl TerminalGrid {
     /// legitimately (per `alacritty_terminal`'s own shrink-resize semantics - see
     /// `scrolling_up_reveals_lines_pushed_into_history`'s own module docs) evicted into real
     /// scrollback the moment the correction happens, even though the human never saw it
-    /// overflow at the size they're actually looking at. Called exactly once, right after that
-    /// first real resize, to reset the baseline before a real user-driven resize (window resize,
-    /// font-size change) can ever legitimately create scrollback of its own.
+    /// overflow at the size they're actually looking at. Called exactly once, right after the
+    /// first real resize that genuinely reached the live pty, to reset the baseline before a
+    /// real user-driven resize (window resize, font-size change) can ever legitimately create
+    /// scrollback of its own.
     ///
-    /// `Grid::update_history(0)` (`grid/mod.rs:154`) immediately followed by
-    /// `update_history(Config::default().scrolling_history)` rather than rebuilding `Term` from
-    /// scratch: a fresh `Term` would also lose the cursor position/mode state `append_bytes` has
-    /// already built up from whatever the child printed at the placeholder size, which needs to
-    /// stay exactly as it is - only the *retained history* is spurious here, not the live
-    /// viewport.
+    /// Only the *retained history* is dropped, via [`Self::retain_history`] - the live viewport,
+    /// cursor position and terminal mode `append_bytes` has already built up from whatever the
+    /// child printed at the placeholder size all stay exactly as they are.
+    ///
+    /// This is the blunt instrument, for content that is real but was never *seen*.
+    /// [`Self::discard_blank_scrollback`] is the narrow, always-on companion for the other half
+    /// of the same issue: history a resize manufactured out of nothing at all.
     pub fn discard_scrollback(&mut self) {
+        self.retain_history(0);
+    }
+
+    /// Drops the run of *entirely blank* lines at the **oldest** end of retained scrollback
+    /// (GitHub issue #368), leaving everything from the oldest line that has real content
+    /// onward exactly as it was.
+    ///
+    /// The invariant this restores: **a pane can never scroll up into a blank void.** Whatever
+    /// is at the very top of the scroll track is a line that actually has something on it, so
+    /// "there is scrollback" and "there is something to scroll to" stay the same statement -
+    /// which is what makes `scroll_history_len`, the scrollbar's own `max_scroll_offset`, and
+    /// the wheel handler's real behavior agree with what the human can see.
+    ///
+    /// This exists because [`Self::resize`] can manufacture exactly such a line out of nothing.
+    /// `alacritty_terminal`'s reflow (`grid/resize.rs`'s `shrink_columns`) re-wraps every row to
+    /// the narrower width, and a pane that gets narrower - the app's own layout settling, a real
+    /// window resize, a font-size change - makes the wrapped content taller, which pushes the
+    /// topmost row out of the viewport and into history. On a freshly opened pane that topmost
+    /// row is the blank line a shell prints before its prompt: **measured live** on a
+    /// just-opened `zsh` pane, a `110x36 -> 38x26` resize took `history_size` from `0` to `1`,
+    /// and that one retained line was all spaces. A genuinely empty terminal then scrolled - the
+    /// live report behind this issue.
+    ///
+    /// Blankness is `alacritty_terminal`'s own `Row::is_clear` (`grid/row.rs:155`), i.e. every
+    /// cell is `Cell::is_empty` (`term/cell.rs:226`): a space *and* default fg/bg *and* no
+    /// inverse/underline/strikeout/wrapline flags. A row painted with a background colour, or
+    /// one that is the wrapped continuation of a real line, is therefore not blank and is never
+    /// trimmed - only rows with genuinely nothing on them.
+    ///
+    /// Deliberately trims only the contiguous run at the *oldest* end rather than every blank
+    /// line in history: a blank line *between* two lines of real output is part of that output's
+    /// own shape and must stay scrollable, exactly where the program printed it.
+    pub fn discard_blank_scrollback(&mut self) {
+        let history = self.scroll_history_len();
+        let grid = self.term.grid();
+        let mut blank = 0usize;
+        // Oldest first. `Grid`'s own `Index<Line>` runs negative into history
+        // (`grid/mod.rs:453`), with `Line(-1)` the line just above the viewport and
+        // `Line(-history)` the oldest retained line.
+        for offset in (1..=history).rev() {
+            if grid[Line(-(offset as i32))].is_clear() {
+                blank += 1;
+            } else {
+                break;
+            }
+        }
+        if blank == 0 {
+            return;
+        }
+        self.retain_history(history - blank);
+    }
+
+    /// Shrinks retained scrollback to at most `keep` lines - dropping the *oldest* lines first,
+    /// which is what `Grid::update_history` (`grid/mod.rs:154`) already does - then restores the
+    /// real `Config::scrolling_history` capacity so later output accumulates history exactly as
+    /// before.
+    ///
+    /// The two-call `update_history(keep)` / `update_history(real_cap)` idiom rather than
+    /// rebuilding `Term` from scratch: a fresh `Term` would also lose the cursor position/mode
+    /// state `append_bytes` has already built up, which needs to stay exactly as it is - only
+    /// the *retained history* is ever spurious here, never the live viewport.
+    fn retain_history(&mut self, keep: usize) {
         let real_cap = Config::default().scrolling_history;
         let grid = self.term.grid_mut();
-        grid.update_history(0);
+        grid.update_history(keep);
         grid.update_history(real_cap);
     }
 
@@ -885,10 +955,13 @@ impl TerminalGrid {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Whether a mouse-wheel scroll reaching this pane right now should be translated into
-    /// arrow-key bytes and forwarded to the child process, rather than moving
-    /// [`Self::scroll_display`] (GitHub issue #362, filed after issue #331 shipped
-    /// `scroll_display` itself but never checked this).
+    /// Whether a mouse-wheel scroll reaching this pane right now should be translated into key
+    /// bytes and forwarded to the child process, rather than moving [`Self::scroll_display`]
+    /// (GitHub issue #362, filed after issue #331 shipped `scroll_display` itself but never
+    /// checked this). *Which* keys is
+    /// `crate::terminal::pane::TerminalPane::forward_scroll_as_page_keys`'s decision, not this
+    /// one's - see its docs for why PageUp/PageDown rather than the arrow keys #362 first
+    /// shipped (GitHub issue #368).
     ///
     /// Two real `Term::mode()` bits, both read live rather than latched for the same reason
     /// [`Self::bracketed_paste_enabled`] is: a running program can flip either at any point in
@@ -906,16 +979,33 @@ impl TerminalGrid {
     ///   (`TermMode::default()`, `term/mod.rs:113-118`). Respecting it means a full-screen
     ///   program that explicitly disables it (rare, but real - some `less` configurations do)
     ///   keeps getting exactly the pre-this-fix inert behavior instead of unwanted synthetic
-    ///   arrow keys.
+    ///   key presses.
     ///
     /// This is the same convention xterm itself documents for `alternateScroll`, and the one
     /// iTerm2/Alacritty/kitty/Windows Terminal all implement: `less`/`vim`/`htop`/an agent
-    /// CLI's own interface responds to the mouse wheel as if the human had pressed the arrow
-    /// keys, because - unlike the normal screen - there is no real scrollback grid underneath
-    /// for a wheel event to move instead.
+    /// CLI's own interface responds to the mouse wheel as if the human had pressed a real
+    /// navigation key, because - unlike the normal screen - there is no real scrollback grid
+    /// underneath for a wheel event to move instead.
     pub fn alt_scroll_forwarding_active(&self) -> bool {
         let mode = self.term.mode();
-        mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL)
+        self.alt_screen_active() && mode.contains(TermMode::ALTERNATE_SCROLL)
+    }
+
+    /// Whether a full-screen program currently owns this terminal's alt screen (`TermMode::
+    /// ALT_SCREEN`, set by `Term::swap_alt` - `vim`, `less`, `htop`, an agent CLI's own UI).
+    ///
+    /// The alt grid keeps no scrollback of its own (`Term::new`, `term/mod.rs:412-413`), so
+    /// every *local* scroll action this pane can take - [`Self::scroll_display`] from the wheel,
+    /// from a PageUp/PageDown key, from the scrollbar - is a guaranteed no-op while this is
+    /// `true`. That is what makes it the right condition for handing those inputs to the child
+    /// process instead (see `crate::terminal::pane::TerminalPane::handle_key_down`).
+    ///
+    /// Separate from [`Self::alt_scroll_forwarding_active`], which additionally requires
+    /// `TermMode::ALTERNATE_SCROLL`: that bit (`DECSET 1007`) is specifically a program's opt-out
+    /// for having the *mouse wheel* synthesised into keys, and says nothing about a key the
+    /// human really did press.
+    pub fn alt_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 }
 
@@ -1300,6 +1390,147 @@ mod tests {
     mod scrollback_tests {
         use super::*;
 
+        /// A shell's real startup output: the blank line most prompts print before themselves,
+        /// then a long, single-line prompt. Deliberately longer than the narrow widths the
+        /// resize tests below use, so `alacritty_terminal`'s reflow really has something to
+        /// re-wrap - which is the whole mechanism GitHub issue #368 is about.
+        const SHELL_STARTUP: &[u8] =
+            b"\r\n/tmp/fix-terminal-scroll-round3 on main! at 0:55:28\r\n$ ";
+
+        /// **GitHub issue #368, the live report: "terminal base scroll ... can scroll up when
+        /// empty and just created".**
+        ///
+        /// Root cause, measured live against the running app: narrowing a pane makes
+        /// `alacritty_terminal`'s reflow (`grid/resize.rs`'s `shrink_columns`) re-wrap the
+        /// prompt taller, which pushes the topmost row of the screen out of the viewport and
+        /// into real retained history - and on a just-opened pane that topmost row is the
+        /// *blank* line the shell printed before its prompt. `history_size` went `0 -> 1` on a
+        /// real `110x36 -> 38x26` resize, the scrollbar appeared, and a mouse wheel really moved
+        /// `display_offset` to `1` on a terminal with nothing in it but a prompt.
+        ///
+        /// The exact numbers here are the ones that were measured in the running app, so this
+        /// fails against the pre-fix code rather than being a synthetic construction.
+        #[test]
+        fn narrowing_a_just_opened_pane_leaves_it_with_nothing_to_scroll_to() {
+            let mut grid = TerminalGrid::new(36, 110);
+            grid.append_bytes(SHELL_STARTUP);
+            assert_eq!(
+                grid.scroll_history_len(),
+                0,
+                "sanity check: a prompt is nowhere near overflowing a 36-row viewport"
+            );
+
+            grid.resize(26, 38);
+
+            assert_eq!(
+                grid.scroll_history_len(),
+                0,
+                "an essentially empty pane must have nothing to scroll to after a resize - the \
+                 only thing the reflow pushed into history was a blank line nobody ever watched \
+                 scroll past"
+            );
+            grid.scroll_display(ScrollAmount::Lines(3));
+            assert_eq!(
+                grid.scroll_offset(),
+                0,
+                "and the wheel must therefore be genuinely inert, not move the view by a blank \
+                 line"
+            );
+            assert!(!grid.is_scrolled_back());
+        }
+
+        /// The general invariant behind the fix, swept across a range of real pane geometries
+        /// rather than the one measured pair above: **after any resize, the top of the scroll
+        /// track is always a line with something on it.**
+        ///
+        /// Stated this way rather than as "a prompt-only pane never has scrollback", because at
+        /// genuinely tiny widths it legitimately does: re-wrapping a 52-character prompt at 20
+        /// columns really does push its first segment off the top of the screen, and being able
+        /// to scroll up to read it is correct - that line has real content on it. What must
+        /// never happen is the case this issue reported, where scrolling up reveals nothing at
+        /// all.
+        #[test]
+        fn a_resize_never_leaves_a_blank_line_at_the_top_of_the_scroll_track() {
+            for (rows, cols) in [
+                (26u16, 38u16),
+                (10, 20),
+                (14, 38),
+                (20, 60),
+                (48, 200),
+                (5, 12),
+            ] {
+                let mut grid = TerminalGrid::new(36, 110);
+                grid.append_bytes(SHELL_STARTUP);
+                grid.resize(rows, cols);
+                if grid.scroll_history_len() == 0 {
+                    continue; // nothing to scroll to at all, which is the ideal outcome
+                }
+                grid.scroll_display(ScrollAmount::Top);
+                let top = row_text(&grid.visible_rows(&TerminalPalette::default())[0]);
+                assert!(
+                    !top.trim().is_empty(),
+                    "at {rows}x{cols} the oldest retained line is blank ({top:?}) - scrolling up \
+                     would move the view and show the human nothing"
+                );
+            }
+        }
+
+        /// The other side of the same fix, and the thing that keeps it honest: a resize must
+        /// still evict *real* content into real scrollback exactly as before. Only the blank
+        /// run at the oldest end of history is ever dropped - one line of real output at the
+        /// very top of history is not blank, so it stays reachable.
+        #[test]
+        fn a_resize_still_evicts_real_content_into_real_scrollback() {
+            let mut grid = grid_with_numbered_lines(10, 40, 9);
+            assert_eq!(
+                grid.scroll_history_len(),
+                0,
+                "sanity check: nine lines fit a ten-row screen"
+            );
+
+            grid.resize(4, 40);
+
+            assert!(
+                grid.scroll_history_len() > 0,
+                "shrinking under the real content must still push it into real scrollback"
+            );
+            grid.scroll_display(ScrollAmount::Top);
+            assert_eq!(
+                row_text(&grid.visible_rows(&TerminalPalette::default())[0]).trim(),
+                "line 0",
+                "and the oldest retained line must still be the oldest real line of output"
+            );
+        }
+
+        /// A blank line *between* two lines of real output is part of that output's own shape
+        /// and must stay exactly where the program printed it - [`TerminalGrid::
+        /// discard_blank_scrollback`] only ever trims the contiguous blank run at the oldest
+        /// end, never blank lines with real content above them.
+        #[test]
+        fn a_blank_line_inside_real_output_is_never_trimmed_away() {
+            let mut grid = TerminalGrid::new(20, 40);
+            grid.append_bytes(b"first\r\n");
+            for _ in 0..8 {
+                grid.append_bytes(b"\r\n");
+            }
+            grid.append_bytes(b"last\r\n");
+
+            grid.resize(3, 40);
+
+            grid.scroll_display(ScrollAmount::Top);
+            let rows = grid.visible_rows(&TerminalPalette::default());
+            assert_eq!(
+                row_text(&rows[0]).trim(),
+                "first",
+                "the oldest retained line still has real content on it"
+            );
+            assert_eq!(
+                row_text(&rows[1]).trim(),
+                "",
+                "and the blank line the program itself printed underneath it is still there"
+            );
+        }
+
         /// The core of GitHub issue #331: scrolling up must actually reveal lines that were
         /// pushed off the top of the visible screen into history, not just move a cursor over
         /// the same five lines that were always on screen.
@@ -1497,7 +1728,7 @@ mod tests {
             let mut grid = TerminalGrid::new(5, 20);
             assert!(
                 !grid.alt_scroll_forwarding_active(),
-                "the normal screen must never forward scroll as arrow keys"
+                "the normal screen must never forward scroll as key presses"
             );
 
             grid.append_bytes(b"\x1b[?1049h"); // enter the alt screen
@@ -1514,7 +1745,7 @@ mod tests {
         }
 
         /// The real xterm `DECSET 1007` opt-out (`ALTERNATE_SCROLL`): a program can stay on the
-        /// alt screen yet explicitly disable scroll-as-arrow-keys translation, in which case a
+        /// alt screen yet explicitly disable scroll-to-key translation, in which case a
         /// wheel event reaching it must go back to being the pre-issue-#362 inert no-op - not
         /// forwarded input the program never asked to receive.
         #[test]
