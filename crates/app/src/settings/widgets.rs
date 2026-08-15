@@ -531,36 +531,56 @@ impl AdeApp {
             .rounded(theme::radius::BUTTON)
             .bg(theme::surface::SEGMENT_TRACK);
 
+        // One `IconRow` for the whole control, not one per segment: that is `REVISION-2026-08-14.md`
+        // §7 rule 7 ("a row of icons needs one shared optical box, not one size per icon") made
+        // structural rather than left to each segment to get right - the exact defect §4w records
+        // fixing after the first cut drew "folder 12x8, magnifier 8x8, diff 7x7".
+        let icons =
+            crate::icons::IconRow::new(&self.settings.icon_pack, crate::icons::IconSize::PanelTab);
         for (index, option) in options.iter().enumerate() {
             let label = option.label;
             let is_active = label == selected;
             let on_select = on_select.clone();
+            let foreground = if is_active {
+                theme::text::PRIMARY
+            } else if option.enabled {
+                theme::settings::SUBTITLE
+            } else {
+                theme::text::DISABLED
+            };
             let mut segment = div()
                 .id(gpui::ElementId::from(format!("{id_prefix}-{label}")))
                 // Index-based lookup key for `VisualTestContext::debug_bounds`, matching this
                 // control's own index-based `on_select` dispatch. No-op in release builds.
                 .debug_selector(move || format!("choice-{id_prefix}-{index}"))
                 .h(px(19.0))
-                .px(px(9.0))
+                // An icon segment is a fixed 26 wide with its glyph centred (§4w's "26x19
+                // buttons"); a label segment stays intrinsically sized with its own side padding.
+                .map(|el| match option.icon {
+                    Some(_) => el.w(px(26.0)).justify_center(),
+                    None => el.px(px(9.0)),
+                })
                 .rounded(theme::radius::CHIP)
                 .flex()
                 .items_center()
                 .gap(px(6.0))
                 .when(is_active, |el| el.bg(theme::surface::SEGMENT_ACTIVE))
-                .child(
-                    div()
-                        .font(font(theme::font::SANS))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(self.ui_text_size(10.5))
-                        .text_color(if is_active {
-                            theme::text::PRIMARY
-                        } else if option.enabled {
-                            theme::settings::SUBTITLE
-                        } else {
-                            theme::text::DISABLED
-                        })
-                        .child(label),
-                )
+                .when_some(option.tooltip, |el, tooltip| {
+                    el.tooltip(crate::root::widgets::text_tooltip(tooltip))
+                })
+                .map(|el| match option.icon {
+                    // The glyph replaces the label entirely - drawing both would put the label
+                    // back on a row §4w emptied on purpose.
+                    Some(icon) => el.child(icons.draw(icon, foreground)),
+                    None => el.child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(self.ui_text_size(10.5))
+                            .text_color(foreground)
+                            .child(label),
+                    ),
+                })
                 .when_some(option.hint, |el, hint| {
                     // A horizontal sibling of the label, not text stacked underneath it.
                     el.child(
@@ -598,14 +618,26 @@ impl AdeApp {
 }
 
 /// One segment of [`AdeApp::render_choice_control`]. The common case is just a label
-/// ([`Self::new`]) - disabled state and/or a secondary hint (a horizontal sibling of the label)
-/// are opt-in for the call sites that need them (the Diff/File toggle's `Diff` segment when
-/// there's no diff to show; the palette scope control's per-segment keybinding hint).
+/// ([`Self::new`]) - disabled state, a secondary hint (a horizontal sibling of the label), and an
+/// icon in place of the label are opt-in for the call sites that need them (the Diff/File toggle's
+/// `Diff` segment when there's no diff to show; the palette scope control's per-segment keybinding
+/// hint; the right panel's three icon tabs).
 #[derive(Clone, Copy)]
 pub(crate) struct ChoiceOption {
+    /// This segment's identity as well as its default rendering: [`AdeApp::render_choice_control`]
+    /// matches `selected` against it. An icon segment still carries one, so selection is never
+    /// keyed on something as fragile as which glyph is drawn.
     pub(in crate::settings) label: &'static str,
     pub(in crate::settings) enabled: bool,
     pub(in crate::settings) hint: Option<&'static str>,
+    /// Drawn **instead of** the label. `STAGE-A-CHANGELOG.md` §4w: the right panel's `Files` /
+    /// `Search` / `Changes` tabs become "three 26x19 buttons in the same segmented shell ... all
+    /// three drawn inside one 11x10 optical box", with the labels moving to the tooltips below.
+    pub(in crate::settings) icon: Option<crate::icons::Icon>,
+    /// The full `"<label> - <hint>"` sentence a segment shows on hover. Mandatory in practice for
+    /// an icon segment, which has no visible label left to read - §4w's own "labels move to
+    /// tooltips with their hints intact".
+    pub(in crate::settings) tooltip: Option<&'static str>,
 }
 
 impl ChoiceOption {
@@ -614,6 +646,8 @@ impl ChoiceOption {
             label,
             enabled: true,
             hint: None,
+            icon: None,
+            tooltip: None,
         }
     }
 
@@ -622,6 +656,8 @@ impl ChoiceOption {
             label,
             enabled,
             hint: None,
+            icon: None,
+            tooltip: None,
         }
     }
 
@@ -630,6 +666,24 @@ impl ChoiceOption {
             label,
             enabled: true,
             hint: Some(hint),
+            icon: None,
+            tooltip: None,
+        }
+    }
+
+    /// An icon segment: the glyph replaces the label on screen, and the label plus its hint move
+    /// into `tooltip` verbatim.
+    pub(crate) fn with_icon(
+        label: &'static str,
+        icon: crate::icons::Icon,
+        tooltip: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            enabled: true,
+            hint: None,
+            icon: Some(icon),
+            tooltip: Some(tooltip),
         }
     }
 }

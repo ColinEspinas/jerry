@@ -357,6 +357,10 @@ impl AdeApp {
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             file_tree_scroll_handle: UniformListScrollHandle::new(),
+            search: crate::search::state::SearchPanel::new(cx),
+            search_scroll_handle: gpui::ScrollHandle::new(),
+            _search_task: None,
+            _search_replace_task: None,
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
             agent_reviews: HashMap::new(),
@@ -784,6 +788,14 @@ impl AdeApp {
                 // the moment this one gained focus, and never toggled after that, reading as no
                 // caret at all most of the time.
                 &this.note_focus_handle,
+                // GitHub issue #162's four search-panel fields are the sixth through ninth, built
+                // inside `this.search` by this same `Self` literal. Wired here rather than left
+                // out: this omission has been a live bug report five separate times (see the four
+                // entries above), and four fields added in one edit is four chances to repeat it.
+                &this.search.query_focus_handle,
+                &this.search.replace_focus_handle,
+                &this.search.include_focus_handle,
+                &this.search.exclude_focus_handle,
             ],
             window,
             cx,

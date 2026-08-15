@@ -172,6 +172,7 @@ actions!(
         NewTerminal,
         NewAgentPane,
         NewGitGraph,
+        SearchInWorktree,
         NextChangedFile,
         ToggleChangeSeen,
         ToggleChangeStaged,
@@ -473,6 +474,21 @@ pub struct AdeApp {
     /// handle `crate::sidebar::render::AdeApp::render_file_tree`'s own `uniform_list` is
     /// `track_scroll`'d with - not a second, parallel tracking mechanism.
     pub(crate) file_tree_scroll_handle: UniformListScrollHandle,
+    /// The right panel's Search tab (GitHub issue #162): its four real inputs, the modifier
+    /// toggles, per-file collapse, and the last completed search - see
+    /// `crate::search::state::SearchPanel`.
+    pub(crate) search: crate::search::state::SearchPanel,
+    /// The result tree's own scroll handle. A plain `gpui::ScrollHandle` rather than a
+    /// `UniformListScrollHandle` like the file tree's: the tree is two-level with per-file
+    /// collapse, so its rows are not uniform in count *or* height, which is exactly what
+    /// `uniform_list` requires. The result cap (`crate::search::engine::MAX_MATCHES`) is what
+    /// bounds how many rows this can ever hold.
+    pub(crate) search_scroll_handle: gpui::ScrollHandle,
+    /// The in-flight debounced search - superseded rather than cancelled, with a generation
+    /// guard on the result, so a slow walk cannot overwrite a newer, faster one.
+    pub(crate) _search_task: Option<Task<()>>,
+    /// The in-flight Replace all / per-file replace.
+    pub(crate) _search_replace_task: Option<Task<()>>,
     pub(crate) diff_root: PathBuf,
     pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
@@ -3248,6 +3264,7 @@ impl Render for AdeApp {
                 el.on_action(cx.listener(Self::handle_new_agent_pane_action))
             })
             .on_action(cx.listener(Self::handle_new_git_graph_action))
+            .on_action(cx.listener(Self::handle_search_in_worktree_action))
             .on_action(cx.listener(Self::handle_next_changed_file_action))
             .on_action(cx.listener(Self::handle_toggle_change_seen_action))
             .on_action(cx.listener(Self::handle_toggle_change_staged_action))
@@ -3705,7 +3722,7 @@ impl OverlayFocus {
     ///
     /// This exists for a real, reproduced case (found by the `tree-focus-bugfixes` branch's own
     /// adversarial audit): with the file tree focused, opening the palette captures
-    /// `tree_focus_handle`; running the palette's own "Toggle Files / Changes" then unrenders the
+    /// `tree_focus_handle`; running the palette's own "Cycle Right Panel" then unrenders the
     /// whole tree, and closing the palette restored focus straight onto it.
     /// `crate::sidebar::render::AdeApp::set_right_sidebar_view` already had a
     /// `tree_focus_handle.is_focused(window)` guard for the *direct* version of this, but the

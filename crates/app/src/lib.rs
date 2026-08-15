@@ -252,6 +252,14 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
         gpui::KeyBinding::new("secondary-shift-g", root::NewGitGraph, None),
+        // GitHub issue #162's own ask, unchanged by the rev-6 re-scope: "`mod+shift+F` opens the
+        // panel focused in the query." Deliberately global (`None`), like every other
+        // `"secondary-shift-"` entry above and unlike the plain letters further down: a real
+        // Cmd/Ctrl-modified keystroke never reaches a focused pty in the first place
+        // (`crate::terminal::pane::keystroke_to_bytes` returns `None` for any keystroke carrying
+        // `platform`, and `Ctrl+Shift+F` is not a control byte any shell reads), so there is no
+        // terminal input for it to swallow.
+        gpui::KeyBinding::new("secondary-shift-f", root::SearchInWorktree, None),
         // `&& !text-input` was added by GitHub issue #288, and it is a real fix rather than
         // defensive padding: that issue puts a pinned review-note card - a genuine
         // `"text-input"` node - *inside* the diff surface, so with the old predicate a plain `]`

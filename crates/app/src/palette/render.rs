@@ -3,7 +3,7 @@ use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
 use crate::settings::widgets::ChoiceOption;
-use crate::sidebar::render::RightSidebarView;
+use crate::sidebar::render::{next_right_sidebar_view, RightSidebarView};
 
 /// Live secondary line for one of the three `Window controls: …` palette commands - names which
 /// chrome that option resolves to and flags the one that's already active, like
@@ -168,9 +168,10 @@ impl AdeApp {
             Some(cwd) => format!("in {}", cwd.display()),
             None => "- select a worktree first".to_string(),
         };
-        let next_sidebar_view = match self.right_sidebar_view {
-            RightSidebarView::Files => "Changes",
-            RightSidebarView::Changes => "Files",
+        let next_sidebar_view = match next_right_sidebar_view(self.right_sidebar_view) {
+            RightSidebarView::Files => "Files",
+            RightSidebarView::Search => "Search",
+            RightSidebarView::Changes => "Changes",
         };
         let mut commands = vec![
             palette::CommandCandidate {
@@ -186,7 +187,7 @@ impl AdeApp {
                 secondary: format!("spawn codex {spawn_target}"),
             },
             palette::CommandCandidate {
-                command: palette::PaletteCommand::ToggleFilesChanges,
+                command: palette::PaletteCommand::CycleRightPanel,
                 secondary: format!("switch the right panel to {next_sidebar_view}"),
             },
             palette::CommandCandidate {
@@ -437,17 +438,17 @@ impl AdeApp {
             palette::PaletteCommand::NewCodexAgent => {
                 self.new_agent(ProcessKind::codex(), window, cx)
             }
-            palette::PaletteCommand::ToggleFilesChanges => {
+            palette::PaletteCommand::CycleRightPanel => {
                 // Any palette gesture must disarm a pending prune confirmation (see
                 // `Self::open_palette`'s docs); the other branches already do this via the
                 // methods they call, so this one clears it explicitly.
                 self.prune_confirm_armed = false;
                 self.discard_confirm_armed = None;
-                let next = match self.right_sidebar_view {
-                    RightSidebarView::Files => RightSidebarView::Changes,
-                    RightSidebarView::Changes => RightSidebarView::Files,
-                };
-                self.set_right_sidebar_view(next, window, cx);
+                self.set_right_sidebar_view(
+                    next_right_sidebar_view(self.right_sidebar_view),
+                    window,
+                    cx,
+                );
             }
             palette::PaletteCommand::PruneWorktrees => self.request_prune(cx),
             palette::PaletteCommand::OpenSettings => self.open_settings(window, cx),
