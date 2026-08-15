@@ -1412,6 +1412,7 @@ impl AdeApp {
         // the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other`) stays exactly
         // that - unaffected by either spacer, both of which sit outside it.
         div()
+            .w_full()
             .flex()
             .flex_col()
             .when(!is_first, |el| el.child(div().h(px(12.0))))
@@ -1438,6 +1439,7 @@ impl AdeApp {
         group: &RepoGroup,
     ) -> impl IntoElement {
         div()
+            .w_full()
             .px(px(12.0))
             .pb(px(6.0))
             .font(font(theme::font::MONO))
@@ -1537,6 +1539,7 @@ impl AdeApp {
             // entry has no usable, real path to select into).
             return div()
                 .id(id)
+                .w_full()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1718,6 +1721,7 @@ impl AdeApp {
             // repo that isn't focused.
             .debug_selector(move || id)
             .cursor_pointer()
+            .w_full()
             .flex()
             .items_center()
             .h(px(27.0))
@@ -1826,6 +1830,7 @@ impl AdeApp {
         // not a style meant for an ordinary flex sibling" reason.
         if trailing_pb {
             div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .child(header)
@@ -1894,6 +1899,7 @@ impl AdeApp {
             // anchoring, so the two must stay one format.
             .debug_selector(move || format!("agent-row-{id}"))
             .cursor_pointer()
+            .w_full()
             .flex()
             .pl(px(13.0))
             // The row's real indent under its worktree: 13px of empty space (padding, not a
@@ -2072,6 +2078,7 @@ impl AdeApp {
         div()
             .id(element_id)
             .debug_selector(move || selector.to_string())
+            .w_full()
             .flex()
             .items_center()
             .gap(px(5.0))
