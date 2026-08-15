@@ -85,12 +85,26 @@ impl AdeApp {
     /// floor, or a second click while a request is already open. Dropping it is deliberate:
     /// queueing would turn an impatient double-click into two requests against an endpoint whose
     /// own limiter is the reason this cadence exists.
+    ///
+    /// # The `cfg(test)` guard lives here, not only on the timer
+    ///
+    /// This is the single choke point every read passes through: the background loop, the
+    /// popover's `Refresh` and a failed row's `Retry` all arrive here, and only the first of the
+    /// three goes anywhere near [`AdeApp::start_budget_poll_loop`]'s own [`POLLING_ENABLED`]
+    /// check. A test that drove either control - a click test on the popover, a render test that
+    /// happened to fire the handler - would otherwise read the developer's own OAuth credential
+    /// off disk and send it to a real provider, which is precisely what that constant exists to
+    /// prevent. Gating the loop alone made the promise true by accident of what the suite happens
+    /// to call today; gating here makes it true by construction.
     pub(crate) fn refresh_provider_budget(
         &mut self,
         provider: Provider,
         manual: bool,
         cx: &mut Context<Self>,
     ) {
+        if !POLLING_ENABLED {
+            return;
+        }
         let now = Instant::now();
         if !self.budget.get(provider).may_poll_now(manual, now) {
             return;
@@ -175,14 +189,40 @@ mod budget_flow_tests {
     }
 
     /// The poll must never run itself in a test build - it reads a real credential off the
-    /// developer's disk and sends it to a real provider. This is the guard, asserted rather than
-    /// assumed.
-    #[test]
-    fn polling_is_off_in_a_test_build() {
-        assert!(
-            !POLLING_ENABLED,
-            "a test run must never spend a real person's provider budget"
-        );
+    /// developer's disk and sends it to a real provider. Asserted at *compile* time rather than in
+    /// a `#[test]` body: a run-time assertion can only fail after the suite has already had the
+    /// chance to make the call it is guarding against, whereas this one refuses to build a test
+    /// binary in which polling is on.
+    const _: () = assert!(
+        !POLLING_ENABLED,
+        "a test run must never spend a real person's provider budget"
+    );
+
+    /// And the guard as *behaviour*, on the path a click really takes: the popover's `Refresh`
+    /// reaches [`AdeApp::refresh_provider_budget`] without going near the background loop, so the
+    /// constant above would not save a click test on its own. Nothing is even attempted here -
+    /// `last_attempt` staying `None` is the proof no request was started.
+    #[gpui::test]
+    fn a_manual_refresh_starts_no_request_at_all_in_a_test_build(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+
+        app.update(cx, |app, cx| {
+            app.refresh_all_budgets(cx);
+            app.refresh_provider_budget(Provider::Claude, true, cx);
+            for provider in Provider::ALL {
+                assert_eq!(
+                    app.budget.get(provider).last_attempt,
+                    None,
+                    "{provider:?} must not have been read - a test must never send a real \
+                     developer's OAuth credential to a real endpoint"
+                );
+                assert!(
+                    !app.budget.get(provider).in_flight,
+                    "{provider:?} must not have a request open either"
+                );
+            }
+        });
     }
 
     #[gpui::test]
@@ -259,9 +299,7 @@ mod budget_flow_tests {
 
         app.update(cx, |app, cx| {
             assert!(
-                !app.agents
-                    .iter()
-                    .any(|agent| agent.kind.is_agent_session()),
+                !app.agents.iter().any(|agent| agent.kind.is_agent_session()),
                 "premise: the startup pane is a shell, not an agent session"
             );
             app.poll_budgets_if_due(cx);

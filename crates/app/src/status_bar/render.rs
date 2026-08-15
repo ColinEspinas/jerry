@@ -40,9 +40,11 @@ pub(crate) enum StatusTier {
     /// §3: `main ↑2 ↓0`'s branch, `4 agents running` - "the readouts you are meant to find
     /// first".
     Primary,
-    /// §3: provider budgets. Nothing in the bar carries this tier until GitHub issue #294 lands
-    /// its per-provider rate-limit clusters; the token itself is live today in the Resources
-    /// popover's memory column (see `crate::theme::status_bar::SECONDARY`).
+    /// §3: provider budgets - carried by the agent pane strip's rate-limit cluster's provider
+    /// name (`crate::budget::render::AdeApp::render_agent_budget_readout`, GitHub issue #294),
+    /// and by the Resources popover's memory column (see `crate::theme::status_bar::SECONDARY`).
+    /// Nothing in the window *footer* itself carries it: §4u′ deleted the footer's aggregate
+    /// budget slot outright, so the tier's own readout lives one surface in.
     Secondary,
     /// §3: `41% cpu · 3.4 GB`, and the tail of every split readout (`↑2 ↓0`).
     Recessive,

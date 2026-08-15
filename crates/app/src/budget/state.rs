@@ -569,7 +569,11 @@ mod budget_state_tests {
             "a window that is not a whole number of hours must not round to one that isn't real"
         );
         assert_eq!(window_label(30), "30s");
-        assert_eq!(window_label(-5), "0s", "a negative duration is not a window");
+        assert_eq!(
+            window_label(-5),
+            "0s",
+            "a negative duration is not a window"
+        );
     }
 
     #[test]
@@ -616,7 +620,10 @@ mod budget_state_tests {
             ProviderReadout::NotConnected,
             "no credential on disk is `not connected`, and nothing about it is broken"
         );
-        assert!(!budget.can_retry(), "there is nothing to retry when there is no credential");
+        assert!(
+            !budget.can_retry(),
+            "there is nothing to retry when there is no credential"
+        );
 
         budget.connected = true;
         assert_eq!(
@@ -631,7 +638,10 @@ mod budget_state_tests {
             ProviderReadout::RefreshFailed,
             "a failure with no earlier numbers has nothing to go stale"
         );
-        assert!(budget.can_retry(), "and it earns the `Retry` \u{a7}4c puts beside it");
+        assert!(
+            budget.can_retry(),
+            "and it earns the `Retry` \u{a7}4c puts beside it"
+        );
 
         let fresh = snapshot(81.0, 40.0);
         budget.last_ok = Some((fresh.clone(), now));
@@ -740,7 +750,11 @@ mod budget_state_tests {
     fn the_last_read_instant_is_the_newest_across_providers() {
         let now = Instant::now();
         let mut state = BudgetState::default();
-        assert_eq!(state.last_read_at(), None, "not sampled yet is its own state");
+        assert_eq!(
+            state.last_read_at(),
+            None,
+            "not sampled yet is its own state"
+        );
 
         let older = now - Duration::from_secs(120);
         state.get_mut(Provider::Claude).last_ok = Some((snapshot(50.0, 50.0), older));

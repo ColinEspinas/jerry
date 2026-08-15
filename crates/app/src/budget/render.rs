@@ -259,7 +259,8 @@ impl AdeApp {
         // Opens upwards from the readout's own top edge. `right: -8px` in the mock is measured
         // from the readout, so the panel's right edge sits 8px past it; both edges are then
         // clamped into the window so a readout near either edge cannot push the panel off screen.
-        let right_edge = (anchor.origin.x + anchor.size.width + px(8.0)).min(viewport.width - px(6.0));
+        let right_edge =
+            (anchor.origin.x + anchor.size.width + px(8.0)).min(viewport.width - px(6.0));
         let left = (right_edge - width).max(px(6.0));
         let bottom = (viewport.height - anchor.origin.y + px(4.0)).max(px(6.0));
 
@@ -304,6 +305,16 @@ impl AdeApp {
             )
     }
 
+    /// `RATE LIMITS` and the `Refresh` control.
+    ///
+    /// **`Refresh` sits in the header, not next to `Updated N ago` in the foot.** §4c's prose runs
+    /// the two together in one sentence ("`Updated 3m ago` and a `Refresh` that sets `Updated just
+    /// now`"), but `Jerry.dc.html` - the newest state of the bundle, and the build §4u′ describes -
+    /// puts `Refresh` at the head opposite the title and leaves the foot to `Updated N ago` and the
+    /// `counts headroom, not spend` footnote. That is also the better reading of the same sentence:
+    /// it fixes what `Refresh` *does* to the foot line, not where it is drawn. The mock wins on
+    /// placement; the prose's actual claim - that the foot line is derived from a real read - is
+    /// what [`Self::render_budget_popover_footer`] implements.
     fn render_budget_popover_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()

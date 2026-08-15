@@ -58,12 +58,29 @@ pub enum ProviderRead {
 }
 
 /// One provider's stored credential.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The `Debug` below is hand-written rather than derived, and that is the point of it - see its
+/// own docs.
+#[derive(Clone, PartialEq)]
 pub struct Credential {
     pub token: String,
     /// Codex's `tokens.account_id`, sent as `ChatGPT-Account-Id`. `None` for Claude, which needs
     /// no equivalent.
     pub account_id: Option<String>,
+}
+
+/// Redacting, on purpose. This struct holds a live OAuth bearer token belonging to the user, and a
+/// `#[derive(Debug)]` would put it verbatim into *any* `{:?}` - a stray `log::debug!`, a panic
+/// message, a future error report. Nothing in this app has a reason to want the token's characters
+/// in a diagnostic, so nothing is given the chance: the presence of each field is reported, and its
+/// value never is.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("token", &"<redacted>")
+            .field("account_id", &self.account_id.is_some())
+            .finish()
+    }
 }
 
 /// The directory a provider's CLI keeps its credential in, honouring the same environment
@@ -549,7 +566,11 @@ mod budget_fetch_tests {
             "primary_window": {"used_percent": 50, "limit_window_seconds": 3600,
                                "reset_after_seconds": 600, "reset_at": 0}}}"#;
         let snapshot = parse_codex_usage(body).expect("parses");
-        assert_eq!(snapshot.windows.len(), 1, "one window is a real payload too");
+        assert_eq!(
+            snapshot.windows.len(),
+            1,
+            "one window is a real payload too"
+        );
         assert_eq!(snapshot.windows[0].label, "1h");
         assert!(
             snapshot.windows[0].resets_at.is_some(),
@@ -599,12 +620,40 @@ mod budget_fetch_tests {
             None
         );
         assert_eq!(
-            parse_credential(Provider::Claude, r#"{"claudeAiOauth": {"accessToken": ""}}"#),
+            parse_credential(
+                Provider::Claude,
+                r#"{"claudeAiOauth": {"accessToken": ""}}"#
+            ),
             None,
             "an empty token is not a token"
         );
         assert_eq!(parse_credential(Provider::Claude, "{}"), None);
         assert_eq!(parse_credential(Provider::Claude, "broken"), None);
+    }
+
+    /// A live bearer token must never be printable. The one place a credential could plausibly
+    /// escape into a log or a panic message is `{:?}`, so that is the hole this closes - and this
+    /// test is what stops a later `#[derive(Debug)]` from quietly reopening it.
+    #[test]
+    fn a_credential_never_prints_its_own_token() {
+        let credential = Credential {
+            token: "sk-ant-oat01-super-secret".to_string(),
+            account_id: Some("acc-secret-1".to_string()),
+        };
+        let printed = format!("{credential:?}");
+        assert!(
+            !printed.contains("super-secret"),
+            "the token must never reach a `{{:?}}`, got {printed}"
+        );
+        assert!(
+            !printed.contains("acc-secret-1"),
+            "nor the account id, got {printed}"
+        );
+        assert!(
+            printed.contains("<redacted>") && printed.contains("account_id: true"),
+            "but a diagnostic must still be able to say a credential was there and complete, got \
+             {printed}"
+        );
     }
 
     #[test]
@@ -614,7 +663,10 @@ mod budget_fetch_tests {
         assert_eq!(utc, zulu, "`Z` and `+00:00` are the same instant");
 
         let fractional = parse_rfc3339("2026-08-15T20:00:00.123456Z").expect("fractional form");
-        assert_eq!(fractional, zulu, "sub-second precision is discarded, not fatal");
+        assert_eq!(
+            fractional, zulu,
+            "sub-second precision is discarded, not fatal"
+        );
 
         let offset = parse_rfc3339("2026-08-15T15:00:00-05:00").expect("negative offset");
         assert_eq!(offset, zulu, "a -05:00 wall clock at 15:00 is 20:00 UTC");
@@ -634,9 +686,17 @@ mod budget_fetch_tests {
             Some(SystemTime::UNIX_EPOCH)
         );
 
-        assert_eq!(parse_rfc3339("2026-08-15T20:00:00"), None, "no zone is not a valid instant");
+        assert_eq!(
+            parse_rfc3339("2026-08-15T20:00:00"),
+            None,
+            "no zone is not a valid instant"
+        );
         assert_eq!(parse_rfc3339("nonsense"), None);
-        assert_eq!(parse_rfc3339("2026-13-15T20:00:00Z"), None, "month 13 is not a date");
+        assert_eq!(
+            parse_rfc3339("2026-13-15T20:00:00Z"),
+            None,
+            "month 13 is not a date"
+        );
     }
 
     /// The credential path really is the file each CLI writes, and really does follow that CLI's
