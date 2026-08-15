@@ -40,13 +40,12 @@
 //! facts) and, where no transcript was captured, a short synthesised one built from that run's own
 //! record - which is what §3 asks for in as many words, and never another run's output.
 
-use crate::hooks::history::PastAgent;
-use crate::rail::status::Status;
 use crate::root::*;
 use crate::theme;
-use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
+use crate::work_surface::agents::{AgentId, ProcessKind};
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, Window};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub mod model;
 pub mod transcript_store;

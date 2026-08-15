@@ -149,6 +149,14 @@ impl AdeApp {
             .as_deref()
             .map(crate::hooks::store::AgentStatusState::load_at)
             .unwrap_or_default();
+        // GitHub issue #227's per-run transcripts sit in a directory beside that file, and
+        // resolve the same way. Nothing is read here: a transcript is read once, when its own tab
+        // is opened (`crate::run_history::flow::AdeApp::load_run_transcript`), because reading
+        // every stored run's output at startup would be megabytes of disk for a surface the user
+        // may never visit.
+        let run_transcript_dir = settings_path
+            .as_deref()
+            .map(crate::run_history::transcript_store::transcript_dir_for);
 
         // GitHub issue #284's per-agent line provenance resolves the same way. Unlike the two
         // above it is genuinely read back at startup - `restore_line_provenance`, called once
@@ -391,6 +399,20 @@ impl AdeApp {
             review_tab_active: false,
             review_focus_handle: cx.focus_handle(),
             review_focus: OverlayFocus::default(),
+            history_scope: crate::run_history::model::HistoryScope::default(),
+            history_collapsed: HashMap::new(),
+            run_drift: HashMap::new(),
+            run_drift_in_flight: false,
+            run_tab_by_worktree: HashMap::new(),
+            run_tab_active: false,
+            run_tab_focus_handle: cx.focus_handle(),
+            run_tab_focus: OverlayFocus::default(),
+            run_tab_scroll_handle: gpui::ScrollHandle::new(),
+            run_transcripts: HashMap::new(),
+            run_transcript_dir,
+            _run_transcript_load_tasks: HashMap::new(),
+            _run_finish_tasks: HashMap::new(),
+            _run_drift_task: None,
             review_scroll_handle: UniformListScrollHandle::new(),
             review_highlight_cache: None,
             _review_baseline_tasks: HashMap::new(),

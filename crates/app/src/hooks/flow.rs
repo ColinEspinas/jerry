@@ -328,7 +328,7 @@ impl AdeApp {
     /// process-wide `crate::persisted_state_lock` mutex across two `fsync`s, and other persisted
     /// files' writers contend for that same lock. Running it inline would put a disk flush on the
     /// render thread.
-    fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.agent_status_path.clone() else {
             return;
         };

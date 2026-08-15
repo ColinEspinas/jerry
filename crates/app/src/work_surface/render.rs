@@ -133,7 +133,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.open_change.is_none() && !self.settings_open && !self.graph_tab_active {
+        if !self.centre_pane_is_not_an_agent() {
             self.agents.focus_active(window, cx);
         }
     }
@@ -459,14 +459,16 @@ impl AdeApp {
     /// rail's *root*, not its filter field (which this used to target): see
     /// [`Self::rail_focus_handle`]'s own docs for the real keystroke-swallowing bug that was.
     pub(crate) fn close_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        // The graph tab (like a file tab or Settings) occupies the centre pane instead of an
-        // agent's own `TerminalPane` while active, so `Agents::close`'s own focus-follows-close
-        // move onto the newly active agent's pane would be exactly as dangling as the
-        // file-tab/Settings cases this guard already covers - a real, adversarial-audit-found
-        // gap: the sibling guard in `Self::focus_newly_spawned_agent` was updated for this, this
-        // one was not.
-        let skip_focus_move =
-            self.open_change.is_some() || self.settings_open || self.graph_tab_active;
+        // A non-agent surface occupies the centre pane instead of an agent's own `TerminalPane`
+        // while it is active, so `Agents::close`'s own focus-follows-close move onto the newly
+        // active agent's pane would dangle. See [`Self::centre_pane_is_not_an_agent`] - the one
+        // shared predicate every such site now reads.
+        let skip_focus_move = self.centre_pane_is_not_an_agent();
+        // GitHub issue #227: record that this run really ended - its transcript, its ending and
+        // its diffstat - *before* anything below tears down the two things that measurement needs
+        // (the pane's grid, and the review baseline ref released two lines down). See
+        // `crate::run_history::flow`'s own module docs on why this moment and no other.
+        self.finish_run_record(id, cx);
         // GitHub issue #225: close this agent's review tab (if it's the one open) and release its
         // baseline ref, *before* `Agents::close` removes the agent - `release_review_baseline`
         // needs to still be able to look up which worktree to run `git update-ref -d` in. The
@@ -492,16 +494,40 @@ impl AdeApp {
         {
             self.clear_merge_flow_for_closed_agent(cx);
         }
-        if self.agents.active_id().is_none()
-            && self.open_change.is_none()
-            && !self.settings_open
-            && !self.graph_tab_active
-        {
+        if self.agents.active_id().is_none() && !self.centre_pane_is_not_an_agent() {
             window.focus(&self.rail_focus_handle, cx);
         }
         // A closed tab is as real a session change as an opened one: relaunching must not reopen
         // a tab the user deliberately closed. See `crate::work_surface::session`.
         self.record_worktree_session(cx);
+    }
+
+    /// Whether some surface *other than an agent's own pane* currently occupies the centre column.
+    ///
+    /// The one shared predicate `REVISION-2026-08-13.md` §7 asks for, in this app's own terms.
+    /// The design states the rule as a deny-list on "is this tab a file"
+    /// (`isFileTab = !isAgent(tab) && tab !== 'terminal' && tab !== 'graph' && tab !== 'run'`) and
+    /// spells out exactly what it costs to forget one: "without the last clause the editor renders
+    /// *below* the new pane and the tab id is pushed into the worktree's open-file list as a
+    /// phantom file tab". Jerry's equivalent question is this one - every real site asked it as an
+    /// inline `open_change.is_some() || settings_open || graph_tab_active`, once per site, and one
+    /// of them had already drifted (the review tab was missing from `close_agent`'s own
+    /// `skip_focus_move`, so closing an agent while the Review tab was showing moved real keyboard
+    /// focus onto a pane nothing was drawing).
+    ///
+    /// **Extend this, and only this, when a centre surface is added.** Every caller is a place
+    /// that would otherwise focus, close or render an agent pane that is not on screen.
+    ///
+    /// Jerry's other half of §7 - "the tab id can't leak into the open-file list" - needs no
+    /// predicate at all: [`work_surface::TabRef`] is an enum, its file arm carries a `PathBuf`,
+    /// and the open-file list is `Vec<PathBuf>`, so a run tab is structurally incapable of landing
+    /// in it.
+    pub(crate) fn centre_pane_is_not_an_agent(&self) -> bool {
+        self.open_change.is_some()
+            || self.settings_open
+            || self.graph_tab_active
+            || self.review_tab_active
+            || self.run_tab_active
     }
 
     /// The rail agent menu's `Pause` action - sends `Ctrl-C` to the agent's pty via

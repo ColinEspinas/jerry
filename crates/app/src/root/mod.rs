@@ -1044,6 +1044,67 @@ pub struct AdeApp {
     /// Pre-open focus target for [`Self::review_focus_handle`] - see [`OverlayFocus`], and
     /// [`Self::graph_focus`] for the identical role on the graph tab.
     pub(crate) review_focus: OverlayFocus,
+    /// Which runs the sidebar's History view is showing - `all` or `this worktree`
+    /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §6, GitHub issue #227).
+    ///
+    /// Deliberately not persisted, for exactly [`Self::sidebar_view`]'s own reason: it is a
+    /// per-window navigation position, not a preference.
+    pub(crate) history_scope: crate::run_history::model::HistoryScope,
+    /// Which History worktree groups the user has explicitly folded or unfolded, keyed by
+    /// worktree path (`true` = folded). A worktree with no entry takes the default
+    /// `crate::run_history::model::build_run_tree` computes - the active one opens, the rest do
+    /// not - which is why this is a map of *explicit* choices rather than a set of open groups:
+    /// the two are only the same until the active worktree changes.
+    pub(crate) history_collapsed: HashMap<PathBuf, bool>,
+    /// Real drift counts, `worktree -> run key -> commits since that run ended` (GitHub issue
+    /// #227). Filled in by `crate::run_history::flow::AdeApp::load_run_drift`, which runs a real
+    /// `wt_core::run_drift::commits_since_each` per worktree on the background executor.
+    ///
+    /// A run with no entry paints **no** drift dot and no drift text - see
+    /// `crate::run_history::model::RunEntry::drift`. There is deliberately no "assume zero"
+    /// fallback: `at the tip` is a real claim about the branch, and a claim made before the
+    /// traversal answered would be a guess dressed as the most reassuring of the three bands.
+    pub(crate) run_drift: HashMap<PathBuf, HashMap<String, usize>>,
+    /// Whether a drift load is already running, so a re-render mid-flight cannot start a second
+    /// one - the same single-flight shape [`Self::prune_in_flight`] uses.
+    pub(crate) run_drift_in_flight: bool,
+    /// Which run's transcript is open as a centre tab in each worktree, keyed by worktree path.
+    ///
+    /// **One run tab per worktree, replaced on the next open** (`REVISION-2026-08-13.md` §3), so
+    /// this is a map rather than [`Self::review_tab_open`]'s single window-wide slot: opening a
+    /// run in another checkout must not close the one you were reading here.
+    pub(crate) run_tab_by_worktree: HashMap<PathBuf, String>,
+    /// Whether the run-transcript tab is the tab strip's currently *active* entry - exactly
+    /// mirrors [`Self::review_tab_active`], including that switching to another tab clears this
+    /// without closing the run tab.
+    pub(crate) run_tab_active: bool,
+    /// The run-transcript tab's own keyboard-focus target, swept exactly like
+    /// [`Self::review_focus_handle`] whenever the tab stops being rendered.
+    pub(crate) run_tab_focus_handle: FocusHandle,
+    /// Pre-open focus target for [`Self::run_tab_focus_handle`] - see [`OverlayFocus`].
+    pub(crate) run_tab_focus: OverlayFocus,
+    /// The run-transcript body's scroll handle - a transcript is longer than the pane.
+    pub(crate) run_tab_scroll_handle: gpui::ScrollHandle,
+    /// Real captured transcripts read back off disk, keyed by run id
+    /// (`crate::run_history::transcript_store`). A key present with `None` means "this run was
+    /// looked up and genuinely has no stored transcript", which is what makes the synthesised
+    /// body (`crate::run_history::model::transcript_body`) a decision rather than a race: without
+    /// the distinction, every first frame after opening a tab would render the synthesis and then
+    /// swap it for the real thing.
+    pub(crate) run_transcripts: HashMap<String, Option<Vec<String>>>,
+    /// Where [`Self::run_transcripts`] is persisted - a sibling of `agent-status.toml`, or `None`
+    /// when this instance has no real settings path (see `crate::settings::store`).
+    pub(crate) run_transcript_dir: Option<PathBuf>,
+    /// In-flight background reads of a run's stored transcript, keyed by run id. Keyed rather
+    /// than a single slot for [`Self::_review_baseline_tasks`]'s own reason: a `Task` cancels on
+    /// drop, and two tabs opened in quick succession must not cancel each other's read.
+    pub(crate) _run_transcript_load_tasks: HashMap<String, Task<()>>,
+    /// In-flight "this run just ended" captures, keyed by run id - the real diffstat measurement
+    /// and record write `crate::run_history::flow::AdeApp::finish_run_record` performs when an
+    /// agent's pane closes. Keyed for the same reason, and removed by each task as it completes.
+    pub(crate) _run_finish_tasks: HashMap<String, Task<()>>,
+    /// The in-flight drift traversal - one slot, guarded by [`Self::run_drift_in_flight`].
+    pub(crate) _run_drift_task: Option<Task<()>>,
     /// The review tab's own overlay-scrollbar handle - its own, not
     /// [`Self::diff_view_scroll_handle`]: the two surfaces are separate places in the app, and
     /// sharing one handle would carry the git Diff view's scroll position into the review (and
