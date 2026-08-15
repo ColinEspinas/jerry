@@ -453,21 +453,31 @@ impl AdeApp {
                 return;
             };
             let target_line = target_range.start.line as usize + 1;
-            // `navigate_to_definition` needs `Window` access to move focus; `update_in` supplies
+            // `open_file_at_line` needs `Window` access to move focus; `update_in` supplies
             // it by looking up the window this entity belongs to (see
             // vendor/zed/crates/gpui/src/app/async_context.rs `AsyncApp::with_window`), without
             // requiring this task to have been spawned via `cx.spawn_in`.
             let _ = this.update_in(cx, |this, window, cx| {
-                this.navigate_to_definition(target_path, target_line, window, cx);
+                this.open_file_at_line(target_path, target_line, window, cx);
             });
         });
         self._goto_definition_tasks.push(task);
     }
 
-    /// Navigates to a go-to-definition result. `absolute_target_path` may be under
-    /// [`Self::file_tree_root`] or entirely outside it (e.g. another crate `rust-analyzer` sees);
-    /// either way `Self::open_file_view`'s own `strip_prefix` handles it, since `PathBuf::join` with
-    /// an already-absolute path just becomes that path.
+    /// Opens `absolute_target_path` in Surface C's File view and lands the caret on
+    /// `one_based_line` - the app's one "open that file, at that line" move.
+    ///
+    /// Named for what it does rather than for its first caller (it was `navigate_to_definition`
+    /// until GitHub issue #292): go-to-definition was only ever one of three real callers, beside
+    /// a terminal `path:line` link ([`Self::open_terminal_link`]) and now the sidebar Problems
+    /// view's own rows (`crate::rail::strip_render`, `REVISION-2026-08-13.md` §2: "opens the file
+    /// at the line on click"). A third caller reaching for a method whose name says "definition"
+    /// is how a second, subtly different copy of this cursor-line dance gets written; there is one
+    /// of these, and this is it.
+    ///
+    /// `absolute_target_path` may be under [`Self::file_tree_root`] or entirely outside it (e.g.
+    /// another crate `rust-analyzer` sees); either way `Self::open_file_view`'s own `strip_prefix`
+    /// handles it, since `PathBuf::join` with an already-absolute path just becomes that path.
     ///
     /// ## Avoiding a cursor-line race
     ///
@@ -476,7 +486,7 @@ impl AdeApp {
     /// once it completes, which would clobber a line set directly here before the load even
     /// starts. [`Self::pending_cursor_line`] is the one-shot instruction that survives the load
     /// instead; `Self::spawn_file_load`'s completion handler consumes it.
-    pub(in crate::code_surface) fn navigate_to_definition(
+    pub(crate) fn open_file_at_line(
         &mut self,
         absolute_target_path: PathBuf,
         one_based_line: usize,

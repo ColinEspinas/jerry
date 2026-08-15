@@ -2693,13 +2693,20 @@ function send(o) {
   const s = JSON.stringify(o);
   process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\r\n\r\n' + s);
 }
-function publish(uri, message, character, characterEnd, source, code) {
+function publish(uri, message, character, characterEnd, source, code, line, severity) {
   const start = character === undefined ? 0 : character;
   const end = characterEnd === undefined ? start + 1 : characterEnd;
+  // `line`/`severity` default to the 0/`1` (error) every earlier caller relied on, so a caller
+  // that doesn't ask for them sends the exact same bytes as before. They exist for the sidebar
+  // Problems view (GitHub issue #292), whose whole subject is a list of several files at several
+  // severities - a fixture where every row is an error on line 0 could not tell a real
+  // severity-tallied header from one that counted rows.
+  const ln = line === undefined ? 0 : line;
+  const sev = severity === undefined ? 1 : severity;
   // `source`/`code` are left off the object entirely when undefined (JSON.stringify drops
   // undefined values), so a caller that doesn't ask for them sends the exact same bytes as before.
   send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [
-    { range: { start: { line: 0, character: start }, end: { line: 0, character: end } }, severity: 1, message, source, code }
+    { range: { start: { line: ln, character: start }, end: { line: ln, character: end } }, severity: sev, message, source, code }
   ] } });
 }
 function handle(msg) {
@@ -2718,7 +2725,7 @@ function handle(msg) {
   if (msg.method === 'shutdown') { send({ jsonrpc: '2.0', id: msg.id, result: null }); return; }
   if (msg.method === 'exit' || msg.method === 'test/die') { process.exit(0); }
   if (msg.method === 'test/publish') {
-    publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd, msg.params.source, msg.params.code);
+    publish(msg.params.uri, msg.params.message, msg.params.character, msg.params.characterEnd, msg.params.source, msg.params.code, msg.params.line, msg.params.severity);
     return;
   }
   if (msg.method === 'completionItem/resolve') {
@@ -2889,6 +2896,45 @@ process.stdin.on('data', (d) => {
                     "message": message,
                     "character": character,
                     "characterEnd": character_end,
+                }),
+            )
+            .expect("the fake server should accept a real notification");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let target = uri(target);
+        while !client.has_diagnostics_result_uri(&target) {
+            assert!(
+                Instant::now() < deadline,
+                "the real publishDiagnostics push never landed in the client's own sink"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Same real push as [`publish_and_wait`], at a real `line` and a real `severity`, naming a
+    /// real `source` - the whole shape one row of the sidebar Problems view renders (GitHub issue
+    /// #292: "severity square, message, file, line, source").
+    ///
+    /// Exists rather than widening [`publish_and_wait`] for the reason
+    /// [`publish_with_source_and_wait`] gives for its own pair: a bare error on line 0 with no
+    /// source is itself a real case that other tests deliberately drive, and a helper that
+    /// silently started sending more would change what those prove.
+    pub(crate) fn publish_full_and_wait(
+        client: &lsp_core::LspClient,
+        target: &str,
+        message: &str,
+        line: u32,
+        severity: u8,
+        source: &str,
+    ) {
+        client
+            .notify_raw(
+                "test/publish",
+                serde_json::json!({
+                    "uri": target,
+                    "message": message,
+                    "line": line,
+                    "severity": severity,
+                    "source": source,
                 }),
             )
             .expect("the fake server should accept a real notification");

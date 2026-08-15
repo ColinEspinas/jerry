@@ -44,7 +44,13 @@ impl Severity {
     /// Ordering from most to least severe, used as the tie-break in [`Severity::worst`] when a
     /// line carries diagnostics of more than one severity - not "whichever is first in the
     /// `Vec`", which would depend on server-side ordering.
-    fn rank(self) -> u8 {
+    ///
+    /// Public since GitHub issue #292: the sidebar Problems view sorts a whole worktree's
+    /// diagnostics worst-first, which is this same ordering applied to a list rather than to a
+    /// line, and it had copied the four arms rather than call them. Two copies of one severity
+    /// ordering is exactly the "a key defined twice is two specifications of one thing"
+    /// duplication `REVISION-2026-08-14.md` §7 rule 5 is about.
+    pub fn rank(self) -> u8 {
         match self {
             Severity::Error => 3,
             Severity::Warning => 2,

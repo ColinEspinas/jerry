@@ -31,62 +31,32 @@
 //!    [`theme::surface::RAIL`], because "a tab only reads as connected if the strip behind it is
 //!    darker than the panel".
 //!
-//! ## What is deliberately not here
+//! ## The Problems view (GitHub issue #292)
 //!
-//! The Problems **view** is minimal on purpose. It reads the app's real, worktree-scoped LSP
-//! diagnostics ([`AdeApp::worktree_problems`]) and lists them, so the Problems cell ships with its
-//! behaviour rather than as a dead button (`REVISION-2026-08-14.md` §7 rule 1: "Ship the
-//! affordance with the behaviour, or ship neither"). Everything past "list what is really there" -
-//! `REVISION-2026-08-13.md` §2's click-to-open navigation, the filter row's per-view query, the
-//! `all`/`this worktree` scope toggle, and reaching diagnostics for files no editor has opened -
-//! is GitHub issue #292's, which this issue blocks.
+//! `REVISION-2026-08-13.md` §2's table, verbatim, is the whole spec: "LSP diagnostics: severity
+//! square, message, file, line, source. `problemDefs` is **keyed by worktree id** and filtered on
+//! the active one, exactly like `histDefs` - a diagnostic belongs to a checkout. Unkeyed, one
+//! global list rendered under every worktree, listing files that were not in it. A clean worktree
+//! gets *No diagnostics in `<branch>`.* and no badge."
+//!
+//! [`AdeApp::worktree_problems`] is the keyed store's read side and documents at length what it
+//! really covers; [`AdeApp::render_problem_row`] is §2's row, including the "opens the file at the
+//! line on click" half. The tallied header, the marker and the two empty notes live in
+//! [`crate::rail::strip`], which can assert them without a window.
+//!
+//! **What the design does not ask for here, and this therefore does not do**: grouping rows by
+//! file, and an `all`/`this worktree` scope toggle. `Jerry.dc.html`'s `probRows` is a flat list,
+//! and §6's scope toggle belongs to *Agent history* ("**Agent history** is repo → worktree → run,
+//! matching the rail, with an `all` / `this worktree` scope toggle") - Problems is specified the
+//! other way in the same revision, as following the selected worktree and only that. A scope
+//! toggle here would contradict §2's own reason for keying the store at all.
 
 use super::*;
 use crate::icons::{IconRow, IconSize};
 use crate::lsp::client::LspClientState;
 use crate::lsp::diagnostics as diagnostics_view;
-use crate::rail::strip::{self, ProblemTally, SidebarView, StripCell, StripMarker};
+use crate::rail::strip::{self, Problem, ProblemTally, SidebarView, StripCell, StripMarker};
 use crate::root::widgets::text_tooltip;
-
-/// One diagnostic in the Problems list, already reduced to what the row paints.
-///
-/// A view model rather than a borrowed `lsp_types::Diagnostic`: the list is scoped to a worktree,
-/// not to an open buffer, so it outlives no particular file's state and needs nothing from
-/// `lsp_types` past the five fields below.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::rail) struct Problem {
-    pub severity: diagnostics_view::Severity,
-    pub message: String,
-    /// The path, relative to the worktree root when it really is inside it - a Problems list
-    /// showing 60 characters of shared prefix on every row says nothing per row.
-    pub file: String,
-    /// `line:column`, 1-based, the way every compiler and every other row in this app prints it.
-    pub position: String,
-    /// The server that reported it (`rustc`, `clippy`, `rust-analyzer`), when it named itself.
-    pub source: Option<String>,
-}
-
-impl Problem {
-    /// Whether this row survives the sidebar's own filter box - the same case-insensitive
-    /// substring test over the row's own visible text that
-    /// [`crate::rail::state::WorktreeRow::matches_filter`] applies to a worktree row, so one field
-    /// behaves the same way whichever view is under it. A blank query matches everything.
-    ///
-    /// This is what lets the filter row's placeholder really say `filter problems`
-    /// (`REVISION-2026-08-13.md` §1) rather than promising a filter that does nothing (§7 rule 1).
-    fn matches_filter(&self, query: &str) -> bool {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return true;
-        }
-        self.message.to_lowercase().contains(&query)
-            || self.file.to_lowercase().contains(&query)
-            || self
-                .source
-                .as_deref()
-                .is_some_and(|source| source.to_lowercase().contains(&query))
-    }
-}
 
 impl AdeApp {
     /// Switches the sidebar to `view`.
@@ -119,17 +89,64 @@ impl AdeApp {
     /// diagnostic belongs to a checkout. Unkeyed, one global list renders under every worktree,
     /// listing files that are not in it." That keying is free here rather than a filter step:
     /// [`AdeApp::lsp_clients`] is already keyed on `(worktree root, server)`, so this reads only
-    /// the clients whose root *is* the selected worktree.
+    /// the clients whose root *is* the selected worktree, and switching worktrees swaps the whole
+    /// list without this method knowing a switch happened.
     ///
-    /// Real data or nothing. A worktree whose language server has never started - or has started
-    /// and reported nothing - yields an empty `Vec`, and the Problems view says so honestly. That
-    /// is what makes the strip's marker safe to derive from this: an empty day cannot produce a
-    /// red dot, which is exactly the failure `REVISION-2026-08-13.md` §1's "gate at the source"
-    /// rule exists to prevent.
+    /// ## The three ways a row is dropped, and what each one is really about
+    ///
+    /// §2's "listing files that were not in it" is one sentence covering three distinct real
+    /// conditions, and only the first is handled by the key:
+    ///
+    /// 1. **Another checkout's client.** Handled by the `client_root != root` test below - and, in
+    ///    practice, twice over: `AdeApp::evict_stale_lsp_clients` already tears every client for a
+    ///    non-active root down on a worktree switch, so the map usually holds only the active
+    ///    root's clients. The test stays because "usually" is not an invariant, and a Problems
+    ///    list is exactly where a violated one would show up, as another branch's files.
+    /// 2. **A file outside the checkout entirely.** `rust-analyzer` really does publish against a
+    ///    dependency's own source under `~/.cargo/registry/...`, and against `~/.rustup`'s
+    ///    standard library. Those are real diagnostics about real files, but they are not files
+    ///    *in this checkout*, and §2's rule is about the checkout - so `strip_prefix` is the
+    ///    filter, and a path it rejects is dropped rather than shown with an absolute path.
+    /// 3. **A file that no longer exists.** GitHub issue #292's own backend acceptance: "no stale
+    ///    rows for files that no longer exist in that checkout". A server that has not noticed a
+    ///    deletion yet (nothing in LSP obliges one to clear diagnostics for a removed file, and
+    ///    `rust-analyzer` only does once its own watcher fires) keeps publishing them, and a row
+    ///    whose click could only ever open nothing has no business being counted either. One
+    ///    `Path::is_file` per *file* the server has anything to say about - not per diagnostic,
+    ///    and not per file in the worktree - which is a handful of `stat`s on a real repo, paid on
+    ///    the same pass that builds the rows.
+    ///
+    /// ## What this does and does not reach
+    ///
+    /// It is the **whole** published map, not the open buffer: `lsp_core::LspClient` retains every
+    /// `publishDiagnostics` the server ever sends, keyed by uri, and
+    /// [`lsp_core::LspClient::published_diagnostics`] hands back all of it. So a file that no
+    /// editor tab has ever opened (one `cargo check` found a type error in three directories away)
+    /// really does get a row, and clicking it really does open it. That is the one property of
+    /// this list worth stating plainly, because the obvious implementation - read the open
+    /// buffer's diagnostics - would not have it.
+    ///
+    /// What it cannot reach is a worktree whose server has never been **started**. This app spawns
+    /// a language server lazily, when a file of that language is first rendered
+    /// (`AdeApp::ensure_lsp_client`, called from `crate::code_surface::file_view`), so a checkout
+    /// nobody has opened a file in yet has no client, no published diagnostics, and an honestly
+    /// empty Problems list. Starting a `rust-analyzer` per worktree from a sidebar click is a real
+    /// resource decision this issue does not make - and an empty list here is a true statement
+    /// about what the app knows, not a fabricated clean bill of health.
+    ///
+    /// Real data or nothing, in other words. That is what makes the strip's marker safe to derive
+    /// from this: an empty day cannot produce a red dot, which is exactly the failure
+    /// `REVISION-2026-08-13.md` §1's "gate at the source" rule exists to prevent.
     pub(in crate::rail) fn worktree_problems(&self) -> Vec<Problem> {
         let Some(root) = self.current_worktree_path() else {
             return Vec::new();
         };
+        // A diagnostic's uri is whatever real path the *server* opened, and `lsp_core`'s own
+        // `path_to_uri` canonicalises on the way in - so a checkout reached through a symlink
+        // (macOS' `/var` -> `/private/var`, or a worktree directory someone symlinked) yields
+        // paths that `strip_prefix(&root)` can never match. Resolved once per pass, not per row,
+        // and falling back to `root` itself if the checkout has since gone away.
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         let mut problems: Vec<Problem> = Vec::new();
         for ((client_root, _server), state) in &self.lsp_clients {
             let LspClientState::Ready(client) = state else {
@@ -139,41 +156,33 @@ impl AdeApp {
                 continue;
             }
             for (path, diagnostics) in client.published_diagnostics() {
-                let file = display_path(&path, &root);
+                let Ok(relative) = path
+                    .strip_prefix(&root)
+                    .or_else(|_| path.strip_prefix(&canonical_root))
+                else {
+                    continue;
+                };
+                if !path.is_file() {
+                    continue;
+                }
+                let file = relative.to_string_lossy().into_owned();
                 for diagnostic in diagnostics {
                     problems.push(Problem {
                         severity: diagnostics_view::Severity::from_lsp(diagnostic.severity),
                         message: diagnostic.message.trim().to_string(),
                         file: file.clone(),
+                        path: path.clone(),
                         // LSP positions are 0-based; every compiler, editor and other row in this
                         // app prints them 1-based.
-                        position: format!(
-                            "{}:{}",
-                            diagnostic.range.start.line + 1,
-                            diagnostic.range.start.character + 1
-                        ),
+                        line: diagnostic.range.start.line + 1,
+                        column: diagnostic.range.start.character + 1,
                         source: diagnostic.source.filter(|source| !source.is_empty()),
                     });
                 }
             }
         }
-        // Worst first - the same "worst wins" ordering `diagnostics_view::Severity::worst` applies
-        // within a line, applied to the list. Ties break on file then position so the order is
-        // total and a re-render cannot reshuffle rows under the pointer.
-        problems.sort_by(|left, right| {
-            severity_rank(right.severity)
-                .cmp(&severity_rank(left.severity))
-                .then_with(|| left.file.cmp(&right.file))
-                .then_with(|| left.position.cmp(&right.position))
-        });
+        problems.sort_by(Problem::worst_first);
         problems
-    }
-
-    /// [`Self::worktree_problems`], tallied by severity - for the strip's marker and for the
-    /// view's own count line alike, so the marker can never report a number the list below it does
-    /// not contain (`REVISION-2026-08-13.md` §2: "tallied over their own data").
-    pub(in crate::rail) fn worktree_problem_tally(&self) -> ProblemTally {
-        tally_problems(&self.worktree_problems())
     }
 
     /// The whole sidebar strip: the view cells, the flex spacer, the `+` new-agent cell and the
@@ -304,31 +313,36 @@ impl AdeApp {
     }
 
     /// The sidebar's body for `view` - the rail's own tree, or the Problems list.
+    ///
+    /// `problems` is the selected worktree's real list, built **once** by the caller
+    /// ([`Self::render_rail`]) and lent to both halves for the same reason `groups` is: the strip's
+    /// marker and this body are two answers about one set of diagnostics, and deriving them from
+    /// one pass is what makes it impossible for the marker to report a number the list below it
+    /// does not contain (`REVISION-2026-08-13.md` §2: "tallied over their own data").
     pub(in crate::rail) fn render_sidebar_body(
         &self,
         view: SidebarView,
         groups: &[RepoGroup],
+        problems: &[Problem],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match view {
             SidebarView::Worktrees => self.render_rail_list(groups, cx),
-            SidebarView::Problems => self.render_problems_view(cx),
+            SidebarView::Problems => self.render_problems_view(problems, cx),
         }
     }
 
     /// The Problems view: the real count line over the real rows, or the real empty note.
     ///
     /// Scoped to the selected worktree and tallied over its own data - see
-    /// [`Self::worktree_problems`]. What this view deliberately does not do yet is GitHub issue
-    /// #292's; see this module's docs.
-    fn render_problems_view(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// [`Self::worktree_problems`].
+    fn render_problems_view(&self, all: &[Problem], cx: &mut Context<Self>) -> gpui::AnyElement {
         // Filtered here, not in `Self::worktree_problems`: the strip's own marker reads that
-        // method too, and a marker that shrank as the filter box was typed into would break the
+        // same list, and a marker that shrank as the filter box was typed into would break the
         // same promise the repo headers' counts keep (`crate::rail::state::RepoWorktrees::
         // all_rows`) - the strip reports what is really in the worktree, the list reports what
         // you asked to see.
         let query = self.filter_query.as_str().to_string();
-        let all = self.worktree_problems();
         let problems: Vec<Problem> = all
             .iter()
             .filter(|problem| problem.matches_filter(&query))
@@ -368,7 +382,7 @@ impl AdeApp {
                 .into_any_element();
         }
 
-        if let Some(line) = tally_problems(&problems).count_line() {
+        if let Some(line) = ProblemTally::over(&problems).count_line() {
             list = list.child(
                 div()
                     .flex_none()
@@ -381,34 +395,48 @@ impl AdeApp {
                     .child(line),
             );
         }
-        for problem in problems {
-            list = list.child(self.render_problem_row(&problem));
+        for (index, problem) in problems.iter().enumerate() {
+            list = list.child(self.render_problem_row(index, problem, cx));
         }
         list.into_any_element()
     }
 
     /// One Problems row: a 5px severity square, the message, and the file/position/source line
-    /// under it - `Jerry.dc.html`'s own `probRows` markup.
-    fn render_problem_row(&self, problem: &Problem) -> impl IntoElement {
+    /// under it - `Jerry.dc.html`'s own `probRows` markup - and the click that opens it.
+    ///
+    /// **The click** is `REVISION-2026-08-13.md` §2's own half of the row spec ("severity square,
+    /// message, file, line, source; opens the file at the line on click"). It goes through
+    /// [`Self::open_file_at_line`], the same one move go-to-definition and a terminal `path:line`
+    /// link already make - so a Problems row lands the caret on the diagnostic's line through the
+    /// same `pending_cursor_line` handshake that survives a background file load, rather than
+    /// through a second copy of it that would work only for already-open files.
+    ///
+    /// **The 2px left edge** is in the mock (`border-left:2px solid transparent`) and never lit
+    /// there. Reserved rather than dropped, for the reason the rail's own childless worktree rows
+    /// reserve their caret slot: it is 2px of the row's real left inset, and a row that omits it
+    /// sits 2px left of every other row in the column.
+    ///
+    /// **The hover fill** is the mock's `style-hover="background:#15181b"`, which is
+    /// [`theme::surface::ROW_HOVER`] exactly - the app's own list-row hover, not a second one.
+    fn render_problem_row(
+        &self,
+        index: usize,
+        problem: &Problem,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mut meta = div()
             .flex()
             .items_baseline()
             .gap(px(6.0))
             .mt(px(3.0))
             .font(font(theme::font::MONO))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(self.ui_text_size(9.5))
-                    .text_color(theme::text::DIMMER)
-                    .child(problem.file.clone()),
-            )
+            .child(self.render_problem_path(&problem.file))
             .child(
                 div()
                     .flex_none()
                     .text_size(self.ui_text_size(9.5))
                     .text_color(theme::text::GHOST)
-                    .child(problem.position.clone()),
+                    .child(problem.position()),
             )
             .child(div().flex_1());
         if let Some(source) = problem.source.clone() {
@@ -421,13 +449,30 @@ impl AdeApp {
             );
         }
 
+        let target = problem.path.clone();
+        let line = problem.line as usize;
+        let element_id = gpui::SharedString::from(format!("sidebar-problems-row-{index}"));
+        let selector = element_id.clone();
         div()
+            .id(element_id)
+            .debug_selector(move || selector.to_string())
             .flex()
             .gap(px(7.0))
+            .border_l_2()
+            .border_color(gpui::transparent_black())
             .pl(px(12.0))
             .pr(px(10.0))
             .pt(px(6.0))
             .pb(px(7.0))
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            .tooltip(text_tooltip(format!(
+                "{}:{} \u{2014} open in the editor",
+                problem.file, problem.line
+            )))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.open_file_at_line(target.clone(), line, window, cx);
+            }))
             .child(
                 div()
                     .flex_none()
@@ -449,6 +494,50 @@ impl AdeApp {
                             .child(problem.message.clone()),
                     )
                     .child(meta),
+            )
+    }
+
+    /// The row's `file` cell: the directory prefix dimmed, the file name at the mock's own
+    /// `#7d848b` ([`theme::text::DIMMER`]).
+    ///
+    /// `Jerry.dc.html` prints the **bare file name** here (`p.file.split('/').pop()`), and this
+    /// deliberately keeps the directory in front of it. The reason is the one thing #292 adds that
+    /// the mock's rows do not have: these rows *open a file*. Four `mod.rs` rows that all read
+    /// `mod.rs` give no way to tell which file a click is about to open - and the design already
+    /// has a shape for exactly this tension, in the Search view one section over, whose rows carry
+    /// `dir` and `file` as two spans at two weights rather than dropping either. This is that
+    /// shape, applied to the same problem.
+    fn render_problem_path(&self, file: &str) -> impl IntoElement {
+        // Both separators, because this string comes from a real `Path` and Windows' is `\`.
+        let (directory, name) = match file.rfind(['/', '\\']) {
+            Some(cut) => file.split_at(cut + 1),
+            None => ("", file),
+        };
+        div()
+            .flex()
+            .min_w_0()
+            .flex_shrink_1()
+            .items_baseline()
+            .text_size(self.ui_text_size(9.5))
+            .when(!directory.is_empty(), |el| {
+                el.child(
+                    // The one shrinkable span in the row, and deliberately this one: a 260px rail
+                    // cannot hold `src/db/orm/select.rs` beside a position and a source, and
+                    // eliding the *directory*'s tail leaves the file name - the half a click is
+                    // about - fully readable, where eliding the cell as a whole would eat it.
+                    div()
+                        .min_w_0()
+                        .flex_shrink_1()
+                        .truncate()
+                        .text_color(theme::text::GHOSTER)
+                        .child(directory.to_string()),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme::text::DIMMER)
+                    .child(name.to_string()),
             )
     }
 }
@@ -554,50 +643,6 @@ fn severity_color(severity: diagnostics_view::Severity) -> theme::ColorToken {
         diagnostics_view::Severity::Information | diagnostics_view::Severity::Hint => {
             theme::text::DIM
         }
-    }
-}
-
-/// `problems` counted into `REVISION-2026-08-13.md` §2's three buckets.
-///
-/// LSP's `Information` and `Hint` both land in `hints`: §2's own table names three severities and
-/// the mock tallies both into its `info` bucket, so these are two levels the design does not
-/// distinguish anywhere - which is why summing them is not §7 rule 4's "two states distinguished
-/// anywhere in the app are never summed anywhere in it".
-fn tally_problems(problems: &[Problem]) -> ProblemTally {
-    let mut tally = ProblemTally::default();
-    for problem in problems {
-        match problem.severity {
-            diagnostics_view::Severity::Error => tally.errors += 1,
-            diagnostics_view::Severity::Warning => tally.warnings += 1,
-            diagnostics_view::Severity::Information | diagnostics_view::Severity::Hint => {
-                tally.hints += 1
-            }
-        }
-    }
-    tally
-}
-
-/// `path` as the Problems row shows it: relative to the worktree it belongs to when it really is
-/// inside it, absolute otherwise.
-///
-/// The fallback is not decoration. rust-analyzer really does publish diagnostics against paths
-/// outside the workspace (a dependency's own source under `~/.cargo/registry/...`), and printing
-/// those as if they were relative would claim a file in this checkout that is not there.
-fn display_path(path: &std::path::Path, root: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Most severe first - the list-level counterpart of `diagnostics_view::Severity::worst`'s own
-/// within-a-line ordering, restated here only because that module's `rank` is private.
-fn severity_rank(severity: diagnostics_view::Severity) -> u8 {
-    match severity {
-        diagnostics_view::Severity::Error => 3,
-        diagnostics_view::Severity::Warning => 2,
-        diagnostics_view::Severity::Information => 1,
-        diagnostics_view::Severity::Hint => 0,
     }
 }
 
@@ -921,8 +966,11 @@ mod sidebar_strip_tests {
             "no language server has reported anything, so the Problems cell must carry no marker"
         );
         app.read_with(cx, |app, _| {
-            assert_eq!(app.worktree_problem_tally(), ProblemTally::default());
             assert!(app.worktree_problems().is_empty());
+            assert_eq!(
+                ProblemTally::over(&app.worktree_problems()),
+                ProblemTally::default()
+            );
         });
     }
 
@@ -1010,72 +1058,6 @@ mod sidebar_strip_tests {
         });
     }
 
-    /// The Problems list's own filter really applies, and the strip's marker deliberately does
-    /// not follow it - the strip reports what is really in the worktree, the list reports what you
-    /// asked to see.
-    #[test]
-    fn a_filter_narrows_the_list_without_touching_what_the_strip_reports() {
-        let rows = vec![
-            Problem {
-                severity: diagnostics_view::Severity::Error,
-                message: "cannot borrow `self.tokens` as mutable".to_string(),
-                file: "src/auth/session.rs".to_string(),
-                position: "212:17".to_string(),
-                source: Some("rustc".to_string()),
-            },
-            Problem {
-                severity: diagnostics_view::Severity::Warning,
-                message: "unused variable: `barrier`".to_string(),
-                file: "tests/auth_race.rs".to_string(),
-                position: "44:9".to_string(),
-                source: Some("clippy".to_string()),
-            },
-        ];
-
-        assert_eq!(
-            rows.iter().filter(|row| row.matches_filter("")).count(),
-            2,
-            "a blank query matches everything, exactly as it does for a worktree row"
-        );
-        // By message, by path, and by the server that reported it - all three of the row's own
-        // visible fields.
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.matches_filter("BORROW"))
-                .count(),
-            1,
-            "case-insensitive, over the message"
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.matches_filter("tests/"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.matches_filter("clippy"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.matches_filter("nothing"))
-                .count(),
-            0
-        );
-
-        assert_eq!(
-            tally_problems(&rows),
-            ProblemTally {
-                errors: 1,
-                warnings: 1,
-                hints: 0
-            },
-            "the tally the strip's marker reads is over the whole worktree, unfiltered"
-        );
-    }
-
     /// §1's "the `+` new-session button (unchanged)" - unchanged meaning the *action*. It moved
     /// into a 38px cell, so this proves the real spawn still happens from a real click on it.
     #[gpui::test]
@@ -1096,5 +1078,549 @@ mod sidebar_strip_tests {
                 "the `+` cell must really spawn, exactly as the rail header's `+` did"
             );
         });
+    }
+}
+
+/// Real coverage for the Problems view itself (GitHub issue #292), driven against a **genuinely
+/// spawned** language server pushing real `textDocument/publishDiagnostics` notifications over the
+/// real wire protocol (`crate::lsp::client::lsp_connection_facade_tests`' own fake server - see
+/// that module's docs for why a real, tiny server rather than the real `rust-analyzer`).
+///
+/// Nothing here seeds a `Problem` by hand. Every assertion below is about what the app really
+/// shows after a real server really said something, because the whole subject of this issue is a
+/// store keyed by checkout - and a hand-built list would be keyed by whatever the test decided.
+#[cfg(test)]
+mod problems_view_tests {
+    use super::*;
+    use crate::lsp::client::lsp_connection_facade_tests::{
+        publish_full_and_wait, spawn_fake_server,
+    };
+    use crate::rail::worktrees::WorktreeItem;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// LSP severity numbers, as a real server sends them.
+    const ERROR: u8 = 1;
+    const WARNING: u8 = 2;
+    const HINT: u8 = 4;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {dir:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
+        git(dir.path(), &["add", "base.txt"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        dir
+    }
+
+    /// Writes a real file under `root` and hands back its absolute path and its `file://` uri -
+    /// the two things a real publish and a real click each need.
+    fn real_file(root: &Path, relative: &str, contents: &str) -> (PathBuf, String) {
+        let absolute = root.join(relative);
+        std::fs::create_dir_all(absolute.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&absolute, contents).expect("write");
+        let uri = lsp_core::LspClient::uri_for_path(&absolute)
+            .expect("a real file:// uri")
+            .to_string();
+        (absolute, uri)
+    }
+
+    fn worktree_item(path: PathBuf, branch: &str) -> WorktreeItem {
+        WorktreeItem {
+            path,
+            label: branch.to_string(),
+            branch: Some(branch.to_string()),
+            is_main: false,
+            is_bare: false,
+            is_detached: false,
+            short_sha: None,
+            is_locked: false,
+            lock_reason: None,
+            is_broken: false,
+            broken_reason: None,
+            error: None,
+        }
+    }
+
+    /// Clicks the strip's Problems cell for real, the way a user reaches this view.
+    fn show_problems(cx: &mut gpui::VisualTestContext) {
+        let cell = cx
+            .debug_bounds("sidebar-strip-problems")
+            .expect("the Problems cell");
+        cx.simulate_click(cell.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// The list the view is really showing, as `(file, line, severity)` triples.
+    fn rows(app: &AdeApp) -> Vec<(String, u32, diagnostics_view::Severity)> {
+        app.worktree_problems()
+            .into_iter()
+            .map(|problem| (problem.file, problem.line, problem.severity))
+            .collect()
+    }
+
+    /// **The property the whole issue turns on.** `REVISION-2026-08-13.md` §2's store is "keyed by
+    /// worktree id and filtered on the active one" - and issue #292's own acceptance closes with
+    /// "a diagnostic from another checkout never renders under the active one".
+    ///
+    /// Two real worktrees, two real servers, one real diagnostic each, **both clients live in the
+    /// map at once** - which is the only arrangement in which the key can be proven to be doing
+    /// the filtering. (In normal use `AdeApp::evict_stale_lsp_clients` has already torn the
+    /// inactive root's client down by this point, which would make a broken key look correct.)
+    #[gpui::test]
+    fn a_diagnostic_from_another_checkout_never_renders_under_the_active_one(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let other = TempDir::new().expect("tempdir");
+        let here = repo.path().to_path_buf();
+        let there = other.path().to_path_buf();
+
+        let (_, here_uri) = real_file(&here, "src/here.rs", "fn here() {}\n");
+        let (_, there_uri) = real_file(&there, "src/there.rs", "fn there() {}\n");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, here.clone());
+        cx.run_until_parked();
+
+        let here_server = spawn_fake_server(&here, "rust-analyzer", "normal");
+        let there_server = spawn_fake_server(&there, "rust-analyzer", "normal");
+        publish_full_and_wait(
+            &here_server,
+            &here_uri,
+            "mismatched types",
+            17,
+            ERROR,
+            "rustc",
+        );
+        publish_full_and_wait(
+            &there_server,
+            &there_uri,
+            "unused variable: `barrier`",
+            43,
+            WARNING,
+            "rustc",
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.worktrees = vec![
+                worktree_item(here.clone(), "main"),
+                worktree_item(there.clone(), "fix/auth"),
+            ];
+            app.select_worktree(0, window, cx);
+            app.lsp_clients.insert(
+                (here.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&here_server)),
+            );
+            app.lsp_clients.insert(
+                (there.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&there_server)),
+            );
+        });
+        cx.run_until_parked();
+        show_problems(cx);
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                rows(app),
+                vec![(
+                    "src/here.rs".to_string(),
+                    18,
+                    diagnostics_view::Severity::Error
+                )],
+                "only the active checkout's diagnostic may render - the other client's is live in \
+                 the same map and must be filtered out by the key, not by luck"
+            );
+        });
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-0").is_some(),
+            "and it must really paint as a row"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-1").is_none(),
+            "one diagnostic is one row"
+        );
+
+        // Now switch, for real. The list must swap - and this is also the path
+        // `evict_stale_lsp_clients` runs on, so the old checkout's client is genuinely gone
+        // afterwards rather than merely filtered.
+        app.update_in(cx, |app, window, cx| app.select_worktree(1, window, cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                rows(app),
+                vec![(
+                    "src/there.rs".to_string(),
+                    44,
+                    diagnostics_view::Severity::Warning
+                )],
+                "\u{a7}2: switching worktrees swaps the list"
+            );
+        });
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-0").is_some(),
+            "the Problems view stays selected across a worktree switch, showing the new \
+             checkout's rows"
+        );
+    }
+
+    /// #292's own backend acceptance: the store retains "**all** files the server reports, not
+    /// just the open buffer". Proven the only way it can be: on a file no editor has ever opened,
+    /// three directories deep, that this test never calls `open_file_view` for - and then by
+    /// clicking its row and watching the real editor land on it, at the real line.
+    ///
+    /// That click is `REVISION-2026-08-13.md` §2's other half ("opens the file at the line on
+    /// click") and goes through `AdeApp::open_file_at_line`, the app's one such move.
+    #[gpui::test]
+    fn a_row_for_a_never_opened_file_really_opens_it_at_the_diagnostics_line(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let root = repo.path().to_path_buf();
+        let (buried, buried_uri) =
+            real_file(&root, "src/db/orm/select.rs", &"// filler\n".repeat(60));
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let server = spawn_fake_server(&root, "rust-analyzer", "normal");
+        publish_full_and_wait(
+            &server,
+            &buried_uri,
+            "no method named `order_by_nulls_last` on `QueryBuilder`",
+            41,
+            ERROR,
+            "rust-analyzer",
+        );
+        app.update(cx, |app, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&server)),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.open_files().is_empty() && app.file_view_cache.is_none(),
+                "premise: no editor has ever opened this file, or any other"
+            );
+            assert_eq!(
+                rows(app),
+                vec![(
+                    "src/db/orm/select.rs".to_string(),
+                    42,
+                    diagnostics_view::Severity::Error
+                )],
+                "a file no buffer has ever been opened for still gets its row - the store is the \
+                 server's whole published map, not the open document"
+            );
+        });
+
+        show_problems(cx);
+        let row = cx
+            .debug_bounds("sidebar-problems-row-0")
+            .expect("the row must paint");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.code_view,
+                crate::code_surface::code_view::CodeView::File,
+                "the click must really open the File view"
+            );
+            assert_eq!(
+                app.file_view_cache
+                    .as_ref()
+                    .map(|cached| cached.path.clone()),
+                Some(buried.clone()),
+                "and it must really load the row's own file"
+            );
+            assert_eq!(
+                app.code_cursor,
+                Some(42),
+                "landing on the diagnostic's own 1-based line, not on line 1 - the whole point of \
+                 going through `open_file_at_line` rather than `open_file_view`"
+            );
+        });
+    }
+
+    /// §2's header "names every severity the list is showing", over a real three-severity list -
+    /// and the strip's marker over the same one pass. The marker is red because there is a real
+    /// error in it (`Jerry.dc.html`'s `probTally.err ? '#e0625c' : '#e2a336'`).
+    #[gpui::test]
+    fn the_header_and_the_marker_are_tallied_over_the_real_published_list(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let root = repo.path().to_path_buf();
+        let (_, broken) = real_file(&root, "src/db/orm/select.rs", "fn a() {}\n");
+        let (_, noisy) = real_file(&root, "src/db/query_builder.rs", "fn b() {}\n");
+        let (_, chatty) = real_file(&root, "src/api/orders.rs", "fn c() {}\n");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let server = spawn_fake_server(&root, "rust-analyzer", "normal");
+        publish_full_and_wait(&server, &broken, "unused import", 23, ERROR, "rustc");
+        publish_full_and_wait(
+            &server,
+            &noisy,
+            "this function has too many arguments (9/7)",
+            65,
+            WARNING,
+            "clippy",
+        );
+        publish_full_and_wait(
+            &server,
+            &chatty,
+            "consider using `let-else` here",
+            202,
+            HINT,
+            "clippy",
+        );
+        app.update(cx, |app, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&server)),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        show_problems(cx);
+
+        app.read_with(cx, |app, _| {
+            let problems = app.worktree_problems();
+            let tally = ProblemTally::over(&problems);
+            assert_eq!(
+                tally,
+                ProblemTally {
+                    errors: 1,
+                    warnings: 1,
+                    hints: 1
+                }
+            );
+            assert_eq!(
+                tally.count_line().as_deref(),
+                Some("1 error \u{b7} 1 warning \u{b7} 1 hint"),
+                "\u{a7}2: the header names every severity the list is showing - a pair that left \
+                 the hint unnamed is the defect the rule was written for"
+            );
+            assert_eq!(
+                tally.total(),
+                problems.len(),
+                "and the header's own total is the number of rows under it"
+            );
+            assert_eq!(
+                tally.marker().expect("three diagnostics").tone,
+                crate::rail::strip::MarkerTone::Failure,
+                "red, because one of them is a real error"
+            );
+            assert_eq!(
+                problems
+                    .first()
+                    .map(|problem| problem.severity)
+                    .expect("a first row"),
+                diagnostics_view::Severity::Error,
+                "worst first"
+            );
+        });
+
+        for selector in [
+            "sidebar-problems-row-0",
+            "sidebar-problems-row-1",
+            "sidebar-problems-row-2",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "all three rows must really paint - {selector} did not"
+            );
+        }
+        assert!(
+            cx.debug_bounds("sidebar-strip-problems-marker").is_some(),
+            "and the strip's own marker must really be there once the store is non-empty"
+        );
+    }
+
+    /// §2's "listing files that were not in it", in the form it really takes on a Rust workspace:
+    /// `rust-analyzer` publishes against a dependency's own source outside the checkout entirely.
+    /// Those are real diagnostics about real files, and they are not this checkout's - so no row
+    /// and nothing in the tally, while the checkout's own diagnostic is untouched beside it.
+    #[gpui::test]
+    fn a_diagnostic_about_a_file_outside_the_checkout_is_the_only_one_dropped(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let registry = TempDir::new().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let (_, dependency) = real_file(
+            registry.path(),
+            "serde-1.0.0/src/lib.rs",
+            "pub fn parse() {}\n",
+        );
+        // A second, in-checkout diagnostic from the *same* server, so an empty list cannot pass
+        // this test for the wrong reason (a client that never went live, a publish that never
+        // landed): the dependency row must be the only one dropped, not everything.
+        let (_, mine) = real_file(&root, "src/lib.rs", "pub fn mine() {}\n");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let server = spawn_fake_server(&root, "rust-analyzer", "normal");
+        publish_full_and_wait(
+            &server,
+            &dependency,
+            "unresolved import",
+            8,
+            ERROR,
+            "rust-analyzer",
+        );
+        publish_full_and_wait(&server, &mine, "unused variable", 3, WARNING, "rustc");
+        app.update(cx, |app, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&server)),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        show_problems(cx);
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                rows(app),
+                vec![(
+                    "src/lib.rs".to_string(),
+                    4,
+                    diagnostics_view::Severity::Warning
+                )],
+                "a dependency's own source is not a file in this checkout - and the checkout's \
+                 own diagnostic proves the client and the publish both really worked"
+            );
+        });
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-1").is_none(),
+            "one row, not two"
+        );
+        let marker = cx
+            .debug_bounds("sidebar-strip-problems-marker")
+            .expect("the marker stands for the one real in-checkout diagnostic");
+        assert_eq!(f32::from(marker.size.width), 5.0);
+    }
+
+    /// #292's own backend acceptance: "no stale rows for files that no longer exist in that
+    /// checkout". Nothing in LSP obliges a server to clear diagnostics for a deleted file, and a
+    /// row whose click could only ever open nothing must not be counted either.
+    #[gpui::test]
+    fn a_row_for_a_deleted_file_disappears_from_the_list_and_the_tally(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let root = repo.path().to_path_buf();
+        let (doomed, doomed_uri) = real_file(&root, "src/scratch.rs", "fn tmp() {}\n");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let server = spawn_fake_server(&root, "rust-analyzer", "normal");
+        publish_full_and_wait(&server, &doomed_uri, "mismatched types", 0, ERROR, "rustc");
+        app.update(cx, |app, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&server)),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        show_problems(cx);
+
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-0").is_some(),
+            "premise: while the file exists, its diagnostic really is a row"
+        );
+
+        // The server is never told. This is the real condition: an agent (or a `git checkout`)
+        // removes a file, and the server's own published map still names it.
+        std::fs::remove_file(&doomed).expect("remove the file");
+        app.update(cx, |_app, cx| cx.notify());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.worktree_problems().is_empty(),
+                "the server still publishes it; the checkout no longer contains it"
+            );
+        });
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-0").is_none(),
+            "so the row must be gone"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-strip-problems-marker").is_none(),
+            "and so must the marker it was the whole reason for"
+        );
+    }
+
+    /// A worktree switch and a server restart are the two other ways the store must stay coherent
+    /// (#292's third backend bullet). The restart half is the one worth a real test: tearing a
+    /// server down really does empty the list, rather than leaving the last frame's rows standing.
+    #[gpui::test]
+    fn restarting_the_language_server_empties_the_list_rather_than_stranding_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let root = repo.path().to_path_buf();
+        let (_, uri) = real_file(&root, "src/main.rs", "fn main() {}\n");
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let server = spawn_fake_server(&root, "rust-analyzer", "normal");
+        publish_full_and_wait(&server, &uri, "mismatched types", 0, ERROR, "rustc");
+        app.update(cx, |app, cx| {
+            app.lsp_clients.insert(
+                (root.clone(), "rust-analyzer"),
+                LspClientState::Ready(Arc::clone(&server)),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        show_problems(cx);
+        assert!(
+            cx.debug_bounds("sidebar-problems-row-0").is_some(),
+            "premise: the row is really there before the restart"
+        );
+
+        app.update(cx, |app, cx| app.restart_lsp_clients(cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.worktree_problems().is_empty(),
+                "a restarted server has published nothing yet, and the view must say so rather \
+                 than keep reporting what the old process said"
+            );
+        });
+        assert!(
+            cx.debug_bounds("sidebar-problems-note").is_some(),
+            "the clean note takes the list's place"
+        );
     }
 }
