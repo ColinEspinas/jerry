@@ -447,10 +447,20 @@ pub struct AdeApp {
     /// later refresh on its own, since refreshes happen every few seconds and a notice that
     /// vanished before it could be read would defeat the point of showing it.
     pub(crate) worktree_selection_notice: Option<String>,
-    /// The agent rail's own real overlay scrollbar handle (GitHub issue #30) - a plain
-    /// `gpui::ScrollHandle`: `crate::rail::render::AdeApp::render_rail_list` renders every row
-    /// eagerly, not through a `uniform_list`.
+    /// The rail's **Problems** view's own real overlay scrollbar handle (GitHub issue #30) - a
+    /// plain `gpui::ScrollHandle`, genuinely few rows so no virtualization is needed. The
+    /// Worktrees view no longer shares this: see [`Self::rail_list_state`].
     pub(crate) rail_scroll_handle: gpui::ScrollHandle,
+    /// The rail's **Worktrees** view's own real virtualized-list state (GitHub issue #364) -
+    /// `crate::rail::render::AdeApp::render_rail_list` used to build every repo header, worktree
+    /// row, agent row and history row
+    /// eagerly, on every render, regardless of scroll position, which is the real reason the rail
+    /// became slow to hover with many worktrees/agents open (GPUI's own hover mechanism forces a
+    /// full `Window::refresh()` on every hover-region transition, and a refresh bypasses every
+    /// view's own per-entity render cache - see that same module's docs for why). `gpui::ListState`
+    /// (not `gpui::UniformListScrollHandle`) because this list's rows genuinely differ in height -
+    /// the same reason [`Self::changes_sections_list`] already uses one.
+    pub(crate) rail_list_state: gpui::ListState,
     pub(crate) selected: Option<usize>,
     pub(crate) agents: Agents,
     pub(crate) file_tree: file_tree::FileTree,

@@ -566,6 +566,185 @@ impl RepoGroup {
     }
 }
 
+/// One flattened row in the rail's Worktrees body - the real fix for the rail becoming
+/// unresponsive to hover with many worktrees/agents open (live user report, GitHub issue #364).
+///
+/// `crate::rail::render::AdeApp::render_rail_list` used to build every repo header, every
+/// worktree row, every agent row and every history row unconditionally, on every single render -
+/// including rows nowhere near the visible viewport. That render ran on every hover-driven
+/// `Window::refresh()` (GPUI's own `.hover()`/`.group_hover()` call `window.refresh()` on every
+/// hover-region transition - see `vendor/zed/crates/gpui/src/elements/div.rs`), and a refresh
+/// forces *every* view in the window to skip its own per-entity prepaint cache for that frame
+/// (`vendor/zed/crates/gpui/src/view.rs`'s `!window.refreshing` check) - so no amount of scoping
+/// which `Entity` owns the hover flag could have bounded the work: the only real lever is
+/// building fewer elements in the first place.
+///
+/// This is the item `crate::rail::render::AdeApp::render_rail_list`'s real `gpui::list` (GPUI's
+/// own variable-row-height virtualized list - `crate::sidebar::render::AdeApp::
+/// render_changes_sections` already uses it for the identical "a 26px header and a 40-ish px
+/// agent row in one scroller" reason, since `uniform_list` sizes every slot from item 0's
+/// measured height alone) renders one of per row actually on screen, plus a small overdraw
+/// margin - so per-hover-event (indeed per-frame) work is bounded by the number of rows visible,
+/// never the total number of rows across every repo.
+///
+/// Deliberately index-only (into the `&[RepoGroup]` the render side already built this frame,
+/// via [`flatten_rail_list_items`]) rather than cloning row data into every item: cheap to build
+/// fresh on every render (as `Self::render_rail_list` already did for its old eager `Vec` of
+/// elements), and there is exactly one place - the render side's own dispatch - that ever needs
+/// to resolve one back into real row data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailListItem {
+    /// One repo group's header band (name, `N wt`, urgency counts).
+    RepoHeader { group_index: usize },
+    /// The inline "not loaded yet" / "no worktrees open yet" / "no worktrees match this filter"
+    /// message shown in place of a repo group's rows when it has none to show.
+    RepoEmptyMessage { group_index: usize },
+    /// One worktree row's own header band - always present, whether or not it is expanded.
+    WorktreeRow {
+        group_index: usize,
+        row_index: usize,
+    },
+    /// One open agent under an expanded worktree row, in the same tab-strip order
+    /// [`WorktreeRow::agents`] already carries. Never emitted for a collapsed row or an errored
+    /// one (an errored [`WorktreeRow`] renders only its [`Self::WorktreeRow`] item - see that
+    /// row's own `error` field docs: it is never interactive and never shows children).
+    AgentRow {
+        group_index: usize,
+        row_index: usize,
+        agent_index: usize,
+    },
+    /// The small "HISTORY" label above an expanded worktree row's past-agent rows - emitted only
+    /// when [`WorktreeRow::history`] is non-empty.
+    HistoryHeader {
+        group_index: usize,
+        row_index: usize,
+    },
+    /// One persisted-but-not-running agent under an expanded worktree row's History section.
+    PastAgentRow {
+        group_index: usize,
+        row_index: usize,
+        history_index: usize,
+    },
+}
+
+impl RailListItem {
+    /// Whether this is the visually last item in its worktree's own block - the one real
+    /// consumer being the 7px gap `crate::rail::render::AdeApp::render_worktree_row` used to
+    /// paint once, on the div wrapping the whole block (header plus its expanded children).
+    /// Flattened, each worktree's block is a variable number of separate list items rather than
+    /// one wrapping div, so the gap moves onto whichever item now actually paints last - the
+    /// [`Self::WorktreeRow`] itself when collapsed or childless, otherwise the last
+    /// [`Self::AgentRow`] or, when this worktree has real history, the last
+    /// [`Self::PastAgentRow`].
+    ///
+    /// Always `false` for an errored worktree row, matching
+    /// `crate::rail::render::AdeApp::render_worktree_row`'s own pre-flatten behaviour exactly: its
+    /// early-return error branch never carried the gap at all, whatever came after it.
+    pub fn is_last_in_worktree_block(&self, groups: &[RepoGroup], expanded: bool) -> bool {
+        let row = match self {
+            RailListItem::RepoHeader { .. } | RailListItem::RepoEmptyMessage { .. } => {
+                return false;
+            }
+            RailListItem::WorktreeRow {
+                group_index,
+                row_index,
+            } => match groups
+                .get(*group_index)
+                .and_then(|g| g.rows.get(*row_index))
+            {
+                Some(row) => row,
+                None => return false,
+            },
+            RailListItem::AgentRow {
+                group_index,
+                row_index,
+                agent_index,
+            } => {
+                let Some(row) = groups
+                    .get(*group_index)
+                    .and_then(|g| g.rows.get(*row_index))
+                else {
+                    return false;
+                };
+                return row.error.is_none()
+                    && row.history.is_empty()
+                    && *agent_index + 1 == row.agents.len();
+            }
+            RailListItem::HistoryHeader { .. } => return false,
+            RailListItem::PastAgentRow {
+                group_index,
+                row_index,
+                history_index,
+            } => {
+                let Some(row) = groups
+                    .get(*group_index)
+                    .and_then(|g| g.rows.get(*row_index))
+                else {
+                    return false;
+                };
+                return row.error.is_none() && *history_index + 1 == row.history.len();
+            }
+        };
+        row.error.is_none() && (!expanded || (row.agents.is_empty() && row.history.is_empty()))
+    }
+}
+
+/// Flattens `groups` into the real sequence [`crate::rail::render::AdeApp::render_rail_list`]'s
+/// `gpui::list` renders - see [`RailListItem`]'s own docs for why this exists at all.
+///
+/// `expanded` mirrors `crate::rail::render::AdeApp::worktree_is_expanded`, injected as a closure
+/// rather than called directly so this stays what every other function in this module is: pure
+/// row-model logic with no `gpui::Window`/`Context` of its own, testable without a real window.
+pub fn flatten_rail_list_items(
+    groups: &[RepoGroup],
+    mut expanded: impl FnMut(&WorktreeRow) -> bool,
+) -> Vec<RailListItem> {
+    let mut items = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        items.push(RailListItem::RepoHeader { group_index });
+        if group.rows.is_empty() {
+            items.push(RailListItem::RepoEmptyMessage { group_index });
+            continue;
+        }
+        for (row_index, row) in group.rows.iter().enumerate() {
+            items.push(RailListItem::WorktreeRow {
+                group_index,
+                row_index,
+            });
+            // Mirrors `crate::rail::render::AdeApp::render_worktree_row`'s own early return for
+            // an errored row: no agents, no history, whatever the real data says.
+            if row.error.is_some() {
+                continue;
+            }
+            let has_children = !row.agents.is_empty() || !row.history.is_empty();
+            if !has_children || !expanded(row) {
+                continue;
+            }
+            for agent_index in 0..row.agents.len() {
+                items.push(RailListItem::AgentRow {
+                    group_index,
+                    row_index,
+                    agent_index,
+                });
+            }
+            if !row.history.is_empty() {
+                items.push(RailListItem::HistoryHeader {
+                    group_index,
+                    row_index,
+                });
+                for history_index in 0..row.history.len() {
+                    items.push(RailListItem::PastAgentRow {
+                        group_index,
+                        row_index,
+                        history_index,
+                    });
+                }
+            }
+        }
+    }
+    items
+}
+
 /// The tooltip on the repo header's **amber** dot+count pair: `"2 worktrees here need input"`.
 ///
 /// Revision 6 replaced the header's one prose run (`3 worktrees waiting`) with two bare

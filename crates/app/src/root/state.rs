@@ -334,6 +334,15 @@ impl AdeApp {
             worktrees_error: None,
             worktree_selection_notice: None,
             rail_scroll_handle: gpui::ScrollHandle::new(),
+            // Starts empty and is reset to the real row count from the one place that builds the
+            // rows (`crate::rail::render::AdeApp::render_rail_list`) - never seeded with a guessed
+            // count, which `gpui::list` would then measure against nothing. Mirrors
+            // `changes_sections_list`'s own init just below for the identical reason.
+            rail_list_state: gpui::ListState::new(
+                0,
+                gpui::ListAlignment::Top,
+                crate::rail::render::RAIL_LIST_OVERDRAW,
+            ),
             selected: None,
             agents: Agents::new(),
             file_tree: file_tree::FileTree::default(),
