@@ -10,6 +10,36 @@
 use super::*;
 
 impl AdeApp {
+    /// The one focus target this window is *always* rendering right now - [`restore_focus`]'s
+    /// last-resort landing spot when an overlay closes with nothing real left to hand focus back
+    /// to, and the answer to GitHub issue #255 ("sometimes the command palette can't be opened
+    /// like when there is no tab open").
+    ///
+    /// The three arms mirror [`Render::render`]'s own three-way body branch exactly, because that
+    /// branch is what decides which of these handles is genuinely `track_focus`'d this frame:
+    /// Settings replaces the workspace body (`crate::settings::render::AdeApp::render_settings`
+    /// tracks [`Self::settings_focus_handle`]), a window with no focused repo renders
+    /// [`Self::render_empty_state`] and its own handle instead, and every other state renders the
+    /// workspace body, whose rail root (`crate::rail::render::AdeApp::render_rail`) carries
+    /// [`Self::rail_focus_handle`]. Getting this wrong would be *worse* than no fallback at all -
+    /// focusing a handle nothing draws is precisely the dangling-focus state this exists to
+    /// escape - so it is derived from the same condition rather than assumed.
+    ///
+    /// The rail's *root*, not its filter field: see [`Self::rail_focus_handle`]'s own docs for the
+    /// real keystroke-swallowing bug that distinction fixed, and note that
+    /// [`Self::close_agent`]/[`Self::select_worktree`]/[`Self::cancel_new_file`] already hand-roll
+    /// exactly this fallback for their own non-overlay paths - this method is what lets the shared
+    /// overlay path stop being the one place that lacked it.
+    pub(crate) fn focus_fallback_handle(&self) -> FocusHandle {
+        if self.settings_open {
+            self.settings_focus_handle.clone()
+        } else if self.focused_repo().is_none() {
+            self.empty_state_focus_handle.clone()
+        } else {
+            self.rail_focus_handle.clone()
+        }
+    }
+
     /// Captures the pre-open focus target only on the closed-to-open transition
     /// (`Self::open_change` was `None`) - a second file opened while one is already showing must
     /// not overwrite the real original target with `Self::code_focus_handle` itself (already
@@ -98,7 +128,8 @@ impl AdeApp {
             cx.notify();
             return;
         }
-        restore_focus(&self.agents, &mut self.palette_focus, window, cx);
+        let fallback = self.focus_fallback_handle();
+        restore_focus(&self.agents, &mut self.palette_focus, fallback, window, cx);
         cx.notify();
     }
 
@@ -194,7 +225,8 @@ impl AdeApp {
         // `App::intercept_keystrokes` subscription - it must never survive leaving the Settings
         // surface, or every keystroke in the whole app would keep being silently swallowed.
         self.cancel_keybinding_recording(cx);
-        restore_focus(&self.agents, &mut self.settings_focus, window, cx);
+        let fallback = self.focus_fallback_handle();
+        restore_focus(&self.agents, &mut self.settings_focus, fallback, window, cx);
         cx.notify();
     }
 }
@@ -2150,5 +2182,241 @@ mod palette_result_focus_tests {
             app.update_in(cx, |app, window, cx| app.close_palette(window, cx));
             cx.run_until_parked();
         }
+    }
+}
+
+/// GitHub issue #255 ("sometimes the command palette can't be opened like when there is no tab
+/// open"): real, keystroke-driven coverage for a window that has genuinely run out of tabs.
+///
+/// The bug was [`restore_focus`]' fallback chain ending at the active agent's terminal pane. With
+/// no agent left there was nothing to end it *with*, so closing a focus-owning surface simply did
+/// not move `Window::focus` at all - leaving it on the handle that had just stopped being
+/// rendered, from where GPUI dispatches every keystroke to the dispatch tree's root, above every
+/// `on_action` handler this app registers. See that function's own docs for the full mechanism
+/// and [`AdeApp::focus_fallback_handle`] for the fix.
+///
+/// Every test here drives the real `crate::default_key_bindings` binding through
+/// `simulate_keystrokes` rather than dispatching [`TogglePalette`] directly. A direct dispatch
+/// would in fact see this particular bug (`gpui::VisualTestContext::dispatch_action` routes
+/// through `Window::dispatch_action`, which resolves against the focused node in the rendered
+/// frame exactly as a keystroke does), but it would *not* see the keystroke half - which binding
+/// string the action is actually reachable by - and the issue is a report about pressing a key.
+/// Same choice, for the same reason, as `tab_strip_keybinding_tests`' own
+/// `ctrl_p_still_works_after_...` neighbours. Each test also asserts its own zero-tab setup before
+/// pressing anything, so none of them can go quietly vacuous if a close path ever stops closing
+/// what its name says.
+#[cfg(test)]
+mod tabless_window_keybinding_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext};
+
+    fn bind_real_keys(cx: &mut gpui::VisualTestContext) {
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+    }
+
+    /// `crate::default_key_bindings`' own `"secondary-p"`, resolved the same way that list does.
+    const SECONDARY_P: &str = if cfg!(target_os = "macos") {
+        "cmd-p"
+    } else {
+        "ctrl-p"
+    };
+
+    /// A test window over a throwaway repo directory holding one real file, with the initial
+    /// shell agent already spawned (the same `palette_focus_tests::open_test_app` setup every
+    /// other keybinding test in this file uses). The `TempDir` is returned so it outlives the
+    /// test body.
+    fn open_app_with_a_file(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = repo.path().join("a.txt");
+        std::fs::write(&file_path, "hello\n").expect("write a.txt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        (app, cx, repo, file_path)
+    }
+
+    /// Closes every open agent through [`AdeApp::close_agent`] - the real entry point the tab
+    /// strip's `×`, middle-click and the Agent menu's Archive row all go through.
+    fn close_every_agent(app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext) {
+        let ids: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        app.update_in(cx, |app, window, cx| {
+            for id in ids {
+                app.close_agent(id, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.agents.is_empty()),
+            "setup: every agent must really be closed"
+        );
+    }
+
+    fn assert_palette_opened(app: &Entity<AdeApp>, cx: &mut gpui::VisualTestContext, state: &str) {
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "a real {SECONDARY_P} keystroke must open the palette {state} - GitHub issue #255: \
+             with no tab left to hand focus back to, restore_focus used to move Window::focus \
+             nowhere at all, leaving it on the surface that had just stopped being rendered and \
+             every global keybinding silently dead until the next click"
+        );
+    }
+
+    /// The plainest reading of the issue: nothing open anywhere. Already green before the fix
+    /// (`AdeApp::close_agent` hand-rolls its own rail fallback for exactly this), and kept as the
+    /// baseline the three real reproductions below are variations on - if this ever breaks, the
+    /// others' evidence about *which* path is at fault stops being readable.
+    #[gpui::test]
+    fn ctrl_p_opens_the_palette_with_no_tab_open_at_all(cx: &mut TestAppContext) {
+        let (app, cx, _repo, _file) = open_app_with_a_file(cx);
+        bind_real_keys(cx);
+
+        close_every_agent(&app, cx);
+
+        cx.simulate_keystrokes(SECONDARY_P);
+        assert_palette_opened(&app, cx, "with no tab open at all");
+    }
+
+    /// Reproduction 1, and the most ordinary of the three: open a file, close the terminal tab,
+    /// close the file tab. `AdeApp::close_agent`'s own rail fallback deliberately stands down
+    /// while a file tab is showing (focus is correctly on the code surface at that point), and the
+    /// file tab's own close then went through [`restore_focus`], whose captured target was the
+    /// agent that no longer exists.
+    #[gpui::test]
+    fn ctrl_p_opens_the_palette_after_the_last_agent_then_the_last_file_tab_are_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _repo, file_path) = open_app_with_a_file(cx);
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file_path, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_some()),
+            "setup: a real file tab must be open"
+        );
+
+        close_every_agent(&app, cx);
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_some()),
+            "setup: the file tab must survive closing the agents - the point of this ordering"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_change_diff(window, cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.open_change.is_none()),
+            "setup: the file tab must really be closed - zero tabs now"
+        );
+        // The mechanism, not just the symptom: focus has to land on something this frame really
+        // renders. The rail's root container is that thing whenever the workspace body is showing
+        // (`AdeApp::focus_fallback_handle`).
+        assert!(
+            app.update_in(cx, |app, window, _cx| app
+                .rail_focus_handle
+                .is_focused(window)),
+            "closing the last tab must leave real keyboard focus on the rail's own root \
+             container, not dangling on the code surface handle that just stopped rendering"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_P);
+        assert_palette_opened(
+            &app,
+            cx,
+            "after the last agent and then the last file tab closed",
+        );
+    }
+
+    /// Reproduction 2: Settings open, the last agent archived from the title bar's Agent menu
+    /// (`AdeApp::archive_agent`, reachable while Settings covers the workspace body), Settings
+    /// closed. `close_agent` stands down here too - focus is legitimately on Settings' own handle
+    /// at that moment - so the dangling target was created by `close_settings`' restore.
+    #[gpui::test]
+    fn ctrl_p_opens_the_palette_after_closing_settings_that_outlived_the_last_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _repo, _file) = open_app_with_a_file(cx);
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| app.open_settings(window, cx));
+        assert!(
+            app.read_with(cx, |app, _| app.settings_open),
+            "setup: Settings must really be open"
+        );
+
+        let ids: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        app.update_in(cx, |app, window, cx| {
+            for id in ids {
+                app.archive_agent(id, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.agents.is_empty()),
+            "setup: every agent must really be archived"
+        );
+
+        app.update_in(cx, |app, window, cx| app.close_settings(window, cx));
+        assert!(
+            app.read_with(cx, |app, _| !app.settings_open
+                && app.open_change.is_none()
+                && app.agents.is_empty()),
+            "setup: Settings closed onto a genuinely tabless workspace"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_P);
+        assert_palette_opened(
+            &app,
+            cx,
+            "after closing Settings that outlived the last agent",
+        );
+    }
+
+    /// Reproduction 3: the git graph tab open, the last agent closed behind it, then the graph tab
+    /// closed. Same shape as the other two through a third surface -
+    /// `crate::graph_view::render::AdeApp::leave_graph_tab`'s own [`restore_focus`] call.
+    #[gpui::test]
+    fn ctrl_p_opens_the_palette_after_closing_a_graph_tab_that_outlived_the_last_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx, _repo, _file) = open_app_with_a_file(cx);
+        bind_real_keys(cx);
+
+        app.update_in(cx, |app, window, cx| app.open_git_graph(window, cx));
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.graph_tab_active),
+            "setup: the graph tab must really be showing"
+        );
+
+        close_every_agent(&app, cx);
+
+        app.update_in(cx, |app, window, cx| app.close_git_graph_tab(window, cx));
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| !app.graph_tab_active
+                && !app.graph_tab_open
+                && app.open_change.is_none()),
+            "setup: the graph tab must really be closed - zero tabs now"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_P);
+        assert_palette_opened(
+            &app,
+            cx,
+            "after closing a graph tab that outlived the last agent",
+        );
     }
 }

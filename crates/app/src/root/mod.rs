@@ -3621,14 +3621,39 @@ impl OverlayFocus {
 /// If the active agent changed while the surface was open, the captured handle is skipped in
 /// favor of the *current* active agent's terminal pane (a handle from a no-longer-active
 /// agent would be just as dangling as the overlay's own). Otherwise the captured handle is
-/// restored, falling back to the active agent's pane if nothing was focused before. A free
-/// function, not an `AdeApp` method, since every caller already holds `&mut self` and needs to
-/// pass `&mut self.some_field` alongside it. Deliberately doesn't call `cx.notify()` - every
-/// caller has its own surface-specific state change around this call and issues its own single
-/// `cx.notify()` once everything, this restore included, is done.
+/// restored, falling back to the active agent's pane if nothing was focused before, and finally
+/// to `fallback` if there is no agent either. A free function, not an `AdeApp` method, since
+/// every caller already holds `&mut self` and needs to pass `&mut self.some_field` alongside it.
+/// Deliberately doesn't call `cx.notify()` - every caller has its own surface-specific state
+/// change around this call and issues its own single `cx.notify()` once everything, this restore
+/// included, is done.
+///
+/// `fallback` ([`AdeApp::focus_fallback_handle`], which every caller passes) is GitHub issue
+/// #255's fix, and it closes a real, reproduced hole rather than padding an unreachable one: this
+/// function used to end its chain at the active agent's pane and simply *not move focus at all*
+/// when there wasn't one, which is the whole bug. A window with no agents left is an ordinary,
+/// fully-supported state (`crate::work_surface::render::AdeApp::render_center_pane`'s own "no
+/// agents open in this worktree" arm), and closing any focus-owning surface in it - a file tab,
+/// the git graph tab, the review tab, Settings, the palette - left `Window::focus` pointing at
+/// the handle that had just stopped being rendered. From there GPUI resolves every subsequent
+/// keystroke against the dispatch tree's *root* node (see this module's [`OverlayFocus`] docs and
+/// `focus_node_id_in_rendered_frame`), which sits above every `on_action` handler `AdeApp` has -
+/// so ⌘P, ⌘,, and every other global binding silently did nothing until the user happened to
+/// click something focusable. Three real reproductions, each now a test in
+/// `crate::root::focus::tabless_window_keybinding_tests`:
+///
+/// 1. Open a file, close the last agent tab, close the file tab.
+/// 2. Open Settings, archive the last agent from the title bar's Agent menu, close Settings.
+/// 3. Open the git graph tab, close the last agent tab, close the graph tab.
+///
+/// Each ends with zero tabs open, which is exactly the state the issue names. The `agent_changed`
+/// branch above is what all three route through: the pre-open target *was* the agent that has
+/// since been closed, so it is (correctly) discarded, and before this parameter existed there was
+/// then nothing left to fall back to.
 pub(crate) fn restore_focus(
     agents: &Agents,
     overlay_focus: &mut OverlayFocus,
+    fallback: FocusHandle,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -3638,11 +3663,10 @@ pub(crate) fn restore_focus(
     } else {
         overlay_focus.return_focus.take()
     };
-    let focus_target =
-        restore_target.or_else(|| agents.active().map(|agent| agent.pane.focus_handle(cx)));
-    if let Some(handle) = focus_target {
-        window.focus(&handle, cx);
-    }
+    let focus_target = restore_target
+        .or_else(|| agents.active().map(|agent| agent.pane.focus_handle(cx)))
+        .unwrap_or(fallback);
+    window.focus(&focus_target, cx);
     overlay_focus.clear();
 }
 

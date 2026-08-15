@@ -7713,3 +7713,78 @@ in isolation. An earlier run of the same suite also showed 15 `spawn_*_watcher` 
 were the host running out of inotify instances (measured at 124/128, with three other worktrees'
 suites running concurrently), not this change - no watcher file is touched by it, and all 18
 watcher tests pass once the host has headroom.
+
+## GitHub issue #255: with no tab left open, every global keybinding died, the command palette's ⌘P included
+
+The whole report, verbatim: *"Sometimes the command palette can't be opened like when there is no
+tab open."* No steps, no trace - so the first real work was finding which zero-tab states actually
+break. Nine candidate paths were written as real `simulate_keystrokes` tests against unmodified
+code; six passed and three failed, and all three failures share one root cause:
+
+1. Open a file, close the last agent tab, close the file tab.
+2. Open Settings, archive the last agent from the title bar's Agent menu, close Settings.
+3. Open the git graph tab, close the last agent tab, close the graph tab.
+
+**Root cause.** `restore_focus` (`crates/app/src/root/mod.rs`) - the shared "an overlay closed,
+put keyboard focus back somewhere real" step every focus-owning surface in this app routes
+through - ended its fallback chain at *the active agent's terminal pane*:
+
+```rust
+let focus_target = restore_target.or_else(|| agents.active().map(..));
+if let Some(handle) = focus_target { window.focus(&handle, cx); }
+```
+
+With no agent left there was nothing to end the chain with, and the `if let` then simply did
+nothing: `Window::focus` stayed pointed at the handle of the surface that had just stopped being
+rendered. GPUI resolves a dispatched action against whichever node the focused `FocusId` maps to
+in the last rendered frame and falls back to the dispatch tree's *root* when that id isn't there
+(`focus_node_id_in_rendered_frame`) - a node above every `on_action` handler `AdeApp` registers.
+So `⌘P`, `⌘,`, `Ctrl+Shift+T` and every other global binding silently did nothing until the user
+clicked something focusable. This is the same dangling-focus bug class `OverlayFocus`/
+`restore_focus` were built to close (see this file's own `ctrl_p_still_works_after_...` history);
+what was new is that a window with **no agents at all** is an ordinary state - `render_center_pane`
+has a real "no agents open in this worktree" arm - and the shared helper had no answer for it.
+Three call sites (`close_agent`, `select_worktree`/`reset_repo_scoped_state`, `cancel_new_file`)
+already hand-rolled exactly the right fallback for their own non-overlay paths, which is why the
+plainest reading of the issue ("close the only tab, press ⌘P") already worked and the three
+orderings above did not: in each of them the pre-open target *was* the agent that has since been
+closed, so `restore_focus`' own `agent_changed` guard correctly discarded it - and then had
+nothing left.
+
+**Fix.** `AdeApp::focus_fallback_handle` (`crates/app/src/root/focus.rs`) returns the one focus
+target this window is definitely rendering right now, deriving its three arms from
+`Render::render`'s own three-way body branch rather than assuming: `settings_focus_handle` while
+Settings has replaced the workspace body, `empty_state_focus_handle` for a window with no focused
+repo, `rail_focus_handle` (the rail's context-less *root*, not its `"text-input"` filter field)
+otherwise. `restore_focus` takes it as a new parameter and ends with `.unwrap_or(fallback)` plus an
+unconditional `window.focus`, so the "moved focus nowhere" outcome is now unrepresentable. All 11
+call sites pass it. Behaviour changes only in the case that was already broken: with a captured
+target or a live agent, the chain resolves exactly as before.
+
+**Tests.** New `root::focus::tabless_window_keybinding_tests` - four `#[gpui::test]`s driving the
+real `crate::default_key_bindings` `secondary-p` binding through `simulate_keystrokes` (never a
+direct `dispatch_action`, which is precisely what cannot see this bug class), one per reproduction
+above plus the already-green "nothing open anywhere" baseline. Each asserts its own zero-tab setup
+before pressing anything so it can't go vacuous, and the file-tab one additionally asserts the
+mechanism rather than only the symptom: real focus must land on `rail_focus_handle`. Reverting
+just the `.unwrap_or(fallback)` line fails exactly the three reproduction tests and leaves the
+baseline green.
+
+**Not reproduced live, and why.** The real app was launched against a scratch repo and captured
+per-window (`XGetImage`), but scripted keystroke delivery into the GPUI window is unreliable in
+this sandbox - synthetic XTEST keys reached the app once and then stopped landing at all - so a
+keyboard-driven end-to-end repro could not be run honestly. The evidence above is the GPUI test
+harness's own real window, real dispatch tree and real key bindings instead. Worth knowing for the
+next person: the status bar's `⌘P commands` hint calls `open_palette` directly from its `on_click`
+rather than dispatching an action, so clicking it kept working throughout - a mouse-only user would
+never have seen this bug.
+
+**Verification**: `cargo build --workspace`, `cargo fmt --all -- --check`, `cargo clippy
+--workspace --all-targets` - all clean. `cargo test -p wt-core`: 290 passed, 0 failed. `cargo test
+-p app --lib`: **2784 passed, 16 failed** - every failure is the known inotify-exhaustion class
+(`rail::worktree_watch`, `sidebar::file_tree_watch`, `root::state::file_tree_watch_integration_
+tests`, `root::repo_list_tests`) plus the known `rust_analyzer_tracks_a_real_live_unsaved_edit_...`
+LSP wiring test, on a host measured at 124/128 `max_user_instances` with several other worktrees'
+suites running concurrently. Nothing in `root::focus`, `code_surface`, `graph_view`, `review`,
+`sidebar::render` or `work_surface::render` failed; the 36 tests in this crate's five
+focus/keybinding modules all pass, new ones included.

@@ -529,7 +529,8 @@ impl AdeApp {
                     self.refresh_open_diff_file_cache();
                     self.dismiss_hover();
                     self.dismiss_completions();
-                    restore_focus(&self.agents, &mut self.code_focus, window, cx);
+                    let fallback = self.focus_fallback_handle();
+                    restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
                 }
             }
         }

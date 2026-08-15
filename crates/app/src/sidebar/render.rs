@@ -58,7 +58,8 @@ impl AdeApp {
             self.tree_context_menu = None;
             self.tree_inline_edit = None;
             if self.tree_focus_handle.is_focused(window) {
-                restore_focus(&self.agents, &mut self.code_focus, window, cx);
+                let fallback = self.focus_fallback_handle();
+                restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
             }
             // 1 again, one level removed, and invisible to the check above: an *overlay* can be
             // holding the tree's handle as its own return target while the overlay itself has
