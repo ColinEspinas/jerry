@@ -117,12 +117,6 @@ push. If you're using [Claude Code](https://claude.com/claude-code), this repo's
 directory (skills, agents, commands) is set up already — install [rtk](https://github.com/rtk-ai/rtk)
 and run `/setup` to cut token usage on command output; optional, not a build dependency.
 
-## Contributors
-
-- [Colin Espinas](https://github.com/ColinEspinas)
-- [Lucas Boinet](https://github.com/lucasboinet)
-- [Lucas](https://github.com/LucasPcq)
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)

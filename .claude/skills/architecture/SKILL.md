@@ -49,6 +49,27 @@ boundary earns its keep over just being a well-organized module. A five-function
 need a crate. `crates/app/src/hooks/` (~5,400 LOC, a whole HTTP listener) does — it's the named
 pilot extraction in `docs/architecture/overview.md`.
 
+**A new crate is a normal, expected outcome of this decision, not an exception to ask permission
+for** — `wt-core`/`pty-core`/`lsp-core` are exactly this pattern already, and the target
+architecture explicitly plans a fourth (`crates/jerry-cli`). If question 5 says yes, create it:
+
+1. `crates/<name>/Cargo.toml` and `src/lib.rs`, matching an existing core crate's shape
+   (`edition = { workspace = true }`, `publish = { workspace = true }`, `license = { workspace = true }`).
+2. Add `[lints]` / `workspace = true` to its `Cargo.toml` — every crate opts into
+   `[workspace.lints]` individually; it isn't automatic. Skipping this is the single easiest way to
+   ship a crate that silently isn't held to `unsafe_code = "deny"` / `clippy::unwrap_used`.
+3. Add `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]` near the top of
+   `src/lib.rs` (after any `//!` module doc, before the first `use`/`mod`) — matches the "expect()
+   is fine in tests" convention every other crate already carries.
+4. Add it to the root `Cargo.toml`'s `[workspace]` `members` list.
+5. Never add a `gpui` dependency — see §1 above, non-negotiable regardless of what the new crate
+   is for.
+6. Add its Scope / Owns / Does not own entry to
+   [`docs/architecture/crates.md`](../../../docs/architecture/crates.md).
+
+Run `cargo build --workspace` and `/check` once it's wired up — a crate that isn't in `members` yet
+won't be picked up by either.
+
 ## When none of this is clear yet
 
 If a change's home is genuinely ambiguous — it could reasonably go in two different crates, or the
@@ -69,5 +90,6 @@ records a *decision*, not every instance of following one.
 ## What this skill doesn't cover
 
 It doesn't check whether existing code already violates the target (that's `rust-standards`'s
-layering check, applied to a diff) and it doesn't execute a crate extraction — it only decides
-whether new work should create one.
+layering check, applied to a diff), and it covers scaffolding a *new* crate but not *extracting*
+one — moving a substantial existing module like `hooks/` out into its own crate, updating every
+caller, is real refactor work with its own risk, not a checklist item.
