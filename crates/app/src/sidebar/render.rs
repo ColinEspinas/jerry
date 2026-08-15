@@ -2336,6 +2336,11 @@ impl AdeApp {
             .border_color(theme::border::INNER)
             .cursor_pointer()
             .hover(|el| el.bg(theme::surface::ROW_HOVER))
+            // The shared caret glyph inherits its colour from whatever wraps it (see
+            // `render_disclosure_caret`'s own docs on why it paints none of its own). Set here
+            // rather than on the glyph: this row's other children - the label, the count, the
+            // seen meter and the diffstat - all name their own token, so nothing else inherits it.
+            .text_color(theme::changes::SECTION_CARET)
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.toggle_changes_section(section, cx);
             }))
@@ -3109,12 +3114,17 @@ impl AdeApp {
                     // and `items_start` top-aligned the 14px caret bar against the 17px text
                     // line. Now the exact structure every working simple input uses
                     // (`Self::render_rail_filter_row`'s caret+text wrapper, `Self::
-                    // render_new_file_prompt`'s name box): an `items_center` row with a small gap
-                    // whose text div is intrinsically sized, so the caret sits right next to the
-                    // real text.
+                    // render_new_file_prompt`'s name box): an `items_center` row whose text div is
+                    // intrinsically sized, so the caret sits right next to the real text.
+                    //
+                    // No decorative gap before the caret - see
+                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own comment for why
+                    // (live report: it read as a gap between the typed text and where it's
+                    // actually being typed). This field was written while that 2px gap was still
+                    // on every other input in the app; it goes here for the same reason it went
+                    // everywhere else.
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
                     .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                         this.focus_commit_message(window, cx);
                     }))

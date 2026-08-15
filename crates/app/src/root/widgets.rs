@@ -21,6 +21,13 @@ use crate::work_surface::agents::ProcessKind;
 /// than computed here), and the caller owns the click handler - the caret is a glyph, not a button,
 /// and every one of its call sites already has a larger clickable row or header around it.
 ///
+/// The caller also owns the **colour**, and deliberately so: both call sites want the same
+/// `#8b9197` ([`theme::changes::SECTION_CARET`] and [`theme::text::DIM`] are one value), but the
+/// rail's caret also carries §4o's hover lift to `#c2c7cc`, armed on the 13x27 hit box around this
+/// glyph. A `text_color` set *here* would win over that hover the same way a CSS `color` on the
+/// child wins over one on the hovered parent, and the lift would silently do nothing. Inheriting
+/// is what makes it work.
+///
 /// Deliberately *not* `crate::sidebar::render::render_tree_caret`: that one reserves its width for
 /// a non-expandable **file** row so the tree's icon column stays aligned, which is a second job
 /// this control does not have.
@@ -33,7 +40,6 @@ pub(crate) fn render_disclosure_caret(open: bool, text_size: Pixels) -> impl Int
         .justify_center()
         .font(font(theme::font::MONO))
         .text_size(text_size)
-        .text_color(theme::changes::SECTION_CARET)
         .child(if open { "\u{25be}" } else { "\u{25b8}" })
 }
 
