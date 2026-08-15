@@ -151,6 +151,12 @@ impl HookRuntime {
         self.listener.session_id_for(id)
     }
 
+    /// This agent's real run-level facts - completed turns and the run's title (GitHub issue
+    /// #227). See [`server::HookListener::run_facts_for`].
+    pub fn run_facts_for(&self, id: AgentId) -> server::RunFacts {
+        self.listener.run_facts_for(id)
+    }
+
     /// Every file write reported since the last call, in arrival order - the signal
     /// `crate::provenance` turns into per-line attribution (GitHub issue #284). Returns
     /// `(edits, dropped)`; see [`server::HookListener::drain_edits`].

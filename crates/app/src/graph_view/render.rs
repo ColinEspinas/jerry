@@ -74,6 +74,11 @@ impl AdeApp {
         // in the opposite direction - see `crate::review::render::AdeApp::leave_review_tab`.
         self.leave_review_tab(window, cx);
         self.review_tab_open = None;
+        // GitHub issue #227: and so is the run-transcript tab - see
+        // `crate::run_history::tab::AdeApp::leave_run_tab`. Deliberately *not* clearing
+        // `run_tab_by_worktree`: unlike the review tab's window-wide slot, that map is this
+        // worktree's own open tab, which leaving the surface does not close.
+        self.leave_run_tab(window, cx);
 
         self.graph_tab_open = true;
         let was_active = self.graph_tab_active;

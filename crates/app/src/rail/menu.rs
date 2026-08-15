@@ -205,14 +205,18 @@ pub fn agent_menu_groups(running: bool) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
     ]
 }
 
-/// Whether this build really has a History *view* for the `⋯` overflow to switch to. It does
-/// not: GitHub issue #227's history is rendered inline under each worktree row, and the sidebar
-/// strip GitHub issue #291 built has exactly two views (`crate::rail::strip::SidebarView`) -
-/// History is *reached* through this overflow rather than being a cell, per
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` section 4t, but the surface it would
-/// open is still #227's to build. Named rather than inlined as a bare `false` so the row that
-/// reads it, its disabled reason and this fact stay one thing - see [`overflow_menu_groups`].
-pub const HISTORY_VIEW_AVAILABLE: bool = false;
+/// Whether this build really has a History *view* for the `⋯` overflow to switch to.
+///
+/// It does, as of GitHub issue #227: [`crate::rail::strip::SidebarView::History`] is a real
+/// sidebar view - the repo → worktree → run index, with its own scope toggle and its own
+/// run-transcript centre tab - reached through this overflow rather than through a cell, per
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t ("a permanent cell in a 5-cell
+/// strip is a claim that you switch to it constantly. If you don't, it belongs in the overflow").
+///
+/// Kept as a named constant rather than collapsed into an ungated row: the row that reads it, the
+/// reason it would show while disabled, and this fact are one thing, and §7 rule 1 ("Ship the
+/// affordance with the behaviour, or ship neither") is the rule it exists to keep honest.
+pub const HISTORY_VIEW_AVAILABLE: bool = true;
 
 /// The sidebar strip's `⋯` overflow (§4u): "History and Settings only, with the glyphs they had
 /// in the strip (clock, sliders) so the move out of the strip does not cost their
@@ -220,7 +224,7 @@ pub const HISTORY_VIEW_AVAILABLE: bool = false;
 /// `⌘K` and its own surface."
 ///
 /// `history_available` is whether this build really has a History surface to switch to - see
-/// [`HISTORY_VIEW_AVAILABLE`]. It does not yet, so the row ships visibly disabled with that as its
+/// [`HISTORY_VIEW_AVAILABLE`]. A build without one shows the row visibly disabled with that as its
 /// reason, rather than as a row that looks live and does nothing.
 pub fn overflow_menu_groups(history_available: bool) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
     vec![vec![
@@ -229,8 +233,7 @@ pub fn overflow_menu_groups(history_available: bool) -> Vec<Vec<MenuEntry<RailMe
             .tooltip("Earlier runs, by repo and worktree")
             .gated(
                 history_available,
-                "there is no History surface in this build yet (issue #227); a worktree's own \
-                 past runs are already listed under its row",
+                "there is no History surface in this build (issue #227)",
             ),
         MenuEntry::new(RailMenuAction::OpenSettings, "Settings")
             .glyph(Icon::SlidersHorizontal)
@@ -393,6 +396,9 @@ mod tests {
             "with no History surface to switch to, the row must say so rather than look live"
         );
         assert!(overflow_menu_groups(true)[0][0].enabled);
+        // GitHub issue #227 built the History view, so the overflow's own row is now live -
+        // \u{a7}7 rule 1: ship the affordance with the behaviour, or ship neither.
+        const { assert!(HISTORY_VIEW_AVAILABLE) };
     }
 
     /// Every row that shows a keycap must name a real, registered binding

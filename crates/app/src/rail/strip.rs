@@ -41,11 +41,21 @@ use crate::lsp::diagnostics::Severity;
 use crate::root::plural;
 use crate::theme;
 
-/// A view the left column can show. Exactly the two §4u leaves in the strip.
+/// A view the left column can show.
 ///
 /// [`SidebarView::Worktrees`] is the rail this app has always had, unchanged - §2's table says so
 /// in as many words ("the existing repo → worktree → agent tree, unchanged"). The strip does not
 /// rebuild it; it sits above it and gates it.
+///
+/// ## Two of these are strip cells, and one deliberately is not
+///
+/// [`SidebarView::ALL`] is the **strip**'s list, not this enum's: §4t moved History out of the
+/// strip and into the `⋯` overflow ("a permanent cell in a 5-cell strip is a claim that you
+/// switch to it constantly. If you don't, it belongs in the overflow"), and §4u fixed the strip
+/// at "two cells and the overflow - Worktrees, Problems, `⋯`". History is still a real *view* -
+/// the sidebar body paints it, the filter row follows it, and `crate::rail::menu`'s overflow row
+/// switches to it - it simply has no cell of its own. That is why [`SidebarView::History`] exists
+/// here but is absent from `ALL`, and why the test below pins both halves of that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SidebarView {
     /// The repo → worktree → agent tree.
@@ -53,10 +63,14 @@ pub enum SidebarView {
     Worktrees,
     /// The selected worktree's LSP diagnostics.
     Problems,
+    /// Agent history, keyed repo → worktree → run (GitHub issue #227). Reached from the `⋯`
+    /// overflow rather than from a cell - see this enum's own docs.
+    History,
 }
 
 impl SidebarView {
-    /// Every view, in the order the strip paints them.
+    /// Every view **the strip paints a cell for**, in the order it paints them - which is
+    /// deliberately not every variant of this enum. See [`SidebarView`]'s own docs.
     pub const ALL: &'static [SidebarView] = &[SidebarView::Worktrees, SidebarView::Problems];
 
     /// The view's name - the first half of its `"<view> — <hint>"` tooltip, and the word the
@@ -65,6 +79,7 @@ impl SidebarView {
         match self {
             SidebarView::Worktrees => "Worktrees",
             SidebarView::Problems => "Problems",
+            SidebarView::History => "History",
         }
     }
 
@@ -76,6 +91,9 @@ impl SidebarView {
         match self {
             SidebarView::Worktrees => "repo \u{b7} worktree \u{b7} agent",
             SidebarView::Problems => "diagnostics in this worktree",
+            // The wording `crate::rail::menu::overflow_menu_groups`' own History row already
+            // carries, so the row you reach this view by and the view itself say one thing.
+            SidebarView::History => "earlier runs, by repo and worktree",
         }
     }
 
@@ -87,6 +105,10 @@ impl SidebarView {
         match self {
             SidebarView::Worktrees => Icon::TreeStructure,
             SidebarView::Problems => Icon::Warning,
+            // §8's own third mapping, and §4u's "with the glyphs they had in the strip (clock,
+            // sliders) so the move out of the strip does not cost their recognisability" - so the
+            // overflow row and this view name the same mark even though no cell paints it.
+            SidebarView::History => Icon::ClockCounterClockwise,
         }
     }
 
@@ -417,6 +439,10 @@ pub fn strip_view_cells(
                     StripMarker::new(agents_needing_you, MarkerTone::NeedsYou)
                 }
                 SidebarView::Problems => problems.marker(),
+                // Unreachable: this maps over `ALL`, which History is deliberately not in. Stated
+                // as `None` rather than as an `unreachable!()` so that the day History *does* get
+                // a cell, the compiler asks for its marker here instead of the app panicking.
+                SidebarView::History => None,
             },
         })
         .collect()
@@ -611,6 +637,37 @@ mod tests {
             2,
             "History belongs to the overflow (\u{a7}4u) and Search to the right panel (\u{a7}4u); \
              a third cell here would be re-adding a strip the design cut down"
+        );
+        assert!(
+            !SidebarView::ALL.contains(&SidebarView::History),
+            "History is a real view the body paints, reached from the \u{2ef} overflow - it must \
+             never acquire a cell"
+        );
+    }
+
+    /// The other half of the same rule: History being absent from the strip must not make it a
+    /// second-class view. It carries the same tooltip pair, the same glyph the overflow row shows,
+    /// and it survives [`effective_view`] exactly like Problems does.
+    #[test]
+    fn history_is_a_full_view_even_though_it_has_no_cell() {
+        assert_eq!(SidebarView::History.label(), "History");
+        assert_eq!(
+            SidebarView::History.tooltip(None),
+            "History \u{2014} earlier runs, by repo and worktree"
+        );
+        assert_eq!(
+            SidebarView::History.icon(),
+            Icon::ClockCounterClockwise,
+            "\u{a7}4u: the overflow keeps the glyph History had in the strip"
+        );
+        assert_eq!(
+            effective_view(true, SidebarView::History),
+            SidebarView::History
+        );
+        assert_eq!(
+            effective_view(false, SidebarView::History),
+            SidebarView::Worktrees,
+            "an empty day has no runs to index either, and no cell to switch back from"
         );
     }
 

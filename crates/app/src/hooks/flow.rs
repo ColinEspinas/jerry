@@ -224,7 +224,19 @@ impl AdeApp {
             return;
         }
 
-        let entries: Vec<(String, std::path::PathBuf, &'static str, i64, _, _, _, _)> = recordable
+        struct RecordedEntry {
+            key: String,
+            cwd: std::path::PathBuf,
+            kind_label: &'static str,
+            spawned_at_unix: i64,
+            status: crate::rail::status::Status,
+            activity: Option<String>,
+            question: Option<String>,
+            session_id: Option<String>,
+            run_facts: crate::hooks::server::RunFacts,
+        }
+
+        let entries: Vec<RecordedEntry> = recordable
             .into_iter()
             .filter_map(|(id, key, cwd, kind_label, spawned_at_unix)| {
                 let agent = self.agents.iter().find(|agent| agent.id == id)?;
@@ -242,7 +254,15 @@ impl AdeApp {
                     .hook_runtime
                     .as_ref()
                     .and_then(|runtime| runtime.session_id_for(id));
-                Some((
+                // GitHub issue #227: the run's own title and completed-turn count, from the same
+                // real hook stream and read ungated for the same reason as the session id - both
+                // describe the run, not the present (`HookListener::run_facts_for`).
+                let run_facts = self
+                    .hook_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.run_facts_for(id))
+                    .unwrap_or_default();
+                Some(RecordedEntry {
                     key,
                     cwd,
                     kind_label,
@@ -251,27 +271,30 @@ impl AdeApp {
                     activity,
                     question,
                     session_id,
-                ))
+                    run_facts,
+                })
             })
             .collect();
 
-        for (key, cwd, kind_label, spawned_at_unix, status, activity, question, session_id) in
-            entries
-        {
+        for entry in entries {
             if self.agent_status_state.set(
-                key.clone(),
-                &cwd,
-                kind_label,
-                spawned_at_unix,
-                status,
-                activity,
-                question,
-                session_id,
+                entry.key.clone(),
+                crate::hooks::store::LiveRun {
+                    worktree: &entry.cwd,
+                    kind: entry.kind_label,
+                    spawned_at_unix: entry.spawned_at_unix,
+                    status: entry.status,
+                    activity: entry.activity,
+                    question: entry.question,
+                    session_id: entry.session_id,
+                    title: entry.run_facts.title,
+                    turns: entry.run_facts.turns,
+                },
                 now,
             ) {
                 changed = true;
             }
-            touched.push(key);
+            touched.push(entry.key);
         }
 
         // Ownership is cumulative across the session: an agent the user has since closed stays
@@ -305,7 +328,7 @@ impl AdeApp {
     /// process-wide `crate::persisted_state_lock` mutex across two `fsync`s, and other persisted
     /// files' writers contend for that same lock. Running it inline would put a disk flush on the
     /// render thread.
-    fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.agent_status_path.clone() else {
             return;
         };

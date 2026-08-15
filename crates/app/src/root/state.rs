@@ -149,6 +149,14 @@ impl AdeApp {
             .as_deref()
             .map(crate::hooks::store::AgentStatusState::load_at)
             .unwrap_or_default();
+        // GitHub issue #227's per-run transcripts sit in a directory beside that file, and
+        // resolve the same way. Nothing is read here: a transcript is read once, when its own tab
+        // is opened (`crate::run_history::flow::AdeApp::load_run_transcript`), because reading
+        // every stored run's output at startup would be megabytes of disk for a surface the user
+        // may never visit.
+        let run_transcript_dir = settings_path
+            .as_deref()
+            .map(crate::run_history::transcript_store::transcript_dir_for);
 
         // GitHub issue #284's per-agent line provenance resolves the same way. Unlike the two
         // above it is genuinely read back at startup - `restore_line_provenance`, called once
@@ -391,6 +399,20 @@ impl AdeApp {
             review_tab_active: false,
             review_focus_handle: cx.focus_handle(),
             review_focus: OverlayFocus::default(),
+            history_scope: crate::run_history::model::HistoryScope::default(),
+            history_collapsed: HashMap::new(),
+            run_drift: HashMap::new(),
+            run_drift_in_flight: false,
+            run_tab_by_worktree: HashMap::new(),
+            run_tab_active: false,
+            run_tab_focus_handle: cx.focus_handle(),
+            run_tab_focus: OverlayFocus::default(),
+            run_tab_scroll_handle: gpui::ScrollHandle::new(),
+            run_transcripts: HashMap::new(),
+            run_transcript_dir,
+            _run_transcript_load_tasks: HashMap::new(),
+            _run_finish_tasks: HashMap::new(),
+            _run_drift_task: None,
             review_scroll_handle: UniformListScrollHandle::new(),
             review_highlight_cache: None,
             _review_baseline_tasks: HashMap::new(),
@@ -1652,6 +1674,14 @@ impl AdeApp {
         // before `self.selected` moves below, while `Self::current_worktree_path` still resolves to the
         // worktree being left.
         self.record_worktree_session(cx);
+        // GitHub issue #227: the run-transcript tab belongs to *one* worktree's strip
+        // (`Self::run_tab_by_worktree`), so a switch away from that worktree must leave the
+        // surface - not merely stop mattering. Without this, `run_tab_active` survived the switch
+        // while `Self::open_run_key` started resolving against the worktree switched *to*, so the
+        // centre pane painted the other checkout's run, or "this run is no longer in the history"
+        // for a worktree that simply has no run tab. The tab itself is untouched: it is still in
+        // its own worktree's strip, one switch back.
+        self.leave_run_tab(window, cx);
         self.selected = Some(index);
         // A real, explicit user selection supersedes any stale "fell back to main" notice a
         // previous refresh may have left up - see `Self::worktree_selection_notice`'s own docs.

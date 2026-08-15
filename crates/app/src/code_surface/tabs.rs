@@ -229,6 +229,10 @@ impl AdeApp {
         // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
         // discipline and, in exactly this way, did not.
         self.leave_review_tab(window, cx);
+        // GitHub issue #227: the run-transcript tab occupies the centre pane exactly as the
+        // graph and review tabs do, so it needs the identical teardown - see
+        // `crate::run_history::tab::AdeApp::leave_run_tab`.
+        self.leave_run_tab(window, cx);
 
         if focus_editor {
             self.focus_code_surface(window, cx);
@@ -409,6 +413,10 @@ impl AdeApp {
         // by an adversarial audit; the review surface's own docs claimed to copy the graph tab's
         // discipline and, in exactly this way, did not.
         self.leave_review_tab(window, cx);
+        // GitHub issue #227: the run-transcript tab occupies the centre pane exactly as the
+        // graph and review tabs do, so it needs the identical teardown - see
+        // `crate::run_history::tab::AdeApp::leave_run_tab`.
+        self.leave_run_tab(window, cx);
 
         self.focus_code_surface(window, cx);
         let has_diff = self

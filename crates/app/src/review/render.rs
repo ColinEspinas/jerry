@@ -51,6 +51,10 @@ impl AdeApp {
         // dangling in the bugs `leave_graph_tab` documents.
         self.leave_graph_tab(window, cx);
         self.graph_tab_open = false;
+        // GitHub issue #227: the run-transcript tab occupies the centre pane exactly as the
+        // graph and review tabs do, so it needs the identical teardown - see
+        // `crate::run_history::tab::AdeApp::leave_run_tab`.
+        self.leave_run_tab(window, cx);
 
         let was_active = self.review_tab_active && self.review_tab_open == Some(id);
         self.review_tab_open = Some(id);

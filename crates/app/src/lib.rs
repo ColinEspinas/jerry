@@ -37,6 +37,11 @@ pub mod review;
 // different persisted state.
 pub mod review_notes;
 pub mod root;
+// GitHub issue #227: agent history - the sidebar's repo -> worktree -> run index and the
+// run-transcript centre tab. Its own folder rather than a file inside `hooks` (which owns the
+// *capture* of what a run was) or inside `rail` (which owns the live tree): this is a surface
+// with its own model, its own persistence and its own tab kind.
+pub mod run_history;
 pub mod settings;
 pub mod sidebar;
 pub mod sound;

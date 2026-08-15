@@ -1550,6 +1550,17 @@ impl TerminalPane {
             .collect()
     }
 
+    /// Everything this pane's process has really printed that the emulator still holds, capped to
+    /// the last `max_lines` - see [`crate::terminal::grid::TerminalGrid::retained_text_lines`].
+    ///
+    /// GitHub issue #227's transcript capture reads this once, at the moment a run ends
+    /// (`crate::run_history::flow::AdeApp::capture_run_transcript`), because that is the last
+    /// moment the run's own output exists anywhere: `Agents::close` shuts the pane down and drops
+    /// the grid with it.
+    pub fn retained_text_lines(&self, max_lines: usize) -> Vec<String> {
+        self.grid.retained_text_lines(max_lines)
+    }
+
     fn spawn_process(&mut self, cx: &mut Context<Self>) {
         let spec = self.spec.clone();
         let program_for_error = spec.program.clone();

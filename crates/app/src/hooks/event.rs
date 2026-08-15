@@ -70,6 +70,15 @@ pub const ACTIVITY_MAX_CHARS: usize = 80;
 /// npm test"), where an activity line is a label.
 pub const QUESTION_MAX_CHARS: usize = 200;
 
+/// Longest [`HookReport::prompt`] Jerry will keep - GitHub issue #227's run title.
+///
+/// Narrower than [`QUESTION_MAX_CHARS`] and wider than [`ACTIVITY_MAX_CHARS`], because this is a
+/// *title*: `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3's history row shows it
+/// on one truncated line ("Reproduce the refresh race in a test"), and the transcript tab header
+/// shows the same string. A user's first message can be a page long; the first sentence of it is
+/// what names the run.
+pub const PROMPT_MAX_CHARS: usize = 120;
+
 /// The largest hook payload Jerry will parse at all. Claude Code payloads are small - the real
 /// ones captured were a few hundred bytes - but `tool_input.content` on a `Write` carries an
 /// entire file, and `tool_output` an entire command's output, so the honest upper bound is "as
@@ -244,6 +253,19 @@ pub struct HookReport {
     /// nothing), and a second parse of the same JSON for a second consumer is how two readers of
     /// one payload start disagreeing about what it said.
     pub edit: Option<EditedFile>,
+    /// The literal text the human typed, off a `UserPromptSubmit` payload's own `prompt` field,
+    /// truncated to [`PROMPT_MAX_CHARS`] (GitHub issue #227). `None` for every other event.
+    ///
+    /// This is what gives a past run a real **title**. Before it, the only thing a history row
+    /// could name a run by was its worktree's directory name (which is the same for every run in
+    /// that checkout) or its last tool call (which describes a moment, not a task). The task the
+    /// user actually asked for is a real, dated statement the user themselves made - the same
+    /// standard [`crate::hooks::store`]'s module docs set for everything else persisted here.
+    ///
+    /// Only the *first* prompt of a session becomes the title; see
+    /// [`crate::hooks::server::HookRecord::first_prompt`] for where that is decided and why it is
+    /// decided there rather than here.
+    pub prompt: Option<String>,
 }
 
 impl HookReport {
@@ -257,6 +279,7 @@ impl HookReport {
             question: None,
             session_id: None,
             edit: None,
+            prompt: None,
         }
     }
 }
@@ -409,7 +432,18 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
         .map(str::to_owned);
 
     let report = match event_name {
-        "SessionStart" | "UserPromptSubmit" => Some(HookReport::bare(HookFact::Working)),
+        // Both mean "mid-turn, working". `UserPromptSubmit` additionally carries the real text
+        // the human typed, which is GitHub issue #227's run title - see
+        // [`HookReport::prompt`]. `SessionStart` carries no such field, so it stays bare.
+        "SessionStart" => Some(HookReport::bare(HookFact::Working)),
+
+        "UserPromptSubmit" => Some(HookReport {
+            prompt: value
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|prompt| truncated(prompt, PROMPT_MAX_CHARS)),
+            ..HookReport::bare(HookFact::Working)
+        }),
 
         "PreToolUse" | "PostToolUse" => {
             let tool = value.get("tool_name").and_then(serde_json::Value::as_str)?;
@@ -429,6 +463,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 question: None,
                 session_id: None,
                 edit: edited_file(tool, &value, phase),
+                prompt: None,
             })
         }
 
@@ -447,6 +482,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .and_then(|error| truncated(error, QUESTION_MAX_CHARS)),
                 session_id: None,
                 edit: None,
+                prompt: None,
             })
         }
 
@@ -471,6 +507,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     question: truncated(asked, QUESTION_MAX_CHARS),
                     session_id: None,
                     edit: None,
+                    prompt: None,
                 });
             }
             let argument = tool_input.and_then(tool_input_preview);
@@ -488,6 +525,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 question,
                 session_id: None,
                 edit: None,
+                prompt: None,
             })
         }
 
@@ -514,6 +552,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                     .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
                 session_id: None,
                 edit: None,
+                prompt: None,
             })
         }
 
@@ -529,6 +568,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
                 .and_then(|message| truncated(message, QUESTION_MAX_CHARS)),
             session_id: None,
             edit: None,
+            prompt: None,
         }),
 
         _ => None,
