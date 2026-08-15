@@ -603,9 +603,9 @@ impl AdeApp {
     /// [`Self::request_close_file_tab`]'s dirty-tab confirm-arm gate. GitHub issue #26 briefly
     /// routed this button through that gate too, but never gave it a matching visible "close
     /// without saving?" cue the way `crate::work_surface::render`'s tab-strip `×` has
-    /// (`Self::close_tab_confirm_armed`'s own docs) - that issue's own `BUILD-LOG.md` entry lists
-    /// "the global `Ctrl+W` binding, the tab strip's own `×`, and middle-click" as the real
-    /// affordances sharing the gate, and doesn't mention this one, and its own verification was
+    /// (`Self::close_tab_confirm_armed`'s own docs) - "the global `Ctrl+W` binding, the tab
+    /// strip's own `×`, and middle-click" are the real affordances sharing the gate; this one
+    /// isn't among them, and its own verification was
     /// scoped to `code_surface::`/`settings::`/`keymap*` tests, which never included
     /// `root::focus::text_undo_scoping_tests` - so a dirty file's first click here silently armed
     /// an invisible confirm state with zero on-screen feedback, unnoticed. Per

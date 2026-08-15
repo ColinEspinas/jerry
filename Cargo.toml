@@ -29,7 +29,7 @@ dbg_macro = "warn"
 
 [workspace.dependencies]
 # Pinned to the exact zed-industries/zed commit this workspace was built and verified
-# against (see BUILD-LOG.md). Bump only deliberately, together with re-running the full
+# against. Bump only deliberately, together with re-running the full
 # test/build/clippy suite - GPUI's API surface is not stable across arbitrary upstream
 # commits.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }

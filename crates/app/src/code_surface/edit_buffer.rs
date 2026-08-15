@@ -145,9 +145,9 @@
 //! (averaged over 10 runs). That's nowhere near the ~5-8ms/frame budget needed for typing to not
 //! visibly lag at 60fps - re-running this on every keystroke for a file that size would make the
 //! whole app stutter on every character typed, the exact "expensive recomputation on every
-//! render/keystroke" bug class this project has hit and fixed repeatedly (see BUILD-LOG.md's
-//! Revision R9a, which independently measured a *different* code path - per-hunk Diff/Merge
-//! highlighting - at up to ~80ms on the same file and added a 300-line cap for it).
+//! render/keystroke" bug class this project has hit and fixed repeatedly - a separate,
+//! independent measurement of a *different* code path (per-hunk Diff/Merge highlighting) found
+//! up to ~80ms on the same file and added a 300-line cap for it there too.
 //!
 //! So [`EditBuffer::replace_range`]/[`EditBuffer::replace_and_mark_range`] (every real edit -
 //! typing, paste, Backspace/Delete/Enter all reduce to one of these two) never call a highlighter

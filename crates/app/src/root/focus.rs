@@ -3,7 +3,7 @@
 //! real focus onto its handle on open, and must restore focus through [`OverlayFocus`]/
 //! [`restore_focus`] on close - see those types' docs in `root::mod` for the dangling-focus
 //! invariant this file exists to satisfy. This project has hit "close forgot to restore" bugs
-//! repeatedly (BUILD-LOG.md); the fix each time was routing through that shared mechanism
+//! repeatedly; the fix each time was routing through that shared mechanism
 //! rather than hand-rolling capture/restore again, so any new overlay added here should do the
 //! same instead of re-deriving it.
 

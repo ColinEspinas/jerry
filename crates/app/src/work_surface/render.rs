@@ -2442,8 +2442,8 @@ impl AdeApp {
     /// for a pane that spends no provider, which a `Shell` never can - a second, narrower reason
     /// this whole strip is agent-only.
     ///
-    /// No `JERRY` wordmark (deliberate deviation from the design mockup, per direct user request -
-    /// see this crate's `lib.rs`/`BUILD-LOG.md` for context, not a bug fix).
+    /// No `JERRY` wordmark (deliberate deviation from the design mockup, per direct user request,
+    /// not a bug fix).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
         agent: &Agent,

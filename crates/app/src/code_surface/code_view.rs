@@ -6397,9 +6397,9 @@ mod tests {
 
 /// GitHub issue: syntax theme redesign - the real fixture corpus.
 ///
-/// This module is the honest substitute for "before/after screenshots of each fixture". This
-/// environment *can* screenshot the running app (see `BUILD-LOG.md`), but it has no scripted way
-/// to open a chosen file in the editor, so per-fixture screenshots are not automatable. What is
+/// This module is the honest substitute for "before/after screenshots of each fixture". The
+/// `verify` skill (`.claude/skills/verify/`) can screenshot the running app, but has no scripted
+/// way to open a chosen file in the editor, so per-fixture screenshots are not automatable. What is
 /// automatable, and is arguably better evidence, is a dump of exactly what the pipeline classifies
 /// each byte as and exactly what colour that resolves to - which is the thing a screenshot would
 /// have been inspected *for*, minus the eyes.

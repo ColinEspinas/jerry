@@ -1,15 +1,22 @@
 # Screenshots
 
 Real captures of the running app, taken with per-window `XGetImage` against the app's own X11
-toplevel. See `BUILD-LOG.md`'s screenshot correction for the recipe and for what does *not* work
-(root-window capture returns black; `weston_screenshooter` is permission-denied; GPUI's
-`render_to_image` has no Linux implementation).
+toplevel — driven with `python-xlib` XTEST (`warp_pointer`/`fake_input`) into the window's own
+root-relative origin. What doesn't work: root-window capture returns black,
+`weston_screenshooter` is permission-denied, and GPUI's `render_to_image` has no Linux
+implementation.
+
+This is a Linux/X11-specific recipe and not reproducible on macOS. `.claude/skills/verify/`
+covers the macOS equivalent (`screencapture`/`osascript`-based) — a different mechanism, so don't
+treat a difference between a new macOS capture and one of these old X11 ones as a rendering
+regression without first checking whether it's platform text rendering (font hinting, subpixel
+AA) rather than an actual bug.
 
 | file | theme | what it shows |
 |---|---|---|
 | `jerry-dark-rust.png` | Jerry Dark | A real Rust file (`crates/lsp-core/src/proc.rs`, lines 136-170) under the **final** palette. Keywords (`mod`, `use`, `let`, `mut`, `fn`, `for`) in **purple**, method calls (`.arg`, `.stdin`, `.spawn`, `.expect`) and `collect_descendant_pids` in **blue**, the function *definition* name in **violet-blue**, types (`Command`, `Stdio`, `Duration`, `Signal`) in **gold**, locals (`child`, `descendants`, `sh_pid`, `pid`) in **rose**, strings in green, `200`/`SIGKILL` in orange, `#[cfg(all(test, unix))]` in **teal**, brackets on the depth ring at the punctuation lightness. |
 | `jerry-dark-rust-doc-comments.png` | Jerry Dark | **Predates the final palette** — kept only as the "before" side of the §2b evidence below. A screenful of `///` doc comments at the brighter `comment_doc` tone. Its screaming-case constants render in `syntax.type`'s cyan, which is the misclassification `RUST_CONSTANT_SUPPLEMENT` fixes; this README used to describe them as "amber", which was simply wrong. |
-| `jerry-dark-markdown.png` | Jerry Dark | Markdown prose under the **final** palette — this file's own `THEME.md`, so it doubles as a check that the spec and the render agree. Headings in **gold**, inline code in green, bold at the brighter neutral. The fenced block visible is **untagged**, so it shows no language injection — per-fence injection is covered by `fixture_corpus_tests`. |
+| `jerry-dark-markdown.png` | Jerry Dark | Markdown prose under the **final** palette — this repo's own `docs/theme-palette-design.md`, so it doubles as a check that the spec and the render agree. Headings in **gold**, inline code in green, bold at the brighter neutral. The fenced block visible is **untagged**, so it shows no language injection — per-fence injection is covered by `fixture_corpus_tests`. |
 | `paper-chrome.png` | Paper | The light theme's chrome. **No editor tab is open in this one** — it does not show syntax colours. |
 | `completions-popup-top.png` | Jerry Dark | The Completions popup (GitHub issue #185) against a **real, live rust-analyzer** response — `Ctrl+Space` at `s.` where `s: String`, so the list is every real method on `String`, well over a hundred items. Twelve rows visible (`MAX_VISIBLE_COMPLETION_ROWS`), the overlay scrollbar's thumb parked at the top, real signatures in the right-hand detail column of each row. |
 | `completions-popup-scrolled.png` | Jerry Dark | The same popup after 30 real `Down` keystrokes. A completely different set of rows, `replace_range` selected on the bottom row, and the thumb moved down the track — item 30 was **permanently unreachable** before this fix, which hard-capped rendering at 12 items with no scroll mechanism at all. |
@@ -69,9 +76,9 @@ pixels changed**, dominated by `#acb2bc -> #de99be` (231 instances), with **zero
 
 That first diff is also what caught the underlying bug: an earlier attempt at the same palette
 change produced **zero** changed pixels, which is how `tree-sitter-rust`'s missing blanket
-`(identifier) @variable` rule was found. See `THEME.md` §2.
+`(identifier) @variable` rule was found. See `docs/theme-palette-design.md` §2.
 
-Sampling the *committed* screenshots directly is also how `THEME.md` §2b's Rust-constant
+Sampling the *committed* screenshots directly is also how `docs/theme-palette-design.md` §2b's Rust-constant
 misclassification was confirmed rather than inferred: `WRITE_TIMEOUT` in
 `jerry-dark-rust-doc-comments.png` measures `#5ec4c4`, which was `syntax.type`, not
 `syntax.constant`.

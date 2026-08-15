@@ -1,4 +1,9 @@
-# THEME.md — Jerry's syntax palette
+# Jerry's syntax palette
+
+Design rationale for the ~270 syntax-highlighting color tokens in `crates/app/src/theme.rs`. For
+the theme *file format* and how to author/import/generate a whole theme (not just syntax colors),
+see [`themes.md`](./themes.md) instead — that's the user-facing guide; this is the design record
+for why the syntax tier specifically looks the way it does.
 
 The full specification of Jerry Dark's syntax palette: every colour in OKLCH, its role, and its
 measured WCAG contrast against the editor background.

@@ -779,7 +779,7 @@ impl CfgFormat {
 /// `$HOME`-relative settings path resolution - Unix-only for now (`std::env::var_os("HOME")`,
 /// no `dirs` crate dependency). Returns `None` if `$HOME` isn't set - callers fall back to an
 /// unpersisted, in-memory [`Settings::default`] rather than panicking or guessing a path.
-/// Windows/macOS home-directory resolution is out of scope for now (see `BUILD-LOG.md`).
+/// Windows/macOS home-directory resolution is out of scope for now.
 pub fn settings_toml_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(

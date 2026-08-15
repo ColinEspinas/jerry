@@ -2134,7 +2134,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
         // rather than as a window-level capture, so this naturally
         // only extends the selection while the pointer is actually over *some* row - dragging
         // past the very top/bottom of the visible rows (auto-scroll) is a real, documented gap,
-        // not built this phase - see `BUILD-LOG.md`.
+        // not built this phase.
         .on_mouse_move(
             cx.listener(move |this, event: &gpui::MouseMoveEvent, _window, cx| {
                 if !event.dragging() {

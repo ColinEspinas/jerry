@@ -5306,9 +5306,9 @@ mod syntax_color_math {
 
     /// CIE-Lab, the space this crate's *distinctness* checks are stated in. Deliberately kept
     /// alongside the OKLCH maths rather than replaced by it: the ΔE figures recorded in this
-    /// module's docs and in THEME.md are Lab ΔE, the familiar "~2.3 is a just-noticeable
-    /// difference" scale, and restating them in OKLab units would make every historical number in
-    /// those docs unreadable against the new ones.
+    /// module's docs and in `docs/theme-palette-design.md` are Lab ΔE, the familiar "~2.3 is a
+    /// just-noticeable difference" scale, and restating them in OKLab units would make every
+    /// historical number in those docs unreadable against the new ones.
     pub(super) fn lab(color: Rgba) -> (f32, f32, f32) {
         fn linear(component: f32) -> f32 {
             if component <= 0.04045 {
