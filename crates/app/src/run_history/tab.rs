@@ -45,6 +45,18 @@ impl AdeApp {
     ///
     /// The single real door: the History view's row click is the only caller, and re-clicking the
     /// row that is already open simply re-activates the tab.
+    ///
+    /// **Selects `worktree` first.** The `all` scope lists every checkout's runs
+    /// (`REVISION-2026-08-14.md` §6), so the row you click is very often *not* in the worktree you
+    /// are standing in - and this tab lives in that run's own worktree's strip. Without the
+    /// switch, the tab was filed under a worktree whose strip was not on screen: nothing appeared
+    /// in the tab strip at all and the centre pane read "this run is no longer in the history",
+    /// because `Self::open_run_key` resolves against the *selected* worktree. Found by a real
+    /// screenshot of the running app, not by a test.
+    ///
+    /// Selecting the run's checkout is also what §3's resume story already assumes - "scoping
+    /// history to a worktree means the checkout is always present" - so the footer's `Resume here`
+    /// acts on the worktree you are now looking at.
     pub(crate) fn open_run_tab(
         &mut self,
         worktree: PathBuf,
@@ -59,6 +71,12 @@ impl AdeApp {
         }
         if self.palette_open {
             self.close_palette(window, cx);
+        }
+        // Before anything below sets `run_tab_active`: `select_worktree` itself leaves the run tab
+        // (a run tab belongs to the worktree being left), so doing this after would immediately
+        // undo it.
+        if self.current_worktree_path().as_deref() != Some(worktree.as_path()) {
+            self.select_worktree_by_path(&worktree, window, cx);
         }
         // Every other centre surface must be *left*, not merely stopped being drawn - see this
         // module's docs, and `crate::review::render::AdeApp::leave_review_tab`'s own.

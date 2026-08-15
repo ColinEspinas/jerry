@@ -668,8 +668,8 @@ fn synthesised_body(run: &PastAgent, branch: Option<&str>) -> Vec<TranscriptLine
         let turns = plural::count(run.turns as usize, "turn", None);
         lines.push(TranscriptLine::new(
             match branch {
-                Some(branch) => format!("  \u{23bf} {turns} in {branch}"),
-                None => format!("  \u{23bf} {turns}"),
+                Some(branch) => format!("  \u{2514} {turns} in {branch}"),
+                None => format!("  \u{2514} {turns}"),
             },
             LineTone::Detail,
         ));
@@ -677,7 +677,7 @@ fn synthesised_body(run: &PastAgent, branch: Option<&str>) -> Vec<TranscriptLine
     if let Some(diffstat) = run.diffstat {
         lines.push(TranscriptLine::new(
             format!(
-                "  \u{23bf} touched {}",
+                "  \u{2514} touched {}",
                 plural::count(diffstat.files as usize, "file", None)
             ),
             LineTone::Detail,
@@ -685,12 +685,12 @@ fn synthesised_body(run: &PastAgent, branch: Option<&str>) -> Vec<TranscriptLine
     }
     if let Some(activity) = &run.activity {
         lines.push(TranscriptLine::new(
-            format!("  \u{23bf} last: {activity}"),
+            format!("  \u{2514} last: {activity}"),
             LineTone::Detail,
         ));
     }
     lines.push(TranscriptLine::new(
-        "  \u{23bf} no transcript was captured for this run",
+        "  \u{2514} no transcript was captured for this run",
         LineTone::Detail,
     ));
     lines
@@ -698,6 +698,14 @@ fn synthesised_body(run: &PastAgent, branch: Option<&str>) -> Vec<TranscriptLine
 
 /// The two closing lines every transcript ends on - §3's
 /// `● Finished. 2 files changed, +41 −0.` and `⎿ run ended today 09:41 after 6m`.
+///
+/// **The detail glyph is `└` (U+2514), not the design's `⎿` (U+23BF).** U+23BF is Claude Code's
+/// own tree mark, and this app's bundled `IBM Plex Mono` has no glyph for it - nor does anything
+/// in the fallback chain on the platforms checked, so it rendered as a tofu box in the real
+/// window (caught by a screenshot, not by a test: a `String` comparison cannot see a missing
+/// glyph). U+2514 is the same mark from the box-drawing block, is really in the bundled font, and
+/// is what `●`/`❯` are already relying on the renderer for. Substituting a character the design
+/// meant *to be seen* is honouring it, not departing from it.
 ///
 /// This is the "one signal that this is a recording" that actually carries the meaning: the pane's
 /// 70% opacity says it is not live, and these say what happened and when it stopped. A transcript
@@ -721,11 +729,11 @@ pub fn closing_lines(run: &PastAgent, now_unix: i64) -> Vec<TranscriptLine> {
     let finished_at = run_finished_at(run);
     let when = run_when(finished_at, now_unix);
     let tail = match (run.ended_at_unix, run_duration(run)) {
-        (Some(_), Some(duration)) => format!("  \u{23bf} run ended {when} after {duration}"),
-        (Some(_), None) => format!("  \u{23bf} run ended {when}"),
+        (Some(_), Some(duration)) => format!("  \u{2514} run ended {when} after {duration}"),
+        (Some(_), None) => format!("  \u{2514} run ended {when}"),
         // No recorded ending at all: say what is actually known - when Jerry last heard from it -
         // rather than calling that moment the end of the run.
-        (None, _) => format!("  \u{23bf} last seen {when}"),
+        (None, _) => format!("  \u{2514} last seen {when}"),
     };
 
     vec![
@@ -1157,7 +1165,7 @@ mod tests {
         );
         assert_eq!(
             body[body.len() - 1].text,
-            "  \u{23bf} run ended today 22:19 after 6m"
+            "  \u{2514} run ended today 22:19 after 6m"
         );
     }
 
@@ -1184,9 +1192,9 @@ mod tests {
             "\u{276f} claude --resume 3d91e07 \u{b7} feat/query-builder"
         );
         assert!(text.contains(&"\u{25cf} Move the select builder behind a trait"));
-        assert!(text.contains(&"  \u{23bf} 21 turns in feat/query-builder"));
-        assert!(text.contains(&"  \u{23bf} touched 6 files"));
-        assert!(text.contains(&"  \u{23bf} no transcript was captured for this run"));
+        assert!(text.contains(&"  \u{2514} 21 turns in feat/query-builder"));
+        assert!(text.contains(&"  \u{2514} touched 6 files"));
+        assert!(text.contains(&"  \u{2514} no transcript was captured for this run"));
         assert_eq!(
             text[text.len() - 2],
             "\u{25cf} Finished. 6 files changed, +148 \u{2212}96."
@@ -1200,7 +1208,7 @@ mod tests {
         past.updated_at_unix = 1_700_000_500;
         let lines = closing_lines(&past, 1_700_000_600);
         assert_eq!(lines[0].text, "\u{25cf} Left unfinished.");
-        assert_eq!(lines[1].text, "  \u{23bf} last seen today 22:21");
+        assert_eq!(lines[1].text, "  \u{2514} last seen today 22:21");
     }
 
     #[test]

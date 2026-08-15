@@ -692,6 +692,104 @@ mod history_surface_tests {
         );
     }
 
+    /// The `all` scope lists every checkout's runs, so a row click very often names a worktree
+    /// you are not standing in - and the tab it opens lives in *that* worktree's strip. Opening
+    /// one must therefore select its checkout, or the tab is filed somewhere nothing is drawing.
+    ///
+    /// A real regression test: before the fix, this rendered an empty tab strip and a centre pane
+    /// reading "this run is no longer in the history", because `open_run_key` resolves against the
+    /// selected worktree. Caught by a screenshot of the running app.
+    #[gpui::test]
+    fn opening_another_checkouts_run_selects_that_checkout(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let wt = TempDir::new().expect("tempdir wt");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            cx.notify();
+            app.worktrees.push(crate::rail::worktrees::WorktreeItem {
+                path: wt.path().to_path_buf(),
+                label: "feature-a".to_string(),
+                branch: Some("feature-a".to_string()),
+                is_main: false,
+                is_bare: false,
+                is_detached: false,
+                short_sha: None,
+                is_locked: false,
+                lock_reason: None,
+                is_broken: false,
+                broken_reason: None,
+                error: None,
+            });
+        });
+        let key = record_finished_run(&app, cx, wt.path(), 1_700_000_000, "in another checkout");
+        assert_ne!(
+            app.read_with(cx, |app, _| app.current_worktree_path()),
+            Some(wt.path().to_path_buf()),
+            "premise: the window is standing somewhere else"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(wt.path().to_path_buf(), key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.current_worktree_path()),
+            Some(wt.path().to_path_buf()),
+            "opening a run selects its own checkout"
+        );
+        assert_eq!(app.read_with(cx, |app, _| app.open_run_key()), Some(key));
+        assert!(app.read_with(cx, |app, _| app.run_tab_active));
+        assert!(
+            app.read_with(cx, |app, _| app.combined_tab_order())
+                .contains(&TabRef::Run),
+            "and the tab really lands in the strip that is now on screen"
+        );
+        assert!(cx.debug_bounds("run-view").is_some());
+    }
+
+    /// The other half of the same rule: switching worktrees *leaves* the run tab, so the centre
+    /// pane never keeps painting another checkout's recording - or, worse, a "no longer in the
+    /// history" note for a worktree that simply has no run tab of its own.
+    #[gpui::test]
+    fn switching_worktrees_leaves_the_run_tab_behind_in_its_own_strip(cx: &mut TestAppContext) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let key = record_finished_run(&app, cx, repo.path(), 1_700_000_000, "a run");
+        app.update_in(cx, |app, window, cx| {
+            app.open_run_tab(repo.path().to_path_buf(), key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.run_tab_active), "premise");
+
+        let index = app
+            .read_with(cx, |app, _| {
+                app.worktrees
+                    .iter()
+                    .position(|item| item.path == repo.path())
+            })
+            .expect("the main checkout is a worktree");
+        app.update_in(cx, |app, window, cx| {
+            app.select_worktree(index, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.run_tab_active),
+            "a worktree switch leaves the surface"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .run_tab_by_worktree
+                .get(repo.path())
+                .cloned()),
+            Some(key),
+            "but the tab itself is untouched - it is one switch back, in its own strip"
+        );
+    }
+
     /// §7's real cost, in this app's own terms: the run tab occupies the centre pane, so
     /// selecting an agent while it is showing must genuinely *leave* it - not merely stop drawing
     /// it while `Window::focus` still points at a handle nothing is tracking.

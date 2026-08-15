@@ -1674,6 +1674,14 @@ impl AdeApp {
         // before `self.selected` moves below, while `Self::current_worktree_path` still resolves to the
         // worktree being left.
         self.record_worktree_session(cx);
+        // GitHub issue #227: the run-transcript tab belongs to *one* worktree's strip
+        // (`Self::run_tab_by_worktree`), so a switch away from that worktree must leave the
+        // surface - not merely stop mattering. Without this, `run_tab_active` survived the switch
+        // while `Self::open_run_key` started resolving against the worktree switched *to*, so the
+        // centre pane painted the other checkout's run, or "this run is no longer in the history"
+        // for a worktree that simply has no run tab. The tab itself is untouched: it is still in
+        // its own worktree's strip, one switch back.
+        self.leave_run_tab(window, cx);
         self.selected = Some(index);
         // A real, explicit user selection supersedes any stale "fell back to main" notice a
         // previous refresh may have left up - see `Self::worktree_selection_notice`'s own docs.
