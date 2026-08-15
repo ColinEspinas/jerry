@@ -3016,11 +3016,19 @@ impl AdeApp {
                 .debug_selector(move || bar_selector)
                 .occlude()
                 .absolute()
-                .right(px(7.0))
-                // Straddling, not sitting on: the bar is 28px tall and hangs 11px above the row's
-                // own top edge, which is what makes it read as floating over the list instead of
-                // as one more thing inside the row (§4i's first cut sat flush inside and was
-                // rejected for exactly that).
+                // §4i right-aligns the bar (`right:7px` in the mock), but the mock's list has no
+                // overlay scrollbar to clear and this panel's does - so this takes the same
+                // shared clearance every other right-aligned thing in this scroller already
+                // takes (`scrollbar::CONTENT_CLEARANCE`'s own docs: "the one shared constant
+                // everywhere right-aligned content sits next to this scrollbar, instead of every
+                // call site repeating its own guess"). A literal 7 would put the discard button
+                // under the track, which is the exact collision GitHub issue #123 fixed once.
+                .right(px(scrollbar::CONTENT_CLEARANCE))
+                // Straddling, not sitting on: the bar is 30px tall (22px buttons + 3px padding
+                // + 1px border each side) and hangs 11px above the row's own top edge, which is
+                // what makes it read as floating over the list instead of as one more thing
+                // inside the row (§4i's first cut sat flush inside and was rejected for exactly
+                // that).
                 .top(px(-11.0))
                 .flex()
                 .items_center()
