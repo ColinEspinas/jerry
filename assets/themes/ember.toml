@@ -55,6 +55,7 @@ menu_row_hover             = "#181f21"
 menu_row_hover_destructive = "#26151c"
 tab_close_hover            = "#1d2325"  # A file tab's close-affordance hover fill
 lsp_popover_footer         = "#131718"
+runs_well                  = "#0f1214"  # The Changes panel's Runs section
 
 # The 1px rules that separate things - zone edges, card and popover outlines, and the
 # selected-row edge.
