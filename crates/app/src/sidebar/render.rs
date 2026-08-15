@@ -5774,6 +5774,50 @@ mod commit_composer_tests {
         );
     }
 
+    /// Live report: staging a file made the message box's caret "align right of the input, not
+    /// blinking" - GitHub issue #45's own failure mode, taken literally, the same live-loop proof
+    /// `rail::render::focusing_the_rail_filter_starts_the_real_shared_blink_loop` uses:
+    /// `commit_message_focus_handle` was built inside the `Self` literal in `root::state`, so it
+    /// could not join the constructor's first `AdeApp::wire_caret_blink` call (that one runs
+    /// before `this` exists) and needed to join the later, second call the way
+    /// `graph_state.branches_filter_focus_handle`/`new_file_focus_handle`/
+    /// `graph_state.branch_prompt_focus_handle` already do - it had been left out of both.
+    /// Left out, `caret_blink_visible` never toggles for this field: it stays frozen at whatever
+    /// it happened to be, which reads as "solid, not blinking" - and once a staged file's draft
+    /// makes the message non-empty, that frozen bar sits after the real text, i.e. "aligned right
+    /// of the input".
+    #[gpui::test]
+    fn focusing_the_commit_message_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+        // `on_focus`/`on_blur` only fire while GPUI considers the window itself "active" - see
+        // `focusing_the_rail_filter_starts_the_real_shared_blink_loop`'s own docs.
+        app.update_in(cx, |_app, window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.simulate_input("m");
+        assert!(
+            app.read_with(cx, |app, _| app.caret_blink_visible),
+            "a fresh focus must start solid/visible"
+        );
+
+        cx.background_executor.advance_clock(
+            crate::root::caret_blink::CARET_BLINK_INTERVAL + std::time::Duration::from_millis(50),
+        );
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.caret_blink_visible),
+            "focusing the commit message field must have started the real, live shared blink \
+             task - if `commit_message_focus_handle` were never wired into \
+             `AdeApp::wire_caret_blink`, no timer would be running at all and this flag would \
+             still be stuck solid"
+        );
+    }
+
     /// The edited message must be what a real commit actually writes, not just what the box
     /// displays - the whole point of wiring the field into `staged_commit_message` rather than a
     /// parallel piece of state the primary button never reads.

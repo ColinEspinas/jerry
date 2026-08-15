@@ -708,6 +708,13 @@ impl AdeApp {
                 // it joins this later call for the same reason `branches_filter_focus_handle`
                 // does - see this call's own docs just above.
                 &this.graph_state.branch_prompt_focus_handle,
+                // GitHub issue #285's commit-message field is a fourth: another real
+                // `text_history::TextField` input built inside this same `Self` literal, live-
+                // reported missing its blink exactly like the three above once did - focusing it
+                // left `caret_blink_visible` frozen at whatever it last was (never toggling, since
+                // no subscription ever called `start_caret_blink` for this handle), so the caret
+                // rendered as a permanently solid bar instead of blinking.
+                &this.commit_message_focus_handle,
             ],
             window,
             cx,
