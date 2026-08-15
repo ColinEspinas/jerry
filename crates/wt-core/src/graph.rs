@@ -1,10 +1,36 @@
 //! Read-only commit-graph data for the git graph tab (design handoff
 //! `design_handoff_jerry_ade/revision 2/CHANGELOG.md`, 2026-07-31 entry, "git graph (issue #1)").
 //!
-//! This module builds the data a graph *view* renders: a topologically-walked list of commits
-//! (via [`gix::Repository::rev_walk`]), each assigned to a lane so merges and branch points can
-//! be drawn as a real lane diagram, plus the real refs (branches/tags/`HEAD`) that point at each
-//! commit (via [`gix::Repository::references`]).
+//! This module builds the data a graph *view* renders: a topologically-walked list of commits,
+//! each assigned to a lane so merges and branch points can be drawn as a real lane diagram, plus
+//! the real refs (branches/tags/`HEAD`) that point at each commit (via
+//! [`gix::Repository::references`]).
+//!
+//! ## Walk order
+//!
+//! The walk is a real topological traversal ([`gix::traverse::commit::topo`], git's own
+//! incremental `--topo-order`/`--date-order` machinery) in
+//! [`Sorting::DateOrder`](gix::traverse::commit::topo::Sorting::DateOrder): commit-time order,
+//! except that **no parent is ever emitted before all of its children**. This module used to use
+//! a plain commit-time sort ([`gix::Repository::rev_walk`] with `Sorting::ByCommitTime`), and
+//! that was a real, user-visible bug ("on some screens the lines seem disconnected"): a pure
+//! time sort hands back a parent *before* one of its children whenever the two share a commit
+//! timestamp (the sort's priority queue breaks ties arbitrarily - and back-to-back commits,
+//! merge scripts and CI create same-second parent/child pairs routinely; this repository's own
+//! history has dozens) or whenever clocks genuinely skew across machines. [`layout_lanes`]
+//! honestly degrades on such input by omitting the affected parent edge (see its docs), so the
+//! affected commit painted as a floating dot - its connector to its own parent simply missing,
+//! on exactly the histories (and exactly the scroll regions) containing such a pair, while every
+//! other screen rendered fine. `git log --graph` implies `--topo-order` for precisely this
+//! reason; this walk now gives the lane layout the same guarantee. For histories whose time
+//! order already is topologically sound, `DateOrder` emits the identical sequence the old
+//! time-sorted walk did.
+//!
+//! The walk order is also a property of the *history*, not of the [`build_graph`] cap: a bigger
+//! `max_commits` reads further into the same deterministic sequence, which is what keeps
+//! `graph_walk_is_prefix_stable_across_caps` (the "load more" UX's foundation) true. A
+//! post-collection topological sort of the capped set - the obvious cheaper fix - would break
+//! exactly that property whenever an out-of-order pair straddles the cap.
 //!
 //! ## Scope
 //!
@@ -32,8 +58,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 
-use gix::revision::walk::Sorting;
-use gix::traverse::commit::simple::CommitTimeOrder;
+use gix::traverse::commit::topo;
+use gix::traverse::commit::Parents;
 use gix::ObjectId;
 
 use crate::diff::AheadBehind;
@@ -210,14 +236,31 @@ pub fn build_graph(
         return Ok(Graph::default());
     }
 
-    let mut platform = repo
-        .rev_walk(tips)
-        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+    // Deduplicate tips before seeding the walk. Several refs legitimately point at one commit
+    // (a branch plus its tag, or two branches parked on the same tip), and unlike the previous
+    // simple walk - whose `seen` set absorbed duplicates on discovery - the topological walk
+    // seeds its initial queue with one entry per tip id it is handed, so a duplicated tip would
+    // emit its commit as two rows.
+    let mut seen_tips = std::collections::HashSet::with_capacity(tips.len());
+    let tips: Vec<ObjectId> = tips
+        .into_iter()
+        .filter(|tip| seen_tips.insert(*tip))
+        .collect();
+
+    // A real topological walk in date order - see the module docs' "Walk order" section for why
+    // a plain commit-time sort here was a real rendering bug. The commit-graph file is a pure
+    // accelerator (it carries the generation numbers that keep the indegree pass incremental,
+    // exactly as in `git log --topo-order`); a repository without one - or with an unreadable
+    // one - still walks correctly from the object database, so its absence must not fail the
+    // build.
+    let mut builder = topo::Builder::from_iters(&repo.objects, tips, None::<Vec<ObjectId>>)
+        .sorting(topo::Sorting::DateOrder)
+        .with_commit_graph(repo.commit_graph_if_enabled().ok().flatten());
     if matches!(scope, GraphScope::Current) {
-        platform = platform.first_parent_only();
+        builder = builder.parents(Parents::First);
     }
-    let walk = platform
-        .all()
+    let walk = builder
+        .build()
         .map_err(|source| Error::RevWalk(Box::new(source)))?;
 
     let mut edges: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
@@ -229,10 +272,20 @@ pub fn build_graph(
             break;
         }
         let info = info.map_err(|source| Error::RevWalkIter(Box::new(source)))?;
-        let commit = info
-            .object()
+        let commit = repo
+            .find_commit(info.id)
             .map_err(|source| Error::RevWalkObject(Box::new(source)))?;
-        let parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
+        let mut parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
+        if matches!(scope, GraphScope::Current) {
+            // `Parents::First` restricts the *traversal* to first parents, but the topo walk
+            // still reports every parent on each emitted commit (its `collect_all_parents`
+            // deliberately ignores the flag). The simple walk this replaces reported only the
+            // first parent under `first_parent_only`, and `GraphScope::Current`'s rows depend on
+            // that shape: with all parents listed, `layout_lanes` Step 4 would open a lane for a
+            // merge's second parent that this scope's walk then never visits - a line running
+            // off the bottom of the graph forever. Keep the rows first-parent-shaped.
+            parent_ids.truncate(1);
+        }
         let refs = refs_by_commit.get(&info.id).cloned().unwrap_or_default();
         let node = commit_node(&info.id, &commit, refs)?;
         edges.push((info.id, parent_ids));
@@ -736,15 +789,19 @@ struct RowLayout {
 ///
 /// ## Out-of-order input
 ///
-/// This assumes the input is topologically sound - every commit appears before its parents. That
-/// holds for any real, well-formed history walked newest-first, *except* when two or more tips
-/// feeding the walk have commits with equal (or clock-skewed) timestamps, in which case a time
-/// sort can legitimately hand back a parent before one of its own children (this is a real,
-/// occasionally-observed `git log` phenomenon, not specific to this crate). Rather than
-/// corrupting the graph with a lane that's left permanently expecting a commit it will never see
-/// again, [`layout_lanes`] tracks which ids it has already emitted as a row and skips wiring a
-/// parent edge to one of them: the affected row's elbow (or lane continuation) is simply omitted
-/// for that one edge, a real but honestly-degraded rendering rather than a silently-wrong one.
+/// This assumes the input is topologically sound - every commit appears before its parents.
+/// [`build_graph`] now *guarantees* that: its walk is a real topological traversal (see the
+/// module docs' "Walk order" section), so a parent can never be handed back before one of its
+/// children. It was not always so - the previous plain time-sorted walk violated the assumption
+/// on tied or clock-skewed timestamps, and the degradation below was the user-visible
+/// "disconnected lines" bug.
+///
+/// The degradation handling stays as defense-in-depth for any input that violates the
+/// assumption anyway (a corrupt history, or a future walk regression): rather than corrupting
+/// the graph with a lane that's left permanently expecting a commit it will never see again,
+/// [`layout_lanes`] tracks which ids it has already emitted as a row and skips wiring a parent
+/// edge to one of them: the affected row's elbow (or lane continuation) is simply omitted for
+/// that one edge, a real but honestly-degraded rendering rather than a silently-wrong one.
 fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> Vec<RowLayout> {
     let mut lanes: Vec<Option<Id>> = Vec::new();
     let mut seen: std::collections::HashSet<Id> =
@@ -1641,10 +1698,10 @@ mod tests {
     fn build_graph_row_order_is_stable_even_with_tied_commit_timestamps() {
         // Regression test for a real failure mode found while building this module: with
         // multiple tips (here, `main` and the still-extant `feature` branch after a merge) fed
-        // into a single time-sorted walk, commits created back-to-back within the test process
-        // can share a timestamp, which can hand back a parent before one of its own children.
-        // `layout_lanes`'s out-of-order handling (see its own docs) must keep this from
-        // panicking or producing a lane that's left dangling forever.
+        // into the walk, commits created back-to-back within the test process can share a
+        // timestamp. The old time-sorted walk could then hand back a parent before one of its
+        // own children; the topological walk must instead keep the order sound (and
+        // `layout_lanes`'s defense-in-depth must keep even unsound input from panicking).
         let repo = init_repo();
         commit(repo.path(), "a.txt", "1", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
@@ -1681,8 +1738,10 @@ mod tests {
     /// elbows for each of them, since a re-laned prefix would visibly rewrite the graph above the
     /// user's viewport while they scrolled.
     ///
-    /// It holds because the walk is deterministic (same tips, same
-    /// `Sorting::ByCommitTime(NewestFirst)`) and `layout_lanes` is a single forward pass whose
+    /// It holds because the walk is deterministic *and its order is a property of the history,
+    /// not of the cap* (the topological walk's emission sequence never consults `max_commits`;
+    /// a bigger cap just reads further into the same sequence - see the module docs' "Walk
+    /// order" section) and `layout_lanes` is a single forward pass whose
     /// output for row `i` is a function of commits `0..=i` alone. This test pins it against a
     /// deliberately branchy history - a merge plus a still-extant side branch, so several lanes
     /// are genuinely live at the cap boundary - rather than a linear one, where every cap trivially
@@ -1726,6 +1785,163 @@ mod tests {
                 "cap {cap} must be an element-identical prefix of the uncapped walk - same \
                  commits, same lanes, same segments and elbows - or the graph tab's index-keyed \
                  selection/menu/scroll would land on a different commit after a load-more"
+            );
+        }
+    }
+
+    /// The structural soundness the whole lane renderer stands on, checked edge by edge: no
+    /// parent row ever above one of its children, every row's own lane continuing downward
+    /// exactly when the commit has a parent to continue to, and every extra parent of a merge
+    /// getting its own diverging elbow. The violation of these is precisely the reported "on
+    /// some screens the lines seem disconnected" bug - see the module docs' "Walk order"
+    /// section for how a time-sorted walk used to violate all three.
+    fn assert_every_parent_edge_is_drawn(graph: &Graph) {
+        let row_index_by_id: std::collections::HashMap<&str, usize> = graph
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.commit.id.as_str(), index))
+            .collect();
+        for (index, row) in graph.rows.iter().enumerate() {
+            for parent in &row.commit.parent_ids {
+                if let Some(&parent_index) = row_index_by_id.get(parent.as_str()) {
+                    assert!(
+                        parent_index > index,
+                        "row {index} ({:?}): its parent {parent} was emitted above it (row \
+                         {parent_index}) - the walk handed back a parent before its child",
+                        row.commit.subject,
+                    );
+                }
+            }
+            let own = row
+                .lane_segments
+                .iter()
+                .find(|segment| segment.lane == row.lane)
+                .unwrap_or_else(|| panic!("row {index} has no segment for its own lane"));
+            assert_eq!(
+                own.ends_here,
+                row.commit.parent_ids.is_empty(),
+                "row {index} ({:?}): its own lane must end exactly when the commit has no \
+                 parent at all - an `ends_here` stub on a commit that has one is a line \
+                 stopping dead above a parent it should reach, the reported disconnect",
+                row.commit.subject,
+            );
+            let diverging = row
+                .elbows
+                .iter()
+                .filter(|elbow| elbow.kind == ElbowKind::Diverging)
+                .count();
+            assert_eq!(
+                diverging,
+                row.commit.parent_ids.len().saturating_sub(1),
+                "row {index} ({:?}): every extra parent of a merge must get its own diverging \
+                 elbow - a dropped one paints a merge with a branch line silently missing",
+                row.commit.subject,
+            );
+        }
+    }
+
+    /// The reported bug itself ("we have a bug with the git graph lines render. On some screens
+    /// the lines seem disconnected"), reproduced via real clock skew: a branch whose commit is
+    /// timestamped *before* its own parent - skewed clocks across machines, or any imported or
+    /// re-dated history. The old time-sorted walk emitted the parent first, `layout_lanes`
+    /// dropped the child's parent edge (its documented out-of-order degradation), and the
+    /// branch painted as a floating fragment connected to nothing - on exactly the histories,
+    /// and exactly the scroll regions, containing such a pair. The topological walk must keep
+    /// every edge drawable instead.
+    #[test]
+    fn a_clock_skewed_branch_still_connects_to_its_parent() {
+        let repo = init_repo();
+        commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_300);
+        git(repo.path(), &["branch", "skewed"]);
+        commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_400);
+        commit_at(repo.path(), "a.txt", "3", "main 2", 1_700_000_500);
+        git(repo.path(), &["checkout", "skewed"]);
+        // Timestamped before its own parent ("base", t = ...300).
+        commit_at(repo.path(), "b.txt", "1", "skewed work", 1_700_000_200);
+        git(repo.path(), &["checkout", "main"]);
+
+        let graph = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
+        assert_eq!(graph.rows.len(), 4);
+        assert_every_parent_edge_is_drawn(&graph);
+
+        // And the connected shape, stated exactly: the skewed commit sits *above* its parent
+        // despite its older timestamp, on its own lane, and the parent's row carries the real
+        // converging elbow that joins that lane back onto the trunk's dot.
+        let subjects: Vec<&str> = graph
+            .rows
+            .iter()
+            .map(|row| row.commit.subject.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["main 2", "main 1", "skewed work", "base"]);
+        let skewed = &graph.rows[2];
+        let base = &graph.rows[3];
+        assert_ne!(skewed.lane, base.lane);
+        assert!(
+            base.elbows.iter().any(|elbow| {
+                elbow.kind == ElbowKind::Converging
+                    && elbow.from_lane == skewed.lane
+                    && elbow.to_lane == base.lane
+            }),
+            "the shared parent's row must join the skewed branch's lane onto its own dot with \
+             a real converging elbow, got {:?}",
+            base.elbows,
+        );
+    }
+
+    /// Same bug class via its far more common trigger: a parent and child sharing one commit
+    /// timestamp. Back-to-back commits, merge scripts and CI create same-second parent/child
+    /// pairs routinely (this repository's own history has dozens), and the old walk's priority
+    /// queue broke those ties arbitrarily - sometimes parent-first. Five commits and three tips
+    /// all in one second leave the walk nothing *but* ties to order by; every edge must still
+    /// come out drawable.
+    #[test]
+    fn same_second_parent_child_pairs_stay_topologically_ordered() {
+        let repo = init_repo();
+        let t = 1_700_000_000;
+        commit_at(repo.path(), "a.txt", "1", "base", t);
+        git(repo.path(), &["checkout", "-b", "side"]);
+        commit_at(repo.path(), "b.txt", "1", "side work", t);
+        git(repo.path(), &["checkout", "main"]);
+        commit_at(repo.path(), "a.txt", "2", "main work", t);
+        merge_at(repo.path(), "side", "merge side", t);
+        git(repo.path(), &["checkout", "-b", "late"]);
+        commit_at(repo.path(), "c.txt", "1", "late work", t);
+        git(repo.path(), &["checkout", "main"]);
+
+        let graph = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
+        assert_eq!(graph.rows.len(), 5);
+        assert_every_parent_edge_is_drawn(&graph);
+    }
+
+    /// [`graph_walk_is_prefix_stable_across_caps`]'s guarantee, re-pinned against the
+    /// adversarial history: with a skewed branch in play, the *cheap* fix for the disconnect
+    /// bug - topologically sorting the capped set after collection - yields a different prefix
+    /// once a bigger cap pulls in the skewed child (whose row must move above its
+    /// already-loaded parent), visibly rewriting the graph above the user's viewport on a
+    /// load-more. The walk-level fix must not: the emission order is a property of the history
+    /// alone, and a bigger cap only ever reads further into the same sequence.
+    #[test]
+    fn graph_walk_prefix_stays_stable_across_caps_on_a_skewed_history() {
+        let repo = init_repo();
+        commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_300);
+        git(repo.path(), &["branch", "skewed"]);
+        commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_400);
+        commit_at(repo.path(), "a.txt", "3", "main 2", 1_700_000_500);
+        git(repo.path(), &["checkout", "skewed"]);
+        commit_at(repo.path(), "b.txt", "1", "skewed work", 1_700_000_200);
+        git(repo.path(), &["checkout", "main"]);
+
+        let full = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
+        assert!(!full.truncated && full.rows.len() == 4);
+        for cap in 1..full.rows.len() {
+            let capped = build_graph(repo.path(), GraphScope::All, cap).expect("build_graph");
+            assert!(capped.truncated);
+            assert_eq!(
+                capped.rows,
+                full.rows[..cap],
+                "cap {cap} must stay an element-identical prefix of the uncapped walk even on \
+                 a history whose time order and topological order disagree"
             );
         }
     }
