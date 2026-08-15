@@ -28,6 +28,10 @@ cargo fmt --all -- --check
 Run them together as `/check` if you're working through Claude Code. None are optional or "mostly
 passing."
 
+See [`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
+from a GitHub issue to a merged PR in this repo, including which Claude Code skill covers which
+step if you're using it.
+
 ## Verifying GPUI / `alacritty_terminal` / `gix` API usage
 
 Never guess a GPUI, `alacritty_terminal`, or `gix` API signature. Before writing a call to one:

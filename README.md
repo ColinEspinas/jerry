@@ -130,12 +130,13 @@ cargo run --release -p app
 ```
 
 `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` must also
-pass — see [`CLAUDE.md`](CLAUDE.md) for the full set of standards and
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution process. If you use
-[Claude Code](https://claude.com/claude-code), this repo's `.claude/` directory (skills, agents,
-commands) is set up for it already — installing the [rtk](https://github.com/rtk-ai/rtk) CLI first
-and running `/setup` cuts token usage on command output noticeably; it's optional, not a build
-dependency.
+pass — see [`CLAUDE.md`](CLAUDE.md) for the full set of standards,
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution process, and
+[`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
+issue → PR in this repo. If you use [Claude Code](https://claude.com/claude-code), this repo's
+`.claude/` directory (skills, agents, commands) is set up for it already — installing the
+[rtk](https://github.com/rtk-ai/rtk) CLI first and running `/setup` cuts token usage on command
+output noticeably; it's optional, not a build dependency.
 
 ## Continuous integration
 

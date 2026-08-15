@@ -121,6 +121,10 @@ keep it. Fixtures live under a sibling `testdata/` directory, not inlined as str
 
 ## Workflow
 
+See [`docs/development-workflow.md`](docs/development-workflow.md) for how a change moves from a
+GitHub issue to a merged PR, and which skill (`plan`, `architecture`, `implement`,
+`rust-standards`, `verify`, `ship`, `review`, `triage`) covers which step.
+
 - Branches: `<type>/<issue>-<slug>` (e.g. `fix/336-text-input-selection`). One convention, matching
   the conventional-commit style already used for commit messages (`feat(app): ...`,
   `fix(pty-core): ...`).

@@ -1,6 +1,6 @@
 ---
 name: implement
-description: Build a scoped GitHub issue end to end - branch, TDD loop, the pre-commit gate, and a PR that links the issue. Use whenever the user says to implement, build, fix, or ship something that has an issue number, or says "go ahead and build it", "implement the plan we just wrote", "let's write the code for #331", or picks up work after plan has already scoped an approach. Don't hand-roll branch naming or the gate manually when this skill covers it - and don't skip straight here from a bare issue number without plan first if the issue hasn't been scoped yet.
+description: Build a scoped GitHub issue end to end - branch, TDD loop, and handing off to ship for the gate/commit/PR. Use whenever the user says to implement or build something that has an issue number, or says "go ahead and build it", "implement the plan we just wrote", "let's write the code for #331", or picks up work after plan has already scoped an approach. Don't hand-roll branch naming manually when this skill covers it - and don't skip straight here from a bare issue number without plan first if the issue hasn't been scoped yet. For finishing work that didn't start from an issue, use ship directly instead.
 ---
 
 # Implement
@@ -26,34 +26,20 @@ first. Implementing against an unscoped issue is how a fix ends up solving the w
    directory rather than inlined strings. Look at a neighboring test module in the same file or
    feature folder before inventing a new pattern.
 
-3. **Implement the minimum that makes the test pass**, respecting the architecture boundary in
-   `CLAUDE.md`: render code dispatches, it doesn't call `wt_core::`/`pty_core::`/`lsp_core::` or
-   shell out directly (that's the target — existing violations in the file you're touching aren't
-   yours to fix unless the issue is about them, but don't add new ones). No `unwrap()`/`expect()`
-   outside test code, no `unsafe` without a justified `SAFETY` comment and a local
-   `#[allow(unsafe_code)]`, `PathBuf` not `String` for paths, git as explicit argv never a shell
-   string, counts through `crates/app/src/root/plural.rs`.
+3. **If the fix's home isn't obvious** — which crate, whether it needs to be a Command/Query,
+   whether it belongs in the domain layer or the UI — use `architecture` before writing code, not
+   after. Most changes are obviously same-shape-as-a-neighboring-file and don't need this.
 
-4. **No fake functionality.** If a piece genuinely can't be built in this pass, say so visibly (a
-   real "not implemented" state, or `todo!("unverified: ...")` with a real explanation) — never a
-   plausible-looking stand-in bound to nothing.
+4. **Implement the minimum that makes the test pass**, then walk it against `rust-standards` before
+   considering the step done — that's the checklist for everything a green `clippy` run doesn't
+   prove (path types, git argv, `plural.rs`, no fake functionality, GPUI blocking-call offload, the
+   comment rule, no new `use super::*`).
 
-5. **Comments**: only a non-obvious *why*, per `CLAUDE.md`. Don't narrate design history or
-   alternatives-considered in the source — that belongs in the commit body or, for something
-   genuinely architectural, a new `docs/adr/000N-*.md`.
-
-6. **Run the gate before every commit**: `/check` (fmt + clippy `-D warnings` + the full test
-   suite). The `.claude/hooks/pre-commit-check.sh` hook only catches fmt/clippy automatically —
-   it does not run tests, so don't treat a clean commit as proof the suite passes.
-
-7. **Commit**, conventional style (`feat(app): ...`, `fix(pty-core): ...`), focused — the shape
-   the existing `git log` already models.
-
-8. **Open the PR** with `gh pr create`, body linking the issue (`Closes #<n>`). If `plan` posted an
-   approach comment, the PR description can be short — the issue already carries the reasoning.
-
-9. **If the change is UI-visible**, run `verify` before opening the PR — attach the capture it
-   produces to the PR description rather than describing the result in prose.
+5. **Finish with `ship`** — it runs the full gate (`/check`), commits, pushes, and opens the PR
+   (capturing `verify` first if the change is UI-visible, filling in
+   `.github/pull_request_template.md` for real rather than leaving it generic). Link the issue this
+   implementation started from; if `plan` posted an approach comment, the PR body can be short —
+   the issue already carries the reasoning.
 
 ## When the plan turns out wrong mid-implementation
 
