@@ -546,10 +546,32 @@ pub fn chip_authors_for(change_set: &super::change_set::ChangeSet) -> Vec<Author
 }
 
 fn drawable(authors: Vec<Author>) -> Vec<Author> {
-    authors
-        .into_iter()
-        .filter(|author| author_style(author).is_some())
-        .collect()
+    authors.into_iter().filter(is_drawable).collect()
+}
+
+/// Whether `author` is one this app can draw at all - [`author_style`]'s own `Some`/`None`
+/// question, answered without building the [`AuthorStyle`] (and its owned label) that a caller
+/// asking only "is there anything here?" would immediately throw away.
+///
+/// Kept next to [`author_style`] and deliberately phrased as the same `match`, so the two cannot
+/// disagree about which authors are drawable; the render tests exercise both.
+pub fn is_drawable(author: &Author) -> bool {
+    match author {
+        Author::Agent(key) => key.kind().is_some(),
+        Author::You => true,
+        Author::Unattributed => false,
+    }
+}
+
+/// Whether this row has anything to draw a chip for - the cheap form of `!chip_authors(..)
+/// .is_empty()`, for the per-frame gate that only needs the yes/no
+/// (`crate::sidebar::render::AdeApp::change_author_filter_live` walks every row of the change
+/// set on every frame).
+pub fn has_drawable_author(entry: &ChangeSetEntry) -> bool {
+    entry
+        .split()
+        .iter()
+        .any(|(author, stat)| !stat.is_empty() && is_drawable(author))
 }
 
 /// A stable, filesystem-safe fragment naming one author inside a `debug_selector` - the durable
@@ -676,6 +698,27 @@ mod tests {
             FILTER_DIM_OPACITY, 0.32,
             "the mock's own opacity, quoted as an acceptance criterion"
         );
+    }
+
+    /// The cheap predicate and the full style must answer the same question - it exists only to
+    /// skip building a label the caller throws away, and a divergence would mean a chip group
+    /// that reserves space for a chip it then cannot draw.
+    #[test]
+    fn the_cheap_drawable_check_agrees_with_the_full_style_for_every_author() {
+        for author in [
+            agent(AgentKind::Claude),
+            agent(AgentKind::Codex),
+            Author::Agent(AgentKey::new("utf8:/repo/wt-a|Opus|1700000000")),
+            Author::Agent(AgentKey::new("not-a-key")),
+            Author::You,
+            Author::Unattributed,
+        ] {
+            assert_eq!(
+                is_drawable(&author),
+                author_style(&author).is_some(),
+                "{author:?}"
+            );
+        }
     }
 
     /// The product decision of 2026-08-14, which `STAGE-A-CHANGELOG.md` §4g had left open: the

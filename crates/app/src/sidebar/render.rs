@@ -2923,7 +2923,10 @@ impl AdeApp {
             // and git's own answer (`git blame`), not this app's local, uncommitted-only record -
             // and the ring's filter would open a diff against a base these chips were never
             // measured over.
-            .when(stageable, |el| {
+            // `worktree_has_multiple_agents` is checked here as well as inside
+            // `render_author_chips`, so a single-agent worktree does not build one throwaway
+            // author `Vec` per row per frame for a group that is then never rendered.
+            .when(stageable && self.worktree_has_multiple_agents(), |el| {
                 el.children(self.render_author_chips(
                     "change-row",
                     &entry.path,
@@ -3291,7 +3294,7 @@ impl AdeApp {
                 .uncommitted_change_set
                 .entries()
                 .iter()
-                .any(|entry| !crate::provenance::render::chip_authors(entry).is_empty())
+                .any(crate::provenance::render::has_drawable_author)
     }
 
     /// §4i's own wording for a filename that **is** seen, verbatim, including the `V` it names as
