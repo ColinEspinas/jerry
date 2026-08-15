@@ -3382,7 +3382,7 @@ enum LaneJoin {
     ContinuesLane,
     /// This curve departs from (or arrives at) this row's own dot while `own_lane`'s own line runs
     /// straight through the very same rows. Painted one stroke to the side the elbow travels, so
-    /// the two 1px lines sit side by side instead of one silently erasing the other.
+    /// the two stroke-wide lines sit side by side instead of one silently erasing the other.
     LeavesDot,
 }
 
@@ -3402,10 +3402,10 @@ enum LaneJoin {
 /// **2. A border is painted *inside* the box's own bounds**, exactly like CSS
 /// `box-sizing: border-box`. The quad shader (`fs_quad` in `crates/gpui_wgpu/src/shaders.wgsl`)
 /// tests each pixel against `corner_to_point + border_widths`, measured *inward* from the bounds
-/// edge. For the 1px borders painted here that means:
+/// edge. For the [`ELBOW_STROKE`]-wide borders painted here that means:
 ///
-/// * `border_t`/`border_l` on an edge at `v` paint the pixel row/column `[v, v + 1)`;
-/// * `border_b`/`border_r` on an edge at `v` paint the pixel row/column `[v - 1, v)`.
+/// * `border_t`/`border_l` on an edge at `v` paint the pixel rows/columns `[v, v + stroke)`;
+/// * `border_b`/`border_r` on an edge at `v` paint the pixel rows/columns `[v - stroke, v)`.
 ///
 /// So two boxes whose *edges* meet at a shared coordinate paint their strokes on two **different,
 /// adjacent** pixels. Anchoring therefore has to be stated in terms of the *painted* stroke, never
@@ -3416,7 +3416,7 @@ struct CurveBox {
     top: Pixels,
     /// Not always `ELBOW_CURVE_SIZE`: a `HorizontalEdge::Bottom` curve is exactly one
     /// [`ELBOW_STROKE`] taller, so that its inside-painted bottom border lands *on* the waist row
-    /// instead of one row above it.
+    /// instead of one stroke above it.
     ///
     /// Growing the height (rather than moving the box) is what makes that correction safe: GPUI
     /// anchors the arc at the box's own corner, so on a `rounded_bl`/`rounded_br` box the extra
@@ -3453,9 +3453,10 @@ impl CurveBox {
             (VerticalEdge::Right, LaneJoin::ContinuesLane) => lane_x + ELBOW_STROKE - size,
             (VerticalEdge::Right, LaneJoin::LeavesDot) => lane_x - size,
         };
-        // A `Top` box needs no correction - its top border already paints the `waist_y` row, the
-        // same row the 1px-tall filled bridge occupies. A `Bottom` box's bottom border paints one
-        // row *above* its own bottom edge, so that edge has to sit one stroke past the waist.
+        // A `Top` box needs no correction - its top border already paints the `waist_y` stroke
+        // rows, the same rows the stroke-tall filled bridge occupies. A `Bottom` box's bottom
+        // border paints one stroke *above* its own bottom edge, so that edge has to sit one
+        // stroke past the waist.
         let (top, height) = match horizontal {
             HorizontalEdge::Top => (waist_y, size),
             HorizontalEdge::Bottom => (waist_y - size, size + ELBOW_STROKE),
@@ -3476,14 +3477,17 @@ impl CurveBox {
     }
 }
 
-/// The width of every stroke in the lane canvas: the plain lane segments' `w(px(1.0))`, the
-/// straight bridge's `h(px(1.0))`, and each curve box's `border_*_1()`. Named rather than left as a
-/// bare `px(1.0)` because [`CurveBox::anchored`]'s corrections are *exactly* one stroke width and
-/// only make sense in those terms. If the graph ever moves to thicker lines this must change with
-/// `border_*_1()` together, or every seam it closes reopens by `stroke - 1` px.
-const ELBOW_STROKE: Pixels = px(1.0);
+/// The width of every stroke in the lane canvas: the plain lane segments' `w(...)`, the straight
+/// bridge's `h(...)`, and each curve box's parametric `border_*(...)` widths - all four take this
+/// exact constant, so the painted widths and the geometry corrections stated in stroke terms
+/// ([`CurveBox::anchored`]'s offsets are *exactly* one stroke width) can never drift apart.
+///
+/// Aliases [`theme::graph::LINE_WIDTH`] (2px) rather than owning its own number: the width is a
+/// fractional-display-scale correctness choice shared with the rebase surface's fold elbow - see
+/// that constant's own docs for the full GPUI device-pixel-snapping story (GitHub issue #346).
+const ELBOW_STROKE: Pixels = theme::graph::LINE_WIDTH;
 
-/// A plain 1px-tall filled segment bridging the entry and exit curves.
+/// A plain [`ELBOW_STROKE`]-tall filled segment bridging the entry and exit curves.
 ///
 /// Always present, even between adjacent lanes where the two curves' own boxes already overlap, and
 /// always overlapping `ELBOW_RADIUS` into each - far enough to cover each curve's whole straight
@@ -3493,10 +3497,10 @@ const ELBOW_STROKE: Pixels = px(1.0);
 /// on the same physical pixel even when the coordinates agree exactly. Covering the straight run
 /// with the fill takes the border's own rendering out of that stretch entirely.
 ///
-/// `top` sits at the plain, unadjusted `waist_y`: a 1px-tall filled rect there occupies the row
-/// `[waist_y, waist_y + 1)`, which is exactly the row a `border_t` on a box starting at `waist_y`
-/// paints. It is the `border_b` curve that needs correcting, and it is corrected via its own height
-/// rather than by moving this bridge - see [`CurveBox::anchored`].
+/// `top` sits at the plain, unadjusted `waist_y`: a stroke-tall filled rect there occupies the
+/// rows `[waist_y, waist_y + stroke)`, which are exactly the rows a `border_t` on a box starting
+/// at `waist_y` paints. It is the `border_b` curve that needs correcting, and it is corrected via
+/// its own height rather than by moving this bridge - see [`CurveBox::anchored`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StraightSegment {
     left: Pixels,
@@ -3662,18 +3666,34 @@ fn elbow_paint_order(elbows: &[wt_core::graph::Elbow]) -> Vec<(usize, wt_core::g
 /// Pure and GPUI-element-free, like `elbow_geometry`/`elbow_color_lane`, so it is directly testable
 /// rather than only reachable through a real painted repo.
 ///
-/// A through-lane always runs the *full* row height, edge to edge. That is what lets an elbow's own
-/// straight lead-out be clipped at the row boundary (see `render_graph_lane_canvas`): the stretch
-/// the clip removes is exactly the stretch the neighbouring row's own segment starts at, so the
-/// line stays continuous while still being painted by exactly one element per lane per row. This
-/// used to inset the neighbour by an `ELBOW_OVERSHOOT` constant instead, because the elbow really
-/// did paint into the neighbouring row back then; clipping removes the overlap at its source, so
-/// there is nothing left to inset for.
+/// A segment whose line continues into the row below - a plain through-lane, or a `starts_here`
+/// stub whose line runs on down to the parent - **overshoots the row's bottom edge by one stroke**
+/// and relies on the row's own `overflow_hidden()` clip (see `render_graph_lane_canvas`) to cut it
+/// back. At an integer display scale the clip removes the overshoot exactly at the boundary and
+/// the next row's own segment resumes on the very next device row, same as the old edge-to-edge
+/// spans. At a *fractional* scale (GitHub issue #346) GPUI's per-primitive device-pixel snapping
+/// can land this row's painted bottom and the next row's painted top one device row apart, leaving
+/// a blank device row mid-line; the overshoot paints that seam row, while the clip - whose mask is
+/// GPUI's `cover_bounds`, a ceiled superset of the row box, i.e. at most one device row of slack -
+/// still guarantees at most one device row ever bleeds past the boundary, where it lands on pixels
+/// the next row's own same-coloured segment paints anyway. This is the same closure mechanism the
+/// elbows' clipped lead-outs (which genuinely cross the boundary) get for free.
+///
+/// An `ends_here` stub's *top* edge needs no mirrored overshoot: the row above always paints the
+/// continuing half of that line (a through segment or a `starts_here` stub, both of which now
+/// overshoot downward), so every shared boundary is covered from above.
+///
+/// History: this used to inset the neighbour by an `ELBOW_OVERSHOOT` constant, then ran exactly
+/// edge-to-edge once clipping removed the elbows' overlap at its source. The overshoot's return
+/// here is deliberate and one stroke *outward* (clipped), never an inset - the clip keeps it
+/// invisible at integer scales rather than reintroducing the doubled-line bug the inset era fixed.
 fn lane_segment_span(segment: &wt_core::graph::LaneSegment, row_h: Pixels) -> (Pixels, Pixels) {
     match (segment.starts_here, segment.ends_here) {
-        (true, _) => (row_h / 2.0, row_h / 2.0),
+        // Starts and ends in this one row: nothing continues below, nothing to overshoot for.
+        (true, true) => (row_h / 2.0, row_h / 2.0),
+        (true, false) => (row_h / 2.0, row_h / 2.0 + ELBOW_STROKE),
         (false, true) => (px(0.0), row_h / 2.0),
-        (false, false) => (px(0.0), row_h),
+        (false, false) => (px(0.0), row_h + ELBOW_STROKE),
     }
 }
 
@@ -3804,8 +3824,8 @@ fn render_graph_lane_canvas(
         // taffy's own `BoxSizing::BorderBox` default applies) - so with that border present the
         // row was 26 tall on the outside but its content box was only 25, while this canvas is a
         // full `ROW` = 26. Under the row's `.items_center()` that centred to `(25 - 26) / 2` =
-        // **-0.5px**, and every horizontal 1px stroke in here - the elbow bridge's `h(px(1.0))`
-        // and both curve boxes' `border_t_1()`/`border_b_1()` - then landed on a half-pixel
+        // **-0.5px**, and every horizontal stroke in here - the elbow bridge's `h(ELBOW_STROKE)`
+        // and both curve boxes' `border_t`/`border_b` - then landed on a half-pixel
         // boundary and rendered smeared across two physical pixel rows at half intensity, while
         // the vertical lane lines (x is untouched) stayed crisp. That was the reported "the lines
         // and elbows do not align correctly vertically", and it is also why four earlier rounds
@@ -3902,22 +3922,25 @@ fn render_graph_lane_canvas(
                 .debug_selector(move || {
                     format!("graph-row-{row_index}-elbow-{elbow_index}-{kind_tag}-{part}")
                 });
+            // Parametric `border_*(ELBOW_STROKE)` rather than the fixed `border_*_1()` suffixes,
+            // so the painted border width and the geometry corrections stated in [`ELBOW_STROKE`]
+            // terms can never drift apart (GitHub issue #346's fix moved the graph to 2px lines).
             let curve_box = match curve.horizontal {
-                HorizontalEdge::Bottom => curve_box.border_b_1(),
-                HorizontalEdge::Top => curve_box.border_t_1(),
+                HorizontalEdge::Bottom => curve_box.border_b(ELBOW_STROKE),
+                HorizontalEdge::Top => curve_box.border_t(ELBOW_STROKE),
             };
             match (curve.horizontal, curve.vertical) {
                 (HorizontalEdge::Bottom, VerticalEdge::Left) => curve_box
-                    .border_l_1()
+                    .border_l(ELBOW_STROKE)
                     .rounded_bl(theme::graph::ELBOW_RADIUS),
                 (HorizontalEdge::Bottom, VerticalEdge::Right) => curve_box
-                    .border_r_1()
+                    .border_r(ELBOW_STROKE)
                     .rounded_br(theme::graph::ELBOW_RADIUS),
                 (HorizontalEdge::Top, VerticalEdge::Left) => curve_box
-                    .border_l_1()
+                    .border_l(ELBOW_STROKE)
                     .rounded_tl(theme::graph::ELBOW_RADIUS),
                 (HorizontalEdge::Top, VerticalEdge::Right) => curve_box
-                    .border_r_1()
+                    .border_r(ELBOW_STROKE)
                     .rounded_tr(theme::graph::ELBOW_RADIUS),
             }
         };
@@ -3929,7 +3952,7 @@ fn render_graph_lane_canvas(
                 .left(geo.straight.left)
                 .top(geo.straight.top)
                 .w(geo.straight.width)
-                .h(px(1.0))
+                .h(ELBOW_STROKE)
                 .bg(color)
                 .debug_selector(move || {
                     format!("graph-row-{row_index}-elbow-{elbow_index}-{kind_tag}-straight")
@@ -3966,7 +3989,9 @@ fn render_graph_lane_canvas(
     };
     canvas = canvas.child(
         dot.absolute()
-            .left(dot_x - size / 2.0 + px(0.5))
+            // Centred on the lane *stroke*, not on `lane_x` itself: the lane line occupies
+            // `[lane_x, lane_x + ELBOW_STROKE)`, so its centre sits half a stroke past `lane_x`.
+            .left(dot_x - size / 2.0 + ELBOW_STROKE / 2.0)
             .top(row_h / 2.0 - size / 2.0)
             .w(size)
             .h(size),
@@ -4950,7 +4975,9 @@ mod elbow_geometry_tests {
     /// `2 * ELBOW_CURVE_SIZE` (20px), so the two curve boxes genuinely overlap, and a real
     /// user-reported glitch lived in exactly that regime - see
     /// `the_straight_bridge_never_runs_past_the_far_curves_own_arc`.
-    const ALL_SHAPES_AND_GAPS: [(ElbowKind, Pixels, Pixels); 8] = [
+    /// `pub(super)` so `elbow_fractional_scale_tests` sweeps the exact same shape/gap catalogue
+    /// rather than a drifting copy.
+    pub(super) const ALL_SHAPES_AND_GAPS: [(ElbowKind, Pixels, Pixels); 8] = [
         (ElbowKind::Diverging, px(9.0), px(51.0)),
         (ElbowKind::Diverging, px(51.0), px(9.0)),
         (ElbowKind::Converging, px(51.0), px(9.0)),
@@ -5257,15 +5284,20 @@ mod elbow_geometry_tests {
                  column, which the neighbouring row's own segment continues"
             );
         }
-        // And that neighbouring segment really does run the full row, edge to edge - it is no
-        // longer inset for an overshoot, because there is no longer an overshoot to inset for.
+        // And that neighbouring segment really does start at the row's own top edge and run the
+        // whole row (plus its own one-stroke seam overshoot past the *bottom* edge, clipped by
+        // its own row - see `lane_segment_span`'s docs; the top edge, where it meets this clip,
+        // stays exactly at 0).
         let through = wt_core::graph::LaneSegment {
             lane: 1,
             starts_here: false,
             ends_here: false,
             dashed: false,
         };
-        assert_eq!(lane_segment_span(&through, ROW_H), (px(0.0), ROW_H));
+        assert_eq!(
+            lane_segment_span(&through, ROW_H),
+            (px(0.0), ROW_H + ELBOW_STROKE)
+        );
     }
 
     #[test]
@@ -5280,8 +5312,9 @@ mod elbow_geometry_tests {
         };
         assert_eq!(
             lane_segment_span(&segment, ROW_H),
-            (ROW_H / 2.0, ROW_H / 2.0),
-            "a lane starting here runs from the dot down to the row's bottom edge"
+            (ROW_H / 2.0, ROW_H / 2.0 + ELBOW_STROKE),
+            "a lane starting here runs from the dot down to the row's bottom edge, plus the \
+             one-stroke seam overshoot its own row clips back (see `lane_segment_span`)"
         );
         segment.starts_here = false;
         segment.ends_here = true;
@@ -5516,6 +5549,233 @@ mod elbow_geometry_tests {
         // the color that continues its own already-painted `ends_here` stub from the row above.
         assert_eq!(elbow_color_lane(ElbowKind::Converging, 1, 0), 1);
         assert_eq!(elbow_color_lane(ElbowKind::Converging, 0, 1), 0);
+    }
+}
+
+/// GitHub issue #346's regression tests: the lane canvas must survive **fractional display scale
+/// factors** (1.25x, 1.5x - #216's `GPUI_X11_SCALE_FACTOR` override, or any fractional-DPI
+/// monitor), where GPUI's device-pixel snapping is what actually places every stroke.
+///
+/// Every other test in this file measures the *logical* geometry, which was already exact - and
+/// that is precisely why four earlier rounds of 1px seam fixes each looked complete while the
+/// user kept seeing jagged elbows "on some screens": the breakage only exists after GPUI rounds
+/// each primitive to whole device pixels *independently*. GPUI pre-rounds every authored inset
+/// and length to whole device pixels before layout (`to_taffy` / `layout_bounds`,
+/// `vendor/zed/crates/gpui/src/taffy.rs`), and snaps border widths as lengths clamped to at
+/// least one device pixel (`Window::snap_stroke` via `round_stroke_to_device_pixel`,
+/// `gpui/src/util.rs`) - so two logically coincident stroke positions reached through
+/// *different* arithmetic (a filled rect's inset+length vs a border painted inward from a box
+/// edge) can legally land one device pixel apart at a fractional scale. These tests restate that
+/// exact arithmetic (each helper cites the GPUI function it mirrors) and pin the invariant that
+/// makes the graph read as continuous lines anyway: at every supported scale, every junction's
+/// two painted stroke intervals still **overlap by at least one device pixel**. That is the real
+/// reason [`theme::graph::LINE_WIDTH`] is 2px: a 1px stroke snaps to a single device pixel, where
+/// a one-pixel disagreement is a total break - reproduced verbatim in the last test below.
+#[cfg(test)]
+mod elbow_fractional_scale_tests {
+    use super::elbow_geometry_tests::ALL_SHAPES_AND_GAPS;
+    use super::*;
+
+    const ROW_H: Pixels = theme::graph::ROW;
+
+    /// The scales this module sweeps: the integer scales that always rendered clean, the two
+    /// real reported fractional scales (1.25, 1.5), and more fractional points across the range
+    /// issue #216's override exposes, so the invariant is a property of the arithmetic rather
+    /// than luck at two sampled values.
+    const SCALES: [f32; 9] = [1.0, 1.1, 1.25, 1.4, 1.5, 1.75, 2.0, 2.25, 3.0];
+
+    /// GPUI's `round_half_toward_zero` (`vendor/zed/crates/gpui/src/util.rs`): nearest integer,
+    /// 0.5 ties toward zero - the tie rule that decides which side of a half-device-pixel
+    /// boundary a coordinate lands on, so it must match GPUI's exactly or this whole module
+    /// tests a different renderer.
+    fn round_half_toward_zero(value: f32) -> f32 {
+        (value.abs() - 0.5).ceil().copysign(value)
+    }
+
+    /// GPUI's `round_to_device_pixel`: how every authored absolute inset and length is
+    /// pre-rounded to whole device pixels before layout (`to_taffy`), and how `snap_bounds`
+    /// rounds a painted quad's edges. Applies to this canvas's `.left()`/`.top()` offsets and
+    /// `.w()`/`.h()` sizes alike.
+    fn device_length(logical: Pixels, scale: f32) -> f32 {
+        round_half_toward_zero(f32::from(logical) * scale)
+    }
+
+    /// GPUI's `round_stroke_to_device_pixel` (used by `Window::snap_stroke` for border widths):
+    /// rounded as a length but clamped to at least one device pixel, so a thin border dims
+    /// rather than disappears.
+    fn device_stroke(logical: Pixels, scale: f32) -> f32 {
+        device_length(logical, scale).max(1.0)
+    }
+
+    /// The half-open device-pixel interval `[start, end)` a filled rect's one axis occupies:
+    /// pre-rounded inset, plus pre-rounded length.
+    fn fill(inset: Pixels, length: Pixels, scale: f32) -> (f32, f32) {
+        let start = device_length(inset, scale);
+        (start, start + device_length(length, scale))
+    }
+
+    /// The device columns a curve box's *vertical* border stroke occupies. A border is painted
+    /// inward from the snapped box edge (`fs_quad` tests `corner_to_point + border_widths`
+    /// inward from bounds - see [`CurveBox`]'s own docs), and the box's far edge is its
+    /// pre-rounded inset plus its pre-rounded width - crucially *not* the same rounding as
+    /// `inset + width` taken together, which is the whole disagreement this module exists for.
+    fn curve_vertical_stroke(curve: &CurveBox, scale: f32) -> (f32, f32) {
+        let stroke = device_stroke(ELBOW_STROKE, scale);
+        let left = device_length(curve.left, scale);
+        let width = device_length(theme::graph::ELBOW_CURVE_SIZE, scale);
+        match curve.vertical {
+            VerticalEdge::Left => (left, left + stroke),
+            VerticalEdge::Right => (left + width - stroke, left + width),
+        }
+    }
+
+    /// The device rows a curve box's *horizontal* border stroke occupies - the same inward
+    /// painting rule on the other axis.
+    fn curve_horizontal_stroke(curve: &CurveBox, scale: f32) -> (f32, f32) {
+        let stroke = device_stroke(ELBOW_STROKE, scale);
+        let top = device_length(curve.top, scale);
+        let height = device_length(curve.height, scale);
+        match curve.horizontal {
+            HorizontalEdge::Top => (top, top + stroke),
+            HorizontalEdge::Bottom => (top + height - stroke, top + height),
+        }
+    }
+
+    fn overlap(a: (f32, f32), b: (f32, f32)) -> f32 {
+        (a.1.min(b.1) - a.0.max(b.0)).max(0.0)
+    }
+
+    #[test]
+    fn a_lane_continuing_curve_still_overlaps_the_lanes_own_line_at_every_scale() {
+        // The device-space restatement of
+        // `elbow_geometry_tests::a_lane_continuing_curve_paints_its_stroke_on_that_lanes_own_column`,
+        // which passes on exact logical coordinates and yet rendered broken: measured for real at
+        // scale 1.5, a lane vertical snapped to device columns disjoint from the curve border
+        // meant to continue it (the reported "the lines seem disconnected from the elbow line
+        // part"). The invariant that keeps the line reading continuous is at least one device
+        // pixel of overlap between the curve's vertical stroke and the lane line it continues.
+        for scale in SCALES {
+            for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+                let geo = elbow_geometry(kind, x_from, x_to, ROW_H);
+                // The lane-continuing end: `Diverging`'s exit lands on `to_lane`'s line,
+                // `Converging`'s entry continues `from_lane`'s (see `elbow_geometry`'s docs).
+                let (continuing, lane) = match kind {
+                    ElbowKind::Diverging => (geo.exit, x_to),
+                    ElbowKind::Converging => (geo.entry, x_from),
+                };
+                let stroke = curve_vertical_stroke(&continuing, scale);
+                let line = fill(lane, ELBOW_STROKE, scale);
+                assert!(
+                    overlap(stroke, line) >= 1.0,
+                    "{kind:?} {x_from:?}->{x_to:?} at scale {scale}: the lane-continuing curve's \
+                     vertical stroke lands on device columns {stroke:?} but the lane's own line \
+                     occupies {line:?} - the junction renders broken (issue #346)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_three_elbow_pieces_still_share_a_waist_row_at_every_scale() {
+        // The device-space restatement of
+        // `elbow_geometry_tests::all_three_elbow_pieces_paint_their_horizontal_stroke_on_the_very_same_pixel_row`.
+        // The entry curve reaches the waist as an inside-painted *bottom* border (its stroke row
+        // is derived from `top + height`, two independently pre-rounded values), the exit as a
+        // *top* border (derived from `top` alone), and the bridge as a plain fill - three
+        // different roundings of one logical row, which at a fractional scale may legally sit one
+        // device row apart. One device row of overlap with the bridge on both ends is what makes
+        // the horizontal read as a single stroke rather than a stepped one - the reported "lines
+        // are jagged when coming to an elbow".
+        for scale in SCALES {
+            for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+                let geo = elbow_geometry(kind, x_from, x_to, ROW_H);
+                let bridge = fill(geo.straight.top, ELBOW_STROKE, scale);
+                for (part, curve) in [("entry", geo.entry), ("exit", geo.exit)] {
+                    let stroke = curve_horizontal_stroke(&curve, scale);
+                    assert!(
+                        overlap(stroke, bridge) >= 1.0,
+                        "{kind:?} {x_from:?}->{x_to:?} at scale {scale}: the {part} curve's \
+                         horizontal stroke occupies device rows {stroke:?} but the bridge \
+                         occupies {bridge:?} - the waist renders as a stepped line (issue #346)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_rows_of_one_lane_leave_no_blank_device_row_at_any_scale() {
+        // The longitudinal seam: two rows' segments of one through-lane abut exactly at the row
+        // boundary in logical space, but each row's painted extent is its own independently
+        // rounded inset+length, and the rows themselves may be placed either `floor(ROW * scale)`
+        // or `ceil(ROW * scale)` device pixels apart depending on how the list's own layout
+        // rounds - measured for real at a fractional scale as one fully blank device row
+        // mid-line. `lane_segment_span`'s one-stroke overshoot (clipped by the row's own mask,
+        // whose far edge is GPUI's `cover_bounds` ceil - at most one device row of slack) must
+        // close the seam for *both* row placements, while the mask keeps the visible bleed to at
+        // most that one slack row, which the next row's own same-coloured line paints anyway.
+        let through = wt_core::graph::LaneSegment {
+            lane: 0,
+            starts_here: false,
+            ends_here: false,
+            dashed: false,
+        };
+        let starts = wt_core::graph::LaneSegment {
+            starts_here: true,
+            ..through
+        };
+        for scale in SCALES {
+            let row_span = f32::from(ROW_H) * scale;
+            let mask_end = row_span.ceil();
+            for next_row_top in [row_span.floor(), row_span.ceil()] {
+                for (label, segment) in [("through", through), ("starts_here", starts)] {
+                    let (top, height) = lane_segment_span(&segment, ROW_H);
+                    let unclipped = fill(top, height, scale);
+                    let painted_end = unclipped.1.min(mask_end);
+                    assert!(
+                        painted_end >= next_row_top,
+                        "{label} at scale {scale}, next row at {next_row_top}: this row's line \
+                         stops at device row {painted_end} - a blank device row mid-line \
+                         (issue #346)"
+                    );
+                    assert!(
+                        painted_end - next_row_top <= 1.0,
+                        "{label} at scale {scale}: the overshoot must never bleed more than the \
+                         mask's one device row of slack past the boundary, got {painted_end} vs \
+                         {next_row_top}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_one_px_design_this_replaces_really_did_break_at_fractional_scales() {
+        // The negative control that proves this module can actually see the bug it guards
+        // against, pinned to the numbers measured off the real renderer before the fix. With the
+        // old 1px stroke at scale 1.5, lane 0's vertical (`.left(9) .w(1)`) pre-rounds to device
+        // columns [13, 14), while the adjacent-lane elbow's lane-continuing right-bordered curve
+        // (box `.left(9 + 1 - 10) .w(10)`, stroke painted inward from its far edge) lands on
+        // [14, 15) - fully disjoint, the measured 100% break at the junction (the real capture
+        // showed absolute columns [469, 470) vs [470, 471); only the origin differs). The 2px
+        // stroke is what buys the >= 1 device pixel of slack the three tests above pin.
+        let scale = 1.5;
+        let one_px_line = fill(px(9.0), px(1.0), scale);
+        assert_eq!(one_px_line, (13.0, 14.0));
+        let old_box_left = device_length(px(9.0 + 1.0 - 10.0), scale);
+        let old_box_width = device_length(theme::graph::ELBOW_CURVE_SIZE, scale);
+        let old_stroke_width = device_stroke(px(1.0), scale);
+        let old_curve_stroke = (
+            old_box_left + old_box_width - old_stroke_width,
+            old_box_left + old_box_width,
+        );
+        assert_eq!(old_curve_stroke, (14.0, 15.0));
+        assert_eq!(
+            overlap(one_px_line, old_curve_stroke),
+            0.0,
+            "sanity: the old 1px design must reproduce the total break in this emulation, or \
+             the emulation is not modelling the renderer that showed it"
+        );
     }
 }
 
