@@ -29,6 +29,7 @@ pub mod rebase;
 pub mod remote;
 pub mod review;
 pub mod rewrite;
+pub mod run_drift;
 pub mod stage;
 pub mod undo;
 

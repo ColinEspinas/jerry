@@ -782,6 +782,51 @@ impl TerminalGrid {
         grid.update_history(real_cap);
     }
 
+    /// Everything this terminal has really printed that it still holds - retained scrollback
+    /// *and* the visible screen - as trimmed-right text lines, oldest first, capped to the last
+    /// `max_lines` of it. GitHub issue #227's real transcript capture: what an agent's own pane
+    /// actually said, kept when its run ends so History can show the run's own output rather than
+    /// a synthesised stand-in.
+    ///
+    /// Deliberately *not* [`Self::visible_rows`]: that is one screenful resolved against a
+    /// palette for painting, and a transcript that stopped at the last 30 rows would cut the run
+    /// off mid-sentence. This reads the raw grid, history included, exactly as
+    /// `Term::line_to_string` does for a clipboard copy - the same `Flags::WIDE_CHAR_SPACER` skip
+    /// (see the module docs) and the same "text only, no colour" contract [`Self::selected_text`]
+    /// has, since nothing downstream of a stored transcript re-renders ANSI attributes.
+    ///
+    /// Blank lines at both ends are dropped: a pane is a fixed-height grid, so a short run leaves
+    /// the rest of the screen as empty rows that are an artefact of the grid's shape, not
+    /// something the program printed.
+    pub fn retained_text_lines(&self, max_lines: usize) -> Vec<String> {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let screen = grid.screen_lines() as i32;
+        let mut lines: Vec<String> = Vec::with_capacity((history + screen).max(0) as usize);
+        for index in -history..screen {
+            let row = &grid[Line(index)];
+            let text: String = row
+                .into_iter()
+                // The spacer's `' '` was written by the emulator, not by the program - keeping it
+                // would put a stray space after every wide character, the identical reasoning
+                // `crate::terminal::pane::TerminalPane::visible_text_lines` already applies.
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| cell.c)
+                .collect();
+            lines.push(text.trim_end().to_string());
+        }
+        while lines.first().is_some_and(|line| line.is_empty()) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        if lines.len() > max_lines {
+            lines.drain(..lines.len() - max_lines);
+        }
+        lines
+    }
+
     /// `true` once [`Self::scroll_offset`] is anything other than live - i.e. the pane is
     /// genuinely showing scrollback rather than the live tail right now.
     pub fn is_scrolled_back(&self) -> bool {
@@ -1190,6 +1235,66 @@ mod tests {
             grid.append_bytes(format!("line {i}\r\n").as_bytes());
         }
         grid
+    }
+
+    /// GitHub issue #227's transcript capture, at the grid level: a run's stored transcript must
+    /// be the run's *whole* retained output, not the last screenful, and must stop at the cap.
+    mod retained_transcript_tests {
+        use super::*;
+
+        #[test]
+        fn a_transcript_reaches_back_past_the_visible_screen_into_real_scrollback() {
+            // Five visible rows, thirty printed lines - twenty-five of them are only in history.
+            let grid = grid_with_numbered_lines(5, 20, 30);
+            let lines = grid.retained_text_lines(1000);
+            assert_eq!(
+                lines.len(),
+                30,
+                "every printed line must survive, not just the visible screenful"
+            );
+            assert_eq!(lines.first().map(String::as_str), Some("line 0"));
+            assert_eq!(lines.last().map(String::as_str), Some("line 29"));
+        }
+
+        #[test]
+        fn the_cap_keeps_the_end_of_the_run_not_its_beginning() {
+            let grid = grid_with_numbered_lines(5, 20, 30);
+            let lines = grid.retained_text_lines(4);
+            assert_eq!(
+                lines,
+                vec![
+                    "line 26".to_string(),
+                    "line 27".to_string(),
+                    "line 28".to_string(),
+                    "line 29".to_string(),
+                ],
+                "a capped transcript must end where the run ended"
+            );
+        }
+
+        /// A pane is a fixed-height grid, so a two-line run leaves the rest of the screen as
+        /// empty rows. Those are the grid's shape, not the program's output.
+        #[test]
+        fn the_empty_rest_of_the_screen_is_not_part_of_the_transcript() {
+            let mut grid = TerminalGrid::new(10, 20);
+            grid.append_bytes(b"first\r\nsecond\r\n");
+            assert_eq!(
+                grid.retained_text_lines(1000),
+                vec!["first".to_string(), "second".to_string()]
+            );
+        }
+
+        /// The same wide-character rule the painter and the clipboard already follow: the spacer
+        /// cell's `' '` belongs to the emulator, not to the program.
+        #[test]
+        fn a_wide_character_contributes_one_char_not_two() {
+            let mut grid = TerminalGrid::new(4, 20);
+            grid.append_bytes("\u{4f60}\u{597d} ok\r\n".as_bytes());
+            assert_eq!(
+                grid.retained_text_lines(1000),
+                vec!["\u{4f60}\u{597d} ok".to_string()]
+            );
+        }
     }
 
     mod scrollback_tests {
