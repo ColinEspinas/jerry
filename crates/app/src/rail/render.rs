@@ -499,10 +499,17 @@ impl AdeApp {
                             .collect();
                         let diff_paths: Vec<PathBuf> =
                             this.agents.iter().map(|agent| agent.cwd.clone()).collect();
+                        // Every open agent's real pid, plus this process's own: GitHub issue
+                        // #293's Resources tree carries Jerry itself as a real row (the bar
+                        // readout promises "what Jerry is costing this machine right now", which
+                        // a total excluding the window, its editors and its language servers
+                        // would not be), and a row with no sample behind it would render a
+                        // permanent `...`.
                         let pids: Vec<u32> = this
                             .agents
                             .iter()
                             .filter_map(|agent| agent.pane.read(cx).pid())
+                            .chain(std::iter::once(std::process::id()))
                             .collect();
                         // GitHub issue #225: every agent with a captured baseline, to be measured
                         // against it below.
@@ -556,6 +563,10 @@ impl AdeApp {
                     this.worktree_notes = snapshot.worktree_notes;
                     this.ahead_behind_cache = snapshot.ahead_behind;
                     this.process_stats = process_samples;
+                    // GitHub issue #293: the Resources popover's `Updated Ns ago` line measures
+                    // against *this* instant - the moment a real sample landed - so it stays
+                    // honest about staleness even if the poll itself stalls.
+                    this.process_stats_sampled_at = Some(Instant::now());
                     this.apply_review_measurements(review_measurements);
                     // GitHub issue #239 phase 2: fold each agent's real, hook-derived state into
                     // the persisted record for issue #227 to build on. Rides this existing timer
@@ -1048,7 +1059,7 @@ impl AdeApp {
     /// for a non-focused repo (always `true` for the focused one - its own data path is
     /// unchanged) so the render side can still tell "never fetched yet" apart from "fetched, and
     /// really has zero worktrees".
-    pub(in crate::rail) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
+    pub(crate) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
             rail::filter_worktree_rows(&rows, self.filter_query.as_str())

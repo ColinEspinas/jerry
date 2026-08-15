@@ -2743,18 +2743,48 @@ pub mod status_bar {
 
     /// Tier 1 - the readouts you are meant to find first (`main ↑2 ↓0`, `4 agents running`).
     pub const PRIMARY: ColorToken = token("status_bar.primary", 0xa9b0b7);
+    /// Tier 2 - the supporting half of a split readout, dimmer than [`PRIMARY`] but still meant
+    /// to be read (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4c's `#7d848b`
+    /// "secondary" row: provider names in the bar once GitHub issue #294 lands, and today the
+    /// Resources popover's own memory column, which is that same "detail you read only if the
+    /// count surprised you" tone).
+    pub const SECONDARY: ColorToken = token("status_bar.secondary", 0x7d848b);
     /// Tier 3 - resource readouts, present but never competing (`41% cpu · 3.4 GB`).
     pub const RECESSIVE: ColorToken = token("status_bar.recessive", 0x4a5057);
     /// The 1px, 13-high rules between tiers.
     pub const DIVIDER: ColorToken = token("status_bar.divider", 0x2b3137);
+
+    /// The Resources popover's uppercase section labels (`CPU`, `MEMORY`, `ON DISK`,
+    /// `LIVE NOW`) - §4d's `#5b6167`.
+    pub const SECTION_LABEL: ColorToken = token("status_bar.section_label", 0x5b6167);
+    /// The unfilled part of a load meter's 3px track (§4d's `#23282c`).
+    pub const METER_TRACK: ColorToken = token("status_bar.meter_track", 0x23282c);
+
+    /// `loadHue()`'s three steps (§4d, verbatim: "grey below 60%, amber to 85%, red above.
+    /// Healthy load spends no colour"). Kept as three tokens rather than reusing
+    /// [`super::status`]'s agent-state hues on purpose: an agent's amber means "this agent is
+    /// waiting for you", a load meter's amber means "your work is affected" - the same pixel
+    /// colour, two different reserved meanings, and a shared token would let a re-theme of one
+    /// silently move the other.
+    pub const LOAD_NEUTRAL: ColorToken = token("status_bar.load_neutral", 0x5e646a);
+    /// 60% < load <= 85%.
+    pub const LOAD_ELEVATED: ColorToken = token("status_bar.load_elevated", 0xc99b4e);
+    /// load > 85%.
+    pub const LOAD_CRITICAL: ColorToken = token("status_bar.load_critical", 0xc4726d);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
     /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("PRIMARY", PRIMARY),
+        ("SECONDARY", SECONDARY),
         ("RECESSIVE", RECESSIVE),
         ("DIVIDER", DIVIDER),
+        ("SECTION_LABEL", SECTION_LABEL),
+        ("METER_TRACK", METER_TRACK),
+        ("LOAD_NEUTRAL", LOAD_NEUTRAL),
+        ("LOAD_ELEVATED", LOAD_ELEVATED),
+        ("LOAD_CRITICAL", LOAD_CRITICAL),
     ];
 }
 
@@ -2958,8 +2988,10 @@ pub mod band {
     /// Interrupt/Retry/Archive action footer, rendered separately below it).
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
-    /// 26 -> 28 (`CHANGELOG.md`'s change 7: "Height 26 -> 28").
-    pub const STATUS_BAR: Pixels = px(28.0);
+    /// 26 -> 28 (`CHANGELOG.md`'s change 7: "Height 26 -> 28"), then 28 -> 30 for rev 6's
+    /// three-tier rebuild (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4c:
+    /// "bar 28 -> 30 high, group gap 9 -> 14").
+    pub const STATUS_BAR: Pixels = px(30.0);
     pub const PALETTE_INPUT: Pixels = px(44.0);
     pub const PALETTE_ROW: Pixels = px(30.0);
     pub const CHANGE_ROW: Pixels = px(27.0);

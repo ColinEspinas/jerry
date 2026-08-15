@@ -1,20 +1,20 @@
 use super::*;
 use crate::root::plural;
 use crate::root::widgets::{
-    hover_keycap_row, render_env_chip, render_keycap_row, text_tooltip, KeycapSize,
+    hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, text_tooltip,
+    KeycapSize,
+};
+use crate::status_bar::resources::{
+    self, LoadLevel, ResourceGroup, ResourceRow, ResourceTree, JERRY_GROUP_LABEL,
 };
 
-/// The agents cluster's text: `"1 agent · 4% cpu · 30 MB"` on Linux, `"1 agent"` elsewhere
-/// (`extras` empty). Pure, so the conjugation is testable without a live process sampler -
-/// which matters here because the single-agent case this used to render as `"1 agents"` is the
-/// *ordinary* one: every window starts with exactly one agent.
 /// This machine's real core count, read once and cached.
 ///
 /// `std::thread::available_parallelism` is not the cheap `sched_getaffinity` call it looks like:
 /// on Linux it also performs the cgroup quota lookup, opening and reading `/proc/self/cgroup`,
 /// `/proc/self/mountinfo` and the cgroup's `cpu.max`/`cpu.cfs_quota_us` files. Calling it from
-/// [`AdeApp::render_status_agents_cluster`] meant real blocking filesystem I/O on the UI thread
-/// on *every frame*, for a value that cannot change while the process is running. This is one
+/// the per-frame resource-tree build meant real blocking filesystem I/O on the UI thread on
+/// *every frame*, for a value that cannot change while the process is running. This is one
 /// `OnceLock` instead - and deliberately not a field on `AdeApp`, since it is a property of the
 /// machine rather than of any window.
 fn available_cores() -> usize {
@@ -26,38 +26,112 @@ fn available_cores() -> usize {
     })
 }
 
-fn status_agents_label(agent_count: usize, extras: &[&str]) -> String {
-    let agents = plural::count(agent_count, "agent", None);
-    if extras.is_empty() {
-        return agents;
-    }
-    format!("{agents} \u{b7} {}", extras.join(" \u{b7} "))
-}
-
-/// The LSP cluster's text: `"1 server"`, `"2 servers · 3 errors"`. `errors` is `None` whenever
-/// no real file's File view is on screen (see [`AdeApp::status_bar_active_parsed_file`]), in
-/// which case the error half is omitted entirely rather than shown as a stale zero.
-fn status_servers_errors_label(server_count: usize, errors: Option<usize>) -> String {
-    let servers = plural::count(server_count, "server", None);
-    match errors {
-        Some(errors) => format!("{servers} \u{b7} {}", plural::count(errors, "error", None)),
-        None => servers,
-    }
-}
-
-/// The 28px status bar (`CHANGELOG.md`'s change 7 - height 26 -> 28, gap 12 -> 9, every value
-/// 10px mono), rebuilt from the old single `8 agents · 2 waiting · …` summary string into a
-/// left/right cluster layout. Every field here reads a real, already-live data source - see each
-/// render helper's own docs for exactly which one, and [`AdeApp::status_bar_active_parsed_file`]
-/// for the one shared gate that keeps the file-scoped fields (`ln N`, indent, line-ending,
-/// `UTF-8`, the diagnostics error count) from ever showing stale data left over from a
-/// previously-viewed file.
+/// The three type tiers rev 6 rebuilt the bar around
+/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3, and
+/// `STAGE-A-CHANGELOG.md` §4c's diagnosis: "the cause was not density - it was that after the
+/// cut, **all thirteen-then-five readouts sat at 10px in `#4a5057`**, one flat tone on `#101214`.
+/// No hierarchy means the eye has to read all of it to find any of it").
 ///
-/// The mockup's second `⌘⇧K agents` palette hint is still omitted for the same reason the old
-/// bar omitted it: that binding is never wired up anywhere in this codebase, so a keycap for it
-/// would advertise a shortcut that silently does nothing. The real `secondary-1`..`secondary-8`
-/// agent-jump keycaps (reused from `Self::render_tab_strip`'s own right-aligned cluster) are
-/// shown instead, since those genuinely are bound.
+/// A named enum rather than three ad-hoc `.text_color(...)`/`.text_size(...)` pairs at each call
+/// site: the whole defect was that every readout independently picked the same tone, so the fix
+/// has to be a closed set of tiers a readout is *assigned to*, not a colour it chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusTier {
+    /// §3: `main ↑2 ↓0`'s branch, `4 agents running` - "the readouts you are meant to find
+    /// first".
+    Primary,
+    /// §3: provider budgets. Nothing in the bar carries this tier until GitHub issue #294 lands
+    /// its per-provider rate-limit clusters; the token itself is live today in the Resources
+    /// popover's memory column (see `crate::theme::status_bar::SECONDARY`).
+    Secondary,
+    /// §3: `41% cpu · 3.4 GB`, and the tail of every split readout (`↑2 ↓0`).
+    Recessive,
+}
+
+impl StatusTier {
+    fn color(self) -> theme::ColorToken {
+        match self {
+            StatusTier::Primary => theme::status_bar::PRIMARY,
+            StatusTier::Secondary => theme::status_bar::SECONDARY,
+            StatusTier::Recessive => theme::status_bar::RECESSIVE,
+        }
+    }
+
+    /// §4c's per-tier sizes: `10.5px/450` primary, `10.5px` secondary, `9.5-10.5px` tertiary.
+    fn text_size(self) -> f32 {
+        match self {
+            StatusTier::Primary | StatusTier::Secondary => 10.5,
+            StatusTier::Recessive => 10.0,
+        }
+    }
+
+    fn weight(self) -> gpui::FontWeight {
+        match self {
+            StatusTier::Primary => gpui::FontWeight::MEDIUM,
+            StatusTier::Secondary | StatusTier::Recessive => gpui::FontWeight::NORMAL,
+        }
+    }
+}
+
+/// A composite readout split into §4c's "bright head and dim tail" - "the count is the fact you
+/// scan for, the size is the detail you read only if the count surprised you".
+///
+/// Pure, and returned rather than rendered directly, so which half is which is a testable fact
+/// rather than a property of a `div` tree.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SplitReadout {
+    /// Rendered at [`StatusTier::Primary`].
+    pub(crate) head: String,
+    /// Rendered at [`StatusTier::Recessive`]. `None` when there genuinely is no tail yet - an
+    /// ahead/behind that hasn't been computed is honestly omitted rather than shown as a
+    /// fabricated `↑0 ↓0`.
+    pub(crate) tail: Option<String>,
+}
+
+/// The branch cluster's split: the branch name is the fact you scan for, the ahead/behind counts
+/// are the detail. §3's own example (`main ↑2 ↓0`) is exactly this pair, and its table puts the
+/// two halves in two different tiers.
+fn branch_readout(branch: String, ahead_behind: Option<(usize, usize)>) -> SplitReadout {
+    SplitReadout {
+        head: branch,
+        tail: ahead_behind.map(|(ahead, behind)| format!("\u{2191}{ahead} \u{2193}{behind}")),
+    }
+}
+
+/// `"4 agents running"` - §4b's `footRun`, the running-agent count on its own after the old
+/// `4 agents · 41% cpu · 3.4 GB` composite was split ("`footAgents` split into `footRun` +
+/// `footLoad`"). Conjugated through [`plural`], never an inline ternary (rev 6 §7 rule 9).
+fn running_agents_label(count: usize) -> String {
+    format!("{} running", plural::count(count, "agent", None))
+}
+
+/// The 30px status bar, rebuilt for rev 6 (GitHub issue #293).
+///
+/// ## What this bar carries, and what it deliberately no longer does
+///
+/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b counted the old bar's thirteen
+/// readouts and found eight of them lifted from VS Code's status bar: "VS Code's footer answers
+/// 'what am I typing into'; Jerry's job is watching agents. Wrong app's chrome." Deleted with
+/// this rebuild, code paths and all (§7 rule 5: "Replacing a control means deleting its old keys
+/// in the same edit"): `ln N`, the indent width, the line ending, the encoding, the editor-zoom
+/// readout, the UI-scale readout, `N servers · M errors`, the five urgency-counter dots, and the
+/// `N wt · Y GB` cluster.
+///
+/// - **Editor zoom** survives as `mod+plus`/`mod+minus` only (§4b's table: "keyboard only
+///   (`⌘+`/`⌘−`); state and handlers kept, both controls gone"). `AdeApp::zoom_in`/`zoom_out`/
+///   `reset_zoom` and `settings.appearance.editor_zoom_percent` are all untouched - only the two
+///   *readouts* are gone.
+/// - **The urgency-counter dots** are §4b's "footer dot cluster", folded into the title bar's own
+///   compact dot chips (`crate::title_bar::render`). §7 rule 4 - "Two states distinguished
+///   anywhere in the app are never summed anywhere in it" - is why the bar's remaining agent
+///   readout counts one state (`running`) rather than every open agent.
+/// - **`N wt · Y GB`** is §4d's one removed duplicate: "the rail owns worktree inventory and its
+///   prune action, the bar owns activity and cost". The rail footer carries it 30px away.
+/// - **`N servers · M errors`** is §4b's "diagnostics count ... strip badge only".
+///
+/// What is left is three visible groups, each on its own tier, separated by §4c's heavier 13-high
+/// divider (`theme::status_bar::DIVIDER`; "at `#22262a` they were invisible, so the groups they
+/// were meant to separate ran together").
 impl AdeApp {
     pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -66,7 +140,7 @@ impl AdeApp {
             .flex_none()
             .items_center()
             .justify_between()
-            .px(px(12.0))
+            .px(px(13.0))
             .w_full()
             .h(theme::band::STATUS_BAR)
             .bg(theme::surface::TITLE_BAR)
@@ -76,9 +150,7 @@ impl AdeApp {
             .child(self.render_status_bar_right(cx))
     }
 
-    /// Branch/ahead-behind, real urgency counters, `N agents · cpu · mem`, `N wt · disk` - each
-    /// divided by a real vertical rule, per `CHANGELOG.md`'s "Left: ... · divider · ... ·
-    /// divider · ...".
+    /// Branch cluster · `N agents running` · `X% cpu · Y GB`, separated by §4c's real dividers.
     fn render_status_bar_left(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mut segments: Vec<gpui::AnyElement> = Vec::new();
         // Shown first - persistent, actionable "a real update is available/ready" information
@@ -98,9 +170,10 @@ impl AdeApp {
         if let Some(branch_cluster) = self.render_status_branch_cluster(cx) {
             segments.push(branch_cluster);
         }
-        segments.push(self.render_status_urgency_counters(cx).into_any_element());
-        segments.push(self.render_status_agents_cluster(cx).into_any_element());
-        segments.push(self.render_status_worktrees_cluster().into_any_element());
+        segments.push(self.render_status_running_agents(cx).into_any_element());
+        if let Some(resources) = self.render_status_resources_readout(cx) {
+            segments.push(resources);
+        }
         render_status_segment_row(segments).into_any_element()
     }
 
@@ -123,6 +196,9 @@ impl AdeApp {
     /// `Error::HeadMovedSinceRecorded`'s two full 40-character commit shas, ...) is truncated
     /// with an ellipsis and carries a real tooltip ([`text_tooltip`]) with the untruncated text -
     /// an audit found this exact text rendered with no truncation or tooltip at all before.
+    ///
+    /// Rendered at [`StatusTier::Primary`]: a notice only exists when there is genuinely
+    /// something to tell you, which is by definition the thing to read first.
     fn render_status_worktree_history_notice(&self) -> Option<gpui::AnyElement> {
         let status = self.worktree_history_status.clone()?;
         Some(
@@ -132,21 +208,15 @@ impl AdeApp {
                 .max_w(px(320.0))
                 .truncate()
                 .tooltip(text_tooltip(status.clone()))
-                .child(self.render_status_text(status))
+                .child(self.render_status_tier_text(status, StatusTier::Primary))
                 .into_any_element(),
         )
     }
 
-    /// Environment chip + real LSP server/error counts, the real file/editor cluster, then the
-    /// palette/agent keycap hints - divided the same way as the left side.
+    /// The environment chip and the palette/agent keycap hints - all that is left on the right
+    /// after §4b's subtractive pass (the file/editor cluster and the LSP counts were the rest of
+    /// it, and both are gone).
     fn render_status_bar_right(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let env_and_servers = div()
-            .flex()
-            .items_center()
-            .gap(px(9.0))
-            .child(render_env_chip())
-            .child(self.render_status_servers_errors());
-
         let hints = div()
             .flex()
             .items_center()
@@ -155,9 +225,7 @@ impl AdeApp {
             .child(self.render_status_agent_hint());
 
         render_status_segment_row(vec![
-            env_and_servers.into_any_element(),
-            self.render_status_file_and_editor_cluster(cx)
-                .into_any_element(),
+            render_env_chip().into_any_element(),
             hints.into_any_element(),
         ])
         .into_any_element()
@@ -170,10 +238,11 @@ impl AdeApp {
     /// `HEAD` still shows real text (`"(detached)"`), matching the agent context bar's own
     /// convention, and a not-yet-computed ahead/behind is honestly omitted rather than shown as
     /// a fabricated `↑0 ↓0`.
-    /// The branch text (design spec change 6: "the branch text became a clickable cluster (fork
-    /// glyph + `main` + `↑2 ↓0`, hover `#1b1f22`) that opens the graph tab") - a real click target
-    /// via `crate::graph_view::render::AdeApp::open_git_graph`, the same entry point the `+` menu
-    /// and the palette's "Open git graph" use.
+    ///
+    /// Split across two tiers per §4c - see [`branch_readout`]. The cluster as a whole is a real
+    /// click target that opens the graph tab via
+    /// `crate::graph_view::render::AdeApp::open_git_graph`, the same entry point the `+` menu and
+    /// the palette's "Open git graph" use.
     ///
     /// ## Why this is gated on [`Self::focused_repo`], not on an active agent
     ///
@@ -214,6 +283,12 @@ impl AdeApp {
             .find(|item| item.path == cwd)
             .and_then(|item| item.branch.clone())
             .unwrap_or_else(|| "(detached)".to_string());
+        let readout = branch_readout(
+            branch,
+            self.ahead_behind_cache
+                .get(&cwd)
+                .map(|ahead_behind| (ahead_behind.ahead, ahead_behind.behind)),
+        );
 
         let mut row = div()
             .id("status-bar-branch-cluster")
@@ -223,281 +298,248 @@ impl AdeApp {
             .gap(px(6.0))
             .cursor_pointer()
             .rounded(theme::radius::CHIP)
-            .px(px(4.0))
+            .px(px(5.0))
+            .h(px(18.0))
             .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 this.open_git_graph(window, cx);
             }))
             .child(crate::graph_view::render::render_graph_tab_chip())
-            .child(self.render_status_text(branch));
+            .child(self.render_status_tier_text(readout.head, StatusTier::Primary));
 
-        if let Some(ahead_behind) = self.ahead_behind_cache.get(&cwd) {
-            row = row.child(self.render_status_text(format!(
-                "\u{2191}{} \u{2193}{}",
-                ahead_behind.ahead, ahead_behind.behind
-            )));
+        if let Some(tail) = readout.tail {
+            row = row.child(self.render_status_tier_text(tail, StatusTier::Recessive));
         }
 
         Some(row.into_any_element())
     }
 
-    /// Five real 5×5 radius-1 urgency-counter squares, one per [`Status`] in
-    /// [`Status::ORDER`] (amber/red/green/blue/grey), each with a real count aggregated across
-    /// every currently open agent - [`rail::urgency_counts`] over [`Self::build_agent_rows`],
-    /// the exact same per-agent status classification the rail's own urgency grouping uses
-    /// (`Self::agent_status` under the hood), not a second, independent classification.
+    /// §4b's `footRun`: `"4 agents running"`, the real count of agents whose derived
+    /// [`Status`] is [`Status::Run`] right now.
     ///
-    /// Known, low-priority redundancy: [`Self::render_rail_list`] already calls
-    /// `build_agent_rows` once earlier in the very same frame, so this is a second, real (if
-    /// cheap - no I/O, per that method's own docs) computation of the identical rows, including,
-    /// for any [`Status::Ask`] agent, a fresh `Vec<String>` allocation of that agent's whole
-    /// visible terminal grid. Not fixed here: both `Self::render_rail`/`Self::render_rail_list`
-    /// and this status bar are `&self` methods (not `&mut self`), so caching this frame's rows
-    /// on `self` for reuse here would need either widening several rail-render signatures to
-    /// `&mut self` or a `RefCell`-style interior-mutability cache - both a more invasive
-    /// restructure than this redundant-but-cheap computation is worth fixing in this pass.
-    fn render_status_urgency_counters(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Counting one state rather than summing every open agent is §7 rule 4 - "Two states
+    /// distinguished anywhere in the app are never summed anywhere in it". The title bar
+    /// distinguishes `ask`/`fail`/`run`, so a bar readout that added them back together would be
+    /// the exact restatement that rule forbids. The count comes from [`rail::urgency_counts`]
+    /// over [`Self::build_agent_rows`] - the same real per-agent classification the rail and the
+    /// title bar's own chips use, so the three can never disagree.
+    fn render_status_running_agents(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.build_agent_rows(cx);
-        div().flex().items_center().gap(px(8.0)).children(
-            rail::urgency_counts(&rows)
-                .into_iter()
-                .map(|(status, count)| {
+        let running = rail::urgency_counts(&rows)
+            .into_iter()
+            .find(|(status, _)| *status == Status::Run)
+            .map(|(_, count)| count)
+            .unwrap_or(0);
+        div()
+            .id("status-bar-running-agents")
+            .debug_selector(|| "status-bar-running-agents".to_string())
+            .child(self.render_status_tier_text(running_agents_label(running), StatusTier::Primary))
+    }
+
+    /// §4d's one resource readout: `41% cpu · 3.4 GB`, clickable, opening the Resources popover.
+    ///
+    /// **The number is the sum of that popover's own tree** - see
+    /// [`crate::status_bar::resources`]. Nothing here aggregates a second time.
+    ///
+    /// **No meter here**, verbatim from §4d: "the budget meter beside it fills with *headroom* -
+    /// full is good. A load meter fills with *usage* - full is bad. Two meters 40px apart meaning
+    /// opposite things is the exact incoherence this pass keeps removing." The load meters live
+    /// inside the popover, under `CPU`/`MEMORY` labels that make the direction unambiguous.
+    ///
+    /// The text takes the load hue only once the machine is genuinely strained
+    /// ([`resources::load_level`]); a healthy load stays [`StatusTier::Recessive`] and spends no
+    /// attention colour at all.
+    ///
+    /// `None` - no readout, and so no popover trigger - on a build with no real sampling backend
+    /// at all (`process_stats::PLATFORM_SAMPLING_SUPPORTED`, which today means FreeBSD). A
+    /// permanent `...% cpu` that can never resolve is the one placeholder that must not reach the
+    /// screen; shipping `…` off-Linux was explicitly rejected for issue #293's own dependency
+    /// (#283), and this is the same rule for the platform where there really is nothing to show.
+    fn render_status_resources_readout(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !process_stats::PLATFORM_SAMPLING_SUPPORTED {
+            return None;
+        }
+        let tree = self.build_resource_tree(cx);
+        let readout = tree.bar_readout();
+        let level = resources::load_level(tree.cpu_percent());
+        let color = if level == LoadLevel::Neutral {
+            StatusTier::Recessive.color()
+        } else {
+            level.color()
+        };
+
+        Some(
+            div()
+                .id("status-bar-resources")
+                .debug_selector(|| "status-bar-resources".to_string())
+                .flex()
+                .items_center()
+                .h(px(18.0))
+                .px(px(5.0))
+                .rounded(theme::radius::CHIP)
+                .cursor_pointer()
+                .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                .when(self.resources_popover_open, |el| {
+                    el.bg(theme::surface::ROW_HOVER_ALT)
+                })
+                .tooltip(text_tooltip(
+                    "What Jerry is costing this machine right now".to_string(),
+                ))
+                .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .w(px(5.0))
-                                .h(px(5.0))
-                                .rounded(px(1.0))
-                                .bg(status.color()),
-                        )
-                        .child(self.render_status_text(count.to_string()))
-                }),
+                        .font(font(theme::font::MONO))
+                        .font_weight(StatusTier::Recessive.weight())
+                        .text_size(self.ui_text_size(StatusTier::Recessive.text_size()))
+                        .text_color(color)
+                        .child(readout),
+                )
+                .child({
+                    let this = cx.entity();
+                    gpui::canvas(
+                        move |bounds, _window, cx| {
+                            this.update(cx, |this, _cx| {
+                                this.resources_readout_bounds = bounds;
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full()
+                })
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    let opening = !this.resources_popover_open;
+                    // GitHub issue #176's shared invariant: opening this popover closes whatever
+                    // else was open. Read before the sweep and applied after it, because the
+                    // sweep clears `resources_popover_open` itself.
+                    let _ = this.close_menu_surfaces_except(Some(menus::MenuSurface::Resources));
+                    this.resources_popover_open = opening;
+                    cx.notify();
+                }))
+                .into_any_element(),
         )
     }
 
-    /// `N agents · X% cpu · Y GB` - agent count is a real count of currently open
-    /// [`crate::work_surface::agents::ProcessKind::Agent`] agents - never a plain
-    /// `ProcessKind::Shell`, which has no agent work to attribute cpu/memory to. cpu/mem are the
-    /// real, periodically-sampled [`Self::process_stats`] aggregated across those agents' real
-    /// pids via [`process_stats::aggregate_process_stats`]. A field with no real sample yet for
-    /// *any* agent shows `...` for that one piece rather than a fabricated `0%`/`0 B` - see that
-    /// function's own docs for exactly when that is: a single un-sampleable pid (e.g. a real
-    /// zombie mid-EOF-poll) no longer blanks every other agent's genuinely known value.
+    /// The real `repo → worktree → agent` cost tree behind both the bar readout and the popover -
+    /// §4d: "the same hierarchy as the rail".
     ///
-    /// `agent_pids` isn't additionally filtered on `TerminalPane::is_running()`: a pid mid-EOF-
-    /// poll (the routine "just exited, not yet reaped" case the aggregation fix above targets)
-    /// still reports `is_running() == true` for up to `MAX_EOF_POLL_TICKS` by design, so that
-    /// filter wouldn't actually exclude the zombie pid this fix cares about. A pid whose agent
-    /// has genuinely gone (`is_running() == false`) already has no pid at all
-    /// (`TerminalPane::pid` returns `None` once its `agent` is cleared), so it's already
-    /// excluded by the `filter_map` below without a separate `is_running` check.
+    /// Built by walking [`Self::build_repo_groups`]'s already-ranked
+    /// `RepoGroup → WorktreeRow → AgentRow` structure rather than re-deriving a second grouping:
+    /// the rail's grouping *is* the hierarchy this popover is specified in terms of, so a second
+    /// implementation of it could only ever drift from the rail it is supposed to mirror.
     ///
-    /// CPU% is normalized to total real system capacity (0-100%) by dividing the raw,
-    /// per-process-ticks-summed aggregate by `std::thread::available_parallelism()`'s real core
-    /// count - `aggregate_process_stats` sums each process's own ticks-derived percentage
-    /// (itself able to exceed 100% for a single busy multi-threaded process), so without this,
-    /// two genuinely busy real agent processes could report a combined `196% cpu`, inconsistent
-    /// with a single 0-100%-of-system-capacity scale. `available_parallelism` is a real,
-    /// already-available `std` API - no new dependency for this.
+    /// [`rail::RepoGroup::all_rows`], not `rows`: the rail's filter box narrows what the rail
+    /// *displays*, and a resource total that shrank as you typed in an unrelated text field would
+    /// be a lie about what the machine is doing.
     ///
-    /// Real on Linux, macOS and Windows alike (GitHub issue #283 - one sampling trait, three real
-    /// per-platform backends, see `crate::status_bar::process_stats`). On a target with no
-    /// backend at all - `process_stats::PLATFORM_SAMPLING_SUPPORTED` is `false`, which today
-    /// means FreeBSD - the cpu/mem fields are omitted entirely and just the real agent count is
-    /// shown, rather than a `...% cpu` placeholder that would sit on screen forever, look broken,
-    /// and never resolve. That is a `const`-gated branch rather than a second `#[cfg]` cascade
-    /// here on purpose: the platform predicate lives in exactly one place, next to the backend
-    /// selection it describes, so adding a platform can never leave this file behind. The unused
-    /// branch is compiled away either way, since the condition is a compile-time constant.
-    fn render_status_agents_cluster(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let agents: Vec<&Agent> = self
-            .agents
-            .iter()
-            .filter(|agent| agent.kind.is_agent_session())
-            .collect();
-        let agent_count = agents.len();
+    /// Jerry's own process is a real row of its own (`JERRY_GROUP_LABEL`), because the readout's
+    /// tooltip promises "what Jerry is costing this machine right now" and a total that excluded
+    /// the window, its editors and its language servers would not be that number.
+    ///
+    /// Known, accepted redundancy: this calls `build_repo_groups`, which the rail already calls
+    /// once in the same frame - the same shape (and the same reason) as the redundant
+    /// `build_agent_rows` call the title bar's chips already make. Both are `&self` renders, so
+    /// caching a frame's result on `self` would need either widened `&mut self` signatures across
+    /// several rail methods or interior mutability; neither is worth it for a computation that
+    /// does no I/O.
+    pub(crate) fn build_resource_tree(&self, cx: &mut Context<Self>) -> ResourceTree {
+        let cores = available_cores();
+        let mut rows: Vec<ResourceRow> = Vec::new();
+        let mut attributed: std::collections::HashSet<crate::work_surface::agents::AgentId> =
+            std::collections::HashSet::new();
 
-        if !process_stats::PLATFORM_SAMPLING_SUPPORTED {
-            return self.render_status_text(status_agents_label(agent_count, &[]));
+        // Walked in the rail's own order - repo groups ranked by their most urgent worktree,
+        // worktrees ranked inside them - so the popover's tree reads top to bottom the way the
+        // rail beside it does.
+        for group in self.build_repo_groups(cx) {
+            for worktree in &group.all_rows {
+                let worktree_label = worktree
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| worktree.label.clone());
+                // Matched against `Self::agents` directly rather than against
+                // `WorktreeRow::agents`: that list is `build_agent_rows`, which filters to
+                // `ProcessKind::is_agent_session()` and so excludes every shell - and a shell is
+                // a real process burning real CPU in a real worktree. The rail is right to leave
+                // shells out of an *agent* list; a cost breakdown that left them out would
+                // under-report, and the bar readout above it claims to be the whole cost.
+                for agent in self.agents.iter().filter(|open| open.cwd == worktree.path) {
+                    let Some(pid) = agent.pane.read(cx).pid() else {
+                        // A pane with no pid has genuinely exited (`TerminalPane::pid` returns
+                        // `None` once its agent is cleared), so there is nothing to attribute.
+                        continue;
+                    };
+                    attributed.insert(agent.id);
+                    let (cpu_percent, memory_bytes) =
+                        resources::row_sample(pid, &self.process_stats, cores);
+                    rows.push(ResourceRow {
+                        repo_name: group.repo_name.clone(),
+                        agent_label: agent.kind.label().to_string(),
+                        worktree_label: worktree_label.clone(),
+                        kind: Some(agent.kind),
+                        pid,
+                        cpu_percent,
+                        memory_bytes,
+                    });
+                }
+            }
         }
 
-        let agent_pids: Vec<u32> = agents
-            .iter()
-            .filter_map(|agent| agent.pane.read(cx).pid())
-            .collect();
-
-        let (cpu_total, rss_total) =
-            process_stats::aggregate_process_stats(&agent_pids, &self.process_stats);
-        let cpu_label = match cpu_total {
-            Some(percent) => {
-                let normalized = process_stats::normalize_cpu_percent(percent, available_cores());
-                format!("{}% cpu", normalized.round() as i64)
+        // Anything the rail's hierarchy does not currently account for still costs this machine
+        // something, and the readout claims to be the whole cost. An agent is genuinely missing
+        // from that hierarchy whenever its cwd is not (yet) in any repo's worktree list: a repo
+        // whose `wt_core::list_worktrees` fetch has not landed, a directory that is not a git
+        // repository at all (the startup shell still runs there and still burns CPU), or a
+        // worktree removed from under a still-running agent. Dropping those rows would make the
+        // bar quietly under-report - the same class of defect as a hardcoded total, just in the
+        // other direction - so they are attributed to their own repo by path instead, and the
+        // hierarchy stays complete.
+        for agent in self.agents.iter() {
+            if attributed.contains(&agent.id) {
+                continue;
             }
-            None => "...% cpu".to_string(),
-        };
-        let mem_label = match rss_total {
-            Some(bytes) => rail::format_bytes(bytes),
-            None => "...".to_string(),
-        };
-
-        self.render_status_text(status_agents_label(
-            agent_count,
-            &[cpu_label.as_str(), mem_label.as_str()],
-        ))
-    }
-
-    /// `N wt · Y GB` - both real, both already computed elsewhere: worktree count from
-    /// [`Self::worktrees`], disk usage from [`Self::disk_usage_label`] (the same formatted label
-    /// `Self::render_rail_footer` shows, via `crate::rail::state::disk_usage_bytes`/
-    /// `Self::load_disk_usage` - not a second computation).
-    fn render_status_worktrees_cluster(&self) -> impl IntoElement {
-        let worktree_count = self.worktrees.len();
-        let disk_label = self.disk_usage_label();
-        self.render_status_text(format!("{worktree_count} wt \u{b7} {disk_label}"))
-    }
-
-    /// `N servers · M errors` - server count is the real number of [`LspClientState::Ready`]
-    /// entries in [`Self::lsp_clients`] (per that field's own docs, eviction keeps this to the
-    /// active root's own clients only). That is genuinely more than one for a language whose
-    /// primary needs a coordinated companion process: a `.vue` file really does have two live
-    /// language servers working on it, so `2 servers` there is the honest count, not a
-    /// double-count of one. The error count is only ever shown while
-    /// [`Self::status_bar_active_parsed_file`] confirms a real file's File view is genuinely on
-    /// screen right now (see that method's docs for why) - otherwise just `N servers` is shown,
-    /// rather than a stale count left over from a file that isn't even open anymore.
-    fn render_status_servers_errors(&self) -> impl IntoElement {
-        let server_count = self
-            .lsp_clients
-            .values()
-            .filter(|state| matches!(state, LspClientState::Ready(_)))
-            .count();
-
-        let label = status_servers_errors_label(server_count, self.status_bar_error_count());
-        self.render_status_text(label)
-    }
-
-    /// Whichever [`code_view::ParsedFile`] is genuinely, currently on screen in Surface C's File
-    /// view - `None` whenever that's not true (Settings is open and covering the whole
-    /// workspace, an agent tab is active, the Diff view is showing, or
-    /// [`Self::file_view_cache`] hasn't caught up with a just-opened file yet). The shared gate
-    /// for every status-bar field that only makes sense for a real, currently-viewed file
-    /// (`ln N`, indent width, line-ending, `UTF-8`, the diagnostics error count) - without it,
-    /// switching away from a file view would leave those fields silently describing a file
-    /// that's no longer open, since [`Self::file_view_cache`]/[`Self::file_view_diagnostics`]
-    /// are only ever refreshed by `Self::render_file_view` itself and nothing clears them on
-    /// tab switch (mirrors how `Self::render_file_view`'s own status bar simply isn't called at
-    /// all outside the File view - the same "don't render an inapplicable field" convention,
-    /// applied here per-field instead of for a whole surface).
-    ///
-    /// The `settings_open` check comes first, and deliberately can't be skipped by any of the
-    /// checks below it: [`Self::render_status_bar`] is rendered as an unconditional sibling of
-    /// whichever body is currently swapped in (`root/mod.rs`'s `Render` impl) - the title bar
-    /// and status bar stay on screen while Settings replaces the three-zone workspace body, so
-    /// without this check every file-specific field here would keep showing a frozen snapshot of
-    /// whatever file was open right before Settings opened, for a file the user can no longer
-    /// even see.
-    fn status_bar_active_parsed_file(&self) -> Option<&code_view::ParsedFile> {
-        if self.settings_open {
-            return None;
-        }
-        if self.code_view != code_view::CodeView::File {
-            return None;
-        }
-        let open_path = self.open_change.as_ref()?;
-        let absolute = self.file_tree_root.join(open_path);
-        self.file_view_cache
-            .as_ref()
-            .filter(|cached| cached.path == absolute)
-    }
-
-    /// Real error-severity diagnostic count for the file [`Self::status_bar_active_parsed_file`]
-    /// confirms is genuinely on screen - `None` (not `Some(0)`) when that isn't true, so
-    /// [`Self::render_status_servers_errors`] can tell "genuinely zero errors in this open file"
-    /// apart from "not applicable right now".
-    ///
-    /// Reads [`Self::file_view_error_count`] directly rather than re-deriving a count from
-    /// [`Self::file_view_diagnostics`]: that map is `diagnostics_view::index_diagnostics_by_line`'s
-    /// per-*line* index, which pushes one entry for every line a diagnostic's range touches, not
-    /// one entry per diagnostic - counting it directly would over-count any diagnostic spanning
-    /// more than one line (and under-count one past a truncated file's parsed line range).
-    /// [`Self::file_view_error_count`] is instead the exact same real count
-    /// `code_surface::file_view::render_file_status_bar` already computed and displayed for this same file
-    /// in this same frame, so the two can never disagree.
-    fn status_bar_error_count(&self) -> Option<usize> {
-        self.status_bar_active_parsed_file()?;
-        self.file_view_error_count
-    }
-
-    /// `ln N` · `N spaces` · `LF`/`CRLF` · `UTF-8` (each shown only while
-    /// [`Self::status_bar_active_parsed_file`] confirms a real file is on screen - `ln N` has
-    /// the further real precondition that [`Self::code_cursor`] has ever been set, per
-    /// `Self::render_file_status_bar`'s own established "no column tracking, so no fabricated
-    /// `col 1`" convention, extended here the same way to "no click yet, so no fabricated `ln
-    /// 1`") · the real, clickable editor-zoom value (reuses [`Self::reset_zoom`], not a second
-    /// zoom mechanism) · the real `UI N%` interface-scale readout. Zoom and UI-scale are always
-    /// shown, independent of whether a file is open - both are real, currently-effective values
-    /// regardless of what's on screen. The `UTF-8` label reads
-    /// [`code_view::ParsedFile::is_valid_utf8`] - a genuinely lossily-decoded file (real bytes
-    /// that weren't valid UTF-8) shows `UTF-8 (lossy)` instead, never a hardcoded claim about
-    /// bytes that were never actually checked.
-    fn render_status_file_and_editor_cluster(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let parsed = self.status_bar_active_parsed_file();
-
-        let mut row = div().flex().items_center().gap(px(9.0));
-
-        if let Some(parsed) = parsed {
-            if let Some(line) = self.code_cursor {
-                row = row.child(self.render_status_text(format!("ln {line}")));
-            }
-            if let Some(width) = code_view::detect_indent_width(&parsed.lines) {
-                row = row.child(self.render_status_text(plural::count(width, "space", None)));
-            }
-            row = row.child(self.render_status_text(parsed.line_ending.label().to_string()));
-            // A real, checked value (`code_view::ParsedFile::is_valid_utf8`), not a hardcoded
-            // literal - a file whose real bytes weren't valid UTF-8 (and so were lossily
-            // decoded, real content silently replaced with `U+FFFD`) says so honestly rather
-            // than falsely claiming `UTF-8`.
-            let encoding_label = if parsed.is_valid_utf8 {
-                "UTF-8".to_string()
-            } else {
-                "UTF-8 (lossy)".to_string()
+            let Some(pid) = agent.pane.read(cx).pid() else {
+                continue;
             };
-            row = row.child(self.render_status_text(encoding_label));
+            let repo_name = self
+                .repos
+                .iter()
+                .filter(|repo| agent.cwd.starts_with(&repo.path))
+                // The longest matching prefix, so a repo nested inside another is attributed to
+                // itself rather than to its ancestor.
+                .max_by_key(|repo| repo.path.as_os_str().len())
+                .map(|repo| repo.name.clone())
+                .unwrap_or_else(|| JERRY_GROUP_LABEL.to_string());
+            let (cpu_percent, memory_bytes) =
+                resources::row_sample(pid, &self.process_stats, cores);
+            rows.push(ResourceRow {
+                repo_name,
+                agent_label: agent.kind.label().to_string(),
+                worktree_label: agent
+                    .cwd
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| agent.cwd.to_string_lossy().to_string()),
+                kind: Some(agent.kind),
+                pid,
+                cpu_percent,
+                memory_bytes,
+            });
         }
 
-        row.child(self.render_status_zoom_value(cx))
-            .child(self.render_status_text(format!(
-                "UI {}%",
-                self.settings.appearance.interface_scale_percent
-            )))
-    }
+        let own_pid = std::process::id();
+        let (cpu_percent, memory_bytes) =
+            resources::row_sample(own_pid, &self.process_stats, cores);
+        rows.push(ResourceRow {
+            repo_name: JERRY_GROUP_LABEL.to_string(),
+            agent_label: "Jerry".to_string(),
+            worktree_label: "window, editors, LSP".to_string(),
+            kind: None,
+            pid: own_pid,
+            cpu_percent,
+            memory_bytes,
+        });
 
-    /// The real editor-zoom value, clickable to reset to 100% - reuses [`Self::reset_zoom`]
-    /// (the exact mechanism the code toolbar's own `Self::render_zoom_control` uses), so this is
-    /// a second *view* of the same real state, never a second zoom implementation. A distinct
-    /// element id (`"status-bar-zoom-value"`) from the toolbar's own `"code-zoom-value"`, since
-    /// both can be on screen in the same frame.
-    fn render_status_zoom_value(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("status-bar-zoom-value")
-            // Test-only (no-op outside `cfg(test)`/`test-support`) - lets a real interaction
-            // test find this element's painted bounds via `VisualTestContext::debug_bounds` and
-            // drive a genuine `simulate_click` against it, the same idiom
-            // `code_surface`'s own click-driven tests use.
-            .debug_selector(|| "status-bar-zoom-value".to_string())
-            .cursor_pointer()
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(self.ui_text_size(10.0))
-            .text_color(theme::text::DIM)
-            .hover(|el| el.text_color(theme::text::SELECTED))
-            .child(format!("{}%", self.settings.appearance.editor_zoom_percent))
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.reset_zoom(cx);
-            }))
+        ResourceTree::from_rows(rows)
     }
 
     /// The `⌘P commands` hint: clicking it (or pressing the bound `secondary-p` - see
@@ -545,25 +587,26 @@ impl AdeApp {
             )
     }
 
-    /// The plain 10px mono `theme::text::DIM` (`#8b9197`) style shared by every text-only
-    /// status-bar value (`CHANGELOG.md`: "all values 10px mono") - matches the zoom value two
-    /// elements over ([`Self::render_status_zoom_value`]), which already correctly uses the same
-    /// token.
-    fn render_status_text(&self, label: String) -> impl IntoElement {
+    /// One status-bar readout, rendered in its assigned [`StatusTier`] - the one place a bar
+    /// readout gets its colour, size and weight, so no readout can quietly pick the flat tone
+    /// §4c removed.
+    fn render_status_tier_text(&self, label: String, tier: StatusTier) -> impl IntoElement {
         div()
             .font(font(theme::font::MONO))
-            .text_size(self.ui_text_size(10.0))
-            .text_color(theme::text::DIM)
+            .font_weight(tier.weight())
+            .text_size(self.ui_text_size(tier.text_size()))
+            .text_color(tier.color())
             .child(label)
     }
 }
 
 /// Lays out already-built segments with a real 1px vertical divider between each consecutive
 /// pair - segments that don't apply right now are simply never pushed into the `Vec` by the
-/// caller, so no divider ever appears next to a missing field (`CHANGELOG.md`'s explicit
-/// `divider` markers only ever separate segments that are always real and present).
+/// caller, so no divider ever appears next to a missing field.
+///
+/// §4c: "group gap 9 -> 14, dividers `#22262a` -> `#2b3137` at 13 high".
 fn render_status_segment_row(segments: Vec<gpui::AnyElement>) -> impl IntoElement {
-    let mut row = div().flex().items_center().gap(px(9.0));
+    let mut row = div().flex().items_center().gap(px(14.0));
     for (index, segment) in segments.into_iter().enumerate() {
         if index > 0 {
             row = row.child(render_status_divider());
@@ -577,243 +620,586 @@ fn render_status_divider() -> impl IntoElement {
     div()
         .flex_none()
         .w(px(1.0))
-        .h(px(14.0))
-        .bg(theme::border::DIVIDER)
+        .h(px(13.0))
+        .bg(theme::status_bar::DIVIDER)
 }
 
-/// A real interaction test proving the status bar's editor-zoom value is genuinely clickable and
-/// resets zoom through [`AdeApp::reset_zoom`] - the exact same real mechanism the code toolbar's
-/// own zoom control (`code_surface::zoom::render_zoom_control`) uses, never a second, copied
-/// implementation.
-/// The two status-bar clusters that used to hardcode their plural noun and so read `1 agents`
-/// / `1 servers · 1 errors` for the single-agent, single-server case that is in fact the
-/// ordinary one (GitHub issue #281).
+/// The Resources popover (§4d) - 320 wide, above the bar, mirroring the rate-limit popover's own
+/// chrome so the two read as one family.
+impl AdeApp {
+    /// The popover's real width (§4d: "The popover (320 wide, mirrors the rate-limit one)").
+    const RESOURCES_POPOVER_WIDTH: f32 = 320.0;
+
+    /// The whole overlay: a transparent click-away scrim plus the panel itself, positioned off
+    /// the readout's real painted bounds ([`Self::resources_readout_bounds`]) - the same shape
+    /// `Self::render_plus_menu` uses, and a direct child of the root element for the same reason
+    /// (the captured bounds are window-space, so `.absolute()` positioning built from them is
+    /// only correct there).
+    pub(crate) fn render_resources_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tree = self.build_resource_tree(cx);
+        let anchor = self.resources_readout_bounds;
+        let width = px(Self::RESOURCES_POPOVER_WIDTH);
+        // The bar sits at the very bottom of the window, so the panel opens *upwards* from the
+        // readout's own top edge rather than downwards from its bottom like every other menu in
+        // the app. `left` is clamped to the window so a bar readout near the right edge can't
+        // push the panel off screen.
+        let left = anchor.origin.x - px(10.0);
+
+        div()
+            .id("status-bar-resources-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(crate::work_surface::state::TRANSPARENT)
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                // `stop_propagation` is what makes this a scrim rather than a transparent sheet:
+                // without it the click also reaches whatever is underneath, and clicking the
+                // readout itself to dismiss the popover would close it here and immediately
+                // reopen it there (the readout's own toggle reads the flag *after* this ran) -
+                // a popover that could not be closed by clicking the control that opened it.
+                cx.stop_propagation();
+                this.resources_popover_open = false;
+                cx.notify();
+            }))
+            .child(
+                menu_popover_chrome(
+                    div()
+                        .id("status-bar-resources-popover")
+                        .debug_selector(|| "status-bar-resources-popover".to_string())
+                        .absolute()
+                        .left(left.max(px(6.0)))
+                        .bottom(theme::band::STATUS_BAR + px(4.0))
+                        .w(width)
+                        .flex()
+                        .flex_col(),
+                    theme::shadow::MENU,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(self.render_resources_popover_header())
+                .child(self.render_resources_headline_stats(&tree))
+                .child(self.render_resources_live_tree(&tree))
+                .child(self.render_resources_disk_line(cx))
+                .child(self.render_resources_footer()),
+            )
+    }
+
+    fn render_resources_popover_header(&self) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .px(px(11.0))
+            .pt(px(8.0))
+            .pb(px(7.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex_1()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::MUTED)
+                    .child("RESOURCES"),
+            )
+    }
+
+    /// §4d's three headline stats, each under a label that makes the meter's direction
+    /// unambiguous: `CPU` and `MEMORY` fill with *usage* (full is bad), which is exactly why they
+    /// are here and not next to the budget meter in the bar.
+    ///
+    /// `ON DISK` deliberately carries **no meter**. A meter needs an honest denominator, and Jerry
+    /// has no real one for disk: the mock's own `18%` fill is a literal, and a fill against a
+    /// guessed total is the "hardcoded number that drifts from its own breakdown" §4d names as the
+    /// defect this panel would otherwise ship with. The value itself is real
+    /// ([`Self::disk_usage_label`], the same figure the rail footer shows).
+    fn render_resources_headline_stats(&self, tree: &ResourceTree) -> impl IntoElement {
+        let cpu = tree.cpu_percent();
+        let memory = tree.memory_bytes();
+        let total_memory = process_stats::system_memory_bytes();
+        let memory_fraction = resources::meter_fraction(memory, total_memory);
+        let memory_level = resources::load_level(memory_fraction.map(|f| f * 100.0));
+
+        div()
+            .flex()
+            .px(px(11.0))
+            .pt(px(9.0))
+            .pb(px(10.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(self.render_resources_stat(
+                "CPU",
+                resources::cpu_label(cpu),
+                cpu.map(|percent| percent / 100.0),
+                resources::load_level(cpu),
+            ))
+            .child(self.render_resources_stat(
+                "MEMORY",
+                resources::memory_label(memory),
+                memory_fraction,
+                memory_level,
+            ))
+            .child(self.render_resources_stat(
+                "ON DISK",
+                self.disk_usage_label(),
+                None,
+                LoadLevel::Neutral,
+            ))
+    }
+
+    /// One headline stat: label, value, and - when there is a real denominator to fill against -
+    /// a 3px load meter in that load's own hue.
+    fn render_resources_stat(
+        &self,
+        label: &'static str,
+        value: String,
+        fraction: Option<f32>,
+        level: LoadLevel,
+    ) -> impl IntoElement {
+        let value_color = if level == LoadLevel::Neutral {
+            theme::text::SELECTED
+        } else {
+            level.color()
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .pr(px(10.0))
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(self.ui_text_size(9.0))
+                    .text_color(theme::status_bar::SECTION_LABEL)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .pt(px(3.0))
+                    .pb(px(5.0))
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(13.0))
+                    .text_color(value_color)
+                    .child(value),
+            )
+            // No track at all when there is no honest denominator - an empty track would read as
+            // a real meter sitting at zero.
+            .when_some(fraction, |el, fraction| {
+                el.child(
+                    div()
+                        .h(px(3.0))
+                        .w_full()
+                        .rounded(px(2.0))
+                        .bg(theme::status_bar::METER_TRACK)
+                        .child(
+                            div()
+                                .h(px(3.0))
+                                .w(gpui::relative(fraction))
+                                .rounded(px(2.0))
+                                .bg(level.color()),
+                        ),
+                )
+            })
+    }
+
+    /// §4d's `LIVE NOW` tree: one section per repo, with a real per-repo subtotal, and one
+    /// `tint · agent · worktree · cpu · memory` row per agent under it.
+    fn render_resources_live_tree(&self, tree: &ResourceTree) -> impl IntoElement {
+        div()
+            .px(px(11.0))
+            .pt(px(7.0))
+            .pb(px(8.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .pb(px(4.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(self.ui_text_size(9.0))
+                            .text_color(theme::status_bar::SECTION_LABEL)
+                            .child("LIVE NOW"),
+                    )
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::HINT)
+                            .child("cpu \u{b7} memory"),
+                    ),
+            )
+            .child(
+                // Capped and scrollable: the panel grows *upwards* from a bar at the very bottom
+                // of the window, so an unbounded tree would push its own headline stats off the
+                // top of the screen once enough agents were open. 168px is eight rows plus their
+                // group headers - past that the list scrolls inside the panel instead.
+                div()
+                    .id("status-bar-resources-tree")
+                    .max_h(px(168.0))
+                    .overflow_y_scroll()
+                    .children(
+                        tree.groups
+                            .iter()
+                            .map(|group| self.render_resources_group(group)),
+                    ),
+            )
+    }
+
+    fn render_resources_group(&self, group: &ResourceGroup) -> impl IntoElement {
+        let is_jerry = group.repo_name == JERRY_GROUP_LABEL;
+        div()
+            .pt(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(17.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font(font(theme::font::MONO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(if is_jerry {
+                                theme::status_bar::SECTION_LABEL
+                            } else {
+                                theme::rail::REPO_HEADER_NAME
+                            })
+                            .child(group.repo_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::GHOSTER)
+                            .child(group.subtotal_label()),
+                    ),
+            )
+            .children(group.rows.iter().map(|row| self.render_resources_row(row)))
+    }
+
+    /// One agent's row. The tint chip is the agent's own
+    /// `crate::work_surface::state::agent_tint` colour - the same mark the rail and the palette
+    /// use for that agent, not a second colour vocabulary. Jerry's own row has no agent tint and
+    /// deliberately does not borrow one.
+    fn render_resources_row(&self, row: &ResourceRow) -> impl IntoElement {
+        let tint = match row.kind {
+            Some(kind) => crate::work_surface::state::agent_tint(kind).0,
+            None => theme::text::GHOST.into(),
+        };
+        let cpu_level = resources::load_level(row.cpu_percent);
+        let cpu_color = if cpu_level == LoadLevel::Neutral {
+            theme::status_bar::PRIMARY
+        } else {
+            cpu_level.color()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .h(px(20.0))
+            .pl(px(9.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded(px(1.0))
+                    .bg(tint),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(10.5))
+                    .text_color(theme::text::STRONG)
+                    .child(row.agent_label.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(row.worktree_label.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(cpu_color)
+                    .child(resources::cpu_label(row.cpu_percent)),
+            )
+            .child(div().flex_none().child(self.render_status_tier_text(
+                resources::memory_label(row.memory_bytes),
+                StatusTier::Secondary,
+            )))
+    }
+
+    /// §4d's disk line: `N worktrees prunable · X MB · Prune`.
+    ///
+    /// Every part of it is the rail footer's own real state, reached through the same methods:
+    /// the candidate list is [`Self::prunable_worktree_paths`] (so what is shown always matches
+    /// what a click will do), the size sums those candidates' own entries in
+    /// [`Self::worktree_disk_usage`], and `Prune` calls [`Self::request_prune`] - the same
+    /// two-click confirmation the rail footer's button uses, not a second, unconfirmed path to a
+    /// destructive action.
+    fn render_resources_disk_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let candidates = self.prunable_worktree_paths();
+        let known_sizes: Vec<u64> = candidates
+            .iter()
+            .filter_map(|path| self.worktree_disk_usage.get(path))
+            .map(|(bytes, _truncated)| *bytes)
+            .collect();
+        let prunable_bytes = resources::prunable_total_bytes(candidates.len(), &known_sizes);
+        let armed = self.prune_confirm_armed;
+        let enabled = !candidates.is_empty() && !self.prune_in_flight;
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(11.0))
+            .pt(px(7.0))
+            .pb(px(8.0))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(10.5))
+                    .text_color(theme::text::STRONG)
+                    .child(resources::prunable_label(candidates.len())),
+            )
+            .child(div().flex_none().child(self.render_status_tier_text(
+                resources::memory_label(prunable_bytes),
+                StatusTier::Secondary,
+            )))
+            .child({
+                let button = div()
+                    .id("status-bar-resources-prune")
+                    .debug_selector(|| "status-bar-resources-prune".to_string())
+                    .flex_none()
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(10.0))
+                    .child(if armed { "Confirm" } else { "Prune" });
+                // Rev 6 §7 rule 2: "A control that acts on results does not exist when there are
+                // none." With nothing to prune the label stays, disabled and inert, rather than
+                // inviting a click `Self::execute_prune`'s own guard would silently swallow.
+                if enabled {
+                    button
+                        .cursor_pointer()
+                        .text_color(theme::button::BLUE_FG)
+                        .hover(|el| el.text_color(theme::text::SELECTED))
+                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.request_prune(cx);
+                        }))
+                } else {
+                    button.cursor_default().text_color(theme::text::DISABLED)
+                }
+            })
+    }
+
+    /// §4d's footer: `Updated Ns ago` and `this machine only`.
+    ///
+    /// The age is measured against [`Self::process_stats_sampled_at`], the real instant the
+    /// background poll last wrote a sample - never a render-time `Instant::now()`, which would
+    /// always read "just now" and tell you nothing.
+    fn render_resources_footer(&self) -> impl IntoElement {
+        let since = self
+            .process_stats_sampled_at
+            .map(|at| std::time::Instant::now().saturating_duration_since(at));
+        div()
+            .flex()
+            .items_center()
+            .px(px(11.0))
+            .pt(px(7.0))
+            .pb(px(8.0))
+            .child(
+                div()
+                    .flex_1()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::status_bar::RECESSIVE)
+                    .child(resources::updated_ago_label(since)),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::SANS))
+                    .text_size(self.ui_text_size(10.0))
+                    .text_color(theme::text::HINT)
+                    .child("this machine only"),
+            )
+    }
+}
+
+/// The three tiers themselves - §4c's whole point is that they are genuinely three different
+/// tones, in a genuine order. A "hierarchy" whose steps resolved to the same colour, or whose
+/// primary was dimmer than its recessive, would be exactly the flat smear this rebuild removed.
 #[cfg(test)]
-mod status_bar_count_conjugation_tests {
+mod status_bar_tier_tests {
     use super::*;
 
-    #[test]
-    fn agents_cluster_conjugates_at_zero_one_and_two() {
-        assert_eq!(status_agents_label(0, &[]), "0 agents");
-        assert_eq!(status_agents_label(1, &[]), "1 agent");
-        assert_eq!(status_agents_label(2, &[]), "2 agents");
-    }
-
-    /// The Linux build appends the real cpu/mem fields; the conjugation must not change.
-    #[test]
-    fn agents_cluster_conjugates_with_the_cpu_and_memory_fields_attached() {
-        assert_eq!(
-            status_agents_label(1, &["4% cpu", "30 MB"]),
-            "1 agent \u{b7} 4% cpu \u{b7} 30 MB"
-        );
-        assert_eq!(
-            status_agents_label(2, &["4% cpu", "30 MB"]),
-            "2 agents \u{b7} 4% cpu \u{b7} 30 MB"
-        );
+    /// Perceived lightness, good enough to order three greys of the same family.
+    fn luminance(color: gpui::Rgba) -> f32 {
+        0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b
     }
 
     #[test]
-    fn servers_cluster_conjugates_at_zero_one_and_two() {
-        assert_eq!(status_servers_errors_label(0, None), "0 servers");
-        assert_eq!(status_servers_errors_label(1, None), "1 server");
-        assert_eq!(status_servers_errors_label(2, None), "2 servers");
+    fn the_three_tiers_are_three_distinct_tones_in_descending_order() {
+        let primary = luminance(StatusTier::Primary.color().resolve());
+        let secondary = luminance(StatusTier::Secondary.color().resolve());
+        let recessive = luminance(StatusTier::Recessive.color().resolve());
+        assert!(
+            primary > secondary,
+            "the primary tier must be brighter than the secondary one - {primary} vs {secondary}"
+        );
+        assert!(
+            secondary > recessive,
+            "the secondary tier must be brighter than the recessive one - {secondary} vs \
+             {recessive}"
+        );
     }
 
-    /// Both counts in the two-count string conjugate independently - the old label got *both*
-    /// wrong at one, and a fix that only handled the server half would still read `1 errors`.
+    /// A hierarchy is type *and* colour: the recessive tier is also the smaller one, so the tail
+    /// of a split readout recedes even in a screenshot with no colour.
     #[test]
-    fn servers_and_errors_conjugate_independently() {
-        assert_eq!(
-            status_servers_errors_label(1, Some(1)),
-            "1 server \u{b7} 1 error"
-        );
-        assert_eq!(
-            status_servers_errors_label(1, Some(2)),
-            "1 server \u{b7} 2 errors"
-        );
-        assert_eq!(
-            status_servers_errors_label(2, Some(1)),
-            "2 servers \u{b7} 1 error"
-        );
-        assert_eq!(
-            status_servers_errors_label(2, Some(0)),
-            "2 servers \u{b7} 0 errors"
-        );
+    fn the_recessive_tier_is_also_the_smaller_type() {
+        assert!(StatusTier::Primary.text_size() > StatusTier::Recessive.text_size());
+        assert_eq!(StatusTier::Primary.weight(), gpui::FontWeight::MEDIUM);
+        assert_eq!(StatusTier::Recessive.weight(), gpui::FontWeight::NORMAL);
+    }
+
+    /// §4c: "every composite readout is split so it has a bright head and a dim tail". The branch
+    /// cluster is the bar's one surviving composite, and the branch - not the arrow counts - is
+    /// the head.
+    #[test]
+    fn the_branch_cluster_splits_into_a_branch_head_and_an_arrow_tail() {
+        let split = branch_readout("main".to_string(), Some((2, 0)));
+        assert_eq!(split.head, "main");
+        assert_eq!(split.tail.as_deref(), Some("\u{2191}2 \u{2193}0"));
+    }
+
+    /// A not-yet-computed ahead/behind is honestly absent, never a fabricated `↑0 ↓0` - which
+    /// would be indistinguishable from a real, measured "level with the base".
+    #[test]
+    fn an_unmeasured_ahead_behind_has_no_tail_at_all() {
+        assert_eq!(branch_readout("main".to_string(), None).tail, None);
+    }
+
+    /// Rev 6 §7 rule 9, on the bar's one remaining count.
+    #[test]
+    fn the_running_agent_count_conjugates() {
+        assert_eq!(running_agents_label(0), "0 agents running");
+        assert_eq!(running_agents_label(1), "1 agent running");
+        assert_eq!(running_agents_label(2), "2 agents running");
     }
 }
 
+/// The deletions §4b/§7 rule 5 demand, proved against the real, rendered bar: every one of these
+/// readouts genuinely painted before this change, so a test that finds them gone is a test that
+/// would have failed on the old bar.
 #[cfg(test)]
-mod status_bar_zoom_click_tests {
+mod status_bar_deletion_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
+    /// The editor-zoom readout is gone from the bar - and its *behaviour* is not. §4b's table:
+    /// "editor zoom ... keyboard only (`⌘+`/`⌘−`); state and handlers kept, both controls gone".
     #[gpui::test]
-    fn clicking_the_status_bar_zoom_value_resets_a_real_non_default_zoom_to_one_hundred(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_zoom_readout_is_gone_but_the_keyboard_zoom_still_works(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
-        // Move zoom away from the default via the real toolbar action, so this test can prove
-        // a genuine reset rather than a value that already happened to be 100%.
+        assert!(
+            cx.debug_bounds("status-bar-zoom-value").is_none(),
+            "the status bar's editor-zoom readout must be gone - §4b deleted the control, not \
+             just its label"
+        );
+
+        let before = app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent);
         app.update(cx, |app, cx| {
             app.zoom_in(cx);
             app.zoom_in(cx);
         });
         cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
-            120,
-            "sanity check: two real zoom-in steps from 100% land on 120%"
+        let zoomed = app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent);
+        assert!(
+            zoomed > before,
+            "the zoom *state and handlers* must survive the readout's deletion - {before} -> \
+             {zoomed}"
         );
-
-        let bounds = cx
-            .debug_bounds("status-bar-zoom-value")
-            .expect("the status bar's zoom value must have painted at least once");
-        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        app.update(cx, |app, cx| app.reset_zoom(cx));
         cx.run_until_parked();
-
         assert_eq!(
             app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_DEFAULT_PERCENT,
-            "a real click on the status bar's zoom value must reset zoom to 100%, through the \
-             same AdeApp::reset_zoom the toolbar's own zoom control calls"
+            "and so must the reset the deleted readout used to be the only button for"
         );
     }
-}
 
-/// Regression coverage for the `N servers · M errors` over-counting bug: a real single
-/// diagnostic whose range spans three lines must count as one error in the status bar, matching
-/// the File view's own footer (`code_surface::file_view::render_file_status_bar`) - not once per line the
-/// per-line diagnostic index (`diagnostics_view::index_diagnostics_by_line`) happens to record
-/// it on.
-#[cfg(test)]
-mod status_bar_error_count_tests {
-    use super::*;
-    use crate::root::focus::palette_focus_tests;
-    use gpui::TestAppContext;
-    use lsp_core::lsp_types;
+    /// The three readouts §4b/§4d name, and the one the design keeps. Driven through the real
+    /// rendered bar rather than by reading source: the point is that these elements are not on
+    /// screen, whatever the code looks like.
+    #[gpui::test]
+    fn the_bar_keeps_exactly_the_segments_rev_six_kept(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
 
-    /// A real diagnostic spanning three lines (start line 0 through end line 2) - the exact
-    /// shape a real multi-line rustc error produces.
-    fn three_line_error() -> lsp_types::Diagnostic {
-        lsp_types::Diagnostic {
-            range: lsp_types::Range {
-                start: lsp_types::Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: lsp_types::Position {
-                    line: 2,
-                    character: 1,
-                },
-            },
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some("rustc".to_string()),
-            message: "mismatched types".to_string(),
-            related_information: None,
-            tags: None,
-            data: None,
+        for kept in [
+            "status-bar-branch-cluster",
+            "status-bar-running-agents",
+            "status-bar-resources",
+        ] {
+            assert!(
+                cx.debug_bounds(kept).is_some(),
+                "{kept} is on rev 6's kept list and must still paint"
+            );
         }
-    }
 
-    #[gpui::test]
-    fn a_real_multiline_diagnostic_counts_once_not_once_per_touched_line(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = repo.path().join("broken.rs");
-        std::fs::write(
-            &file_path,
-            "fn main() {\n    let x: i32 =\n        \"nope\";\n}\n",
-        )
-        .expect("write broken.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let parsed = code_view::load_file(&file_path).expect("load_file");
-        let diagnostics = vec![three_line_error()];
-        let by_line = diagnostics_view::index_diagnostics_by_line(&diagnostics, &parsed.lines);
-        // Sanity check on the real per-line index this bug came from: a single diagnostic
-        // touching three lines really does produce three separate per-line entries - proving
-        // that summing it directly (the old, buggy approach) really would over-count.
-        assert_eq!(
-            by_line.values().flatten().count(),
-            3,
-            "sanity check: the per-line index really does record one entry per touched line, \
-             for a single real diagnostic"
-        );
-
+        // And the whole file/editor cluster is gone with it - `status_bar_active_parsed_file`,
+        // the shared gate that fed `ln N`/indent/EOL/encoding and the diagnostics count, no
+        // longer exists at all, so opening a real file cannot bring any of them back.
+        let file_path = repo.path().join("a.rs");
+        std::fs::write(&file_path, "fn main() {}\n").expect("write a.rs");
         app.update(cx, |app, _cx| {
-            app.code_view = code_view::CodeView::File;
-            app.open_change = Some(PathBuf::from("broken.rs"));
-            app.file_view_cache = Some(parsed);
-            // What `render_file_view` genuinely writes alongside a real
-            // `LspFileStatus::Analyzed { errors: 1, .. }` for this exact diagnostic list: one
-            // real error, not three - the same real count the File view's own footer displays.
-            app.file_view_diagnostics = by_line;
-            app.file_view_error_count = Some(1);
+            app.code_view = crate::code_surface::code_view::CodeView::File;
+            app.open_change = Some(std::path::PathBuf::from("a.rs"));
+            app.file_view_cache = crate::code_surface::code_view::load_file(&file_path).ok();
+            app.file_view_error_count = Some(3);
+            app.code_cursor = Some(7);
         });
         cx.run_until_parked();
-
-        let error_count = app.read_with(cx, |app, _| app.status_bar_error_count());
-        assert_eq!(
-            error_count,
-            Some(1),
-            "a single diagnostic spanning three lines must count once in the status bar, \
-             matching the File view's own footer - not once per line it touches"
-        );
-    }
-
-    /// The status bar's file-specific fields (including the error count) must disappear while
-    /// Settings covers the whole workspace, rather than keep showing a frozen snapshot of
-    /// whatever file was open right before Settings opened.
-    #[gpui::test]
-    fn file_specific_fields_disappear_while_settings_is_open(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = repo.path().join("broken.rs");
-        std::fs::write(&file_path, "fn main() {\n    let x = 1;\n}\n").expect("write broken.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let parsed = code_view::load_file(&file_path).expect("load_file");
-        app.update(cx, |app, _cx| {
-            app.code_view = code_view::CodeView::File;
-            app.open_change = Some(PathBuf::from("broken.rs"));
-            app.file_view_cache = Some(parsed);
-            app.file_view_error_count = Some(2);
-            app.code_cursor = Some(1);
-        });
-        cx.run_until_parked();
-
         assert!(
-            app.read_with(cx, |app, _| app.status_bar_active_parsed_file().is_some()),
-            "sanity check: with Settings closed, a real, matching file view is genuinely active"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.status_bar_error_count()),
-            Some(2),
-            "sanity check: the error count is genuinely shown before Settings opens"
-        );
-
-        cx.dispatch_action(ToggleSettings);
-        cx.run_until_parked();
-
-        assert!(
-            app.read_with(cx, |app, _| app.settings_open),
-            "sanity check: Settings genuinely opened"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.status_bar_active_parsed_file().is_none()),
-            "the file-specific gate must return None while Settings covers the whole workspace"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.status_bar_error_count()),
-            None,
-            "the error count must disappear while Settings is open, not keep showing a frozen \
-             snapshot of the file that was open before Settings covered the workspace"
+            cx.debug_bounds("status-bar-zoom-value").is_none(),
+            "a real, open file must not resurrect any part of the deleted editor cluster"
         );
     }
 }
@@ -844,8 +1230,9 @@ mod status_bar_branch_cluster_visibility_tests {
     }
 
     /// A real repo on a real branch, so the cluster has genuine branch text to show rather than
-    /// falling through to `"(detached)"` for want of a git repository at all.
-    fn seeded_repo() -> tempfile::TempDir {
+    /// falling through to `"(detached)"` for want of a git repository at all. Shared with
+    /// `super::resources_popover_tests`, which needs the same real worktree list.
+    pub(super) fn seeded_repo() -> tempfile::TempDir {
         let repo = tempfile::tempdir().expect("tempdir");
         git(repo.path(), &["init", "-b", "main"]);
         git(repo.path(), &["config", "user.email", "test@example.com"]);
@@ -914,5 +1301,170 @@ mod status_bar_branch_cluster_visibility_tests {
             "clicking the branch cluster with no agent open must really open the git graph tab, \
              through the same AdeApp::open_git_graph the + menu and palette use"
         );
+    }
+}
+
+/// The Resources popover, driven through the real bar: a real click on the real readout, a real
+/// tree built from the app's own real agents.
+#[cfg(test)]
+mod resources_popover_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn clicking_the_resources_readout_really_opens_and_closes_the_popover(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.resources_popover_open),
+            "sanity check: the popover starts closed"
+        );
+        assert!(
+            cx.debug_bounds("status-bar-resources-popover").is_none(),
+            "sanity check: nothing is painted while it is closed"
+        );
+
+        let bounds = cx
+            .debug_bounds("status-bar-resources")
+            .expect("the resources readout must paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app.resources_popover_open),
+            "a real click on the readout must open the Resources popover"
+        );
+        assert!(
+            cx.debug_bounds("status-bar-resources-popover").is_some(),
+            "and the panel must really paint"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.resources_popover_open),
+            "a second click must close it again"
+        );
+    }
+
+    /// §4d's `repo → worktree → agent`, built from the app's own real state: opening a real git
+    /// repo spawns a real startup agent in a real worktree, so the tree must carry that agent
+    /// under that repo's name, through the rail's own grouping, plus Jerry's own row.
+    #[gpui::test]
+    fn the_tree_is_keyed_repo_then_worktree_then_agent_and_includes_jerry_itself(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = super::status_bar_branch_cluster_visibility_tests::seeded_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let (tree, repo_name) = app.update(cx, |app, cx| {
+            let name = app
+                .repos
+                .first()
+                .map(|repo| repo.name.clone())
+                .expect("a real focused repo");
+            (app.build_resource_tree(cx), name)
+        });
+
+        assert!(
+            tree.groups
+                .iter()
+                .any(|group| group.repo_name == JERRY_GROUP_LABEL),
+            "Jerry's own process must be a real row - the readout promises what Jerry costs this \
+             machine, and a total that excluded the window would not be that number"
+        );
+        let repo_group = tree
+            .groups
+            .iter()
+            .find(|group| group.repo_name == repo_name)
+            .expect("the opened repo must be a group of its own");
+        assert!(
+            !repo_group.rows.is_empty(),
+            "the repo's real startup agent must appear under it"
+        );
+        // The middle level really is the *rail's* worktree, not a path basename guessed by the
+        // fallback: this repo's one worktree is on branch `main`, and only the hierarchy walk
+        // knows that.
+        assert!(
+            repo_group
+                .rows
+                .iter()
+                .any(|row| row.worktree_label == "main"),
+            "the agent must be attributed through the rail's own repo -> worktree hierarchy, \
+             which is where the branch name comes from - got {:?}",
+            repo_group
+                .rows
+                .iter()
+                .map(|row| row.worktree_label.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every open agent with a real pid appears exactly once in the tree, whatever the rail's
+    /// grouping currently knows about its worktree - a directory that is not a git repo at all
+    /// still runs a real startup shell that really costs this machine something, and a readout
+    /// claiming to be the whole cost must not silently drop it.
+    #[gpui::test]
+    fn every_open_agent_is_accounted_for_exactly_once(cx: &mut TestAppContext) {
+        // Deliberately *not* a git repo: this is the case where the rail has no worktree rows to
+        // hang the agent off, which is exactly when the fallback attribution has to carry it.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let (tree, live_pids) = app.update(cx, |app, cx| {
+            let pids: Vec<u32> = app
+                .agents
+                .iter()
+                .filter_map(|agent| agent.pane.read(cx).pid())
+                .collect();
+            (app.build_resource_tree(cx), pids)
+        });
+        assert!(
+            !live_pids.is_empty(),
+            "sanity check: opening a repo really spawns a process with a real pid"
+        );
+
+        let tree_pids: Vec<u32> = tree.rows().map(|row| row.pid).collect();
+        for pid in &live_pids {
+            assert_eq!(
+                tree_pids.iter().filter(|listed| *listed == pid).count(),
+                1,
+                "pid {pid} is a real, live agent process and must appear exactly once in the \
+                 tree - dropping it makes the bar under-report, counting it twice makes it \
+                 over-report"
+            );
+        }
+        assert!(
+            tree_pids.contains(&std::process::id()),
+            "and Jerry's own process is in there too"
+        );
+    }
+
+    /// The popover trigger carries **no** worktree or agent count (§3: "Do not put worktree or
+    /// agent counts here; the rail footer already carries them 30px away"), and no meter (§4d).
+    /// Checked against the real derived readout text.
+    #[gpui::test]
+    fn the_readout_carries_only_cost_no_counts(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let readout = app.update(cx, |app, cx| app.build_resource_tree(cx).bar_readout());
+        assert!(
+            readout.contains("cpu"),
+            "the readout is the cost readout: {readout}"
+        );
+        for forbidden in ["worktree", "agent", "wt "] {
+            assert!(
+                !readout.contains(forbidden),
+                "the resources readout must not carry a {forbidden} count - the rail footer \
+                 already does, 30px away. Got: {readout}"
+            );
+        }
     }
 }

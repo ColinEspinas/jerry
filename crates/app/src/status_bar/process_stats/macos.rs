@@ -171,6 +171,53 @@ fn mach_ticks_to_nanos(ticks: u64) -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
+/// See [`super::system_memory_bytes`] - this machine's real total physical memory, from one
+/// `sysctlbyname("hw.memsize")` call.
+///
+/// `sysctlbyname` with the string name rather than a `[CTL_HW, HW_MEMSIZE]` mib array: the name
+/// form is the documented, stable spelling and needs no numeric constant whose value would have
+/// to be trusted sight-unseen from a machine that cannot run this code. `hw.memsize` (not
+/// `hw.physmem`) is the 64-bit field - `hw.physmem` is a 32-bit `int` that saturates at 2 GB and
+/// would silently under-report every real Mac this app runs on.
+///
+/// Read once and cached: installed physical memory cannot change while the process runs, and this
+/// is the denominator of a meter redrawn on every frame the Resources popover is open.
+pub fn system_memory_bytes() -> Option<u64> {
+    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(read_total_memory_bytes)
+}
+
+/// The uncached `sysctlbyname("hw.memsize")` reading behind [`system_memory_bytes`], separate so
+/// the test below exercises the real call rather than a cached first result.
+fn read_total_memory_bytes() -> Option<u64> {
+    let name = c"hw.memsize";
+    let mut value: u64 = 0;
+    let mut len: libc::size_t = std::mem::size_of::<u64>();
+
+    // SAFETY: `name` is a real, NUL-terminated C string with a lifetime covering the whole call.
+    // `value` is a live, stack-owned, uniquely borrowed `u64` and `len` is initialised to exactly
+    // its size, which is the contract `sysctlbyname` requires: it writes at most `len` bytes
+    // through the pointer and updates `len` with what it actually wrote. The last two arguments
+    // are the documented "no new value" form (null pointer, zero length), so this is a pure read.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    // A short write would mean the kernel answered with a narrower type than `hw.memsize`'s
+    // documented `uint64_t`, leaving the high bytes of `value` as the zeros they were initialised
+    // to - a silently wrong total rather than a failure, so it is rejected explicitly.
+    if result != 0 || len != std::mem::size_of::<u64>() || value == 0 {
+        return None;
+    }
+    Some(value)
+}
+
 /// One real `proc_pid_rusage(pid, RUSAGE_INFO_V0, ...)` call. `None` when the call fails - the
 /// process has exited, or this app may not query it - never a zeroed struct passed off as a real
 /// reading.
@@ -239,6 +286,27 @@ mod tests {
     fn a_nonexistent_pid_is_an_honest_none() {
         assert_eq!(Sampler.cpu_time(u32::MAX), None);
         assert_eq!(Sampler.resident_bytes(u32::MAX), None);
+    }
+
+    /// A real `sysctlbyname("hw.memsize")` read on the runner itself: every real Mac has some
+    /// physical memory, and it is always at least as large as this process's own resident set -
+    /// which is what makes it a usable meter denominator rather than a number that could put the
+    /// numerator past 100%.
+    #[test]
+    fn reads_this_real_machines_total_memory() {
+        let total = read_total_memory_bytes().expect("hw.memsize must be readable on a real Mac");
+        let own_rss = Sampler
+            .resident_bytes(std::process::id())
+            .expect("own resident size");
+        assert!(
+            total >= own_rss,
+            "total physical memory ({total}) must be at least this process's own RSS ({own_rss})"
+        );
+        assert_eq!(
+            system_memory_bytes(),
+            Some(total),
+            "the cached accessor must return the same real reading, not a separate guess"
+        );
     }
 
     /// The timebase ratio is a real, sane hardware value - `1/1` on Intel, `125/3` on Apple

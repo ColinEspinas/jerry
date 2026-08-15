@@ -38,6 +38,13 @@ impl ProcessSampler for Sampler {
     }
 }
 
+/// See [`super::system_memory_bytes`] - honestly `None`, like every other reading here. The
+/// Resources popover's memory meter renders no fill at all rather than one against a guessed
+/// denominator.
+pub fn system_memory_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +56,7 @@ mod tests {
         let pid = std::process::id();
         assert_eq!(Sampler.cpu_time(pid), None);
         assert_eq!(Sampler.resident_bytes(pid), None);
+        assert_eq!(super::system_memory_bytes(), None);
         assert_eq!(Sampler.backend_name(), "unsupported");
         // [`SUPPORTED`] is what the status bar reads to omit the cpu/memory fields entirely, so
         // what actually matters is that it agrees with what this backend can really produce -
