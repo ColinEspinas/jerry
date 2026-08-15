@@ -482,10 +482,10 @@ impl AdeApp {
             return;
         }
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.commit_message.pop(Instant::now()),
+            "backspace" => self.commit_message.backspace(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => {
-                    self.commit_message.push_str(text, Instant::now())
+                    self.commit_message.insert_str(text, Instant::now())
                 }
                 _ => false,
             },

@@ -424,6 +424,13 @@ impl AdeApp {
             (_, Some(note)) => note.text.clone(),
             _ => String::new(),
         };
+        // Only the card actually being edited has a caret at all, so only its draft's own offset
+        // is meaningful; a pinned, read-only card renders with `focus_handle: None` and never
+        // paints one.
+        let text_caret = match &self.note_draft {
+            Some(draft) if editing => draft.field.caret(),
+            _ => text.len(),
+        };
         let mark = note.map(|note| note.mark()).unwrap_or(NoteMark::Draft);
         // The honest half of the draft/sent history: a card that has been sent and then edited
         // can still say what the agent really was told.
@@ -508,6 +515,7 @@ impl AdeApp {
                         text_selector: SharedString::from(text_selector),
                         focus_handle: editing.then_some(&self.note_focus_handle),
                         text: &text,
+                        caret_offset: text_caret,
                         placeholder: NOTE_PLACEHOLDER,
                         font: theme::font::SANS,
                         text_size: px(11.5),

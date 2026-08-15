@@ -857,9 +857,11 @@ impl AdeApp {
             return;
         };
         let changed = match keystroke.key.as_str() {
-            "backspace" => row.reword_message.pop(Instant::now()),
+            "backspace" => row.reword_message.backspace(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => row.reword_message.push_str(text, Instant::now()),
+                Some(text) if !text.is_empty() => {
+                    row.reword_message.insert_str(text, Instant::now())
+                }
                 _ => false,
             },
         };

@@ -2161,7 +2161,7 @@ mod palette_result_focus_tests {
             app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
             app.update(cx, |app, _| {
                 app.palette_query
-                    .push_str(command.label(), std::time::Instant::now());
+                    .insert_str(command.label(), std::time::Instant::now());
             });
             cx.run_until_parked();
 

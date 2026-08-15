@@ -1134,6 +1134,7 @@ impl AdeApp {
                         text_selector: "settings-shell-text".into(),
                         focus_handle: Some(&self.shell_focus_handle),
                         text: if has_shell { &shell } else { "" },
+                        caret_offset: self.shell_input.caret(),
                         placeholder: &placeholder,
                         font: theme::font::MONO,
                         text_size: self.ui_text_size(10.5),
@@ -1169,13 +1170,13 @@ impl AdeApp {
         self.reset_caret_blink(cx);
         let escaped = keystroke.key.as_str() == "escape";
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.shell_input.pop(Instant::now()),
+            "backspace" => self.shell_input.backspace(Instant::now()),
             // Clearing the field is itself a real, meaningful edit here (it means "go back to the
             // system default"), so it persists like any other - and is undoable, like every other
             // simple input's `Esc`.
             "escape" => self.shell_input.clear(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => self.shell_input.push_str(text, Instant::now()),
+                Some(text) if !text.is_empty() => self.shell_input.insert_str(text, Instant::now()),
                 _ => false,
             },
         };
@@ -2146,7 +2147,7 @@ impl AdeApp {
         }
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.theme_seed_input.pop(Instant::now()),
+            "backspace" => self.theme_seed_input.backspace(Instant::now()),
             "escape" => self.theme_seed_input.clear(Instant::now()),
             "enter" => {
                 self.start_generate_theme_from_seed(cx);
@@ -2154,7 +2155,7 @@ impl AdeApp {
             }
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => {
-                    self.theme_seed_input.push_str(text, Instant::now())
+                    self.theme_seed_input.insert_str(text, Instant::now())
                 }
                 _ => false,
             },
@@ -2644,6 +2645,7 @@ impl AdeApp {
                         text_selector: "settings-keymap-filter-text".into(),
                         focus_handle: Some(&self.settings_keymap_filter_focus_handle),
                         text: self.settings_keymap_filter.as_str(),
+                        caret_offset: self.settings_keymap_filter.caret(),
                         placeholder: &format!("filter {}", plural::count(total, "binding", None)),
                         font: theme::font::SANS,
                         text_size: px(11.0),
@@ -2677,13 +2679,13 @@ impl AdeApp {
         // handle_palette_key_down`'s identical reasoning.
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.settings_keymap_filter.pop(Instant::now()),
+            "backspace" => self.settings_keymap_filter.backspace(Instant::now()),
             // A real, undoable step - see `crate::rail::AdeApp::handle_filter_key_down`'s own
             // identical `Esc` handling.
             "escape" => self.settings_keymap_filter.clear(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => {
-                    self.settings_keymap_filter.push_str(text, Instant::now())
+                    self.settings_keymap_filter.insert_str(text, Instant::now())
                 }
                 _ => false,
             },

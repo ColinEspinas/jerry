@@ -237,12 +237,17 @@ impl AdeApp {
         )
     }
 
-    /// Types (or backspaces/clears) into [`Self::filter_query`] - a small, hand-rolled text
-    /// field (append/backspace only, no cursor positioning or selection) rather than
+    /// Types into [`Self::filter_query`] - a small, hand-rolled text field rather than
     /// `vendor/zed/crates/gpui/examples/input.rs`'s full `EntityInputHandler`, judged out of
     /// scope for a single filter row. Modified keystrokes (⌘, ⌃, ⌥) are left unhandled and
     /// keep propagating, so app-level shortcuts (e.g. ⌘N) still reach their bindings while
     /// this field has focus.
+    ///
+    /// Every key but `Esc` is `crate::text_history::TextField::handle_editing_key`'s, which is
+    /// where GitHub issue #162's real caret arrived: Left/Right/Home/End/Delete work here now,
+    /// not only in the search panel that motivated the upgrade. That is the issue's own "benefits
+    /// every other filter row", taken literally rather than left as a claim about a capability
+    /// nothing else calls.
     pub(in crate::rail) fn handle_filter_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -257,14 +262,14 @@ impl AdeApp {
         // handle_palette_key_down`'s identical reasoning.
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.filter_query.pop(Instant::now()),
             // A real, undoable step, not a silent loss: `Esc` clearing a typed filter is exactly
             // the case Ctrl+Z should bring back. See `crate::text_history::TextField::set`.
             "escape" => self.filter_query.clear(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => self.filter_query.push_str(text, Instant::now()),
-                _ => false,
-            },
+            key => self.filter_query.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                Instant::now(),
+            ),
         };
         if changed {
             self.prune_confirm_armed = false;
@@ -964,6 +969,7 @@ impl AdeApp {
                 text_selector: "rail-filter-text".into(),
                 focus_handle: Some(&self.filter_focus_handle),
                 text: self.filter_query.as_str(),
+                caret_offset: self.filter_query.caret(),
                 placeholder: match view {
                     rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
                     rail_strip::SidebarView::Problems => "filter problems",
@@ -2920,7 +2926,7 @@ mod rail_row_tests {
         // Type a filter query that matches only "alpha", not "beta".
         app.update(cx, |app, _cx| {
             app.filter_query
-                .push_str("alpha", std::time::Instant::now());
+                .insert_str("alpha", std::time::Instant::now());
         });
 
         let groups_after_filter = app.update(cx, |app, cx| app.build_repo_groups(cx));

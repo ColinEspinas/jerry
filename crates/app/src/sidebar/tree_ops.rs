@@ -658,7 +658,7 @@ impl AdeApp {
             }
             "backspace" => {
                 if let Some(edit) = self.tree_inline_edit.as_mut() {
-                    edit.name.pop(Instant::now());
+                    edit.name.backspace(Instant::now());
                     edit.error = None;
                     cx.notify();
                     cx.stop_propagation();
@@ -671,7 +671,7 @@ impl AdeApp {
                     .filter(|text| !text.is_empty())
                 {
                     if let Some(edit) = self.tree_inline_edit.as_mut() {
-                        edit.name.push_str(text, Instant::now());
+                        edit.name.insert_str(text, Instant::now());
                         edit.error = None;
                         cx.notify();
                         cx.stop_propagation();

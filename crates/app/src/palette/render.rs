@@ -646,7 +646,7 @@ impl AdeApp {
                 cx.stop_propagation();
             }
             "backspace" => {
-                self.palette_query.pop(Instant::now());
+                self.palette_query.backspace(Instant::now());
                 self.palette_selected = 0;
                 cx.notify();
                 cx.stop_propagation();
@@ -692,7 +692,7 @@ impl AdeApp {
                         }
                     }
                 }
-                self.palette_query.push_str(text, Instant::now());
+                self.palette_query.insert_str(text, Instant::now());
                 self.palette_selected = 0;
                 cx.notify();
                 cx.stop_propagation();

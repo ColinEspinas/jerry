@@ -1181,13 +1181,13 @@ impl AdeApp {
         // exactly why this field never blinked in the first place.
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.graph_state.branches_filter.pop(Instant::now()),
+            "backspace" => self.graph_state.branches_filter.backspace(Instant::now()),
             "escape" => self.graph_state.branches_filter.clear(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => self
                     .graph_state
                     .branches_filter
-                    .push_str(text, Instant::now()),
+                    .insert_str(text, Instant::now()),
                 _ => false,
             },
         };
@@ -1243,7 +1243,9 @@ impl AdeApp {
             }
             "backspace" => {
                 if self.graph_state.branch_prompt.is_some() {
-                    self.graph_state.branch_prompt_name.pop(Instant::now());
+                    self.graph_state
+                        .branch_prompt_name
+                        .backspace(Instant::now());
                     if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                         open.error = None;
                     }
@@ -1261,7 +1263,7 @@ impl AdeApp {
                     if self.graph_state.branch_prompt.is_some() {
                         self.graph_state
                             .branch_prompt_name
-                            .push_str(text, Instant::now());
+                            .insert_str(text, Instant::now());
                         if let Some(open) = self.graph_state.branch_prompt.as_mut() {
                             open.error = None;
                         }
@@ -3094,6 +3096,7 @@ impl AdeApp {
                 text_selector: "graph-branches-filter-text".into(),
                 focus_handle: Some(&self.graph_state.branches_filter_focus_handle),
                 text: self.graph_state.branches_filter.as_str(),
+                caret_offset: self.graph_state.branches_filter.caret(),
                 placeholder: "filter branches",
                 font: theme::font::MONO,
                 text_size: px(10.5),
