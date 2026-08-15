@@ -1028,13 +1028,17 @@ pub(in crate::code_surface) fn render_diff_line(
         )
         .child(text_row)
         // The gesture itself, and only where a line really has an identity to pin a note to.
+        // The gesture itself, and only where a line really has an identity to pin a note to.
+        //
+        // Deliberately **no tooltip on the row**. Ride-along I11 asks for one on *"every icon-only
+        // or otherwise unlabelled control"*, and a diff line is neither - it is content, and the
+        // note column beside it is the affordance. A row-wide tooltip also turned out to be a real
+        // interaction hazard rather than only noise: it is a deferred overlay drawn next to the
+        // pointer, i.e. potentially directly under it, where it can absorb the very click it is
+        // describing. The card and the send button, which *are* controls, keep theirs.
         .when_some(anchor, |el, anchor| {
             el.cursor_pointer()
                 .hover(|style| style.bg(theme::surface::ROW_HOVER))
-                .tooltip(crate::root::widgets::text_tooltip(match note {
-                    Some(_) => NOTE_LINE_TOOLTIP_EXISTING,
-                    None => NOTE_LINE_TOOLTIP_NEW,
-                }))
                 .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     this.toggle_line_note(anchor, window, cx);
                 }))
@@ -1057,12 +1061,6 @@ fn render_note_column(note: Option<NoteMark>, is_note_cursor: bool) -> impl Into
         .text_color(color)
         .child(glyph)
 }
-
-/// The two halves of what a click on a diff line does, as tooltips - ride-along I11's *"every
-/// icon-only or otherwise unlabelled control"*, and a whole diff row with a hover state and no
-/// label is exactly that.
-const NOTE_LINE_TOOLTIP_NEW: &str = "Click to pin a review note on this line";
-const NOTE_LINE_TOOLTIP_EXISTING: &str = "Click to edit this line's review note";
 
 /// Everything [`render_diff_line`] needs beyond the diff line itself.
 ///
