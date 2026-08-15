@@ -320,8 +320,11 @@ impl AdeApp {
         // the editor instead of itself. Found by this module's own `find_bar_tests`, which typed
         // `left left ...` into the bar and got the text back unmoved.
         //
-        // Rendered above the surface rather than over it: a find bar that covers the first line
-        // of what it is searching is hiding a result it is meant to point at.
+        // It therefore sits at the very top of the pane, above the file toolbar, rather than
+        // between the toolbar and the content: that is the one position outside the editor's own
+        // context stack. It is also the position Zed puts its own buffer search in - the bar
+        // belongs to the pane, not to the line it is pointing at - and it keeps the bar from
+        // covering the first line of what it is searching, which a floating overlay would.
         if self.find_bar.is_none() {
             return surface;
         }
