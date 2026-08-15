@@ -19,6 +19,7 @@ pub mod keymap;
 pub mod keymap_overrides;
 pub mod language;
 pub mod lsp;
+pub mod menu;
 pub mod merge;
 pub mod palette;
 // `pub(crate)`: a single small lock shared by `rail::repo`/`sidebar::fold_state`/

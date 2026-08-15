@@ -366,7 +366,7 @@ impl AdeApp {
     }
 
     /// Opens the context menu for `target` at a real click position, clamped so the whole
-    /// popover stays inside the window (`context_menu::clamp_menu_origin`).
+    /// popover stays inside the window (`crate::menu::model::clamp_menu_origin`).
     ///
     /// Also focuses the tree and selects the targeted row - a right-click is a real selection
     /// gesture in its own right, independent of the menu it also opens.
@@ -409,11 +409,11 @@ impl AdeApp {
         // edge would overhang it.
         let rows = context_menu::menu_rows(&target, self.tree_clipboard.is_some());
         let viewport = window.bounds().size;
-        let (origin_x, origin_y) = context_menu::clamp_menu_origin(
+        let (origin_x, origin_y) = crate::menu::model::clamp_menu_origin(
             click_x,
             click_y,
-            context_menu::MENU_WIDTH,
-            context_menu::menu_height(&rows),
+            crate::menu::model::MENU_WIDTH,
+            crate::menu::model::menu_height(&rows),
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
@@ -2902,12 +2902,12 @@ mod tree_ops_regression_tests {
             let rows = context_menu::menu_rows(&menu.target, false);
             assert!(
                 menu.origin_x >= 0.0
-                    && menu.origin_x + context_menu::MENU_WIDTH <= f32::from(viewport.width),
+                    && menu.origin_x + crate::menu::model::MENU_WIDTH <= f32::from(viewport.width),
                 "the popover must sit inside the window"
             );
             assert!(
                 menu.origin_y >= 0.0
-                    && menu.origin_y + context_menu::menu_height(&rows)
+                    && menu.origin_y + crate::menu::model::menu_height(&rows)
                         <= f32::from(viewport.height)
             );
         });
@@ -3668,7 +3668,8 @@ mod tree_ops_regression_tests {
             ContextTarget::Folder(repo.path().join("src")),
             ContextTarget::Empty,
         ] {
-            let expected = context_menu::menu_height(&context_menu::menu_rows(&target, false));
+            let expected =
+                crate::menu::model::menu_height(&context_menu::menu_rows(&target, false));
             app.update_in(cx, |app, window, cx| {
                 app.tree_clipboard = None;
                 app.open_tree_context_menu(target.clone(), 40.0, 80.0, window, cx);

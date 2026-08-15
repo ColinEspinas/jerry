@@ -15,7 +15,8 @@
 //!
 //! §8's "Stays hand-drawn" list is Jerry's own vocabulary and is deliberately **not** touched by
 //! this module: agent tint chips, status dots, file-extension chips, diff gutter marks, and the
-//! graph's lanes and merge elbows. [`Icon`] is exactly §8's eleven mapped slots, no more.
+//! graph's lanes and merge elbows. [`Icon`] is §8's eleven mapped slots plus the one slot §4u
+//! names outside that table (the overflow menu's Settings row, GitHub issue #290), no more.
 //!
 //! ## Sizing: one optical box per row, never one size per icon
 //!
@@ -54,7 +55,7 @@
 //! ## User icon packs still override, by name
 //!
 //! `crate::icon_pack::resolve_icon` is unchanged and still wins: a pack that really contains
-//! `<name>.svg` for one of these eleven names replaces the shipped file for that slot
+//! `<name>.svg` for one of these names replaces the shipped file for that slot
 //! ([`resolve_source`]). The pack's own icons are looked up by the same design-handoff names this
 //! module uses (`folder`, `trash`, ...), so a pack author needs nothing but the name.
 //!
@@ -109,6 +110,10 @@ pub const ICON_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/magnifying-glass.svg"),
     ),
     (
+        "icons/sliders-horizontal.svg",
+        include_bytes!("../../../assets/icons/sliders-horizontal.svg"),
+    ),
+    (
         "icons/terminal-window.svg",
         include_bytes!("../../../assets/icons/terminal-window.svg"),
     ),
@@ -126,9 +131,10 @@ pub const ICON_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// One shipped Phosphor glyph. Exactly `REVISION-2026-08-14.md` §8's mapping table - eleven
-/// slots, no speculative extras: an icon nothing draws is an affordance with no behaviour behind
-/// it, which §7 rule 1 rules out ("Ship the affordance with the behaviour, or ship neither").
+/// One shipped Phosphor glyph. `REVISION-2026-08-14.md` §8's mapping table, plus the overflow
+/// menu's Settings glyph §4u names (GitHub issue #290) - and no speculative extras: an icon
+/// nothing draws is an affordance with no behaviour behind it, which §7 rule 1 rules out ("Ship
+/// the affordance with the behaviour, or ship neither").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
     /// Search panel's count row: replace.
@@ -145,6 +151,10 @@ pub enum Icon {
     GitBranch,
     /// Right-panel tab: Search.
     MagnifyingGlass,
+    /// The `⋯` overflow menu: Settings (GitHub issue #290). `STAGE-A-CHANGELOG.md` §4u:
+    /// History and Settings keep "the glyphs they had in the strip (clock, sliders) so the move
+    /// out of the strip does not cost their recognisability".
+    SlidersHorizontal,
     /// Work-surface tab strip: terminal.
     TerminalWindow,
     /// Rail footer: prune merged worktrees.
@@ -165,6 +175,7 @@ impl Icon {
         Icon::Funnel,
         Icon::GitBranch,
         Icon::MagnifyingGlass,
+        Icon::SlidersHorizontal,
         Icon::TerminalWindow,
         Icon::Trash,
         Icon::TreeStructure,
@@ -183,6 +194,7 @@ impl Icon {
             Icon::Funnel => "funnel",
             Icon::GitBranch => "git-branch",
             Icon::MagnifyingGlass => "magnifying-glass",
+            Icon::SlidersHorizontal => "sliders-horizontal",
             Icon::TerminalWindow => "terminal-window",
             Icon::Trash => "trash",
             Icon::TreeStructure => "tree-structure",
@@ -201,6 +213,7 @@ impl Icon {
             Icon::Funnel => "icons/funnel.svg",
             Icon::GitBranch => "icons/git-branch.svg",
             Icon::MagnifyingGlass => "icons/magnifying-glass.svg",
+            Icon::SlidersHorizontal => "icons/sliders-horizontal.svg",
             Icon::TerminalWindow => "icons/terminal-window.svg",
             Icon::Trash => "icons/trash.svg",
             Icon::TreeStructure => "icons/tree-structure.svg",
@@ -225,6 +238,9 @@ pub enum IconSize {
     /// magnifier 8x8, diff 7x7 - so three icons on one row had three weights". The mock's own
     /// shapes actually span y 3.5-14.5, i.e. 11x11; 11 is the box both readings agree on.
     PanelTab,
+    /// 13px - a row of the app's shared menu (`crate::menu`). `Jerry.dc.html`'s own context-menu
+    /// row draws its leading glyph in a `width:13px;height:13px` box.
+    MenuRow,
     /// 14px - the work-surface tab strip's per-tab chip (`Jerry.dc.html`:
     /// `width:14px;height:14px`), shared by every tab kind on that strip, terminal included.
     TabChip,
@@ -241,6 +257,7 @@ impl IconSize {
     /// Every named size.
     pub const ALL: &'static [IconSize] = &[
         IconSize::PanelTab,
+        IconSize::MenuRow,
         IconSize::TabChip,
         IconSize::Strip,
         IconSize::Control,
@@ -250,6 +267,7 @@ impl IconSize {
     pub const fn box_size(self) -> Pixels {
         match self {
             IconSize::PanelTab => px(11.0),
+            IconSize::MenuRow => px(13.0),
             IconSize::TabChip => px(14.0),
             IconSize::Strip => px(15.0),
             IconSize::Control => px(17.0),
@@ -426,6 +444,11 @@ mod tests {
         ("count row: filter", Icon::Funnel, "funnel"),
         ("count row: fold-all", Icon::CaretDown, "caret-down"),
         ("rail footer: prune", Icon::Trash, "trash"),
+        (
+            "overflow menu: Settings",
+            Icon::SlidersHorizontal,
+            "sliders-horizontal",
+        ),
         (
             "tab strip: terminal",
             Icon::TerminalWindow,
@@ -831,6 +854,7 @@ mod tests {
             "icon-funnel",
             "icon-git-branch",
             "icon-magnifying-glass",
+            "icon-sliders-horizontal",
             "icon-terminal-window",
             "icon-trash",
             "icon-tree-structure",

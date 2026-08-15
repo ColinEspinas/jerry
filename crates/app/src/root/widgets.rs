@@ -521,7 +521,7 @@ pub(crate) fn render_modal_button(
 /// One group divider's whole vertical footprint, in px: the 1px rule of
 /// [`render_menu_group_divider`] plus its 4px margins top and bottom. Exported because the two
 /// menus that have to *measure* themselves - `crate::title_bar::menu`'s row-index math and
-/// `crate::sidebar::context_menu::menu_height`'s window-edge clamp - both read the real number
+/// `crate::menu::model::menu_height`'s window-edge clamp - both read the real number
 /// rather than each restating `1 + 4 + 4`.
 pub(crate) const MENU_GROUP_DIVIDER_HEIGHT: Pixels = px(9.0);
 

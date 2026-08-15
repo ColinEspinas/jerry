@@ -366,6 +366,10 @@ impl AdeApp {
             fold_state_save_running: false,
             // Nothing has been walked yet, so nothing may be pruned yet either.
             file_tree_complete: false,
+            rail_row_menu: None,
+            rail_overflow_menu: None,
+            rail_overflow_button_bounds: gpui::Bounds::default(),
+            remove_worktree_confirm_armed: None,
             tree_context_menu: None,
             tree_inline_edit: None,
             tree_clipboard: None,

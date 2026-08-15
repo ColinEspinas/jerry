@@ -12,7 +12,6 @@ use crate::work_surface::agents::AgentId;
 use crate::work_surface::agents::ProcessKind;
 use gpui::{Context, Window};
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 
 pub(crate) mod flow;

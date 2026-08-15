@@ -136,19 +136,76 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.worktree_history_op_in_flight.is_some() {
-            return;
-        }
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
         };
         let worktree_path = agent.cwd.clone();
+        self.execute_discard_worktree_path(worktree_path, cx);
+    }
+
+    /// The rail's `Remove worktree…` row (GitHub issue #290), keyed by worktree path - two
+    /// clicks, exactly like [`Self::request_discard_worktree`]'s button, and running the same
+    /// real [`Self::execute_discard_worktree_path`] underneath.
+    ///
+    /// Keyed by *path*, not by agent, because a worktree row's menu is reachable for a worktree
+    /// with no agent in it at all - and because the worktree is what the operation really acts
+    /// on. The arming state lives in [`AdeApp::remove_worktree_confirm_armed`] and is cleared by
+    /// every path that closes the menu, so a half-confirmed removal can never survive into the
+    /// next time the menu is opened.
+    ///
+    /// Returns whether this call really ran the removal (`false` when it only armed, or when
+    /// another worktree-history operation was already in flight), so the caller knows whether to
+    /// leave the menu open for the confirming click. The in-flight check is deliberately made
+    /// *before* the confirmation is touched, exactly as
+    /// `crate::graph_view::render::AdeApp::request_graph_delete_branch`'s own audit finding
+    /// requires: disarming and then refusing to run would silently turn the click the user is
+    /// about to repeat into a dead one.
+    pub(crate) fn request_discard_worktree_path(
+        &mut self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.worktree_history_op_in_flight.is_some() {
+            return false;
+        }
+        if self.remove_worktree_confirm_armed.as_deref() != Some(worktree_path.as_path()) {
+            let branch_display = self.branch_display_for(&worktree_path);
+            self.worktree_history_status = Some(format!(
+                "click Remove again to really remove {branch_display}"
+            ));
+            self.remove_worktree_confirm_armed = Some(worktree_path);
+            cx.notify();
+            return false;
+        }
+        self.prune_confirm_armed = false;
+        self.discard_confirm_armed = None;
+        self.remove_worktree_confirm_armed = None;
+        self.execute_discard_worktree_path(worktree_path, cx);
+        true
+    }
+
+    /// The real, already-confirmed discard of one worktree - the single place
+    /// `wt_core::undo::discard_worktree` is called from, whether the confirmation came from the
+    /// Review footer's per-agent button or the rail's per-worktree menu row.
+    ///
+    /// Closes **every** agent open in that worktree on success, not just the one whose button
+    /// started it: the directory all of their `cwd`s point at no longer exists, so any tab left
+    /// behind is a shell running in a deleted path.
+    pub(in crate::worktree_history) fn execute_discard_worktree_path(
+        &mut self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.worktree_history_op_in_flight.is_some() {
+            return;
+        }
         let repo_path = self.focused_repo_path();
         let branch_display = self.branch_display_for(&worktree_path);
         self.worktree_history_op_in_flight = Some(WorktreeHistoryOpKind::Discard);
         self.worktree_history_status = Some(format!("discarding {branch_display}\u{2026}"));
         cx.notify();
 
+        let discarded_path = worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -175,8 +232,16 @@ impl AdeApp {
                         } else {
                             format!("discarded {branch_display}")
                         });
-                        // The agent's cwd no longer exists.
-                        this.close_agent(id, window, cx);
+                        // Every one of these agents' cwd no longer exists.
+                        let orphaned: Vec<AgentId> = this
+                            .agents
+                            .iter_for_cwd(discarded_path.clone())
+                            .map(|agent| agent.id)
+                            .collect();
+                        for id in orphaned {
+                            this.close_agent(id, window, cx);
+                        }
+                        this.remove_worktree_confirm_armed = None;
                         this.refresh_after_worktree_history_op(cx);
                     }
                     Err(err) => {

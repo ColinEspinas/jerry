@@ -22,7 +22,7 @@ const SHELL_SUGGESTIONS_MAX_HEIGHT: gpui::Pixels = px(269.0);
 
 /// The smallest left offset the dropdown will accept, for a window narrow enough that
 /// right-aligning it against the field would push it off the left edge. Mirrors
-/// `crate::sidebar::context_menu::MENU_EDGE_MARGIN`, whose job is exactly this.
+/// `crate::menu::model::MENU_EDGE_MARGIN`, whose job is exactly this.
 const SHELL_SUGGESTIONS_EDGE_MARGIN: f32 = 4.0;
 
 /// The sound-event picker dropdown's width (GitHub issue #226) - narrower than the Shell
@@ -1335,7 +1335,7 @@ impl AdeApp {
         // panel, wider than the 168px field, grows inwards over the page rather than off it -
         // the same right-alignment the git graph's row menu uses against its own trigger. Clamped
         // to a small left margin for a genuinely narrow window, mirroring
-        // `crate::sidebar::context_menu::MENU_EDGE_MARGIN`'s own job.
+        // `crate::menu::model::MENU_EDGE_MARGIN`'s own job.
         let left = px(f32::max(
             (bounds.origin.x + bounds.size.width - SHELL_SUGGESTIONS_WIDTH).as_f32(),
             SHELL_SUGGESTIONS_EDGE_MARGIN,
