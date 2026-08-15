@@ -5692,6 +5692,88 @@ mod commit_composer_tests {
         );
     }
 
+    /// Live report: "once a file is staged the commit message input breaks again... this should
+    /// be the same input." Typed first, before anything is staged (so the field seeds from the
+    /// empty draft, not a real file's), then a file gets staged out from under it - the field
+    /// must keep the user's own text, keep real keyboard focus, and keep accepting real
+    /// keystrokes, exactly the way [`clicking_the_message_box_and_typing_really_edits_it`] proves
+    /// for the reverse order (stage first, then type).
+    #[gpui::test]
+    fn typing_before_staging_survives_a_later_stage(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        assert!(
+            cx.debug_bounds("commit-composer-message-empty").is_some(),
+            "sanity check: nothing is staged yet, so the box starts on the empty draft"
+        );
+
+        let bounds = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let message_handle = app.update_in(cx, |app, _window, _cx| {
+            app.commit_message_focus_handle.clone()
+        });
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&message_handle),
+            "a real click on the empty field must really focus it"
+        );
+
+        cx.simulate_input("fixes the race");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race",
+            "sanity check: typing into the empty field works before anything is staged"
+        );
+
+        // A real click on the checkbox itself, not a direct `toggle_staged` call - this goes
+        // through GPUI's real mouse-down/mouse-up dispatch, which is what a live mousedown-then-
+        // blur interaction (were there one) would actually exercise.
+        let checkbox = cx
+            .debug_bounds("stage-checkbox-a.txt")
+            .expect("the staging checkbox must really paint");
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app
+                .staged_files
+                .contains(&PathBuf::from("a.txt"))),
+            "sanity check: the click really staged the file"
+        );
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race",
+            "staging a file must not touch the user's own already-typed message"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_commit_message()),
+            "fixes the race",
+            "and the composer must still read the user's text, not fall back to a fresh draft \
+             for the newly-staged file"
+        );
+        assert_eq!(
+            app.update_in(cx, |_app, window, cx| window.focused(cx))
+                .as_ref(),
+            Some(&message_handle),
+            "staging a file must not steal keyboard focus off the message field"
+        );
+
+        cx.simulate_input(", closes #2");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.commit_message.as_str().to_string()),
+            "fixes the race, closes #2",
+            "the field must still be genuinely editable after a stage happened under it - not \
+             just displaying stale text but refusing further real keystrokes"
+        );
+    }
+
     /// The edited message must be what a real commit actually writes, not just what the box
     /// displays - the whole point of wiring the field into `staged_commit_message` rather than a
     /// parallel piece of state the primary button never reads.
