@@ -465,40 +465,25 @@ pub fn action_button_colors(style: ActionStyle) -> ActionColors {
 /// handlers dispatch on this. Every variant either has real backing logic wired up, or is
 /// rendered honestly disabled (see [`FooterAction::implemented`]) - never a button that looks
 /// clickable but silently does nothing.
+///
+/// GitHub issue #295 cut this enum from seven variants to two. `Interrupt`, `OpenTerminal`,
+/// `KeepAllChanges`, `OpenReview` and `Unimplemented` (`Open in editor`) are **deleted**, not
+/// hidden: `STAGE-A-CHANGELOG.md` §4t makes the agent pane's bottom strip a readout rather than
+/// an action bar, and `REVISION-2026-08-14.md` §7 rule 5 forbids leaving the old keys behind
+/// ("Replacing a control means deleting its old keys in the same edit - a key defined twice is
+/// two specifications of one thing, and the reader cannot tell which is real").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Sends a `Ctrl-C` to the agent's pty (`TerminalPane::interrupt`).
-    Interrupt,
-    /// Finds-or-spawns a `Shell` agent in the same cwd and selects it.
-    OpenTerminal,
     /// Closes this tab and spawns a fresh agent of the same kind/cwd - an approximate
     /// stand-in for `Retry`/`Resume` (this app has no saved-agent resumability to actually
     /// resume *from* - see [`pty_state_label`] on the same gap).
     Respawn,
-    /// `crate::worktree_history::flow::AdeApp::keep_all_changes` (Revision R10): a real,
-    /// undoable `wt_core::undo::commit_all_changes` on this agent's worktree.
-    KeepAllChanges,
     /// `crate::worktree_history::flow::AdeApp::request_discard_worktree` (Revision R10): a real
     /// `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the rail
     /// footer's `prune` button (see that method's own docs for why - this is a real, destructive
     /// action that force-removes a worktree, preserving uncommitted/untracked content in a real
     /// git stash first).
     DiscardWorktree,
-    /// GitHub issue #225: opens this agent's **review** tab
-    /// (`crate::review::render::AdeApp::open_review_tab`) - what has changed since this agent
-    /// started, or since the user last marked it reviewed. Deliberately not a second door: this
-    /// row has existed as [`ActionKind::Unimplemented`] since the original design, waiting for
-    /// exactly this feature, and was wired up rather than replaced.
-    ///
-    /// Real, but *conditionally* so: the render call site disables it whenever
-    /// `crate::review::flow::AdeApp::review_available_for` is false (no baseline captured yet, or
-    /// more than one agent open in this worktree - see that method's docs), the same
-    /// state-dependent enablement layered on top of [`FooterAction::implemented`] that
-    /// [`ActionKind::Respawn`] already uses.
-    OpenReview,
-    /// No backing logic exists yet (the editor-surface workflow) - always rendered disabled
-    /// regardless of [`FooterAction::implemented`] (always `false` for these).
-    Unimplemented,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,77 +502,40 @@ pub struct FooterAction {
     pub implemented: bool,
 }
 
-/// The footer action strip for one [`Status`]: review gets `Keep all ⌘⏎` (green, real - Revision
-/// R10) · `Review diff` (still unimplemented) · `Open in editor` (still unimplemented) ·
-/// `Discard worktree` (real - Revision R10); ask gets `Open terminal` · `Interrupt ⌃C`; fail gets
-/// `Retry ⌘R` · `Open terminal` · `Discard worktree` (real - Revision R10); run gets
-/// `Interrupt ⌃C` · `Open terminal`; idle gets `Resume ⌘⏎` (blue) alone - `Archive` is
-/// deliberately not repeated here (GitHub issue #20): the context bar's own
-/// `Self::render_archive_button` already renders it unconditionally for every non-bare agent, so
-/// an idle agent used to show it twice.
+/// The footer action strip for one [`Status`] - GitHub issue #295's final state
+/// (`STAGE-A-CHANGELOG.md` §4e/§4r/§4t).
+///
+/// The agent pane is a terminal, so a button that duplicates a keystroke which already works in
+/// the focused surface is unearned space (§4t), and an action whose object is the *worktree* or
+/// the *branch* does not belong under one agent of a possibly multi-agent worktree (§4e/§4r).
+/// What is left is only what is run-scoped and has no other home:
+///
+/// | Status | Actions | Why the rest went |
+/// |---|---|---|
+/// | `Ask` (needs input) | none | "there is nothing to interrupt; the question is answered in the pane" (§4e) |
+/// | `Run` (running) | none | `⌃C` in the focused pty *is* the interrupt (§4t) |
+/// | `Fail` (failed) | `Retry ⌘R` · `Discard worktree` | the run really can be restarted, and the two-click discard is this app's only worktree deletion under an agent |
+/// | `Review` (finished) | none | "a finished transcript is a record; its actions live where their object lives" (§4r) |
+/// | `Idle` (paused) | `Resume ⌘⏎` | the one verb that restarts a stopped run |
+///
+/// Deleted outright rather than hidden, per `REVISION-2026-08-14.md` §7 rule 5 - see
+/// [`ActionKind`]'s own docs. The verbs that still exist elsewhere kept their real homes:
+/// `Archive` is the rail's agent/worktree context menus (`crate::rail::menu`, GitHub issue #290)
+/// and the title bar's Agent menu; `Keep all changes` and `Discard worktree` are also on that
+/// Agent menu; `Review` moved to it (`crate::title_bar::menu_model::MenuCommand::ReviewAgent`);
+/// `Open terminal` is the no-agent empty state's secondary CTA
+/// (`crate::work_surface::render::AdeApp::render_no_agents_empty_state`), where §4t keeps it
+/// because "with no agent there is no keystroke to duplicate and no readout to show".
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
-        Status::Review => vec![
-            FooterAction {
-                kind: ActionKind::KeepAllChanges,
-                label: "Keep all",
-                // No keycap: the original mockup shows `mod+enter`, but this app has no real
-                // global keybinding for it - see `crate::default_key_bindings`'s own docs on
-                // why a global `Ctrl+Enter`/`Cmd+Enter` isn't safe to add casually (the same
-                // "app-level shortcut steals terminal input" risk class already documented
-                // there for `CloseFocusedTab`, which scopes itself away from a focused terminal
-                // rather than accept the collision; this app's whole domain is running agent
-                // CLIs in terminals, and Ctrl+Enter/Cmd+Enter is a plausible binding one
-                // of them could reasonably use for its own "submit" gesture). An audit caught
-                // this row still advertising the keycap after being promoted from
-                // `implemented: false` - a real keycap must never render for a keystroke that
-                // does nothing, the same rule `Self::render_pty_header`'s own `clear` hint
-                // already follows for the identical reason.
-                keycap: None,
-                style: ActionStyle::PrimaryGreen,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::OpenReview,
-                // "Review", not "Review diff" (GitHub issue #225): this door leads to the
-                // agent-review surface, and "diff" is the git side's word - see
-                // `crate::review`'s own module docs on the enforced vocabulary split.
-                label: "Review",
-                keycap: None,
-                style: ActionStyle::Outline,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::Unimplemented,
-                label: "Open in editor",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: false,
-            },
-            FooterAction {
-                kind: ActionKind::DiscardWorktree,
-                label: "Discard worktree",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-        ],
-        Status::Ask => vec![
-            FooterAction {
-                kind: ActionKind::OpenTerminal,
-                label: "Open terminal",
-                keycap: None,
-                style: ActionStyle::Outline,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::Interrupt,
-                label: "Interrupt",
-                keycap: Some("ctrl+C"),
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-        ],
+        // §4r: "`review` now renders no bar, matching `ask`". `Keep all` was "a fiction borrowed
+        // from buffer-based inline-diff tools" (the edits are already on disk), `Review`/`Open in
+        // editor` were navigation, and `Discard worktree` under one agent of a two-agent worktree
+        // "throws away the other agent's work from a pane that never mentions them".
+        Status::Review => Vec::new(),
+        // §4e: "`Interrupt` offered on an agent that is *waiting for you* - there is nothing to
+        // interrupt", and a second terminal does not answer the question the agent is asking.
+        Status::Ask => Vec::new(),
         Status::Fail => vec![
             FooterAction {
                 kind: ActionKind::Respawn,
@@ -597,13 +545,6 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: true,
             },
             FooterAction {
-                kind: ActionKind::OpenTerminal,
-                label: "Open terminal",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-            FooterAction {
                 kind: ActionKind::DiscardWorktree,
                 label: "Discard worktree",
                 keycap: None,
@@ -611,22 +552,10 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
                 implemented: true,
             },
         ],
-        Status::Run => vec![
-            FooterAction {
-                kind: ActionKind::Interrupt,
-                label: "Interrupt",
-                keycap: Some("ctrl+C"),
-                style: ActionStyle::Outline,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::OpenTerminal,
-                label: "Open terminal",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-        ],
+        // §4t: "`Interrupt` was the last button on it, and the pane is a terminal: `⌃C` already
+        // interrupts and `mod+R` already retries, so a button duplicating a keystroke that works
+        // in the focused surface is the same unearned space as §4r."
+        Status::Run => Vec::new(),
         Status::Idle => vec![FooterAction {
             kind: ActionKind::Respawn,
             label: "Resume",
@@ -755,82 +684,102 @@ mod tests {
         );
     }
 
-    /// GitHub issue #225 promoted the review row from a permanently-disabled placeholder to a
-    /// real door into the agent review surface. `Open in editor` is the only row in this strip
-    /// with no backing logic left.
+    /// GitHub issue #295 / §4t: every action that survives has real backing logic. The
+    /// permanently-inert `Open in editor` row is gone with the rest, so there is no longer any
+    /// such thing as an unimplemented footer action.
     #[test]
-    fn every_review_footer_action_except_open_in_editor_now_has_real_backing() {
-        let actions = footer_actions(Status::Review);
-        for action in &actions {
-            let should_be_implemented = !matches!(action.kind, ActionKind::Unimplemented);
-            assert_eq!(
-                action.implemented, should_be_implemented,
-                "{} implemented={} - only `Open in editor` should still be unimplemented",
-                action.label, action.implemented
-            );
+    fn every_surviving_footer_action_has_real_backing_logic() {
+        for status in Status::ORDER {
+            for action in footer_actions(status) {
+                assert!(
+                    action.implemented,
+                    "{status:?}'s {:?} action is not implemented - issue #295 deleted the \
+                     placeholder row rather than keeping an inert button",
+                    action.label
+                );
+            }
         }
-        let unimplemented: Vec<&str> = actions
-            .iter()
-            .filter(|action| !action.implemented)
-            .map(|action| action.label)
-            .collect();
-        assert_eq!(unimplemented, vec!["Open in editor"]);
     }
 
-    /// The review door must be a real [`ActionKind::OpenReview`], not the old placeholder - and
-    /// it must not say "diff", which is the git side's word (see `crate::review`'s module docs on
-    /// the enforced vocabulary split).
+    /// §4r, verbatim: "a finished transcript is a record; its actions live where their object
+    /// lives". `Keep all`, `Review`, `Open in editor` and `Discard worktree` all left.
     #[test]
-    fn the_review_footer_door_is_real_and_never_says_diff() {
-        let actions = footer_actions(Status::Review);
-        let review = actions
-            .iter()
-            .find(|action| action.kind == ActionKind::OpenReview)
-            .expect("the Review status footer must offer a real review door");
-        assert!(review.implemented);
-        assert_eq!(review.label, "Review");
-        assert!(
-            !review.label.to_lowercase().contains("diff"),
-            "the review door must not use the git side's own word - got {:?}",
-            review.label
-        );
+    fn a_finished_agent_offers_no_footer_actions_at_all() {
+        assert!(footer_actions(Status::Review).is_empty());
     }
 
+    /// §4e: "`Interrupt` offered on an agent that is *waiting for you* - there is nothing to
+    /// interrupt", and `Open terminal` "opens a *different* terminal, which does not answer the
+    /// question the agent is asking".
     #[test]
-    fn ask_actions_are_open_terminal_then_interrupt_both_real() {
-        let actions = footer_actions(Status::Ask);
-        let labels: Vec<&str> = actions.iter().map(|a| a.label).collect();
-        assert_eq!(labels, vec!["Open terminal", "Interrupt"]);
-        assert!(actions.iter().all(|a| a.implemented));
+    fn an_asking_agent_offers_no_footer_actions_at_all() {
+        assert!(footer_actions(Status::Ask).is_empty());
     }
 
+    /// §4t: `⌃C` in the focused pty is the interrupt, so the button duplicating it is deleted.
     #[test]
-    fn fail_actions_include_a_real_retry_and_a_real_discard() {
+    fn a_running_agent_offers_no_footer_actions_at_all() {
+        assert!(footer_actions(Status::Run).is_empty());
+    }
+
+    /// The one status that keeps two verbs: the run really can be retried, and the two-click
+    /// discard is a real destructive action with no keystroke behind it. `Open terminal` went.
+    #[test]
+    fn fail_actions_are_exactly_a_real_retry_then_a_real_discard() {
         let actions = footer_actions(Status::Fail);
+        let labels: Vec<&str> = actions.iter().map(|action| action.label).collect();
+        assert_eq!(labels, vec!["Retry", "Discard worktree"]);
         assert_eq!(actions[0].kind, ActionKind::Respawn);
-        assert!(actions[0].implemented);
-        assert_eq!(actions.last().unwrap().kind, ActionKind::DiscardWorktree);
-        assert!(actions.last().unwrap().implemented);
+        assert_eq!(actions[1].kind, ActionKind::DiscardWorktree);
+        assert!(actions.iter().all(|action| action.implemented));
     }
 
-    /// GitHub issue #20: idle no longer repeats `Archive` in the footer - the context bar already
-    /// renders it unconditionally for every non-bare agent (`Self::render_archive_button`).
+    /// GitHub issue #20 kept `Archive` out of the idle footer because the context bar already
+    /// rendered it; issue #295 then deleted the context bar's copy too, so `Archive` now lives
+    /// only in the rail menus and the title bar's Agent menu - and idle is still just `Resume`.
     #[test]
-    fn idle_actions_are_just_a_real_resume_not_a_second_archive() {
+    fn idle_actions_are_just_a_real_resume() {
         let actions = footer_actions(Status::Idle);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, ActionKind::Respawn);
+        assert_eq!(actions[0].label, "Resume");
         assert!(actions[0].implemented);
     }
 
+    /// The two verbs §4t names as already-bound keystrokes, and the four §4e/§4r moved to their
+    /// objects' own surfaces, must not come back to any status's footer.
     #[test]
-    fn every_status_produces_a_non_empty_action_list() {
+    fn no_status_offers_a_verb_that_lives_somewhere_else_now() {
         for status in Status::ORDER {
-            assert!(
-                !footer_actions(status).is_empty(),
-                "{status:?} produced no footer actions at all"
-            );
+            for action in footer_actions(status) {
+                assert!(
+                    !matches!(
+                        action.label,
+                        "Interrupt"
+                            | "Open terminal"
+                            | "Keep all"
+                            | "Review"
+                            | "Review diff"
+                            | "Open in editor"
+                            | "Merge"
+                            | "Archive"
+                    ),
+                    "{status:?} still offers {:?}, which GitHub issue #295 moved out of the \
+                     agent pane's bottom strip",
+                    action.label
+                );
+            }
         }
+    }
+
+    /// Every remaining button keeps its keycap where it really has one (issue #295's ride-along),
+    /// and never advertises one it does not - `Discard worktree` has no keybinding in this app.
+    #[test]
+    fn surviving_buttons_advertise_only_keycaps_that_really_exist() {
+        let fail = footer_actions(Status::Fail);
+        assert_eq!(fail[0].keycap, Some("mod+R"));
+        assert_eq!(fail[1].keycap, None);
+        assert_eq!(footer_actions(Status::Idle)[0].keycap, Some("mod+enter"));
     }
 
     /// A live title is the label, verbatim - no branch, no ordinal, nothing appended.

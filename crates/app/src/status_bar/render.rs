@@ -17,7 +17,7 @@ use crate::status_bar::resources::{
 /// *every frame*, for a value that cannot change while the process is running. This is one
 /// `OnceLock` instead - and deliberately not a field on `AdeApp`, since it is a property of the
 /// machine rather than of any window.
-fn available_cores() -> usize {
+pub(crate) fn available_cores() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CORES.get_or_init(|| {
         std::thread::available_parallelism()
@@ -49,7 +49,7 @@ pub(crate) enum StatusTier {
 }
 
 impl StatusTier {
-    fn color(self) -> theme::ColorToken {
+    pub(crate) fn color(self) -> theme::ColorToken {
         match self {
             StatusTier::Primary => theme::status_bar::PRIMARY,
             StatusTier::Secondary => theme::status_bar::SECONDARY,
@@ -58,14 +58,14 @@ impl StatusTier {
     }
 
     /// §4c's per-tier sizes: `10.5px/450` primary, `10.5px` secondary, `9.5-10.5px` tertiary.
-    fn text_size(self) -> f32 {
+    pub(crate) fn text_size(self) -> f32 {
         match self {
             StatusTier::Primary | StatusTier::Secondary => 10.5,
             StatusTier::Recessive => 10.0,
         }
     }
 
-    fn weight(self) -> gpui::FontWeight {
+    pub(crate) fn weight(self) -> gpui::FontWeight {
         match self {
             StatusTier::Primary => gpui::FontWeight::MEDIUM,
             StatusTier::Secondary | StatusTier::Recessive => gpui::FontWeight::NORMAL,

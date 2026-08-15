@@ -339,6 +339,11 @@ impl AdeApp {
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
             ),
+            MenuCommand::ReviewAgent => (
+                "R",
+                theme::text::DIM.into(),
+                theme::surface::CHIP_NEUTRAL.into(),
+            ),
             MenuCommand::KeepAllChanges => (
                 "K",
                 theme::text::DIM.into(),
@@ -402,6 +407,7 @@ impl AdeApp {
             MenuCommand::NewTerminal => "in this worktree".to_string(),
             MenuCommand::NextAgent | MenuCommand::PreviousAgent => "cycle tabs".to_string(),
             MenuCommand::ArchiveAgent => "close the active tab".to_string(),
+            MenuCommand::ReviewAgent => "what this agent changed".to_string(),
             MenuCommand::KeepAllChanges => "commit the active worktree".to_string(),
             MenuCommand::DiscardWorktree => "force-remove uncommitted content".to_string(),
             MenuCommand::Documentation => "README on GitHub".to_string(),
@@ -1130,14 +1136,16 @@ mod title_menu_tests {
         });
         cx.run_until_parked();
 
-        // The Discard row is the 7th real row (index 6, 0-based) in the Agent menu: New
-        // Terminal, New Agent Pane, [divider], Next Agent, Previous Agent, [divider],
-        // Archive Agent, Keep All Changes, Discard Worktree - six real rows and two dividers
-        // sit above it (see `AdeApp::agent_menu_rows`'s own row order).
+        // The Discard row is the 8th real row (index 7, 0-based) in the Agent menu: New
+        // Terminal, New Agent Pane, [divider], Next Agent, Previous Agent, [divider], Review
+        // Agent, Archive Agent, Keep All Changes, Discard Worktree - seven real rows and two
+        // dividers sit above it (see `MenuCommand::rows`'s own row order). `Review Agent` joined
+        // that third group with GitHub issue #295, which deleted the agent pane footer's own
+        // `Review` door along with the rest of the finished-agent action bar.
         let bounds = app.read_with(cx, |app, _| {
             app.title_menu_button_bounds[TitleMenu::Agent.index()]
         });
-        let discard_row_point = nth_row_click_point(bounds, 6, 2);
+        let discard_row_point = nth_row_click_point(bounds, 7, 2);
 
         // First, arming click on the real rendered Discard row.
         cx.simulate_click(discard_row_point, gpui::Modifiers::none());

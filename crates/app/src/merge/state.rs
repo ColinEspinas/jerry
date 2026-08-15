@@ -1,4 +1,4 @@
-//! Pure (GPUI-free) state for the context bar's `Merge` action and Surface D's
+//! Pure (GPUI-free) state for the git graph's merge actions and Surface D's
 //! conflict-resolution flow - mirrors `crate::rail::state`/`crate::rail::status`'s own split: this module
 //! only holds already-computed facts (from `wt_core::merge` calls made in `crate::root`, which
 //! has the `Context<AdeApp>` background-thread access those calls need) and pure transitions

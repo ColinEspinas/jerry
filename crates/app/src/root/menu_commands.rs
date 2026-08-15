@@ -78,6 +78,15 @@ impl AdeApp {
                 self.current_worktree_agents().count() > 1
             }
             MenuCommand::ArchiveAgent => self.agents.active_id().is_some(),
+            // GitHub issue #295 moved the agent review door here from the pane footer, which §4r
+            // emptied ("a finished transcript is a record; its actions live where their object
+            // lives"). It keeps issue #225's own gate exactly: a review needs a real captured
+            // baseline, and it is only meaningful when this agent is the sole agent in its
+            // worktree - see `crate::review::flow::AdeApp::review_available_for`.
+            MenuCommand::ReviewAgent => self
+                .agents
+                .active_id()
+                .is_some_and(|id| self.review_available_for(id)),
             MenuCommand::KeepAllChanges => {
                 self.agents.active_id().is_some()
                     && self.worktree_history_op_in_flight
@@ -213,6 +222,12 @@ impl AdeApp {
                 if let Some(id) = self.agents.active_id() {
                     self.title_menu_open = None;
                     self.archive_agent(id, window, cx);
+                }
+            }
+            MenuCommand::ReviewAgent => {
+                if let Some(id) = self.agents.active_id() {
+                    self.title_menu_open = None;
+                    self.open_review_tab(id, window, cx);
                 }
             }
             MenuCommand::KeepAllChanges => {
@@ -364,6 +379,15 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.perform_menu_command(MenuCommand::ArchiveAgent, window, cx);
+    }
+
+    pub(crate) fn handle_review_agent_menu_command(
+        &mut self,
+        _: &ReviewAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perform_menu_command(MenuCommand::ReviewAgent, window, cx);
     }
 
     pub(crate) fn handle_keep_all_changes_menu_command(

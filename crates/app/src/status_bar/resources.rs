@@ -152,12 +152,23 @@ impl ResourceTree {
 
     /// The status bar's own recessive readout: `"41% cpu · 3.4 GB"`, the sum of this tree.
     pub fn bar_readout(&self) -> String {
-        format!(
-            "{} cpu \u{b7} {}",
-            cpu_label(self.cpu_percent()),
-            memory_label(self.memory_bytes())
-        )
+        agent_readout(self.cpu_percent(), self.memory_bytes())
     }
+}
+
+/// One process's cost in the window's one readout wording: `"6.2% cpu · 0.51 GB"`.
+///
+/// Shared verbatim by [`ResourceTree::bar_readout`] (the whole-window total) and the agent pane's
+/// per-agent strip (`STAGE-A-CHANGELOG.md` §4t, GitHub issue #295 -
+/// `crate::work_surface::render::AdeApp::render_agent_cost_readout`). Two surfaces stating a cost
+/// in two different formats would be two vocabularies for one fact, so there is exactly one
+/// formatter and both call it.
+pub fn agent_readout(cpu_percent: Option<f32>, memory_bytes: Option<u64>) -> String {
+    format!(
+        "{} cpu \u{b7} {}",
+        cpu_label(cpu_percent),
+        memory_label(memory_bytes)
+    )
 }
 
 /// Sums whatever CPU readings are genuinely known - `None` only when not one row has a reading at
