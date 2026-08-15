@@ -10,5 +10,5 @@ msrv = "1.95.0"
 # version of this check needs the glob-import cleanup ADR 0003 itself names as the prerequisite.
 # In the meantime, `.claude/hooks/check-conventions.sh` enforces a coarser but real textual
 # ratchet on the same rule (and on new `use super::*` globs) - it needs no glob cleanup first,
-# runs in the pre-commit hook and in CI, and is documented in docs/adr/0003-ui-must-not-call-adapters.md.
+# runs in the pre-commit hook and in CI, and is documented in docs/architecture/decisions.md (§3).
 disallowed-methods = []

@@ -78,7 +78,7 @@ assigned step end to end when work is being split across subagents.
 | What | Where |
 |---|---|
 | Standards (what "correct" means) | [`CLAUDE.md`](../CLAUDE.md) |
-| Target architecture | [`docs/architecture/`](./architecture/), [`docs/adr/`](./adr/) |
+| Target architecture, and why | [`docs/architecture/`](./architecture/) (`decisions.md` for the reasoning) |
 | Skills | `.claude/skills/*/SKILL.md` |
 | Commands | `.claude/commands/*.md` |
 | Agents | `.claude/agents/*.md` |

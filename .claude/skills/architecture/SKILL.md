@@ -7,36 +7,33 @@ description: Decide where new logic belongs - which crate, which layer, whether 
 
 Jerry's target shape is a dependency rule (nothing points outward) plus a Command/Query
 application layer, documented in [`docs/architecture/overview.md`](../../../docs/architecture/overview.md),
-[`docs/architecture/crates.md`](../../../docs/architecture/crates.md), and the ADRs under
-`docs/adr/`. Most of the existing codebase doesn't follow it yet — this skill is for deciding where
-*new* work should go so it doesn't add to that gap, without pretending the whole codebase already
-matches the target.
+[`docs/architecture/crates.md`](../../../docs/architecture/crates.md), and the reasoning behind
+each rule in [`docs/architecture/decisions.md`](../../../docs/architecture/decisions.md). Most of
+the existing codebase doesn't follow it yet — this skill is for deciding where *new* work should go
+so it doesn't add to that gap, without pretending the whole codebase already matches the target.
 
 ## The decision, in order
 
 **1. Is this pure domain/infrastructure logic — git, process/PTY, LSP — with no rendering
 concern?** It belongs in `wt-core`, `pty-core`, or `lsp-core`, and it must never import `gpui`.
-This is non-negotiable, not a style preference: see
-[`0001-gpui-free-core-crates.md`](../../../docs/adr/0001-gpui-free-core-crates.md). If the logic
-needs something from GPUI's world (a `Context`, a `Window`), that's a sign it doesn't belong in a
-core crate at all — find the boundary and pass plain data across it instead.
+This is non-negotiable, not a style preference: see `decisions.md` §1. If the logic needs something
+from GPUI's world (a `Context`, a `Window`), that's a sign it doesn't belong in a core crate at all
+— find the boundary and pass plain data across it instead.
 
 **2. Is this a mutation, or a read with no side effects, that the view needs to trigger?** Shape it
 as a Command (mutation) or Query (read) — a typed input struct, a typed outcome — even if it's
-sitting inside `crates/app` for now rather than fully layered out. See
-[`0002-command-query-core.md`](../../../docs/adr/0002-command-query-core.md) for the shape and why
-a loose function doesn't give the same thing. This is what eventually lets `crates/jerry-cli`
-dispatch the same action the view does — a function with an ad hoc signature can't be dispatched
-generically, a Command can.
+sitting inside `crates/app` for now rather than fully layered out. See `decisions.md` §2 for the
+shape and why a loose function doesn't give the same thing. This is what eventually lets
+`crates/jerry-cli` dispatch the same action the view does — a function with an ad hoc signature
+can't be dispatched generically, a Command can.
 
 **3. Is this rendering — drawing state, wiring up interaction?** It reads state already held on
 `AdeApp` (or a future per-feature successor) and dispatches a Command/Query for anything that
 mutates or needs fresh data. It does not call `wt_core::`/`pty_core::`/`lsp_core::` or shell out
-directly — see [`0003-ui-must-not-call-adapters.md`](../../../docs/adr/0003-ui-must-not-call-adapters.md).
-If you're touching a `render.rs` that already violates this (most of them do today — 109
-`wt_core::` references in `graph_view/render.rs` alone), don't compound it with a new one; whether
-to also fix the existing violations in that file is a separate call from whether your own change
-adds new ones.
+directly — see `decisions.md` §3. If you're touching a `render.rs` that already violates this (most
+of them do today — 109 `wt_core::` references in `graph_view/render.rs` alone), don't compound it
+with a new one; whether to also fix the existing violations in that file is a separate call from
+whether your own change adds new ones.
 
 **4. Does this look like it doesn't need `gpui` at all, but it's about to land inside
 `crates/app`?** Check first — `crates/app` already carries roughly 24k lines with zero `gpui`
@@ -61,13 +58,13 @@ exactly the kind of fork `plan` should surface on the issue before `implement` s
 ## When the decision is genuinely new
 
 Questions 1–5 apply an existing rule; most work is that, and stops there. Occasionally a change
-needs a call none of the four ADRs already make — a new crate boundary, a new cross-cutting rule,
-a reversal of an earlier one. That's worth a new ADR, not a paragraph buried in a commit message:
-copy [`docs/adr/template.md`](../../../docs/adr/template.md) to the next `000N`, write it, and add
-a row to [`docs/adr/README.md`](../../../docs/adr/README.md)'s index. Don't reach for this for
-routine applications of an existing rule (`hooks/` being the pilot extraction candidate doesn't
-need its own ADR — it's already covered by 0001/0002) — an ADR records a *decision*, not every
-instance of following one.
+needs a call none of the four entries in `docs/architecture/decisions.md` already make — a new
+crate boundary, a new cross-cutting rule, a reversal of an earlier one. That's worth a new numbered
+entry there, not a paragraph buried in a commit message: follow the existing entries' shape
+(Status / Context / Decision / Consequences) and append it, rather than editing an old entry back to
+"current." Don't reach for this for routine applications of an existing rule (`hooks/` being the
+pilot extraction candidate doesn't need its own entry — it's already covered by §1/§2) — an entry
+records a *decision*, not every instance of following one.
 
 ## What this skill doesn't cover
 

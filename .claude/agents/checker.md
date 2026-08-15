@@ -18,7 +18,7 @@ Report in this order:
    destructive git path lacking a dirty-working-tree refusal and its test.
 3. **Layering** — render code (`render.rs`, anything implementing `Render`/`IntoElement`) calling
    `wt_core::`/`pty_core::`/`lsp_core::` or `std::process::Command` directly instead of dispatching
-   a Command/Query (CLAUDE.md's architecture section, `docs/adr/0003-ui-must-not-call-adapters.md`)
+   a Command/Query (CLAUDE.md's architecture section, `docs/architecture/decisions.md` §3)
    — flag *new* instances in the diff; this project's existing violations are tracked separately,
    not something every diff is expected to fix.
 4. **Comments** — a new comment that restates the line below it, or that narrates design history/

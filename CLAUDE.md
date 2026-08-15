@@ -35,20 +35,21 @@ observation made against a debug build is trustworthy.
 
 Dependencies point inward. `wt-core`, `pty-core`, `lsp-core` are pure domain/infrastructure crates
 with **zero `gpui` dependency** — that must never change. `crates/app` is the only crate allowed to
-depend on `gpui`. Full detail: [`docs/architecture/overview.md`](docs/architecture/overview.md),
-[`docs/architecture/crates.md`](docs/architecture/crates.md), and the ADRs under `docs/adr/`.
+depend on `gpui`. Full detail and the reasoning behind each rule:
+[`docs/architecture/overview.md`](docs/architecture/overview.md),
+[`docs/architecture/crates.md`](docs/architecture/crates.md),
+[`docs/architecture/decisions.md`](docs/architecture/decisions.md).
 
 The application-layer unit is a **Command** (mutation) or **Query** (read), each a typed input
 struct with a typed outcome — not a loose function, not a service method with an ad hoc signature.
 This is what lets the same action be dispatched from the GPUI view and, eventually, from
-`crates/jerry-cli`. See [`0002-command-query-core.md`](docs/adr/0002-command-query-core.md).
+`crates/jerry-cli`. See `docs/architecture/decisions.md` §2.
 
 Render code (`render.rs`, anything implementing `Render`/`IntoElement`) dispatches a Command or
 Query and draws the outcome. It never calls `wt_core::`, `pty_core::`, `lsp_core::`, or
 `std::process::Command` directly. This is a *target*, not yet the current state — see
-[`0003-ui-must-not-call-adapters.md`](docs/adr/0003-ui-must-not-call-adapters.md) for the gap and
-the tracking issues. New code follows the rule starting now; existing violations are backlog, not
-license to add more.
+`docs/architecture/decisions.md` §3 for the gap and the tracking issues. New code follows the rule
+starting now; existing violations are backlog, not license to add more.
 
 **No new `use super::*`.** Explicit imports only. Glob imports are why the layering violation above
 can't be caught by a type-aware lint today — a "pure" module can silently receive `gpui` symbols
@@ -110,8 +111,8 @@ either rule already holds everywhere.
   non-obvious from the signature.
 - `//` inline: only a non-obvious *why*. Never restate what the next line already says.
 - **Not source comments:** design history, issue archaeology, review-thread transcripts,
-  alternatives-considered, revision IDs. That material belongs in a commit body or a
-  `docs/adr/000N-*.md` entry, not embedded in the code it explains.
+  alternatives-considered, revision IDs. That material belongs in a commit body or a new entry in
+  `docs/architecture/decisions.md`, not embedded in the code it explains.
 
 This is a real course-correction: comments are currently 25.7% of this codebase's lines, and some
 files (`root/mod.rs` at 53%, `lib.rs` at 50%) are more prose than code. New code follows this rule.

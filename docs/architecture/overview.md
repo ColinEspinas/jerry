@@ -2,8 +2,7 @@
 
 Jerry is a desktop app: a GPUI view driving a git/process/LSP domain that must also work headless,
 from a CLI, without dragging a UI framework along. This document is the target shape. It is not yet
-the current shape — see [`docs/adr/0003-ui-must-not-call-adapters.md`](../adr/0003-ui-must-not-call-adapters.md)
-for the gap and the tracking issues.
+the current shape — see [`decisions.md`](./decisions.md) §3 for the gap and the tracking issues.
 
 ## The dependency rule
 
@@ -33,7 +32,7 @@ adapters directly instead of going through a command.
 ## Commands and queries, not services
 
 The unit of application logic is a **Command** (a mutation) or a **Query** (a read), not a service
-method. See [`0002-command-query-core.md`](../adr/0002-command-query-core.md) for the rationale;
+method. See [`decisions.md`](./decisions.md) §2 for the rationale;
 the short version: reifying an action as a typed input + typed outcome is what lets the same
 dispatch serve both the GPUI view and a `clap` CLI, and lets actions compose without either caller
 knowing the other exists.

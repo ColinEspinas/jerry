@@ -11,7 +11,7 @@ labels: ""
 
 ## Why
 
-<!-- What this makes possible or safer afterward. Reference an ADR (docs/adr/) if the target
+<!-- What this makes possible or safer afterward. Reference docs/architecture/decisions.md if the target
      shape is already decided there. -->
 
 ## Scope

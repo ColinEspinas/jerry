@@ -11,8 +11,8 @@ Never fake functionality: no hardcoded data behind UI, no simulated output, no c
 nothing. Render code dispatches a Command/Query and draws the outcome — it does not call
 `wt_core::`/`pty_core::`/`lsp_core::` or shell out directly (CLAUDE.md's architecture section).
 Comments are a non-obvious *why* only — never restate the line below them, never narrate design
-history or alternatives-considered (that belongs in the commit body, or a new `docs/adr/000N-*.md`
-for something genuinely architectural).
+history or alternatives-considered (that belongs in the commit body, or a new entry in
+`docs/architecture/decisions.md` for something genuinely architectural).
 
 Before any GPUI, `alacritty_terminal`, or `gix` call, get a real usage from the `finder` agent
 rather than guessing — there is no `vendor/zed` in this repo; the real source is the resolved

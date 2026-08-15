@@ -100,7 +100,7 @@ jobs:
 
       # Deterministic ratchet, not a cargo lint: fails if the count of `use super::*` globs or
       # of adapter calls in render.rs files rose vs .claude/conventions-baseline.json. See that
-      # script's own comments and docs/adr/0003-ui-must-not-call-adapters.md.
+      # script's own comments and docs/architecture/decisions.md (§3).
       - name: Convention ratchet
         run: .claude/hooks/check-conventions.sh
 

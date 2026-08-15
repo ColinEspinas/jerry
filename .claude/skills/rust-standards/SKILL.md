@@ -45,13 +45,14 @@ isn't the happy path."
 6. **Layering.** Does render code (`render.rs`, anything implementing `Render`/`IntoElement`) call
    `wt_core::`/`pty_core::`/`lsp_core::` or shell out via `std::process::Command` directly, instead
    of dispatching a Command/Query? New code follows the target in
-   `docs/architecture/overview.md`/`docs/adr/0003-ui-must-not-call-adapters.md` even though most of
+   `docs/architecture/overview.md`/`docs/architecture/decisions.md` (§3) even though most of
    the existing codebase doesn't yet — if you're unsure whether something needs a full
    Command/Query shape, the `architecture` skill covers that decision.
 
 7. **Comments.** Does a comment explain a non-obvious *why*, or does it restate the line below it?
    Does it narrate design history, alternatives considered, or an issue number's whole backstory —
-   content that belongs in the commit body or a `docs/adr/000N-*.md` instead? `CLAUDE.md`'s comment
+   content that belongs in the commit body or a new entry in `docs/architecture/decisions.md`
+   instead? `CLAUDE.md`'s comment
    rule exists because this codebase's comments were 25.7% of its lines at last measurement; new
    code is what keeps that number from climbing back up.
 

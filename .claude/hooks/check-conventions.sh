@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deterministic ratchet check for the two structural rules in CLAUDE.md that clippy can't
-# express without the glob-import cleanup first (docs/adr/0003-ui-must-not-call-adapters.md):
+# express without the glob-import cleanup first (docs/architecture/decisions.md, entry 3):
 # no new `use super::*` glob, no new adapter call from a render.rs file. This does not rely on
 # an LLM following instructions - it's a real grep run by a real script, wired to three points
 # so drift is caught as early as possible rather than only at the end:
@@ -44,13 +44,13 @@ fail=0
 
 if [ "$glob_current" -gt "$glob_baseline" ]; then
   echo "check-conventions: FAIL - 'use super::*;' occurrences in crates/app/src rose from $glob_baseline to $glob_current." >&2
-  echo "  New glob imports make layering violations unlintable (docs/adr/0003). Use explicit imports instead." >&2
+  echo "  New glob imports make layering violations unlintable (docs/architecture/decisions.md, entry 3). Use explicit imports instead." >&2
   fail=1
 fi
 
 if [ "$adapter_current" -gt "$adapter_baseline" ]; then
   echo "check-conventions: FAIL - wt_core::/pty_core::/lsp_core::/process::Command::new calls in render.rs files rose from $adapter_baseline to $adapter_current." >&2
-  echo "  Render code dispatches a Command/Query instead of calling an adapter directly (docs/adr/0003)." >&2
+  echo "  Render code dispatches a Command/Query instead of calling an adapter directly (docs/architecture/decisions.md, entry 3)." >&2
   fail=1
 fi
 
