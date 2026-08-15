@@ -3100,8 +3100,21 @@ impl AdeApp {
                     .on_action(cx.listener(Self::handle_commit_message_text_redo))
                     .on_key_down(cx.listener(Self::handle_commit_message_key_down))
                     .cursor_text()
+                    // Live report ("carret is not centered verticaly, when typing it goes to the
+                    // right side of the input"): this row used to be `.items_start()` with
+                    // `.flex_1().min_w_0()` on the *text* div below. `flex_1` stretched the text
+                    // div's layout box across the whole field, so the caret - a `flex_none`
+                    // sibling rendered *after* it in DOM order once the message is non-empty -
+                    // sat pinned at the field's right edge instead of adjacent to the last glyph,
+                    // and `items_start` top-aligned the 14px caret bar against the 17px text
+                    // line. Now the exact structure every working simple input uses
+                    // (`Self::render_rail_filter_row`'s caret+text wrapper, `Self::
+                    // render_new_file_prompt`'s name box): an `items_center` row with a small gap
+                    // whose text div is intrinsically sized, so the caret sits right next to the
+                    // real text.
                     .flex()
-                    .items_start()
+                    .items_center()
+                    .gap(px(2.0))
                     .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                         this.focus_commit_message(window, cx);
                     }))
@@ -3119,8 +3132,6 @@ impl AdeApp {
                     .child(
                         div()
                             .debug_selector(move || message_selector)
-                            .flex_1()
-                            .min_w_0()
                             .font(font(theme::font::SANS))
                             .text_size(px(11.5))
                             .line_height(px(17.0))
@@ -5467,6 +5478,80 @@ mod commit_composer_tests {
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         cx.simulate_input(text);
         cx.run_until_parked();
+    }
+
+    /// Live report ("The input is completly broken, carret is not centered verticaly, when
+    /// typing it goes to the right side of the input"): the message *text* div used to carry
+    /// `.flex_1().min_w_0()`, which stretched its own layout box across the whole field, so the
+    /// caret - the next `flex_none` sibling in the row once a message exists - painted pinned
+    /// at the field's right edge no matter how short the typed message was, and the row's
+    /// `.items_start()` top-aligned the 14px caret bar against the text line instead of
+    /// centering it. Same measured-bounds discipline as
+    /// `rail::render::rail_filter_caret_tests`: the caret must sit before the placeholder when
+    /// empty, hug the real typed text's right edge (not the field's) once typed, and sit
+    /// vertically centered in the field.
+    #[gpui::test]
+    fn message_caret_hugs_the_real_text_and_is_vertically_centered(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (_app, cx) = open_changes_view(cx, &repo);
+
+        let field = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let empty_caret = cx
+            .debug_bounds("commit-composer-message-caret")
+            .expect("the caret element must really lay out with an empty message");
+        let placeholder = cx
+            .debug_bounds("commit-composer-message-empty")
+            .expect("the placeholder text must really paint");
+        assert!(
+            empty_caret.origin.x <= placeholder.origin.x,
+            "with an empty message, the caret must sit before (at or left of) the \
+             placeholder's own start x - got caret {empty_caret:?} vs placeholder \
+             {placeholder:?}",
+        );
+
+        cx.simulate_input("fix");
+        cx.run_until_parked();
+
+        let caret = cx
+            .debug_bounds("commit-composer-message-caret")
+            .expect("the caret element must really lay out with a typed message");
+        let text = cx
+            .debug_bounds("commit-composer-message-fix")
+            .expect("the real typed message must really paint");
+        let field = cx
+            .debug_bounds("commit-composer-message-field")
+            .expect("the message field must really paint");
+        let text_right = text.origin.x + text.size.width;
+        assert!(
+            caret.origin.x >= text_right,
+            "with a typed message, the caret must sit at or after the text's own right edge - \
+             got caret {caret:?} vs text {text:?}",
+        );
+        assert!(
+            caret.origin.x - text_right <= px(4.0),
+            "the caret must hug the real typed text's right edge, not sit pushed to the \
+             field's right edge (the flex_1-on-the-text-div bug) - got caret {caret:?} vs \
+             text {text:?}",
+        );
+        let field_right = field.origin.x + field.size.width;
+        assert!(
+            field_right - (caret.origin.x + caret.size.width) > px(20.0),
+            "for a short message the caret must be well clear of the field's right edge - \
+             got caret {caret:?} in field {field:?}",
+        );
+        let caret_center = caret.origin.y + caret.size.height / 2.0;
+        let field_center = field.origin.y + field.size.height / 2.0;
+        assert!(
+            caret_center >= field_center - px(2.0) && caret_center <= field_center + px(2.0),
+            "the caret must be vertically centered in the field - got caret center \
+             {caret_center:?} vs field center {field_center:?} (caret {caret:?}, field \
+             {field:?})",
+        );
     }
 
     #[gpui::test]
