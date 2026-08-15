@@ -740,6 +740,14 @@ impl AdeApp {
                 // no subscription ever called `start_caret_blink` for this handle), so the caret
                 // rendered as a permanently solid bar instead of blinking.
                 &this.commit_message_focus_handle,
+                // GitHub issue #288's review-note field is a fifth, and the same live report came
+                // in again the same night: another real `text_history::TextField` built inside
+                // this same `Self` literal (`crate::review_notes::flow`), never threaded through
+                // `Self::wire_caret_blink`, so its caret never blinked - it painted only if
+                // `caret_blink_visible` happened to be `true` from some *other* handle's timer at
+                // the moment this one gained focus, and never toggled after that, reading as no
+                // caret at all most of the time.
+                &this.note_focus_handle,
             ],
             window,
             cx,
