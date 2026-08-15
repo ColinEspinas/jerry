@@ -251,6 +251,27 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // arm adds `"file-editor"` onto the same node rather than replacing it, which is the exact
         // live bug that narrowed `"]"`'s own predicate.
         gpui::KeyBinding::new("v", root::ToggleChangeSeen, Some("diff && !file-editor")),
+        // `design_handoff_jerry_ade/revision 5/Jerry.dc.html`'s own `changesHints` (line 4548):
+        // `[['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by author']]` - three
+        // keycap hints on the Changes panel's footer, of which `space stage` was the one with no
+        // binding behind it at all. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same
+        // strip.
+        //
+        // Scoped exactly like `v` above and `]` above that, and its subject is the same one
+        // theirs is: `AdeApp::open_change`, the file whose diff is on screen, which is also the
+        // row the Changes list paints as selected (`AdeApp::render_change_row`'s own `selected`).
+        // One selection concept for the whole strip - a second, separate keyboard cursor for this
+        // list would put two differently-highlighted "current rows" on screen at once.
+        //
+        // `!file-editor` is doing real work here, more than it is for `v`: in the editable File
+        // view a space is a character to type, and `"diff"`'s File arm adds `"file-editor"` onto
+        // the same node rather than replacing it (see `crate::code_surface::render`), so a bare
+        // `Some("diff")` would swallow every space typed into a file.
+        gpui::KeyBinding::new(
+            "space",
+            root::ToggleChangeStaged,
+            Some("diff && !file-editor"),
+        ),
         gpui::KeyBinding::new("secondary-1", root::JumpToAgent1, None),
         gpui::KeyBinding::new("secondary-2", root::JumpToAgent2, None),
         gpui::KeyBinding::new("secondary-3", root::JumpToAgent3, None),

@@ -537,6 +537,7 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::NewGitGraph" => Some("Open git graph"),
         "app::NextChangedFile" => Some("Next changed file"),
         "app::ToggleChangeSeen" => Some("Mark file seen / unseen"),
+        "app::ToggleChangeStaged" => Some("Stage / unstage file"),
         "app::JumpToAgent1" => Some("Jump to agent 1"),
         "app::JumpToAgent2" => Some("Jump to agent 2"),
         "app::JumpToAgent3" => Some("Jump to agent 3"),
@@ -1885,6 +1886,7 @@ mod tests {
                 "Open git graph",
                 "Next changed file",
                 "Mark file seen / unseen",
+                "Stage / unstage file",
                 "Jump to agent 1",
                 "Jump to agent 2",
                 "Jump to agent 3",
@@ -2088,6 +2090,11 @@ mod tests {
         // under `Some("rebase-plan && !text-input")` (5 - see `crate::default_key_bindings` for
         // why the negated conjunct is load-bearing over a surface that contains a real text
         // field) and `RebaseStart` under plain `Some("rebase-plan")` (1).
+        // The Changes-footer prose fix added 1 more real scoped binding: `space` ->
+        // `ToggleChangeStaged`, under the same `Some("diff && !file-editor")` predicate `v` and
+        // `]` carry - `Jerry.dc.html`'s `changesHints` advertises `space stage` in that footer and
+        // nothing was bound to it. `!file-editor` matters more here than for either of those: a
+        // space is a character to type in the File view.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -2095,7 +2102,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            82,
+            83,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
@@ -2105,7 +2112,8 @@ mod tests {
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
              EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
              (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) plus \
-             every real interactive-rebase plan binding (6, GitHub issue #304) to be \
+             every real interactive-rebase plan binding (6, GitHub issue #304) plus \
+             `space -> ToggleChangeStaged` (1, the Changes footer's own `space stage` hint) to be \
              scoped, not global"
         );
         assert!(
