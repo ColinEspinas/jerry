@@ -2032,16 +2032,41 @@ impl AdeApp {
                     .text_color(theme::text::BODY)
                     .child(row.commit.subject.clone()),
             )
+            // The working-tree row's own union figure (GitHub issue #287) - `Jerry.dc.html`'s
+            // `Git graph` state carries `13 files · +319 −145` in this slot, between the subject
+            // and the author column. Read straight off the uncommitted change set, so it is the
+            // same number the Uncommitted section's header states rather than a second count of
+            // the same working tree. A commit row has no note: what a commit changed is its own
+            // diff, one click away, and repeating a figure per row is what
+            // `REVISION-2026-07-31.md` §4 removed from these columns in the first place.
+            .children(is_working_tree.then(|| self.render_graph_working_tree_note()))
             .child(
                 div()
                     .debug_selector(move || format!("graph-row-{index}-author"))
                     .w(px(88.0))
                     .px(px(4.0))
                     .truncate()
+                    .flex()
+                    .items_center()
                     .font(font(theme::font::SANS))
                     .text_size(px(10.5))
                     .text_color(theme::text::DIM)
-                    .child(row.commit.author_name.clone()),
+                    // Audit I4: the row used to pin one agent (`s: 's3'`) to the whole working
+                    // tree, which a shared worktree makes a plain falsehood. It carries the `by`
+                    // union instead - every agent (and `you`) really on record for something dirty
+                    // in this checkout - and a commit row keeps git's own author name, which is
+                    // the honest answer for a commit and the only one git has.
+                    .when(is_working_tree, |el| {
+                        el.children(self.render_author_chip_strip(
+                            "graph-working-tree",
+                            &crate::provenance::render::chip_authors_for(
+                                &self.uncommitted_change_set,
+                            ),
+                        ))
+                    })
+                    .when(!is_working_tree, |el| {
+                        el.child(row.commit.author_name.clone())
+                    }),
             )
             .child(
                 div()
@@ -2064,6 +2089,30 @@ impl AdeApp {
                     .child(row.commit.short_id.clone()),
             )
             .child(self.render_graph_row_menu_button(index, row, cx))
+    }
+
+    /// The working-tree row's `N files · +A −B` note - the real union figure for everything dirty
+    /// in this checkout, whoever wrote it.
+    ///
+    /// Every number comes from `AdeApp::uncommitted_change_set`, which is one row per path
+    /// (`crate::provenance::change_set`), so the file count here is the worktree's own and not the
+    /// sum of per-agent counts - a file two agents share is one dirty file, and
+    /// `REVISION-2026-07-31.md` §4's "honest arithmetic" is exactly that those two figures differ.
+    fn render_graph_working_tree_note(&self) -> impl IntoElement {
+        let stat = self.uncommitted_change_set.total();
+        div()
+            .debug_selector(|| "graph-working-tree-note".to_string())
+            .flex_none()
+            .mr(px(10.0))
+            .font(font(theme::font::MONO))
+            .text_size(px(10.0))
+            .text_color(theme::text::FAINTER)
+            .child(format!(
+                "{} \u{b7} +{} \u{2212}{}",
+                crate::root::plural::count(self.uncommitted_change_set.len(), "file", None),
+                stat.added,
+                stat.removed
+            ))
     }
 
     fn render_graph_row_menu_button(
@@ -3971,7 +4020,7 @@ mod graph_row_menu_tests {
     }
 
     /// Three real commits, clean working tree at the end - `build_graph` yields exactly three
-    /// real commit rows (indices 0..=2, newest first), with no "Uncommitted changes" row to
+    /// real commit rows (indices 0..=2, newest first), with no "Working tree" row to
     /// throw off the indices these tests target.
     fn seed_three_commits(dir: &std::path::Path) {
         git(dir, &["init", "-b", "main"]);
@@ -7687,7 +7736,7 @@ mod graph_virtualization_tests {
     }
 
     /// `count` real commits, and a clean working tree at the end so `build_graph` adds no
-    /// "Uncommitted changes" row to shift the indices these tests name by literal selector.
+    /// "Working tree" row to shift the indices these tests name by literal selector.
     ///
     /// `--allow-empty` keeps the seed cheap: what is being measured here is how many *rows* get
     /// painted, and an empty commit is as real a `GraphRow` as any other.

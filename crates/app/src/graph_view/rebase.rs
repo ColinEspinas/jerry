@@ -386,7 +386,7 @@ impl AdeApp {
     /// `from_row_index`'s own commit as the real `onto` target
     /// (`wt_core::rebase::commits_to_rebase`'s own contract: every commit `HEAD` has that isn't
     /// reachable from `onto`, oldest first - exactly `git rebase -i <onto>`'s default todo). A
-    /// no-op for the synthetic "Uncommitted changes" row (`row.commit.id` is empty there - never a
+    /// no-op for the synthetic "Working tree" row (`row.commit.id` is empty there - never a
     /// real rebase target).
     ///
     /// GitHub issue #241 made this the row menu's *only* rebase entry: a second, separate
@@ -488,7 +488,7 @@ impl AdeApp {
     ) {
         self.graph_state.row_menu_open = None;
         self.graph_state.hard_reset_confirm_armed = None;
-        // The synthetic "Uncommitted changes" row carries an empty commit id - never a real
+        // The synthetic "Working tree" row carries an empty commit id - never a real
         // rebase target.
         if onto.is_empty() {
             return;

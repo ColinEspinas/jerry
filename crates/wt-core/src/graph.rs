@@ -270,10 +270,15 @@ pub fn build_graph(
         });
     }
 
-    // The uncommitted-changes row: real, only added when the worktree is genuinely dirty, and
-    // only when `HEAD`'s own commit really is the first row - see the module docs on why this is
-    // skipped (not faked) for scopes where a newer commit on another branch legitimately sorts
-    // first.
+    // The working-tree row: real, only added when the worktree is genuinely dirty, and only when
+    // `HEAD`'s own commit really is the first row - see the module docs on why this is skipped
+    // (not faked) for scopes where a newer commit on another branch legitimately sorts first.
+    //
+    // Named `Working tree`, not `Uncommitted changes`, since rev 6 (audit item I5, applied in
+    // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`'s §3.2.5 row). The panel already
+    // has a section called `Uncommitted`; this row is the working tree *as a point on the graph*,
+    // one step past `HEAD`, and naming it after the other surface's section made two different
+    // things share a word. `Jerry.dc.html`'s own `Git graph` state reads `Working tree`.
     if let Some(first) = rows.first() {
         if Some(&first.commit.id) == head_id.map(|id| id.to_string()).as_ref()
             && is_dirty(repo_path).unwrap_or(false)
@@ -284,7 +289,7 @@ pub fn build_graph(
                     id: String::new(),
                     short_id: String::new(),
                     parent_ids: vec![first.commit.id.clone()],
-                    subject: "Uncommitted changes".to_string(),
+                    subject: "Working tree".to_string(),
                     body: String::new(),
                     author_name: String::new(),
                     author_email: String::new(),

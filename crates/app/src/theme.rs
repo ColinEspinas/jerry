@@ -2753,6 +2753,49 @@ pub mod changes {
     /// The armed `Discard?` pill's label.
     pub const DISCARD_FG: ColorToken = token("changes.discard_fg", 0xe0847e);
 
+    /// The `⚠` ring around a file row's author chips - *this path has lines from more than one
+    /// agent* (`REVISION-2026-08-14.md` §1), and the control that filters the open diff by author
+    /// (GitHub issue #287).
+    ///
+    /// **Amber, deliberately.** `STAGE-A-CHANGELOG.md` §4g left this one open - it removed the
+    /// rail's aggregate `⚠ N` for devaluing amber and then flagged the ring itself:
+    ///
+    /// > **Left in place, flagged for a later call:** that ring is also amber (`#8a6420`). By the
+    /// > same argument it is stating a fact, not a warning […] A neutral ring would keep the click
+    /// > target and drop the false alarm.
+    ///
+    /// The product decision of 2026-08-14 (GitHub issue #287) **overrides that note**: a shared
+    /// file genuinely does need attention, so amber here is the app's own amber-means-attention
+    /// language used correctly rather than spent on a fact. The two halves of §4g are not in
+    /// tension once the count is gone - amber was devalued by an aggregate that named no file and
+    /// did nothing when clicked, and this ring names exactly one file and filters its diff.
+    ///
+    /// Same hex as [`super::status::ASK_CARD_EDGE`], its own key: both are the attention amber at
+    /// border weight, on two unrelated elements.
+    pub const SHARED_RING: ColorToken = token("changes.shared_ring", 0x8a6420);
+
+    /// The `you` gutter bar in the diff view - Orca's second rule, kept: *"your own hand edit
+    /// flips that line back to you"* (`REVISION-2026-08-14.md` §1), and `you` is deliberately
+    /// **not** an agent, so it is deliberately not an agent tint either.
+    ///
+    /// `#4e545a`, `Jerry.dc.html`'s own `attrOf('you').bg` - a neutral, outside
+    /// [`super::agent`]'s whole pool by construction, so a hand edit can never be mistaken for
+    /// whichever agent happens to hold the nearest hue.
+    pub const HAND_EDIT_GUTTER: ColorToken = token("changes.hand_edit_gutter", 0x4e545a);
+    /// The `you` author chip's glyph, the neutral counterpart to an agent chip's own tint.
+    pub const HAND_EDIT_CHIP_FG: ColorToken = token("changes.hand_edit_chip_fg", 0x8b9197);
+    /// The `you` author chip's fill. Same hex as [`super::surface::CHIP_NEUTRAL`], its own key -
+    /// see [`RUN_META_ENDED`] for this palette's convention on shared values.
+    pub const HAND_EDIT_CHIP_BG: ColorToken = token("changes.hand_edit_chip_bg", 0x23272b);
+
+    /// The `<agent> only ✕` indicator that appears in the file toolbar while a per-author filter
+    /// is active, and **only** while it is active (`STAGE-A-CHANGELOG.md` §4b - "Without this a
+    /// filtered diff would read as the whole diff").
+    pub const FILTER_BG: ColorToken = token("changes.filter_bg", 0x1d2226);
+    /// [`FILTER_BG`]'s hover fill - the indicator is a real control (clicking it clears the
+    /// filter), so it answers the pointer.
+    pub const FILTER_HOVER_BG: ColorToken = token("changes.filter_hover_bg", 0x242a2f);
+
     /// A hover-action button's own hover fill, inside the floating bar §4i puts on a hovered row.
     /// The bar's shell is the app's one popover chrome
     /// (`crate::root::widgets::menu_popover_chrome`, whose [`super::surface::PALETTE`]/
@@ -2780,6 +2823,12 @@ pub mod changes {
         ("SECTION_STAT_DEL", SECTION_STAT_DEL),
         ("FILENAME_UNSEEN", FILENAME_UNSEEN),
         ("FILENAME_SEEN", FILENAME_SEEN),
+        ("SHARED_RING", SHARED_RING),
+        ("HAND_EDIT_GUTTER", HAND_EDIT_GUTTER),
+        ("HAND_EDIT_CHIP_FG", HAND_EDIT_CHIP_FG),
+        ("HAND_EDIT_CHIP_BG", HAND_EDIT_CHIP_BG),
+        ("FILTER_BG", FILTER_BG),
+        ("FILTER_HOVER_BG", FILTER_HOVER_BG),
         ("DISCARD_BG", DISCARD_BG),
         ("DISCARD_BORDER", DISCARD_BORDER),
         ("DISCARD_FG", DISCARD_FG),
