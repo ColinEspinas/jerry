@@ -595,6 +595,15 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         // GitHub issue #158.
         "app::TerminalCopy" => Some("Terminal: copy selection"),
         "app::TerminalPaste" => Some("Terminal: paste"),
+        // GitHub issue #304 - the interactive-rebase plan's own keyboard verbs, which design
+        // spec §1.4's footer band advertises as keycap hints. Rebindable like every other row
+        // here; the labels name the plan surface so they group together in the page's filter.
+        "app::RebaseReorderUp" => Some("Rebase plan: move row up"),
+        "app::RebaseReorderDown" => Some("Rebase plan: move row down"),
+        "app::RebasePickRow" => Some("Rebase plan: pick"),
+        "app::RebaseSquashRow" => Some("Rebase plan: squash"),
+        "app::RebaseDropRow" => Some("Rebase plan: drop"),
+        "app::RebaseStart" => Some("Rebase plan: start rebase"),
         _ => None,
     }
 }
@@ -1987,6 +1996,15 @@ mod tests {
                 // GitHub issue #158's terminal copy/paste, both scoped `Some("terminal")`.
                 "Terminal: copy selection",
                 "Terminal: paste",
+                // GitHub issue #304's interactive-rebase plan verbs, scoped
+                // `Some("rebase-plan && !text-input")` (and plain `Some("rebase-plan")` for the
+                // last) - the real bindings behind design spec §1.4's footer keycap hints.
+                "Rebase plan: move row up",
+                "Rebase plan: move row down",
+                "Rebase plan: pick",
+                "Rebase plan: squash",
+                "Rebase plan: drop",
+                "Rebase plan: start rebase",
             ]
         );
     }
@@ -2059,6 +2077,11 @@ mod tests {
         // (`cmd-c`/`cmd-v` on macOS, `ctrl-shift-c`/`ctrl-shift-v` elsewhere), both
         // `Some("terminal")` - see `crate::default_key_bindings`'s own entry for why the shifted
         // variants, and why leaving them unbound was the bug.
+        // GitHub issue #304 added 6 more real scoped bindings: the interactive-rebase plan's own
+        // `RebaseReorderUp`/`RebaseReorderDown`/`RebasePickRow`/`RebaseSquashRow`/`RebaseDropRow`
+        // under `Some("rebase-plan && !text-input")` (5 - see `crate::default_key_bindings` for
+        // why the negated conjunct is load-bearing over a surface that contains a real text
+        // field) and `RebaseStart` under plain `Some("rebase-plan")` (1).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -2066,7 +2089,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            75,
+            81,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
@@ -2075,7 +2098,8 @@ mod tests {
              binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
              GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
              EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
-             (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) to be \
+             (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) plus \
+             every real interactive-rebase plan binding (6, GitHub issue #304) to be \
              scoped, not global"
         );
         assert!(

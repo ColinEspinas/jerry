@@ -199,6 +199,12 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
         vec!["app", "diff file-editor text-input completions"],
         vec!["app", "merge-editor text-input"],
         vec!["app", "text-input"],
+        // The interactive-rebase plan surface (GitHub issue #304), and the same surface with one
+        // of its own `reword` rows' message fields focused - a real `"text-input"` node nested
+        // *inside* the `"rebase-plan"` container, which is the whole reason that surface's
+        // plain-letter bindings carry `&& !text-input` (see `crate::default_key_bindings`).
+        vec!["app", "rebase-plan"],
+        vec!["app", "rebase-plan", "text-input"],
         // The file tree (GitHub issue #19), built by calling the *same* function the renderer
         // calls, over both of its inputs - not by restating its literals here. See
         // [`file_tree_key_context`] for why that indirection is load-bearing rather than tidy.
@@ -720,15 +726,16 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 15,
-            "real_context_stacks() is hand-derived from exactly fifteen .key_context(..) call \
+            call_sites, 16,
+            "real_context_stacks() is hand-derived from exactly sixteen .key_context(..) call \
              sites (ten of which emit the same bare \"text-input\": the palette, the rail \
              filter, the new-file prompt, the Branches filter, the Keybindings filter, the \
              Themes page's \"Generate from colour\" seed input, the General page's \"Shell\" \
              field (GitHub issue #213), GitHub issue #241's git graph row menu's \"Create \
              branch here\" prompt, GitHub issue #242 phase B's interactive-rebase plan row's own \
              reword message field, and - newest, GitHub issue #285's Changes panel commit \
-             message field) - a new one means that list, and every disjointness answer built on \
+             message field, plus GitHub issue #304's own \"rebase-plan\") - a new one means \
+             that list, and every disjointness answer built on \
              it, needs updating. Real sites found: {sites:?}"
         );
 
@@ -768,6 +775,7 @@ mod tests {
             "diff file-editor text-input completions",
             "merge-editor text-input",
             "text-input",
+            "rebase-plan",
         ]
         .into_iter()
         .chain(tree_literals)

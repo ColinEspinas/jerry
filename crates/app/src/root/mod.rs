@@ -259,6 +259,20 @@ actions!(
         OpenDocumentation,
         ReportIssue,
         About,
+        // GitHub issues #302-#305: the interactive-rebase plan's own six keyboard actions, the
+        // real bindings behind design spec §1.4's footer hint strip (`alt+↑↓ reorder · P pick ·
+        // S squash · D drop · mod+enter start`). Registered in `crate::default_key_bindings`
+        // under `"rebase-plan && !text-input"` (`"rebase-plan"` for `RebaseStart`) - see that
+        // function's own docs for why the negated conjunct is load-bearing here: a plan row's
+        // `reword` field is a real text input *inside* the rebase surface, so `P`/`S`/`D` and
+        // `alt+↑↓` must go dead the moment it takes focus or typing "p" into a commit message
+        // would silently rewrite that row's action instead.
+        RebaseReorderUp,
+        RebaseReorderDown,
+        RebasePickRow,
+        RebaseSquashRow,
+        RebaseDropRow,
+        RebaseStart,
     ]
 );
 

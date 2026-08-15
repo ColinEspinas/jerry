@@ -65,6 +65,21 @@ impl RebaseActionKind {
         }
     }
 
+    /// The action menu's own one-line hint (design spec §1.4's action table, "Menu hint" column,
+    /// verbatim). Lives beside [`Self::label`] rather than in `crate::graph_view::rebase_render`
+    /// because it is content, not presentation: the six of them being one exhaustive `match` is
+    /// what keeps §4's "menu hints one line each" from being satisfiable for only some actions.
+    pub(crate) fn hint(self) -> &'static str {
+        match self {
+            RebaseActionKind::Pick => "keep the commit as it is",
+            RebaseActionKind::Reword => "stop to edit the message",
+            RebaseActionKind::Edit => "stop to amend the contents",
+            RebaseActionKind::Squash => "fold up, keep both messages",
+            RebaseActionKind::Fixup => "fold up, discard this message",
+            RebaseActionKind::Drop => "remove the commit",
+        }
+    }
+
     /// Whether this action folds its own row into the previous resulting block (design spec
     /// §1.4's fold-elbow indicator, §1.6's "N commits folded in") - `squash`/`fixup` only.
     pub(crate) fn folds_into_previous(self) -> bool {
@@ -186,6 +201,14 @@ pub(crate) struct RebaseModeState {
     /// Oldest-first, applied top to bottom - see this module's own docs.
     pub plan: Vec<RebasePlanRow>,
     pub phase: RebasePhase,
+    /// Which plan row is selected (design spec §1.4: "Row selection: 2px left edge `#3f5b74` on
+    /// bg `#1a1e21`"), and the row every keyboard action in §1.4's footer hint strip
+    /// (`P pick · S squash · D drop`, `alt+↑↓ reorder`) acts on. A plain index rather than a
+    /// commit id, unlike [`Self::dragging_row`]: selection has to survive a reorder as *"the row
+    /// I am working on stays under the cursor"*, and [`AdeApp::move_selected_rebase_plan_row`]
+    /// moves it deliberately alongside the row it moved. Clamped by [`Self::selected_index`] so a
+    /// plan that shrinks (or has not loaded yet) can never index out of bounds.
+    pub selected_row: usize,
     /// Which row's action-chip dropdown (design spec §1.4: `<action> ▾`) is open, if any.
     pub action_menu_open: Option<usize>,
     /// `true` while the plan is still being built (the background `commits_to_rebase`/
@@ -215,6 +238,20 @@ pub(crate) struct RebaseModeState {
     pub dragging_row: Option<String>,
     pub drag_insertion: Option<(String, bool)>,
     pub _task: Option<Task<()>>,
+}
+
+impl RebaseModeState {
+    /// [`Self::selected_row`], clamped to a row that really exists right now - `None` only for a
+    /// genuinely empty plan (the mode's own loading phase, before the background pass has built a
+    /// single row). Every reader goes through this rather than indexing `plan[selected_row]`
+    /// directly: the plan is rebuilt from scratch on a real reload, and a stale index outliving
+    /// the row it pointed at would panic.
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        if self.plan.is_empty() {
+            return None;
+        }
+        Some(self.selected_row.min(self.plan.len() - 1))
+    }
 }
 
 /// One block of [`derive_result_blocks`]'s output - the Result panel's own per-resulting-commit
@@ -478,6 +515,7 @@ impl AdeApp {
             onto_short,
             plan: Vec::new(),
             phase: RebasePhase::Planning,
+            selected_row: 0,
             action_menu_open: None,
             op_in_flight: true,
             already_on_upstream: Vec::new(),
@@ -706,6 +744,74 @@ impl AdeApp {
             }
             rebase_state.action_menu_open = None;
         }
+        cx.notify();
+    }
+
+    /// Design spec §1.4's row selection - a real click anywhere on a plan row that isn't the
+    /// action chip or the reword field (both of which `cx.stop_propagation()`).
+    pub(crate) fn select_rebase_plan_row(&mut self, row_index: usize, cx: &mut Context<Self>) {
+        if let Some(rebase_state) = self.graph_state.rebase.as_mut() {
+            if row_index < rebase_state.plan.len() && rebase_state.selected_row != row_index {
+                rebase_state.selected_row = row_index;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Design spec §1.4's footer hint `P pick · S squash · D drop`: set the **selected** row's
+    /// action from the keyboard. Deliberately routed through [`Self::set_rebase_row_action`]
+    /// rather than reaching into the plan itself, so a keyboard action and a real menu click can
+    /// never diverge (the menu-closing, the `cx.notify()`, and every derived recount are one code
+    /// path).
+    pub(crate) fn set_selected_rebase_row_action(
+        &mut self,
+        action: RebaseActionKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
+            return;
+        };
+        // Never while a real git call is in flight, for the same reason every banner button is
+        // disabled then (see `Self::render_rebase_banner_actions`'s own docs): the plan being
+        // edited under a running rebase is exactly the double-click bug class that guard exists
+        // for, and a keystroke is no less real a mutation than a click.
+        if rebase_state.op_in_flight || !matches!(rebase_state.phase, RebasePhase::Planning) {
+            return;
+        }
+        let Some(index) = rebase_state.selected_index() else {
+            return;
+        };
+        self.set_rebase_row_action(index, action, cx);
+    }
+
+    /// Design spec §1.4's footer hint `alt+↑↓ reorder`: the keyboard counterpart to the drag
+    /// handle. Reuses [`move_rebase_plan_row`] (identity-matched, not index-matched) rather than
+    /// swapping in place, so the drag path and the keyboard path really are the same reorder.
+    /// The selection follows the row it moved - otherwise a held `alt+↑` would walk the selection
+    /// down the plan while shuffling a different row each time.
+    pub(crate) fn move_selected_rebase_plan_row(&mut self, up: bool, cx: &mut Context<Self>) {
+        let Some(rebase_state) = self.graph_state.rebase.as_mut() else {
+            return;
+        };
+        if rebase_state.op_in_flight || !matches!(rebase_state.phase, RebasePhase::Planning) {
+            return;
+        }
+        let Some(index) = rebase_state.selected_index() else {
+            return;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|next| *next < rebase_state.plan.len())
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let moved = rebase_state.plan[index].commit.clone();
+        let neighbour = rebase_state.plan[target].commit.clone();
+        move_rebase_plan_row(&mut rebase_state.plan, &moved, &neighbour, !up);
+        rebase_state.selected_row = target;
+        rebase_state.action_menu_open = None;
         cx.notify();
     }
 
