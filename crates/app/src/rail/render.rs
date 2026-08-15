@@ -4501,14 +4501,15 @@ mod rail_filter_caret_tests {
 
 /// GitHub issue #5's "custom icon packs" - real coverage that the rail agent row's chip
 /// (`AdeApp::render_agent_chip_icon`, the one real call site this feature is wired to today)
-/// actually switches between the app's default letter chip and a real pack SVG, rather than
-/// just trusting the render code's own claim to do so.
+/// actually switches between the app's default letter chip and a real pack icon, rather than
+/// just trusting the render code's own claim to do so. GitHub issue #309's own regression test
+/// lives here too - see `the_pack_icon_element_is_a_real_image_not_a_colour_dependent_svg`.
 #[cfg(test)]
 mod agent_chip_icon_pack_tests {
     use crate::rail::worktrees::WorktreeItem;
     use crate::root::focus::palette_focus_tests;
     use crate::work_surface::agents::ProcessKind;
-    use gpui::TestAppContext;
+    use gpui::{px, TestAppContext};
 
     fn worktree_item(path: std::path::PathBuf, label: &str) -> WorktreeItem {
         WorktreeItem {
@@ -4577,8 +4578,8 @@ mod agent_chip_icon_pack_tests {
             "with no icon pack configured, the rail's own default agent chip must paint"
         );
         assert!(
-            cx.debug_bounds("agent-chip-icon-pack-svg").is_none(),
-            "with no icon pack configured, no pack SVG element must paint at all"
+            cx.debug_bounds("agent-chip-icon-pack-image").is_none(),
+            "with no icon pack configured, no pack image element must paint at all"
         );
     }
 
@@ -4599,14 +4600,57 @@ mod agent_chip_icon_pack_tests {
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("agent-chip-icon-pack-svg").is_some(),
-            "once a real pack directory with a matching shell.svg is configured, the rail row \
-             must really switch to painting the pack's own SVG element"
+            cx.debug_bounds("agent-chip-icon-pack-image").is_some(),
+            "once a real pack directory with a matching claude.svg is configured, the rail row \
+             must really switch to painting the pack's own image element"
         );
         assert!(
             cx.debug_bounds("agent-chip-icon-default").is_none(),
             "the default letter chip must not also paint once the pack icon takes over - \
              exactly one of the two must be showing, never both at once"
+        );
+    }
+
+    /// GitHub issue #309: `debug_bounds` (the two tests above) only proves the pack-icon element
+    /// exists in the render tree - `Interactivity::paint` records it *before* running the
+    /// element's own paint closure, so it stays `Some(..)` even for an element whose paint
+    /// closure draws nothing. That is exactly how the empty-box bug shipped past those two tests
+    /// in the first place: the old pack-icon branch built a `gpui::svg()` with no `.text_color()`
+    /// set, and GPUI's `Svg::paint` (`vendor/zed/crates/gpui/src/elements/svg.rs`) zips its path
+    /// with `style.text.color` and skips painting outright when that's `None` - a real, silent,
+    /// invisible empty box that both bounds-only tests above were blind to.
+    ///
+    /// This test instead inspects the real element `AdeApp::render_agent_chip_icon` hands back,
+    /// downcasting the type-erased `AnyElement` (`gpui::AnyElement::downcast_mut`) to check which
+    /// concrete GPUI element type is actually behind it. `gpui::Img::paint`
+    /// (`vendor/zed/crates/gpui/src/elements/img.rs`) never reads `style.text.color` at all - it
+    /// paints real decoded pixels unconditionally - so this is the real, structural guarantee
+    /// that the pack icon cannot regress back into the invisible-alpha-mask failure mode.
+    #[gpui::test]
+    fn the_pack_icon_element_is_a_real_image_not_a_colour_dependent_svg(cx: &mut TestAppContext) {
+        let pack_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(pack_dir.path().join("claude.svg"), "<svg></svg>").expect("write");
+
+        let (_repo, _wt, app, cx) = open_with_a_running_agent(cx);
+        app.update(cx, |app, cx| {
+            app.settings.icon_pack.directory = Some(pack_dir.path().to_path_buf());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let mut element = app.read_with(cx, |app, _cx| {
+            app.render_agent_chip_icon(ProcessKind::claude(), px(15.0), app.ui_text_size(9.0))
+        });
+        assert!(
+            element.downcast_mut::<gpui::Img>().is_some(),
+            "a configured pack icon must be built through gpui::img(), whose paint never \
+             consults style.text.color, not gpui::svg(), whose paint silently skips painting \
+             altogether when no text colour is set"
+        );
+        assert!(
+            element.downcast_mut::<gpui::Svg>().is_none(),
+            "a configured pack icon must not be a gpui::svg() element - that is the exact shape \
+             of GitHub issue #309's empty-box bug"
         );
     }
 }

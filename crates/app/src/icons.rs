@@ -60,8 +60,14 @@
 //! module uses (`folder`, `trash`, ...), so a pack author needs nothing but the name.
 //!
 //! Note this module deliberately does not change `crate::root::widgets`'
-//! `render_agent_chip_icon`, the one older icon-pack call site - its no-tint path predates this
-//! issue and is a separate, already-shipped surface.
+//! `render_agent_chip_icon`, the one older icon-pack call site - it is a separate,
+//! already-shipped surface with a real difference from this one: a shipped Phosphor icon is
+//! deliberately monochrome and *should* pick up a theme tint (point 1 above), while an
+//! agent-chip pack icon is a full-color, user-supplied brand image that must keep its own
+//! colors. GitHub issue #309 fixed that older call site's own version of point 2 above (it drew
+//! empty boxes for the same "no text color" reason) by switching it to `gpui::img()`, which
+//! doesn't consult `style.text.color` at all - not by adding a tint, which would have been wrong
+//! for a full-color logo.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
