@@ -42,6 +42,9 @@ pub mod root;
 // *capture* of what a run was) or inside `rail` (which owns the live tree): this is a surface
 // with its own model, its own persistence and its own tab kind.
 pub mod run_history;
+// GitHub issue #162 / `REVISION-2026-08-14.md` §5: the right panel's Search tab - the matcher,
+// the bounded worktree walk, the two-level result tree and the real in-place replace behind it.
+pub mod search;
 pub mod settings;
 pub mod sidebar;
 pub mod sound;
@@ -249,6 +252,21 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),
         gpui::KeyBinding::new("secondary-shift-g", root::NewGitGraph, None),
+        // GitHub issue #162's own ask, unchanged by the rev-6 re-scope: "`mod+shift+F` opens the
+        // panel focused in the query." Deliberately global (`None`), like every other
+        // `"secondary-shift-"` entry above and unlike the plain letters further down: a real
+        // Cmd/Ctrl-modified keystroke never reaches a focused pty in the first place
+        // (`crate::terminal::pane::keystroke_to_bytes` returns `None` for any keystroke carrying
+        // `platform`, and `Ctrl+Shift+F` is not a control byte any shell reads), so there is no
+        // terminal input for it to swallow.
+        gpui::KeyBinding::new("secondary-shift-f", root::SearchInWorktree, None),
+        // GitHub issue #162's in-file find. Scoped `Some("file-editor")`, unlike the panel's
+        // global `secondary-shift-f` above: `mod+F` only means anything where there is a file to
+        // find *in*, and the Diff view is two files side by side, so a bar claiming to find "in
+        // this file" over it would have to pick one silently. The handler independently re-checks
+        // `AdeApp::active_editable_path` for the same reason every other `"file-editor"`-scoped
+        // handler does.
+        gpui::KeyBinding::new("secondary-f", root::FindInFile, Some("file-editor")),
         // `&& !text-input` was added by GitHub issue #288, and it is a real fix rather than
         // defensive padding: that issue puts a pinned review-note card - a genuine
         // `"text-input"` node - *inside* the diff surface, so with the old predicate a plain `]`

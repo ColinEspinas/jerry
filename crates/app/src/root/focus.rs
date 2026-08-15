@@ -2015,12 +2015,12 @@ mod palette_result_focus_tests {
     }
 
     /// Adversarial-audit regression, MAJOR. With the tree focused, opening the palette captures
-    /// `tree_focus_handle`; running the palette's own "Toggle Files / Changes" then unrenders the
+    /// `tree_focus_handle`; running the palette's own "Cycle Right Panel" then unrenders the
     /// whole tree. `set_right_sidebar_view`'s own `is_focused` guard cannot see this, because the
     /// *palette* holds focus at that moment - so closing the palette restored focus straight onto
     /// a handle that is no longer in the frame.
     #[gpui::test]
-    fn toggling_to_changes_from_the_palette_does_not_restore_focus_onto_the_unrendered_tree(
+    fn cycling_off_files_from_the_palette_does_not_restore_focus_onto_the_unrendered_tree(
         cx: &mut TestAppContext,
     ) {
         let (_repo, app, cx) = open_seeded(cx);
@@ -2036,7 +2036,7 @@ mod palette_result_focus_tests {
             let groups = app.build_palette_groups(cx);
             let index = palette::flatten(&groups).iter().position(|entry| {
                 entry.target
-                    == palette::EntryTarget::Command(palette::PaletteCommand::ToggleFilesChanges)
+                    == palette::EntryTarget::Command(palette::PaletteCommand::CycleRightPanel)
             });
             match index {
                 Some(index) => {
@@ -2046,15 +2046,15 @@ mod palette_result_focus_tests {
                 None => false,
             }
         });
-        assert!(ran, "the palette must offer the real Files/Changes toggle");
+        assert!(ran, "the palette must offer the real right-panel cycle");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.right_sidebar_view,
-                RightSidebarView::Changes,
-                "premise: the toggle really ran and the tree really is unrendered"
+                RightSidebarView::Search,
+                "premise: the cycle really ran (Files -> Search) and the tree really is unrendered"
             );
         });
         let (focused, tree_handle) = app.update_in(cx, |app, window, cx| {
@@ -2161,7 +2161,7 @@ mod palette_result_focus_tests {
             app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
             app.update(cx, |app, _| {
                 app.palette_query
-                    .push_str(command.label(), std::time::Instant::now());
+                    .insert_str(command.label(), std::time::Instant::now());
             });
             cx.run_until_parked();
 

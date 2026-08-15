@@ -288,6 +288,7 @@ pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("status_bar", status_bar::TOKENS),
     ("notes", notes::TOKENS),
     ("history", history::TOKENS),
+    ("search", search::TOKENS),
 ];
 
 /// Every real registered [`ColorToken`], flattened across [`TOKEN_GROUPS`] - registry order
@@ -3161,6 +3162,49 @@ pub mod history {
     ];
 }
 
+/// The right panel's Search tab (GitHub issue #162, `REVISION-2026-08-14.md` §5 /
+/// `STAGE-A-CHANGELOG.md` §4v) - real hex values transcribed directly from those sections, not
+/// paraphrased.
+///
+/// Only the values this surface is the **first** to need get keys here. Its greys are already in
+/// the ramp and are reused rather than re-declared: the idle note's `#41464b` is
+/// [`super::text::HINT`], the empty note's and the placeholders' `#4e545a` is
+/// [`super::text::GHOST`], the count row's `#5e646a` is [`super::text::FAINTER`], a modifier
+/// button's off-state is [`super::text::FAINTER`] too, the line number's `#3d4248` is
+/// [`super::text::DISABLED`] and the file row's dimmed directory `#454b51` is
+/// [`super::text::GHOSTER`]. A second key holding a value the ramp already states would be
+/// exactly the "two specifications of one thing" defect §4w names.
+pub mod search {
+    use super::{token, ColorToken};
+
+    /// A modifier button's active fill - `Aa` / `ab` / `.*` while that modifier is on
+    /// (§5: "on-state bg `#1d3242` fg `#a5cdf0`, off `#5e646a`"). Shared with the query row's
+    /// own `⇄` and funnel toggles, which §4v draws in the same active pair.
+    pub const MODIFIER_ON_BG: ColorToken = token("search.modifier_on_bg", 0x1d3242);
+    /// That button's glyph while it is on.
+    pub const MODIFIER_ON_FG: ColorToken = token("search.modifier_on_fg", 0xa5cdf0);
+
+    /// The highlight behind the matched text on a result row (§4v: "the hit highlighted
+    /// `#2b3d4f`/`#a5cdf0`").
+    pub const MATCH_BG: ColorToken = token("search.match_bg", 0x2b3d4f);
+    /// The matched text itself.
+    pub const MATCH_FG: ColorToken = token("search.match_fg", 0xa5cdf0);
+
+    /// The un-matched context either side of the hit on a result row - deliberately recessive
+    /// against [`MATCH_FG`], since the line is there to place the hit, not to be read in full.
+    pub const LINE: ColorToken = token("search.line", 0x767d84);
+
+    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
+    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry.
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("MODIFIER_ON_BG", MODIFIER_ON_BG),
+        ("MODIFIER_ON_FG", MODIFIER_ON_FG),
+        ("MATCH_BG", MATCH_BG),
+        ("MATCH_FG", MATCH_FG),
+        ("LINE", LINE),
+    ];
+}
+
 /// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
 /// 2026-07-31 entry, "git graph (issue #1)") - real hex values transcribed directly from that
 /// entry's §2/§3, not paraphrased. The column header band and the removal of the per-commit
@@ -3561,6 +3605,25 @@ pub mod band {
     pub const TITLE_BAR_CAPTION_BUTTON: Pixels = px(44.0);
     /// The tab strip's `+` menu popover's row height.
     pub const PLUS_MENU_ROW: Pixels = px(29.0);
+
+    // The right panel's Search tab (GitHub issue #162). Every value below is a real measurement
+    // off `Jerry.dc.html`'s own `showFind` block, not a round number picked here. The query row
+    // itself is [`FILTER_ROW`] (30), shared with the rail's own filter - they are the same object
+    // in two places and must not drift.
+    /// The `⇄` replace row, revealed under the query row.
+    pub const SEARCH_REPLACE_ROW: Pixels = px(28.0);
+    /// One of the two `include`/`exclude` glob rows, revealed under those.
+    pub const SEARCH_GLOB_ROW: Pixels = px(25.0);
+    /// The count row: `14 results in 6 files` plus the `⇄` / funnel / fold-all controls.
+    pub const SEARCH_COUNT_ROW: Pixels = px(24.0);
+    /// A result tree's file row - caret, chip, name, dimmed directory, match count.
+    pub const SEARCH_FILE_ROW: Pixels = px(24.0);
+    /// One match row under it - line number, then the line with its hit highlighted.
+    pub const SEARCH_MATCH_ROW: Pixels = px(19.0);
+    /// The square hit box every 17x17 icon button in the search panel's count row uses, matching
+    /// `crate::icons::IconSize::Control`'s own optical box (`STAGE-A-CHANGELOG.md` §4w raised
+    /// fold-all 15 -> 17 to land exactly here).
+    pub const SEARCH_ICON_BUTTON: Pixels = px(17.0);
 }
 
 pub mod zone {

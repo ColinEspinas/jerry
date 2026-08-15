@@ -504,6 +504,19 @@ impl AdeApp {
     /// happens to be rendering. And there is deliberately no gap between the text and the caret:
     /// a cursor sits flush against the last glyph (`crate::rail::render`'s own live report).
     ///
+    /// The third rule, added by GitHub issue #162: the caret sits at
+    /// [`SimpleInput::caret_offset`], not unconditionally at the end. Now that
+    /// `crate::text_history::TextField` has a real caret, the text is split at it and the bar is
+    /// drawn *between* the two halves. With the caret at the end - which is where it is for every
+    /// field until the user presses Left or Home - the trailing half is empty and this renders
+    /// exactly the structure it always did, which is why the existing caret-position tests still
+    /// measure what they measured.
+    ///
+    /// [`SimpleInput::text_selector`] deliberately stays on the **leading** half rather than
+    /// moving to a wrapper around both: those tests assert "the caret is at or past the text's
+    /// right edge", and a wrapper containing the caret would enclose it and make that assertion
+    /// unsatisfiable by construction.
+    ///
     /// The caller still owns the box *around* this row - its border, padding, height and
     /// background - because that genuinely differs per field. What it no longer owns is the part
     /// that was never supposed to differ.
@@ -513,6 +526,7 @@ impl AdeApp {
             text_selector,
             focus_handle,
             text,
+            caret_offset,
             placeholder,
             font: font_name,
             text_size,
@@ -522,7 +536,19 @@ impl AdeApp {
         // "Blank" by the same rule every caller used: nothing typed at all. A field holding only
         // spaces is holding real text and shows it, with the caret after it.
         let is_blank = text.is_empty();
-        let shown = if is_blank { placeholder } else { text }.to_string();
+        // Clamped and re-aligned to a real `char` boundary here as well as in `TextField`: this
+        // helper also serves callers that pass an offset from somewhere else, and slicing a
+        // `&str` mid-character panics.
+        let split_at = (0..=text.len())
+            .rev()
+            .find(|offset| *offset <= caret_offset && text.is_char_boundary(*offset))
+            .unwrap_or(0);
+        let (before_caret, after_caret) = text.split_at(split_at);
+        let leading = if is_blank {
+            placeholder.to_string()
+        } else {
+            before_caret.to_string()
+        };
         // `None` is a genuinely read-only row - a pinned note card that is not the one being
         // typed into, say. It cannot be expressed by passing a handle that happens to be
         // unfocused: several of these rows can be on screen sharing *one* focus handle (only one
@@ -534,6 +560,21 @@ impl AdeApp {
             }
             None => el,
         };
+        // One shared shape for both halves: intrinsically sized, and allowed to shrink and clip
+        // rather than to wrap or to push the caret out of the row. `min_w_0` here is a *floor* of
+        // zero on an auto-sized box, which is a different thing from the `flex_1` that used to sit
+        // beside it and is what makes a field narrower than its own text degrade to a clipped line
+        // instead of a two-line row.
+        let span = |content: String, color: theme::ColorToken| {
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .font(font(font_name))
+                .text_size(text_size)
+                .text_color(color)
+                .child(content)
+        };
         div()
             // On the wrapper, which is the whole point - see this method's own docs.
             .flex_1()
@@ -542,26 +583,22 @@ impl AdeApp {
             .items_center()
             .when(is_blank, caret)
             .child(
-                div()
-                    .debug_selector(move || text_selector.to_string())
-                    // Intrinsically sized, and allowed to shrink and clip rather than to wrap or
-                    // to push the caret out of the row: `min_w_0` here is a *floor* of zero on an
-                    // auto-sized box, which is a different thing from the `flex_1` that used to
-                    // sit beside it and is what makes a field narrower than its own text degrade
-                    // to a clipped line instead of a two-line row.
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .font(font(font_name))
-                    .text_size(text_size)
-                    .text_color(if is_blank {
+                span(
+                    leading,
+                    if is_blank {
                         placeholder_color
                     } else {
                         text_color
-                    })
-                    .child(shown),
+                    },
+                )
+                .debug_selector(move || text_selector.to_string()),
             )
             .when(!is_blank, caret)
+            // Only when there really is text after the caret, so a field with the caret at its end
+            // paints the exact element tree it painted before this method knew about carets.
+            .when(!is_blank && !after_caret.is_empty(), |el| {
+                el.child(span(after_caret.to_string(), text_color))
+            })
     }
 }
 
@@ -583,6 +620,11 @@ pub(crate) struct SimpleInput<'a> {
     pub focus_handle: Option<&'a FocusHandle>,
     /// What the field holds right now.
     pub text: &'a str,
+    /// Where the insertion point is, as a byte offset into [`Self::text`] -
+    /// `crate::text_history::TextField::caret`. Clamped and re-aligned to a `char` boundary by
+    /// the renderer, so an out-of-range or mid-character value degrades to the nearest real one
+    /// rather than panicking.
+    pub caret_offset: usize,
     /// What it says while that is empty.
     pub placeholder: &'a str,
     /// The font family, as a `crate::theme::font` name.

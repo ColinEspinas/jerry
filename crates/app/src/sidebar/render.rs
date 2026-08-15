@@ -63,7 +63,7 @@ impl AdeApp {
             }
             // 1 again, one level removed, and invisible to the check above: an *overlay* can be
             // holding the tree's handle as its own return target while the overlay itself has
-            // focus - which is exactly the state the palette's own "Toggle Files / Changes"
+            // focus - which is exactly the state the palette's own "Cycle Right Panel"
             // command runs in, since the palette is focused and the tree is not. Closing the
             // palette afterwards would then restore focus onto a handle this very branch has
             // just unrendered. Swept from every overlay rather than only the palette, so a
@@ -72,6 +72,26 @@ impl AdeApp {
             self.palette_focus.forget_target(&self.tree_focus_handle);
             self.settings_focus.forget_target(&self.tree_focus_handle);
             self.code_focus.forget_target(&self.tree_focus_handle);
+        }
+        if view != RightSidebarView::Search {
+            // The same dangling-focus invariant as the Files block above, for GitHub issue #162's
+            // four fields: leaving Search unrenders every one of their `track_focus` nodes, so a
+            // handle still focused here would leave `Window::focus` pointing at a `FocusId` no
+            // rendered frame can resolve - which silently kills every context-scoped binding and
+            // the focused terminal's own key handling until the next click. Swept from the
+            // overlays too, for the reason the Files block's own `forget_target` sweep records:
+            // the palette can be the focused surface while holding a search field as its return
+            // target, and closing it would restore focus onto a node this branch just unrendered.
+            for field in crate::search::state::SearchField::ALL {
+                let handle = self.search.focus_handle(field).clone();
+                if handle.is_focused(window) {
+                    let fallback = self.focus_fallback_handle();
+                    restore_focus(&self.agents, &mut self.code_focus, fallback, window, cx);
+                }
+                self.palette_focus.forget_target(&handle);
+                self.settings_focus.forget_target(&handle);
+                self.code_focus.forget_target(&handle);
+            }
         }
         if view != RightSidebarView::Changes {
             // GitHub issue #176, the mirror image of the block above: leaving Changes unrenders
@@ -482,10 +502,10 @@ impl AdeApp {
             return;
         }
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.commit_message.pop(Instant::now()),
+            "backspace" => self.commit_message.backspace(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
                 Some(text) if !text.is_empty() => {
-                    self.commit_message.push_str(text, Instant::now())
+                    self.commit_message.insert_str(text, Instant::now())
                 }
                 _ => false,
             },
@@ -1613,30 +1633,56 @@ impl AdeApp {
         row.into_any_element()
     }
 
-    /// Zone 3's header band (36 high): the real `Files | Changes` segmented control
+    /// Zone 3's header band (36 high): the real `Files · Search · Changes` segmented control
     /// (`design_handoff_jerry_ade/README.md`: "Header 36: segmented `Files | Changes`
-    /// (Files is first and default...)") plus the real `+n`/`−n` totals across the currently
-    /// loaded diff, summed from the same real per-file stats
-    /// (`crate::sidebar::changes::diff_file_stats`) the Changes rows themselves show.
+    /// (Files is first and default...)", with GitHub issue #162 adding Search in the middle) plus
+    /// the real `+n`/`−n` totals across the currently loaded diff, summed from the same real
+    /// per-file stats (`crate::sidebar::changes::diff_file_stats`) the Changes rows themselves
+    /// show.
+    ///
+    /// The three segments are **icons**, not text - `STAGE-A-CHANGELOG.md` §4w: "`Files` /
+    /// `Search` / `Changes` were the only text tabs left in a window whose left strip is already
+    /// iconographic. Now three 26x19 buttons in the same segmented shell, selected state
+    /// unchanged, each with a tooltip carrying the old label plus its old hint." The tooltip
+    /// strings below are `Jerry.dc.html`'s own `title` attributes on those three buttons,
+    /// transcribed rather than paraphrased.
     pub(in crate::sidebar) fn render_right_sidebar_toggle(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = match self.right_sidebar_view {
             RightSidebarView::Files => "Files",
+            RightSidebarView::Search => "Search",
             RightSidebarView::Changes => "Changes",
         };
         let toggle = self.render_choice_control(
             "right-sidebar-toggle",
-            &[ChoiceOption::new("Files"), ChoiceOption::new("Changes")],
+            &[
+                ChoiceOption::with_icon(
+                    "Files",
+                    crate::icons::Icon::Folder,
+                    "Files \u{2014} the file tree for this worktree",
+                ),
+                ChoiceOption::with_icon(
+                    "Search",
+                    crate::icons::Icon::MagnifyingGlass,
+                    "Search \u{2014} find in this worktree",
+                ),
+                ChoiceOption::with_icon(
+                    "Changes",
+                    crate::icons::Icon::GitBranch,
+                    "Changes \u{2014} runs, uncommitted, commits and the branch diff",
+                ),
+            ],
             selected.to_string(),
             cx,
             |this, index, window, cx| {
-                // Structural, not a label re-match: index 0 is `Files`, index 1 is `Changes`,
-                // per the `options` array literal right above - see
+                // Structural, not a label re-match: index 0 is `Files`, 1 is `Search`, 2 is
+                // `Changes`, per the `options` array literal right above - see
                 // `Self::render_choice_control`'s own docs for why dispatch is index-based.
                 let view = match index {
-                    1 => RightSidebarView::Changes,
+                    1 => RightSidebarView::Search,
+                    2 => RightSidebarView::Changes,
                     _ => RightSidebarView::Files,
                 };
                 this.set_right_sidebar_view(view, window, cx);
@@ -1820,6 +1866,11 @@ impl AdeApp {
                     self.window_controls_style().is_macos(),
                     self.tree_inline_edit.is_none(),
                 )),
+            // GitHub issue #162 / `REVISION-2026-08-14.md` §5: the query row (with the replace
+            // and glob rows it reveals), the count row, then the body - which is the two-level
+            // match tree, or one of the two message states, gated on one has-query flag. The whole
+            // panel is `crate::search::render`'s; this arm only places it.
+            RightSidebarView::Search => container.child(self.render_search_panel(cx)),
             // GitHub issue #285: four collapsible sections, with the commit composer pinned
             // **above** them rather than at the panel's foot. The composer is a git control and
             // the sections are what it acts on, so it reads first; that ordering is
@@ -4023,13 +4074,39 @@ impl AdeApp {
 }
 
 /// Which data source the right sidebar currently shows for the selected worktree - Zone 3's
-/// `right_pane` state (`Files | Changes`, `Files` default). The panel never shows diff
+/// `right_pane` state (`Files · Search · Changes`, `Files` default). The panel never shows diff
 /// *content* (see [`AdeApp::open_change`]'s docs) - `Changes` is the per-file review list,
 /// not a diff view.
+///
+/// `Search` is the middle tab (GitHub issue #162, `STAGE-A-CHANGELOG.md` §4u: "Search is now the
+/// middle tab of the right panel - `Files · Search · Changes`"). Middle rather than appended:
+/// these three are ordered by how far from the file they are - the tree, then finding a file's
+/// contents, then what has changed in them - and the order is what a user learns, not the label.
+///
+/// The variants' declaration order is also the segments' order in
+/// [`AdeApp::render_right_sidebar_toggle`], whose `on_select` dispatches by index. See
+/// `crate::settings::widgets::AdeApp::render_choice_control`'s own docs for why index, not label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RightSidebarView {
     Files,
+    Search,
     Changes,
+}
+
+/// The next tab in `Files -> Search -> Changes -> Files` order, behind the command palette's
+/// `Cycle Right Panel`.
+///
+/// A free function next to the enum rather than two separate `match`es inside
+/// `crate::palette::render`: that command both *names* the tab it is about to show and *switches*
+/// to it, and those were two independent matches over the same enum before this - a shape that
+/// only stayed correct while nobody added a third variant. Which is exactly what GitHub issue #162
+/// then did.
+pub(crate) fn next_right_sidebar_view(current: RightSidebarView) -> RightSidebarView {
+    match current {
+        RightSidebarView::Files => RightSidebarView::Search,
+        RightSidebarView::Search => RightSidebarView::Changes,
+        RightSidebarView::Changes => RightSidebarView::Files,
+    }
 }
 
 /// One row of [`AdeApp::render_file_tree`]'s virtualized list: either a real walked entry (by

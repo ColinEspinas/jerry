@@ -333,9 +333,9 @@ impl AdeApp {
             return;
         }
         let changed = match keystroke.key.as_str() {
-            "backspace" => draft.field.pop(Instant::now()),
+            "backspace" => draft.field.backspace(Instant::now()),
             _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => draft.field.push_str(text, Instant::now()),
+                Some(text) if !text.is_empty() => draft.field.insert_str(text, Instant::now()),
                 _ => false,
             },
         };

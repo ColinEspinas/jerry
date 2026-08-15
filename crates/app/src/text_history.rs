@@ -66,6 +66,8 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// How long a pause in typing ends the current undo group. Long enough that an ordinary typing
 /// burst (including a moment's thought mid-word) stays one step; short enough that stepping away
 /// and coming back doesn't silently extend a step that already feels finished. Sits deliberately
@@ -603,18 +605,44 @@ impl TextHistory {
 /// agent filter, the Settings › Keybindings filter, the New file name prompt, the file
 /// tree's inline New File / New Folder / Rename editor - `crate::sidebar::tree_ops::TreeInlineEdit`,
 /// which became one of these when GitHub issue #19's tree met issue #17's undo work at a merge -
-/// the git graph tab's Branches filter, and GitHub issue #242 phase B's interactive-rebase plan
-/// rows' own per-row `reword` message field, one instance per row) with a real undo history
-/// attached. All are append/backspace-only with no caret of their own - see
-/// `crate::rail::AdeApp::handle_filter_key_down`'s own docs for that deliberate scope decision -
-/// so every snapshot here is a collapsed caret at the end of the text.
+/// the git graph tab's Branches filter, GitHub issue #242 phase B's interactive-rebase plan
+/// rows' own per-row `reword` message field, and GitHub issue #162's four search-panel fields)
+/// with a real undo history attached.
 ///
-/// The `String` is private on purpose: every mutation has to go through a method that records, so
-/// a future call site physically cannot bypass the history the way a bare `pub` field would allow.
-/// That is the same silent-divergence bug class this project's own audits keep finding.
+/// ## A real caret (GitHub issue #162)
+///
+/// These fields used to be append/backspace-only, with every history snapshot a collapsed caret
+/// pinned at the end of the text. `REVISION-2026-08-14.md` §5 ended that: "the shared single-line
+/// input needs to become a real editable field - caret positioning, not append/backspace-only;
+/// that upgrade is part of this issue and benefits every other filter row." A search panel with
+/// four real fields is where the old shape stops being defensible - a user *will* arrow back into
+/// a mistyped query rather than backspacing out eight characters of a regex to fix the first one.
+///
+/// So [`Self::caret`] is a real byte offset into [`Self::as_str`], always on a grapheme-cluster
+/// boundary, and every edit happens *there*: [`Self::insert_str`] splices at it,
+/// [`Self::backspace`]/[`Self::delete_forward`] remove the cluster on either side of it, and
+/// [`Self::move_left`]/[`Self::move_right`]/[`Self::move_to_start`]/[`Self::move_to_end`] move it
+/// without recording anything. [`Self::handle_editing_key`] is all of that behind one call, so a
+/// call site gets the whole vocabulary rather than whichever half it remembered to wire.
+///
+/// Undo/redo restore the caret too, from the [`SelectionSnapshot`]s the history already carried -
+/// which is what makes the coalescing policy's own "a caret jump is a group boundary" rule mean
+/// something here for the first time: arrowing away mid-burst now really does start a new step.
+///
+/// Deliberately **not** implemented: selection (and therefore selection-replacing typing, cut, or
+/// shift-arrow). Nothing in these fields needs it, `crate::code_surface::edit_buffer::EditBuffer`
+/// is what a surface that does needs, and half a selection model is worse than none.
+///
+/// The `String` and the caret are private on purpose: every mutation has to go through a method
+/// that records and that re-clamps the caret, so a future call site physically cannot bypass the
+/// history or leave the caret mid-cluster the way bare `pub` fields would allow. That is the same
+/// silent-divergence bug class this project's own audits keep finding.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TextField {
     text: String,
+    /// A byte offset into [`Self::text`], always `<= text.len()` and always on a grapheme
+    /// boundary.
+    caret: usize,
     history: TextHistory,
 }
 
@@ -623,9 +651,9 @@ impl TextField {
         Self::default()
     }
 
-    /// A field that opens *already holding* `text`, with an empty history - the file tree's
-    /// inline **rename** editor (GitHub issue #19), which pre-fills with the entry's current
-    /// name.
+    /// A field that opens *already holding* `text`, with an empty history and the caret at the
+    /// end - the file tree's inline **rename** editor (GitHub issue #19), which pre-fills with the
+    /// entry's current name.
     ///
     /// Deliberately not `new()` followed by [`Self::set`]: that would record the pre-fill as a
     /// real undoable step, so the very first `Ctrl+Z` after opening a rename would blank the
@@ -634,6 +662,7 @@ impl TextField {
     /// false until the user genuinely changes something.
     pub fn seeded(text: &str) -> Self {
         Self {
+            caret: text.len(),
             text: text.to_string(),
             history: TextHistory::new(),
         }
@@ -647,16 +676,108 @@ impl TextField {
         self.text.is_empty()
     }
 
-    /// Appends `text` at the end (this widget class has no caret to insert at), recording it as
-    /// ordinary typing. Returns whether anything changed.
-    pub fn push_str(&mut self, text: &str, now: Instant) -> bool {
+    /// Where the insertion point really is, as a byte offset into [`Self::as_str`]. What
+    /// `crate::root::widgets::SimpleInput` splits the rendered text at.
+    pub fn caret(&self) -> usize {
+        self.caret
+    }
+
+    /// The text before and after the caret - the two spans a rendered row draws the caret bar
+    /// between, so no call site has to slice on a byte offset itself and risk panicking mid-
+    /// cluster.
+    pub fn split_at_caret(&self) -> (&str, &str) {
+        self.text.split_at(self.caret)
+    }
+
+    /// The grapheme boundary at or just before `offset`, clamped into the text. A single-line
+    /// field is short enough to scan whole, unlike `EditBuffer` (see its own
+    /// `previous_boundary` docs for the measured whole-buffer-scan bug that is *not* reachable
+    /// here).
+    fn boundary_at_or_before(&self, offset: usize) -> usize {
+        if offset >= self.text.len() {
+            return self.text.len();
+        }
+        self.text
+            .grapheme_indices(true)
+            .rev()
+            .find(|(index, _)| *index <= offset)
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// The grapheme boundary strictly before the caret, or `None` at the very start.
+    fn previous_boundary(&self) -> Option<usize> {
+        self.text
+            .grapheme_indices(true)
+            .rev()
+            .find(|(index, _)| *index < self.caret)
+            .map(|(index, _)| index)
+    }
+
+    /// The grapheme boundary strictly after the caret, or `None` at the very end.
+    fn next_boundary(&self) -> Option<usize> {
+        self.text
+            .grapheme_indices(true)
+            .find(|(index, grapheme)| index + grapheme.len() > self.caret)
+            .map(|(index, grapheme)| index + grapheme.len())
+    }
+
+    /// Moves the caret one grapheme cluster left. Returns whether it really moved, so a caller can
+    /// tell "the view needs repainting" from "this keystroke did nothing and should keep
+    /// propagating".
+    pub fn move_left(&mut self) -> bool {
+        match self.previous_boundary() {
+            Some(offset) => {
+                self.caret = offset;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The mirror of [`Self::move_left`].
+    pub fn move_right(&mut self) -> bool {
+        match self.next_boundary() {
+            Some(offset) => {
+                self.caret = offset;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn move_to_start(&mut self) -> bool {
+        let moved = self.caret != 0;
+        self.caret = 0;
+        moved
+    }
+
+    pub fn move_to_end(&mut self) -> bool {
+        let moved = self.caret != self.text.len();
+        self.caret = self.text.len();
+        moved
+    }
+
+    /// Puts the caret at the grapheme boundary at or before `offset` - for a caller that has a
+    /// real byte offset of its own (a click hit-test) rather than an arrow key.
+    pub fn set_caret(&mut self, offset: usize) -> bool {
+        let clamped = self.boundary_at_or_before(offset);
+        let moved = clamped != self.caret;
+        self.caret = clamped;
+        moved
+    }
+
+    /// Splices `text` in at the caret, recording it as ordinary typing and leaving the caret after
+    /// what was inserted. Returns whether anything changed.
+    pub fn insert_str(&mut self, text: &str, now: Instant) -> bool {
         if text.is_empty() {
             return false;
         }
-        let at = self.text.len();
+        let at = self.caret;
         let before = SelectionSnapshot::caret(at);
-        self.text.push_str(text);
-        let after = SelectionSnapshot::caret(self.text.len());
+        self.text.insert_str(at, text);
+        self.caret = at + text.len();
+        let after = SelectionSnapshot::caret(self.caret);
         self.history.record(
             TextEdit {
                 at,
@@ -671,19 +792,21 @@ impl TextField {
         true
     }
 
-    /// Removes the last `char`, matching the `String::pop` these fields used before they had a
-    /// history. Returns whether anything was removed.
-    pub fn pop(&mut self, now: Instant) -> bool {
-        let Some(popped) = self.text.pop() else {
+    /// Removes the grapheme cluster **before** the caret - Backspace. Returns whether anything was
+    /// removed.
+    pub fn backspace(&mut self, now: Instant) -> bool {
+        let Some(at) = self.previous_boundary() else {
             return false;
         };
-        let at = self.text.len();
-        let before = SelectionSnapshot::caret(at + popped.len_utf8());
+        let removed = self.text[at..self.caret].to_string();
+        let before = SelectionSnapshot::caret(self.caret);
+        self.text.replace_range(at..self.caret, "");
+        self.caret = at;
         let after = SelectionSnapshot::caret(at);
         self.history.record(
             TextEdit {
                 at,
-                removed: popped.to_string(),
+                removed,
                 inserted: String::new(),
             },
             before,
@@ -694,18 +817,45 @@ impl TextField {
         true
     }
 
+    /// Removes the grapheme cluster **after** the caret - Delete. The caret does not move, which
+    /// is exactly why this cannot share a coalescing group with [`Self::backspace`] by accident:
+    /// their `before`/`after` snapshots differ.
+    pub fn delete_forward(&mut self, now: Instant) -> bool {
+        let Some(end) = self.next_boundary() else {
+            return false;
+        };
+        let at = self.caret;
+        let removed = self.text[at..end].to_string();
+        let before = SelectionSnapshot::caret(at);
+        self.text.replace_range(at..end, "");
+        self.history.record(
+            TextEdit {
+                at,
+                removed,
+                inserted: String::new(),
+            },
+            before,
+            SelectionSnapshot::caret(at),
+            EditKind::Delete,
+            now,
+        );
+        true
+    }
+
     /// Replaces the whole field programmatically (the `Esc`-clears gesture the rail/Settings
-    /// filters have). Recorded as its own sealed step, so `Esc` then Ctrl+Z really brings the
-    /// query back rather than silently losing it. Returns whether anything changed.
+    /// filters have, or a command that seeds a query). Recorded as its own sealed step, so `Esc`
+    /// then Ctrl+Z really brings the query back rather than silently losing it. Leaves the caret
+    /// at the end of the new text. Returns whether anything changed.
     pub fn set(&mut self, text: &str, now: Instant) -> bool {
         if self.text == text {
             return false;
         }
-        let before = SelectionSnapshot::caret(self.text.len());
+        let before = SelectionSnapshot::caret(self.caret);
         let after = SelectionSnapshot::caret(text.len());
         self.history
             .record_replacement(&self.text, text, before, after, now);
         self.text = text.to_string();
+        self.caret = self.text.len();
         true
     }
 
@@ -719,6 +869,7 @@ impl TextField {
     /// [`TextHistory::reset`]'s own docs.
     pub fn reset(&mut self) {
         self.text.clear();
+        self.caret = 0;
         self.history.reset();
     }
 
@@ -726,9 +877,10 @@ impl TextField {
         self.history.can_undo()
     }
 
-    /// Steps one group back. Returns whether anything was actually undone - `false` both for an
-    /// empty history and (defensively) for a group that doesn't match the current text, which
-    /// leaves both the text and the cursor untouched rather than corrupting either.
+    /// Steps one group back, restoring the caret the group recorded as its `before`. Returns
+    /// whether anything was actually undone - `false` both for an empty history and (defensively)
+    /// for a group that doesn't match the current text, which leaves the text, the caret and the
+    /// cursor untouched rather than corrupting any of them.
     pub fn undo(&mut self) -> bool {
         let Some(group) = self.history.peek_undo() else {
             return false;
@@ -741,11 +893,12 @@ impl TextField {
             }
         }
         self.text = candidate;
+        self.caret = self.boundary_at_or_before(group.before.start);
         self.history.commit_undo();
         true
     }
 
-    /// The mirror of [`Self::undo`].
+    /// The mirror of [`Self::undo`], restoring the group's `after` caret.
     pub fn redo(&mut self) -> bool {
         let Some(group) = self.history.peek_redo() else {
             return false;
@@ -757,8 +910,35 @@ impl TextField {
             }
         }
         self.text = candidate;
+        self.caret = self.boundary_at_or_before(group.after.start);
         self.history.commit_redo();
         true
+    }
+
+    /// One keystroke's worth of ordinary single-line editing, so every call site gets the whole
+    /// vocabulary rather than whichever half it remembered to wire - which is precisely how these
+    /// fields ended up append/backspace-only for eight surfaces in the first place.
+    ///
+    /// `key`/`key_char` come straight off `gpui::Keystroke`. Returns whether anything changed
+    /// (text *or* caret), i.e. whether the caller should `cx.notify()` and stop propagation.
+    ///
+    /// Deliberately does **not** handle `escape`, `enter`, `tab` or the arrow keys' `up`/`down`:
+    /// every one of those means something different per surface (cancel, accept, move a list
+    /// selection), and a shared default would silently take them away from the handler that owns
+    /// them. A caller matches its own keys first and falls through to this.
+    pub fn handle_editing_key(&mut self, key: &str, key_char: Option<&str>, now: Instant) -> bool {
+        match key {
+            "left" => self.move_left(),
+            "right" => self.move_right(),
+            "home" => self.move_to_start(),
+            "end" => self.move_to_end(),
+            "backspace" => self.backspace(now),
+            "delete" => self.delete_forward(now),
+            _ => match key_char {
+                Some(text) if !text.is_empty() => self.insert_str(text, now),
+                _ => false,
+            },
+        }
     }
 
     /// Real recorded-step count - see [`TextHistory::len`]'s own docs.
@@ -1177,7 +1357,7 @@ mod tests {
 
         // A real edit on top of a seeded field undoes back to the baseline, not past it.
         let mut field = TextField::seeded("README.md");
-        field.push_str("x", t0());
+        field.insert_str("x", t0());
         assert_eq!(field.as_str(), "README.mdx");
         assert!(field.undo());
         assert_eq!(field.as_str(), "README.md");
@@ -1189,7 +1369,7 @@ mod tests {
         let mut field = TextField::new();
         let now = t0();
         for ch in "hello".chars() {
-            field.push_str(&ch.to_string(), now);
+            field.insert_str(&ch.to_string(), now);
         }
         assert_eq!(field.as_str(), "hello");
         assert_eq!(field.history_len(), 1);
@@ -1204,7 +1384,7 @@ mod tests {
     fn text_field_escape_clear_is_undoable() {
         let mut field = TextField::new();
         let now = t0();
-        field.push_str("main", now);
+        field.insert_str("main", now);
         assert!(field.clear(now));
         assert_eq!(field.as_str(), "");
         assert!(field.undo());
@@ -1219,9 +1399,9 @@ mod tests {
     fn text_field_backspaces_coalesce_and_undo_as_one_step() {
         let mut field = TextField::new();
         let now = t0();
-        field.push_str("abcdef", now);
+        field.insert_str("abcdef", now);
         for _ in 0..3 {
-            field.pop(now);
+            field.backspace(now);
         }
         assert_eq!(field.as_str(), "abc");
         assert!(field.undo());
@@ -1232,7 +1412,7 @@ mod tests {
     fn text_field_reset_drops_the_history_too() {
         let mut field = TextField::new();
         let now = t0();
-        field.push_str("abc", now);
+        field.insert_str("abc", now);
         field.reset();
         assert_eq!(field.as_str(), "");
         assert!(
@@ -1246,13 +1426,200 @@ mod tests {
     fn text_field_handles_a_real_multi_byte_character_without_splitting_it() {
         let mut field = TextField::new();
         let now = t0();
-        field.push_str("caf\u{e9}", now);
-        field.push_str("\u{1f600}", now);
+        field.insert_str("caf\u{e9}", now);
+        field.insert_str("\u{1f600}", now);
         assert_eq!(field.as_str(), "caf\u{e9}\u{1f600}");
-        assert!(field.pop(now));
+        assert!(field.backspace(now));
         assert_eq!(field.as_str(), "caf\u{e9}");
         assert!(field.undo());
         assert_eq!(field.as_str(), "caf\u{e9}\u{1f600}");
+    }
+
+    // GitHub issue #162: the real caret. Before this, every one of these fields was
+    // append/backspace-only and every snapshot was pinned at the end of the text.
+
+    /// Types `text` into `field` one real keystroke at a time, exactly as
+    /// `handle_editing_key`'s character arm receives it.
+    fn type_into(field: &mut TextField, text: &str, now: Instant) {
+        for ch in text.chars() {
+            field.handle_editing_key("", Some(&ch.to_string()), now);
+        }
+    }
+
+    #[test]
+    fn text_typed_into_a_fresh_field_leaves_the_caret_after_it() {
+        let mut field = TextField::new();
+        type_into(&mut field, "refresh", t0());
+        assert_eq!(field.caret(), "refresh".len());
+        assert_eq!(field.split_at_caret(), ("refresh", ""));
+    }
+
+    #[test]
+    fn arrowing_back_and_typing_really_inserts_in_the_middle() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "refresh_token", now);
+        for _ in 0.."_token".len() {
+            assert!(field.handle_editing_key("left", None, now));
+        }
+        assert_eq!(field.split_at_caret(), ("refresh", "_token"));
+        type_into(&mut field, "ed", now);
+        assert_eq!(
+            field.as_str(),
+            "refreshed_token",
+            "this is the whole point of the upgrade: fixing the start of a query without \
+             backspacing out its end"
+        );
+        assert_eq!(field.caret(), "refreshed".len());
+    }
+
+    #[test]
+    fn backspace_and_delete_act_on_opposite_sides_of_the_caret() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abcd", now);
+        field.handle_editing_key("left", None, now);
+        field.handle_editing_key("left", None, now);
+        assert_eq!(field.split_at_caret(), ("ab", "cd"));
+
+        assert!(field.handle_editing_key("backspace", None, now));
+        assert_eq!(field.as_str(), "acd");
+        assert_eq!(field.caret(), 1);
+
+        assert!(field.handle_editing_key("delete", None, now));
+        assert_eq!(field.as_str(), "ad");
+        assert_eq!(field.caret(), 1, "Delete never moves the caret");
+    }
+
+    #[test]
+    fn home_and_end_move_the_caret_to_the_real_ends() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abc", now);
+        assert!(field.handle_editing_key("home", None, now));
+        assert_eq!(field.caret(), 0);
+        assert!(
+            !field.handle_editing_key("home", None, now),
+            "a key that moves nothing must report so, or the caller stops propagating a \
+             keystroke it did not use"
+        );
+        assert!(field.handle_editing_key("end", None, now));
+        assert_eq!(field.caret(), 3);
+    }
+
+    #[test]
+    fn the_caret_never_lands_inside_a_grapheme_cluster() {
+        let mut field = TextField::new();
+        let now = t0();
+        // A family emoji is a single UAX #29 cluster made of several code points and 25 bytes.
+        let cluster = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        field.insert_str(cluster, now);
+        field.insert_str("x", now);
+        assert!(field.handle_editing_key("left", None, now));
+        assert_eq!(field.caret(), cluster.len());
+        assert!(field.handle_editing_key("left", None, now));
+        assert_eq!(
+            field.caret(),
+            0,
+            "one Left must step over the whole cluster, not into the middle of it"
+        );
+
+        field.move_to_end();
+        assert!(field.handle_editing_key("backspace", None, now));
+        assert_eq!(field.as_str(), cluster);
+        assert!(field.handle_editing_key("backspace", None, now));
+        assert_eq!(
+            field.as_str(),
+            "",
+            "Backspace removes the whole cluster, never a lone code point that would leave \
+             mojibake behind"
+        );
+    }
+
+    #[test]
+    fn moving_the_caret_mid_burst_is_a_real_undo_boundary() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abc", now);
+        assert_eq!(field.history_len(), 1);
+        field.handle_editing_key("home", None, now);
+        type_into(&mut field, "X", now);
+        assert_eq!(
+            field.history_len(),
+            2,
+            "the coalescing policy has always called a caret jump a boundary - with no caret to \
+             jump, that rule could never fire in these fields"
+        );
+        assert_eq!(field.as_str(), "Xabc");
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "abc");
+        assert_eq!(
+            field.caret(),
+            0,
+            "undo restores the caret the burst started at"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_put_the_caret_back_where_the_step_left_it() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "hello", now);
+        assert!(field.undo());
+        assert_eq!(field.caret(), 0);
+        assert!(field.redo());
+        assert_eq!(field.caret(), 5);
+    }
+
+    #[test]
+    fn setting_and_clearing_the_whole_field_move_the_caret_with_it() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abcdef", now);
+        field.move_to_start();
+        assert!(field.clear(now));
+        assert_eq!(field.caret(), 0);
+        assert!(field.set("main", now));
+        assert_eq!(
+            field.caret(),
+            4,
+            "a programmatic replacement leaves the caret at the end of what it wrote - a caret \
+             stranded past the end of the new text would panic the renderer's own split"
+        );
+    }
+
+    #[test]
+    fn a_seeded_field_opens_with_the_caret_at_the_end_of_its_prefill() {
+        let field = TextField::seeded("README.md");
+        assert_eq!(field.caret(), "README.md".len());
+    }
+
+    #[test]
+    fn set_caret_clamps_an_out_of_range_or_mid_character_offset() {
+        let mut field = TextField::seeded("caf\u{e9}");
+        field.move_to_start();
+        assert!(field.set_caret(999));
+        assert_eq!(field.caret(), field.as_str().len());
+        field.set_caret(4);
+        assert_eq!(
+            field.caret(),
+            3,
+            "byte 4 is inside the two-byte `\u{e9}`; the caret must land on the boundary before it"
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_leaves_the_keys_its_callers_own_alone() {
+        let mut field = TextField::seeded("abc");
+        let now = t0();
+        for key in ["escape", "enter", "tab", "up", "down"] {
+            assert!(
+                !field.handle_editing_key(key, None, now),
+                "`{key}` means something different on every surface - a shared default would \
+                 silently take it away from the handler that owns it"
+            );
+        }
+        assert_eq!(field.as_str(), "abc");
     }
 
     /// Regression for a real, reachable data-losing sequence found in self-review: `commit_undo`

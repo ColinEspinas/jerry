@@ -126,8 +126,15 @@ pub enum PaletteCommand {
     NewClaudeAgent,
     /// `crate::root::AdeApp::new_agent(ProcessKind::codex(), ..)`.
     NewCodexAgent,
-    /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files | Changes` control.
-    ToggleFilesChanges,
+    /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files - Search - Changes`
+    /// control.
+    ///
+    /// A **cycle**, not a toggle, since GitHub issue #162 made the panel three tabs: `Toggle` was
+    /// this command's own name while there were exactly two, and leaving it named that over three
+    /// would have been a name stating something the command no longer does - the "two
+    /// specifications of one thing" defect `STAGE-A-CHANGELOG.md` 4w names, in its
+    /// name-versus-behaviour form.
+    CycleRightPanel,
     /// `crate::root::AdeApp::request_prune` - goes through the same two-click confirmation gate
     /// as the rail footer's own `prune` button, never bypassing it.
     PruneWorktrees,
@@ -183,7 +190,7 @@ impl PaletteCommand {
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
-        PaletteCommand::ToggleFilesChanges,
+        PaletteCommand::CycleRightPanel,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
         PaletteCommand::RestartLanguageServers,
@@ -206,7 +213,7 @@ impl PaletteCommand {
             PaletteCommand::NewShell => "New Shell",
             PaletteCommand::NewClaudeAgent => "New Claude Agent",
             PaletteCommand::NewCodexAgent => "New Codex Agent",
-            PaletteCommand::ToggleFilesChanges => "Toggle Files / Changes",
+            PaletteCommand::CycleRightPanel => "Cycle Right Panel",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
             PaletteCommand::RestartLanguageServers => "Restart Language Servers",
@@ -226,7 +233,9 @@ impl PaletteCommand {
             PaletteCommand::NewShell => "shell terminal spawn agent",
             PaletteCommand::NewClaudeAgent => "claude agent spawn agent cli",
             PaletteCommand::NewCodexAgent => "codex agent spawn agent cli",
-            PaletteCommand::ToggleFilesChanges => "files changes panel sidebar switch",
+            PaletteCommand::CycleRightPanel => {
+                "files search changes find panel sidebar switch toggle tab"
+            }
             PaletteCommand::PruneWorktrees => "prune worktree remove delete cleanup merged",
             PaletteCommand::OpenSettings => "settings preferences agents worktrees config",
             PaletteCommand::RestartLanguageServers => {

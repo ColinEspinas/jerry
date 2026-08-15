@@ -106,7 +106,7 @@ impl AdeApp {
             }
             "backspace" => {
                 if let Some(input) = self.new_file_input.as_mut() {
-                    input.name.pop(Instant::now());
+                    input.name.backspace(Instant::now());
                     // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::
                     // AdeApp::handle_filter_key_down`'s identical reasoning. Missing here
                     // (GitHub issue #45) is exactly why this field never blinked.
@@ -122,7 +122,7 @@ impl AdeApp {
                     .filter(|text| !text.is_empty())
                 {
                     if let Some(input) = self.new_file_input.as_mut() {
-                        input.name.push_str(text, Instant::now());
+                        input.name.insert_str(text, Instant::now());
                         self.reset_caret_blink(cx);
                         cx.notify();
                         cx.stop_propagation();
@@ -181,6 +181,11 @@ impl AdeApp {
             .new_file_input
             .as_ref()
             .map(|input| input.name.as_str().to_string())
+            .unwrap_or_default();
+        let name_caret = self
+            .new_file_input
+            .as_ref()
+            .map(|input| input.name.caret())
             .unwrap_or_default();
         let parent_label = self
             .new_file_input
@@ -272,6 +277,7 @@ impl AdeApp {
                                 text_selector: "new-file-name-text".into(),
                                 focus_handle: Some(&self.new_file_focus_handle),
                                 text: &name,
+                                caret_offset: name_caret,
                                 placeholder: "file-name.ext",
                                 font: theme::font::MONO,
                                 text_size: px(11.5),

@@ -219,6 +219,23 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
         // characters instead of letting them be typed into a note.
         vec!["app", "diff", "diff-view"],
         vec!["app", "diff", "diff-view", "text-input"],
+        // GitHub issue #162 adds two more bare `"text-input"` frames, and their *stacks* are the
+        // interesting part rather than the tag:
+        //
+        // - the Search panel's four fields live in the right sidebar, which is not inside any
+        //   other keyed container, so they are the plain `vec!["app", "text-input"]` already
+        //   listed above - no new stack.
+        // - the in-file find bar is deliberately a **sibling** of the code surface's own
+        //   `"diff file-editor text-input"` node rather than a child of it (see
+        //   `crate::code_surface::render::AdeApp::render_code_surface`), which is exactly why it
+        //   is *also* the plain `vec!["app", "text-input"]` and not a
+        //   `["app", "diff file-editor text-input", "text-input"]`. Nested, every arrow key,
+        //   Enter and Esc typed into the bar would have matched an `Editor*` binding instead -
+        //   a real, reproduced bug, not a hypothetical.
+        //
+        // So neither adds a stack here; both add a call site, which is what the drift guard
+        // below counts.
+        //
         // The file tree (GitHub issue #19), built by calling the *same* function the renderer
         // calls, over both of its inputs - not by restating its literals here. See
         // [`file_tree_key_context`] for why that indirection is load-bearing rather than tidy.
@@ -740,15 +757,16 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 18,
-            "real_context_stacks() is hand-derived from exactly eighteen .key_context(..) call \
-             sites (eleven of which emit the same bare \"text-input\": the palette, the rail \
+            call_sites, 20,
+            "real_context_stacks() is hand-derived from exactly twenty .key_context(..) call \
+             sites (thirteen of which emit the same bare \"text-input\": the palette, the rail \
              filter, the new-file prompt, the Branches filter, the Keybindings filter, the \
              Themes page's \"Generate from colour\" seed input, the General page's \"Shell\" \
              field (GitHub issue #213), GitHub issue #241's git graph row menu's \"Create \
              branch here\" prompt, GitHub issue #242 phase B's interactive-rebase plan row's own \
              reword message field, GitHub issue #285's Changes panel commit message field, and - \
-             newest, GitHub issue #288's pinned review-note card - plus GitHub issue #304's own \
+             GitHub issue #288's pinned review-note card, and - newest - GitHub issue #162's \
+             Search panel row and its in-file find bar - plus GitHub issue #304's own \
              \"rebase-plan\" and issue #288's own \"diff-view\") - a new one means \
              that list, and every disjointness answer built on \
              it, needs updating. Real sites found: {sites:?}"

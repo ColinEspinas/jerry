@@ -238,7 +238,7 @@ impl AdeApp {
             (false, _) => "diff",
         };
 
-        div()
+        let surface = div()
             .id("code-surface")
             // Focus target for the whole Diff/File surface - see `code_focus_handle`'s docs for
             // the dangling-`Window::focus` bug this fixes, the same class `render_settings`'s
@@ -298,6 +298,9 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_editor_indent_action))
             .on_action(cx.listener(Self::handle_editor_dedent_action))
             .on_action(cx.listener(Self::handle_editor_escape_action))
+            // GitHub issue #162's in-file find. On this node rather than the window root because
+            // its binding is `"file-editor"`-scoped, and this node is what carries that tag.
+            .on_action(cx.listener(Self::handle_find_in_file_action))
             .flex()
             .flex_col()
             .flex_1()
@@ -307,6 +310,33 @@ impl AdeApp {
             .bg(theme::surface::CENTER)
             .child(toolbar)
             .child(body)
+            .into_any_element();
+
+        // The find bar is a **sibling** of the `"code-surface"` node above, not a child of it,
+        // and that is load-bearing rather than cosmetic. GPUI resolves a keystroke against the
+        // focused node's whole ancestor context stack, so a bar nested inside a node carrying
+        // `"file-editor"` would have `EditorLeft`, `EditorEnter` and `EditorCollapseCursors`
+        // matching every arrow key, Enter and Esc typed into it - the field would silently drive
+        // the editor instead of itself. Found by this module's own `find_bar_tests`, which typed
+        // `left left ...` into the bar and got the text back unmoved.
+        //
+        // It therefore sits at the very top of the pane, above the file toolbar, rather than
+        // between the toolbar and the content: that is the one position outside the editor's own
+        // context stack. It is also the position Zed puts its own buffer search in - the bar
+        // belongs to the pane, not to the line it is pointing at - and it keeps the bar from
+        // covering the first line of what it is searching, which a floating overlay would.
+        if self.find_bar.is_none() {
+            return surface;
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .children(self.render_find_bar(cx))
+            .child(surface)
             .into_any_element()
     }
 
