@@ -873,6 +873,21 @@ pub mod surface {
     pub const WINDOW_BORDER: ColorToken = token("surface.window_border", 0x262a2e);
     pub const TITLE_BAR: ColorToken = token("surface.title_bar", 0x101214);
     pub const RAIL: ColorToken = token("surface.rail", 0x101113); // left rail + right panel
+    /// The sidebar strip's own recessed band (GitHub issue #291) - the 36px view switcher above
+    /// the rail. Deliberately **darker than [`RAIL`]**, and that is the whole reason it is its own
+    /// token rather than a reuse of [`WINDOW`] or [`PTY`]:
+    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim - "a tab only
+    /// reads as connected if the strip behind it is **darker than the panel**, and here strip and
+    /// rail were both `#101113`, so the slab floated. Strip is now `#0c0e10`; the selected cell is
+    /// `#101113`, exactly the rail's own background". `Jerry.dc.html`'s own final markup then
+    /// settled one step lower again (`background:#0a0b0d`, matching §4v's closing verification
+    /// line "selected `rgb(16,17,19)` over strip `rgb(10,11,13)`"), which is the value here.
+    ///
+    /// A theme that lifted this to or above [`RAIL`] would not merely recolour the strip - it
+    /// would destroy the selected cell's "cut the column rule and join the panel below" reading,
+    /// which is the strip's entire selection idiom. `theme::tests::the_sidebar_strip_stays_
+    /// recessed_below_the_rail_in_every_bundled_theme` holds that invariant.
+    pub const SIDEBAR_STRIP: ColorToken = token("surface.sidebar_strip", 0x0a0b0d);
     pub const CENTER: ColorToken = token("surface.center", 0x131518); // work surface
     pub const PTY: ColorToken = token("surface.pty", 0x0d0f11); // agent CLI + terminal
     pub const HEADER: ColorToken = token("surface.header", 0x121417); // context bar, panel headers
@@ -946,6 +961,7 @@ pub mod surface {
         ("WINDOW_BORDER", WINDOW_BORDER),
         ("TITLE_BAR", TITLE_BAR),
         ("RAIL", RAIL),
+        ("SIDEBAR_STRIP", SIDEBAR_STRIP),
         ("CENTER", CENTER),
         ("PTY", PTY),
         ("HEADER", HEADER),
@@ -1092,6 +1108,23 @@ pub mod text {
     /// The file tree row's `▾`/`▸` caret - same hex as [`PATH`] but a distinct token for a
     /// distinct element.
     pub const TREE_CARET: ColorToken = token("text.tree_caret", 0x4a5057);
+    /// The colour a hovered glyph lifts to in a surface whose *background* already encodes
+    /// selection - today the sidebar strip's cells (GitHub issue #291).
+    ///
+    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v derives it from a real
+    /// defect and states the rule verbatim: **"two states must not compete on one property. If
+    /// background says 'selected', hover says it somewhere else."** Making the selected cell match
+    /// the rail (which the cut-out requires) dropped selected to luminance 16.9 while a background
+    /// hover sat at 25.4, so hovering an *inactive* view out-read the active one. "Hover moved off
+    /// background entirely: the cell sets `color`, every glyph part draws with `currentColor`, and
+    /// hover lifts `color` to `#c8ced4`."
+    ///
+    /// Its own token rather than a reuse of [`HEADING`] (`#c8cdd2`, two units away and
+    /// indistinguishable today) because the two answer different questions: `HEADING` is a resting
+    /// *text* step on the ramp, this is the top of a two-state glyph pair whose floor is
+    /// [`FAINTER`]. A theme retuning its heading weight must not silently flatten a hover that is
+    /// the only feedback an inactive strip cell has.
+    pub const GLYPH_HOVER: ColorToken = token("text.glyph_hover", 0xc8ced4);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
@@ -1115,6 +1148,7 @@ pub mod text {
         ("DISABLED", DISABLED),
         ("PATH", PATH),
         ("TREE_CARET", TREE_CARET),
+        ("GLYPH_HOVER", GLYPH_HOVER),
     ];
 }
 
@@ -3095,10 +3129,20 @@ pub mod band {
     use super::{px, Pixels};
 
     pub const TITLE_BAR: Pixels = px(38.0);
-    /// Shared height for the work-surface tab strip, the session-rail header, and the
-    /// files/changes panel header - the three sit side by side under the title bar and must
-    /// line up pixel-perfect, so they read off one constant instead of three values that could
-    /// drift independently.
+    /// Shared height for the work-surface tab strip, the rail's own sidebar strip
+    /// (`crate::rail::strip`, GitHub issue #291 - it *replaced* the plain rail header at this
+    /// same height), and the files/changes panel header - the three sit side by side under the
+    /// title bar and must line up pixel-perfect, so they read off one constant instead of three
+    /// values that could drift independently.
+    ///
+    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v is the reason this is one
+    /// constant and not three, and it is worth reading before changing it - the design really did
+    /// raise one of the three to 38 and produced "a visible staircase at every column boundary".
+    /// Its rule, verbatim: **"column headers that share a y are one rule, not three. Changing any
+    /// of their heights changes a line that spans the whole window - check the other two in the
+    /// same edit."** The same section also fixes the *colour* of that rule at
+    /// [`super::border::RAIL_INNER`] for all three, "which once the rules lined up would have read
+    /// as one rule changing shade mid-span" otherwise.
     pub const CHROME_HEADER: Pixels = px(36.0);
     pub const CONTEXT_BAR: Pixels = px(32.0);
     pub const DIFF_TOOLBAR: Pixels = px(31.0);
@@ -3149,6 +3193,13 @@ pub mod zone {
     pub const COMPOSER_WIDTH: Pixels = px(560.0);
     /// The tab strip's `+` menu popover's width.
     pub const PLUS_MENU_WIDTH: Pixels = px(326.0);
+    /// One sidebar-strip cell's width (GitHub issue #291). `STAGE-A-CHANGELOG.md` §4v: the strip's
+    /// cells "are now the same object" as the centre tabs - "**38px full-height cells, no radius,
+    /// no gap**" - which `Jerry.dc.html`'s own markup renders as `width:38px` inside a
+    /// [`super::band::CHROME_HEADER`]-high band. Every cell in the strip is exactly this wide,
+    /// view cells and the `+`/`⋯` alike, which is what makes the dividing rules read as a tab
+    /// strip's segments rather than as icons on a dark band.
+    pub const SIDEBAR_STRIP_CELL: Pixels = px(38.0);
 }
 
 /// The only shadows in the product. Drop them if GPUI makes them awkward - the borders
@@ -4328,6 +4379,50 @@ mod syntax_contrast_tests {
                      the real {MIN_RATIO}:1 floor"
                 );
             }
+        }
+    }
+
+    /// The sidebar strip's one structural invariant, in every bundled theme (GitHub issue #291).
+    ///
+    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "a tab only reads as
+    /// connected if the strip behind it is **darker than the panel**, and here strip and rail were
+    /// both `#101113`, so the slab floated." The selected cell fills with [`surface::RAIL`] and
+    /// paints its own rule in the same colour, so a theme that let [`surface::SIDEBAR_STRIP`]
+    /// collapse onto `RAIL` would take the strip's entire selection idiom with it - a failure no
+    /// contrast floor catches, because both colours would still be perfectly legible.
+    ///
+    /// Stated as *recession*, not as "darker", because `Paper` is a real bundled light theme whose
+    /// derivation legitimately inverts the ramp: there, every surface Jerry Dark makes darker is
+    /// made lighter. So the invariant is measured against [`surface::WINDOW`] - the palette's own
+    /// "one step back from a panel" - and asks only that the strip sits on that same side of the
+    /// rail, by at least as much.
+    #[test]
+    fn the_sidebar_strip_stays_recessed_below_the_rail_in_every_bundled_theme() {
+        for def in crate::settings::state::THEME_DEFS.iter() {
+            let _guard = with_bundled_theme(def.name);
+            let strip = relative_luminance(surface::SIDEBAR_STRIP.resolve());
+            let rail = relative_luminance(surface::RAIL.resolve());
+            let window = relative_luminance(surface::WINDOW.resolve());
+            let recession = window - rail;
+            assert!(
+                recession != 0.0,
+                "{}: premise - this palette must separate the window body from a panel at all, \
+                 or there is no direction for `recessed` to mean",
+                def.name
+            );
+            assert!(
+                (strip - rail).signum() == recession.signum(),
+                "{}: the sidebar strip ({strip:.4}) must be recessed from the rail ({rail:.4}) in \
+                 the same direction the window body ({window:.4}) is - on the wrong side of it \
+                 the selected cell stops reading as joined to the panel below",
+                def.name
+            );
+            assert!(
+                (strip - rail).abs() >= recession.abs(),
+                "{}: and by at least as much - a strip that only just clears the rail is the \
+                 floating slab \u{a7}4v rejected",
+                def.name
+            );
         }
     }
 
