@@ -257,7 +257,7 @@ impl AdeApp {
         let settings_keymap_filter_focus_handle = cx.focus_handle();
         let theme_seed_focus_handle = cx.focus_handle();
         let shell_focus_handle = cx.focus_handle();
-        let caret_blink_subscriptions = AdeApp::wire_caret_blink(
+        let (caret_blink_subscriptions, caret_blink_handles) = AdeApp::wire_caret_blink(
             &[
                 &code_focus_handle,
                 &merge_edit_focus_handle,
@@ -454,6 +454,7 @@ impl AdeApp {
             caret_blink_visible: true,
             _caret_blink_task: Task::ready(()),
             _caret_blink_subscriptions: caret_blink_subscriptions,
+            caret_blink_handles,
             graph_tab_open: false,
             graph_tab_active: false,
             graph_focus_handle: cx.focus_handle(),
@@ -724,7 +725,7 @@ impl AdeApp {
         // literal). Wired here instead, appending onto the very same `_caret_blink_subscriptions`
         // vec so there's still exactly one place holding every real caret subscription this app
         // has, not two.
-        let extra_caret_blink_subscriptions = AdeApp::wire_caret_blink(
+        let (extra_caret_blink_subscriptions, extra_caret_blink_handles) = AdeApp::wire_caret_blink(
             &[
                 &this.graph_state.branches_filter_focus_handle,
                 &this.new_file_focus_handle,
@@ -754,6 +755,11 @@ impl AdeApp {
         );
         this._caret_blink_subscriptions
             .extend(extra_caret_blink_subscriptions);
+        // The handle list has to grow with the subscriptions, not just alongside them:
+        // `Self::stop_caret_blink_on_blur` answers "is some *other* caret focused right now?"
+        // from it, and a handle missing here would be read as "nothing caret-bearing is focused"
+        // and kill the shared loop on every hand-off into it.
+        this.caret_blink_handles.extend(extra_caret_blink_handles);
         // Real "add this one repo on startup" (Revision R12 Phase 0, extended by GitHub issue
         // #90 to a genuinely optional repo): `resolved_repo_path` - the CLI argument, the
         // remembered last-focused repo, or nothing at all, per `Self::new_with_settings`'s own
