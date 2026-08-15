@@ -3203,10 +3203,20 @@ pub mod graph {
     /// degrades safely either way (it still keeps the menu on-screen, just not pixel-perfectly
     /// flush with the edge), so this has been left as a known imprecision rather than a blocker.
     pub const ROW_MENU_HEIGHT: Pixels = px(425.0);
-    /// The Branches panel's own branch right-click context menu width (GitHub issue #241) - the
-    /// same 330 as [`ROW_MENU_WIDTH`], since it is the same kind of popover with the same kind of
-    /// rows, just anchored off a branch row instead of a commit row.
-    pub const BRANCH_MENU_WIDTH: Pixels = px(330.0);
+    /// The Branches panel's own branch right-click context menu width (GitHub issue #241).
+    ///
+    /// Deliberately **wider** than [`ROW_MENU_WIDTH`]'s design-specified 330 (§4's "a 330-wide
+    /// context menu" is that menu's own number, for its own short verbs), because this menu's rows
+    /// genuinely need more room and were measurably losing text at 330 in a real running build:
+    /// its labels are whole sentences (`Rebase current branch on Branch…`) and its sub-labels carry
+    /// real explanations rather than a sha - `Delete Branch…`'s own "refused if it has unmerged
+    /// commits" was already truncating to "…unmerged co…" before anything was added to this menu,
+    /// and `Merge into current branch…`'s blocked reason (`graph_branch_merge_gate`) has to be
+    /// *readable* to do its job at all: a reason clipped to "2 files still uncom…" is a rule
+    /// (REVISION-2026-08-14.md §1 rule 3, "the reason on the button itself") only half kept.
+    /// Measured against the longest real label+reason pair this menu can produce, in a real X11
+    /// build, not calculated from font metrics.
+    pub const BRANCH_MENU_WIDTH: Pixels = px(400.0);
     /// The branch context menu's painted height under the test suite's `gpui::TestAppContext` -
     /// pinned by `crate::graph_view::render::graph_branch_menu_tests::
     /// the_branch_menu_pins_the_real_height_this_edge_clamp_relies_on` for exactly the reasons
