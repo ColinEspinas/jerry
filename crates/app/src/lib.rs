@@ -260,6 +260,13 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         // `platform`, and `Ctrl+Shift+F` is not a control byte any shell reads), so there is no
         // terminal input for it to swallow.
         gpui::KeyBinding::new("secondary-shift-f", root::SearchInWorktree, None),
+        // GitHub issue #162's in-file find. Scoped `Some("file-editor")`, unlike the panel's
+        // global `secondary-shift-f` above: `mod+F` only means anything where there is a file to
+        // find *in*, and the Diff view is two files side by side, so a bar claiming to find "in
+        // this file" over it would have to pick one silently. The handler independently re-checks
+        // `AdeApp::active_editable_path` for the same reason every other `"file-editor"`-scoped
+        // handler does.
+        gpui::KeyBinding::new("secondary-f", root::FindInFile, Some("file-editor")),
         // `&& !text-input` was added by GitHub issue #288, and it is a real fix rather than
         // defensive padding: that issue puts a pinned review-note card - a genuine
         // `"text-input"` node - *inside* the diff surface, so with the old predicate a plain `]`

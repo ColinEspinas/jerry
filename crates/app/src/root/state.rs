@@ -361,6 +361,8 @@ impl AdeApp {
             search_scroll_handle: gpui::ScrollHandle::new(),
             _search_task: None,
             _search_replace_task: None,
+            find_bar: None,
+            find_bar_focus_handle: cx.focus_handle(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
             agent_reviews: HashMap::new(),
@@ -796,6 +798,10 @@ impl AdeApp {
                 &this.search.replace_focus_handle,
                 &this.search.include_focus_handle,
                 &this.search.exclude_focus_handle,
+                // And the tenth: GitHub issue #162's in-file find bar. Its handle is permanent
+                // even though the bar itself is created and dropped on every `mod+F`, precisely so
+                // it can be wired here once rather than on every opening.
+                &this.find_bar_focus_handle,
             ],
             window,
             cx,

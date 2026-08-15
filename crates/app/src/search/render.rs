@@ -26,7 +26,7 @@ use gpui::{div, font, prelude::*, px, ClickEvent, Context, KeyDownEvent, SharedS
 
 use crate::icons::{Icon, IconRow, IconSize};
 use crate::root::widgets::{text_tooltip, SimpleInput};
-use crate::root::{plural, scrollbar, AdeApp, SearchInWorktree, TextRedo, TextUndo};
+use crate::root::{plural, scrollbar, AdeApp, FindInFile, SearchInWorktree, TextRedo, TextUndo};
 use crate::search::engine::{
     self, Matcher, PathFilter, ReplaceOutcome, SearchOutcome, SearchRequest,
 };
@@ -1700,5 +1700,622 @@ mod panel_tests {
             "a `FocusId` no rendered frame can resolve silently kills every context-scoped \
              binding until the next click"
         );
+    }
+}
+
+/// The in-file find bar (`mod+F`) - `crate::search::in_file`'s model, drawn in the file view's
+/// own column between its toolbar and its content.
+///
+/// Deliberately built from the panel's own helpers rather than a second vocabulary: the same
+/// modifier buttons, the same 17x17 icon-button box, the same leading text mark, the same
+/// `SimpleInput` row, the same three-state count. GitHub issue #162's own instruction for the
+/// unspecced half: "match the panel's vocabulary rather than inventing a new one."
+impl AdeApp {
+    /// `mod+F` - opens the bar over the focused file view and puts the caret in it, or, if it is
+    /// already open, re-focuses it (the same "press it again to get back to the field" behaviour
+    /// every editor's find has).
+    pub(crate) fn handle_find_in_file_action(
+        &mut self,
+        _: &FindInFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only over a real editable File view. There is no honest subject otherwise: the Diff
+        // view is two files side by side, and a bar claiming to find "in this file" over it would
+        // have to pick one silently.
+        if self.active_editable_path().is_none() {
+            return;
+        }
+        if self.find_bar.is_none() {
+            self.find_bar = Some(crate::search::in_file::FindBar::new(
+                self.find_bar_focus_handle.clone(),
+            ));
+        }
+        self.refresh_find_bar();
+        let handle = self
+            .find_bar
+            .as_ref()
+            .expect("just created or already present")
+            .focus_handle
+            .clone();
+        window.focus(&handle, cx);
+        self.reset_caret_blink(cx);
+        cx.notify();
+    }
+
+    /// Closes the bar and hands focus back to the editor - the surface the user was reading, and
+    /// the only one that can accept the keystroke they press next.
+    pub(crate) fn close_find_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_bar.take().is_some() {
+            let code = self.code_focus_handle.clone();
+            window.focus(&code, cx);
+            cx.notify();
+        }
+    }
+
+    /// Re-runs the find against the buffer's **live** content - unsaved edits included, since that
+    /// is what is on screen.
+    pub(crate) fn refresh_find_bar(&mut self) {
+        let Some(content) = self
+            .active_edit_buffer()
+            .map(|buffer| buffer.content.clone())
+        else {
+            return;
+        };
+        if let Some(bar) = self.find_bar.as_mut() {
+            bar.recompute(&content);
+        }
+    }
+
+    /// Moves the editor's caret and viewport onto the bar's current hit.
+    fn reveal_current_find_hit(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_editable_path() else {
+            return;
+        };
+        let Some(line) = self
+            .find_bar
+            .as_ref()
+            .and_then(|bar| bar.current_hit())
+            .map(|hit| hit.line_number)
+        else {
+            return;
+        };
+        self.code_cursor = Some(line);
+        self.scroll_file_view_to_line(&path, line.saturating_sub(1), gpui::ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    /// Steps the bar one hit forward or back and reveals it.
+    fn step_find_bar(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let moved = match self.find_bar.as_mut() {
+            Some(bar) if forward => bar.step_next().is_some(),
+            Some(bar) => bar.step_previous().is_some(),
+            None => false,
+        };
+        if moved {
+            self.reveal_current_find_hit(cx);
+        }
+    }
+
+    /// The bar itself, or nothing when it is closed.
+    pub(crate) fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let bar = self.find_bar.as_ref()?;
+        let has_results = bar.has_results();
+        let count = bar.count_label();
+        let invalid = bar.notice().is_some();
+        Some(
+            div()
+                .id("find-bar")
+                .debug_selector(|| "find-bar".to_string())
+                .track_focus(&bar.focus_handle)
+                .key_context("text-input")
+                .on_action(cx.listener(|this, _: &TextUndo, _window, cx| {
+                    if this.find_bar.as_mut().is_some_and(|bar| bar.query.undo()) {
+                        this.refresh_find_bar();
+                        cx.notify();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &TextRedo, _window, cx| {
+                    if this.find_bar.as_mut().is_some_and(|bar| bar.query.redo()) {
+                        this.refresh_find_bar();
+                        cx.notify();
+                    }
+                }))
+                .on_key_down(cx.listener(Self::handle_find_bar_key_down))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    let Some(handle) = this.find_bar.as_ref().map(|bar| bar.focus_handle.clone())
+                    else {
+                        return;
+                    };
+                    window.focus(&handle, cx);
+                    this.reset_caret_blink(cx);
+                }))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .h(theme::band::FILTER_ROW)
+                .pl(px(12.0))
+                .pr(px(8.0))
+                .bg(theme::surface::HEADER)
+                .border_b_1()
+                .border_color(theme::border::ROW)
+                .child(render_search_row_mark("/", self.ui_text_size(10.0)))
+                .child(self.render_simple_input_row(SimpleInput {
+                    caret_selector: "find-bar-caret".into(),
+                    text_selector: "find-bar-text".into(),
+                    focus_handle: Some(&bar.focus_handle),
+                    text: bar.query.as_str(),
+                    caret_offset: bar.query.caret(),
+                    placeholder: "find in this file",
+                    font: theme::font::MONO,
+                    text_size: self.ui_text_size(11.0),
+                    text_color: theme::text::SELECTED,
+                    placeholder_color: theme::text::GHOST,
+                }))
+                .child(
+                    div()
+                        .id("find-bar-count")
+                        .debug_selector(|| "find-bar-count".to_string())
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(9.5))
+                        .text_color(if invalid {
+                            theme::status::FAIL
+                        } else {
+                            theme::text::FAINTER
+                        })
+                        .child(count),
+                )
+                .children(
+                    SearchModifier::ALL
+                        .into_iter()
+                        .map(|modifier| self.render_find_bar_modifier(modifier, cx)),
+                )
+                // Rule 2 once more: with nothing to step through, next/prev do not exist.
+                .children(
+                    has_results
+                        .then(|| self.render_find_bar_step(false, bar.step_tooltip(false), cx)),
+                )
+                .children(
+                    has_results
+                        .then(|| self.render_find_bar_step(true, bar.step_tooltip(true), cx)),
+                )
+                .child(
+                    div()
+                        .id("find-bar-close")
+                        .debug_selector(|| "find-bar-close".to_string())
+                        .flex_none()
+                        .w(theme::band::SEARCH_ICON_BUTTON)
+                        .h(theme::band::SEARCH_ICON_BUTTON)
+                        .rounded(theme::radius::CHIP)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                        .tooltip(text_tooltip("Close find (Esc)"))
+                        .child(
+                            div()
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(11.0))
+                                .text_color(theme::text::FAINTER)
+                                .child("\u{d7}"),
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.close_find_bar(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// One `Aa` / `ab` / `.*` button on the find bar - the panel's own button, pointed at the
+    /// bar's own options.
+    fn render_find_bar_modifier(
+        &self,
+        modifier: SearchModifier,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let on = self
+            .find_bar
+            .as_ref()
+            .is_some_and(|bar| modifier.is_on(bar.options));
+        let key = match modifier {
+            SearchModifier::MatchCase => "case",
+            SearchModifier::WholeWord => "word",
+            SearchModifier::Regex => "regex",
+        };
+        div()
+            .id(SharedString::from(format!("find-bar-modifier-{key}")))
+            .debug_selector(move || format!("find-bar-modifier-{key}"))
+            .flex_none()
+            .w(theme::band::SEARCH_ICON_BUTTON)
+            .h(theme::band::SEARCH_ICON_BUTTON)
+            .rounded(theme::radius::CHIP)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(on, |el| el.bg(theme::search::MODIFIER_ON_BG))
+            .when(!on, |el| {
+                el.hover(|el| el.bg(theme::surface::SEGMENT_ACTIVE))
+            })
+            .tooltip(text_tooltip(modifier.tooltip()))
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(self.ui_text_size(8.5))
+                    .text_color(if on {
+                        theme::search::MODIFIER_ON_FG
+                    } else {
+                        theme::text::FAINTER
+                    })
+                    .when(modifier == SearchModifier::WholeWord, |el| el.underline())
+                    .child(modifier.label()),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                if let Some(bar) = this.find_bar.as_mut() {
+                    modifier.toggle(&mut bar.options);
+                }
+                this.refresh_find_bar();
+                cx.notify();
+            }))
+    }
+
+    /// One next/prev button.
+    fn render_find_bar_step(
+        &self,
+        forward: bool,
+        tooltip: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = if forward {
+            "find-bar-next"
+        } else {
+            "find-bar-prev"
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex_none()
+            .w(theme::band::SEARCH_ICON_BUTTON)
+            .h(theme::band::SEARCH_ICON_BUTTON)
+            .rounded(theme::radius::CHIP)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+            .tooltip(text_tooltip(tooltip))
+            // The file tree's own caret glyphs, rotated in meaning rather than in geometry:
+            // `▾`/`▴` is down/up through a list of lines, which is exactly what stepping is.
+            // Reusing the tree's family keeps this from being a fourth arrow vocabulary in a
+            // window that already has three.
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(11.0))
+                    .text_color(theme::text::FAINTER)
+                    .child(if forward { "\u{25be}" } else { "\u{25b4}" }),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.step_find_bar(forward, cx);
+            }))
+    }
+
+    /// One keystroke into the find bar.
+    fn handle_find_bar_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+            return;
+        }
+        match keystroke.key.as_str() {
+            // Esc closes rather than clearing: the bar is a transient surface over a file, and
+            // the field's own contents are what the user would want back if they reopen it.
+            "escape" => {
+                self.close_find_bar(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            // Enter / Shift+Enter step, the way every editor's find does.
+            "enter" => {
+                self.step_find_bar(!keystroke.modifiers.shift, cx);
+                cx.stop_propagation();
+                return;
+            }
+            _ => {}
+        }
+        self.reset_caret_blink(cx);
+        let changed = self.find_bar.as_mut().is_some_and(|bar| {
+            bar.query.handle_editing_key(
+                keystroke.key.as_str(),
+                keystroke.key_char.as_deref(),
+                Instant::now(),
+            )
+        });
+        if changed {
+            self.refresh_find_bar();
+            self.reveal_current_find_hit(cx);
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+}
+
+/// The in-file find bar driven the way a user drives it: `mod+F` over a real open file, real
+/// keystrokes, real next/prev, and the real editor caret really moving.
+#[cfg(test)]
+mod find_bar_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use tempfile::TempDir;
+
+    const SAMPLE: &str = "let refresh_token = issue();\n\
+                          if refresh_token.expired() { drop(refresh_token); }\n\
+                          // nothing here\n\
+                          fn refresh_token() {}\n";
+
+    fn repo_with_open_file(
+        cx: &mut TestAppContext,
+    ) -> (TempDir, gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let file = repo.path().join("session.rs");
+        std::fs::write(&file, SAMPLE).expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(file.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        (repo, app, cx)
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("`{selector}` must really paint"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn mod_f_opens_a_real_find_bar_over_the_open_file_and_focuses_it(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        assert!(
+            cx.debug_bounds("find-bar").is_none(),
+            "premise: the bar is closed until it is asked for"
+        );
+
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("find-bar").is_some(),
+            "the bar must really paint, not merely exist in state"
+        );
+        let (focused, handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.find_bar_focus_handle.clone())
+        });
+        assert_eq!(focused.as_ref(), Some(&handle));
+    }
+
+    #[gpui::test]
+    fn typing_really_finds_and_the_count_follows_the_panels_three_state_gate(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let bar = app.find_bar.as_ref().expect("open");
+            assert_eq!(
+                bar.count_label(),
+                "",
+                "an empty field is not searched yet, which is not `no results`"
+            );
+        });
+        assert!(
+            cx.debug_bounds("find-bar-next").is_none(),
+            "a control that acts on results does not exist when there are none"
+        );
+
+        cx.simulate_input("refresh_token");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let bar = app.find_bar.as_ref().expect("open");
+            assert_eq!(bar.count_label(), "1 of 4");
+        });
+        assert!(cx.debug_bounds("find-bar-next").is_some());
+        assert!(cx.debug_bounds("find-bar-prev").is_some());
+
+        // A real query with no hits is its own, differently-worded state.
+        cx.simulate_input("_nonexistent");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.find_bar.as_ref().expect("open").count_label(),
+                "no results"
+            );
+        });
+        assert!(cx.debug_bounds("find-bar-next").is_none());
+    }
+
+    #[gpui::test]
+    fn next_and_previous_really_move_the_editor_caret_and_wrap(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        cx.simulate_input("refresh_token");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.code_cursor,
+                Some(1),
+                "typing lands on the first hit, on line 1"
+            );
+        });
+
+        click(cx, "find-bar-next");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.find_bar.as_ref().expect("open").count_label(), "2 of 4");
+            assert_eq!(app.code_cursor, Some(2));
+        });
+
+        // Enter steps too, the way every editor's find does.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.find_bar.as_ref().expect("open").count_label(), "3 of 4");
+        });
+
+        click(cx, "find-bar-next");
+        click(cx, "find-bar-next");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.find_bar.as_ref().expect("open").count_label(),
+                "1 of 4",
+                "stepping past the last hit wraps"
+            );
+            assert_eq!(app.code_cursor, Some(1));
+        });
+
+        click(cx, "find-bar-prev");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.find_bar.as_ref().expect("open").count_label(), "4 of 4");
+            assert_eq!(app.code_cursor, Some(4));
+        });
+    }
+
+    #[gpui::test]
+    fn the_match_case_button_really_changes_the_find(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        cx.simulate_input("REFRESH_TOKEN");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.find_bar.as_ref().expect("open").count_label(), "1 of 4")
+        });
+
+        click(cx, "find-bar-modifier-case");
+        app.read_with(cx, |app, _| {
+            let bar = app.find_bar.as_ref().expect("open");
+            assert!(bar.options.match_case);
+            assert_eq!(
+                bar.count_label(),
+                "no results",
+                "`Aa` means here exactly what it means in the panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_find_bar_searches_the_buffer_not_the_bytes_on_disk(cx: &mut TestAppContext) {
+        let (repo, app, cx) = repo_with_open_file(cx);
+        let file = repo.path().join("session.rs");
+
+        // A real unsaved edit, exactly as typing into the File view produces. `edit_buffers` is
+        // keyed by the **worktree-relative** path (`AdeApp::edit_buffer_key`), which is also what
+        // `active_editable_path` hands back.
+        app.update(cx, |app, _cx| {
+            let relative = app
+                .active_editable_path()
+                .expect("the File view really has an editable path");
+            let buffer = app
+                .edit_buffer_mut(&relative)
+                .expect("the open file has a buffer");
+            buffer.content.push_str("let unsaved_marker = 1;\n");
+        });
+
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        cx.simulate_input("unsaved_marker");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.find_bar.as_ref().expect("open").count_label(),
+                "1 of 1",
+                "finding the saved bytes while the user looks at their own unsaved edits would \
+                 answer a question about a file that is not on screen"
+            );
+        });
+        assert!(
+            !std::fs::read_to_string(&file)
+                .expect("read")
+                .contains("unsaved_marker"),
+            "premise: that text really is only in the buffer"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_bar_and_hands_focus_back_to_the_editor(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        cx.simulate_input("refresh");
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| assert!(app.find_bar.is_none()));
+        assert!(cx.debug_bounds("find-bar").is_none());
+        let (focused, code_handle, bar_handle) = app.update_in(cx, |app, window, cx| {
+            (
+                window.focused(cx),
+                app.code_focus_handle.clone(),
+                app.find_bar_focus_handle.clone(),
+            )
+        });
+        assert_ne!(
+            focused.as_ref(),
+            Some(&bar_handle),
+            "focus left on an unrendered node silently kills every context-scoped binding"
+        );
+        assert_eq!(focused.as_ref(), Some(&code_handle));
+    }
+
+    #[gpui::test]
+    fn the_close_button_does_what_escape_does(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        click(cx, "find-bar-close");
+        app.read_with(cx, |app, _| assert!(app.find_bar.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_bar_has_a_real_caret_that_can_be_moved_back_into_the_query(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.dispatch_action(FindInFile);
+        cx.run_until_parked();
+        cx.simulate_input("refresh_token");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("find-bar-caret").is_some(),
+            "a focused field paints a real caret"
+        );
+
+        cx.simulate_keystrokes("left left left left left left");
+        cx.run_until_parked();
+        cx.simulate_input("ed");
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.find_bar.as_ref().expect("open").query.as_str(),
+                "refreshed_token"
+            );
+        });
     }
 }

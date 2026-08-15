@@ -11,6 +11,8 @@
 //! - [`glob`] - the pure `include`/`exclude` pattern language (`**`, `*`, `?`, comma-separated).
 //! - [`engine`] - the compiled matcher the three modifier buttons produce, the bounded worktree
 //!   walk, the two-level result tree, and the real on-disk replace.
+//! - [`in_file`] - the `mod+F` find bar's own pure model: hits in the open buffer, the current
+//!   one, and the same three-state count the panel uses.
 //! - [`state`] - the panel's own pure state: the four real inputs, which one has focus, the
 //!   modifier toggles, per-file collapse, the load state, and the three-state gate the count row
 //!   and body both read.
@@ -21,6 +23,7 @@
 
 pub mod engine;
 pub mod glob;
+pub mod in_file;
 pub mod state;
 
 pub(crate) mod render;

@@ -173,6 +173,7 @@ actions!(
         NewAgentPane,
         NewGitGraph,
         SearchInWorktree,
+        FindInFile,
         NextChangedFile,
         ToggleChangeSeen,
         ToggleChangeStaged,
@@ -489,6 +490,17 @@ pub struct AdeApp {
     pub(crate) _search_task: Option<Task<()>>,
     /// The in-flight Replace all / per-file replace.
     pub(crate) _search_replace_task: Option<Task<()>>,
+    /// The `mod+F` find bar over the focused file view, or `None` while it is closed
+    /// (GitHub issue #162's own in-file-find section). An `Option` rather than an always-present
+    /// struct with an `open` flag: the bar has no state worth keeping between openings, and a
+    /// live `FocusHandle` that no rendered node tracks is exactly the dangling-focus hazard
+    /// `crate::root::OverlayFocus` exists for.
+    pub(crate) find_bar: Option<crate::search::in_file::FindBar>,
+    /// The find bar's focus handle - permanent, and wired into `crate::root::caret_blink` at
+    /// start-up like every other field's, even though the bar itself comes and goes. See
+    /// `crate::search::in_file::FindBar::focus_handle`'s own docs for why it is not minted per
+    /// opening.
+    pub(crate) find_bar_focus_handle: FocusHandle,
     pub(crate) diff_root: PathBuf,
     pub(crate) diff_state: DiffLoadState,
     /// The real `+n`/`-n` totals across every file in [`Self::diff_state`]'s currently loaded
