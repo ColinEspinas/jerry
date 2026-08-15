@@ -1246,13 +1246,11 @@ pub struct AdeApp {
     pub(crate) filter_focus_handle: FocusHandle,
     /// The Changes panel's commit message field - genuinely editable text with the same real,
     /// undoable history every other field in this app gets (GitHub issue #17 -
-    /// [`text_history::TextField`]). Empty until the user's first click/keystroke in it, at which
-    /// point [`crate::sidebar::render::AdeApp::focus_commit_message`] seeds it with the current
-    /// draft (`changes::draft_commit_message`) via [`text_history::TextField::seeded`] - a real
-    /// baseline the user can freely edit or fully replace, not a value `Ctrl+Z` could undo away to
-    /// nothing. [`crate::sidebar::render::AdeApp::staged_commit_message`] is the one place that
-    /// resolves "the field is still empty" back to the live draft, so every commit path (the
-    /// primary button, the `▾` menu) always agrees on what gets written.
+    /// [`text_history::TextField`]). A normal, empty text input the user has to fill in
+    /// themselves - no auto-drafted fallback (removed per explicit product decision: see
+    /// [`crate::sidebar::render::AdeApp::staged_commit_message`]'s own docs for why). Every commit
+    /// path (the primary button, the `▾` menu) reads this same field, so they always agree on
+    /// what gets written, and none of them will act at all with it empty.
     pub(crate) commit_message: text_history::TextField,
     pub(crate) commit_message_focus_handle: FocusHandle,
     /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"

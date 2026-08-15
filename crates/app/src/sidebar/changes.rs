@@ -285,19 +285,6 @@ pub fn commit_button_label(staged_count: usize) -> String {
     }
 }
 
-/// A placeholder commit message, standing in for real agent-drafted commit-message generation -
-/// **out of scope for this task**: no such system exists anywhere in this codebase yet (this
-/// phase only wires the Changes panel's real staging/composer UI against real data). Deterministic
-/// and derived straight from the staged file list rather than fabricated prose, and empty when
-/// nothing is staged - the composer only ever shows this with something real to say.
-pub fn draft_commit_message(staged: &[&DiffFile]) -> String {
-    match staged {
-        [] => String::new(),
-        [only] => format!("Update {}", only.path.display()),
-        many => format!("Update {}", plural::count(many.len(), "file", None)),
-    }
-}
-
 /// Parses a `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@...` hunk header's
 /// new-file range. `wt_core::diff::DiffHunk` only re-exposes the header's original text (the
 /// parser that produced it is private to `wt-core`), so the fold-marker treatment below needs
@@ -804,23 +791,5 @@ mod tests {
     fn commit_button_label_is_plural_for_more_than_one_staged_file() {
         assert_eq!(commit_button_label(2), "Commit 2 files");
         assert_eq!(commit_button_label(3), "Commit 3 files");
-    }
-
-    #[test]
-    fn draft_commit_message_is_empty_with_nothing_staged() {
-        assert_eq!(draft_commit_message(&[]), "");
-    }
-
-    #[test]
-    fn draft_commit_message_names_the_one_file_when_exactly_one_is_staged() {
-        let a = changed_file("src/a.rs", 1, 0);
-        assert_eq!(draft_commit_message(&[&a]), "Update src/a.rs");
-    }
-
-    #[test]
-    fn draft_commit_message_names_a_count_when_several_files_are_staged() {
-        let a = changed_file("src/a.rs", 1, 0);
-        let b = changed_file("src/b.rs", 1, 0);
-        assert_eq!(draft_commit_message(&[&a, &b]), "Update 2 files");
     }
 }
