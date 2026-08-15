@@ -1736,12 +1736,21 @@ impl AdeApp {
                     .pt(px(4.0))
                     .pb(px(5.0))
                     .gap(px(2.0))
-                    .border_l(if is_selected { px(2.0) } else { px(1.0) })
-                    .border_color(if is_selected {
-                        status.color()
-                    } else {
-                        theme::border::ZONE.into()
-                    })
+                    // `Jerry.dc.html`'s own agent row: `border-left:2px solid {{ a.edge }}`, with
+                    // `edge: live ? st.color : 'transparent'` - a *fixed* 2px slot painted only
+                    // for the focused agent. Two things were wrong with the width/colour pair
+                    // this replaces (`2px status` selected, `1px #1e2225` otherwise), both of
+                    // them created by moving the indent onto the wrapper above: the 1px fallback
+                    // is the *same* `#1e2225` as the connector `div` immediately to its left, so
+                    // an unselected row drew the connector twice as thick as the design's own
+                    // 1px; and the width flipping 1px -> 2px on selection shifted this row's
+                    // whole content box sideways by a pixel the moment you clicked it. The 2px
+                    // gutter is now always reserved and simply left unpainted when this agent
+                    // isn't the focused one - the same "a channel with one meaning has exactly
+                    // two states, on and off" the worktree row's own edge follows
+                    // (`worktree_row_edge`).
+                    .border_l(px(2.0))
+                    .when(is_selected, |el| el.border_color(status.color()))
                     .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
                     .when(!is_selected, |el| {
                         el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
@@ -1912,8 +1921,16 @@ impl AdeApp {
                     .pt(px(6.0))
                     .pb(px(7.0))
                     .gap(px(2.0))
+                    // The 2px slot is reserved so a history row's content lines up with the live
+                    // agent rows above it, and deliberately left **unpainted**. A past agent has
+                    // no selected state (there is no pane behind it - see this function's own
+                    // docs), so the only thing a painted edge here could restate is the status,
+                    // which this row already says twice on its second line: the 4px status dot
+                    // and the `was <state>` word. That is §4m's rule 2 exactly - "the edge was
+                    // the third statement... and always the least precise" - and painting it
+                    // would make a finished run the loudest thing in a rail whose §4n hierarchy
+                    // work is about pushing children *below* their parent, not above it.
                     .border_l(px(2.0))
-                    .border_color(status.color())
                     .child(
                         div()
                             .flex()
