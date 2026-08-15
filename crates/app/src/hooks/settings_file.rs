@@ -1667,13 +1667,39 @@ mod tests {
         let entry = windows_hook_entry(forwarder, "PreToolUse").expect("quotable");
         let command = entry["command"].as_str().expect("a command");
 
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(command)
-            .env("PATH", &bin)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("the generated command must be runnable by a real POSIX shell");
+        // `write_private_file` above already closes its write handle (via `File`'s `Drop`,
+        // driven off `sync_all`'s return) well before this point, so the standard "close the
+        // write fd before exec'ing" fix is already in place for this test's own fd. The
+        // remaining hazard (see issue #320) is `ETXTBSY` from a *different* test's
+        // `Command::spawn` racing a `fork()` while this fd was briefly open: `fork()` duplicates
+        // every fd in the whole process, not just the calling thread's, so under the full
+        // parallel suite some other test's spawn can fork with our still-open write fd on
+        // `powershell.exe` inherited into its child, and that child holds it open for writing
+        // (Rust's `O_CLOEXEC` only closes it *at* that child's own `exec`, not at `fork`) for
+        // the brief span until it execs its own target. If this test's own exec of the stand-in
+        // lands in that span, `/bin/sh` reports `ETXTBSY` as "Text file busy" on its stderr and
+        // exits non-zero. That span is a handful of microseconds and is outside this test's
+        // control (it belongs to an unrelated test's spawn, not this one's), so retrying the
+        // exec specifically on that signature - rather than looping on some fd of our own - is
+        // the correct fix, not a band-aid: it is bounded, narrowly targeted at the one known
+        // transient cause, and does not mask any other failure mode.
+        let mut attempt = 0;
+        let output = loop {
+            attempt += 1;
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .env("PATH", &bin)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("the generated command must be runnable by a real POSIX shell");
+            let is_etxtbsy = !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+            if !is_etxtbsy || attempt >= 20 {
+                break output;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(
             output.status.success(),
             "the generated command must parse: {}",
