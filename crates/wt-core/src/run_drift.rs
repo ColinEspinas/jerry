@@ -3,15 +3,15 @@
 //!
 //! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §4 defines drift as a count of
 //! "commits since" a finished agent run ended, banded into `at the tip` / `1-2 commits since` /
-//! `3+ commits since`. The band and its wording are the app's ([`app::run_history::model`]); the
-//! *number* is this module, and it is a real `git rev-list` in the run's own checkout, never an
-//! estimate.
+//! `3+ commits since`. The band and its wording are the app's (`app::run_history::model`); the
+//! *number* is this module, and it is a real `git log` traversal in the run's own checkout, never
+//! an estimate.
 //!
 //! ## Why a timestamp and not a recorded commit id
 //!
 //! A run record could have stored the `HEAD` sha at the moment its agent closed, and drift could
 //! then be `git rev-list --count <sha>..HEAD`. That was considered and deliberately not done, for
-//! two reasons worth writing down because both are judgement calls rather than facts:
+//! two reasons worth writing down because both are judgement calls rather than settled facts:
 //!
 //! 1. **It would only ever work for runs recorded after the field was added.** Every record Jerry
 //!    has already written carries a real `updated_at_unix` and no sha, and a drift band that is
@@ -33,30 +33,46 @@ use std::path::Path;
 
 use crate::{check_success, run_git, Error};
 
-/// How many commits reachable from `HEAD` in the worktree at `worktree_path` were committed at or
-/// after `since_unix` (seconds since the Unix epoch).
+/// Drift for **every** run in one checkout, from one `git` invocation.
 ///
-/// `Ok(None)` - never a fabricated `0` - for the one real case where the question has no answer:
-/// an unborn `HEAD` (a freshly `git init`ed checkout with no commit at all), which `git rev-list`
-/// reports as a failure rather than as an empty history. Every other failure is a real [`Error`]
-/// the caller can surface or log; nothing here silently degrades into a number.
+/// Returns, for each entry of `since_unix`, how many commits reachable from `HEAD` in the worktree
+/// at `worktree_path` were committed at or after that moment - in the same order as the input.
 ///
-/// `since_unix` is passed as git's own `@<seconds>` "fixed timestamp" date format rather than a
-/// formatted local date string, so no timezone interpretation happens anywhere between the record
-/// and the traversal.
+/// One invocation rather than one per run, and that is the whole reason this is the primitive
+/// [`commits_since`] delegates to: a worktree with three runs in its history would otherwise cost
+/// three `git` child processes every time the History view refreshed. Reading each commit's own
+/// committer date once and counting locally answers all of them, with exactly the same semantics
+/// `git rev-list --count --since=@<t>` has (both filter on committer date), and with no cap on how
+/// far back a run can be - the traversal is bounded by the *oldest* moment asked about.
+///
+/// `Ok(None)` - never a fabricated vector of zeros - for the one real case where the question has
+/// no answer at all: an unborn `HEAD` (a freshly `git init`ed checkout with no commit in it),
+/// which git reports as a failure rather than as an empty history. An empty `since_unix` gets an
+/// empty vector and spawns nothing.
+///
+/// Each moment is passed to git as its own `@<seconds>` "fixed timestamp" date, so no timezone
+/// interpretation happens anywhere between a run record and the traversal.
 ///
 /// Performs blocking I/O: spawns a real `git` child process. Callers on a UI thread must hand it
 /// to a background executor (see `app::run_history::flow`).
-pub fn commits_since(worktree_path: &Path, since_unix: i64) -> Result<Option<usize>, Error> {
-    // A negative (or zero) timestamp is not a real run-end moment - `@-1` is also a date git
-    // would happily accept and traverse the entire history for. Refuse to guess.
-    if since_unix <= 0 {
-        return Ok(None);
+pub fn commits_since_each(
+    worktree_path: &Path,
+    since_unix: &[i64],
+) -> Result<Option<Vec<usize>>, Error> {
+    if since_unix.is_empty() {
+        return Ok(Some(Vec::new()));
     }
+    // A negative (or zero) timestamp is not a real run-end moment, and `@-1` is a date git would
+    // happily accept and traverse the entire history for. Such an entry answers `0` rather than
+    // widening everyone else's traversal.
+    let Some(oldest) = since_unix.iter().copied().filter(|at| *at > 0).min() else {
+        return Ok(Some(vec![0; since_unix.len()]));
+    };
+
     let args: Vec<OsString> = vec![
-        "rev-list".into(),
-        "--count".into(),
-        format!("--since=@{since_unix}").into(),
+        "log".into(),
+        "--format=%ct".into(),
+        format!("--since=@{oldest}").into(),
         "HEAD".into(),
     ];
     let output = run_git(worktree_path, &args)?;
@@ -67,20 +83,46 @@ pub fn commits_since(worktree_path: &Path, since_unix: i64) -> Result<Option<usi
         if stderr.contains("unknown revision")
             || stderr.contains("ambiguous argument")
             || stderr.contains("bad revision")
+            || stderr.contains("does not have any commits yet")
         {
             return Ok(None);
         }
         check_success(&args, &output)?;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_commit_count(&text))
+    let landed = parse_commit_dates(&String::from_utf8_lossy(&output.stdout));
+    Ok(Some(
+        since_unix
+            .iter()
+            .map(|at| {
+                if *at <= 0 {
+                    return 0;
+                }
+                landed.iter().filter(|committed| *committed >= at).count()
+            })
+            .collect(),
+    ))
 }
 
-/// Parses `git rev-list --count`'s stdout into a real count. `None` - not a fabricated `0` - for
-/// output this doesn't recognise, so a future git whose output shape changed can never be
-/// rendered as "at the tip".
-fn parse_commit_count(text: &str) -> Option<usize> {
-    text.trim().parse::<usize>().ok()
+/// Drift for one run - a thin wrapper over [`commits_since_each`], so there is exactly one
+/// traversal and one counting rule in this module rather than two that could disagree.
+///
+/// `Ok(None)` for an unborn `HEAD`, and for a `since_unix` that is not a real moment.
+pub fn commits_since(worktree_path: &Path, since_unix: i64) -> Result<Option<usize>, Error> {
+    if since_unix <= 0 {
+        return Ok(None);
+    }
+    Ok(
+        commits_since_each(worktree_path, &[since_unix])?
+            .and_then(|counts| counts.first().copied()),
+    )
+}
+
+/// Parses `git log --format=%ct`'s stdout - one committer date per line. A line that isn't a real
+/// timestamp is skipped rather than counted as zero (which would make it land "since" every run).
+fn parse_commit_dates(text: &str) -> Vec<i64> {
+    text.lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -181,10 +223,51 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_rev_list_output_parses_to_none_not_a_fabricated_zero() {
-        assert_eq!(parse_commit_count("3\n"), Some(3));
-        assert_eq!(parse_commit_count("  12  "), Some(12));
-        assert_eq!(parse_commit_count(""), None);
-        assert_eq!(parse_commit_count("not a number"), None);
+    fn unparsable_commit_dates_are_skipped_rather_than_counted_as_the_epoch() {
+        assert_eq!(
+            parse_commit_dates("1700000000\n1700000100\n"),
+            vec![1_700_000_000, 1_700_000_100]
+        );
+        assert_eq!(parse_commit_dates(""), Vec::<i64>::new());
+        assert_eq!(
+            parse_commit_dates("1700000000\nnot a number\n"),
+            vec![1_700_000_000]
+        );
+    }
+
+    /// The point of the batched form: several runs in one checkout, answered from one traversal,
+    /// each with its own real count.
+    #[test]
+    fn every_run_in_one_checkout_is_answered_from_one_traversal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path();
+        git(path, &["init", "-b", "main"]);
+        commit_at(path, "a", 1_700_000_000);
+        commit_at(path, "b", 1_700_001_000);
+        commit_at(path, "c", 1_700_002_000);
+        commit_at(path, "d", 1_700_003_000);
+
+        let counts = commits_since_each(
+            path,
+            &[
+                1_700_003_500, // after everything
+                1_700_002_500, // one commit since
+                1_700_000_500, // three commits since
+                0,             // not a real moment
+            ],
+        )
+        .expect("must run")
+        .expect("a real history must answer");
+        assert_eq!(counts, vec![0, 1, 3, 0]);
+    }
+
+    #[test]
+    fn asking_about_no_runs_at_all_spawns_nothing_and_answers_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(
+            commits_since_each(dir.path(), &[]).expect("must not error"),
+            Some(Vec::new()),
+            "a worktree with no runs must not cost a git process"
+        );
     }
 }

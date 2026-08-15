@@ -287,6 +287,7 @@ pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("budget", budget::TOKENS),
     ("status_bar", status_bar::TOKENS),
     ("notes", notes::TOKENS),
+    ("history", history::TOKENS),
 ];
 
 /// Every real registered [`ColorToken`], flattened across [`TOKEN_GROUPS`] - registry order
@@ -2997,6 +2998,149 @@ pub mod notes {
         ("SEND_HOVER_BG", SEND_HOVER_BG),
         ("SEND_FG", SEND_FG),
         ("SEND_CAP_FG", SEND_CAP_FG),
+    ];
+}
+
+/// Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227,
+/// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §4/§5, transcribed from that
+/// revision's own tables and from `revision 5/tokens.rs`'s `history` module).
+///
+/// # Two independent axes
+///
+/// §5, verbatim: "**Outcome and drift are independent axes**: an abandoned run at the tip is the
+/// most resumable thing in the list." That is why they are two separate families here and why no
+/// token is shared between them - a row saying `abandoned` in grey next to a green `at the tip`
+/// dot is the design working, not a contradiction to be tidied away.
+///
+/// # Outcome: four values, and deliberately no `merged`
+///
+/// §5's table, in full:
+///
+/// | Outcome | fg / bg |
+/// |---|---|
+/// | `done` | `#7fc79a` / `#16261e` |
+/// | `interrupted` | `#c99b4e` / `#2b2413` |
+/// | `failed` | `#c4726d` / `#2a1719` |
+/// | `abandoned` | `#8b9197` / `#1e2225` |
+///
+/// There is no `OUT_MERGED` and there must never be one: "**merging happens to a branch, not to a
+/// run.** A run whose code later merged simply finished; whether the branch merged is already on
+/// the worktree row in the rail (`merged · prunable`)."
+///
+/// These four reuse the app's reserved green/amber/red/neutral families rather than introducing
+/// new hues, which is exactly what those families are reserved for (see [`agent`]'s own docs):
+/// this is outcome signalling, not identity.
+///
+/// # Drift: three bands
+///
+/// §4's table:
+///
+/// | Commits since | Shown | Dot |
+/// |---|---|---|
+/// | 0 | `at the tip` | `#5cb87f` |
+/// | 1-2 | `N commits since` | `#8fbde6` |
+/// | 3+ | `N commits since` in `#a3873f` | `#c99b4e` |
+///
+/// Only the far band tints its *text* ([`DRIFT_FAR_TEXT`]); the other two leave it in the row's
+/// own dim foreground ([`DRIFT_TEXT`]), so colour on the label means "this one has moved a long
+/// way" rather than merely restating the dot.
+pub mod history {
+    use super::{token, ColorToken};
+
+    /// `done` - its last turn ended cleanly and Jerry watched it end.
+    pub const OUT_DONE_FG: ColorToken = token("history.out_done_fg", 0x7fc79a);
+    pub const OUT_DONE_BG: ColorToken = token("history.out_done_bg", 0x16261e);
+    /// `interrupted` - ended while it was still working, or still waiting on a human.
+    pub const OUT_INTERRUPTED_FG: ColorToken = token("history.out_interrupted_fg", 0xc99b4e);
+    pub const OUT_INTERRUPTED_BG: ColorToken = token("history.out_interrupted_bg", 0x2b2413);
+    /// `failed` - its last real signal was a failure.
+    pub const OUT_FAILED_FG: ColorToken = token("history.out_failed_fg", 0xc4726d);
+    pub const OUT_FAILED_BG: ColorToken = token("history.out_failed_bg", 0x2a1719);
+    /// `abandoned` - nobody ever saw it end.
+    pub const OUT_ABANDONED_FG: ColorToken = token("history.out_abandoned_fg", 0x8b9197);
+    pub const OUT_ABANDONED_BG: ColorToken = token("history.out_abandoned_bg", 0x1e2225);
+
+    /// Drift dot, 0 commits since - `at the tip`.
+    pub const DRIFT_TIP: ColorToken = token("history.drift_tip", 0x5cb87f);
+    /// Drift dot, 1-2 commits since.
+    pub const DRIFT_NEAR: ColorToken = token("history.drift_near", 0x8fbde6);
+    /// Drift dot, 3+ commits since.
+    pub const DRIFT_FAR: ColorToken = token("history.drift_far", 0xc99b4e);
+    /// The drift *label*, in the two bands that do not tint it (§4's table names a text colour
+    /// only for the far band). Shares [`text::FAINTER`]'s value, with its own key so a theme can
+    /// move the history list's own recessive text without moving the rail's.
+    pub const DRIFT_TEXT: ColorToken = token("history.drift_text", 0x5e646a);
+    /// The drift label in the far band only (§4: "`N commits since` in `#a3873f`").
+    pub const DRIFT_FAR_TEXT: ColorToken = token("history.drift_far_text", 0xa3873f);
+
+    /// The scope toggle's selected segment (`REVISION-2026-08-14.md` §6's `all` / `this worktree`
+    /// pair) - `Jerry.dc.html`'s own `hScopes` fill and border. Its own keys rather than
+    /// [`surface::SEGMENT_ACTIVE`]'s, because the mock draws this control as a *bordered* pill
+    /// inside a 27px band rather than as the settings screen's tracked segmented control.
+    pub const SCOPE_ON_BG: ColorToken = token("history.scope_on_bg", 0x1d2226);
+    pub const SCOPE_ON_BORDER: ColorToken = token("history.scope_on_border", 0x2a3138);
+    pub const SCOPE_ON_FG: ColorToken = token("history.scope_on_fg", 0xc2c7cc);
+    pub const SCOPE_OFF_FG: ColorToken = token("history.scope_off_fg", 0x5e646a);
+    pub const SCOPE_HOVER_BG: ColorToken = token("history.scope_hover_bg", 0x1b1f22);
+
+    /// The repo header label in the history list's repo → worktree → run hierarchy.
+    pub const REPO_LABEL: ColorToken = token("history.repo_label", 0x9aa1a8);
+    /// A worktree group's label when it is *not* the active worktree; the active one takes
+    /// [`text::SELECTED`] and the selection edge instead (§6: "Active worktree carries the blue
+    /// edge and opens by default").
+    pub const GROUP_LABEL: ColorToken = token("history.group_label", 0xa9b0b7);
+    /// A run row's title when the row is not the open one.
+    pub const ROW_TITLE: ColorToken = token("history.row_title", 0xc2c7cc);
+
+    /// The transcript body's four line tones, transcribed from `Jerry.dc.html`'s own `LFG` map
+    /// (`p` / `c` / `d` / `w`) - the leading `❯ claude --resume …` command line, ordinary body
+    /// text, the indented `⎿ …` detail lines, and the `● …` lead line that opens and closes a
+    /// synthesised transcript.
+    ///
+    /// A **captured** transcript is plain text with no styling of its own (the terminal grid's
+    /// colours are not stored - see `crate::run_history::transcript_store`), so every one of its
+    /// lines takes [`TRANSCRIPT_BODY`]. The other three are used by the synthesised transcript and
+    /// by the closing line, which this app builds itself and therefore does know the shape of.
+    pub const TRANSCRIPT_PROMPT: ColorToken = token("history.transcript_prompt", 0x8fbde6);
+    pub const TRANSCRIPT_BODY: ColorToken = token("history.transcript_body", 0xa7adb4);
+    pub const TRANSCRIPT_DETAIL: ColorToken = token("history.transcript_detail", 0x6b7178);
+    pub const TRANSCRIPT_LEAD: ColorToken = token("history.transcript_lead", 0xced4da);
+
+    /// The transcript body's opacity - `revision 5/tokens.rs`'s own
+    /// `TRANSCRIPT_OPACITY = 0.70`, and §3's "the transcript at **70% opacity** - the one signal
+    /// that this is a recording, not a live pane".
+    ///
+    /// Not a [`ColorToken`] because it is not a colour: it multiplies whatever the transcript's
+    /// own lines are already coloured, so it stays correct in a theme that recolours them.
+    pub const TRANSCRIPT_OPACITY: f32 = 0.70;
+
+    /// Every real [`ColorToken`] this module declares - see [`super::TOKEN_GROUPS`].
+    pub const TOKENS: &[(&str, ColorToken)] = &[
+        ("OUT_DONE_FG", OUT_DONE_FG),
+        ("OUT_DONE_BG", OUT_DONE_BG),
+        ("OUT_INTERRUPTED_FG", OUT_INTERRUPTED_FG),
+        ("OUT_INTERRUPTED_BG", OUT_INTERRUPTED_BG),
+        ("OUT_FAILED_FG", OUT_FAILED_FG),
+        ("OUT_FAILED_BG", OUT_FAILED_BG),
+        ("OUT_ABANDONED_FG", OUT_ABANDONED_FG),
+        ("OUT_ABANDONED_BG", OUT_ABANDONED_BG),
+        ("DRIFT_TIP", DRIFT_TIP),
+        ("DRIFT_NEAR", DRIFT_NEAR),
+        ("DRIFT_FAR", DRIFT_FAR),
+        ("DRIFT_TEXT", DRIFT_TEXT),
+        ("DRIFT_FAR_TEXT", DRIFT_FAR_TEXT),
+        ("SCOPE_ON_BG", SCOPE_ON_BG),
+        ("SCOPE_ON_BORDER", SCOPE_ON_BORDER),
+        ("SCOPE_ON_FG", SCOPE_ON_FG),
+        ("SCOPE_OFF_FG", SCOPE_OFF_FG),
+        ("SCOPE_HOVER_BG", SCOPE_HOVER_BG),
+        ("REPO_LABEL", REPO_LABEL),
+        ("GROUP_LABEL", GROUP_LABEL),
+        ("ROW_TITLE", ROW_TITLE),
+        ("TRANSCRIPT_PROMPT", TRANSCRIPT_PROMPT),
+        ("TRANSCRIPT_BODY", TRANSCRIPT_BODY),
+        ("TRANSCRIPT_DETAIL", TRANSCRIPT_DETAIL),
+        ("TRANSCRIPT_LEAD", TRANSCRIPT_LEAD),
     ];
 }
 
