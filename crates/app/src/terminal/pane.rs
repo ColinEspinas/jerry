@@ -1846,6 +1846,20 @@ fn keystroke_to_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
         }
     }
 
+    // Shift+Tab -> the standard CSI back-tab sequence (GitHub issue #236). GPUI reports the
+    // same base key (`"tab"`) regardless of Shift, so without this the match below would send
+    // plain `\t` for both - indistinguishable to whatever's on the other end of the pty. A real
+    // terminal sends `\x1b[Z` for back-tab instead, which is what readline-based tools and
+    // Claude Code's own CLI listen for to cycle their mode in the opposite direction. Must run
+    // before the `match` below, whose `"tab"` arm has no way to see the modifier.
+    //
+    // Excludes Ctrl+Shift+Tab (`!modifiers.control`) so that combination's byte stays exactly
+    // what it was before this fix - plain `\t`, via the fallthrough `match` below - rather than
+    // silently picking up back-tab semantics nobody asked for on top of an unrelated modifier.
+    if keystroke.key == "tab" && keystroke.modifiers.shift && !keystroke.modifiers.control {
+        return Some(b"\x1b[Z".to_vec());
+    }
+
     match keystroke.key.as_str() {
         "enter" => Some(b"\r".to_vec()),
         "backspace" => Some(b"\x7f".to_vec()),
@@ -2923,6 +2937,66 @@ mod keystroke_tests {
             Some(vec![0x1a]),
             "Ctrl+Z must map to the real Ctrl+<letter> control code (0x1a), the SIGTSTP \
              terminal-suspend byte essentially every interactive program relies on"
+        );
+    }
+
+    /// Regression test for GitHub issue #236: Shift+Tab silently sent the exact same byte as
+    /// plain Tab, so any CLI relying on the standard back-tab sequence to detect Shift+Tab
+    /// (readline-based tools, Claude Code's own mode-cycling shortcut) never saw it and did
+    /// nothing. Pinning both mappings side by side in one test is the point - it's not enough
+    /// for Shift+Tab to produce *something*, it must produce something a real terminal would
+    /// never also produce for plain Tab.
+    #[test]
+    fn shift_tab_sends_the_real_back_tab_sequence_distinct_from_plain_tab() {
+        let plain = keystroke("tab", Modifiers::default());
+        assert_eq!(
+            keystroke_to_bytes(&plain),
+            Some(b"\t".to_vec()),
+            "plain Tab must still send the ordinary tab byte"
+        );
+
+        let shifted = keystroke(
+            "tab",
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            keystroke_to_bytes(&shifted),
+            Some(b"\x1b[Z".to_vec()),
+            "Shift+Tab must send the standard CSI back-tab sequence (\\x1b[Z), not the plain \
+             tab byte - this is what readline-based tools and Claude Code's own CLI listen for \
+             to cycle their mode in the opposite direction"
+        );
+
+        assert_ne!(
+            keystroke_to_bytes(&plain),
+            keystroke_to_bytes(&shifted),
+            "Tab and Shift+Tab must be distinguishable on the wire"
+        );
+    }
+
+    /// Ctrl+Shift+Tab is deliberately left alone by the back-tab fix above: it still falls
+    /// through to the plain `"tab"` match arm and sends `\t`, exactly as it did before GitHub
+    /// issue #236 was fixed. This pins that the fix's `!modifiers.control` guard actually does
+    /// what its comment says, rather than back-tab semantics silently spreading to a modifier
+    /// combination nobody asked for.
+    #[test]
+    fn ctrl_shift_tab_is_unaffected_by_the_back_tab_fix() {
+        let ks = keystroke(
+            "tab",
+            Modifiers {
+                shift: true,
+                control: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks),
+            Some(b"\t".to_vec()),
+            "Ctrl+Shift+Tab must keep sending the plain tab byte, unchanged by the Shift+Tab \
+             back-tab fix"
         );
     }
 }
