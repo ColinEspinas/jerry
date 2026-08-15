@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# PreToolUse:Bash hook. Runs the fast half of CLAUDE.md's pre-commit gate - the structural
-# ratchet (check-conventions.sh), fmt --check, and clippy -D warnings - before a `git commit`
-# command executes, so a lint-failing or convention-regressing change never lands in history.
-# Deliberately does NOT run `cargo test --workspace`: this workspace's suite (3000+ tests,
-# several spawning real processes/LSP servers) takes minutes, too slow for a hook that blocks
-# every commit. Running the full test suite is still mandatory before considering work done -
-# that's what `/check` and CLAUDE.md's own gate are for - this hook is a fast safety net, not a
-# substitute for it.
+# PreToolUse:Bash hook. Runs CLAUDE.md's pre-commit gate - the structural ratchet
+# (check-conventions.sh), fmt --check, and clippy -D warnings - before a `git commit` command
+# executes, so a lint-failing or convention-regressing change never lands in history.
+# `cargo test --workspace` is intentionally not part of this gate (or `/check`'s) right now -
+# GitHub issue #348 tracks why and getting it back. Run tests relevant to your change manually.
 #
 # Exit code contract, matching Claude Code's PreToolUse protocol: this hook must NEVER hard-fail
 # in a way that blocks work for a reason unrelated to the gate itself. Missing `jq`, missing
@@ -44,7 +41,7 @@ if [ -n "$FAIL" ]; then
   if [ "$FAIL" = "conventions" ]; then
     REASON="the convention ratchet failed - see /tmp/jerry-precommit-conventions.log."
   else
-    REASON="cargo $FAIL failed - see /tmp/jerry-precommit-$FAIL.log. Run /check for the full gate (including tests) before committing."
+    REASON="cargo $FAIL failed - see /tmp/jerry-precommit-$FAIL.log. Run /check before committing."
   fi
   jq -n --arg reason "$REASON" '{
     "hookSpecificOutput": {

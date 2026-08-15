@@ -14,17 +14,21 @@ the product description; this file only covers how to build it.
 
 ```sh
 cargo build --workspace
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-All four together are the pre-commit gate — run them as `/check` before considering anything done.
-`.claude/hooks/pre-commit-check.sh` runs the fast half (fmt + clippy) automatically before any
-`git commit`, as a safety net; it deliberately skips the full test suite, which takes minutes, so
-`/check` — not the hook alone — is what "done" means. None of the four are optional; a PR that
-needs `#[allow(...)]` to silence a lint either fixes the underlying issue or justifies the allow
-with a one-line comment.
+All three together are the pre-commit gate — run them as `/check` before considering anything
+done. `.claude/hooks/pre-commit-check.sh` runs the same three automatically before any
+`git commit`, as a safety net. None are optional; a PR that needs `#[allow(...)]` to silence a
+lint either fixes the underlying issue or justifies the allow with a one-line comment.
+
+**`cargo test --workspace` is deliberately not part of this gate right now.** A real run
+surfaced most of the GPUI-window-touching suite failing/timing out outside an interactive
+session — investigated in [GitHub issue #348](https://github.com/ColinEspinas/jerry/issues/348),
+which also tracks getting it back into CI and this gate once resolved. Run tests relevant to what
+you're touching manually in the meantime (e.g. `cargo test -p wt-core`, or a scoped
+`cargo test -p app --lib <module>::`), and don't treat a clean `/check` as proof the suite passes.
 
 Run the app with `cargo run --release -p app [repo-path]`. Use `--release` unless you're actively
 recompiling every few seconds: a debug-profile GPUI build is commonly 5–20× slower for the per-frame

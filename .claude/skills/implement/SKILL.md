@@ -35,7 +35,7 @@ first. Implementing against an unscoped issue is how a fix ends up solving the w
    prove (path types, git argv, `plural.rs`, no fake functionality, GPUI blocking-call offload, the
    comment rule, no new `use super::*`).
 
-5. **Finish with `ship`** — it runs the full gate (`/check`), commits, pushes, and opens the PR
+5. **Finish with `ship`** — it runs the gate (`/check`), commits, pushes, and opens the PR
    (capturing `verify` first if the change is UI-visible, filling in
    `.github/pull_request_template.md` for real rather than leaving it generic). Link the issue this
    implementation started from; if `plan` posted an approach comment, the PR body can be short —

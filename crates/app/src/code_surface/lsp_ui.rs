@@ -3000,6 +3000,8 @@ mod vue_two_server_wiring_tests {
     }
 
     #[gpui::test]
+    // Real typescript-language-server + vue-language-server spawn, not installed in CI - GitHub issue #348.
+    #[ignore]
     fn a_real_vue_file_gets_real_diagnostics_from_both_servers_and_a_real_hover(
         cx: &mut TestAppContext,
     ) {

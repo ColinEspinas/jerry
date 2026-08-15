@@ -4702,6 +4702,8 @@ process.stdin.on('data', (d) => {
     /// companion must forget the `.vue` bookkeeping (the companion really was sent that file) and
     /// must not take the primary's own client down with it.
     #[gpui::test]
+    // Real vue-language-server spawn, not installed in CI - GitHub issue #348.
+    #[ignore]
     fn restarting_a_companion_forgets_its_own_documents_without_touching_its_primary(
         cx: &mut TestAppContext,
     ) {
@@ -5306,6 +5308,8 @@ mod lsp_diagnostics_wiring_tests {
     /// path the Rust test above exercises, but for a real `.ts` file, proving the extension-based
     /// dispatch that replaced the old boolean gate genuinely reaches a non-Rust language too.
     #[gpui::test]
+    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
+    #[ignore]
     fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
@@ -5709,6 +5713,8 @@ mod lsp_diagnostics_wiring_tests {
     /// - see `crate::language`'s own docs on why `npm install typescript@5` is a genuine, real
     /// project-local requirement in this sandbox, not conservative caution.
     #[gpui::test]
+    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
+    #[ignore]
     fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
@@ -5832,6 +5838,8 @@ mod lsp_diagnostics_wiring_tests {
 
     /// The same real, live proof as the two tests above, for `pyright-langserver`.
     #[gpui::test]
+    // Real pyright-langserver spawn, not installed in CI - GitHub issue #348.
+    #[ignore]
     fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {

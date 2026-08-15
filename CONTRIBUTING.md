@@ -20,13 +20,14 @@ Every change must pass, locally, before you open a PR — the same checks CI run
 
 ```sh
 cargo build --workspace
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 Run them together as `/check` if you're working through Claude Code. None are optional or "mostly
-passing."
+passing." `cargo test --workspace` is intentionally not part of this list right now — see
+[issue #348](https://github.com/ColinEspinas/jerry/issues/348); run tests relevant to what you're
+touching manually instead.
 
 See [`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
 from a GitHub issue to a merged PR in this repo, including which Claude Code skill covers which

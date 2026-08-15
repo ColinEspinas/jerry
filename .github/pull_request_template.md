@@ -14,9 +14,10 @@
 
 ## Testing
 
-- [ ] `/check` (fmt + clippy `-D warnings` + `cargo test --workspace`) passes locally
+- [ ] `/check` (conventions + fmt + clippy `-D warnings`) passes locally
 - [ ] `verify` capture attached below, if this touches `render.rs`/`theme.rs`/layout
-- [ ] New/changed behavior has a real test, not just a compile check
+- [ ] New/changed behavior has a real test, run manually and confirmed passing (`cargo test
+      --workspace` isn't part of the gate right now - issue #348)
 
 <!-- Note anything that couldn't be run and why ("not run: needs a live rust-analyzer") rather
      than silently leaving a box unchecked. -->

@@ -48,7 +48,8 @@ process that applies them.
    against `design_handoff_jerry_ade/revision/` or the issue's acceptance criteria. The only way
    UI-visible work gets checked against something real instead of "looks right."
 
-7. **Finish — `ship`.** Runs `/check` (the full gate: fmt, clippy, tests), commits, pushes, and
+7. **Finish — `ship`.** Runs `/check` (the gate: conventions, fmt, clippy — not tests right now,
+   see [issue #348](https://github.com/ColinEspinas/jerry/issues/348)), commits, pushes, and
    opens the PR from `.github/pull_request_template.md` with a real summary — not a generic one.
    Works standalone for anything that didn't start from a scoped issue, too.
 
@@ -61,7 +62,7 @@ process that applies them.
 ## Commands vs. skills
 
 `/check` and `/setup` are commands — deterministic, cheap, no judgment involved (`/check` just runs
-three cargo invocations in order). Everything above is a skill because it requires judgment: what
+three fixed checks in order). Everything above is a skill because it requires judgment: what
 counts as "UI-visible," what a real (non-generic) PR summary looks like, whether something needs a
 new crate. Reach for the command when the answer is fixed; reach for the skill when it depends on
 the change.

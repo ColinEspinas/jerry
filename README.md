@@ -105,7 +105,6 @@ deliberately, not casually.
 ## Contributing
 
 ```sh
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -113,9 +112,11 @@ cargo fmt --all -- --check
 must all pass — see [`CLAUDE.md`](CLAUDE.md) for the full standards, [`CONTRIBUTING.md`](CONTRIBUTING.md)
 for the process, and [`docs/development-workflow.md`](docs/development-workflow.md) for how a
 change moves from issue to merged PR. `.github/workflows/ci.yml` runs the same checks on every
-push. If you're using [Claude Code](https://claude.com/claude-code), this repo's `.claude/`
-directory (skills, agents, commands) is set up already — install [rtk](https://github.com/rtk-ai/rtk)
-and run `/setup` to cut token usage on command output; optional, not a build dependency.
+push. `cargo test --workspace` is not currently part of this gate — see
+[issue #348](https://github.com/ColinEspinas/jerry/issues/348). If you're using
+[Claude Code](https://claude.com/claude-code), this repo's `.claude/` directory (skills, agents,
+commands) is set up already — install [rtk](https://github.com/rtk-ai/rtk) and run `/setup` to
+cut token usage on command output; optional, not a build dependency.
 
 ## License
 

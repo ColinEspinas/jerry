@@ -10,8 +10,12 @@ changed and why from the diff alone.
 
 ## Steps
 
-1. **Run the gate.** `/check` (fmt + clippy `-D warnings` + the full test suite). Don't proceed
-   past a failure — a PR opened against a red gate just moves the failure to someone else's screen.
+1. **Run the gate.** `/check` (conventions + fmt + clippy `-D warnings`). Don't proceed past a
+   failure — a PR opened against a red gate just moves the failure to someone else's screen.
+   `cargo test --workspace` isn't part of this gate right now
+   ([issue #348](https://github.com/ColinEspinas/jerry/issues/348)) — run whatever tests are
+   relevant to the change manually (e.g. `cargo test -p wt-core`, or a scoped `cargo test -p app
+   --lib <module>::`) and note the result in the PR's Testing section instead of leaving it blank.
 
 2. **Decide if this is UI-visible.** `git diff --name-only` against the target branch — did it
    touch a `render.rs`, `theme.rs`, or anything else that changes what the app looks like? If so,
@@ -32,9 +36,9 @@ changed and why from the diff alone.
    - **What** — what changed, specifically, not a restatement of the commit list. If `plan` already
      posted an approach on the issue, this can be short.
    - **Why** — only if it isn't obvious from the issue/title; delete the section otherwise.
-   - **Testing** — check off what was actually run (`/check`, `verify` if step 2 triggered it, a
-     real test for the new behavior); note anything that couldn't run and why, rather than leaving
-     an unchecked box unexplained.
+   - **Testing** — check off what was actually run (`/check`, `verify` if step 2 triggered it, the
+     scoped tests from step 1); note anything that couldn't run and why, rather than leaving an
+     unchecked box unexplained.
    - **Architecture notes** — only if this touches the crate boundary or added/changed a
      Command/Query (e.g. "new Command: `AttemptCherryPick` in `wt-core`"); delete the section for a
      change that doesn't touch any of that.
