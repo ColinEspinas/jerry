@@ -6,7 +6,9 @@ msrv = "1.95.0"
 # to enforce ADR 0003 (render.rs must dispatch a Command/Query, never call an adapter or shell
 # out directly): that method has other, legitimate call sites in this crate today (opening a
 # path in the OS file manager, relaunching the updater) that a blanket disallow would also
-# flag, and clippy.toml has no way to scope a disallowed method to specific files. Real
-# enforcement needs the glob-import cleanup ADR 0003 itself names as the prerequisite - see
-# docs/adr/0003-ui-must-not-call-adapters.md and the tracking issue.
+# flag, and clippy.toml has no way to scope a disallowed method to specific files. A type-aware
+# version of this check needs the glob-import cleanup ADR 0003 itself names as the prerequisite.
+# In the meantime, `.claude/hooks/check-conventions.sh` enforces a coarser but real textual
+# ratchet on the same rule (and on new `use super::*` globs) - it needs no glob cleanup first,
+# runs in the pre-commit hook and in CI, and is documented in docs/adr/0003-ui-must-not-call-adapters.md.
 disallowed-methods = []

@@ -17,7 +17,8 @@
       "Bash(gh issue:*)",
       "Bash(gh pr:*)",
       "Bash(gh label:*)",
-      "Bash(gh repo view:*)"
+      "Bash(gh repo view:*)",
+      "Bash(.claude/hooks/check-conventions.sh:*)"
     ]
   },
   "hooks": {

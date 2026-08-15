@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted. Not yet enforced — see Consequences.
+Accepted. Partially enforced — see Consequences: a textual ratchet blocks the count of
+violations from growing; a full, type-aware lint blocking every violation is still pending.
 
 ## Context
 
@@ -37,12 +38,19 @@ call site.
 
 ## Consequences
 
-- This is currently violated at scale (142 direct adapter references across `render.rs` files) and
-  is **not** retroactively fixed by this ADR. It's the target; the gap is tracked as GitHub issues
-  (see `docs/architecture/overview.md`'s "what must move" section).
+- This is currently violated at scale (204 direct adapter references across `render.rs` files, per
+  `.claude/conventions-baseline.json`) and is **not** retroactively fixed by this ADR. It's the
+  target; the gap is tracked as GitHub issues (see `docs/architecture/overview.md`'s "what must
+  move" section).
 - New render code written from this point on must not add new adapter calls — that part is
-  effective immediately, reviewed against in `implement`/`review`.
-- Mechanical enforcement (a `clippy::disallowed-methods` entry naming `wt_core`/`pty_core`/
-  `lsp_core` paths, scoped to `render.rs` files) is blocked on the glob-import cleanup: today,
-  `use super::*` means a lint can't reliably tell which module a symbol resolved from. That cleanup
-  is tracked as its own issue.
+  effective immediately, reviewed against in `implement`/`review`/`rust-standards`, **and now
+  mechanically checked**: `.claude/hooks/check-conventions.sh` greps every `render.rs` file for
+  `wt_core::`/`pty_core::`/`lsp_core::`/`process::Command::new` and fails (locally, in the
+  pre-commit hook, and in CI) if the count exceeds the checked-in baseline. This is a textual
+  ratchet, not a type-aware lint — it can't tell a real violation from a string literal that
+  happens to contain `wt_core::`, but it needs no glob-import cleanup first and catches the actual
+  failure mode (a new call added where the count used to be lower) today.
+- A full, type-aware `clippy::disallowed-methods` entry naming `wt_core`/`pty_core`/`lsp_core`
+  paths, scoped to `render.rs` files, is still blocked on the glob-import cleanup: today, `use
+  super::*` means a lint can't reliably tell which module a symbol resolved from. That cleanup is
+  tracked as its own issue; the ratchet above is the interim mechanical backstop until it lands.

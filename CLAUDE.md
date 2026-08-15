@@ -51,9 +51,15 @@ the tracking issues. New code follows the rule starting now; existing violations
 license to add more.
 
 **No new `use super::*`.** Explicit imports only. Glob imports are why the layering violation above
-can't be caught by a lint today — a "pure" module can silently receive `gpui` symbols through its
-parent's glob. Existing globs aren't retrofitted in a given change unless that change already
-touches the file for another reason.
+can't be caught by a type-aware lint today — a "pure" module can silently receive `gpui` symbols
+through its parent's glob. Existing globs aren't retrofitted in a given change unless that change
+already touches the file for another reason.
+
+Both of the above are enforced by a real, deterministic script, not just this file's prose:
+`.claude/hooks/check-conventions.sh` greps for new `use super::*` globs and new adapter calls in
+`render.rs` files, and fails — locally in the pre-commit hook, and in CI — if either count exceeds
+`.claude/conventions-baseline.json`. It's a ratchet (the count may only go down), not a claim that
+either rule already holds everywhere.
 
 ## Rust standards
 
