@@ -64,9 +64,11 @@ built from. If you're working on UI:
 ## Architecture decisions
 
 Significant design decisions are recorded as ADRs under `docs/adr/`, one file per decision — see
+[`docs/adr/README.md`](docs/adr/README.md) for the index and
 [`docs/architecture/overview.md`](docs/architecture/overview.md) for the current target
-architecture and why. If your change makes an architectural call worth remembering, add an ADR
-rather than explaining it in a code comment or a commit message alone.
+architecture and why. If your change makes an architectural call worth remembering, start from
+[`docs/adr/template.md`](docs/adr/template.md) rather than explaining the decision in a code
+comment or a commit message alone.
 
 ## Commit / PR expectations
 

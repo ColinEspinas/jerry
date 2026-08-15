@@ -58,6 +58,17 @@ If a change's home is genuinely ambiguous — it could reasonably go in two diff
 Command/Query shape doesn't fit cleanly — say so explicitly rather than picking silently. This is
 exactly the kind of fork `plan` should surface on the issue before `implement` starts writing code.
 
+## When the decision is genuinely new
+
+Questions 1–5 apply an existing rule; most work is that, and stops there. Occasionally a change
+needs a call none of the four ADRs already make — a new crate boundary, a new cross-cutting rule,
+a reversal of an earlier one. That's worth a new ADR, not a paragraph buried in a commit message:
+copy [`docs/adr/template.md`](../../../docs/adr/template.md) to the next `000N`, write it, and add
+a row to [`docs/adr/README.md`](../../../docs/adr/README.md)'s index. Don't reach for this for
+routine applications of an existing rule (`hooks/` being the pilot extraction candidate doesn't
+need its own ADR — it's already covered by 0001/0002) — an ADR records a *decision*, not every
+instance of following one.
+
 ## What this skill doesn't cover
 
 It doesn't check whether existing code already violates the target (that's `rust-standards`'s
