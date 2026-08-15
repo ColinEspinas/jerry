@@ -5030,6 +5030,65 @@ mod rail_rev6_render_tests {
         );
     }
 
+    /// Live report, screenshot-confirmed: "worktree pane is messed up, width issues" -
+    /// inconsistent row widths, and agent rows that don't share their parent worktree row's own
+    /// left/right extent. Root cause: `gpui::list` (GitHub issue #364's virtualization) lays each
+    /// item out via `Element::layout_as_root` with a real, *definite* available width - the
+    /// list's own painted `bounds.size.width` (verified directly against vendored
+    /// `gpui::elements::list`'s `layout_all_items`/`layout_items`, the same "read the real
+    /// upstream source" idiom this file's own scrollbar geometry notes already use) - but unlike
+    /// an ordinary `div().flex().flex_col()` parent, it does **not** stretch a root item to that
+    /// width by default. `render_change_row`/`render_section_header` (the pre-existing,
+    /// correct `gpui::list` user this rail work explicitly modeled itself on) already carry an
+    /// explicit `.w_full()` on their own root element for exactly this reason; every
+    /// `RailListItem` render function was missing it.
+    ///
+    /// Measured, not asserted from the source: every real painted row must span exactly the
+    /// rail's own real list width, the same real container `Self::render_rail_list` wraps
+    /// `gpui::list` in.
+    #[gpui::test]
+    fn every_rail_list_item_spans_the_full_rail_width(cx: &mut TestAppContext) {
+        let (_repo, wt, app, cx) = open_with_a_failed_agent(cx);
+
+        let wt_path = wt.path().to_path_buf();
+        let agent_id = app.update(cx, |app, _cx| {
+            app.agents
+                .iter()
+                .find(|a| a.cwd == wt_path)
+                .expect("the real failed agent this helper seeds, in its own worktree")
+                .id
+        });
+
+        let list = cx
+            .debug_bounds("agent-rail-list")
+            .expect("the rail's own list band must paint");
+        let worktree_row = cx
+            .debug_bounds(selector(format!("worktree-row-0-{}", wt_path.display())))
+            .expect("the worktree row must paint");
+        let agent_row = cx
+            .debug_bounds(selector(format!("agent-row-{agent_id}")))
+            .expect("the agent row under it must paint");
+
+        assert_eq!(
+            worktree_row.size.width, list.size.width,
+            "a worktree row is one gpui::list item and must span the list's real available \
+             width, not shrink to fit its own label/status content"
+        );
+        assert_eq!(
+            agent_row.size.width, list.size.width,
+            "an agent row is also its own gpui::list item and must span the exact same real \
+             width as the worktree row above it - a narrower agent row is what made the \
+             screenshot's agent rows look misaligned/indented wrong relative to their parent"
+        );
+        assert_eq!(
+            worktree_row.origin.x, agent_row.origin.x,
+            "both rows are flush against the same list origin - the agent row's own 13px \
+             indent is internal padding (proven by \
+             the_agent_row_is_really_indented_under_its_worktree_not_flush_with_it above), not \
+             a narrower or offset root box"
+        );
+    }
+
     /// §4/§8: `prune` is a bin icon at a 17px hit box, and the text button it replaced is gone -
     /// "it was the only text action in a rail otherwise made of rows", and §7 rule 5 requires the
     /// old path to go in the same edit.
