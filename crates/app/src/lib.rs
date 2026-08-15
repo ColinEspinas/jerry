@@ -59,8 +59,9 @@ use std::path::PathBuf;
 
 use gpui::{
     point, px, size, App, AppContext, Bounds, Size, TitlebarOptions, WindowBounds,
-    WindowDecorations, WindowOptions,
+    WindowDecorations, WindowHandle, WindowOptions,
 };
+use settings::store as settings_store;
 
 /// The app's globally-bound keyboard shortcuts - the single list both [`run`] (production
 /// startup) and this crate's own regression test
@@ -785,6 +786,53 @@ pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
     }
 }
 
+/// Opens one real ADE window using [`default_window_options`] and `use_remembered_repo: true` -
+/// exactly [`run`]'s own no-CLI-argument launch path (GitHub issue #90: reopen whatever repo/tab
+/// session was last focused, or a genuinely empty window if nothing was ever persisted). Factored
+/// out so [`run`]'s two real callers of this exact shape - the initial launch window below, and
+/// the Dock "reopen" handler registered via `cx.on_reopen` further down - share one definition
+/// rather than risk silently drifting apart, the same "no second copy of a decision" reasoning
+/// [`default_key_bindings`]'s own docs already give for the window options themselves.
+///
+/// `repo_path` is threaded through rather than hardcoded to `None`: the initial launch still
+/// needs to honor a real CLI argument (`Some(path)`, which makes `use_remembered_repo`
+/// irrelevant - see [`root::AdeApp::new`]'s own docs), while the reopen handler always passes
+/// `None`, since a Dock click never carries a path.
+///
+/// The production settings load (`Settings::load_or_init`, a real read of - and, on a first run,
+/// a real write to - `~/.config/jerry/settings.toml`) happens here rather than inside
+/// [`open_ade_window_with_settings`], mirroring [`root::AdeApp::new`]'s own split from
+/// `new_with_settings`: that split exists specifically so tests can supply an in-memory
+/// [`settings_store::Settings`] and a temp-dir path instead, never touching whatever machine
+/// happens to run `cargo test` - see `open_ade_window_tests` below, which exercises the shared
+/// half through that seam.
+fn open_ade_window(
+    repo_path: Option<PathBuf>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<root::AdeApp>> {
+    let settings_path = settings_store::settings_toml_path();
+    let settings = settings_store::Settings::load_or_init();
+    open_ade_window_with_settings(repo_path, settings, settings_path, cx)
+}
+
+/// The testable half of [`open_ade_window`] - everything after the production settings load,
+/// taking an already-resolved [`settings_store::Settings`]/path the same way
+/// [`root::AdeApp::new_with_settings`] does, for the identical reason (see that function's own
+/// docs).
+fn open_ade_window_with_settings(
+    repo_path: Option<PathBuf>,
+    settings: settings_store::Settings,
+    settings_path: Option<PathBuf>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<root::AdeApp>> {
+    let options = default_window_options(cx);
+    cx.open_window(options, move |window, cx| {
+        cx.new(|cx| {
+            root::AdeApp::new_with_settings(repo_path, true, settings, settings_path, window, cx)
+        })
+    })
+}
+
 /// The environment variable GPUI's X11 client reads a forced scale factor from - the literal
 /// name from its own `get_scale_factor`
 /// (`gpui_linux/src/linux/x11/client.rs`, this workspace's pinned `zed` rev). Named here rather
@@ -846,64 +894,84 @@ pub fn run(repo_path: Option<PathBuf>) {
     // `with_assets` registers `fonts::Assets` as the app's `AssetSource`
     // (`vendor/zed/crates/gpui/src/app.rs:198`) before the launch callback runs, since
     // `fonts::load_embedded_fonts` needs `cx.asset_source()` already wired up.
-    gpui_platform::application()
-        .with_assets(fonts::Assets)
-        .run(move |cx: &mut App| {
-            if let Err(err) = fonts::load_embedded_fonts(cx) {
-                // Not fatal - GPUI falls back to a system font (see `theme::font`'s docs) -
-                // but it's a regression from "the bundled Plex glyphs actually render", so it
-                // must be visible in the log rather than silently swallowed.
-                log::error!("failed to load bundled fonts: {err}");
+    let application = gpui_platform::application().with_assets(fonts::Assets);
+
+    // GitHub issue #278: macOS's "click the Dock icon to reopen" gesture
+    // (`applicationShouldHandleReopen:hasVisibleWindows:`) is a real `NSApplicationDelegate`
+    // contract every well-behaved native app implements, and `gpui_macos`'s own AppKit delegate
+    // already does implement it correctly - see
+    // `vendor/zed/crates/gpui_macos/src/platform.rs`'s `should_handle_reopen`, which is wired up
+    // unconditionally in that file's `build_classes` and only ever invokes this app's callback
+    // when AppKit itself reports `hasVisibleWindows == false`. GPUI exposes it cross-platform as
+    // `Application::on_reopen` (registered on the builder, before `run` consumes it by value -
+    // unlike `cx.on_action`/`cx.set_menus` a few lines down, this is not an `App`-context method
+    // at all); the gap was entirely on this app's side, which never called it. Nothing here quits
+    // or hides windows when the last one closes either (there is no
+    // `applicationShouldTerminateAfterLastWindowClosed` override anywhere in this workspace, and
+    // `NSApplication`'s own default for an unimplemented delegate method is to keep the process
+    // running), so the process really was sitting there alive with zero windows and no way back
+    // in - exactly issue #278's report.
+    //
+    // The new window opens exactly like a fresh, no-CLI-argument launch (`open_ade_window(None,
+    // cx)`, the same call the initial window below makes) rather than a bare empty one: issue #90
+    // already established that "no CLI argument" means "reopen whatever repo/tab session was last
+    // focused", and a Dock click with no windows open reads to the user as exactly that case - a
+    // relaunch - not as `crate::title_bar::menu`'s deliberately-empty "New Window" row.
+    //
+    // Every other platform's `Platform::on_reopen` (`gpui_linux`, `gpui_windows`) stores the
+    // callback too, but nothing on those platforms ever invokes it - registering it
+    // unconditionally here is harmless dead weight there, not a behavior change, and avoids a
+    // `#[cfg(target_os = "macos")]` split for a call that's inert everywhere it doesn't apply.
+    application.on_reopen(|cx| {
+        if let Err(err) = open_ade_window(None, cx) {
+            log::error!("failed to reopen an ADE window from the Dock: {err}");
+        } else {
+            cx.activate(true);
+        }
+    });
+
+    application.run(move |cx: &mut App| {
+        if let Err(err) = fonts::load_embedded_fonts(cx) {
+            // Not fatal - GPUI falls back to a system font (see `theme::font`'s docs) -
+            // but it's a regression from "the bundled Plex glyphs actually render", so it
+            // must be visible in the log rather than silently swallowed.
+            log::error!("failed to load bundled fonts: {err}");
+        }
+
+        cx.bind_keys(default_key_bindings());
+
+        // GitHub issue #235: the four macOS application-menu commands with no `AdeApp`/
+        // `Window` to run against (Quit must work even with no window focused, e.g. invoked
+        // from the Dock; Hide/Hide Others/Show All are pure `gpui::App`-level window-manager
+        // calls) - registered as real global `App`-level action listeners rather than on any
+        // one window's root, so they still fire with nothing focused at all. Every other real
+        // `MenuCommand` this issue added dispatches through a window-scoped `on_action` on
+        // `AdeApp`'s own root instead - see `crate::root::menu_commands`'s own docs for why
+        // these four are the one deliberate exception.
+        cx.on_action(|_: &root::Quit, cx| cx.quit());
+        cx.on_action(|_: &root::Hide, cx| cx.hide());
+        cx.on_action(|_: &root::HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &root::ShowAll, cx| cx.unhide_other_apps());
+
+        // Must run after `bind_keys` above: `gpui::App::set_menus` reads the current
+        // `Keymap` right now to resolve each real item's own displayed key equivalent
+        // (`gpui_macos`'s menu-item construction reads `keymap.bindings_for_action`), so
+        // calling it first would install a menu with no keycap shown for anything
+        // `default_key_bindings` bound.
+        #[cfg(target_os = "macos")]
+        cx.set_menus(title_bar::native_menu::native_menus());
+
+        match open_ade_window(repo_path.clone(), cx) {
+            Ok(_) => cx.activate(true),
+            Err(err) => {
+                // `open_window` failing (e.g. no display available) can't be propagated
+                // through GPUI's `FnOnce(&mut App)` launch callback; log and quit instead
+                // of panicking or leaving a headless process running with no window.
+                log::error!("failed to open ADE window: {err}");
+                cx.quit();
             }
-
-            cx.bind_keys(default_key_bindings());
-
-            // GitHub issue #235: the four macOS application-menu commands with no `AdeApp`/
-            // `Window` to run against (Quit must work even with no window focused, e.g. invoked
-            // from the Dock; Hide/Hide Others/Show All are pure `gpui::App`-level window-manager
-            // calls) - registered as real global `App`-level action listeners rather than on any
-            // one window's root, so they still fire with nothing focused at all. Every other real
-            // `MenuCommand` this issue added dispatches through a window-scoped `on_action` on
-            // `AdeApp`'s own root instead - see `crate::root::menu_commands`'s own docs for why
-            // these four are the one deliberate exception.
-            cx.on_action(|_: &root::Quit, cx| cx.quit());
-            cx.on_action(|_: &root::Hide, cx| cx.hide());
-            cx.on_action(|_: &root::HideOthers, cx| cx.hide_other_apps());
-            cx.on_action(|_: &root::ShowAll, cx| cx.unhide_other_apps());
-
-            // Must run after `bind_keys` above: `gpui::App::set_menus` reads the current
-            // `Keymap` right now to resolve each real item's own displayed key equivalent
-            // (`gpui_macos`'s menu-item construction reads `keymap.bindings_for_action`), so
-            // calling it first would install a menu with no keycap shown for anything
-            // `default_key_bindings` bound.
-            #[cfg(target_os = "macos")]
-            cx.set_menus(title_bar::native_menu::native_menus());
-
-            let options = default_window_options(cx);
-            let opened = cx.open_window(options, {
-                let repo_path = repo_path.clone();
-                // `true`: the real process-launch path, which is exactly the one case GitHub
-                // issue #90 wants a remembered folder auto-reopened for - unlike a "New Window"
-                // menu row later in the same running process (`crate::title_bar::menu`'s own
-                // handler), which deliberately passes `false` for a genuinely empty window
-                // regardless of what's persisted. See `root::AdeApp::new`'s own docs for exactly
-                // what this flag controls.
-                move |window, cx| {
-                    cx.new(|cx| root::AdeApp::new(repo_path.clone(), true, window, cx))
-                }
-            });
-
-            match opened {
-                Ok(_) => cx.activate(true),
-                Err(err) => {
-                    // `open_window` failing (e.g. no display available) can't be propagated
-                    // through GPUI's `FnOnce(&mut App)` launch callback; log and quit instead
-                    // of panicking or leaving a headless process running with no window.
-                    log::error!("failed to open ADE window: {err}");
-                    cx.quit();
-                }
-            }
-        });
+        }
+    });
 }
 
 /// GitHub issue #216's real decision, tested without a process environment to mutate - see
@@ -988,6 +1056,113 @@ mod x11_scale_factor_env_tests {
                 "an empty GPUI_X11_SCALE_FACTOR={empty:?} is not an override"
             );
         }
+    }
+}
+
+/// GitHub issue #278's real fix, tested at [`open_ade_window_with_settings`] - the app-level half
+/// of "click the Dock icon to reopen the app" this app's own `cx.on_reopen` handler in [`run`]
+/// calls. What is deliberately **not** claimed here: that AppKit's real
+/// `applicationShouldHandleReopen:hasVisibleWindows:` delegate method fires, or that
+/// `gpui_macos`'s own C-ABI trampoline for it runs at all - both happen inside a pinned
+/// dependency, driven by a real macOS window manager, and there is no headless way to assert
+/// either from this Linux sandbox (see `vendor/zed/crates/gpui_macos/src/platform.rs`'s
+/// `should_handle_reopen` for that side, and `vendor/zed/crates/gpui/src/platform/test/platform.rs`'s
+/// own `on_reopen`, a genuine no-op that drops its callback outright - `TestPlatform` gives no way
+/// to invoke it even in principle). What *is* proven is the whole of this app's side of the
+/// contract once AppKit does call it: which window opens, and in what state.
+#[cfg(test)]
+mod open_ade_window_tests {
+    use super::{open_ade_window_with_settings, settings_store};
+    use crate::root::AdeApp;
+
+    /// The actual bug report: with a real repo remembered from an earlier launch, "reopening"
+    /// (`repo_path: None`, the same shape the Dock handler always passes) must bring that repo -
+    /// and its tab session - back, exactly like a fresh relaunch would (GitHub issue #90). Not a
+    /// bare empty window, which is what this app showed before issue #278's fix existed at all
+    /// (there was no handler, so nothing opened anything).
+    #[gpui::test]
+    fn reopen_shape_restores_the_remembered_repo(cx: &mut gpui::TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        // "Launch 1": a real CLI-argument launch against `repo`, which focuses (and so persists)
+        // it - the exact same setup `root::mod`'s own
+        // `a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo` test uses.
+        // Deliberately *not* rebinding `cx` to the `&mut VisualTestContext` this returns (unlike
+        // that test): the reopen call below needs the outer `&mut TestAppContext`'s own
+        // window-less `update`, which `VisualTestContext` doesn't have the same shape of.
+        let (_first, _first_window_cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo.path().to_path_buf()),
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path.clone()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // The Dock reopen handler's real call, `repo_path: None`, against that same persisted
+        // settings path - no live window, nothing but what was written to disk above.
+        let reopened = cx
+            .update(|cx| {
+                open_ade_window_with_settings(
+                    None,
+                    settings_store::Settings::default(),
+                    Some(settings_path),
+                    cx,
+                )
+            })
+            .expect("reopening should succeed");
+        cx.run_until_parked();
+
+        let app = reopened.root(cx).expect("a real root entity");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo_path(),
+                repo.path(),
+                "a Dock reopen must restore the same repo a fresh relaunch would, not a bare \
+                 empty window"
+            );
+            assert_eq!(app.repos.len(), 1);
+        });
+    }
+
+    /// The other real case: nothing was ever persisted (a first-ever launch, or a remembered
+    /// repo since deleted - `root::mod`'s own
+    /// `a_remembered_repo_that_no_longer_exists_falls_back_to_a_genuinely_empty_window` covers
+    /// the latter at the `AdeApp` level already). A Dock reopen in that state must still succeed
+    /// and open a real, genuinely empty window - never panic, never silently do nothing.
+    #[gpui::test]
+    fn reopen_shape_opens_a_genuinely_empty_window_when_nothing_is_remembered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let reopened = cx
+            .update(|cx| {
+                open_ade_window_with_settings(
+                    None,
+                    settings_store::Settings::default(),
+                    Some(settings_path),
+                    cx,
+                )
+            })
+            .expect("reopening with nothing remembered should still succeed");
+        cx.run_until_parked();
+
+        let app = reopened.root(cx).expect("a real root entity");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.focused_repo(),
+                None,
+                "with nothing ever remembered, a reopen must land on the same empty state a \
+                 fresh first launch would - not crash, not silently open nothing"
+            );
+        });
     }
 }
 
