@@ -757,6 +757,31 @@ impl TerminalGrid {
         self.term.grid().history_size()
     }
 
+    /// Drops any scrollback accumulated so far without disturbing the live viewport, cursor, or
+    /// terminal mode (GitHub issue #362) - `crate::terminal::pane::TerminalPane::
+    /// maybe_resize_pty`'s own docs for why: `Self::new` sizes this grid (and the pty) at a
+    /// placeholder before the pane has ever measured its real content-box size, so a program
+    /// that prints output before the corrective resize-down lands can have that output
+    /// legitimately (per `alacritty_terminal`'s own shrink-resize semantics - see
+    /// `scrolling_up_reveals_lines_pushed_into_history`'s own module docs) evicted into real
+    /// scrollback the moment the correction happens, even though the human never saw it
+    /// overflow at the size they're actually looking at. Called exactly once, right after that
+    /// first real resize, to reset the baseline before a real user-driven resize (window resize,
+    /// font-size change) can ever legitimately create scrollback of its own.
+    ///
+    /// `Grid::update_history(0)` (`grid/mod.rs:154`) immediately followed by
+    /// `update_history(Config::default().scrolling_history)` rather than rebuilding `Term` from
+    /// scratch: a fresh `Term` would also lose the cursor position/mode state `append_bytes` has
+    /// already built up from whatever the child printed at the placeholder size, which needs to
+    /// stay exactly as it is - only the *retained history* is spurious here, not the live
+    /// viewport.
+    pub fn discard_scrollback(&mut self) {
+        let real_cap = Config::default().scrolling_history;
+        let grid = self.term.grid_mut();
+        grid.update_history(0);
+        grid.update_history(real_cap);
+    }
+
     /// `true` once [`Self::scroll_offset`] is anything other than live - i.e. the pane is
     /// genuinely showing scrollback rather than the live tail right now.
     pub fn is_scrolled_back(&self) -> bool {
@@ -813,6 +838,39 @@ impl TerminalGrid {
     /// since a program can enable and disable it at any point in its own lifetime.
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Whether a mouse-wheel scroll reaching this pane right now should be translated into
+    /// arrow-key bytes and forwarded to the child process, rather than moving
+    /// [`Self::scroll_display`] (GitHub issue #362, filed after issue #331 shipped
+    /// `scroll_display` itself but never checked this).
+    ///
+    /// Two real `Term::mode()` bits, both read live rather than latched for the same reason
+    /// [`Self::bracketed_paste_enabled`] is: a running program can flip either at any point in
+    /// its own lifetime.
+    ///
+    /// - `TermMode::ALT_SCREEN` (`Term::swap_alt`, entering `vim`/`less`/an agent CLI's
+    ///   full-screen UI) - the module docs' "alt screen has no scrollback of its own" section:
+    ///   `scroll_display` is a real no-op there, since the alt grid's `history_size` is always
+    ///   `0` (`Term::new`, `term/mod.rs:412-413`), so a mouse-wheel reaching a full-screen
+    ///   program did nothing at all before this - not "nothing to scroll to", genuinely inert
+    ///   input the running program never saw either.
+    /// - `TermMode::ALTERNATE_SCROLL` (`DECSET 1007`, xterm's own name for exactly this
+    ///   feature) - the real, standard signal a program uses to opt out again even while the
+    ///   alt screen is active (`term/mod.rs:1980`/`:2032`), on by default
+    ///   (`TermMode::default()`, `term/mod.rs:113-118`). Respecting it means a full-screen
+    ///   program that explicitly disables it (rare, but real - some `less` configurations do)
+    ///   keeps getting exactly the pre-this-fix inert behavior instead of unwanted synthetic
+    ///   arrow keys.
+    ///
+    /// This is the same convention xterm itself documents for `alternateScroll`, and the one
+    /// iTerm2/Alacritty/kitty/Windows Terminal all implement: `less`/`vim`/`htop`/an agent
+    /// CLI's own interface responds to the mouse wheel as if the human had pressed the arrow
+    /// keys, because - unlike the normal screen - there is no real scrollback grid underneath
+    /// for a wheel event to move instead.
+    pub fn alt_scroll_forwarding_active(&self) -> bool {
+        let mode = self.term.mode();
+        mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL)
     }
 }
 
@@ -1320,6 +1378,54 @@ mod tests {
                 grid.scroll_offset(),
                 0,
                 "a scroll attempt on the alt screen must not move it into a history it doesn't have"
+            );
+        }
+
+        /// GitHub issue #362: [`TerminalGrid::alt_scroll_forwarding_active`] must flip on the
+        /// instant the alt screen is entered (`\x1b[?1049h`, real `smcup`) and back off the
+        /// instant it's exited (`\x1b[?1049l`, real `rmcup`) - the normal screen must never be
+        /// treated as alt-scroll-forwarding, and a program that leaves the alt screen (a full
+        /// `vim`/`less`/agent-CLI session ending) must hand real scrollback control straight
+        /// back to the mouse wheel with no leftover forwarding state.
+        #[test]
+        fn alt_scroll_forwarding_tracks_the_real_alt_screen_state() {
+            let mut grid = TerminalGrid::new(5, 20);
+            assert!(
+                !grid.alt_scroll_forwarding_active(),
+                "the normal screen must never forward scroll as arrow keys"
+            );
+
+            grid.append_bytes(b"\x1b[?1049h"); // enter the alt screen
+            assert!(
+                grid.alt_scroll_forwarding_active(),
+                "the alt screen, with ALTERNATE_SCROLL on by default, must forward"
+            );
+
+            grid.append_bytes(b"\x1b[?1049l"); // exit the alt screen
+            assert!(
+                !grid.alt_scroll_forwarding_active(),
+                "leaving the alt screen must hand control back to real scroll_display"
+            );
+        }
+
+        /// The real xterm `DECSET 1007` opt-out (`ALTERNATE_SCROLL`): a program can stay on the
+        /// alt screen yet explicitly disable scroll-as-arrow-keys translation, in which case a
+        /// wheel event reaching it must go back to being the pre-issue-#362 inert no-op - not
+        /// forwarded input the program never asked to receive.
+        #[test]
+        fn alt_scroll_forwarding_respects_the_real_alternate_scroll_opt_out() {
+            let mut grid = TerminalGrid::new(5, 20);
+            grid.append_bytes(b"\x1b[?1049h"); // enter the alt screen
+            assert!(
+                grid.alt_scroll_forwarding_active(),
+                "sanity check: on by default"
+            );
+
+            grid.append_bytes(b"\x1b[?1007l"); // DECRST 1007: opt out of alternate scroll
+            assert!(
+                !grid.alt_scroll_forwarding_active(),
+                "a program that explicitly disables DECSET 1007 must not have scroll forwarded \
+                 to it as synthetic input"
             );
         }
     }

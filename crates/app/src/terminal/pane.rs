@@ -87,8 +87,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, font, prelude::*, px, rgb, BorderStyle, Bounds, ClickEvent, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Pixels, ScrollWheelEvent, Size,
-    Task, Window,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Modifiers, Pixels,
+    ScrollWheelEvent, Size, Task, Window,
 };
 use pty_core::{ExitStatus, PtyError, PtySession, SpawnOptions};
 
@@ -801,6 +801,13 @@ pub struct TerminalPane {
     /// (`render`, every frame - self-correcting, since the grid is the single source of truth
     /// for "are we scrolled back", never mirrored here).
     new_output_while_scrolled: bool,
+    /// `true` once [`Self::maybe_resize_pty`] has applied a resize computed from a real,
+    /// measured [`Self::content_bounds`] rather than the pre-paint `window.viewport_size()`
+    /// fallback (GitHub issue #362) - see that method's own docs for why the very first such
+    /// resize discards whatever scrollback the placeholder-sized spawn window may have
+    /// manufactured. Latched permanently `true` after that one discard so a later, real
+    /// user-driven resize (an actual window resize, a font-size change) is never touched by it.
+    settled_real_size: bool,
 }
 
 impl TerminalPane {
@@ -835,6 +842,7 @@ impl TerminalPane {
             scroll_handle: TerminalScrollHandle::new(),
             pending_scroll_px: 0.0,
             new_output_while_scrolled: false,
+            settled_real_size: false,
         };
         this.spawn_process(cx);
         this
@@ -1272,8 +1280,10 @@ impl TerminalPane {
     }
 
     /// Mouse-wheel/trackpad scrollback (GitHub issue #331) - converts `event.delta` into whole
-    /// grid lines, carrying any sub-line remainder in [`Self::pending_scroll_px`], then drives
-    /// `TerminalGrid::scroll_display` directly.
+    /// grid lines, carrying any sub-line remainder in [`Self::pending_scroll_px`], then either
+    /// drives `TerminalGrid::scroll_display` directly or - while a full-screen program has the
+    /// alt screen active (GitHub issue #362) - forwards the same number of arrow-key presses to
+    /// the child process instead; see [`Self::forward_scroll_as_arrow_keys`]'s own docs for why.
     ///
     /// A real `on_scroll_wheel` handler, not GPUI's built-in `overflow_y_scroll`/`track_scroll`
     /// mechanism every other scrollable region in this app uses (`crate::root::scrollbar`'s own
@@ -1286,7 +1296,9 @@ impl TerminalPane {
     /// `vendor/zed/crates/gpui/src/elements/div.rs`'s own built-in scroll listener adds straight
     /// onto a `ScrollHandle`'s offset, whose own docs say "negative when scrolled down") scrolls
     /// toward the live tail; a positive one scrolls up into history - matching
-    /// [`ScrollAmount::Lines`]'s own sign convention, so the delta needs no inversion here.
+    /// [`ScrollAmount::Lines`]'s own sign convention, so the delta needs no inversion here. The
+    /// same convention carries over to [`Self::forward_scroll_as_arrow_keys`]: positive sends Up,
+    /// negative sends Down.
     fn handle_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1304,8 +1316,48 @@ impl TerminalPane {
             return;
         }
         self.pending_scroll_px -= lines * row_height;
-        self.grid.scroll_display(ScrollAmount::Lines(lines as i32));
+        if self.grid.alt_scroll_forwarding_active() {
+            self.forward_scroll_as_arrow_keys(lines as i32);
+        } else {
+            self.grid.scroll_display(ScrollAmount::Lines(lines as i32));
+        }
         cx.notify();
+    }
+
+    /// Translates a mouse-wheel scroll delta into the same arrow-key byte sequence
+    /// [`keystroke_to_bytes`] already produces for a real Up/Down key press, and writes it
+    /// straight to the pty (GitHub issue #362) - reusing that one encoder rather than a second,
+    /// hand-rolled `\x1b[A`/`\x1b[B` literal here, so the two stay identical if that mapping
+    /// ever changes (e.g. to respect `TermMode::APP_CURSOR`'s `\x1bO`-prefixed variant).
+    ///
+    /// The real convention xterm/iTerm2/Alacritty/kitty/Windows Terminal all implement for a
+    /// program with the alt screen active and `ALTERNATE_SCROLL` set (see
+    /// [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs): there is no real scrollback
+    /// grid under the alt screen for a wheel event to move instead, so `less`/`vim`/`htop`/an
+    /// agent CLI's own interface sees the wheel exactly as if the human pressed the arrow key
+    /// `lines.unsigned_abs()` times - one key press per grid line (matching xterm's own
+    /// behavior), not Page Up/Down for larger deltas, so a fast flick moves the program's own
+    /// cursor/selection by exactly as many lines as it would have scrolled real scrollback.
+    fn forward_scroll_as_arrow_keys(&mut self, lines: i32) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let key = if lines > 0 { "up" } else { "down" };
+        let Some(single_press) = keystroke_to_bytes(&Keystroke {
+            key: key.to_string(),
+            key_char: None,
+            modifiers: Modifiers::default(),
+        }) else {
+            return;
+        };
+        let presses = lines.unsigned_abs() as usize;
+        let mut bytes = Vec::with_capacity(single_press.len() * presses);
+        for _ in 0..presses {
+            bytes.extend_from_slice(&single_press);
+        }
+        if let Err(err) = session.write_input(&bytes) {
+            self.spawn_error = Some(format!("failed to write input: {err}"));
+        }
     }
 
     /// Applies a scrollbar click/drag's requested target, if one was recorded since the last
@@ -1851,7 +1903,24 @@ impl TerminalPane {
     /// pane at a 7.2x19.0px cell size computed 117 cols/37 rows from the raw padding-box
     /// measurement, but only ~115 cols/~36 rows actually fit once [`PANE_PADDING_PX`] (applied
     /// per side) is subtracted - the extra column/row painted through `overflow_hidden()`.
+    ///
+    /// **The first real measurement discards any scrollback it manufactured (GitHub issue
+    /// #362).** [`Self::new`] spawns the child process (and sizes [`Self::grid`]) at a fixed
+    /// placeholder (`TERMINAL_ROWS`/`TERMINAL_COLS`) before this pane has ever painted once, so
+    /// [`Self::content_bounds`] is still `None` and every resize up to this point has used the
+    /// `window.viewport_size()` guess above - not this pane's own real space, which is normally
+    /// smaller (a tab strip, sidebar, rail, status bar, ... all share the window with it).
+    /// Whatever the child printed while the grid still believed it had the placeholder's -
+    /// usually taller - size can get legitimately evicted into real retained scrollback the
+    /// instant this method applies the smaller, correct size (`alacritty_terminal`'s own
+    /// shrink-resize semantics - see `TerminalGrid::discard_scrollback`'s own docs), even though
+    /// the human never saw it overflow at the size they're actually looking at. Discarding once,
+    /// right here, means a brand-new pane never opens already showing a scrollbar for content
+    /// nobody watched scroll past - while a later *real* resize (an actual window resize, a
+    /// font-size change, both of which reach this same method) still creates real scrollback
+    /// exactly as before, since [`Self::settled_real_size`] only ever latches once.
     fn maybe_resize_pty(&mut self, window: &Window) {
+        let is_first_real_measurement = !self.settled_real_size && self.content_bounds.is_some();
         let raw_size = self
             .content_bounds
             .map(|bounds| bounds.size)
@@ -1860,6 +1929,10 @@ impl TerminalPane {
         let cell_size = self.cell_size(window);
         let (rows, cols) = size_to_grid(size, cell_size);
         self.resize_to(rows, cols);
+        if is_first_real_measurement {
+            self.settled_real_size = true;
+            self.grid.discard_scrollback();
+        }
     }
 
     /// Applies a target `(rows, cols)` to the grid and, if a live session exists, the child
@@ -5059,6 +5132,299 @@ mod scrollback_pane_tests {
             );
         });
         assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
+    }
+
+    /// GitHub issue #362: a mouse-wheel scroll reaching a pane whose child has the alt screen
+    /// active must be forwarded to the pty as real arrow-key bytes (via the same
+    /// [`keystroke_to_bytes`] encoder a real Up/Down key press uses), rather than moving
+    /// [`TerminalGrid::scroll_display`] - the alt screen has no scrollback of its own to move
+    /// (see [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs).
+    ///
+    /// `cat -v`, not plain `cat`: it visualizes control bytes (`ESC` -> the literal two
+    /// characters `^[`) as ordinary printable text, so the forwarded `\x1b[A` bytes show up in
+    /// this pane's own grid as the literal string `^[[A` instead of being reinterpreted as a
+    /// real cursor-motion escape sequence by this same grid's own VT parser - the one way to
+    /// observe the *exact* bytes a real child process received without a second, hand-rolled
+    /// test-only pty seam.
+    #[gpui::test]
+    fn alt_screen_scroll_forwards_arrow_keys_to_the_real_pty(cx: &mut TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.alt_scroll_forwarding_active()),
+            "sanity check: the grid must report the alt screen as active before scrolling"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, 2.0))),
+                window,
+                cx,
+            );
+        });
+
+        // Real `cat -v` printing back exactly what it received on stdin - give the poll loop
+        // real ticks to drain it.
+        for _ in 0..20 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            0,
+            "the alt screen has no scrollback of its own - scroll_display must never have moved"
+        );
+        let joined = pane
+            .read_with(cx, |pane, _| pane.visible_text_lines())
+            .join("");
+        assert_eq!(
+            joined.matches("^[[A").count(),
+            2,
+            "a two-line upward scroll must forward exactly two real Up-arrow byte sequences, \
+             visualized by `cat -v` as the literal text `^[[A`: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches("^[[B").count(),
+            0,
+            "an upward scroll must never also send a Down-arrow byte sequence: {joined:?}"
+        );
+    }
+
+    /// The mirror of the test above: downward scroll on the alt screen must forward Down-arrow
+    /// bytes, not Up.
+    #[gpui::test]
+    fn alt_screen_scroll_down_forwards_down_arrow_keys(cx: &mut TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+        });
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, -3.0))),
+                window,
+                cx,
+            );
+        });
+
+        for _ in 0..20 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        let joined = pane
+            .read_with(cx, |pane, _| pane.visible_text_lines())
+            .join("");
+        assert_eq!(
+            joined.matches("^[[B").count(),
+            3,
+            "a three-line downward scroll must forward exactly three real Down-arrow byte \
+             sequences: {joined:?}"
+        );
+        assert_eq!(joined.matches("^[[A").count(), 0);
+    }
+
+    /// GitHub issue #362: once a full-screen program exits the alt screen, a mouse-wheel scroll
+    /// must go straight back to real `TerminalGrid::scroll_display` - no leftover forwarding
+    /// state, and no arrow-key bytes reaching whatever process (a plain shell prompt) is now
+    /// running there instead.
+    #[gpui::test]
+    fn leaving_the_alt_screen_restores_real_scrollback_on_the_next_scroll(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+            pane.inject_bytes_for_test(b"\x1b[?1049l", cx); // and leave it again
+        });
+        assert!(
+            !pane.read_with(cx, |pane, _| pane.grid.alt_scroll_forwarding_active()),
+            "sanity check: back on the normal screen"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, 4.0))),
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            4,
+            "back on the normal screen, a scroll must move real scroll_display exactly as \
+             before this issue - not still be forwarded as arrow keys"
+        );
+    }
+
+    /// GitHub issue #362: a freshly-opened pane whose child prints only a handful of lines -
+    /// genuinely fewer than the real viewport height - must never show the scrollbar affordance.
+    /// `crate::root::scrollbar::render_vertical_scrollbar` already returns `None` whenever
+    /// `TerminalScrollHandle::max_scroll_offset` is at or below zero (see that function's own
+    /// docs), so this is really a test that a fresh pane's real `scroll_history_len` starts and
+    /// stays `0` for genuinely non-overflowing content - the scrollbar's own gate does the rest.
+    #[gpui::test]
+    fn a_fresh_pane_with_little_content_shows_no_scrollbar(cx: &mut TestAppContext) {
+        let (pane, cx) = new_pane(cx);
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"$ echo hello\r\nhello\r\n$ ", cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()),
+            0,
+            "a handful of lines, well under the real viewport height, must never manufacture \
+             scrollback"
+        );
+        assert!(
+            cx.debug_bounds("terminal-scrollbar").is_none(),
+            "the scrollbar must not be painted when there is nothing to scroll to"
+        );
+
+        // Genuine overflow - more lines than the real viewport holds - must still show it.
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        push_numbered_lines(&pane, cx, rows * 3);
+
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()) > 0,
+            "sanity check: this really did overflow"
+        );
+        assert!(
+            cx.debug_bounds("terminal-scrollbar").is_some(),
+            "genuine overflow must still show the scrollbar - this fix must not suppress it"
+        );
+    }
+
+    /// The precise mechanism behind the test above (GitHub issue #362): `TerminalPane::new`
+    /// spawns the child (and sizes `TerminalGrid`) at the `TERMINAL_ROWS`/`TERMINAL_COLS`
+    /// placeholder before this pane has ever measured its own real content-box size. If the
+    /// child prints more than the eventual *real* (smaller) viewport will hold - but still less
+    /// than the placeholder's own height - before that correction lands,
+    /// `alacritty_terminal`'s own shrink-resize semantics legitimately evict the overflow into
+    /// real retained scrollback the instant `TerminalPane::maybe_resize_pty` applies the
+    /// correct, smaller size. This reproduces that exact race deterministically - no GPUI
+    /// layout timing depended on - by resetting a pane back to its pre-first-paint state (a
+    /// placeholder-sized grid, `content_bounds` still unmeasured), printing content that fits
+    /// the placeholder but not the eventual real size, and then driving
+    /// `maybe_resize_pty` with a real, small measurement exactly as the pane's own second render
+    /// would.
+    #[gpui::test]
+    fn the_placeholder_spawn_races_content_bounds_but_the_first_real_resize_discards_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx) = new_pane(cx);
+
+        // Roll back to the pre-first-paint state `TerminalPane::new` actually starts in -
+        // `new_pane`'s own `add_window_view` call already settled this test pane once, so this
+        // simulates a pane whose very first corrective resize hasn't happened yet.
+        pane.update(cx, |pane, _cx| {
+            pane.grid = TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS);
+            pane.content_bounds = None;
+            pane.settled_real_size = false;
+            pane.resize_latch = ResizeLatch::default();
+        });
+
+        // The child prints output that comfortably fits the placeholder's own height but will
+        // not fit the small real size below - exactly the race this issue reports.
+        let placeholder_rows = TERMINAL_ROWS as usize;
+        let real_rows = 10u16;
+        assert!(
+            placeholder_rows > real_rows as usize,
+            "sanity check: the placeholder must genuinely be taller than the real target"
+        );
+        pane.update(cx, |pane, cx| {
+            for i in 0..(placeholder_rows - 5) {
+                pane.inject_bytes_for_test(format!("line {i}\r\n").as_bytes(), cx);
+            }
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()),
+            0,
+            "sanity check: this content fits the placeholder's own 48-row height, so nothing has \
+             overflowed yet"
+        );
+
+        // The pane's own content-box measurement settles to a real, much smaller area - what
+        // `render`'s measuring `canvas()` reports once it has actually painted.
+        let small_bounds = Bounds {
+            origin: gpui::point(px(0.0), px(0.0)),
+            size: gpui::size(px(800.0), px(real_rows as f32 * ROW_LINE_HEIGHT_PX)),
+        };
+        pane.update_in(cx, |pane, window, _cx| {
+            pane.content_bounds = Some(small_bounds);
+            pane.maybe_resize_pty(window);
+        });
+
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid_dimensions().1) <= real_rows + 1,
+            "sanity check: the corrective resize must have actually shrunk the grid"
+        );
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()),
+            0,
+            "the very first real resize must discard whatever the placeholder-sized spawn \
+             window manufactured - the human never saw this content overflow at the size \
+             they're actually looking at"
+        );
+        assert!(pane.read_with(cx, |pane, _| pane.settled_real_size));
+
+        // Later, genuine overflow (more output than the now-correctly-sized real viewport
+        // holds - the normal, expected behavior PR #351 shipped) must still create real
+        // scrollback exactly as before this fix - only the one-time placeholder-spawn race
+        // above is special-cased, not overflow in general.
+        pane.update(cx, |pane, cx| {
+            for i in 0..50 {
+                pane.inject_bytes_for_test(format!("more {i}\r\n").as_bytes(), cx);
+            }
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()) > 0,
+            "output that genuinely overflows the real, already-settled viewport must still \
+             create real scrollback - this fix must only special-case the one-time \
+             placeholder-spawn race, not overflow in general"
+        );
+
+        // A second, genuine resize (an actual window resize happening after settling) must
+        // also still be able to create real scrollback via the ordinary shrink path.
+        let smaller_bounds = Bounds {
+            origin: gpui::point(px(0.0), px(0.0)),
+            size: gpui::size(px(800.0), px(3.0 * ROW_LINE_HEIGHT_PX)),
+        };
+        let history_before_second_resize =
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len());
+        pane.update_in(cx, |pane, window, _cx| {
+            pane.content_bounds = Some(smaller_bounds);
+            pane.maybe_resize_pty(window);
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len())
+                >= history_before_second_resize,
+            "a second, genuine resize after settling must still be able to grow real scrollback \
+             via the ordinary shrink path - this fix must not have latched some permanent \
+             discard-on-every-resize behavior"
+        );
     }
 
     /// Trackpad pixel deltas rarely divide evenly by the row height - two individually-sub-line
