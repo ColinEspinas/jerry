@@ -2912,20 +2912,21 @@ impl AdeApp {
                     name_cell
                 }
             })
-            // GitHub issue #287: who wrote this file, right after its name - `REVISION-2026-08-14.md`
-            // §1's "agent chip per row […] amber ring when it has two authors", and
-            // `REVISION-2026-07-31.md` §4's gate that chips exist only in a multi-agent worktree.
-            // `render_author_chips` owns both the gate and the ring; this row only says where they
-            // go.
+            // GitHub issue #287: who wrote this file, right after its name -
+            // `REVISION-2026-08-14.md` §1's "agent chip per row […] amber ring when it has two
+            // authors". `render_author_chips` owns the ring, the tooltips and both click
+            // gestures; this row only says where the group goes and when it exists at all.
+            //
             // `stageable` is the Uncommitted scope, which is exactly where the design puts these:
             // *"Each **Uncommitted** row gains a chip group after the filename"*. An Against-main
             // row lists work already committed, where "who wrote this line" is git's own question
             // and git's own answer (`git blame`), not this app's local, uncommitted-only record -
             // and the ring's filter would open a diff against a base these chips were never
             // measured over.
-            // `worktree_has_multiple_agents` is checked here as well as inside
-            // `render_author_chips`, so a single-agent worktree does not build one throwaway
-            // author `Vec` per row per frame for a group that is then never rendered.
+            //
+            // The multi-agent gate (`REVISION-2026-07-31.md` §4) is repeated here rather than left
+            // to `render_author_chips` alone, so a single-agent worktree does not build one
+            // throwaway author `Vec` per row per frame for a group that is then never rendered.
             .when(stageable && self.worktree_has_multiple_agents(), |el| {
                 el.children(self.render_author_chips(
                     "change-row",
