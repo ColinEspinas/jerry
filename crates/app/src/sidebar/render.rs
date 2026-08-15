@@ -1910,7 +1910,13 @@ impl AdeApp {
 
         for section in sections::ChangesSection::ORDER {
             let body = self.changes_section_body(section, cx);
-            let count = body.iter().filter(|row| row.is_counted()).count();
+            // Against main is the one exception: it renders no row per file (see
+            // `SectionRow::AgainstMainContext`'s own docs), so its count reads the real file
+            // total directly rather than counting rows that do not exist.
+            let count = match section {
+                sections::ChangesSection::AgainstMain => self.change_set.len(),
+                _ => body.iter().filter(|row| row.is_counted()).count(),
+            };
             let open = self.changes_sections.is_open(section);
             rows.push(sections::SectionRow::Header(sections::SectionHeader {
                 section,
@@ -1918,7 +1924,6 @@ impl AdeApp {
                 count,
                 stat: self.changes_section_stat(section, &body),
                 open,
-                scope: section.scope_phrase(base_branch.as_deref()),
                 seen: match section {
                     sections::ChangesSection::Uncommitted => Some((
                         self.seen_files
@@ -2050,6 +2055,13 @@ impl AdeApp {
                 // worktree already has its own entry point on the rail's worktree context menu,
                 // so putting either here would be a second home for an action that already has
                 // one - the exact defect §4e removed them from the agent header for.
+                //
+                // No per-file rows, though issue #285's own checklist says "diffstat, file list
+                // and commit context" - a deliberate deviation from that restated checklist back
+                // toward `Jerry.dc.html` itself: line 1422's `baseRows` is a synthetic one-entry
+                // array (`wtBaseDefs`'s `files` is a plain count, never an array of files), so a
+                // committed file was never meant to be its own row here. Requested directly:
+                // "commited files should not appear on the changes tab under against master."
                 let base = self.changes_base_branch().map(str::to_string);
                 if let Some(base) = base {
                     body.push(SectionRow::AgainstMainContext {
@@ -2070,7 +2082,6 @@ impl AdeApp {
                         },
                     });
                 }
-                body.extend((0..self.change_set.len()).map(SectionRow::AgainstMainFile));
                 if diff.truncated {
                     body.push(warn(
                         "diff truncated: this branch's real changes exceeded wt_core::diff's own \
@@ -2259,12 +2270,6 @@ impl AdeApp {
                     None => div().into_any_element(),
                 }
             }
-            SectionRow::AgainstMainFile(index) => match self.change_set.entries().get(*index) {
-                Some(entry) => self
-                    .render_change_row(entry, ChangesSection::AgainstMain, cx)
-                    .into_any_element(),
-                None => div().into_any_element(),
-            },
             SectionRow::Commit(commit) => self.render_commit_row(commit).into_any_element(),
             SectionRow::AgainstMainContext { text, sub } => self
                 .render_against_main_context(text, sub)
@@ -2328,7 +2333,6 @@ impl AdeApp {
             .border_color(theme::border::INNER)
             .cursor_pointer()
             .hover(|el| el.bg(theme::surface::ROW_HOVER))
-            .tooltip(text_tooltip(header.scope.clone()))
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.toggle_changes_section(section, cx);
             }))
@@ -6485,9 +6489,9 @@ mod commit_composer_tests {
     ///
     /// The Uncommitted section is the working tree against `HEAD`, so a file whose difference from
     /// `main` is already inside a real commit is not in it at all - there is no row for it to
-    /// render a misleading checkbox on. It is still fully visible and reviewable, in the
-    /// Against-main section, which is the scope that legitimately lists committed work; that
-    /// section has no checkboxes at all.
+    /// render a misleading checkbox on. It is still counted in the Against-main section's header,
+    /// the scope that legitimately covers committed work - but not as a row of its own: that
+    /// section renders no row per file at all (see `SectionRow::AgainstMainContext`'s own docs).
     #[gpui::test]
     fn a_committed_file_is_in_the_against_main_section_not_the_uncommitted_one(
         cx: &mut TestAppContext,
@@ -6513,7 +6517,9 @@ mod commit_composer_tests {
              issue #220, removed by construction rather than by a per-row condition"
         );
 
-        // ...and it really is in the branch-scope section, which starts collapsed.
+        // ...and it really is counted in the branch-scope section, which starts collapsed - but
+        // never as a row of its own, open or not (see `SectionRow::AgainstMainContext`'s own
+        // docs: Against main renders no row per file at all).
         assert!(
             cx.debug_bounds("against-main-row-committed.txt").is_none(),
             "premise: Against main starts collapsed, so nothing of it is painted yet"
@@ -6523,14 +6529,29 @@ mod commit_composer_tests {
         });
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("against-main-row-committed.txt").is_some(),
-            "expanding Against main must show the committed file - reviewing what the branch \
-             would land is exactly what that scope is for"
+            cx.debug_bounds("against-main-row-committed.txt").is_none(),
+            "expanding Against main must still not paint a row for the committed file - only its \
+             one context card"
+        );
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let against_main_count = rows.iter().find_map(|row| match row {
+            sections::SectionRow::Header(header)
+                if header.section == sections::ChangesSection::AgainstMain =>
+            {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(2),
+            "reviewing what the branch would land is exactly what this scope is for - the \
+             committed file is still counted (alongside dirty.txt), just not given its own row"
         );
         assert!(
             cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
-            "and even there it must offer no checkbox: `REVISION-2026-08-14.md` §9 box 1, \
-             checkboxes exist only in Uncommitted"
+            "and it offers no checkbox anywhere: `REVISION-2026-08-14.md` §9 box 1, checkboxes \
+             exist only in Uncommitted"
         );
     }
 
@@ -6572,46 +6593,9 @@ mod commit_composer_tests {
         );
     }
 
-    /// A committed file's Against-main row is inert with respect to staging: it has no checkbox at
-    /// all, and clicking the row runs no `git add` - it opens the file's diff, which is the whole
-    /// of what a read-only scope's row does.
-    #[gpui::test]
-    fn clicking_an_against_main_row_stages_nothing_in_real_git(cx: &mut TestAppContext) {
-        let repo = repo_with_a_committed_and_a_dirty_file();
-        let (app, cx) = open_changes_view(cx, &repo);
-        app.update(cx, |app, cx| {
-            app.toggle_changes_section(sections::ChangesSection::AgainstMain, cx);
-        });
-        cx.run_until_parked();
-
-        let row = cx
-            .debug_bounds("against-main-row-committed.txt")
-            .expect("the committed file's branch-scope row must really paint");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain"]),
-            "M dirty.txt",
-            "the real git index must be untouched - the one changed path is unstaged-modified \
-             (`git_output` trims the porcelain code's leading space), and nothing about \
-             `committed.txt` may have been added"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.staged_files.is_empty()),
-            "and the app's own staged set must be untouched too"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.open_change.clone()),
-            Some(PathBuf::from("committed.txt")),
-            "what the click *does* do is open the file's diff - the committed file stays fully \
-             reviewable"
-        );
-    }
-
     /// After a real commit the just-committed file leaves the Uncommitted section entirely (the
-    /// working tree now matches `HEAD` for it) and is still there in Against main, which is the
-    /// scope that lists what the branch would land.
+    /// working tree now matches `HEAD` for it) and is still counted in Against main, which is the
+    /// scope that lists what the branch would land - though never as a row of its own.
     #[gpui::test]
     fn committing_a_staged_file_moves_it_out_of_uncommitted_and_into_against_main(
         cx: &mut TestAppContext,
@@ -6659,8 +6643,23 @@ mod commit_composer_tests {
         });
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("against-main-row-dirty.txt").is_some(),
-            "it still differs from `main`, so it is still in the branch-scope section"
+            cx.debug_bounds("against-main-row-dirty.txt").is_none(),
+            "it still differs from `main`, so it is still counted in the branch-scope section - \
+             but never as a row of its own, open or not"
+        );
+        let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
+        let against_main_count = rows.iter().find_map(|row| match row {
+            sections::SectionRow::Header(header)
+                if header.section == sections::ChangesSection::AgainstMain =>
+            {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(2),
+            "dirty.txt (just committed) and committed.txt both differ from main now"
         );
     }
 
@@ -6919,13 +6918,19 @@ mod changes_sections_tests {
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
 
-        // The generic form, over the exact row list the renderer consumes: for every header, the
-        // number of counted rows between it and the next header is that header's own `count`.
+        // The generic form, over the exact row list the renderer consumes: for every header
+        // *except Against main*, the number of counted rows between it and the next header is
+        // that header's own `count`. Against main is the one exception - it renders no row per
+        // file at all (`SectionRow::AgainstMainContext`'s own docs), so its count is checked
+        // separately below, against the real file total instead of a rendered-row tally.
         let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
         let mut current: Option<(ChangesSection, usize)> = None;
         let mut counted = 0usize;
         let mut checked = 0usize;
         let close = |section: ChangesSection, claimed: usize, actual: usize| {
+            if section == ChangesSection::AgainstMain {
+                return;
+            }
             assert_eq!(
                 claimed,
                 actual,
@@ -6951,13 +6956,21 @@ mod changes_sections_tests {
         }
         assert_eq!(checked, 4, "all four sections must have been checked");
 
+        let against_main_count = rows.iter().find_map(|row| match row {
+            SectionRow::Header(header) if header.section == ChangesSection::AgainstMain => {
+                Some(header.count)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            against_main_count,
+            Some(4),
+            "against main's count is the real file total (dirty-a, dirty-b, done-a, done-b), \
+             not a tally of rows it never renders"
+        );
+
         // ...and the rows really paint, so the check above is about a list that reaches the screen.
-        for selector in [
-            "change-row-dirty-a.txt",
-            "change-row-dirty-b.txt",
-            "against-main-row-done-a.txt",
-            "against-main-row-dirty-a.txt",
-        ] {
+        for selector in ["change-row-dirty-a.txt", "change-row-dirty-b.txt"] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
                 "{selector} must really paint once its section is open"
@@ -6977,30 +6990,25 @@ mod changes_sections_tests {
             "the Uncommitted section stages"
         );
         assert!(
-            cx.debug_bounds("against-main-row-dirty-a.txt").is_some(),
-            "premise: the same path is also an Against-main row, so the two rows are genuinely \
-             being told apart below rather than one of them simply being absent"
+            cx.debug_bounds("against-main-row-dirty-a.txt").is_none(),
+            "Against main renders no row per file at all (`SectionRow::AgainstMainContext`'s own \
+             docs), so there is no second row here for a stray checkbox to double up on"
         );
-        // One path, two rows, one checkbox: the checkbox id is per path, so a second checkbox for
-        // `dirty-a.txt` in the branch-scope section would collide with the first rather than
-        // reading as a separate element - which is exactly why this also asserts the *row* ids
-        // differ. The structural guarantee is `ChangesSection::has_checkboxes`, asserted directly
-        // in `crate::sidebar::sections`' own tests; this is its rendered half.
+        // The structural guarantee is `ChangesSection::has_checkboxes`, asserted directly in
+        // `crate::sidebar::sections`' own tests; this is its rendered half.
         let rows = app.update(cx, |app, cx| app.changes_section_rows(cx));
         let sections_with_files: Vec<ChangesSection> = rows
             .iter()
             .filter_map(|row| match row {
                 SectionRow::UncommittedFile(_) => Some(ChangesSection::Uncommitted),
-                SectionRow::AgainstMainFile(_) => Some(ChangesSection::AgainstMain),
                 SectionRow::Commit(_) => Some(ChangesSection::Commits),
                 SectionRow::Run(_) => Some(ChangesSection::Runs),
                 _ => None,
             })
             .collect();
         assert!(
-            sections_with_files.contains(&ChangesSection::AgainstMain)
-                && sections_with_files.contains(&ChangesSection::Commits),
-            "premise: the other sections really do have rows here"
+            sections_with_files.contains(&ChangesSection::Commits),
+            "premise: the other file-bearing section really does have rows here"
         );
         assert_eq!(
             sections_with_files
@@ -7040,11 +7048,18 @@ mod changes_sections_tests {
     }
 
     #[gpui::test]
-    fn the_against_main_section_renders_no_action_buttons(cx: &mut TestAppContext) {
+    fn the_against_main_section_renders_no_action_buttons_and_no_file_rows(
+        cx: &mut TestAppContext,
+    ) {
         // The product decision recorded on GitHub issue #285, overriding
         // `REVISION-2026-08-14.md` §1 rule 3 and `STAGE-A-CHANGELOG.md` §4e: merging is the git
         // graph's job and worktree removal already has its entry point on the rail, so this
-        // section is read-only - diffstat, file list and commit context only.
+        // section is read-only.
+        //
+        // And, separately: no row per committed file either, reported directly ("commited files
+        // should not appear on the changes tab under against master") and confirmed against
+        // `Jerry.dc.html` line 1422's own `baseRows` - a synthetic one-entry array, never a
+        // per-file loop. Against main's only real body row is its context card.
         let repo = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
@@ -7064,12 +7079,10 @@ mod changes_sections_tests {
             assert!(
                 matches!(
                     row,
-                    SectionRow::AgainstMainFile(_)
-                        | SectionRow::AgainstMainContext { .. }
-                        | SectionRow::Note { .. }
+                    SectionRow::AgainstMainContext { .. } | SectionRow::Note { .. }
                 ),
-                "the Against-main section may only hold its context card, its file rows and its \
-                 own notes - no action rows: {row:?}"
+                "the Against-main section may only hold its context card and its own notes - no \
+                 action rows, and no row per file: {row:?}"
             );
         }
         assert!(
@@ -7078,6 +7091,11 @@ mod changes_sections_tests {
                 .any(|row| matches!(row, SectionRow::AgainstMainContext { .. })),
             "it does still carry the read-only commit context"
         );
+        assert!(
+            cx.debug_bounds("against-main-row-done-a.txt").is_none(),
+            "and neither committed file painted a row of its own"
+        );
+        assert!(cx.debug_bounds("against-main-row-done-b.txt").is_none());
     }
 
     #[gpui::test]

@@ -155,30 +155,6 @@ impl ChangesSection {
         }
     }
 
-    /// The header tooltip that makes this section self-labelling (audit I6) - it states the
-    /// section's **base point**, which is the fact that tells the four scopes apart.
-    pub fn scope_phrase(self, base_branch: Option<&str>) -> String {
-        match self {
-            ChangesSection::Runs => {
-                "What each agent wrote in this worktree, from the uncommitted changes attributed \
-                 to it"
-                    .to_string()
-            }
-            ChangesSection::Uncommitted => {
-                "Everything dirty in this checkout, whoever wrote it - working tree \u{2192} HEAD"
-                    .to_string()
-            }
-            ChangesSection::Commits => match base_branch {
-                Some(base) => format!("Work already written down on this branch, since {base}"),
-                None => "Work already written down on this branch".to_string(),
-            },
-            ChangesSection::AgainstMain => match base_branch {
-                Some(base) => format!("What this branch would land on {base}"),
-                None => "What this branch would land on its base".to_string(),
-            },
-        }
-    }
-
     /// The section's 2px left edge (`REVISION-2026-08-14.md` §1's table).
     ///
     /// `None` for [`ChangesSection::Runs`]: a run's edge is *its own agent's tint*, resolved per
@@ -460,11 +436,14 @@ pub enum SectionRow {
     /// nothing rather than indexing a stale snapshot.
     UncommittedFile(usize),
     Commit(wt_core::diff::BranchCommit),
-    /// An index into the merge-base diff's file list, same discipline.
-    AgainstMainFile(usize),
-    /// The Against-main section's read-only context card - what would land, and how far ahead or
-    /// behind the branch is. Deliberately **not** a file row: the header's count is the file
-    /// count, so counting this would break "header count equals rendered row count".
+    /// The Against-main section's *only* body row (besides its own notes): what would land, and
+    /// how far ahead or behind the branch is. Unlike the other three sections, Against main never
+    /// lists a row per file - `Jerry.dc.html` line 1422's own `baseRows` is a synthetic one-entry
+    /// array (`wtBaseDefs`'s `files` is a plain count, never an array of files), and the panel's
+    /// own header count reads that count directly (`Self::changes_section_rows`), not the number
+    /// of rows this section renders - a deliberate exception to `SectionHeader::count`'s usual
+    /// "derived from the body" rule, and a deliberate removal of this section's earlier per-file
+    /// listing (a committed file is no longer its own row here at all).
     AgainstMainContext {
         text: String,
         sub: String,
@@ -482,15 +461,12 @@ impl SectionRow {
     ///
     /// Headers, the Against-main context card and section notes are not: counting them would break
     /// the panel's own acceptance criterion that a header's count equals the number of rows it
-    /// renders. See [`SectionHeader::count`], which is derived by running this over the section's
-    /// own body rather than by a second, independent count.
+    /// renders, for the three sections where that correspondence holds. See [`SectionHeader::count`]
+    /// for the fourth, Against main, whose count is never derived from this at all.
     pub fn is_counted(&self) -> bool {
         matches!(
             self,
-            SectionRow::Run(_)
-                | SectionRow::UncommittedFile(_)
-                | SectionRow::Commit(_)
-                | SectionRow::AgainstMainFile(_)
+            SectionRow::Run(_) | SectionRow::UncommittedFile(_) | SectionRow::Commit(_)
         )
     }
 
@@ -504,9 +480,7 @@ impl SectionRow {
             SectionRow::Run(_) => ChangesSection::Runs,
             SectionRow::UncommittedFile(_) => ChangesSection::Uncommitted,
             SectionRow::Commit(_) => ChangesSection::Commits,
-            SectionRow::AgainstMainFile(_) | SectionRow::AgainstMainContext { .. } => {
-                ChangesSection::AgainstMain
-            }
+            SectionRow::AgainstMainContext { .. } => ChangesSection::AgainstMain,
             SectionRow::Note { section, .. } => *section,
         }
     }
@@ -519,17 +493,17 @@ pub struct SectionHeader {
     /// [`ChangesSection::label`]'s output, already uppercased and already carrying the real base
     /// branch name where that applies.
     pub label: String,
-    /// **Derived from the section's own body rows**, by counting the ones
-    /// [`SectionRow::is_counted`] accepts - so "the header count equals the rendered row count" is
-    /// a property of how the list is built rather than an agreement between two counters. The body
-    /// is built whether or not the section is open, and only *pushed* when it is, which is what
-    /// lets a collapsed section still state a true count.
+    /// For Uncommitted, Commits and Runs: **derived from the section's own body rows**, by
+    /// counting the ones [`SectionRow::is_counted`] accepts - so "the header count equals the
+    /// rendered row count" is a property of how the list is built rather than an agreement
+    /// between two counters. The body is built whether or not the section is open, and only
+    /// *pushed* when it is, which is what lets a collapsed section still state a true count.
+    ///
+    /// For Against main: the real file count directly (`Self::changes_section_rows`), since that
+    /// section renders no row per file at all - only its one context card.
     pub count: usize,
     pub stat: DiffStat,
     pub open: bool,
-    /// [`ChangesSection::scope_phrase`]'s output - the header's tooltip, and the thing that makes
-    /// the section self-labelling (audit I6).
-    pub scope: String,
     /// `(seen, total)` for the Uncommitted section only - the `N/M seen` counter and its meter.
     /// `None` everywhere else: the other three sections have nothing to have read.
     pub seen: Option<(usize, usize)>,
@@ -829,22 +803,6 @@ mod tests {
             "with no detected base, the header must not claim one"
         );
         assert_eq!(ChangesSection::Runs.label(Some("main")), "RUNS");
-    }
-
-    #[test]
-    fn every_section_states_its_own_base_point() {
-        // Audit I6: every entry point that lands in this panel arrives somewhere that states its
-        // scope.
-        for section in ChangesSection::ORDER {
-            let phrase = section.scope_phrase(Some("main"));
-            assert!(!phrase.is_empty(), "{} has no scope phrase", section.key());
-        }
-        assert!(ChangesSection::Uncommitted
-            .scope_phrase(None)
-            .contains("HEAD"));
-        assert!(ChangesSection::AgainstMain
-            .scope_phrase(Some("main"))
-            .contains("main"));
     }
 
     #[test]
