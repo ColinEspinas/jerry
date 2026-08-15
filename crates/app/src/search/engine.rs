@@ -1,0 +1,1258 @@
+//! The pure, GPUI-free content search behind the right panel's Search tab: the compiled matcher
+//! the three modifier buttons produce, the worktree walk, the two-level result tree, and the real
+//! in-place replace.
+//!
+//! Everything here is a plain function over plain data with no `Window`, no `Context` and no app
+//! state, which is the split every feature folder in this crate uses (`crate::sidebar::file_tree`
+//! vs `crate::sidebar::render`). The panel itself is `crate::search::render`.
+//!
+//! ## One matcher, three buttons
+//!
+//! `Aa` (match case), `ab` (whole word) and `.*` (regex) are not three code paths - they are three
+//! inputs to one [`Matcher`], which is always a real `regex::Regex`. A literal query is
+//! `regex::escape`d first; whole-word wraps the whole thing in `\b(?:...)\b`. That is one place
+//! for the "leftmost, non-overlapping" semantics every editor's find has, rather than a
+//! hand-rolled substring scan for two of the three states and a regex for the third - which is
+//! exactly how the two would silently drift apart on overlapping matches.
+//!
+//! The one behaviour that genuinely differs by mode is what the *replacement* string means: in
+//! regex mode `$1` is a real capture reference (what a user typing a regex expects, and what VS
+//! Code does), and in literal mode it is a literal dollar sign. See [`Matcher::replace_all`].
+//!
+//! ## Bounded, because a worktree is not bounded
+//!
+//! `target/` alone can hold hundreds of thousands of files, and this walk runs against whatever
+//! the active worktree really contains. Four real limits, each reported honestly rather than
+//! silently applied: [`MAX_MATCHES`], [`MAX_SCANNED_FILES`], [`MAX_FILE_BYTES`] and a binary-file
+//! check. [`SearchOutcome::truncated`] is what the panel's count row turns into a real truncation
+//! notice - the issue's own "results cap with an honest truncation notice".
+
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+use crate::search::glob::GlobList;
+
+/// The largest file this search will read. The same ceiling
+/// `crate::code_surface::code_view::MAX_FILE_BYTES` puts on opening a file in the editor, for the
+/// same reason: past it, the thing on disk is not source you are searching, and reading it costs
+/// more than any hit in it is worth.
+pub const MAX_FILE_BYTES: u64 = crate::code_surface::code_view::MAX_FILE_BYTES as u64;
+
+/// How many matches one search collects before it stops and reports itself truncated. High enough
+/// that a real question about a real worktree is answered in full; low enough that a one-character
+/// query against a large checkout cannot build a multi-million-row tree the panel would then have
+/// to render.
+pub const MAX_MATCHES: usize = 2_000;
+
+/// How many files one search will open before it stops and reports itself truncated. A separate
+/// bound from [`MAX_MATCHES`] because the expensive case is the *opposite* one: a long, specific
+/// query that matches almost nothing still reads every file in the worktree.
+pub const MAX_SCANNED_FILES: usize = 20_000;
+
+/// How much of a file is sniffed for a NUL byte before it is called binary and skipped.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// The three modifier buttons in the query row, as real state
+/// (`REVISION-2026-08-14.md` §5: "`Aa` / `ab` / `.*` modifier buttons").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// `Aa` - off means the search is case-insensitive.
+    pub match_case: bool,
+    /// `ab` - the query must sit on word boundaries.
+    pub whole_word: bool,
+    /// `.*` - the query is a regular expression rather than literal text.
+    pub regex: bool,
+}
+
+/// A compiled query. Construct with [`Matcher::compile`]; an invalid regex is a real, reportable
+/// state ([`MatcherError`]) rather than a silent fallback to a literal search, which would answer
+/// a question the user did not ask.
+#[derive(Debug, Clone)]
+pub struct Matcher {
+    regex: regex::Regex,
+    /// Kept so [`Self::replace_all`] can tell a real regex replacement (where `$1` is a capture
+    /// reference) from a literal one (where it is a dollar sign) - see this module's own docs.
+    regex_mode: bool,
+}
+
+/// Why a query could not be compiled - shown verbatim under the query row, since a regex error
+/// message is the only thing that can tell the user which character is the problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatcherError(pub String);
+
+impl std::fmt::Display for MatcherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Matcher {
+    /// Compiles `query` under `options`. Returns `Ok(None)` for a query that is empty once
+    /// trimmed of nothing at all - i.e. genuinely `""` - which is the panel's "not searched yet"
+    /// state and not an error.
+    ///
+    /// A query of pure whitespace is a **real** query: a user searching for `"    "` (an
+    /// indentation width) means it, and treating it as empty would silently refuse a legitimate
+    /// search. Only a genuinely empty string is the idle state.
+    pub fn compile(query: &str, options: SearchOptions) -> Result<Option<Self>, MatcherError> {
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let body = if options.regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        // `\b(?:...)\b` rather than `\b...\b`: without the non-capturing group, a top-level
+        // alternation in regex mode (`foo|bar`) would bind as `(\bfoo)|(bar\b)` and quietly stop
+        // meaning "whole word".
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{body})\b")
+        } else {
+            body
+        };
+        let regex = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!options.match_case)
+            .build()
+            .map_err(|error| MatcherError(first_line_of(&error.to_string())))?;
+        Ok(Some(Matcher {
+            regex,
+            regex_mode: options.regex,
+        }))
+    }
+
+    /// Every non-overlapping match in `line`, as byte ranges into it.
+    ///
+    /// Zero-length matches are dropped rather than reported. They are reachable the moment the
+    /// user types `.*` or `a?` into a regex query, and a zero-width "match" is not something the
+    /// tree can highlight, the count can honestly total, or replace can act on - it would produce
+    /// one result row per character in the worktree.
+    pub fn find_in_line(&self, line: &str) -> Vec<Range<usize>> {
+        self.regex
+            .find_iter(line)
+            .filter(|found| found.start() != found.end())
+            .map(|found| found.range())
+            .collect()
+    }
+
+    /// `text` with every match replaced, plus how many were replaced.
+    ///
+    /// In regex mode `replacement` is a real template: `$1` / `${name}` expand to captures, which
+    /// is what a user who just typed a regex means by it. In literal mode it is inserted verbatim
+    /// (`regex::NoExpand`), so replacing with `$5.00` writes `$5.00` rather than an empty capture.
+    ///
+    /// Zero-length matches are skipped here for the same reason [`Self::find_in_line`] drops them,
+    /// and by the same code path - so the count this returns is always exactly the count the tree
+    /// showed.
+    pub fn replace_all(&self, text: &str, replacement: &str) -> (String, usize) {
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0usize;
+        let mut count = 0usize;
+        for captures in self.regex.captures_iter(text) {
+            let whole = captures.get(0).expect("group 0 always exists");
+            if whole.start() == whole.end() {
+                continue;
+            }
+            out.push_str(&text[last..whole.start()]);
+            if self.regex_mode {
+                captures.expand(replacement, &mut out);
+            } else {
+                out.push_str(replacement);
+            }
+            last = whole.end();
+            count += 1;
+        }
+        out.push_str(&text[last..]);
+        (out, count)
+    }
+}
+
+/// A regex error renders as several lines with a caret diagram, which is more than a one-line
+/// notice under a 28px field can show. The first line is the sentence that names the problem.
+fn first_line_of(message: &str) -> String {
+    message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(message)
+        .trim()
+        .to_string()
+}
+
+/// The two path-filter fields, resolved into the one question the walk asks per file.
+///
+/// The asymmetry between them is deliberate and is the whole reason this is a type rather than
+/// two `GlobList`s: an **empty include** means "no include filter", i.e. every path is a
+/// candidate, while an empty exclude means "exclude nothing". Both read as "the field is blank, so
+/// it is not filtering", but they are opposite defaults on a bare `GlobList::matches`.
+#[derive(Debug, Clone, Default)]
+pub struct PathFilter {
+    include: GlobList,
+    exclude: GlobList,
+}
+
+impl PathFilter {
+    pub fn new(include: &str, exclude: &str) -> Self {
+        PathFilter {
+            include: GlobList::parse(include),
+            exclude: GlobList::parse(exclude),
+        }
+    }
+
+    /// Whether a worktree-relative, `/`-separated path survives both fields.
+    pub fn allows(&self, relative: &str) -> bool {
+        if !self.include.is_empty() && !self.include.matches(relative) {
+            return false;
+        }
+        !self.exclude.matches(relative)
+    }
+}
+
+/// One matched line, and every hit on it.
+///
+/// The whole line is kept rather than a pre-trimmed display string: the panel's own left-elision
+/// rule ([`elide_around`]) is a *rendering* decision that depends on which hit a row is showing,
+/// and baking it in here would make the same data unusable for replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineMatch {
+    /// 1-based, as every editor and every `grep` reports it.
+    pub line_number: usize,
+    pub text: String,
+    /// Byte ranges into [`Self::text`], in order, non-overlapping.
+    pub ranges: Vec<Range<usize>>,
+}
+
+/// One file's whole contribution to the tree - the file row plus the match rows under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMatches {
+    /// Absolute, so a click can open it without re-deriving the worktree root.
+    pub path: PathBuf,
+    /// Worktree-relative and `/`-separated - what the file row prints and what the path filter
+    /// matched.
+    pub relative: String,
+    pub lines: Vec<LineMatch>,
+}
+
+impl FileMatches {
+    /// Hits in this file, counting **matches** rather than lines - two hits on one line are two
+    /// results, which is what the tree draws and what Replace all would act on.
+    pub fn match_count(&self) -> usize {
+        self.lines.iter().map(|line| line.ranges.len()).sum()
+    }
+
+    /// The file's own name, as the file row's leading label.
+    pub fn file_name(&self) -> &str {
+        match self.relative.rsplit_once('/') {
+            Some((_, name)) => name,
+            None => self.relative.as_str(),
+        }
+    }
+
+    /// The dimmed directory beside it, with its trailing `/` - `""` for a root-level file.
+    pub fn directory(&self) -> &str {
+        match self.relative.rfind('/') {
+            Some(index) => &self.relative[..=index],
+            None => "",
+        }
+    }
+}
+
+/// A completed search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOutcome {
+    pub files: Vec<FileMatches>,
+    /// Total hits across every file - the `N results` half of the count row.
+    pub total_matches: usize,
+    /// A real limit was reached ([`MAX_MATCHES`] or [`MAX_SCANNED_FILES`]), so this is a prefix of
+    /// the truth and the panel must say so.
+    pub truncated: bool,
+    /// How many files were really opened and scanned - the number the truncation notice quotes.
+    pub scanned_files: usize,
+}
+
+/// Everything one search run needs. A struct rather than five parameters because the panel builds
+/// it from five separate widgets and three of them are strings that would be transposable.
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    /// The worktree being searched - `STAGE-A-CHANGELOG.md` §4u: "scoped to the active worktree
+    /// like the tree beside it".
+    pub root: PathBuf,
+    pub matcher: Matcher,
+    pub filter: PathFilter,
+}
+
+/// Runs a real content search over `request.root`.
+///
+/// Blocking, by design: the caller runs it on `gpui::BackgroundExecutor` exactly as
+/// `crate::sidebar::file_tree::build_file_tree` is run (see `crate::search::render::AdeApp::
+/// start_search`). Errors reading an individual file or directory are skipped rather than
+/// aborting - one unreadable folder must never blank a whole result tree - which is the same call
+/// `build_file_tree`'s own walk makes.
+pub fn search_worktree(request: &SearchRequest) -> SearchOutcome {
+    let mut outcome = SearchOutcome::default();
+    let mut candidates = Vec::new();
+    collect_files(&request.root, &mut candidates, &mut outcome);
+    // A stable, predictable order: the tree is read top to bottom and a search re-run after a
+    // keystroke must not shuffle rows the user was reading. `read_dir` order is not defined.
+    candidates.sort();
+
+    for path in candidates {
+        if outcome.truncated {
+            break;
+        }
+        let Some(relative) = relative_slash_path(&request.root, &path) else {
+            continue;
+        };
+        if !request.filter.allows(&relative) {
+            continue;
+        }
+        if outcome.scanned_files >= MAX_SCANNED_FILES {
+            outcome.truncated = true;
+            break;
+        }
+        let Some(content) = read_searchable(&path) else {
+            continue;
+        };
+        outcome.scanned_files += 1;
+        let mut lines = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let ranges = request.matcher.find_in_line(line);
+            if ranges.is_empty() {
+                continue;
+            }
+            outcome.total_matches += ranges.len();
+            lines.push(LineMatch {
+                line_number: index + 1,
+                text: line.to_string(),
+                ranges,
+            });
+            if outcome.total_matches >= MAX_MATCHES {
+                outcome.truncated = true;
+                break;
+            }
+        }
+        if !lines.is_empty() {
+            outcome.files.push(FileMatches {
+                path,
+                relative,
+                lines,
+            });
+        }
+    }
+    outcome
+}
+
+/// Every regular file under `dir`, recursively.
+///
+/// `.git` is the one thing skipped unconditionally, and it is skipped for a reason no filter
+/// should have to restate: it is this app's own bookkeeping, it is mostly binary, and a search of
+/// it can only ever return things the user cannot act on. **Every other dotfile is searchable** -
+/// a deliberate divergence from `crate::sidebar::file_tree::build_file_tree`, which hides them
+/// from the tree. A tree that hides `.github/workflows/ci.yml` is a browsing choice; a search that
+/// silently cannot find text in it is the "an index, not a result" failure `STAGE-A-CHANGELOG.md`
+/// §4v names, one level up.
+///
+/// Symlinks are not followed (`DirEntry::file_type` does not follow them), so a worktree
+/// containing a link to `/` cannot make this walk unbounded.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, outcome: &mut SearchOutcome) {
+    if out.len() >= MAX_SCANNED_FILES {
+        outcome.truncated = true;
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            collect_files(&path, out, outcome);
+            if outcome.truncated {
+                return;
+            }
+        } else if file_type.is_file() {
+            if out.len() >= MAX_SCANNED_FILES {
+                outcome.truncated = true;
+                return;
+            }
+            out.push(path);
+        }
+    }
+}
+
+/// `path`'s text, or `None` when it is not something to search: too large
+/// ([`MAX_FILE_BYTES`]), binary (a NUL byte in the first [`BINARY_SNIFF_BYTES`]), not valid UTF-8,
+/// or simply unreadable.
+///
+/// The UTF-8 check is real rather than lossy: a lossy decode would report byte offsets into a
+/// string that is not what is on disk, and replace would then write those offsets back.
+pub fn read_searchable(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let sniff = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
+    if sniff.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// `path` relative to `root`, with `/` separators - `None` when it is not under `root` at all.
+fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut out = String::new();
+    for component in relative.components() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&component.as_os_str().to_string_lossy());
+    }
+    Some(out)
+}
+
+/// One file's real, on-disk replace: reads it, replaces every match, writes it back only if
+/// something actually changed.
+///
+/// Re-reads rather than trusting the [`SearchOutcome`] the tree is showing - that outcome can be
+/// seconds old and an agent may have rewritten the file since. The count returned is therefore
+/// the count that really landed, which is what "report what changed" has to mean.
+pub fn replace_in_file(
+    path: &Path,
+    matcher: &Matcher,
+    replacement: &str,
+) -> io::Result<ReplacedFile> {
+    let Some(content) = read_searchable(path) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a searchable text file",
+        ));
+    };
+    let (replaced, count) = matcher.replace_all(&content, replacement);
+    if count == 0 || replaced == content {
+        return Ok(ReplacedFile {
+            path: path.to_path_buf(),
+            matches: 0,
+        });
+    }
+    fs::write(path, replaced.as_bytes())?;
+    Ok(ReplacedFile {
+        path: path.to_path_buf(),
+        matches: count,
+    })
+}
+
+/// What one file's replace really did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedFile {
+    pub path: PathBuf,
+    /// Zero when the file was re-read and no longer matched - a real outcome, not a failure.
+    pub matches: usize,
+}
+
+/// The whole outcome of a Replace all / per-file replace, as the panel reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplaceOutcome {
+    pub files_changed: usize,
+    pub matches_replaced: usize,
+    /// Files that were deliberately not touched because they are open in the editor with unsaved
+    /// edits - see [`replace_across`]'s own docs.
+    pub skipped_dirty: Vec<PathBuf>,
+    /// Files whose write really failed, with the OS's own message.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// Replaces across `files`, skipping any path in `dirty` entirely.
+///
+/// `dirty` is the set of files currently open in the editor with **unsaved** changes
+/// (`crate::code_surface::edit_buffer::EditBuffer::is_dirty`). Writing those would silently
+/// destroy edits the user has not saved: the replace is computed from what is on disk, so it
+/// would write disk-content-with-substitutions over a buffer the editor still believes it owns,
+/// and the editor's own next save would then write the un-replaced buffer straight back. Refusing
+/// and *naming* them is the only honest option - `REVISION-2026-08-14.md` §7 rule 1's "ship the
+/// affordance with the behaviour, or ship neither", applied to a partial one.
+pub fn replace_across(
+    files: &[PathBuf],
+    matcher: &Matcher,
+    replacement: &str,
+    dirty: &HashSet<PathBuf>,
+) -> ReplaceOutcome {
+    let mut outcome = ReplaceOutcome::default();
+    for path in files {
+        if dirty.contains(path) {
+            outcome.skipped_dirty.push(path.clone());
+            continue;
+        }
+        match replace_in_file(path, matcher, replacement) {
+            Ok(replaced) if replaced.matches > 0 => {
+                outcome.files_changed += 1;
+                outcome.matches_replaced += replaced.matches;
+            }
+            Ok(_) => {}
+            Err(error) => outcome.failed.push((path.clone(), error.to_string())),
+        }
+    }
+    outcome
+}
+
+/// How many characters of context sit before the hit on a match row before the prefix elides from
+/// the left. `Jerry.dc.html`'s own `trimPre`: `s.length > 16 ? '…' + s.slice(-15)`.
+pub const ELIDE_PREFIX_MAX: usize = 16;
+
+/// The same for the tail. `Jerry.dc.html`'s own `trimPost`: `s.length > 26 ? s.slice(0, 25) + '…'`.
+pub const ELIDE_SUFFIX_MAX: usize = 26;
+
+/// Splits `line` around `range` into the three spans a match row draws, with the design's own
+/// left-elision applied.
+///
+/// `Jerry.dc.html` states the rule and the reason verbatim: "The row is ~40 characters at 10px
+/// mono. A long prefix pushes the match clean out of the box, which defeats the point of showing
+/// the line at all - so the prefix elides from the LEFT and the hit stays at a fixed early column,
+/// the way VS Code does it. The tail may overflow; the tail is only context."
+///
+/// Counts **characters**, not bytes, so an indented line of CJK or a comment with an emoji in it
+/// elides at the same visual width as an ASCII one rather than three times earlier.
+pub fn elide_around(line: &str, range: &Range<usize>) -> (String, String, String) {
+    let before = &line[..range.start];
+    let hit = &line[range.clone()];
+    let after = &line[range.end..];
+
+    let before_chars: Vec<char> = before.chars().collect();
+    let prefix = if before_chars.len() > ELIDE_PREFIX_MAX {
+        let tail: String = before_chars[before_chars.len() - (ELIDE_PREFIX_MAX - 1)..]
+            .iter()
+            .collect();
+        format!("\u{2026}{tail}")
+    } else {
+        before.to_string()
+    };
+
+    let after_chars: Vec<char> = after.chars().collect();
+    let suffix = if after_chars.len() > ELIDE_SUFFIX_MAX {
+        let head: String = after_chars[..ELIDE_SUFFIX_MAX - 1].iter().collect();
+        format!("{head}\u{2026}")
+    } else {
+        after.to_string()
+    };
+
+    (prefix, hit.to_string(), suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matcher(query: &str, options: SearchOptions) -> Matcher {
+        Matcher::compile(query, options)
+            .expect("compiles")
+            .expect("a non-empty query")
+    }
+
+    fn literal(query: &str) -> Matcher {
+        matcher(query, SearchOptions::default())
+    }
+
+    #[test]
+    fn an_empty_query_is_the_idle_state_not_an_error() {
+        assert!(Matcher::compile("", SearchOptions::default())
+            .expect("no error")
+            .is_none());
+    }
+
+    #[test]
+    fn a_whitespace_only_query_is_a_real_search() {
+        let matcher = literal("    ");
+        assert_eq!(
+            matcher.find_in_line("    indented").len(),
+            1,
+            "searching for an indentation width is a real thing to want; only a genuinely empty \
+             field is the not-searched-yet state"
+        );
+    }
+
+    #[test]
+    fn a_literal_query_never_reads_as_a_regex() {
+        let matcher = literal("a.c");
+        assert!(
+            matcher.find_in_line("abc").is_empty(),
+            "`.` must be literal"
+        );
+        assert_eq!(matcher.find_in_line("a.c").len(), 1);
+    }
+
+    #[test]
+    fn match_case_off_is_case_insensitive_and_on_is_not() {
+        let insensitive = literal("Token");
+        assert_eq!(insensitive.find_in_line("refresh_token").len(), 1);
+        let sensitive = matcher(
+            "Token",
+            SearchOptions {
+                match_case: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert!(sensitive.find_in_line("refresh_token").is_empty());
+        assert_eq!(sensitive.find_in_line("refresh_Token").len(), 1);
+    }
+
+    #[test]
+    fn whole_word_rejects_a_hit_inside_a_longer_identifier() {
+        let matcher = matcher(
+            "token",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert!(
+            matcher.find_in_line("refresh_token").is_empty(),
+            "`_` is a word character, so `refresh_token` does not contain the whole word `token`"
+        );
+        assert_eq!(matcher.find_in_line("let token = 1;").len(), 1);
+    }
+
+    #[test]
+    fn whole_word_over_a_regex_alternation_binds_to_the_whole_alternation() {
+        // Without the `(?:...)` group this compiles to `\bfoo|bar\b`, which silently means
+        // "whole-word foo, or any bar" - the exact shadowed-semantics bug the group exists for.
+        let matcher = matcher(
+            "foo|bar",
+            SearchOptions {
+                whole_word: true,
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert!(matcher.find_in_line("xxbarxx").is_empty());
+        assert_eq!(matcher.find_in_line("a bar b").len(), 1);
+    }
+
+    #[test]
+    fn an_invalid_regex_is_a_real_reportable_error_not_a_silent_literal_fallback() {
+        let error = Matcher::compile(
+            "(unclosed",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .expect_err("an unclosed group must not compile");
+        assert!(!error.0.is_empty());
+        assert!(
+            !error.0.contains('\n'),
+            "the panel shows one line under a 28px field: {}",
+            error.0
+        );
+    }
+
+    #[test]
+    fn matches_are_leftmost_and_non_overlapping() {
+        let matcher = literal("aa");
+        assert_eq!(
+            matcher.find_in_line("aaaa"),
+            vec![0..2, 2..4],
+            "two non-overlapping hits, not three overlapping ones"
+        );
+    }
+
+    #[test]
+    fn a_zero_width_regex_match_is_never_reported_as_a_result() {
+        let matcher = matcher(
+            "x*",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(
+            matcher.find_in_line("abc"),
+            Vec::<Range<usize>>::new(),
+            "`x*` matches the empty string at every offset - one result row per character is not \
+             a search result"
+        );
+        assert_eq!(matcher.find_in_line("axxb"), vec![1..3]);
+    }
+
+    #[test]
+    fn replace_in_literal_mode_never_expands_a_dollar_group() {
+        let matcher = literal("PRICE");
+        let (out, count) = matcher.replace_all("cost: PRICE", "$5.00");
+        assert_eq!(out, "cost: $5.00");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn replace_in_regex_mode_really_expands_captures() {
+        let matcher = matcher(
+            r"fn (\w+)\(",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        let (out, count) = matcher.replace_all("fn refresh(", "pub fn $1(");
+        assert_eq!(out, "pub fn refresh(");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn replace_counts_every_hit_including_several_on_one_line() {
+        let matcher = literal("a");
+        let (out, count) = matcher.replace_all("a b a\na", "X");
+        assert_eq!(out, "X b X\nX");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn replacing_with_the_empty_string_is_a_real_deletion() {
+        let matcher = literal("_old");
+        let (out, count) = matcher.replace_all("name_old = 1", "");
+        assert_eq!(out, "name = 1");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_path_filter_with_an_empty_include_lets_everything_through() {
+        let filter = PathFilter::new("", "");
+        assert!(filter.allows("src/lib.rs"));
+        assert!(filter.allows("target/debug/x"));
+    }
+
+    #[test]
+    fn a_real_include_narrows_and_a_real_exclude_wins_over_it() {
+        let filter = PathFilter::new("src/**, tests/**", "src/generated/**");
+        assert!(filter.allows("src/auth/session.rs"));
+        assert!(filter.allows("tests/auth_race.rs"));
+        assert!(!filter.allows("migrations/0031.sql"), "not included");
+        assert!(
+            !filter.allows("src/generated/api.rs"),
+            "exclude must win over include, or an exclude could never narrow one"
+        );
+    }
+
+    #[test]
+    fn file_matches_split_a_relative_path_into_name_and_dimmed_directory() {
+        let file = FileMatches {
+            path: PathBuf::from("/wt/src/auth/session.rs"),
+            relative: "src/auth/session.rs".to_string(),
+            lines: Vec::new(),
+        };
+        assert_eq!(file.file_name(), "session.rs");
+        assert_eq!(file.directory(), "src/auth/");
+
+        let root_level = FileMatches {
+            path: PathBuf::from("/wt/README.md"),
+            relative: "README.md".to_string(),
+            lines: Vec::new(),
+        };
+        assert_eq!(root_level.file_name(), "README.md");
+        assert_eq!(root_level.directory(), "");
+    }
+
+    #[test]
+    fn a_files_match_count_totals_hits_not_lines() {
+        let file = FileMatches {
+            path: PathBuf::from("/wt/a.rs"),
+            relative: "a.rs".to_string(),
+            lines: vec![
+                LineMatch {
+                    line_number: 1,
+                    text: "a a".to_string(),
+                    ranges: vec![0..1, 2..3],
+                },
+                LineMatch {
+                    line_number: 4,
+                    text: "aa".to_string(),
+                    ranges: vec![0..1, 1..2],
+                },
+            ],
+        };
+        assert_eq!(
+            file.match_count(),
+            4,
+            "two hits on one line are two results - the count row and Replace all must agree"
+        );
+    }
+
+    #[test]
+    fn a_long_prefix_elides_from_the_left_so_the_hit_stays_at_an_early_column() {
+        let line = "                    let refresh_token = issue();";
+        let range = line.find("refresh_token").expect("the hit")..;
+        let range = range.start..range.start + "refresh_token".len();
+        let (prefix, hit, suffix) = elide_around(line, &range);
+        assert!(prefix.starts_with('\u{2026}'));
+        assert_eq!(prefix.chars().count(), ELIDE_PREFIX_MAX);
+        assert_eq!(hit, "refresh_token");
+        assert_eq!(suffix, " = issue();");
+    }
+
+    #[test]
+    fn a_short_prefix_and_tail_are_left_exactly_as_they_are() {
+        let (prefix, hit, suffix) = elide_around("let a = 1;", &(4..5));
+        assert_eq!(
+            (prefix.as_str(), hit.as_str(), suffix.as_str()),
+            ("let ", "a", " = 1;")
+        );
+    }
+
+    #[test]
+    fn a_long_tail_elides_from_the_right_because_the_tail_is_only_context() {
+        let line = format!("x{}", "y".repeat(80));
+        let (_, hit, suffix) = elide_around(&line, &(0..1));
+        assert_eq!(hit, "x");
+        assert_eq!(suffix.chars().count(), ELIDE_SUFFIX_MAX);
+        assert!(suffix.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn elision_counts_characters_not_bytes() {
+        // Twenty CJK characters is 60 bytes; a byte-counting elision would cut this three times
+        // earlier than an equivalent ASCII line.
+        let prefix_source = "\u{6f22}".repeat(20);
+        let line = format!("{prefix_source}HIT");
+        let start = prefix_source.len();
+        let (prefix, hit, _) = elide_around(&line, &(start..start + 3));
+        assert_eq!(hit, "HIT");
+        assert_eq!(prefix.chars().count(), ELIDE_PREFIX_MAX);
+    }
+}
+
+/// Real searches and real replaces over a real, multi-file worktree on disk - no in-memory stand-in
+/// for the walk, the reads or the writes, because the walk's own rules (`.git`, symlinks, binary
+/// files, the size cap) are exactly the part an in-memory fixture cannot exercise.
+///
+/// The corpus mirrors `Jerry.dc.html`'s own fixture (`refresh_token` across `src/auth/`,
+/// `tests/` and `migrations/`) so the shapes asserted here are the shapes the panel was designed
+/// against.
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    /// Writes a real worktree and returns its `TempDir` - the whole fixture in one place so every
+    /// test below searches the same corpus the panel's own mock does.
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            fs::write(&path, content).expect("write");
+        };
+        write(
+            "src/auth/session.rs",
+            "use crate::store;\n\
+             pub fn issue(&self) -> Token {\n    let refresh_token = self.store.issue(&sid)?;\n\
+             \n    if self.refresh_token.is_expired(now) {\n        drop(refresh_token);\n    }\n}\n",
+        );
+        write(
+            "src/auth/store.rs",
+            "pub trait Store {\n    fn refresh_token(&self, sid: &SessionId) -> Option<Token>;\n}\n",
+        );
+        write("src/api/users.rs", "let t = auth.refresh_token(&sid)?;\n");
+        write(
+            "tests/auth_race.rs",
+            "let a = svc.refresh_token(sid).unwrap();\nlet b = svc.refresh_token(sid).unwrap();\n",
+        );
+        write(
+            "migrations/0031_add_refresh_lock.sql",
+            "alter table sessions\n  add column refresh_token_lock boolean not null default false;\n",
+        );
+        write("README.md", "No hits in here.\n");
+        write("Cargo.lock", "refresh_token = \"1\"\n");
+        // Real `.git` bookkeeping: the one thing the walk skips unconditionally.
+        write(".git/COMMIT_EDITMSG", "wip refresh_token\n");
+        // A dotfile that is *not* `.git` - searchable, deliberately, see `collect_files`' docs.
+        write(
+            ".github/workflows/ci.yml",
+            "run: cargo test refresh_token\n",
+        );
+        // A real binary file: a NUL byte in the sniff window.
+        fs::write(root.join("logo.bin"), [0x89, 0x50, 0x00, 0x01, 0x02]).expect("write binary");
+        dir
+    }
+
+    fn run(
+        root: &Path,
+        query: &str,
+        options: SearchOptions,
+        include: &str,
+        exclude: &str,
+    ) -> SearchOutcome {
+        let matcher = Matcher::compile(query, options)
+            .expect("compiles")
+            .expect("a non-empty query");
+        search_worktree(&SearchRequest {
+            root: root.to_path_buf(),
+            matcher,
+            filter: PathFilter::new(include, exclude),
+        })
+    }
+
+    fn relatives(outcome: &SearchOutcome) -> Vec<&str> {
+        outcome
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_real_search_across_a_real_worktree_finds_every_file_and_every_line() {
+        let dir = fixture();
+        let outcome = run(
+            dir.path(),
+            "refresh_token",
+            SearchOptions::default(),
+            "",
+            "",
+        );
+
+        assert_eq!(
+            relatives(&outcome),
+            vec![
+                ".github/workflows/ci.yml",
+                "Cargo.lock",
+                "migrations/0031_add_refresh_lock.sql",
+                "src/api/users.rs",
+                "src/auth/session.rs",
+                "src/auth/store.rs",
+                "tests/auth_race.rs",
+            ],
+            "sorted, stable order - a re-run after a keystroke must not shuffle rows"
+        );
+        assert_eq!(
+            outcome.total_matches, 10,
+            "every hit, counted as a hit: three on three separate lines of session.rs, one each \
+             in store.rs / users.rs / the migration / Cargo.lock / the workflow, and two in \
+             auth_race.rs"
+        );
+        assert!(!outcome.truncated);
+
+        let session = outcome
+            .files
+            .iter()
+            .find(|file| file.relative == "src/auth/session.rs")
+            .expect("session.rs");
+        assert_eq!(
+            session
+                .lines
+                .iter()
+                .map(|line| line.line_number)
+                .collect::<Vec<_>>(),
+            vec![3, 5, 6],
+            "real 1-based line numbers off the real file"
+        );
+    }
+
+    #[test]
+    fn the_git_directory_is_never_searched_but_other_dotfiles_are() {
+        let dir = fixture();
+        let outcome = run(
+            dir.path(),
+            "refresh_token",
+            SearchOptions::default(),
+            "",
+            "",
+        );
+        assert!(
+            !relatives(&outcome)
+                .iter()
+                .any(|path| path.starts_with(".git/")),
+            "`.git` is this app's own bookkeeping - a hit in it is not actionable"
+        );
+        assert!(
+            relatives(&outcome).contains(&".github/workflows/ci.yml"),
+            "a search that silently cannot find text in a dotfile is an index, not a result"
+        );
+    }
+
+    #[test]
+    fn a_binary_file_is_skipped_rather_than_decoded() {
+        let dir = fixture();
+        fs::write(
+            dir.path().join("blob.bin"),
+            [b'r', b'e', b'f', 0x00, b'r', b'e', b'f'],
+        )
+        .expect("write");
+        let outcome = run(dir.path(), "ref", SearchOptions::default(), "", "");
+        assert!(!relatives(&outcome).contains(&"blob.bin"));
+    }
+
+    #[test]
+    fn a_file_past_the_size_cap_is_skipped() {
+        let dir = fixture();
+        let huge = format!(
+            "{}\nrefresh_token\n",
+            "x".repeat(MAX_FILE_BYTES as usize + 1)
+        );
+        fs::write(dir.path().join("huge.rs"), huge).expect("write");
+        let outcome = run(
+            dir.path(),
+            "refresh_token",
+            SearchOptions::default(),
+            "",
+            "",
+        );
+        assert!(!relatives(&outcome).contains(&"huge.rs"));
+    }
+
+    #[test]
+    fn the_include_and_exclude_fields_really_narrow_a_real_walk() {
+        let dir = fixture();
+        let included = run(
+            dir.path(),
+            "refresh_token",
+            SearchOptions::default(),
+            "src/**, tests/**",
+            "",
+        );
+        assert_eq!(
+            relatives(&included),
+            vec![
+                "src/api/users.rs",
+                "src/auth/session.rs",
+                "src/auth/store.rs",
+                "tests/auth_race.rs",
+            ]
+        );
+
+        let excluded = run(
+            dir.path(),
+            "refresh_token",
+            SearchOptions::default(),
+            "",
+            "*.lock, migrations/**, .github/**",
+        );
+        assert_eq!(
+            relatives(&excluded),
+            vec![
+                "src/api/users.rs",
+                "src/auth/session.rs",
+                "src/auth/store.rs",
+                "tests/auth_race.rs",
+            ],
+            "the design's own `target/**, *.lock` shape, against a real tree"
+        );
+    }
+
+    #[test]
+    fn match_case_really_changes_a_real_result_set() {
+        let dir = fixture();
+        fs::write(dir.path().join("src/Cased.rs"), "Refresh_Token\n").expect("write");
+
+        let insensitive = run(
+            dir.path(),
+            "Refresh_Token",
+            SearchOptions::default(),
+            "src/**",
+            "",
+        );
+        assert!(insensitive.total_matches > 1);
+
+        let sensitive = run(
+            dir.path(),
+            "Refresh_Token",
+            SearchOptions {
+                match_case: true,
+                ..SearchOptions::default()
+            },
+            "src/**",
+            "",
+        );
+        assert_eq!(relatives(&sensitive), vec!["src/Cased.rs"]);
+        assert_eq!(sensitive.total_matches, 1);
+    }
+
+    #[test]
+    fn a_real_replace_all_rewrites_every_file_on_disk_and_reports_what_changed() {
+        let dir = fixture();
+        let root = dir.path();
+        let outcome = run(
+            root,
+            "refresh_token",
+            SearchOptions::default(),
+            "src/**",
+            "",
+        );
+        let files: Vec<PathBuf> = outcome.files.iter().map(|file| file.path.clone()).collect();
+        assert_eq!(files.len(), 3);
+
+        let matcher = Matcher::compile("refresh_token", SearchOptions::default())
+            .expect("compiles")
+            .expect("a query");
+        let replaced = replace_across(&files, &matcher, "rotate_token", &HashSet::new());
+
+        assert_eq!(replaced.files_changed, 3);
+        assert_eq!(replaced.matches_replaced, 5);
+        assert!(replaced.skipped_dirty.is_empty());
+        assert!(replaced.failed.is_empty());
+
+        let session = fs::read_to_string(root.join("src/auth/session.rs")).expect("read back");
+        assert!(
+            !session.contains("refresh_token"),
+            "the file on disk must really have changed: {session}"
+        );
+        assert!(session.contains("rotate_token"));
+        assert!(
+            session.contains("use crate::store;"),
+            "every untouched line must survive verbatim"
+        );
+
+        // Outside the include filter, so genuinely untouched.
+        let untouched = fs::read_to_string(root.join("tests/auth_race.rs")).expect("read back");
+        assert!(untouched.contains("refresh_token"));
+
+        // And the search really agrees afterwards.
+        let after = run(
+            root,
+            "refresh_token",
+            SearchOptions::default(),
+            "src/**",
+            "",
+        );
+        assert_eq!(after.total_matches, 0);
+    }
+
+    #[test]
+    fn a_file_open_with_unsaved_edits_is_refused_and_named_rather_than_silently_overwritten() {
+        let dir = fixture();
+        let root = dir.path();
+        let session = root.join("src/auth/session.rs");
+        let store = root.join("src/auth/store.rs");
+        let before = fs::read_to_string(&session).expect("read");
+
+        let matcher = Matcher::compile("refresh_token", SearchOptions::default())
+            .expect("compiles")
+            .expect("a query");
+        let dirty: HashSet<PathBuf> = [session.clone()].into_iter().collect();
+        let outcome = replace_across(
+            &[session.clone(), store.clone()],
+            &matcher,
+            "rotate",
+            &dirty,
+        );
+
+        assert_eq!(outcome.skipped_dirty, vec![session.clone()]);
+        assert_eq!(outcome.files_changed, 1, "the clean file is still replaced");
+        assert_eq!(
+            fs::read_to_string(&session).expect("read back"),
+            before,
+            "a file with unsaved editor changes must be byte-identical afterwards - writing it \
+             would destroy edits the editor still believes it owns"
+        );
+        assert!(fs::read_to_string(&store)
+            .expect("read back")
+            .contains("rotate"));
+    }
+
+    #[test]
+    fn replacing_one_file_leaves_every_other_matching_file_alone() {
+        let dir = fixture();
+        let root = dir.path();
+        let matcher = Matcher::compile("refresh_token", SearchOptions::default())
+            .expect("compiles")
+            .expect("a query");
+
+        let replaced =
+            replace_in_file(&root.join("src/api/users.rs"), &matcher, "rotate").expect("replaced");
+        assert_eq!(replaced.matches, 1);
+
+        assert!(fs::read_to_string(root.join("src/api/users.rs"))
+            .expect("read")
+            .contains("rotate"));
+        assert!(
+            fs::read_to_string(root.join("src/auth/store.rs"))
+                .expect("read")
+                .contains("refresh_token"),
+            "a per-file replace is per file"
+        );
+    }
+
+    #[test]
+    fn a_replace_that_re_reads_a_file_no_longer_matching_reports_zero_rather_than_writing() {
+        let dir = fixture();
+        let path = dir.path().join("src/api/users.rs");
+        let matcher = Matcher::compile("refresh_token", SearchOptions::default())
+            .expect("compiles")
+            .expect("a query");
+        // An agent rewrote the file between the search and the replace - the real race this
+        // re-read exists for.
+        fs::write(&path, "let t = auth.rotate(&sid)?;\n").expect("rewrite");
+        let replaced = replace_in_file(&path, &matcher, "x").expect("no error");
+        assert_eq!(replaced.matches, 0);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "let t = auth.rotate(&sid)?;\n",
+            "nothing matched, so nothing may be written"
+        );
+    }
+
+    #[test]
+    fn overlapping_candidates_are_replaced_left_to_right_without_double_counting() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "aaaa\n").expect("write");
+        let matcher = Matcher::compile("aa", SearchOptions::default())
+            .expect("compiles")
+            .expect("a query");
+        let replaced = replace_in_file(&path, &matcher, "b").expect("replaced");
+        assert_eq!(
+            replaced.matches, 2,
+            "`aaaa` holds two non-overlapping `aa`, not three overlapping ones"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read back"), "bb\n");
+    }
+
+    #[test]
+    fn the_result_cap_stops_the_search_and_says_so_rather_than_returning_a_silent_prefix() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut content = String::new();
+        for _ in 0..(MAX_MATCHES + 50) {
+            content.push_str("hit\n");
+        }
+        fs::write(dir.path().join("big.txt"), content).expect("write");
+        let outcome = run(dir.path(), "hit", SearchOptions::default(), "", "");
+        assert!(outcome.truncated);
+        assert!(outcome.total_matches >= MAX_MATCHES);
+        assert!(
+            outcome.total_matches <= MAX_MATCHES + 1,
+            "the cap must stop the scan, not merely be observed after it: {}",
+            outcome.total_matches
+        );
+    }
+
+    #[test]
+    fn a_symlink_is_never_followed_so_a_loop_cannot_make_the_walk_unbounded() {
+        let dir = fixture();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("loop"))
+                .expect("a real symlink back to the root");
+            let outcome = run(
+                dir.path(),
+                "refresh_token",
+                SearchOptions::default(),
+                "",
+                "",
+            );
+            assert!(
+                !relatives(&outcome)
+                    .iter()
+                    .any(|path| path.starts_with("loop/")),
+                "following this link would recurse forever"
+            );
+            assert!(!outcome.truncated);
+        }
+    }
+}

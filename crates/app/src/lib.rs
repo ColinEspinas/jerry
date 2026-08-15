@@ -42,6 +42,9 @@ pub mod root;
 // *capture* of what a run was) or inside `rail` (which owns the live tree): this is a surface
 // with its own model, its own persistence and its own tab kind.
 pub mod run_history;
+// GitHub issue #162 / `REVISION-2026-08-14.md` §5: the right panel's Search tab - the matcher,
+// the bounded worktree walk, the two-level result tree and the real in-place replace behind it.
+pub mod search;
 pub mod settings;
 pub mod sidebar;
 pub mod sound;
