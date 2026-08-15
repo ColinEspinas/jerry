@@ -4830,6 +4830,36 @@ mod editing_tests {
         );
     }
 
+    /// The `!file-editor` half of the Changes footer's `space stage` binding, live rather than
+    /// asserted off the predicate string: `space` is bound to `ToggleChangeStaged` under
+    /// `"diff && !file-editor"`, and `"diff"`'s File arm adds `"file-editor"` *onto the same node*
+    /// rather than replacing it (see `crate::code_surface::render`), so a bare `Some("diff")`
+    /// would have swallowed every space typed into a real file. This types one through the real
+    /// dispatch and checks it landed in the buffer.
+    #[gpui::test]
+    fn a_real_space_typed_into_the_file_view_is_text_not_the_stage_binding(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file_path = write_file(repo.path(), "sample.txt", "ab\n");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        open_file_for_editing(&app, cx, file_path.clone());
+        bind_real_keys(cx);
+        let relative = PathBuf::from("sample.txt");
+
+        cx.simulate_keystrokes("x space y");
+        assert_eq!(
+            buffer_content(&app, cx, &relative),
+            "x yab\n",
+            "a real `space` keystroke in the File view must insert a space, not reach \
+             `ToggleChangeStaged`"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.staged_files.is_empty()),
+            "and it must not have staged anything on the way through"
+        );
+    }
+
     /// `ctrl-y` as a real, alternative redo key - GitHub issue #17's checklist asks for it
     /// explicitly, and it is a literal `Ctrl` on every OS (see `crate::default_key_bindings`).
     #[gpui::test]
