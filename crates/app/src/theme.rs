@@ -3035,8 +3035,19 @@ pub mod graph {
     /// jagged when coming to an elbow ... on some screens it is fine and on other it breaks").
     /// At 2 logical px every snapped stroke is at least 2 device pixels at every scale >= 1.0,
     /// so the worst-case one-device-pixel disagreement still leaves the strokes overlapping and
-    /// the line reads continuous - pinned by `crate::graph_view::render`'s
-    /// `elbow_fractional_scale_tests`, which emulate GPUI's own snapping arithmetic.
+    /// the line reads continuous.
+    ///
+    /// Round 2 of the same issue: overlap alone still allowed a one-device-pixel *step* at each
+    /// junction (a curve's waist stroke on rows `[n, n+3)` against a `[n, n+2)` bridge -
+    /// connected, but visibly jagged at 1.25x on a real fractional-scale run). The lane canvas
+    /// therefore now authors its whole geometry pre-snapped to the device-pixel grid
+    /// (`crate::graph_view::render`'s `SnapGrid` - see its docs for the full pipeline argument),
+    /// which makes every junction's two painted intervals *identical*, not merely overlapping -
+    /// pinned by `elbow_fractional_scale_tests`' exact-equality sweeps, which emulate GPUI's own
+    /// snapping arithmetic over a fine scale grid plus a seeded random sample. The 2px width
+    /// stays: it is the graph's established visual weight, and it keeps the stroke robust even
+    /// under coordinate sources this crate does not control (e.g. a fractionally-scrolled
+    /// ancestor).
     pub const LINE_WIDTH: Pixels = px(2.0);
     /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
     /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
