@@ -76,19 +76,19 @@ pub enum Error {
     #[error("failed to compute merge-base: {0}")]
     MergeBase(#[source] Box<gix::repository::merge_base::Error>),
 
-    /// [`crate::graph::build_graph`] failed to configure the commit walk (e.g. a bad `git`
-    /// commit-graph cache).
+    /// [`crate::graph::build_graph`] failed to configure the topological commit walk (e.g. an
+    /// unreadable tip object while seeding its initial queues).
     #[error("failed to start the commit graph walk: {0}")]
-    RevWalk(#[source] Box<gix::revision::walk::Error>),
+    RevWalk(#[source] Box<gix::traverse::commit::topo::Error>),
 
     /// [`crate::graph::build_graph`] failed while stepping the commit walk (a corrupt or
     /// unreadable object encountered mid-traversal).
     #[error("failed while walking the commit graph: {0}")]
-    RevWalkIter(#[source] Box<gix::revision::walk::iter::Error>),
+    RevWalkIter(#[source] Box<gix::traverse::commit::topo::Error>),
 
     /// [`crate::graph::build_graph`] could not read a commit object the walk yielded an id for.
     #[error("failed to read a commit object: {0}")]
-    RevWalkObject(#[source] Box<gix::object::find::existing::Error>),
+    RevWalkObject(#[source] Box<gix::object::find::existing::with_conversion::Error>),
 
     /// [`crate::graph::build_graph`] could not decode a commit's message or author signature.
     #[error("failed to decode a commit: {0}")]
