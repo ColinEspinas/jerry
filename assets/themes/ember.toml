@@ -249,6 +249,40 @@ send_hover_bg    = "#132830"  # Its hover fill.
 send_fg          = "#6599ae"  # Its label.
 send_cap_fg      = "#488199"  # Its ⌘⏎ keycaps' glyphs.
 
+# Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227,
+# design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md §4/§5, transcribed from that
+# revision's own tables and from revision 5/tokens.rs's history module).
+[history]
+out_done_fg        = "#689057"  # done - its last turn ended cleanly and Jerry watched it end.
+out_done_bg        = "#172116"
+out_interrupted_fg = "#a66730"  # interrupted
+out_interrupted_bg = "#291d10"
+out_failed_fg      = "#984d60"  # failed - its last real signal was a failure.
+out_failed_bg      = "#26151c"
+out_abandoned_fg   = "#646c70"  # abandoned - nobody ever saw it end.
+out_abandoned_bg   = "#1a1f20"
+drift_tip          = "#56863a"  # Drift dot, 0 commits since - at the tip.
+drift_near         = "#518fa8"  # Drift dot, 1-2 commits since.
+drift_far          = "#a66730"  # Drift dot, 3+ commits since.
+drift_text         = "#454d51"
+drift_far_text     = "#8a5c21"
+scope_on_bg        = "#181f21"
+scope_on_border    = "#202a2e"
+scope_on_fg        = "#8a9194"
+scope_off_fg       = "#454d51"
+scope_hover_bg     = "#181c1e"
+repo_label         = "#6e777b"
+group_label        = "#788186"
+row_title          = "#8a9194"  # A run row's title when the row is not the open one.
+transcript_prompt  = "#518fa8"
+transcript_body    = "#777f84"
+transcript_detail  = "#4e565b"
+transcript_lead    = "#929a9d"
+resume_bg          = "#1d2f19"  # The run-transcript footer's Resume here button
+resume_bg_hover    = "#253f20"
+resume_border      = "#345129"
+resume_fg          = "#7b9f6f"
+
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 # The code surface
