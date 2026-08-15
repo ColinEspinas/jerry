@@ -2120,7 +2120,7 @@ impl AdeApp {
                 lane_count,
                 scale_factor,
             ))
-            .child(render_graph_ref_chips(row))
+            .child(render_graph_ref_chips(row, cx))
             .child(
                 div()
                     .flex_1()
@@ -4158,7 +4158,22 @@ fn render_graph_lane_canvas(
 
 /// Ref chips for one row (design spec §2): local branches on their lane-colour dim pair, `HEAD`,
 /// outlined remotes, and tags.
-fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
+///
+/// GitHub issue #277: a local-branch chip is a right-click target in its own right, distinct
+/// from the row it sits on. Right-clicking directly on one opens the *branch*-scoped menu
+/// ([`AdeApp::render_graph_branch_menu`], via [`AdeApp::open_graph_branch_menu_at`]) with its
+/// real "Checkout Branch" action (`AdeApp::request_graph_branch_checkout` -
+/// `git switch -- <branch>`), rather than falling through to the row's own commit-scoped `⋯`
+/// menu (`AdeApp::request_graph_checkout`, a detached-HEAD checkout of the row's SHA). This
+/// mirrors `render_graph_branch_row`'s own right-click handler in the Branches panel byte for
+/// byte - same target function, same `cx.stop_propagation()` so the click never also reaches
+/// the row's handler underneath - the chip is just a second, row-embedded entry point onto the
+/// exact same branch menu. Scoped to `LocalBranch` only, same as the Branches panel itself
+/// (`Self::render_graph_branches_panel` filters on `RefKind::LocalBranch`): a remote branch or a
+/// tag has no "Checkout Branch" operation of its own - checking either out is inherently a
+/// detached-HEAD move, so those chips are left non-interactive and a right-click on them falls
+/// through to the row's own (correct, commit-scoped) menu, same as clicking bare row space.
+fn render_graph_ref_chips(row: &GraphRow, cx: &mut Context<AdeApp>) -> impl IntoElement {
     let mut chips = div()
         .flex_none()
         .flex()
@@ -4167,17 +4182,42 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
         .px(px(6.0));
     for chip in &row.commit.refs {
         let element = match chip.kind {
-            RefKind::LocalBranch => div()
-                .px(px(6.0))
-                .h(px(15.0))
-                .flex()
-                .items_center()
-                .rounded(theme::radius::MARK)
-                .bg(local_branch_dim_bg(lane_for_ref(row, chip)))
-                .font(font(theme::font::MONO))
-                .text_size(px(9.0))
-                .text_color(lane_color(lane_for_ref(row, chip)))
-                .child(chip.name.clone()),
+            RefKind::LocalBranch => {
+                let name = chip.name.clone();
+                div()
+                    .id(format!("graph-ref-chip-{name}"))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("graph-ref-chip-{name}")
+                    })
+                    .px(px(6.0))
+                    .h(px(15.0))
+                    .flex()
+                    .items_center()
+                    .rounded(theme::radius::MARK)
+                    .bg(local_branch_dim_bg(lane_for_ref(row, chip)))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.0))
+                    .text_color(lane_color(lane_for_ref(row, chip)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener({
+                            let name = name.clone();
+                            move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_graph_branch_menu_at(
+                                    name.clone(),
+                                    event.position.x,
+                                    event.position.y,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .child(chip.name.clone())
+                    .into_any_element()
+            }
             RefKind::RemoteBranch => div()
                 .px(px(6.0))
                 .h(px(15.0))
@@ -4189,7 +4229,8 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
                 .font(font(theme::font::MONO))
                 .text_size(px(9.0))
                 .text_color(theme::text::DIM)
-                .child(chip.name.clone()),
+                .child(chip.name.clone())
+                .into_any_element(),
             RefKind::Tag => div()
                 .px(px(6.0))
                 .h(px(15.0))
@@ -4200,7 +4241,8 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
                 .font(font(theme::font::MONO))
                 .text_size(px(9.0))
                 .text_color(theme::graph::TAG_CHIP_FG)
-                .child(chip.name.clone()),
+                .child(chip.name.clone())
+                .into_any_element(),
         };
         chips = chips.child(element);
         if chip.is_head {
