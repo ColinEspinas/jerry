@@ -48,19 +48,24 @@ Never guess a GPUI, `alacritty_terminal`, or `gix` API signature. Before writing
 If you genuinely cannot verify a signature this way, leave a `todo!("unverified: ...")` describing
 exactly what's unverified rather than shipping a guess.
 
-## `design_handoff_jerry_ade/`
+## Design documentation
 
-This directory is a **design reference**, not application code: a high-fidelity HTML mockup
-(`Jerry.dc.html`) plus a `tokens.rs` file with the exact colors/spacing/type this UI ("Jerry") was
-built from. If you're working on UI:
+What each UI surface is for, how it's put together, and the invariants a change must not break
+live in [`docs/design/`](docs/design/README.md) — one page per surface, plus
+[`docs/design/decisions.md`](docs/design/decisions.md), a numbered log in the same shape as the
+architecture one below. If you're working on UI, read
+[`docs/design/principles.md`](docs/design/principles.md) and
+[`docs/design/vocabulary.md`](docs/design/vocabulary.md) first, then the page for the surface
+you're changing.
 
-- Read `design_handoff_jerry_ade/README.md` for the layout spec (exact zone heights, colors,
-  states) before changing `crates/app/src/theme.rs` or any view module — the HTML mockup is the
-  authoritative source for exact values when in doubt.
-- Do not port markup out of `Jerry.dc.html` directly, and do not treat it as something to keep in
-  sync going forward — it's a one-time handoff artifact, not a living spec.
-- `design_handoff_jerry_ade/revision/` holds a later revision of the same handoff (see its own
-  `CHANGELOG.md`) — prefer it over the top-level files where the two disagree.
+These pages deliberately never reprint a value. `crates/app/src/theme.rs` is the source of truth
+for every colour and dimension — each token carries its own doc comment, and the bundled themes in
+`assets/themes/` are generated from it — so a page names the token rather than a hex, and cannot
+drift from it.
+
+**A UI change updates the relevant page in the same PR.** If it makes a call a future contributor
+would otherwise re-litigate, add a numbered entry to `docs/design/decisions.md` rather than
+explaining it in a code comment.
 
 ## Architecture decisions
 

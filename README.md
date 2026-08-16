@@ -51,11 +51,10 @@ crates/
   pty-core/   PTY process spawning, I/O streaming, resize, process-tree teardown
   lsp-core/   LSP client (spawns and speaks LSP to rust-analyzer and other servers)
   app/        the GPUI application itself (binary crate)
-assets/       bundled fonts (IBM Plex Sans/Mono, OFL) used by the app
-design_handoff_jerry_ade/
-              the design handoff this UI ("Jerry") was built from — reference only
+assets/       bundled fonts (IBM Plex Sans/Mono, OFL) and Phosphor icons used by the app
 docs/
   architecture/  target architecture, and the reasoning behind each rule
+  design/        what each UI surface is for, and the rules a change must not break
   themes.md, theme-palette-design.md
 ```
 

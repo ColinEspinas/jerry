@@ -27,7 +27,7 @@ process that applies them.
    needs a sweep) — or ad hoc, for something too small to warrant one.
 
 2. **Scope it — `plan`.** Reads the issue and its comments, reads the actual code it touches,
-   checks `design_handoff_jerry_ade/revision/` if it's UI-shaped, and posts the approach back to
+   checks [`docs/design/`](design/README.md) if it's UI-shaped, and posts the approach back to
    the issue as a comment. Skip this only for genuinely trivial changes; most drift in this project
    comes from implementing against an unscoped one-line bug report.
 
@@ -45,7 +45,7 @@ process that applies them.
    imports. Run it before calling any step done, not only at review time.
 
 6. **See it, if it's visible — `verify`.** Launches the app, screenshots it, checks the result
-   against `design_handoff_jerry_ade/revision/` or the issue's acceptance criteria. The only way
+   against [`docs/design/`](design/README.md) or the issue's acceptance criteria. The only way
    UI-visible work gets checked against something real instead of "looks right."
 
 7. **Finish — `ship`.** Runs `/check` (the gate: conventions, fmt, clippy — not tests right now,
