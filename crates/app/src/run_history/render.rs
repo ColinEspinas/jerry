@@ -316,7 +316,13 @@ impl AdeApp {
         let outcome = entry.outcome();
         let key = run.key.clone();
         let worktree = run.worktree.clone();
-        let is_open = self.run_tab_by_worktree.get(&worktree) == Some(&key);
+        // `run_tab_active` too, not just the map: `run_tab_by_worktree` remembers which run a
+        // worktree's tab would *reopen to* (so `render_run_tab` can still find it - see
+        // `Self::leave_run_tab`, which clears `run_tab_active` but deliberately leaves this entry
+        // alone), not whether that tab is the centre pane's current occupant. Reading the map
+        // alone left this row highlighted after switching away to an agent (or the review/graph
+        // tab) - a live user report ("history rows weren't unselected when switching away").
+        let is_open = self.run_tab_active && self.run_tab_by_worktree.get(&worktree) == Some(&key);
 
         let element_id = gpui::SharedString::from(format!("history-run-{key}"));
         let body_id = gpui::SharedString::from(format!("history-run-body-{key}"));
@@ -639,6 +645,106 @@ mod history_surface_tests {
                  `{selector}` is missing"
             );
         }
+    }
+
+    /// Live user report: "agents and agents history rows were not unselected when switching
+    /// between them when needed." An agent row and a history run row both derived their own
+    /// "am I the selected one" from a piece of state nothing ever cleared the *other* row's own
+    /// state for, so switching from one to the other could leave both reading as selected at
+    /// once - two rail rows (and two tab-strip tabs) both drawn as active.
+    ///
+    /// Asserted the same way `nothing_selected_means_nothing_shown_anywhere` (`crate::rail::
+    /// render`) already asserts single-selection consistency: by reading the exact fields the
+    /// render code itself branches on - `AdeApp::active_agent_pane_id` (what
+    /// `crate::rail::render::AdeApp::render_agent_row` and `Self::render_agent_tab` both call for
+    /// their own `is_selected`/`is_active`) and the `run_tab_active` + `run_tab_by_worktree`
+    /// pair (`crate::run_history::render::AdeApp::render_history_run_row`'s own `is_open`) -
+    /// rather than trying to read painted colour back out of a window, which this codebase's own
+    /// `gpui::TestAppContext` has no way to do (only `debug_bounds`, a geometry lookup).
+    #[gpui::test]
+    fn switching_between_an_agent_and_a_history_run_leaves_exactly_one_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // A real second agent (the startup shell is `Agents`' first entry) so this exercises a
+        // genuine "agent row" rather than the guaranteed startup shell.
+        app.update_in(cx, |app, window, cx| {
+            app.new_agent(ProcessKind::Agent(AgentKind::Claude), window, cx)
+        });
+        cx.run_until_parked();
+        let agent_id = app.read_with(cx, |app, _| {
+            app.agents.iter().last().expect("a spawned agent").id
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active_agent_pane_id()),
+            Some(agent_id),
+            "premise: the freshly spawned agent is the one genuinely selected right now"
+        );
+
+        let key = record_finished_run(&app, cx, repo.path(), 1_700_000_000, "an earlier run");
+
+        // The real click path: open the History sidebar, then open the run's own transcript tab
+        // - exactly what `render_history_run_row`'s `on_click` does.
+        app.update_in(cx, |app, window, cx| {
+            app.open_history_view(cx);
+            app.open_run_tab(repo.path().to_path_buf(), key.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(app.run_tab_active, "the run tab must now be the active one");
+            let history_row_selected =
+                app.run_tab_active && app.run_tab_by_worktree.get(repo.path()) == Some(&key);
+            assert!(
+                history_row_selected,
+                "and the history row for the run just opened must read as selected"
+            );
+            assert_eq!(
+                app.active_agent_pane_id(),
+                None,
+                "the agent row/tab must no longer read as selected - the centre pane is showing \
+                 the run transcript, not that agent's pane. Before the fix this was still \
+                 `Some(agent_id)`, because both the rail row and the tab strip read \
+                 `Agents::active_id` straight, which `open_run_tab` never touches"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                Some(agent_id),
+                "the *underlying* remembered agent must be untouched, though - it's what \
+                 `select_agent` returns to, not something `open_run_tab` should ever clear"
+            );
+        });
+
+        // Switch back to the agent - the real click path (`render_agent_row`'s/`render_agent_tab`'s
+        // own `on_click`, both of which call `select_agent`).
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_pane_id(),
+                Some(agent_id),
+                "the agent row/tab must read as selected again"
+            );
+            assert!(
+                !app.run_tab_active,
+                "and the run tab must no longer be the centre pane's active occupant"
+            );
+            let history_row_selected =
+                app.run_tab_active && app.run_tab_by_worktree.get(repo.path()) == Some(&key);
+            assert!(
+                !history_row_selected,
+                "so the history row must read as unselected too - even though \
+                 `run_tab_by_worktree` still remembers this run for this worktree (that's what \
+                 lets the run tab in the strip still resolve to it if re-activated), the row's own \
+                 selection reads `run_tab_active` first and that is genuinely `false` now"
+            );
+        });
     }
 
     /// §3: "One run tab per worktree; opening another replaces it." The replacement is a

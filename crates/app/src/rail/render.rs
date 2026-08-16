@@ -1874,7 +1874,11 @@ impl AdeApp {
         trailing_pb: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_selected = self.agents.active_id() == Some(agent.id);
+        // See `crate::work_surface::render::AdeApp::active_agent_pane_id`'s own docs: reading
+        // `Agents::active_id` straight here would leave this row drawn as selected even while
+        // the centre pane is genuinely showing the review/run/graph tab instead - the live user
+        // report ("agent rows and history rows weren't unselected when switching between them").
+        let is_selected = self.active_agent_pane_id() == Some(agent.id);
         let status = agent.status;
         let chip_icon = self.render_agent_chip_icon(agent.kind, px(15.0), self.ui_text_size(9.0));
         let state_color: gpui::Rgba = match status {

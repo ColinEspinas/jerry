@@ -1819,7 +1819,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let id = agent.id;
-        let is_active = self.agents.active_id() == Some(id);
+        let is_active = self.active_agent_pane_id() == Some(id);
         let chip_kind = work_surface::tab_chip_kind(agent.kind);
         let is_mono = matches!(chip_kind, work_surface::TabChipKind::Cli);
         let colors = work_surface::tab_colors(is_active);
@@ -2681,6 +2681,34 @@ impl AdeApp {
             None => surface.child(self.render_no_agents_empty_state(cx)),
         }
         .into_any_element()
+    }
+
+    /// Whether `id` is genuinely the agent the centre pane is showing right now - the exact same
+    /// cascade [`Self::render_center_pane`] itself follows, mirrored here so that nothing which
+    /// draws a "this is the selected one" edge from [`Agents::active_id`] - the rail's own agent
+    /// row (`crate::rail::render::AdeApp::render_agent_row`) and this tab strip's own agent tab
+    /// ([`Self::render_agent_tab`]) - can disagree with what the centre pane is actually showing.
+    ///
+    /// [`Agents::active_id`]'s own docs are explicit that it is "read directly by the centre pane
+    /// with no repo-scoping of its own": every *other* centre-pane occupant - the review tab, the
+    /// run tab, the graph tab - is a separate `bool` layered on top precisely because `Agents`
+    /// itself has no way to know about them ([`Self::review_tab_active`]/[`Self::run_tab_active`]/
+    /// [`Self::graph_tab_active`]), so any caller that wants "is the agent pane really what's on
+    /// screen" has to apply the same layering [`Self::render_center_pane`] does, rather than
+    /// reading [`Agents::active_id`] straight.
+    ///
+    /// Before this existed, both call sites above did exactly that - read [`Agents::active_id`]
+    /// straight - so opening a history run (GitHub issue #227) left whichever agent had been
+    /// active still drawn as the selected rail row *and* the active tab, alongside the run's own
+    /// now-correctly-selected row: two rows/tabs reading as selected at once, a live user report.
+    /// The review and graph tabs share the identical shape and were silently carrying the same
+    /// bug; this closes it for all three at the one root, rather than teaching each caller a
+    /// fourth flag to check.
+    pub(crate) fn active_agent_pane_id(&self) -> Option<AgentId> {
+        if self.review_tab_active || self.run_tab_active || self.graph_tab_active {
+            return None;
+        }
+        self.agents.active_id()
     }
 
     /// The centre pane with no agent open in this worktree at all.
