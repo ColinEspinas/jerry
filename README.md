@@ -1,4 +1,6 @@
-<h1 align="center">Jerry</h1>
+<p align="center">
+  <img width="960" alt="Jerry" src="https://github.com/user-attachments/assets/1e972955-9150-4c30-b379-dee50074abc8" />
+</p>
 
 <p align="center">
   <a href="https://github.com/ColinEspinas/jerry/releases/latest"><img src="https://img.shields.io/github/v/release/ColinEspinas/jerry?style=flat&label=release&color=5cb87f" alt="Latest release" /></a>
