@@ -182,8 +182,8 @@ one is on your `PATH`. Claude Code goes further than the rest: it reports its ow
 conversations can be resumed from where they stopped.
 
 **More are coming.** Any coding agent that runs in a terminal fits this model, and the goal is to
-work with all of them. Today that's Claude Code and Codex; [Cursor](../../issues/353) is next. If
-yours is missing, [open an issue](../../issues/new) — that's how it gets prioritised.
+work with all of them. If yours is missing, [open an issue](../../issues/new) — that's how it gets
+prioritised.
 
 ---
 
