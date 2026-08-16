@@ -257,7 +257,7 @@ you.
 
 ## Built with
 
-| | |
+| Library | What it handles |
 | --- | --- |
 | [**GPUI**](https://www.gpui.rs/) | The UI framework, from the Zed editor |
 | [**`alacritty_terminal`**](https://github.com/zed-industries/alacritty) + **`portable-pty`** | Terminal emulation and process handling |
