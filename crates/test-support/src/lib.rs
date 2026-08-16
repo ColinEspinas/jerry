@@ -24,7 +24,7 @@ pub use repo::{
     add_worktree, seed_bare_remote, seed_commits, seed_empty_repo, seed_empty_repo_at, seed_repo,
     seed_repo_at, seed_three_commits,
 };
-pub use wait::{stays_false, wait_until};
+pub use wait::{stays_false, wait_until, wait_until_every};
 
 /// Re-exported so a consumer can name the type [`seed_repo`] returns without repeating the
 /// `tempfile` dependency in its own manifest.

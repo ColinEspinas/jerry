@@ -8057,6 +8057,8 @@ mod changes_sections_tests {
         assert!(cx.debug_bounds("changes-section-runs-2-open").is_some());
     }
 
+    /// `#[cfg(unix)]`: the ended run below is a real `/bin/false` child, which needs a `/bin`.
+    #[cfg(unix)]
     #[gpui::test]
     fn a_live_run_and_an_ended_run_render_side_by_side(cx: &mut TestAppContext) {
         // The mock's sad path (`STAGE-A-SELFCHECK.md`): "a live run and a frozen run render side

@@ -56,8 +56,10 @@ body:
 
 - **No `thread::sleep` in test code.** Use `cx.run_until_parked()` or
   `test_support::wait_until(deadline, cond)`. There are **303** existing wall-clock waits, including
-  a `from_secs(9)` and ten `from_millis(500)`; they are the purge issue's problem, but the rule
-  starts here.
+  ten `from_millis(500)`; they are the purge issue's problem, but the rule starts here. The
+  `from_secs(9)` this list used to name is gone: `hooks::server`'s
+  `many_slow_clients_at_once_cannot_starve_a_real_hook` now waits on the drip-feeders' own
+  cut-off signal instead of guessing a duration.
 - Any test that spawns a process owns its teardown, via an RAII guard from `test-support`.
 - Any test that opens a file watcher shuts it down. A leaked watcher thread fails the tier's budget.
 - Every `#[ignore]` carries a reason string naming exactly what is missing.
@@ -102,19 +104,27 @@ Argv, never an interpolated shell string — the same rule production code follo
 | `seed_bare_remote() -> TempDir` | a bare repo on `main`, as a push/fetch target |
 | `add_worktree(repo, "feature", &path)` | a real second working copy on a new branch |
 
-Every seeded repo configures `user.email`, `user.name` and `commit.gpgsign=false`, so a fixture
-behaves the same on a machine with commit signing configured globally.
+Every seeded repo configures `user.email`, `user.name`, `commit.gpgsign=false` and
+`core.autocrlf=false`, so a fixture behaves the same on a machine with commit signing configured
+globally, and on Windows — where git otherwise ships `core.autocrlf=true` and would put `\r` into
+every content, diff and blame assertion.
 
 ### Waiting and teardown
 
 | Helper | Does |
 |---|---|
 | `wait_until(deadline: Duration, cond) -> bool` | polls until `cond` holds or the deadline passes; the caller writes the assertion message |
+| `wait_until_every(interval, deadline, cond) -> bool` | as `wait_until`, with an explicit poll interval — for a check that perturbs what it measures |
 | `stays_false(window: Duration, cond) -> bool` | the inverse — proves something stays quiet for a bounded window |
 | `ChildGuard` | kill-on-drop wrapper for a spawned `Child`; derefs to `Child`, plus `spawn`, `is_running`, `kill_and_wait`, `into_inner` |
 
 `wait_until` is the *only* sanctioned wall-clock wait in the workspace. Anything a GPUI executor
 drives waits with `cx.run_until_parked()` instead.
+
+Reach for `wait_until_every` only when the check itself is not free — a probe that takes a
+connection slot in the server it is asking about, a check that contends for the lock the subject
+needs. At `wait_until`'s 10 ms such a check measures its own polling rate. Prefer, where it exists,
+a signal the subject already emits: perturbing nothing beats polling coarsely.
 
 ### GPUI fixtures (`crates/app/src/test_support.rs`)
 

@@ -29,6 +29,10 @@ pub fn seed_empty_repo_at(dir: &Path) {
     // A machine with commit signing configured globally would otherwise block every fixture
     // commit on a passphrase prompt that never arrives in a test runner.
     git(dir, &["config", "commit.gpgsign", "false"]);
+    // Git for Windows ships `core.autocrlf=true`, which would materialize CRLF in every fixture
+    // checkout and put `\r` into content, diff-hunk and blame assertions the fixture wrote with
+    // `\n`. Pinned here so a fixture behaves identically on all three platforms (#440, finding 2).
+    git(dir, &["config", "core.autocrlf", "false"]);
 }
 
 /// A git repository on branch `main` with one commit (`file.txt`) and a clean working tree.
