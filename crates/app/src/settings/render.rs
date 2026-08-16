@@ -5339,7 +5339,7 @@ pub(in crate::settings) fn render_settings_placeholder_page() -> impl IntoElemen
 #[cfg(test)]
 mod settings_keymap_filter_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     #[gpui::test]
@@ -5347,7 +5347,7 @@ mod settings_keymap_filter_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         app.update_in(cx, |app, window, cx| {
@@ -5402,7 +5402,7 @@ mod settings_keymap_filter_tests {
 #[cfg(test)]
 mod search_exclude_settings_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     fn open_test_app_with_real_settings_path(
@@ -5431,7 +5431,7 @@ mod search_exclude_settings_tests {
     #[gpui::test]
     fn typing_a_pattern_and_pressing_enter_adds_it_and_clears_the_field(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         app.update_in(cx, |app, window, cx| {
@@ -5481,7 +5481,7 @@ mod search_exclude_settings_tests {
     #[gpui::test]
     fn enter_on_a_blank_or_duplicate_pattern_is_a_silent_no_op(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         app.update_in(cx, |app, window, cx| {
@@ -5588,7 +5588,7 @@ mod search_exclude_settings_tests {
 #[cfg(test)]
 mod terminal_font_size_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     #[gpui::test]
@@ -5596,7 +5596,7 @@ mod terminal_font_size_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let pane = app
@@ -5654,7 +5654,7 @@ mod terminal_font_size_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         // A second real agent, spawned at whatever the default font size already was.
@@ -5693,7 +5693,7 @@ mod terminal_font_size_tests {
 #[cfg(test)]
 mod settings_lsp_install_action_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     fn synthetic_row(binary: &'static str, ready: bool) -> settings::LspRow {
@@ -5710,7 +5710,7 @@ mod settings_lsp_install_action_tests {
     #[gpui::test]
     fn install_action_renders_only_for_a_genuinely_not_installed_row(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         app.update_in(cx, |app, window, cx| {
@@ -5748,8 +5748,8 @@ mod settings_lsp_install_action_tests {
 mod shell_setting_tests {
     use super::*;
     use crate::rail::status::Status;
-    use crate::root::focus::palette_focus_tests;
     use crate::terminal::pane::TerminalSpec;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     /// Same shape as the sibling test modules' own helper (`keybinding_rebind_tests`,
@@ -5822,7 +5822,7 @@ mod shell_setting_tests {
     #[gpui::test]
     fn an_unconfigured_shell_still_spawns_the_real_os_default(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let expected = PathBuf::from(TerminalSpec::default_shell_program_display())
@@ -6382,14 +6382,14 @@ mod shell_suggestion_dropdown_tests {
 /// actually persisted and applied" discipline.
 #[cfg(test)]
 mod caret_settings_tests {
-    use crate::root::focus::palette_focus_tests;
     use crate::settings::store::CaretStyle;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     #[gpui::test]
     fn set_caret_style_changes_the_real_persisted_setting(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         assert_eq!(
             app.read_with(cx, |app, _| app.settings.appearance.caret_style),
@@ -6425,7 +6425,7 @@ mod caret_settings_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         assert!(
             app.read_with(cx, |app, _| app.settings.appearance.caret_blink),
@@ -6472,7 +6472,7 @@ mod indent_guide_settings_tests {
     /// own `open_app_with_state_dir` (that one isn't `pub(crate)`, so this is a small, deliberate
     /// duplicate rather than a cross-module dependency on a test-only helper), which is what gives
     /// this test a real `settings.toml` to persist to and reload from, unlike
-    /// `crate::root::focus::palette_focus_tests::open_test_app`'s deliberately unpersisted `None`.
+    /// `crate::test_support::open_test_app`'s deliberately unpersisted `None`.
     ///
     /// Loads real settings from `settings_path` first (via `Settings::load_or_init_at`, the same
     /// real load `crate::root::mod`'s own startup path uses) rather than always constructing with
@@ -6552,7 +6552,7 @@ mod indent_guide_settings_tests {
 /// own measured-bounds technique rather than only reading the render code.
 #[cfg(test)]
 mod settings_keymap_filter_caret_tests {
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
     use std::time::Duration;
 
@@ -6561,7 +6561,7 @@ mod settings_keymap_filter_caret_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_settings(window, cx);
@@ -6631,7 +6631,7 @@ mod settings_keymap_filter_caret_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_settings(window, cx);
             app.settings_page = crate::settings::SettingsPage::General;
@@ -6689,7 +6689,7 @@ mod settings_keymap_filter_caret_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         // `on_focus`/`on_blur` (`AdeApp::wire_caret_blink`'s own mechanism) only fire while GPUI
         // considers the window itself "active" - a real, freshly opened test window starts out
         // not active at all.
@@ -6731,7 +6731,7 @@ mod settings_keymap_filter_caret_tests {
 mod keybinding_rebind_tests {
     use super::*;
     use crate::keymap_overrides::BindingIdentity;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     fn open_test_app_with_real_settings_path(
@@ -6889,7 +6889,7 @@ mod keybinding_rebind_tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let file_path = repo.path().join("main.rs");
         std::fs::write(&file_path, "fn main() {}\n").expect("write main.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });
@@ -6952,7 +6952,7 @@ mod keybinding_rebind_tests {
 #[cfg(test)]
 mod theme_swap_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     /// `crate::theme::CURRENT_THEME` is real, thread-local, mutable state - reset it after this
@@ -6974,7 +6974,7 @@ mod theme_swap_tests {
     ) {
         let _guard = ResetThemeIndexOnDrop;
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         assert!(
             theme::current_theme_palette().is_none(),
@@ -7023,7 +7023,7 @@ mod theme_swap_tests {
     fn follow_system_selects_paper_on_light_and_jerry_dark_on_dark(cx: &mut TestAppContext) {
         let _guard = ResetThemeIndexOnDrop;
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.apply_follow_system_appearance(gpui::WindowAppearance::Light, cx);
@@ -7060,7 +7060,7 @@ mod theme_swap_tests {
     ) {
         let _guard = ResetThemeIndexOnDrop;
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.set_theme_name("Slate".to_string(), cx);
@@ -7103,7 +7103,7 @@ mod theme_swap_tests {
     ) {
         let _guard = ResetThemeIndexOnDrop;
         let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         assert!(!app.read_with(cx, |app, _| app.settings.theme.follow_system));
 
         let appearance_before = app.read_with(cx, |_, cx| cx.window_appearance());

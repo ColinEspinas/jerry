@@ -1,7 +1,7 @@
 use super::*;
 use crate::lsp::completion_popup::{CompletionsEntry, CompletionsStatus};
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::test_support::open_test_app;
 
 /// [`AdeApp::lsp_clients`]' real key: a repository root paired with the real server binary
 /// running for it - see that field's own docs for why a bare `PathBuf` was widened to this
@@ -2488,12 +2488,12 @@ mod lsp_client_eviction_tests {
     fn switching_between_several_worktrees_never_lets_lsp_clients_grow_past_one(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let worktree_a = tempfile::tempdir().expect("tempdir a");
-        let worktree_b = tempfile::tempdir().expect("tempdir b");
-        let worktree_c = tempfile::tempdir().expect("tempdir c");
+        let repo = crate::lsp::fixtures::temp_repo();
+        let worktree_a = crate::lsp::fixtures::temp_repo();
+        let worktree_b = crate::lsp::fixtures::temp_repo();
+        let worktree_c = crate::lsp::fixtures::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2566,11 +2566,11 @@ mod lsp_client_eviction_tests {
     fn a_worktree_switch_evicts_every_language_client_for_the_old_root_not_just_one(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let worktree_old = tempfile::tempdir().expect("tempdir old");
-        let worktree_new = tempfile::tempdir().expect("tempdir new");
+        let repo = crate::lsp::fixtures::temp_repo();
+        let worktree_old = crate::lsp::fixtures::temp_repo();
+        let worktree_new = crate::lsp::fixtures::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2865,15 +2865,12 @@ process.stdin.on('data', (d) => {
                 serde_json::json!({ "uri": target, "message": message }),
             )
             .expect("the fake server should accept a real notification");
-        let deadline = Instant::now() + Duration::from_secs(10);
         let target = uri(target);
-        while !client.has_diagnostics_result_uri(&target) {
-            assert!(
-                Instant::now() < deadline,
-                "the real publishDiagnostics push never landed in the client's own sink"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || client
+                .has_diagnostics_result_uri(&target)),
+            "the real publishDiagnostics push never landed in the client's own sink"
+        );
     }
 
     /// Same real push as [`publish_and_wait`], at an explicit `character..character_end` UTF-16
@@ -2899,15 +2896,12 @@ process.stdin.on('data', (d) => {
                 }),
             )
             .expect("the fake server should accept a real notification");
-        let deadline = Instant::now() + Duration::from_secs(10);
         let target = uri(target);
-        while !client.has_diagnostics_result_uri(&target) {
-            assert!(
-                Instant::now() < deadline,
-                "the real publishDiagnostics push never landed in the client's own sink"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || client
+                .has_diagnostics_result_uri(&target)),
+            "the real publishDiagnostics push never landed in the client's own sink"
+        );
     }
 
     /// Same real push as [`publish_and_wait`], at a real `line` and a real `severity`, naming a
@@ -2938,15 +2932,12 @@ process.stdin.on('data', (d) => {
                 }),
             )
             .expect("the fake server should accept a real notification");
-        let deadline = Instant::now() + Duration::from_secs(10);
         let target = uri(target);
-        while !client.has_diagnostics_result_uri(&target) {
-            assert!(
-                Instant::now() < deadline,
-                "the real publishDiagnostics push never landed in the client's own sink"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || client
+                .has_diagnostics_result_uri(&target)),
+            "the real publishDiagnostics push never landed in the client's own sink"
+        );
     }
 
     /// Same real push as [`publish_and_wait`], but carrying the `source` and `code` fields a real
@@ -2972,33 +2963,28 @@ process.stdin.on('data', (d) => {
                 }),
             )
             .expect("the fake server should accept a real notification");
-        let deadline = Instant::now() + Duration::from_secs(10);
         let target = uri(target);
-        while !client.has_diagnostics_result_uri(&target) {
-            assert!(
-                Instant::now() < deadline,
-                "the real publishDiagnostics push never landed in the client's own sink"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || client
+                .has_diagnostics_result_uri(&target)),
+            "the real publishDiagnostics push never landed in the client's own sink"
+        );
     }
 
     fn wait_for_relay_observation(client: &lsp_core::LspClient) -> String {
         let observed = uri("file:///relay-observed");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(diagnostics) = client.diagnostics_for_uri(&observed) {
-                if let Some(first) = diagnostics.first() {
-                    return first.message.clone();
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the primary never observed any relay response at all - a hanging primary is \
-                 exactly the failure this path must never produce"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut message = None;
+        assert!(
+            test_support::wait_until(Duration::from_secs(30), || {
+                message = client
+                    .diagnostics_for_uri(&observed)
+                    .and_then(|diagnostics| diagnostics.first().map(|first| first.message.clone()));
+                message.is_some()
+            }),
+            "the primary never observed any relay response at all - a hanging primary is \
+             exactly the failure this path must never produce"
+        );
+        message.expect("the wait above only returns true once a real message landed")
     }
 
     #[test]
@@ -3089,7 +3075,7 @@ process.stdin.on('data', (d) => {
     /// errors. Also pins the `None`-vs-`Some(vec![])` distinction across the merge.
     #[test]
     fn a_two_server_connection_merges_both_halves_real_diagnostics() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "primary", "normal");
         let companion = spawn_fake_server(root.path(), "companion", "normal");
         let target = "file:///merged.vue";
@@ -3135,7 +3121,7 @@ process.stdin.on('data', (d) => {
     /// including passing `None` through as `None`.
     #[test]
     fn a_single_server_connection_passes_diagnostics_straight_through() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let client = spawn_fake_server(root.path(), "solo", "normal");
         let connection = LspConnection::Single(client.clone());
         let target = "file:///solo.rs";
@@ -3153,7 +3139,7 @@ process.stdin.on('data', (d) => {
     /// for a hybrid-mode primary, not a failure), so the companion's real answer is what surfaces.
     #[test]
     fn hover_falls_back_to_the_companion_when_the_primary_has_nothing() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "primary", "normal");
         let companion = spawn_fake_server(root.path(), "companion", "hover");
         let params = lsp_core::lsp_types::HoverParams {
@@ -3233,7 +3219,7 @@ process.stdin.on('data', (d) => {
     /// such an identifier did nothing at all: the facade hardcoded its fallback to hover only.
     #[test]
     fn goto_definition_falls_back_to_the_companion_on_an_empty_array_answer() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "primary", "normal");
 
         let single = LspConnection::Single(primary.clone());
@@ -3281,7 +3267,7 @@ process.stdin.on('data', (d) => {
     /// `.vue` script block were always empty with no fallback ever attempted.
     #[test]
     fn completion_falls_back_to_the_companion_on_an_empty_completion_list() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "primary", "normal");
 
         let single = LspConnection::Single(primary.clone());
@@ -3343,15 +3329,14 @@ process.stdin.on('data', (d) => {
     fn a_debounced_re_sync_never_drops_an_already_ready_popup_back_to_loading(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let absolute = root.join("src").join("main.rs");
         std::fs::write(&absolute, "fn a() {\n    x\n}\n").expect("write main.rs");
         let relative = PathBuf::from("src/main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3366,19 +3351,14 @@ process.stdin.on('data', (d) => {
         // lsp_uri_cache` has a real entry for this path - populated by `Self::dispatch_did_open`'s
         // own background task, which `Self::render_center_pane` is what actually drives here
         // (mirroring `wait_for_real_diagnostics`'s own reasoning).
-        let uri_cache_deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            app.update(cx, |app, cx| app.render_center_pane(cx));
-            cx.run_until_parked();
-            if app.read_with(cx, |app, _| app.lsp_uri_cache.contains_key(&absolute)) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < uri_cache_deadline,
-                "the fake client's uri never reached AdeApp::lsp_uri_cache"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            crate::lsp::fixtures::wait_until_parked(cx, Duration::from_secs(10), |cx| {
+                app.update(cx, |app, cx| app.render_center_pane(cx));
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| app.lsp_uri_cache.contains_key(&absolute))
+            }),
+            "the fake client's uri never reached AdeApp::lsp_uri_cache"
+        );
 
         // A pre-existing `Ready` popup for this exact path, seeded directly - standing in for
         // whatever real server response is already showing by the time a later keystroke's
@@ -3432,15 +3412,14 @@ process.stdin.on('data', (d) => {
     /// does: the decision under test is synchronous, before any request is ever dispatched.
     #[gpui::test]
     fn accepting_a_completion_does_not_immediately_reopen_the_popup(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let absolute = root.join("src").join("main.rs");
         std::fs::write(&absolute, "fn a() {\n    \n}\n").expect("write main.rs");
         let relative = PathBuf::from("src/main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3531,14 +3510,13 @@ process.stdin.on('data', (d) => {
     fn selecting_a_completion_item_resolves_its_real_detail_and_documentation(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         let absolute = root.join("main.rs");
         std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
         let relative = PathBuf::from("main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3616,14 +3594,13 @@ process.stdin.on('data', (d) => {
     fn a_real_resolved_detail_replaces_a_placeholder_the_server_sent_inline(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         let absolute = root.join("main.rs");
         std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
         let relative = PathBuf::from("main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3696,14 +3673,13 @@ process.stdin.on('data', (d) => {
     fn an_item_whose_resolve_was_cancelled_by_moving_on_is_resolved_again_on_return(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         let absolute = root.join("main.rs");
         std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
         let relative = PathBuf::from("main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3785,14 +3761,13 @@ process.stdin.on('data', (d) => {
     /// must not fire a second, redundant request for the same thing.
     #[gpui::test]
     fn an_item_with_a_resolve_already_in_flight_is_not_asked_twice(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         let absolute = root.join("main.rs");
         std::fs::write(&absolute, "fn a() {}\n").expect("write main.rs");
         let relative = PathBuf::from("main.rs");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -3868,14 +3843,13 @@ process.stdin.on('data', (d) => {
     /// request should never leave in the first place).
     #[gpui::test]
     fn a_server_without_resolve_support_is_never_asked_to_resolve(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         let absolute = root.join("main.vue");
         std::fs::write(&absolute, "<template></template>\n").expect("write main.vue");
         let relative = PathBuf::from("main.vue");
 
-        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) =
-            palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx): (Entity<AdeApp>, &mut VisualTestContext) = open_test_app(cx, root.clone());
         // `vue-language-server` is the fake client key `crate::language::lsp_binary_for_extension`
         // resolves for `.vue` - reused here purely to get a `Ready` client under the right key,
         // not because this test cares about the real Vue companion mechanism at all.
@@ -3924,7 +3898,7 @@ process.stdin.on('data', (d) => {
     /// bound is the actual proof, not the returned value.
     #[test]
     fn a_request_outside_the_fallback_list_never_consults_the_companion() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let spec = vue_companion_spec();
         assert!(
             !spec.fallback_methods.contains(&"textDocument/references"),
@@ -4033,7 +4007,7 @@ process.stdin.on('data', (d) => {
     /// plausible-looking "everything's fine" status.
     #[test]
     fn a_dead_companion_flips_liveness_and_is_named_in_the_real_status() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "vue-language-server", "normal");
         let companion =
             spawn_fake_server(root.path(), "typescript-language-server (vue)", "normal");
@@ -4050,15 +4024,12 @@ process.stdin.on('data', (d) => {
             .notify_raw("test/die", serde_json::Value::Null)
             .expect("the fake server should accept the notification that kills it");
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while connection.is_connection_alive() {
-            assert!(
-                Instant::now() < deadline,
-                "a WithCompanion connection must stop reporting itself alive once either half's \
-                 real process dies"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || !connection
+                .is_connection_alive()),
+            "a WithCompanion connection must stop reporting itself alive once either half's \
+             real process dies"
+        );
         let reason = connection
             .liveness_failure_reason()
             .expect("a dead half must produce a real reason");
@@ -4085,7 +4056,7 @@ process.stdin.on('data', (d) => {
     /// The same honesty rule in the other direction: a dead primary names the primary.
     #[test]
     fn a_dead_primary_is_named_rather_than_blamed_on_the_companion() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "vue-language-server", "normal");
         let connection = LspConnection::WithCompanion {
             primary: primary.clone(),
@@ -4095,28 +4066,26 @@ process.stdin.on('data', (d) => {
         primary
             .notify_raw("test/die", serde_json::Value::Null)
             .expect("notification accepted");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(reason) = connection.liveness_failure_reason() {
-                assert!(
-                    reason.contains("vue-language-server"),
-                    "the message must name the real primary, got: {reason}"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the dead primary was never noticed"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut reason = None;
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || {
+                reason = connection.liveness_failure_reason();
+                reason.is_some()
+            }),
+            "the dead primary was never noticed"
+        );
+        let reason = reason.expect("the wait above only returns true once a reason landed");
+        assert!(
+            reason.contains("vue-language-server"),
+            "the message must name the real primary, got: {reason}"
+        );
     }
 
     /// A companion that failed its own spawn must be surfaced honestly rather than silently
     /// leaving the user with half the analysis and a confident-looking status.
     #[test]
     fn a_companion_that_failed_to_spawn_is_surfaced_in_the_real_file_status() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "vue-language-server", "normal");
         let connection = LspConnection::Single(primary.clone());
         let status = lsp_file_status(
@@ -4137,7 +4106,7 @@ process.stdin.on('data', (d) => {
     /// alone is genuinely working in the meantime.
     #[test]
     fn a_still_spawning_companion_leaves_the_primarys_own_status_intact() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "vue-language-server", "normal");
         let connection = LspConnection::Single(primary.clone());
         let status = lsp_file_status(
@@ -4155,14 +4124,10 @@ process.stdin.on('data', (d) => {
 
     /// Waits for a genuinely spawned server's real process death to be observed by its client.
     fn wait_until_dead(client: &lsp_core::LspClient) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while client.is_connection_alive() {
-            assert!(
-                Instant::now() < deadline,
-                "the real process death should have been observed within 10s"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(Duration::from_secs(10), || !client.is_connection_alive()),
+            "the real process death should have been observed within 10s"
+        );
     }
 
     /// The real bug: nothing in this crate ever checked `is_connection_alive` on a *cadence*. It
@@ -4177,8 +4142,8 @@ process.stdin.on('data', (d) => {
     /// flip.
     #[gpui::test]
     fn a_dead_ready_client_is_reaped_into_a_real_named_failed_state(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::lsp::fixtures::temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         let key: LspClientKey = (repo.path().to_path_buf(), "rust-analyzer");
 
@@ -4245,9 +4210,9 @@ process.stdin.on('data', (d) => {
     fn restarting_clears_the_dead_client_and_all_of_its_document_bookkeeping(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let opened = root.join("src").join("main.rs");
         let relative = PathBuf::from("src/main.rs");
 
@@ -4322,14 +4287,14 @@ process.stdin.on('data', (d) => {
     async fn a_restart_drops_the_in_flight_tasks_that_would_repopulate_cleared_bookkeeping(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let absolute = root.join("src").join("main.rs");
         std::fs::write(&absolute, "fn main() {}\n").expect("write main.rs");
         let relative = PathBuf::from("src/main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         app.update_in(cx, |app, window, cx| {
             app.lsp_clients.insert(
@@ -4383,9 +4348,9 @@ process.stdin.on('data', (d) => {
     /// the real [`AdeApp::execute_palette_command`], not by asserting the enum variant exists.
     #[gpui::test]
     fn the_restart_palette_command_runs_the_real_restart(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
 
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
@@ -4430,9 +4395,9 @@ process.stdin.on('data', (d) => {
     /// `lsp_diagnostics_wiring_tests`.
     #[gpui::test]
     async fn a_restart_frees_the_key_so_a_fresh_spawn_is_really_attempted(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let key: LspClientKey = (root.clone(), "rust-analyzer");
 
         let first = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
@@ -4506,7 +4471,7 @@ process.stdin.on('data', (d) => {
     async fn restarting_one_server_leaves_every_other_live_client_untouched(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let rust_absolute = root.join("src").join("main.rs");
@@ -4516,7 +4481,7 @@ process.stdin.on('data', (d) => {
         let rust_relative = PathBuf::from("src/main.rs");
         let ts_relative = PathBuf::from("src/app.ts");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let rust_server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         let ts_server = spawn_fake_server(repo.path(), "typescript-language-server", "normal");
         app.update_in(cx, |app, window, cx| {
@@ -4629,7 +4594,7 @@ process.stdin.on('data', (d) => {
     async fn restarting_every_server_still_forgets_the_whole_roots_conversation(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let rust_absolute = root.join("src").join("main.rs");
@@ -4639,7 +4604,7 @@ process.stdin.on('data', (d) => {
         let rust_relative = PathBuf::from("src/main.rs");
         let ts_relative = PathBuf::from("src/app.ts");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let rust_server = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
         let ts_server = spawn_fake_server(repo.path(), "typescript-language-server", "normal");
         app.update_in(cx, |app, window, cx| {
@@ -4702,14 +4667,13 @@ process.stdin.on('data', (d) => {
     /// companion must forget the `.vue` bookkeeping (the companion really was sent that file) and
     /// must not take the primary's own client down with it.
     #[gpui::test]
-    // Real vue-language-server spawn, not installed in CI - GitHub issue #348.
-    #[ignore]
+    #[ignore = "external: vue-language-server; see docs/testing.md"]
     fn restarting_a_companion_forgets_its_own_documents_without_touching_its_primary(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let spec = vue_companion_spec();
         let vue_absolute = root.join("src").join("App.vue");
         let vue_relative = PathBuf::from("src/App.vue");
@@ -4775,9 +4739,9 @@ process.stdin.on('data', (d) => {
     /// the restart itself skips those keys, so offering one would be a row that does nothing.
     #[gpui::test]
     fn the_restartable_server_list_is_the_real_live_client_map(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let ready = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
 
         app.update(cx, |app, _cx| {
@@ -4831,8 +4795,8 @@ process.stdin.on('data', (d) => {
     fn a_real_relay_round_trip_delivers_the_companions_body_in_the_real_wire_shape(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::lsp::fixtures::temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let spec = vue_companion_spec();
         let primary = spawn_fake_server(repo.path(), "vue-language-server", "normal");
         let companion = spawn_fake_server(repo.path(), spec.client_key, "normal");
@@ -4875,8 +4839,8 @@ process.stdin.on('data', (d) => {
     fn a_companion_that_never_answers_still_gets_a_real_null_response_back_to_the_primary(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::lsp::fixtures::temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let spec = vue_companion_spec();
         let primary = spawn_fake_server(repo.path(), "vue-language-server", "normal");
         let companion = spawn_fake_server(repo.path(), spec.client_key, "silent");
@@ -4922,8 +4886,8 @@ process.stdin.on('data', (d) => {
     fn a_relay_arriving_before_the_companion_is_ready_still_answers_the_primary(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::lsp::fixtures::temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let spec = vue_companion_spec();
         let primary = spawn_fake_server(repo.path(), "vue-language-server", "normal");
 
@@ -4961,7 +4925,7 @@ process.stdin.on('data', (d) => {
     /// itself in both directions, against real handshakes rather than a version assumption.
     #[test]
     fn only_a_companion_that_really_advertises_pull_support_becomes_a_pull_target() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::lsp::fixtures::temp_repo();
         let primary = spawn_fake_server(root.path(), "primary", "pull");
 
         assert!(
@@ -5006,8 +4970,8 @@ process.stdin.on('data', (d) => {
     fn a_relay_with_a_real_id_but_a_malformed_command_still_answers_the_primary(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::lsp::fixtures::temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let spec = vue_companion_spec();
         let primary = spawn_fake_server(repo.path(), "vue-language-server", "normal");
         let companion = spawn_fake_server(repo.path(), spec.client_key, "normal");
@@ -5041,78 +5005,19 @@ process.stdin.on('data', (d) => {
             "the real id must come back with an honest null body rather than nothing at all"
         );
     }
-
-    /// Item 5 of the issue's scope: the facade must add no meaningful overhead to the already-
-    /// working single-server path. Measures a real, non-network method (the server's own
-    /// advertised `textDocumentSync` capability, read under a `Mutex`) called directly on the raw
-    /// client vs. through `LspConnection::Single`'s delegating method.
-    ///
-    /// No hard threshold is asserted on the *ratio* - timing in a sandbox under real parallel
-    /// process load is genuinely noisy, and a flaky performance gate is worse than none. What is
-    /// asserted is a deliberately generous, real bound - 1000ns - not "zero"/"unmeasurable": on a
-    /// loaded CI runner the delta is real wall-clock time and can land anywhere under that
-    /// ceiling, not nanoseconds as the ceiling's own headroom might suggest. Kept in the normal,
-    /// non-`#[ignore]` suite on purpose, matching this project's own established convention for
-    /// its other timing-sensitive tests (see `lsp_diagnostics_wiring_tests`'s module docs) - this
-    /// project has no separate slow/perf-test lane. The measured numbers are printed so a
-    /// regression is visible in the log even when the assertion passes.
-    #[test]
-    fn single_delegation_stays_under_a_generous_1000ns_ceiling() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let client = spawn_fake_server(root.path(), "bench", "normal");
-        let connection = LspConnection::Single(client.clone());
-        const ITERATIONS: u32 = 200_000;
-
-        // A real warm-up pass, so neither measurement pays first-touch costs the other doesn't.
-        for _ in 0..1_000 {
-            std::hint::black_box(client.supports_document_sync());
-            std::hint::black_box(connection.supports_document_sync());
-        }
-
-        let started = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(client.supports_document_sync());
-        }
-        let direct = started.elapsed();
-
-        let started = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(connection.supports_document_sync());
-        }
-        let through_facade = started.elapsed();
-
-        let direct_ns = direct.as_nanos() as f64 / f64::from(ITERATIONS);
-        let facade_ns = through_facade.as_nanos() as f64 / f64::from(ITERATIONS);
-        println!(
-            "supports_document_sync: direct {direct_ns:.1}ns/call, via LspConnection::Single \
-             {facade_ns:.1}ns/call, delta {:.1}ns",
-            facade_ns - direct_ns
-        );
-        assert!(
-            facade_ns - direct_ns < 1_000.0,
-            "the facade's enum match + delegate should stay well under this generous 1000ns \
-             ceiling; a real microsecond-or-more of added cost per call would mean it isn't the \
-             cheap branch it claims to be (direct {direct_ns:.1}ns, facade {facade_ns:.1}ns)"
-        );
-    }
 }
 
-/// Slow, end-to-end coverage proving the real async path from a real `rust-analyzer`
-/// `publishDiagnostics` response through to [`AdeApp::render_file_view`]'s rendered output,
-/// through this crate's own real code path (`AdeApp::open_file_view` -> `ensure_lsp_client` ->
-/// `dispatch_did_open` -> `render_file_view`) rather than by calling `lsp_core` directly and
-/// bypassing `AdeApp`.
+/// End-to-end coverage of the real async path from a real language server's own
+/// `publishDiagnostics` through to [`AdeApp::render_file_view`]'s rendered output, driven through
+/// this crate's real code path (`AdeApp::open_file_view` -> `ensure_lsp_client` ->
+/// `dispatch_did_open` -> `render_file_view`) rather than by calling `lsp_core` directly.
 ///
-/// This genuinely spawns a real `rust-analyzer` against a tiny, dependency-free scratch cargo
-/// project (kept dependency-free so `cargo metadata`/rust-analyzer's own workspace discovery
-/// never needs network access) with a genuine `let x: i32 = "not a number";` type mismatch, and
-/// polls real wall-clock time (up to 480s - see this module's own real-deadline constants for
-/// the exact per-test budgets, widened past `lsp_core::client`'s own e2e test's 180s baseline;
-/// see the docs on the deadlines themselves for why) for the diagnostic to actually arrive - no
-/// sleep stands in for that wait, and nothing is fabricated if the wait times out (the assertion
-/// just fails). This is a genuinely slow test (real process spawn plus real sysroot indexing)
-/// kept in the normal, non-`#[ignore]` suite on purpose - this project has no separate "slow
-/// test" lane.
+/// Every test here that spawns a real server is `external` tier (`docs/testing.md`): it needs a
+/// binary this repo does not vendor, and it polls real wall-clock time for minutes while that
+/// server indexes a sysroot. The one exception is
+/// [`Self::a_transient_pull_failure_is_retried_not_treated_as_a_permanent_stall`], which drives
+/// the same wiring from [`super::lsp_connection_facade_tests::spawn_fake_server`]'s deterministic
+/// stand-in instead and so stays on the PR gate.
 #[cfg(test)]
 mod lsp_diagnostics_wiring_tests {
     use super::*;
@@ -5152,8 +5057,8 @@ mod lsp_diagnostics_wiring_tests {
     /// Same minimal, dependency-free scratch cargo project shape as
     /// `lsp_core::client::tests::write_scratch_project` - kept as its own small copy here
     /// rather than exporting that one across the crate boundary.
-    fn write_scratch_project(main_rs: &str) -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+    fn write_scratch_project(main_rs: &str) -> crate::lsp::fixtures::TempRepo {
+        let dir = crate::lsp::fixtures::temp_repo();
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"app_lsp_wiring_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -5167,32 +5072,23 @@ mod lsp_diagnostics_wiring_tests {
     /// Repeatedly re-renders the centre pane and drains the deterministic test executor until
     /// `AdeApp::file_view_diagnostics` holds at least one diagnostic, or `deadline` passes. The
     /// real `publishDiagnostics` notification arrives on `lsp_core`'s own raw OS reader thread,
-    /// outside GPUI's scheduler entirely, so this must genuinely keep re-checking over real
-    /// time, like `lsp_core::client`'s own `wait_for_update` polling loop one layer down.
+    /// outside GPUI's scheduler entirely, so this must genuinely keep re-checking over real time.
     fn wait_for_real_diagnostics(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
-        deadline: Instant,
+        deadline: Duration,
     ) {
-        loop {
-            app.update(cx, |app, cx| {
-                app.render_center_pane(cx);
-            });
-            cx.run_until_parked();
-
-            let has_diagnostics = app.read_with(cx, |app, _| !app.file_view_diagnostics.is_empty());
-            if has_diagnostics {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no real diagnostic reached AdeApp::file_view_diagnostics within the caller's \
-                 real deadline (this helper is shared by callers with different real timeouts - \
-                 480s for rust-analyzer, 240s for typescript-language-server/pyright - so the \
-                 message deliberately doesn't hardcode either one)"
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        assert!(
+            crate::lsp::fixtures::wait_until_parked(cx, deadline, |cx| {
+                app.update(cx, |app, cx| {
+                    app.render_center_pane(cx);
+                });
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| !app.file_view_diagnostics.is_empty())
+            }),
+            "no real diagnostic reached AdeApp::file_view_diagnostics within the caller's own \
+             deadline"
+        );
     }
 
     /// The end-to-end proof this fix exists to deliver: a real `rust-analyzer`, spawned via this
@@ -5201,6 +5097,7 @@ mod lsp_diagnostics_wiring_tests {
     /// - ends up in `AdeApp::file_view_diagnostics`, which is exactly what
     /// `AdeApp::render_file_view`'s row builder reads to draw the underline/card.
     #[gpui::test]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     fn a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
@@ -5210,7 +5107,7 @@ mod lsp_diagnostics_wiring_tests {
         );
         let main_rs = project.path().join("src").join("main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
@@ -5220,8 +5117,7 @@ mod lsp_diagnostics_wiring_tests {
         // must happen before `ensure_lsp_client` ever gets a chance to run.
         cx.run_until_parked();
 
-        let deadline = Instant::now() + Duration::from_secs(480);
-        wait_for_real_diagnostics(&app, cx, deadline);
+        wait_for_real_diagnostics(&app, cx, Duration::from_secs(480));
 
         app.read_with(cx, |app, _| {
             let all_diagnostics: Vec<&diagnostics_view::LineDiagnostic> =
@@ -5308,13 +5204,12 @@ mod lsp_diagnostics_wiring_tests {
     /// path the Rust test above exercises, but for a real `.ts` file, proving the extension-based
     /// dispatch that replaced the old boolean gate genuinely reaches a non-Rust language too.
     #[gpui::test]
-    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
-    #[ignore]
+    #[ignore = "external: typescript-language-server; see docs/testing.md"]
     fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
     ) {
         let _serialize = serialize_real_lsp_subprocess_test();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::lsp::fixtures::temp_repo();
         std::fs::write(
             dir.path().join("tsconfig.json"),
             "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\"}}\n",
@@ -5342,15 +5237,14 @@ mod lsp_diagnostics_wiring_tests {
             .expect("npm should be on PATH in this sandbox (real, live network install)");
         assert!(status.success(), "npm install typescript@5 failed");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, dir.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_ts.clone(), window, cx);
         });
         cx.run_until_parked();
 
-        let deadline = Instant::now() + Duration::from_secs(240);
-        wait_for_real_diagnostics(&app, cx, deadline);
+        wait_for_real_diagnostics(&app, cx, Duration::from_secs(240));
 
         app.read_with(cx, |app, _| {
             let all_diagnostics: Vec<&diagnostics_view::LineDiagnostic> =
@@ -5389,21 +5283,20 @@ mod lsp_diagnostics_wiring_tests {
     fn wait_until(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
-        deadline: Instant,
+        deadline: Duration,
         message: &str,
         predicate: impl Fn(&AdeApp) -> bool,
     ) {
-        loop {
-            app.update(cx, |app, cx| {
-                app.render_center_pane(cx);
-            });
-            cx.run_until_parked();
-            if app.read_with(cx, |app, _| predicate(app)) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{message}");
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        assert!(
+            crate::lsp::fixtures::wait_until_parked(cx, deadline, |cx| {
+                app.update(cx, |app, cx| {
+                    app.render_center_pane(cx);
+                });
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| predicate(app))
+            }),
+            "{message}"
+        );
     }
 
     /// Drives a real edit through the exact same code path a real keystroke does
@@ -5436,6 +5329,7 @@ mod lsp_diagnostics_wiring_tests {
     /// identifier reaches a real `textDocument/completion` response, and accepting it splices the
     /// real chosen item's text into the real buffer via `EditBuffer::replace_range`.
     #[gpui::test]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     fn rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
@@ -5444,14 +5338,14 @@ mod lsp_diagnostics_wiring_tests {
             "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n",
         );
         let main_rs = project.path().join("src").join("main.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(480);
+        let indexed_deadline = Duration::from_secs(480);
         wait_until(
             &app,
             cx,
@@ -5482,29 +5376,10 @@ mod lsp_diagnostics_wiring_tests {
             );
         });
 
-        // Widened twice from a real, observed 180s-deadline failure under genuine full-suite
-        // parallel load (`cargo test -p app --lib` with its default, num-cpus-wide test-
-        // threads): the whole suite repeatedly ran 3-5x its normal wall-clock length (up to
-        // ~330s vs. the usual ~70-100s) on this same sandbox, and this real rust-analyzer -
-        // already `Ready` and only asked to recompute diagnostics for a two-line edit, not
-        // re-index from scratch - still hadn't published the new diagnostic even at 300s on a
-        // later, still-more-contended run (this module's own `REAL_LSP_SUBPROCESS_TEST_LOCK`
-        // and the `None`-is-retried fix in `AdeApp::schedule_lsp_sync`'s own retry loop both
-        // already close the *other* real bugs this same investigation found - this deadline
-        // widening is a distinct, additional real-headroom fix, not a substitute for either).
-        // The wait itself already polls correctly (real `std::thread::sleep` between checks,
-        // bounded by a real deadline, not a fixed tick count - see `wait_until`'s own docs); the
-        // deadline itself was just too tight for how slow a real subprocess can genuinely get
-        // when dozens of sibling tests' own real subprocesses (other `rust-analyzer`/`pyright`/
-        // `typescript-language-server`/pty sessions, and - on this particular shared sandbox -
-        // other agents' own concurrent full test-suite runs) are contending for the same CPU
-        // cores. 480s keeps real headroom for that without losing the "assertion still fails if
-        // diagnostics genuinely never arrive" property that makes this a real regression gate,
-        // not a rubber stamp - and rust-analyzer gets the widest budget of the three real
-        // servers this module covers because it is, empirically, the one that has actually
-        // needed it (typescript-language-server/pyright's own 240s deadlines have not been
-        // observed failing across dozens of full-suite reproduction runs).
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(480);
+        // Real rust-analyzer, recomputing after an edit under whatever load the machine is
+        // already under - the widest budget of the three servers this module covers, empirically
+        // the one that has needed it.
+        let diagnostic_deadline = Duration::from_secs(480);
         wait_until(
             &app,
             cx,
@@ -5556,7 +5431,7 @@ mod lsp_diagnostics_wiring_tests {
             "\nfn call() {\n    prin",
         );
 
-        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        let completion_deadline = Duration::from_secs(60);
         wait_until(
             &app,
             cx,
@@ -5628,13 +5503,13 @@ mod lsp_diagnostics_wiring_tests {
     fn a_transient_pull_failure_is_retried_not_treated_as_a_permanent_stall(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let absolute = root.join("src").join("main.rs");
         std::fs::write(&absolute, "fn main() {}\n").expect("write main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let server = super::lsp_connection_facade_tests::spawn_fake_server(
             repo.path(),
             "rust-analyzer",
@@ -5682,27 +5557,19 @@ mod lsp_diagnostics_wiring_tests {
         // uses `type_text`'s own advance for the sync debounce - `run_until_parked()` alone does
         // not carry the virtual clock forward on its own, so without this the retry's own timer
         // would never fire and this loop would hang until the real deadline below.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut retried_past_the_first_failure = false;
-        while Instant::now() < deadline {
-            cx.background_executor
-                .advance_clock(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY);
-            cx.run_until_parked();
-            if server
-                .diagnostics_for_uri(&file_uri)
-                .is_some_and(|diagnostics| {
-                    diagnostics
-                        .iter()
-                        .any(|d| d.message == "real diagnostic from a retried pull")
-                })
-            {
-                retried_past_the_first_failure = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
         assert!(
-            retried_past_the_first_failure,
+            crate::lsp::fixtures::wait_until_parked(cx, Duration::from_secs(10), |cx| {
+                cx.background_executor
+                    .advance_clock(PULL_DIAGNOSTICS_EMPTY_RETRY_DELAY);
+                cx.run_until_parked();
+                server
+                    .diagnostics_for_uri(&file_uri)
+                    .is_some_and(|diagnostics| {
+                        diagnostics
+                            .iter()
+                            .any(|d| d.message == "real diagnostic from a retried pull")
+                    })
+            }),
             "the retry loop must survive the fake server's first, deliberately-erroring pull \
              attempt and pick up the real, non-empty result its second attempt answers with - a \
              pre-fix build stops retrying after that first error and never reaches it"
@@ -5713,13 +5580,12 @@ mod lsp_diagnostics_wiring_tests {
     /// - see `crate::language`'s own docs on why `npm install typescript@5` is a genuine, real
     /// project-local requirement in this sandbox, not conservative caution.
     #[gpui::test]
-    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
-    #[ignore]
+    #[ignore = "external: typescript-language-server, npm; see docs/testing.md"]
     fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
         let _serialize = serialize_real_lsp_subprocess_test();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::lsp::fixtures::temp_repo();
         std::fs::write(
             dir.path().join("tsconfig.json"),
             "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\"}}\n",
@@ -5741,13 +5607,13 @@ mod lsp_diagnostics_wiring_tests {
             .expect("npm should be on PATH in this sandbox (real, live network install)");
         assert!(status.success(), "npm install typescript@5 failed");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, dir.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_ts.clone(), window, cx);
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(240);
+        let indexed_deadline = Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -5772,7 +5638,7 @@ mod lsp_diagnostics_wiring_tests {
                 .is_dirty());
         });
 
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(240);
+        let diagnostic_deadline = Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -5796,7 +5662,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         type_text(&app, cx, completion_trigger_offset, "\nconsol");
 
-        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        let completion_deadline = Duration::from_secs(60);
         wait_until(
             &app,
             cx,
@@ -5838,24 +5704,23 @@ mod lsp_diagnostics_wiring_tests {
 
     /// The same real, live proof as the two tests above, for `pyright-langserver`.
     #[gpui::test]
-    // Real pyright-langserver spawn, not installed in CI - GitHub issue #348.
-    #[ignore]
+    #[ignore = "external: pyright-langserver; see docs/testing.md"]
     fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
     ) {
         let _serialize = serialize_real_lsp_subprocess_test();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::lsp::fixtures::temp_repo();
         let main_py = dir.path().join("main.py");
         let baseline = "ok: int = 1\nprint(ok)\n";
         std::fs::write(&main_py, baseline).expect("write main.py");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, dir.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, dir.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_py.clone(), window, cx);
         });
         cx.run_until_parked();
 
-        let indexed_deadline = Instant::now() + Duration::from_secs(240);
+        let indexed_deadline = Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -5875,7 +5740,7 @@ mod lsp_diagnostics_wiring_tests {
                 .is_dirty());
         });
 
-        let diagnostic_deadline = Instant::now() + Duration::from_secs(240);
+        let diagnostic_deadline = Duration::from_secs(240);
         wait_until(
             &app,
             cx,
@@ -5902,7 +5767,7 @@ mod lsp_diagnostics_wiring_tests {
         });
         type_text(&app, cx, completion_trigger_offset, "\npri");
 
-        let completion_deadline = Instant::now() + Duration::from_secs(60);
+        let completion_deadline = Duration::from_secs(60);
         wait_until(
             &app,
             cx,

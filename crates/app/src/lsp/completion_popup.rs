@@ -1314,8 +1314,8 @@ fn resolve_completion_edit(
 #[cfg(test)]
 mod completions_scroll_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use crate::root::scrollbar::ScrollableHandle;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// Comfortably more than both the old 12-item render cap and the
@@ -1348,13 +1348,13 @@ mod completions_scroll_tests {
     ) -> (
         Entity<AdeApp>,
         &mut VisualTestContext,
-        tempfile::TempDir,
+        crate::lsp::fixtures::TempRepo,
         PathBuf,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("sample.rs");
         std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });
@@ -1653,17 +1653,17 @@ mod completions_scroll_tests {
 #[cfg(test)]
 mod completion_detail_pane_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     fn seed_ready_popup(
         cx: &mut TestAppContext,
         items: Vec<lsp_core::lsp_types::CompletionItem>,
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("sample.rs");
         std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });
@@ -1815,11 +1815,11 @@ mod completion_detail_pane_tests {
     fn a_short_lists_flipped_above_position_is_close_to_the_caret_not_the_worst_case_height(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("sample.rs");
         let lines: Vec<String> = (0..30).map(|i| format!("fn f{i}() {{}}")).collect();
         std::fs::write(&file, lines.join("\n") + "\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });
@@ -1954,10 +1954,10 @@ mod completion_detail_pane_tests {
     fn accepting_a_real_auto_import_writes_its_import_line_and_keeps_the_caret(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("main.ts");
         std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });
@@ -2032,10 +2032,10 @@ mod completion_detail_pane_tests {
     /// diagnostic at all) and still cannot be bundled.
     #[gpui::test]
     fn the_auto_import_setting_off_inserts_the_name_without_the_import(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("main.ts");
         std::fs::write(&file, "const a = 1;\n\nconst other = app\n").expect("write main.ts");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });
@@ -2447,10 +2447,10 @@ mod completion_detail_pane_tests {
     fn a_loading_popup_paints_only_the_list_column_with_no_detail_pane_or_footer_hints(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::lsp::fixtures::temp_repo();
         let file = repo.path().join("sample.rs");
         std::fs::write(&file, "fn main() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file, window, cx);
         });

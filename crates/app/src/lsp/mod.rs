@@ -31,3 +31,5 @@ pub mod hover;
 
 pub(crate) mod client;
 pub(crate) mod completion_popup;
+#[cfg(test)]
+pub(crate) mod fixtures;

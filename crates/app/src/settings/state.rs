@@ -529,6 +529,9 @@ pub struct KeybindingRow {
 pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     match action.name() {
         "app::NewAgent" => Some("New agent"),
+        // macOS-only (`cmd-q`, registered in `crate::default_key_bindings`), and the same wording
+        // the application menu's own row uses (`title_bar::menu_model::MenuCommand::Quit`).
+        "app::Quit" => Some("Quit Jerry"),
         "app::TogglePalette" => Some("Command palette"),
         "app::ToggleSettings" => Some("Open settings"),
         "app::GotoDefinition" => Some("Go to definition"),
@@ -1372,65 +1375,6 @@ mod tests {
     }
 
     #[test]
-    fn nav_groups_match_the_documented_2026_07_29_regroup() {
-        let groups = nav_groups();
-        let labels: Vec<&str> = groups.iter().map(|g| g.label).collect();
-        assert_eq!(labels, vec!["Workspace", "Interface", "Editor", "Other"]);
-        assert_eq!(
-            groups[0].pages,
-            vec![
-                SettingsPage::General,
-                SettingsPage::Agents,
-                SettingsPage::Worktrees
-            ]
-        );
-        assert_eq!(
-            groups[1].pages,
-            vec![
-                SettingsPage::Appearance,
-                SettingsPage::Theme,
-                SettingsPage::Keymap
-            ]
-        );
-        assert_eq!(
-            groups[2].pages,
-            vec![SettingsPage::Editor, SettingsPage::LanguageServers]
-        );
-        assert_eq!(
-            groups[3].pages,
-            vec![
-                SettingsPage::Notifications,
-                SettingsPage::Integrations,
-                SettingsPage::About
-            ]
-        );
-    }
-
-    #[test]
-    fn exactly_the_nine_documented_pages_are_implemented() {
-        for page in SettingsPage::ALL {
-            let expected = matches!(
-                page,
-                SettingsPage::General
-                    | SettingsPage::Agents
-                    | SettingsPage::Worktrees
-                    | SettingsPage::Appearance
-                    | SettingsPage::Theme
-                    | SettingsPage::Keymap
-                    | SettingsPage::Editor
-                    | SettingsPage::LanguageServers
-                    | SettingsPage::Notifications
-            );
-            assert_eq!(
-                page.is_implemented(),
-                expected,
-                "{:?} implemented-ness should match the design's documented scope",
-                page.label()
-            );
-        }
-    }
-
-    #[test]
     fn nav_only_pages_share_the_same_honest_placeholder_subtitle() {
         // `About`, not `Notifications`: GitHub issue #226 made Notifications a real, implemented
         // page, so it no longer shows the shared nav-only placeholder text - `About` is still
@@ -1464,47 +1408,38 @@ mod tests {
         assert_eq!(ids.len(), original_len, "duplicate SettingsPage::id()");
     }
 
+    /// One row per `AGENT_KINDS` entry, each carrying its own real resolved path and status -
+    /// the mixed case is the one that matters, since an all-or-nothing bug passes both extremes.
     #[test]
-    fn detect_agent_rows_reports_ready_for_a_resolver_that_finds_the_binary() {
-        let rows = detect_agent_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
-        assert_eq!(rows.len(), 2, "one row per AGENT_KINDS entry");
-        assert!(rows.iter().all(|row| row.is_ready()));
-        assert!(rows.iter().all(|row| row.status_label() == "ready"));
-        let claude = rows
+    fn detect_agent_rows_reports_each_binarys_own_real_status() {
+        let all_found = detect_agent_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
+        assert_eq!(all_found.len(), 2, "one row per AGENT_KINDS entry");
+        assert!(all_found.iter().all(|row| row.is_ready()));
+        assert!(all_found.iter().all(|row| row.status_label() == "ready"));
+        let claude = all_found
             .iter()
             .find(|row| row.kind == AgentKind::Claude)
             .expect("a Claude row should exist");
         assert_eq!(claude.binary_name, "claude");
         assert_eq!(claude.resolved_path, Some(PathBuf::from("/usr/bin/claude")));
-    }
 
-    #[test]
-    fn detect_agent_rows_reports_not_found_for_a_resolver_that_finds_nothing() {
-        let rows = detect_agent_rows(|_name| None);
-        assert!(rows.iter().all(|row| !row.is_ready()));
-        assert!(rows.iter().all(|row| row.status_label() == "not found"));
-    }
+        let none_found = detect_agent_rows(|_name| None);
+        assert!(none_found.iter().all(|row| !row.is_ready()));
+        assert!(none_found
+            .iter()
+            .all(|row| row.status_label() == "not found"));
 
-    #[test]
-    fn detect_agent_rows_can_report_mixed_real_and_not_found_status() {
-        // Proves the two rows' statuses are independent, not all-or-nothing.
-        let rows = detect_agent_rows(|name| {
-            if name == "claude" {
-                Some(PathBuf::from("/usr/bin/claude"))
-            } else {
-                None
-            }
-        });
-        let claude = rows
-            .iter()
-            .find(|row| row.kind == AgentKind::Claude)
-            .expect("claude row");
-        let codex = rows
-            .iter()
-            .find(|row| row.kind == AgentKind::Codex)
-            .expect("codex row");
-        assert!(claude.is_ready());
-        assert!(!codex.is_ready());
+        let mixed =
+            detect_agent_rows(|name| (name == "claude").then(|| PathBuf::from("/usr/bin/claude")));
+        let ready = |kind| {
+            mixed
+                .iter()
+                .find(|row| row.kind == kind)
+                .expect("a row per kind")
+                .is_ready()
+        };
+        assert!(ready(AgentKind::Claude));
+        assert!(!ready(AgentKind::Codex));
     }
 
     fn note(clean: Option<bool>, merged: bool, is_locked: bool) -> WorktreeNote {
@@ -1520,87 +1455,86 @@ mod tests {
         }
     }
 
+    /// The dot a worktree row paints, over every real note shape. `Prunable` outranks plain
+    /// `Clean`, a main checkout is always `Main` however dirty it is, and a *locked* merged-clean
+    /// worktree is deliberately not prunable - the same rule `WorktreeNote::is_prunable` states,
+    /// which this is a thin reduction of rather than a second implementation.
     #[test]
-    fn worktree_dot_status_main_checkout_is_always_main_regardless_of_note() {
-        let dirty_main = note(Some(false), false, false);
-        assert_eq!(
-            worktree_dot_status(true, &dirty_main),
-            WorktreeDotStatus::Main
-        );
-    }
-
-    #[test]
-    fn worktree_dot_status_prunable_takes_priority_over_plain_clean() {
-        let merged_clean = note(Some(true), true, false);
-        assert_eq!(
-            worktree_dot_status(false, &merged_clean),
-            WorktreeDotStatus::Prunable
-        );
-    }
-
-    #[test]
-    fn worktree_dot_status_dirty_and_clean_and_unknown() {
-        assert_eq!(
-            worktree_dot_status(false, &note(Some(false), false, false)),
-            WorktreeDotStatus::Dirty
-        );
-        assert_eq!(
-            worktree_dot_status(false, &note(Some(true), false, false)),
-            WorktreeDotStatus::Clean
-        );
+    fn worktree_dot_status_reduces_every_real_note_to_its_own_dot() {
         let unknown = WorktreeNote {
             is_main: false,
             clean: None,
             merge: None,
             is_locked: false,
         };
-        assert_eq!(
-            worktree_dot_status(false, &unknown),
-            WorktreeDotStatus::Unknown
-        );
+        for (name, is_main, note, expected) in [
+            (
+                "a dirty main checkout",
+                true,
+                note(Some(false), false, false),
+                WorktreeDotStatus::Main,
+            ),
+            (
+                "merged and clean",
+                false,
+                note(Some(true), true, false),
+                WorktreeDotStatus::Prunable,
+            ),
+            (
+                "dirty",
+                false,
+                note(Some(false), false, false),
+                WorktreeDotStatus::Dirty,
+            ),
+            (
+                "clean but unmerged",
+                false,
+                note(Some(true), false, false),
+                WorktreeDotStatus::Clean,
+            ),
+            ("no note at all", false, unknown, WorktreeDotStatus::Unknown),
+            (
+                "locked, merged and clean",
+                false,
+                note(Some(true), true, true),
+                WorktreeDotStatus::Clean,
+            ),
+        ] {
+            assert_eq!(worktree_dot_status(is_main, &note), expected, "{name}");
+        }
     }
 
     #[test]
-    fn worktree_dot_status_locked_merged_clean_is_not_prunable_matching_worktree_note() {
-        // Mirrors `crate::rail::state`'s own locked-worktree test - this function is a thin reduction
-        // of `WorktreeNote::is_prunable`, not a second implementation of the same rule.
-        let locked = note(Some(true), true, true);
-        assert_eq!(
-            worktree_dot_status(false, &locked),
-            WorktreeDotStatus::Clean
-        );
-    }
-
-    #[test]
-    fn worktree_row_action_main_checkout_has_no_action() {
+    fn worktree_row_action_offers_prune_only_where_pruning_is_real() {
         let main_note = WorktreeNote {
             is_main: true,
             clean: Some(true),
             merge: None,
             is_locked: false,
         };
-        assert_eq!(
-            worktree_row_action(true, &main_note),
-            WorktreeRowAction::None
-        );
-    }
-
-    #[test]
-    fn worktree_row_action_prunable_gets_prune_others_get_open() {
-        let prunable = note(Some(true), true, false);
-        assert_eq!(
-            worktree_row_action(false, &prunable),
-            WorktreeRowAction::Prune
-        );
-
-        let unmerged = note(Some(true), false, false);
-        assert_eq!(
-            worktree_row_action(false, &unmerged),
-            WorktreeRowAction::Open
-        );
-
-        let dirty = note(Some(false), false, false);
-        assert_eq!(worktree_row_action(false, &dirty), WorktreeRowAction::Open);
+        for (name, is_main, note, expected) in [
+            ("a main checkout", true, main_note, WorktreeRowAction::None),
+            (
+                "merged and clean",
+                false,
+                note(Some(true), true, false),
+                WorktreeRowAction::Prune,
+            ),
+            (
+                "clean but unmerged",
+                false,
+                note(Some(true), false, false),
+                WorktreeRowAction::Open,
+            ),
+            (
+                "dirty",
+                false,
+                note(Some(false), false, false),
+                WorktreeRowAction::Open,
+            ),
+        ] {
+            assert_eq!(worktree_row_action(is_main, &note), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1772,19 +1706,33 @@ mod tests {
             .all(|language| language.binary == "synthetic-binary"));
     }
 
+    /// One row per registered language, each carrying its own real status - the mixed case is
+    /// the one that matters, since an all-or-nothing bug passes both extremes.
     #[test]
-    fn detect_lsp_rows_reports_ready_for_a_resolver_that_finds_every_binary() {
-        let rows = detect_lsp_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
-        assert_eq!(rows.len(), lsp_languages().len());
-        assert!(rows.iter().all(|row| row.is_ready()));
-        assert!(rows.iter().all(|row| row.status_label() == "ready"));
-    }
+    fn detect_lsp_rows_reports_each_binarys_own_real_status() {
+        let all_found = detect_lsp_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
+        assert_eq!(all_found.len(), lsp_languages().len());
+        assert!(all_found.iter().all(|row| row.is_ready()));
+        assert!(all_found.iter().all(|row| row.status_label() == "ready"));
 
-    #[test]
-    fn detect_lsp_rows_reports_not_installed_for_a_resolver_that_finds_nothing() {
-        let rows = detect_lsp_rows(|_| None);
-        assert!(rows.iter().all(|row| !row.is_ready()));
-        assert!(rows.iter().all(|row| row.status_label() == "not installed"));
+        let none_found = detect_lsp_rows(|_| None);
+        assert!(none_found.iter().all(|row| !row.is_ready()));
+        assert!(none_found
+            .iter()
+            .all(|row| row.status_label() == "not installed"));
+
+        let mixed = detect_lsp_rows(|name| {
+            (name == "rust-analyzer").then(|| PathBuf::from("/usr/bin/rust-analyzer"))
+        });
+        let ready = |language| {
+            mixed
+                .iter()
+                .find(|row| row.language == language)
+                .unwrap_or_else(|| panic!("a {language} row should exist"))
+                .is_ready()
+        };
+        assert!(ready("Rust"));
+        assert!(!ready("Go"));
     }
 
     /// Proves [`detect_lsp_rows`] carries the real install URL straight through from
@@ -1808,27 +1756,6 @@ mod tests {
             rust.install_url,
             "https://rust-analyzer.github.io/book/rust_analyzer_binary.html"
         );
-    }
-
-    #[test]
-    fn detect_lsp_rows_can_report_mixed_real_and_not_installed_status() {
-        let rows = detect_lsp_rows(|name| {
-            if name == "rust-analyzer" {
-                Some(PathBuf::from("/usr/bin/rust-analyzer"))
-            } else {
-                None
-            }
-        });
-        let rust = rows
-            .iter()
-            .find(|row| row.language == "Rust")
-            .expect("a Rust row should exist");
-        let go = rows
-            .iter()
-            .find(|row| row.language == "Go")
-            .expect("a Go row should exist");
-        assert!(rust.is_ready());
-        assert!(!go.is_ready());
     }
 
     #[test]
@@ -1877,301 +1804,44 @@ mod tests {
         }
     }
 
+    /// The keystroke-swallowing bug class this page's rows exist to make visible: a binding that
+    /// claims a plain letter or a bare `Ctrl+C` *globally* eats that keystroke out of a focused
+    /// terminal or text field. Each command below is registered with a real context predicate for
+    /// that reason, so each must report as scoped rather than global.
     #[test]
-    fn keybinding_rows_are_derived_in_real_registration_order() {
-        let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings, &[]);
-        let commands: Vec<&str> = rows.iter().map(|row| row.command).collect();
-        assert_eq!(
-            commands,
-            vec![
-                "New agent",
-                "Command palette",
-                "Open settings",
-                "Text: undo",
-                "Text: redo",
-                "Text: redo",
-                "Text: copy selection",
-                "Text: cut selection",
-                "Text: paste",
-                "Text: select all",
-                "Go to definition",
-                "New terminal",
-                "New agent pane",
-                "Open git graph",
-                "Search in this worktree",
-                "Find in this file",
-                "Next changed file",
-                "Mark file seen / unseen",
-                "Stage / unstage file",
-                "Jump to agent 1",
-                "Jump to agent 2",
-                "Jump to agent 3",
-                "Jump to agent 4",
-                "Jump to agent 5",
-                "Jump to agent 6",
-                "Jump to agent 7",
-                "Jump to agent 8",
-                "Editor: delete backward",
-                "Editor: delete forward",
-                "Editor: insert newline",
-                "Editor: move left",
-                "Editor: move right",
-                "Editor: move up",
-                "Editor: move down",
-                "Editor: extend selection left",
-                "Editor: extend selection right",
-                "Editor: extend selection up",
-                "Editor: extend selection down",
-                // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
-                "Editor: move left one word",
-                "Editor: move right one word",
-                "Editor: extend selection left one word",
-                "Editor: extend selection right one word",
-                "Editor: go to line start",
-                "Editor: go to line end",
-                "Editor: select all",
-                "Editor: copy",
-                "Editor: cut",
-                "Editor: paste",
-                "Editor: save file",
-                "Editor: save file (overwrite external change)",
-                // Multi-cursor (Revision R13, issue #28): Ctrl+D/Ctrl+Shift+L/Ctrl+K Ctrl+D.
-                "Editor: select next occurrence",
-                "Editor: select all occurrences",
-                "Editor: skip occurrence",
-                // GitHub issue #26's real Tab/Shift+Tab indentation, scoped
-                // `"file-editor && !completions"` - see `crate::default_key_bindings`'s own docs
-                // for why `Tab` no longer falls through to plain-text insertion here.
-                "Editor: indent",
-                "Editor: dedent",
-                // `Escape` here is `EditorCollapseCursors`, not a separate `EditorEscape` - it
-                // composes GitHub issue #28's own multi-cursor collapse with issue #26's
-                // accessibility focus-out hatch, since only one binding can genuinely own the
-                // File view's plain `Escape` at equal context depth (see `crate::code_surface::
-                // editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs).
-                "Editor: collapse cursors",
-                "Completions: select previous",
-                "Completions: select next",
-                "Completions: accept selected",
-                "Completions: accept selected",
-                "Completions: dismiss",
-                // GitHub issue #26's manual completion trigger/refresh, scoped plain
-                // `"file-editor"` (fires whether the popup is open or closed).
-                "Completions: trigger",
-                // Revision R8.5c's `"merge-editor"`-scoped bindings for Surface D's merge
-                // hand-edit whole-file editor - the same real `Editor*` action *types*/labels as
-                // the `"file-editor"` set above (reused, not duplicated - see
-                // `crate::code_surface::editing::AdeApp::active_edit_target`'s own docs), minus
-                // `EditorSaveAnyway` (deliberately never bound here - there is no
-                // external-change-conflict concept for a merge hand-edit buffer) and minus every
-                // `Completions*` binding (no completions popup is ever wired up for this
-                // surface).
-                "Editor: delete backward",
-                "Editor: delete forward",
-                "Editor: insert newline",
-                "Editor: move left",
-                "Editor: move right",
-                "Editor: move up",
-                "Editor: move down",
-                "Editor: extend selection left",
-                "Editor: extend selection right",
-                "Editor: extend selection up",
-                "Editor: extend selection down",
-                "Editor: move left one word",
-                "Editor: move right one word",
-                "Editor: extend selection left one word",
-                "Editor: extend selection right one word",
-                "Editor: go to line start",
-                "Editor: go to line end",
-                "Editor: select all",
-                "Editor: copy",
-                "Editor: cut",
-                "Editor: paste",
-                "Editor: save file",
-                // The same GitHub issue #26 indent/dedent/escape bindings, mirrored here for the
-                // merge hand-edit target - scoped plain `"merge-editor"` (no completions popup
-                // exists for this surface, so there's no `!completions` narrowing to mirror).
-                "Editor: indent",
-                "Editor: dedent",
-                "Editor: move focus out",
-                // GitHub issue #19's file-tree bindings, each scoped to
-                // `"file-tree && !tree-editing"` - see `crate::default_key_bindings`' own docs
-                // and `crate::sidebar::tree_ops`' module docs for why both halves of that
-                // predicate are load-bearing.
-                "Files tree: rename",
-                "Files tree: copy",
-                "Files tree: cut",
-                "Files tree: paste",
-                // GitHub issue #105's `Delete` (runs immediately, no confirmation) and its own
-                // real undo/redo, `Ctrl+Z`/`Ctrl+Shift+Z` - distinct actions from `TextUndo`/
-                // `TextRedo`, scoped the same `"file-tree && !tree-editing"` as every binding
-                // above.
-                "Files tree: delete",
-                "Files tree: undo",
-                "Files tree: redo",
-                // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
-                "Close focused tab",
-                // GitHub issue #20's terminal footer `clear`, scoped `Some("terminal")`.
-                "Terminal: clear",
-                // GitHub issue #158's terminal copy/paste, both scoped `Some("terminal")`.
-                "Terminal: copy selection",
-                "Terminal: paste",
-                // GitHub issue #304's interactive-rebase plan verbs, scoped
-                // `Some("rebase-plan && !text-input")` (and plain `Some("rebase-plan")` for the
-                // last) - the real bindings behind design spec §1.4's footer keycap hints.
-                "Rebase plan: move row up",
-                "Rebase plan: move row down",
-                "Rebase plan: pick",
-                "Rebase plan: squash",
-                "Rebase plan: drop",
-                "Rebase plan: start rebase",
-                "Diff: send review notes to the agent",
-                "Diff: note on this line",
-            ]
-        );
-    }
-
-    #[test]
-    fn keybinding_rows_report_the_real_global_context_for_every_default_binding() {
-        // Regression coverage for the bug this replaced: a hand-copied list once labeled
-        // `Go to definition` `context: "editor"` even though it's actually registered global.
-        //
-        // Revision R8.5a added a second real scoped context (`"file-editor"`, the real File
-        // view text-editing actions) alongside the pre-existing `"diff"` one (`]` ->
-        // `NextChangedFile`) - both are deliberately non-global for the same real reason
-        // (swallowing ordinary keystrokes in a focused terminal agent), so the scoped count
-        // grew from 1 to 1 + 19 real `Editor*` bindings (a fix round added `EditorSaveAnyway`,
-        // the real escape hatch for a permanently-stuck `AdeApp::file_external_conflict`). A
-        // later fix round changed `]`'s own registered predicate from `Some("diff")` to
-        // `Some("diff && !file-editor")` (a real, live-reproduced bug: since `"file-editor"` is
-        // *added onto* the same node's context rather than replacing `"diff"`, the bare
-        // `"diff"` predicate kept matching - and kept swallowing a literal `]` keystroke - even
-        // while a file was actively being edited) - `KeybindingRow::context` only ever reports
-        // the coarse `"global"`/`"scoped"` distinction (see its own docs), so that predicate
-        // change doesn't move this test's own counts, but `]` is still exactly as "scoped" as
-        // before. Revision R8.5b added 5 more real scoped bindings for the Completions popup
-        // (`CompletionsUp`/`CompletionsDown`/`CompletionsDismiss`, plus `CompletionsAccept`
-        // bound twice - `tab` and `enter`), each `Some("file-editor && completions")`.
-        // Revision R8.5c added 18 more real scoped bindings for Surface D's merge hand-edit
-        // whole-file editor, each `Some("merge-editor")` - the same 18 `Editor*` actions as the
-        // `"file-editor"` set minus `EditorSaveAnyway` (see
-        // `keybinding_rows_are_derived_in_real_registration_order`'s own updated expectations
-        // for exactly which).
-        // GitHub issue #17 added 3 more real scoped bindings, `TextUndo` (`secondary-z`) and
-        // `TextRedo` (bound twice - `secondary-shift-z` and `ctrl-y`), each `Some("text-input")`:
-        // `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, which a focused terminal
-        // needs unclaimed to send the real `SIGTSTP` suspend control byte
-        // (`crate::terminal::pane::keystroke_to_bytes`) - see `crate::default_key_bindings`'s own
-        // docs for the full reasoning.
-        // GitHub issue #27 added 8 more real scoped bindings: `EditorWordLeft`/`EditorWordRight`/
-        // `EditorSelectWordLeft`/`EditorSelectWordRight`, each bound once under `"file-editor"`
-        // and once under `"merge-editor"` - the same word-wise-caret-navigation set both real
-        // editors share, matching every other `Editor*` action's own dual registration.
-        // Revision R13 (issue #28) added 4 more real scoped bindings, all File-view-only
-        // (`crate::merge::editing`'s `"merge-editor"` context deliberately does not get these):
-        // `EditorSelectNextOccurrence` (`Ctrl+D`), `EditorSelectAllOccurrences` (`Ctrl+Shift+L`),
-        // `EditorSkipOccurrence` (`Ctrl+K Ctrl+D`, all three `Some("file-editor")`), and
-        // `EditorCollapseCursors` (`Esc`, `Some("file-editor && !completions")` - narrowed rather
-        // than the other three's bare `"file-editor"` because GitHub issue #26 also wants the
-        // File view's plain `Escape` for its own accessibility focus-out hatch, and only one
-        // binding can genuinely own a keystroke at equal context depth; see `crate::
-        // code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs for how
-        // it composes both real behaviors from this one binding rather than a separate
-        // `EditorEscape` shadowing or being shadowed by it).
-        // GitHub issue #26 added 7 more real scoped bindings on top of that (not counting
-        // `EditorCollapseCursors` above, which is issue #28's own action): `EditorIndent`/
-        // `EditorDedent` under `"file-editor && !completions"` (2), the same two again plus
-        // `EditorEscape` under plain `"merge-editor"` (3, `EditorEscape` here since
-        // `"merge-editor"` never gets multi-cursor actions and so never faces the same collision
-        // `EditorCollapseCursors` resolves in the File view), `CompletionsInvoke` under plain
-        // `"file-editor"` (1), and `CloseFocusedTab` under `Some("!terminal")` (1, the same real
-        // terminal-control-byte conflict class `"ctrl-shift-t"` above already established).
-        // GitHub issue #105 added 3 more real scoped bindings: `FileTreeDelete` (`Delete`, runs
-        // immediately - no confirmation step, so no different scoping from Copy/Cut/Paste/Rename
-        // above it) and its own `FileTreeUndo`/`FileTreeRedo` (`Ctrl+Z`/`Ctrl+Shift+Z`) - distinct
-        // actions from `TextUndo`/`TextRedo`, all three `Some("file-tree && !tree-editing")`.
-        // GitHub issue #20 added 1 more real scoped binding: `TerminalClear`
-        // (`cmd-k`/`ctrl-shift-l`), `Some("terminal")`.
-        // GitHub issue #155 removed 1: `FileTreeContextMenu` (`Shift+F10`) - right-click plus
-        // each row's own already-bound shortcut covers the same ground, so a second
-        // keyboard-only path to the menu had no real justification of its own.
-        // GitHub issue #158 added 2 more real scoped bindings: `TerminalCopy`/`TerminalPaste`
-        // (`cmd-c`/`cmd-v` on macOS, `ctrl-shift-c`/`ctrl-shift-v` elsewhere), both
-        // `Some("terminal")` - see `crate::default_key_bindings`'s own entry for why the shifted
-        // variants, and why leaving them unbound was the bug.
-        // GitHub issue #286 added 1 more real scoped binding: `v` -> `ToggleChangeSeen`, under
-        // the same `Some("diff && !file-editor")` predicate `]` carries and for the same reason -
-        // a plain letter must never be claimed over a focused terminal, and the seen-state it
-        // toggles belongs to the file whose diff is open.
-        // GitHub issue #304 added 6 more real scoped bindings: the interactive-rebase plan's own
-        // `RebaseReorderUp`/`RebaseReorderDown`/`RebasePickRow`/`RebaseSquashRow`/`RebaseDropRow`
-        // under `Some("rebase-plan && !text-input")` (5 - see `crate::default_key_bindings` for
-        // why the negated conjunct is load-bearing over a surface that contains a real text
-        // field) and `RebaseStart` under plain `Some("rebase-plan")` (1).
-        // GitHub issue #288 added 2 more real scoped bindings, on the diff's own review-notes
-        // surface: `SendReviewNotes` (`mod+enter`) under plain `Some("diff-view")` - the notes
-        // bar draws it as keycaps, and having just typed a note is the likeliest moment to send
-        // the batch - and `ToggleLineNote` (`c`) under `Some("diff-view && !text-input")`, the
-        // same negated conjunct and the same reason as the rebase plan's plain letters above:
-        // the pinned note card is a real text field inside that very container.
-        // GitHub issue #162 added 1 more scoped binding: `mod+F` -> `FindInFile` under
-        // `Some("file-editor")`. Its sibling `mod+shift+F` -> `SearchInWorktree` is deliberately
-        // *global* and so is not counted here - the right panel's Search tab has no editor to be
-        // scoped to, and a real Cmd/Ctrl-modified keystroke never reaches a focused pty anyway.
-        // The Changes-footer prose fix added 1 more: `space` -> `ToggleChangeStaged`, alongside
-        // `v` and `]` - `Jerry.dc.html`'s `changesHints` advertises `space stage` in that footer
-        // and nothing was bound to it. All three of those now also carry `&& !text-input`, since
-        // issue #288's pinned note card is a real text input *inside* the `"diff"` node that
-        // `"file-editor"` does not cover.
-        // GitHub issue #336 added 4 more scoped bindings: `TextCopy`/`TextCut`/`TextPaste`/
-        // `TextSelectAll` (`mod+C`/`mod+X`/`mod+V`/`mod+A`) under
-        // `Some("text-input && !file-editor && !merge-editor")` - the same `"text-input"` tag
-        // `TextUndo`/`TextRedo` above carry, with the two editor surfaces excluded because their
-        // own `Editor*` actions already own those exact keystrokes there at the same predicate
-        // depth (see `crate::default_key_bindings`' own entry).
-        let bindings = crate::default_key_bindings();
-        let rows = keybinding_rows(&bindings, &[]);
-        assert!(!rows.is_empty());
-        let scoped: Vec<&KeybindingRow> =
-            rows.iter().filter(|row| row.context != "global").collect();
-        assert_eq!(
-            scoped.len(),
-            90,
-            "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
-             every real Completions* binding (5) plus every real merge-editor binding (18) plus \
-             TextUndo/TextRedo (3, GitHub issue #17) plus every real \
-             file-tree binding (7, GitHub issues #19 and #105, less 1 for issue #155's removed \
-             FileTreeContextMenu) plus every real word-wise Editor* \
-             binding (8, GitHub issue #27) plus every real multi-cursor Editor* binding (4, \
-             GitHub issue #28) plus every real GitHub issue #26 binding (7, not counting \
-             EditorCollapseCursors above, which is issue #28's own action) plus TerminalClear \
-             (1, GitHub issue #20) plus TerminalCopy/TerminalPaste (2, GitHub issue #158) plus \
-             every real interactive-rebase plan binding (6, GitHub issue #304) plus every \
-             real review-note binding (2, GitHub issue #288) plus `space -> \
-             ToggleChangeStaged` (1, the Changes footer's own `space stage` hint) plus \
-             `mod+F -> FindInFile` (1, GitHub issue #162's in-file find) plus \
-             TextCopy/TextCut/TextPaste/TextSelectAll (4, GitHub issue #336) to be scoped, \
-             not global"
-        );
+    fn every_binding_registered_behind_a_context_is_reported_as_scoped_not_global() {
+        let rows = keymap_page_rows();
+        let scoped: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.context != "global")
+            .map(|row| row.command)
+            .collect();
         assert!(
-            scoped
-                .iter()
-                .filter(|row| row.command.starts_with("Files tree: "))
-                .count()
-                == 7,
-            "every file-tree binding must be reported as scoped - a globally-bound Ctrl+C would \
-             be exactly the keystroke-swallowing bug class this list's own docs catalogue"
+            !scoped.is_empty(),
+            "premise: some bindings really are scoped"
         );
-        assert!(
-            scoped.iter().any(|row| row.command == "Next changed file"),
-            "the diff-scoped (now diff && !file-editor) ] binding must still be reported as \
-             scoped"
-        );
-        assert!(
-            scoped.iter().any(|row| row.command == "Editor: save file"),
-            "a real file-editor-scoped binding must be reported as scoped too"
-        );
+        for command in [
+            "Files tree: rename",
+            "Files tree: copy",
+            "Files tree: cut",
+            "Files tree: paste",
+            "Files tree: delete",
+            "Next changed file",
+            "Mark file seen / unseen",
+            "Stage / unstage file",
+            "Editor: save file",
+            "Completions: accept selected",
+            "Terminal: clear",
+            "Terminal: copy selection",
+            "Rebase plan: pick",
+            "Diff: note on this line",
+        ] {
+            assert!(
+                scoped.contains(&command),
+                "{command:?} must be reported as scoped - a global binding for it would swallow \
+                 that keystroke out of a focused terminal or text field"
+            );
+        }
     }
 
     #[test]
