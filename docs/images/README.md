@@ -13,9 +13,14 @@ Each capture replaces the same filename, at roughly the same aspect ratio, with 
 against a real repo and real agents — no mocked rows, no empty states standing in for populated
 ones.
 
+`hero.png` is the only full-window shot. It renders at 960px, so the whole three-zone layout has room
+to read. **Every other image renders in a 50%-wide table cell**, roughly 400px on a desktop browser —
+a full-window screenshot shrunk to that is illegible. Crop each one to its own surface, close enough
+that the thing the block is about is the thing you see.
+
 | File | Surface | What has to be visible |
 | --- | --- | --- |
-| `hero.png` | Whole window | All three zones at once: the rail with several sessions in different states, an agent mid-run in the work surface, its diff on the right. |
+| `hero.png` | Whole window (960px) | All three zones at once: the rail with several sessions in different states, an agent mid-run in the work surface, its diff on the right. |
 | `rail.png` | Session rail | Several worktrees across at least two repos, with agent rows showing different derived statuses and elapsed times. |
 | `terminal.png` | Work surface | An agent CLI's own live TUI rendering correctly, with the per-worktree tab strip and a shell tab beside it. |
 | `review.png` | Diff + review notes | A real diff against a detected base branch with at least one line-anchored note attached. |
@@ -29,5 +34,15 @@ ones.
 anything in frame that shouldn't be public (absolute paths under a home directory, private branch
 names, agent conversation content).
 
-Keep them reasonably sized — these load on the repo's front page. PNG for static surfaces; a GIF is
-only worth it for `hero.png`, and only if it shows something a still can't.
+Keep them reasonably sized — these all load on the repo's front page, unlazily.
+
+PNG for static surfaces. A GIF is worth it only where motion carries something a still can't (an
+agent's status flipping in the rail, a TUI redrawing, notes landing in a PTY). Where one is used,
+pair it with a still fallback rather than shipping the GIF alone:
+
+```html
+<picture>
+  <source srcset="docs/images/rail.gif" type="image/gif">
+  <img src="docs/images/rail.png" alt="..." width="100%" />
+</picture>
+```

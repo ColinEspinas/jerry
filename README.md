@@ -1,103 +1,175 @@
-<div align="center">
+<h1 align="center">Jerry</h1>
 
-# Jerry
+<p align="center">
+  <a href="https://github.com/ColinEspinas/jerry/releases/latest"><img src="https://img.shields.io/github/v/release/ColinEspinas/jerry?style=flat&label=release&color=5cb87f" alt="Latest release" /></a>
+  <a href="https://github.com/ColinEspinas/jerry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ColinEspinas/jerry/ci.yml?style=flat&branch=master&label=CI" alt="CI status" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-74ade8?style=flat" alt="License: MIT OR Apache-2.0" /></a>
+  <img src="https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-4493F8?style=flat" alt="Supported platforms: macOS, Linux, Windows" />
+  <a href="https://www.gpui.rs/"><img src="https://img.shields.io/badge/built%20with-GPUI-e2a336?style=flat" alt="Built with GPUI" /></a>
+</p>
 
-**Supervise a fleet of AI coding agents — each one in its own real git worktree.**
+<p align="center">
+  <strong>Supervise a fleet of AI coding agents.</strong><br/>
+  Run Claude Code and Codex side by side — each in its own real git worktree, all in one window.
+</p>
 
-[![Release](https://img.shields.io/github/v/release/ColinEspinas/jerry?label=release&color=5cb87f)](https://github.com/ColinEspinas/jerry/releases/latest)
-[![CI](https://github.com/ColinEspinas/jerry/actions/workflows/ci.yml/badge.svg)](https://github.com/ColinEspinas/jerry/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-74ade8)](#license)
+<h3 align="center"><a href="../../releases/latest"><ins>Download Jerry</ins></a></h3>
 
-[**Download**](../../releases/latest) &nbsp;·&nbsp; [Install from source](#install) &nbsp;·&nbsp; [Supported agents](#supported-agents) &nbsp;·&nbsp; [Contributing](CONTRIBUTING.md)
+<p align="center">
+  <img src="docs/images/hero.png" alt="Jerry: the session rail, an agent running in the work surface, and its diff on the right" width="960" />
+</p>
 
-<img src="docs/images/hero.png" alt="Jerry: the session rail, an agent running in the work surface, and its diff on the right" width="880">
-
-</div>
+<p align="center">
+  <sub><a href="#install">Install</a> &nbsp;·&nbsp; <a href="#supported-agents">Supported agents</a> &nbsp;·&nbsp; <a href="docs/architecture/overview.md">Architecture</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp; <a href="../../issues">Issues</a></sub>
+</p>
 
 > [!NOTE]
 > **Jerry is a working prototype, not a released product.** It does real work — real worktrees, real
 > agent processes, real `git` — but expect rough edges. [Open issues](../../issues) is the honest
 > list of what's in progress.
 
-## The idea
+## One window, every agent
 
 You already give each task its own agent. Jerry gives each agent its own **real git worktree** — a
-separate checkout on its own branch, not a sandbox and not a copy — plus a terminal to run in, a diff
-of what it changed, and an editor to fix what it got wrong.
+separate checkout on its own branch, not a sandbox and not a copy — then puts a terminal, a diff, an
+editor and a git graph around it.
 
-The rail on the left is every session at once. The rest of the window is whichever one you're looking
-at.
+- **Every agent gets a worktree.** Two agents editing the same file never collide.
+- **Every session in one rail.** Status comes from the underlying git and process state, not from
+  what the agent says about itself.
+- **Review without leaving.** Diff against the detected base branch, drop line-anchored notes, send
+  them back to the agent that wrote the code.
+- **Fix it yourself when that's faster.** A real editor with LSP, in the same window.
+- **Resolve the merge in place.** Per-hunk accept/reject, or the conflict markers by hand.
+
+---
 
 ## Features
 
+<table>
+<tr>
+<td width="50%" valign="middle">
+
 ### One worktree per session
 
-<img src="docs/images/rail.png" alt="The session rail, one row per worktree and agent" width="720">
+Every session is a real `git worktree` on its own branch. The rail shows all of them at once, with
+status derived from the underlying git and process state — Claude Code reports structurally over a
+hook side-channel, other agents fall back to terminal-title and quiescence signals.
 
-Every session is a real `git worktree` on its own branch, so two agents editing the same file never
-collide. The rail shows all of them at once, with status derived from the underlying git and process
-state rather than from anything the agent says about itself. Claude Code sessions report structural
-status over a hook side-channel; other agents fall back to terminal-title and quiescence signals.
+[Source →](crates/app/src/rail/)
+
+</td>
+<td width="50%">
+  <img src="docs/images/rail.png" alt="The session rail, one row per worktree and agent" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
 ### A real terminal, not a log pane
 
-<img src="docs/images/terminal.png" alt="An agent CLI running in the work surface" width="720">
+The agent's own CLI runs in a real PTY, rendered through `alacritty_terminal` grid emulation —
+cursor-addressed redraw, so its live TUI behaves exactly as it does in your own terminal. Tabs are
+scoped per worktree, with a plain shell tab alongside the agents.
 
-The work surface runs the agent's own CLI in a real PTY, rendered through `alacritty_terminal` grid
-emulation — cursor-addressed redraw, so the agent's live TUI behaves exactly as it does in your own
-terminal instead of scrolling past as a text dump. Tabs are scoped per worktree, and a plain shell
-tab sits alongside the agents in the same directory.
+[Source →](crates/app/src/work_surface/)
 
-### Diff, with notes that go back to the agent
+</td>
+<td width="50%">
+  <img src="docs/images/terminal.png" alt="An agent CLI running in the work surface" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
-<img src="docs/images/review.png" alt="The diff view with line-anchored review notes" width="720">
+### Diff, with notes that go back
 
 Review a session's changes against its automatically detected base branch. Line-anchored notes batch
-into a single prompt and get delivered to a *named* agent's PTY, then stay pinned afterwards so you
-can check the revision against what you actually asked for.
+into a single prompt, get delivered to a *named* agent's PTY, and stay pinned afterwards so you can
+check the revision against what you actually asked for.
+
+[Source →](crates/app/src/review_notes/)
+
+</td>
+<td width="50%">
+  <img src="docs/images/review.png" alt="The diff view with line-anchored review notes" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
 ### An editor with real language support
 
-<img src="docs/images/editor.png" alt="The code editor with LSP diagnostics and completions" width="720">
-
 Full text editing — cursor, selection, IME — with `tree-sitter` highlighting and a hand-written LSP
 client behind it: hover, go-to-definition, diagnostics and completions from `rust-analyzer`,
-`typescript-language-server`, Vue Language Tools, `pyright` and `gopls`. Agents get things wrong;
-fixing them shouldn't mean leaving the window.
+`typescript-language-server`, Vue Language Tools, `pyright` and `gopls`.
+
+[Source →](crates/app/src/code_surface/)
+
+</td>
+<td width="50%">
+  <img src="docs/images/editor.png" alt="The code editor with LSP diagnostics and completions" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
 ### Merge conflicts, structurally
 
-<img src="docs/images/conflicts.png" alt="Structural per-hunk merge conflict resolution" width="720">
-
 Resolve a conflicted merge per hunk with accept/reject, or drop into the same editor and edit the
-conflict markers by hand. Both paths are the real resolution — whichever one suits the conflict in
-front of you.
+conflict markers by hand. Both paths are the real resolution — whichever suits the conflict in front
+of you.
+
+[Source →](crates/app/src/merge/)
+
+</td>
+<td width="50%">
+  <img src="docs/images/conflicts.png" alt="Structural per-hunk merge conflict resolution" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
 
 ### The git graph
-
-<img src="docs/images/graph.png" alt="The git graph tab" width="720">
 
 Commits, branches and worktrees in one view, with an interactive rebase mode whose plan you edit
 before anything runs.
 
-### Also in the box
+[Source →](crates/app/src/graph_view/)
+
+</td>
+<td width="50%">
+  <img src="docs/images/graph.png" alt="The git graph tab" width="100%" />
+</td>
+</tr>
+</table>
+
+**Also in the box:**
 
 - **Undo/redo for worktree-level actions** — committing or discarding a session's changes is
   reversible from the command palette's History group.
 - **Per-agent line provenance** — when two agents share a worktree, which one wrote each line.
-- **Agent run history** — a repo → worktree → run index with full transcripts, and `--resume` to pick
-  a previous Claude Code conversation back up.
-- **Rate-limit budget readout** — per-provider 5h/7d usage, next to the agent pane.
-- **Search** across the worktree, in the right panel.
-- **Themes** — six bundled, plus VS Code theme import. Themes are plain TOML where every key is
-  optional and anything unset is inherited, so a three-line file is a complete theme. See
-  [`docs/themes.md`](docs/themes.md).
-- **Sounds** for agent events — off by default, end to end.
-- **Self-update** from GitHub releases.
+- **[Agent run history](crates/app/src/run_history/)** — a repo → worktree → run index with full
+  transcripts, and `--resume` to pick a previous Claude Code conversation back up.
+- **[Rate-limit budget readout](crates/app/src/budget/)** — per-provider 5h/7d usage, next to the
+  agent pane.
+- **[Search](crates/app/src/search/)** across the worktree, in the right panel.
+- **[Themes](docs/themes.md)** — six bundled, plus VS Code theme import. Plain TOML where every key
+  is optional and anything unset is inherited, so a three-line file is a complete theme.
+- **[Sounds](crates/app/src/sound/)** for agent events — off by default, end to end.
+- **[Self-update](crates/app/src/updater/)** from GitHub releases.
 - **Settings** for General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, Language
   servers, Notifications and Integrations.
 
+---
+
 ## Supported agents
+
+<p>
+  <a href="https://claude.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
+  <kbd>Plain shell</kbd>
+</p>
 
 | Agent | CLI | Status signal |
 | --- | --- | --- |
@@ -109,22 +181,28 @@ Both CLIs are resolved on `$PATH` and spawned directly in the session's worktree
 bundle, wrap or proxy either one, so you bring your own install and your own auth; **Settings ›
 Agents** tells you whether each is actually on your `$PATH`.
 
+Unlike the tools Jerry is modelled on, this is a **short, explicit list, not "any CLI agent"** — each
+one is a real enum variant with its own spawn and status handling.
 [Cursor CLI support](https://github.com/ColinEspinas/jerry/issues/353) is open, not built.
+
+---
 
 ## Install
 
-**Prebuilt binary** — from the [latest release](../../releases/latest):
+### Prebuilt binary
+
+From the [latest release](../../releases/latest):
 
 | Platform | Asset |
 | --- | --- |
-| macOS (Apple Silicon) | `jerry-macos.tar.gz` |
-| Linux (x86_64) | `jerry-linux.tar.gz` |
-| Windows (x86_64) | `jerry-windows.zip` |
+| macOS (Apple Silicon) | [`jerry-macos.tar.gz`](../../releases/latest) |
+| Linux (x86_64) | [`jerry-linux.tar.gz`](../../releases/latest) |
+| Windows (x86_64) | [`jerry-windows.zip`](../../releases/latest) |
 
 All three ship a binary every release, but maturity is uneven: macOS has been run locally on Apple
 Silicon, Linux builds and runs against both display servers, and Windows is build-verified in CI.
 
-**From source:**
+### From source
 
 ```sh
 git clone https://github.com/ColinEspinas/jerry
@@ -171,13 +249,15 @@ you.
 
 </details>
 
+---
+
 ## Built with
 
-[GPUI](https://www.gpui.rs/) (Zed's UI framework) ·
-[`alacritty_terminal`](https://github.com/zed-industries/alacritty) + `portable-pty` for the
-terminal and PTY layer · [`gix`](https://crates.io/crates/gix) plus the real `git` CLI for version
-control · [`lsp-types`](https://crates.io/crates/lsp-types) with a hand-written client ·
-`tree-sitter` (Rust, TypeScript/TSX, JavaScript, Python) for highlighting.
+[GPUI](https://www.gpui.rs/) (Zed's UI framework) &nbsp;·&nbsp;
+[`alacritty_terminal`](https://github.com/zed-industries/alacritty) + `portable-pty` for terminal and
+PTY &nbsp;·&nbsp; [`gix`](https://crates.io/crates/gix) plus the real `git` CLI for version control
+&nbsp;·&nbsp; [`lsp-types`](https://crates.io/crates/lsp-types) with a hand-written client
+&nbsp;·&nbsp; `tree-sitter` (Rust, TypeScript/TSX, JavaScript, Python) for highlighting.
 
 ## Contributing
 
@@ -185,11 +265,15 @@ Issues and PRs are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the proc
 pass before a PR opens; [`CLAUDE.md`](CLAUDE.md) is the single source of truth for how the code
 itself should look, for humans and agents alike.
 
-The workspace is four crates — `wt-core` (git), `pty-core` (processes), `lsp-core` (language
-servers) and `app` (the GPUI application, and the only crate allowed to depend on GPUI). The rules
-behind that split, and the reasoning for each, are in
-[`docs/architecture/`](docs/architecture/overview.md); how a change moves from issue to merged PR is
-in [`docs/development-workflow.md`](docs/development-workflow.md).
+The workspace is four crates — `wt-core` (git), `pty-core` (processes), `lsp-core` (language servers)
+and `app` (the GPUI application, and the only crate allowed to depend on GPUI). The rules behind that
+split, and the reasoning for each, are in [`docs/architecture/`](docs/architecture/overview.md); how
+a change moves from issue to merged PR is in
+[`docs/development-workflow.md`](docs/development-workflow.md).
+
+<a href="https://github.com/ColinEspinas/jerry/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=ColinEspinas/jerry" alt="Jerry contributors" />
+</a>
 
 ## License
 
