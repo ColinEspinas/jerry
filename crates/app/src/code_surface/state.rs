@@ -16,10 +16,6 @@ pub(crate) enum DiffLoadState {
 /// [`AdeApp::render_file_view`] most recently asked to load. Mirrors [`DiffLoadState`]'s shape:
 /// `load_file` does the same class of blocking I/O (`std::fs::read`, plus a `tree-sitter` parse
 /// for `.rs` files) and must never run on the GPUI foreground thread.
-///
-/// Kept separate from [`AdeApp::file_view_cache`] rather than folded into an
-/// `Option<Result<ParsedFile, String>>` there, so a fresh load for a newly opened file doesn't
-/// overwrite (and blank) whatever was last successfully shown while it's still in flight.
 #[derive(Debug)]
 pub(crate) enum FileLoadState {
     Idle,
@@ -31,11 +27,6 @@ pub(crate) enum FileLoadState {
 /// `crate::code_surface::lsp_ui::HOVER_TRIGGER_DELAY` has elapsed and a real
 /// `textDocument/hover` request has gone out for it - see
 /// [`AdeApp::hover_over_token`]'s own docs for the debounce this backs.
-///
-/// Deliberately the exact same four fields [`HoverEntry`] carries minus its `status`: a resolved
-/// [`HoverEntry`] *is* this anchor plus a real response, so [`AdeApp::hover_anchor_matches`] can
-/// compare the two directly rather than through a second, independently-derived notion of "the
-/// same token".
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HoverAnchor {
     pub(in crate::code_surface) path: PathBuf,
@@ -155,15 +146,11 @@ mod hover_entry_underline_tests {
         }
     }
 
-    /// The one real behavior change this test exists for: a genuinely empty, already-answered
-    /// hover must not underline - see `HoverEntry::worth_underlining`'s own docs.
     #[test]
     fn a_genuinely_empty_answered_hover_is_not_worth_underlining() {
         assert!(!entry_with(HoverStatus::Ready(None)).worth_underlining());
     }
 
-    /// Every other real status still is - `Loading`/`Failed` both still show a real popover of
-    /// their own (see `render_hover_card`), so the underline affordance pointing at it must too.
     #[test]
     fn every_other_real_status_is_still_worth_underlining() {
         assert!(entry_with(HoverStatus::Loading).worth_underlining());

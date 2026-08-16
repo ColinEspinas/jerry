@@ -1,64 +1,6 @@
 //! Recording and restoring one worktree's whole tab session - "quit Jerry with some set of tabs
 //! open across some set of worktrees and repos, relaunch it, and everything you had open comes
 //! back".
-//!
-//! [`crate::work_surface::tab_order_state`] is the durable half (what the file looks like, what
-//! survives a restart, and why); this is the live half: turning the real tab strip into a
-//! [`crate::work_surface::tab_order_state::SessionTab`] list on every change
-//! ([`AdeApp::record_worktree_session`]), and turning that list back into real tabs, real files and
-//! real processes ([`AdeApp::restore_worktree_session`]).
-//!
-//! ## Scope and timing: restore per worktree, on its first real activation
-//!
-//! The obvious design - restore everything at launch - was rejected deliberately, and this is the
-//! one genuinely product-shaped decision in this module, so it is written down rather than left
-//! implicit.
-//!
-//! A restored tab is not a row in a list; it is a real OS process. A user who has worked in a
-//! dozen worktrees across three repos would, on a naive eager restore, watch Jerry fork a dozen
-//! shells and resume a handful of Claude conversations - real PTYs, real CPU, real token spend on
-//! conversations they did not ask to continue - before the first frame they could act on. That is
-//! slow, expensive, and surprising in a way "restore my tabs" does not ask for.
-//!
-//! So restore is **lazy and per worktree**: a worktree's session is reopened the first time that
-//! worktree is genuinely selected in this window, and never again in it (see
-//! [`crate::root::AdeApp::session_restored`]). What that buys, concretely:
-//!
-//! - **Launch still lands you back where you were**, with your tabs, because startup genuinely
-//!   selects a worktree on the way in (`crate::root::AdeApp::load_worktrees_for_opened_repo` ->
-//!   `crate::rail::worktrees::selection_for_opened_repo`), and - new here - it prefers the
-//!   worktree you were last in (`crate::rail::repo::RepoRecord::selected_worktree`) rather than
-//!   always the main checkout. One worktree's worth of processes, not every worktree's.
-//! - **Every other worktree and repo comes back the instant you go there**, at the cost of exactly
-//!   the visit the user just performed anyway. From the user's side "everything reopened"; from
-//!   the machine's side, nothing was spawned that was never looked at.
-//! - **PR #265's invariant holds structurally rather than by care.** That change established that
-//!   a tab is never shown, never spawnable, and never implicitly attributed to anything except a
-//!   real, currently-selected worktree. Restore hangs off *selection itself*, so there is no path
-//!   through this module that can produce a tab for a worktree that isn't selected - and
-//!   [`AdeApp::restore_worktree_session`] additionally refuses outright if it is ever handed a
-//!   worktree that isn't the live one.
-//!
-//! The honest cost of the choice: switching into a worktree you haven't visited yet this run spawns
-//! its processes at that moment, so that one switch is heavier than a plain switch used to be. That
-//! is the same cost the eager design pays, just moved to the moment it buys something.
-//!
-//! ## What restoring can and cannot honestly do
-//!
-//! - A **file tab** is reopened outright. A file deleted or moved since the last session is
-//!   skipped with a real reason ([`crate::root::AdeApp::session_restore_notices`]) - never a
-//!   phantom tab for a path that no longer resolves.
-//! - A **terminal tab** is a fresh shell in the same worktree, in the same slot. A real OS shell
-//!   process cannot survive an app quit and this codebase has no process-reattachment to pretend
-//!   otherwise with, so that is exactly what is claimed and exactly what happens.
-//! - An **agent tab** is restored only as a genuine `claude --resume <session_id>`
-//!   ([`crate::work_surface::agents::Agents::spawn_resume`], GitHub issue #227's real, verified
-//!   resume path) - the same conversation, carried forward. An agent with no recorded session id
-//!   (every Codex agent, since no hooks exist for Codex at all, and any Claude agent that closed
-//!   before a hook reported one) is **not** restored, and says why. Spawning a fresh, contextless
-//!   agent into that slot would look like a restored conversation and be nothing of the kind.
-//!
-//! One tab degrading never fails the rest of the restore - each is decided on its own.
 
 use std::path::{Path, PathBuf};
 
@@ -80,27 +22,6 @@ impl AdeApp {
     /// the write side of this module. Called from every real tab mutation (a file tab opened or
     /// closed, an agent or shell spawned or closed, a drag-reorder) and, as a safety net, from
     /// [`Self::select_worktree`] just before it switches away.
-    ///
-    /// Cheap enough to call that freely: it snapshots an already-in-memory tab order, compares it
-    /// against what is already recorded, and returns without touching the disk at all when nothing
-    /// changed - which is the common case for the safety-net call.
-    ///
-    /// Refuses, deliberately, in three cases:
-    ///
-    /// - No worktree genuinely selected ([`Self::current_worktree_path`] is `None`). There is no such
-    ///   thing as a session belonging to a repo rather than to a worktree, so there is nothing to
-    ///   file it under.
-    /// - This worktree's own session hasn't been restored yet
-    ///   ([`Self::session_restored`]). Until it has, the live tab strip is *not* the truth about
-    ///   this worktree - it is whatever exists before the restore that was about to run - and
-    ///   writing it would erase the session the next selection was going to reopen. This is the
-    ///   real ordering hazard in the whole feature, and this check is where it is closed.
-    /// - `graph`/`review` tabs are dropped from the recorded session rather than persisted. Both
-    ///   are single, window-wide slots ([`Self::graph_tab_open`], [`Self::review_tab_open`]) rather
-    ///   than per-worktree tabs, and a review tab additionally names a live
-    ///   [`crate::work_surface::agents::AgentId`] that no restart can resolve; recording either
-    ///   would mean inventing a per-worktree existence neither actually has. They simply reopen
-    ///   the way they always have, from their own live state.
     pub(crate) fn record_worktree_session(&mut self, cx: &mut Context<Self>) {
         let Some(cwd) = self.current_worktree_path() else {
             return;
@@ -126,12 +47,6 @@ impl AdeApp {
     /// `cwd`'s live tab strip, as the session record that would be written for it - split out of
     /// [`Self::record_worktree_session`] so the mapping from real tabs to persisted ones is one
     /// readable list rather than buried in that method's own guards.
-    ///
-    /// Reads [`Self::combined_tab_order`], not `Agents`/[`Self::open_files`] directly, so the
-    /// recorded order is by construction the order the user actually sees - including a
-    /// drag-chosen interleaving of agents and files, which is the whole thing issue #16 persists
-    /// and which reading the two underlying lists separately would silently flatten back into
-    /// "agents, then files".
     fn session_tabs_for(&self, cwd: &Path) -> Vec<SessionTab> {
         self.combined_tab_order()
             .iter()
@@ -154,18 +69,6 @@ impl AdeApp {
     }
 
     /// The real Claude Code `session_id` currently known for a live agent, or `None`.
-    ///
-    /// Deliberately read out of [`Self::agent_status_state`] - GitHub issue #239 phase 2's
-    /// hook-learned facts, keyed by `crate::review::state::baseline_key` - rather than tracked as a
-    /// second copy on [`crate::work_surface::agents::Agent`]. That store is already the one place
-    /// a session id is ever learned (an agent's own hooks report it), already keyed by exactly the
-    /// three durable facts available here, and already what
-    /// `crate::hooks::flow::AdeApp::resume_past_agent` resumes from - so a session recorded here
-    /// and a session resumed from the rail's history rows can never disagree about what a given
-    /// agent's conversation is.
-    ///
-    /// `None` is a real and common answer, not a failure: a Codex agent has no hooks at all, and a
-    /// Claude agent that has not yet run a single turn has not reported one yet.
     fn live_agent_session_id(
         &self,
         agent: &crate::work_surface::agents::Agent,
@@ -177,34 +80,6 @@ impl AdeApp {
 
     /// Reopens `cwd`'s persisted tab session for real - the read side of this module, and the one
     /// place tabs are ever created from a persisted record.
-    ///
-    /// Called from exactly the two places a worktree becomes genuinely, currently selected:
-    /// [`Self::select_worktree`] (every rail click, and every programmatic selection that goes
-    /// through it) and [`Self::spawn_initial_shell_for_opened_repo`] (a just-opened repo, which
-    /// also covers `current_worktree_path`'s one documented no-usable-worktree last resort). Ordering
-    /// matters at the second: this runs *before* that method's guaranteed initial shell, so a
-    /// worktree whose session already contains a terminal gets its own remembered one back rather
-    /// than that one plus a redundant fresh one - the "already has an agent" check there does the
-    /// rest.
-    ///
-    /// Refuses without marking anything when it is handed a worktree that isn't the live one
-    /// (`cwd != self.file_tree_root`): the file tabs it reopens are stored per worktree keyed by
-    /// exactly that root ([`Self::open_files_mut`]), so restoring against a stale root would file
-    /// one worktree's tabs under another. Refusing rather than marking is what lets the real,
-    /// correctly-ordered call a moment later still do the work.
-    ///
-    /// A no-op for a window with no real persistence at all ([`Self::tab_order_path`] is `None` -
-    /// every GPUI test that hasn't opted into a real settings path), and for a worktree with
-    /// nothing recorded. Neither is an error: a worktree Jerry has never seen has no session, and
-    /// opens exactly as it always has.
-    ///
-    /// One selection path deliberately doesn't reach here: `Self::load_worktrees`'s own
-    /// fall-back-to-main recovery, which re-points [`Self::selected`] from a background task with
-    /// no `&mut Window` to move focus (or spawn anything) with - see that arm's own docs. A
-    /// worktree reached that way keeps its recorded session untouched (the recorder's gate refuses
-    /// a worktree that hasn't been through here) and restores it on the next real selection, which
-    /// is the honest outcome: an external `git worktree remove` is not the user asking to reopen
-    /// somewhere.
     pub(crate) fn restore_worktree_session(
         &mut self,
         cwd: PathBuf,
@@ -344,12 +219,6 @@ impl AdeApp {
 
 /// End-to-end coverage for the real thing this module exists to do: quit Jerry, launch it again,
 /// and get your tabs back.
-///
-/// Every test here performs a genuine relaunch - a second, independently constructed [`AdeApp`]
-/// against the *same* real settings directory, exactly as a real process restart does - rather
-/// than reading the persisted file back and asserting on its contents. The file format already has
-/// its own unit coverage in `crate::work_surface::tab_order_state`; what these prove is that the
-/// live app really writes it, really reads it, and really reopens what it names.
 #[cfg(test)]
 mod session_restore_tests {
     use super::*;
@@ -471,13 +340,6 @@ mod session_restore_tests {
             .collect()
     }
 
-    /// The headline behaviour, end to end: file tabs *and* terminal tabs, in a real drag-chosen
-    /// interleaved order, across two real worktrees - quit, relaunch, and get every one of them
-    /// back, in the same order, under the same worktree.
-    ///
-    /// The interleaving matters specifically: reconstructing "all the agents, then all the files"
-    /// would pass a naive per-kind assertion while silently losing the one thing GitHub issue #16's
-    /// drag order exists to record.
     #[gpui::test]
     fn a_relaunch_reopens_every_file_and_terminal_tab_in_its_real_drag_order(
         cx: &mut TestAppContext,
@@ -500,7 +362,6 @@ mod session_restore_tests {
             app.update_in(cx, |app, window, cx| {
                 app.open_file_view(repo_path.join("a.txt"), window, cx);
                 app.open_file_view(repo_path.join("b.txt"), window, cx);
-                // A second terminal alongside the one every window starts with.
                 app.new_agent(ProcessKind::Shell, window, cx);
             });
             cx.run_until_parked();
@@ -527,7 +388,6 @@ mod session_restore_tests {
                 "premise: launch 1 really has this interleaved strip in the main worktree"
             );
 
-            // A second worktree, with its own separate tab.
             app.update_in(cx, |app, window, cx| {
                 let index = worktree_index(app, &feature);
                 app.select_worktree(index, window, cx);
@@ -558,7 +418,6 @@ mod session_restore_tests {
              stack a third one on top of a restored session that already has terminals"
         );
 
-        // The second worktree's own session comes back on its first real selection, not at launch.
         app.update_in(cx, |app, window, cx| {
             let index = worktree_index(app, &feature);
             app.select_worktree(index, window, cx);
@@ -572,9 +431,6 @@ mod session_restore_tests {
         );
     }
 
-    /// The scope/timing decision made observable: a worktree the user has not gone to yet this
-    /// launch has spawned nothing at all. Restoring every worktree eagerly would show up here as
-    /// the feature worktree's terminal already running before it was ever selected.
     #[gpui::test]
     fn an_unvisited_worktrees_session_costs_nothing_until_it_is_really_selected(
         cx: &mut TestAppContext,
@@ -588,7 +444,6 @@ mod session_restore_tests {
         {
             let (app, cx) = launch(cx, Some(repo_path.clone()), settings_path.clone());
             cx.run_until_parked();
-            // Give the feature worktree two real terminals of its own.
             app.update_in(cx, |app, window, cx| {
                 let index = worktree_index(app, &feature);
                 app.select_worktree(index, window, cx);
@@ -643,8 +498,6 @@ mod session_restore_tests {
         );
     }
 
-    /// A file deleted between sessions must degrade to exactly one missing tab, with a real
-    /// reason - never a panic, and never a phantom tab for a path that no longer resolves.
     #[gpui::test]
     fn a_file_deleted_between_sessions_is_skipped_with_a_real_reason(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
@@ -685,14 +538,6 @@ mod session_restore_tests {
         );
     }
 
-    /// The agent half, and the part that makes it worth doing at all: a Claude agent whose real
-    /// `session_id` was captured last session comes back as a genuine
-    /// `claude --resume <session_id>` - the same conversation, not a fresh one in the same slot.
-    ///
-    /// Asserted against the restored pane's real [`crate::terminal::pane::TerminalSpec`], mirroring
-    /// `crate::work_surface::render`'s own `spawn_resume_prepends_resume_ahead_of_the_real_hook_
-    /// injection` - the same way GitHub issue #227's resume proves continuity, since the argument
-    /// list is what the `claude` binary itself acts on.
     #[gpui::test]
     fn a_claude_agent_is_restored_by_a_real_resume_carrying_its_own_session_id(
         cx: &mut TestAppContext,
@@ -776,13 +621,6 @@ mod session_restore_tests {
         );
     }
 
-    /// The honest failure the request asks for: an agent with no resumable session id (every Codex
-    /// agent - no hooks exist for it at all - and any Claude agent that closed before one was ever
-    /// reported) is **not** restored, and says why. Spawning a fresh agent into that slot would
-    /// look like a restored conversation and be nothing of the kind.
-    ///
-    /// The rest of the session must survive the refusal - that is the "degrade a single tab, don't
-    /// fail the whole restore" half.
     #[gpui::test]
     fn an_agent_with_no_resumable_session_is_refused_honestly_and_alone(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
@@ -850,11 +688,6 @@ mod session_restore_tests {
         );
     }
 
-    /// "Relaunch Jerry" (no CLI argument at all - the real process-launch path) must land back in
-    /// the worktree you were actually last working in, with its tabs, rather than in the main
-    /// checkout with someone else's. Without the per-repo
-    /// [`crate::rail::repo::RepoRecord::selected_worktree`] memory this whole feature would only
-    /// pay off after the user manually clicked the right rail row.
     #[gpui::test]
     fn relaunching_with_no_cli_argument_lands_back_in_the_last_worktree_with_its_tabs(
         cx: &mut TestAppContext,
@@ -877,7 +710,6 @@ mod session_restore_tests {
             cx.run_until_parked();
         }
 
-        // No CLI argument: the real "just launch Jerry again" gesture.
         let (app, cx) = launch(cx, None, settings_path);
         cx.run_until_parked();
 
@@ -897,10 +729,6 @@ mod session_restore_tests {
         );
     }
 
-    /// An explicitly named path is a real statement about where to work, and must win over the
-    /// remembered worktree - the deliberate other half of the decision the previous test covers.
-    /// Silently opening a different worktree because it was the last one visited would be
-    /// overriding the user, not helping them.
     #[gpui::test]
     fn an_explicitly_named_path_still_wins_over_the_remembered_worktree(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
@@ -929,9 +757,6 @@ mod session_restore_tests {
         );
     }
 
-    /// The multi-repo reading of "everything should reopen": quit with two real repos open, each
-    /// with its own tabs, relaunch, and both are back - the focused one immediately, the other the
-    /// moment the user goes to it.
     #[gpui::test]
     fn both_repos_tab_sessions_survive_a_relaunch(cx: &mut TestAppContext) {
         let (_repo_a, repo_a) = init_repo();
@@ -948,7 +773,6 @@ mod session_restore_tests {
                 app.open_file_view(repo_a.join("in-a.txt"), window, cx);
             });
             cx.run_until_parked();
-            // A real second repo, opened in the same window exactly as "Open Folder…" does.
             app.update_in(cx, |app, window, cx| {
                 app.open_repo_in_current_window(repo_b.clone(), window, cx);
             });
@@ -994,9 +818,6 @@ mod session_restore_tests {
         );
     }
 
-    /// The other direction, and the reason the recorder is wired into every close path: a tab the
-    /// user deliberately closed must stay closed across a relaunch. A restore that only ever added
-    /// tabs would quietly resurrect them forever.
     #[gpui::test]
     fn a_deliberately_closed_tab_stays_closed_across_a_relaunch(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();

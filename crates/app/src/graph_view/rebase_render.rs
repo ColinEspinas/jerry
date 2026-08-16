@@ -52,13 +52,6 @@ impl gpui::Render for DraggedRebaseRow {
 
 /// Design spec §1.4's footer hint strip, verbatim and in order:
 /// `alt+↑↓ reorder · P pick · S squash · D drop · mod+enter start`.
-///
-/// Authored as `crate::keymap` spec strings, never as literal glyphs, so every one of them
-/// renders through `crate::keymap::resolve_combo` and picks up the platform's own modifier
-/// exactly like every other keycap in the app. Each spec is the real, registered keystroke of the
-/// matching action in `crate::default_key_bindings` - `"P"`/`"S"`/`"D"` are shown uppercase (a
-/// keycap is a key, not a character) while the binding itself is the unmodified letter, the same
-/// way `Jerry.dc.html`'s own reference footer prints them.
 const REBASE_FOOTER_HINTS: [(&str, &str); 5] = [
     ("alt+\u{2191}\u{2193}", "reorder"),
     ("P", "pick"),
@@ -117,9 +110,6 @@ pub(crate) struct RebaseActionStyle {
 /// surface that colours by action reads it - the chip, its dropdown option's label, and §1.4's
 /// fold elbow, whose stroke is specified as "a 1px elbow **in the action's colour**" - so those
 /// three can never drift into disagreeing about what `squash` looks like.
-///
-/// Returns `theme::ColorToken`s rather than resolved `Rgba`s deliberately: a token is what a real
-/// theme can retint, and it is also what [`rebase_action_palette_tests`] can compare exactly.
 pub(crate) fn rebase_action_style(action: RebaseActionKind) -> RebaseActionStyle {
     let (fg, bg, border) = match action {
         RebaseActionKind::Pick => (
@@ -233,13 +223,6 @@ impl AdeApp {
 
     /// Design spec §1.4's **Footer**, 28 high: the keycap hints, a flex spacer, §1.5's
     /// `pauses here` legend, then §1.1's order note.
-    ///
-    /// A real pinned band (`flex_none`, a sibling of the scroller - not a child of it). GitHub
-    /// issue #304's actual bug: the order note used to be appended *inside*
-    /// [`Self::render_rebase_plan_rows`]' `overflow_y_scroll` container, so on any plan long
-    /// enough to scroll it left the screen exactly when it mattered - and §1.1 is explicit that
-    /// this note is the whole mitigation for the plan running oldest-first against a
-    /// newest-first graph ("do not drop it").
     fn render_rebase_plan_footer(&self) -> gpui::AnyElement {
         let macos = self.window_controls_style().is_macos();
         div()
@@ -841,14 +824,6 @@ impl AdeApp {
     /// follows that row for free when the plan list scrolls - see
     /// `crate::graph_view::render::render_graph_row_menu`'s own docs for why *that* popover needs
     /// the heavier window-space mechanism instead).
-    ///
-    /// Painted through `gpui::deferred`, which is the whole reason that nesting is viable. The
-    /// menu genuinely does escape its own row's box (274 × six rows, against a 28-high row), and
-    /// an ordinary `.absolute()` child is still painted in its parent's turn - so every *later*
-    /// plan row drew straight over the top of it. That was live-reproduced on a real build of
-    /// this branch and is exactly what §1.4's own "menu at z-index 30" asks not to happen;
-    /// `deferred` defers the child's paint until after every ancestor has drawn, keeping its
-    /// layout (and therefore its scroll-following anchor) exactly where it is.
     fn render_rebase_action_menu(
         &self,
         index: usize,
@@ -1265,11 +1240,6 @@ fn render_rebase_stop_count_warning(rebase_state: &RebaseModeState) -> Option<gp
 
 /// Design spec §1.7's warning row, verbatim: "one row each (5px square · title 11px/450 `#c2c7cc`
 /// · body 10.5px/15 `#767d84` · optional action)".
-///
-/// GitHub issue #305: this used to be a single flex row with one text child - no square, no
-/// title/body split (the two were concatenated into one sentence), and `theme::status::ASK` for
-/// **all three** warnings regardless of what they meant. `dot` is now the caller's own severity,
-/// which is what carries §1.7's deliberate amber → blue → grey gradient.
 fn render_rebase_warning_shell(kind: RebaseWarningKind, title: String, body: String) -> gpui::Div {
     let slug = kind.slug();
     div()
@@ -1338,12 +1308,6 @@ enum RebaseButtonStyle {
 /// render_rebase_banner_actions`'s own docs) - a disabled button renders dimmed, with no
 /// `cursor_pointer`, and (the caller's own job - see that method) no `.on_click` attached at all,
 /// so it is genuinely inert, not just styled to look that way.
-///
-/// `keycaps` are already platform-resolved (`crate::keymap::resolve_combo`) and render through
-/// `crate::root::widgets::render_action_keycap_row`, the shared helper whose whole purpose is a
-/// keycap tinted by its own button rather than by the neutral chrome palette - §1.2's "in the
-/// button's own border colour", and the same treatment the work surface's `Keep all ⌘⏎` already
-/// uses.
 fn render_rebase_button(
     label: &'static str,
     style: RebaseButtonStyle,
@@ -1418,22 +1382,6 @@ fn render_rebase_button(
 /// above's edge, `bottom:13` so it lands on the chip centreline, `border-left` + `border-bottom`,
 /// 5px corner radius. Reads up-and-left into the commit being folded into. **Same vocabulary as
 /// the graph's merge elbows**."
-///
-/// That last sentence is why this is a real drawn box rather than the mono `└` glyph it replaced:
-/// `crate::graph_view::render`'s own merge connectors are `border_l + border_b +
-/// rounded_bl(theme::graph::ELBOW_RADIUS)` boxes, and this reuses exactly that construction (and
-/// exactly that radius constant) so a fold really does read as the same kind of mark as a merge,
-/// not as a lookalike drawn a second way.
-///
-/// One deliberate deviation from §1.4's literal "1px": the stroke is
-/// [`theme::graph::LINE_WIDTH`], the same width the graph's own elbows moved to for GitHub issue
-/// #346 (1px borders render broken/dimmed at fractional display scale factors - see that
-/// constant's docs). The spec's own "same vocabulary as the graph's merge elbows" is the clause
-/// that has to win when the two conflict.
-///
-/// A non-folding row gets a **zero-width** slot, not an empty fixed one - that is what makes a
-/// `squash`/`fixup` row genuinely indent 20 under the commit it folds into (§4's checklist item),
-/// rather than sitting at the same x as every `pick` row with a glyph in a slot they all share.
 fn render_rebase_fold_elbow(
     index: usize,
     folded: bool,
@@ -1469,10 +1417,6 @@ fn render_rebase_fold_elbow(
 /// Design spec §1.3's column header, 22 high: `action` 104 (13 left pad, clearing the rows' 2px
 /// selection edge) · `commit` flex · `files` 62 right · `sha` 62 right · **pause column 22,
 /// carrying an outlined 5px square** as its label.
-///
-/// That last cell is the other half of §1.5's "one column, one legend" (GitHub issue #304): the
-/// mark appears here as the column's own name and once more in the footer as `pauses here`, so no
-/// row ever has to carry the word.
 fn render_rebase_column_header() -> gpui::AnyElement {
     // The exact same label treatment `render_graph_header`'s own inner `label` helper uses
     // (§1.3: "Same treatment as the graph's header") - 9px/450 Plex Sans, uppercased in code
@@ -1545,10 +1489,6 @@ fn render_rebase_column_header() -> gpui::AnyElement {
 /// the rebase actually stopped. `edit`'s and a message-less `reword`'s planned/actual markers
 /// render identically - the design spec itself says the visual distinction between the two
 /// `StopReason`s isn't load-bearing.
-///
-/// The footer's own `pauses here` legend renders the outlined variant through this very function
-/// rather than hand-drawing a second square, so the legend can never come to mean a mark the
-/// column no longer paints.
 fn render_rebase_pause_marker(planned: bool, actual: bool) -> gpui::AnyElement {
     if !planned && !actual {
         return gpui::Empty.into_any_element();
@@ -1653,7 +1593,6 @@ mod rebase_flow_tests {
     ) {
         let (_repo, app, cx) = open_seeded_graph(cx);
 
-        // Real right-click on row 2 (`base`, the oldest commit) opens its row menu.
         let row = cx
             .debug_bounds("graph-row-2")
             .expect("row 2 must be painted");
@@ -1853,16 +1792,6 @@ mod rebase_flow_tests {
 
     // --- The derived Result list is checked against what real git actually produces -------------
 
-    /// Design spec §1.6 / GitHub issue #242's own checklist: `N -> M commits` and the whole
-    /// Result list are "derived by walking the plan (drop skips, squash/fixup fold into the
-    /// previous entry, everything else appends) - never authored".
-    ///
-    /// `super::rebase`'s own unit tests already prove that derivation is *internally* consistent.
-    /// They cannot prove it is *true*, because they never run git: a derivation that drifted from
-    /// git's real interactive-rebase semantics would still agree with itself. This test closes
-    /// that gap by checking the derived blocks against the real history a real `git rebase`
-    /// actually produces from the very same plan - every one of the six actions exercised at
-    /// once, both fold verbs included.
     #[gpui::test]
     fn the_derived_result_blocks_match_the_real_history_a_real_rebase_produces(
         cx: &mut TestAppContext,
@@ -1887,7 +1816,6 @@ mod rebase_flow_tests {
         });
         cx.run_until_parked();
 
-        // The graph walks newest first, so row 6 is `base` - the real `onto` this plan bases on.
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(6, cx);
         });
@@ -2027,12 +1955,6 @@ mod rebase_flow_tests {
 
     // --- A reword message supplied up front removes the pause for real --------------------------
 
-    /// Design spec §1.5's central claim, and GitHub issue #242's own checklist item: "supplying a
-    /// reword message removes that pause from the plan, the mark, and the count". The existing
-    /// coverage supplies a message only *after* a real stop has already happened; this proves the
-    /// up-front case the design actually argues for - "the whole plan, messages included, can be
-    /// settled before anything runs" - all the way through to real git never handing control back
-    /// at all.
     #[gpui::test]
     fn a_reword_message_supplied_before_start_runs_straight_through_with_no_stop(
         cx: &mut TestAppContext,
@@ -2042,7 +1964,6 @@ mod rebase_flow_tests {
             app.enter_rebase_mode(2, cx);
         });
         cx.run_until_parked();
-        // Row 1 (`third`) - the plan's newest row, so it lands as the real final `HEAD`.
         app.update_in(cx, |app, _window, cx| {
             app.set_rebase_row_action(1, super::rebase::RebaseActionKind::Reword, cx);
         });
@@ -2389,12 +2310,6 @@ mod rebase_flow_tests {
         }
     }
 
-    /// GitHub issue #242 phase B review fix #1 - real, independently reproduced: switching
-    /// worktrees in the rail while rebase mode was live used to leave `graph_state.rebase`
-    /// (and any paused agent) pointed at the worktree that had just stopped being
-    /// `self.diff_root`, so every subsequent click silently ran real git against the wrong
-    /// worktree. `Self::select_worktree` -> `Self::reset_repo_scoped_state` must leave the mode
-    /// outright (real agent resume included) the instant that switch happens.
     #[gpui::test]
     fn switching_worktrees_while_rebase_mode_is_live_leaves_the_mode_and_resumes_paused_agents(
         cx: &mut TestAppContext,
@@ -2457,7 +2372,6 @@ mod rebase_flow_tests {
             );
         });
 
-        // The real rail gesture: select the *other* worktree.
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
         });
@@ -2472,14 +2386,6 @@ mod rebase_flow_tests {
         wait_for_proc_state_not(pid, "T");
     }
 
-    /// GitHub issue #242 phase B review fix #2 - real, independently reproduced: `Continue`/
-    /// `Skip` had no `op_in_flight` guard, so a second click (here, a real `Skip` fired right
-    /// after a real `Continue`, both before the first's own background call resolves) could run
-    /// concurrently with the first's still-in-flight real `wt_core::rebase` call. Proven here by
-    /// a real, materially different final result if the guard is missing: an unguarded `Skip`
-    /// racing a real `Continue` from an `edit` stop would really drop the plan's next commit from
-    /// history; with the guard, `Skip` is refused outright and the plan completes with every real
-    /// commit intact.
     #[gpui::test]
     fn a_second_op_click_while_the_first_is_still_in_flight_is_refused_not_raced(
         cx: &mut TestAppContext,
@@ -2529,13 +2435,6 @@ mod rebase_flow_tests {
         );
     }
 
-    /// GitHub issue #242 phase B review fix #3 - real, independently reproduced: `Cancel` had no
-    /// `op_in_flight` guard at all, so clicking it while `Start rebase`'s real subprocess was
-    /// still running dropped `graph_state.rebase` out from under it, leaving the repository
-    /// genuinely mid-rebase with no banner left to recover it from. Proven here: a real `Cancel`
-    /// click fired immediately after `Start`, before its own background call resolves, must be a
-    /// no-op - the real outcome still lands and rebase mode is left through the genuine
-    /// `Completed` path, not silently discarded.
     #[gpui::test]
     fn cancel_is_refused_while_start_rebase_is_in_flight_and_the_real_outcome_still_lands(
         cx: &mut TestAppContext,
@@ -2600,10 +2499,6 @@ mod rebase_flow_tests {
         );
     }
 
-    /// GitHub issue #242 phase B review fix #5(a) - real, independently reproduced: closing the
-    /// graph tab outright while rebase mode was live used to drop `graph_state.rebase` (and any
-    /// paused agent) directly, with no real resume - the only surface that could trigger one had
-    /// just been removed.
     #[gpui::test]
     fn closing_the_graph_tab_mid_rebase_resumes_a_paused_agent(cx: &mut TestAppContext) {
         let (repo, app, cx) = open_seeded_graph(cx);
@@ -2716,13 +2611,6 @@ mod rebase_flow_tests {
 
     // --- Design spec §1.3/§1.4/§1.5's real geometry (GitHub issues #303, #304) ---------------
 
-    /// GitHub issue #303, both halves: a `squash`/`fixup` row really indents 20 under the commit
-    /// it folds into, and the mark it carries is a real drawn elbow, not a mono `└` glyph
-    /// sitting in a slot every row shares.
-    ///
-    /// Measured against the *same* row before and after a real action change, the way
-    /// `crate::graph_view::render::graph_selection_render_tests` measures its own no-shift
-    /// claim - so this is about that row moving, not about two different rows differing.
     #[gpui::test]
     fn a_fold_row_indents_its_chip_by_twenty_and_paints_a_real_elbow(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -2791,13 +2679,6 @@ mod rebase_flow_tests {
         );
     }
 
-    /// GitHub issue #304's headline bug: the order note (§1.1 calls it "the whole mitigation -
-    /// do not drop it") lived *inside* the scrolling row list, so it left the screen on exactly
-    /// the long plans where oldest-vs-newest confusion matters.
-    ///
-    /// Asserted structurally rather than by scrolling: the note is painted **below** the
-    /// scroller's own bottom edge, which is only possible if it is a sibling band rather than
-    /// scrollable content. A plan long enough to overflow makes that a real distinction.
     #[gpui::test]
     fn the_order_note_lives_in_a_pinned_footer_below_the_scrolling_plan_list(
         cx: &mut TestAppContext,
@@ -2806,7 +2687,6 @@ mod rebase_flow_tests {
         git(repo.path(), &["init", "-b", "main"]);
         git(repo.path(), &["config", "user.email", "test@example.com"]);
         git(repo.path(), &["config", "user.name", "Test User"]);
-        // Far more rows than any test window is tall, so the list genuinely scrolls.
         for n in 0..40 {
             commit(
                 repo.path(),
@@ -2858,8 +2738,6 @@ mod rebase_flow_tests {
         }
     }
 
-    /// §1.5's "one column, one legend": the mark is named once as the column header's own label
-    /// and once in the footer, and no row ever carries the word.
     #[gpui::test]
     fn the_pause_column_is_legended_in_the_header_and_once_more_in_the_footer(
         cx: &mut TestAppContext,
@@ -2907,8 +2785,6 @@ mod rebase_flow_tests {
 
     // --- The action menu (GitHub issue #302) ---------------------------------------------------
 
-    /// §1.4's action menu: 274 wide, one hint line per action, and a ✓ on the current one. It
-    /// used to be a 90-wide list of bare labels with no hint, no mark and no highlight.
     #[gpui::test]
     fn the_action_menu_is_274_wide_and_paints_all_six_actions(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -2962,7 +2838,6 @@ mod rebase_flow_tests {
             );
             option_bounds.push(bounds);
         }
-        // The menu opens *below* its own row and never over it (§1.4 asks for this explicitly).
         let row = cx
             .debug_bounds("rebase-plan-row-0")
             .expect("row 0 must be painted");
@@ -2976,8 +2851,6 @@ mod rebase_flow_tests {
 
     // --- The real keyboard bindings behind §1.4's footer hints (GitHub issue #304) -------------
 
-    /// A real keystroke, on a real focused surface, really changing the plan - the footer's
-    /// `S squash` keycap is only honest if this passes.
     #[gpui::test]
     fn pressing_the_footers_own_letter_really_changes_the_selected_rows_action(
         cx: &mut TestAppContext,
@@ -2988,7 +2861,6 @@ mod rebase_flow_tests {
         });
         cx.run_until_parked();
 
-        // Select row 1 by a real click on it, exactly as a user would.
         let row = cx
             .debug_bounds("rebase-plan-row-1")
             .expect("row 1 must be painted");
@@ -3050,9 +2922,6 @@ mod rebase_flow_tests {
         });
     }
 
-    /// `alt+↑↓ reorder` - the keyboard twin of the drag handle, with the selection following the
-    /// row it moved (otherwise a held `alt+↑` would walk the selection down the plan while
-    /// shuffling a different row each press).
     #[gpui::test]
     fn alt_arrow_really_reorders_the_selected_row_and_the_selection_follows_it(
         cx: &mut TestAppContext,
@@ -3106,10 +2975,6 @@ mod rebase_flow_tests {
         });
     }
 
-    /// The `&& !text-input` conjunct on those bindings, proven the only way that matters: typing
-    /// the letter `p` into a real, focused `reword` message field must type a `p`, not silently
-    /// rewrite that row's action to `pick`. GPUI dispatches a matching `KeyBinding` *before* any
-    /// `on_key_down` listener, so without the conjunct this is exactly what would happen.
     #[gpui::test]
     fn typing_into_a_reword_field_never_fires_the_plans_own_letter_shortcuts(
         cx: &mut TestAppContext,
@@ -3164,9 +3029,6 @@ mod rebase_flow_tests {
 
     // --- The warning stack and the stopped strip (GitHub issue #305) ---------------------------
 
-    /// §1.7's row construction: a severity square, a title and a body, as three real elements -
-    /// the stack used to be one flex row with the title and body concatenated into one sentence
-    /// and no square at all.
     #[gpui::test]
     fn each_warning_row_paints_a_real_dot_title_and_body(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -3174,7 +3036,6 @@ mod rebase_flow_tests {
             app.enter_rebase_mode(2, cx);
         });
         cx.run_until_parked();
-        // A real `edit` row makes §1.7's third warning (the stop count) genuinely non-zero.
         app.update_in(cx, |app, _window, cx| {
             app.set_rebase_row_action(0, super::rebase::RebaseActionKind::Edit, cx);
         });
@@ -3202,9 +3063,6 @@ mod rebase_flow_tests {
         );
     }
 
-    /// §1.8's strip, structurally: the 5px amber square it was missing entirely, alongside the
-    /// progress text. (Its *colour* moving off `status::FAIL`'s red onto the needs-input amber
-    /// is asserted where colour can honestly be asserted - see `rebase_design_tests`' own docs.)
     #[gpui::test]
     fn the_stopped_strip_paints_the_amber_square_the_spec_asks_for(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3267,13 +3125,6 @@ mod rebase_flow_tests {
 }
 
 /// The design spec's own tables, asserted as tables (GitHub issues #302 and #305).
-///
-/// Deliberately pure `#[test]`s over the real functions the renderer itself calls, not
-/// `#[gpui::test]`s: this test harness has no way to read a painted quad's colour back, so a
-/// "the chip is really green" claim can only be made honestly one layer down - at the single
-/// function every call site resolves its colours through. The structural half of those issues
-/// (there really is an elbow, there really is a dot/title/body) is asserted against real painted
-/// bounds in [`rebase_flow_tests`] instead.
 #[cfg(test)]
 mod rebase_design_tests {
     use super::rebase::RebaseActionKind;
@@ -3282,9 +3133,6 @@ mod rebase_design_tests {
 
     /// `revision 5/REVISION-2026-08-12.md` §1.4's action table, transcribed here as data so a
     /// drift in either direction is a failing assertion rather than a review catch.
-    ///
-    /// | Action | fg | bg | border |
-    /// |---|---|---|---|
     fn spec_action_table() -> Vec<(RebaseActionKind, u32, u32, u32)> {
         vec![
             (RebaseActionKind::Pick, 0xa9b0b7, 0x1c2023, 0x2a2f34),
@@ -3321,12 +3169,6 @@ mod rebase_design_tests {
         }
     }
 
-    /// GitHub issue #302's actual complaint: every chip rendered one neutral colour, so "the
-    /// colour-coding the design leans on carries no information at all". Six distinct
-    /// foregrounds is exactly the property that was missing - and the two folding verbs sharing
-    /// a *background* while differing in foreground is §1.4's own deliberate choice ("the two
-    /// folding actions share a hue because they do the same thing to history; `squash` is the
-    /// brighter of the pair"), asserted here rather than left to look like an oversight.
     #[test]
     fn no_two_actions_are_the_same_colour_and_the_two_folding_verbs_share_a_background() {
         let mut seen: Vec<gpui::Rgba> = Vec::new();
@@ -3351,8 +3193,6 @@ mod rebase_design_tests {
         );
     }
 
-    /// §4's checklist item "menu hints one line each", as data - the menu used to render a bare
-    /// `kind.label()` with no hint at all.
     #[test]
     fn every_action_has_the_design_specs_own_one_line_menu_hint() {
         let expected = [
@@ -3374,8 +3214,6 @@ mod rebase_design_tests {
         }
     }
 
-    /// GitHub issue #305: the warning stack rendered `theme::status::ASK` for all three rows, so
-    /// §1.7's deliberate amber → blue → grey gradient was flat.
     #[test]
     fn the_three_warning_severities_are_three_genuinely_different_colours() {
         let expected = [
@@ -3395,10 +3233,6 @@ mod rebase_design_tests {
         }
     }
 
-    /// The strongest guard the footer band can carry (GitHub issue #304): every keycap it paints
-    /// names a keystroke that a real, registered `gpui::KeyBinding` really answers to. A hint
-    /// strip is worse than no hint strip if it advertises shortcuts that do nothing, and this
-    /// surface genuinely registered no action at all before this change.
     #[test]
     fn every_footer_keycap_hint_is_backed_by_a_really_registered_binding() {
         // Each footer hint, paired with the real action name(s) and registered keystroke(s) it

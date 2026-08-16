@@ -1,23 +1,4 @@
 //! The title-bar band: everything about one feature, in one folder.
-//!
-//! Unlike the pure-logic/rendering split every other feature folder uses, this one is a
-//! rendering subsystem throughout (there is no window-free decision logic behind a title
-//! bar); it is split by what a reader is actually looking for:
-//!
-//! - [`render`] - the band itself: the macOS traffic-light cluster, the Windows/Linux
-//!   caption buttons, and the left/right cluster composition.
-//! - [`menu`] - the Windows/Linux `File Edit View Agent Help` dropdowns: which rows each
-//!   one offers and what real `AdeApp` method each row calls.
-//! - [`menu_model`] - the pure-data command model ([`menu_model::MenuCommand`],
-//!   [`menu_model::MenuRow`]) both [`menu`]'s popover and `native_menu`'s real macOS menu
-//!   render from, so the two can never silently offer two different command sets (GitHub issue
-//!   #235).
-//! - `native_menu` (macOS only) - the real `NSApp.mainMenu`, built from [`menu_model`] and
-//!   installed via `gpui::App::set_menus` in `crate::run`.
-//!
-//! Both glob-import this module (`use super::*`), which is why the shared imports they need
-//! live here rather than at the top of each file - the same convention `crate::root`
-//! established for its own submodules.
 
 #[cfg(test)]
 use crate::code_surface::edit_buffer;

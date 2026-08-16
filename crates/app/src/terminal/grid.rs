@@ -1,142 +1,4 @@
 //! ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
-//!
-//! ## Why this replaced `ansi.rs`'s hand-rolled scanner
-//!
-//! Step 3's `ansi::TerminalBuffer` recognized and dropped CSI/OSC escape sequences rather than
-//! interpreting them, so it had no notion of cursor position: a full-screen, cursor-addressed
-//! program (`vim`, `htop`, or an interactive agent CLI that redraws its UI in place) would
-//! render as a garbled stream of raw draw commands instead of a clean, in-place-updating
-//! screen. This module drives `alacritty_terminal::Term` - the same crate/rev `vendor/zed`'s
-//! own `terminal` crate uses (`vendor/zed/Cargo.toml`, pinned identically here) - instead of a
-//! plain-text scan.
-//!
-//! ## API surface, verified against the pinned rev's real source
-//!
-//! Every signature below was checked against the fetched dependency source at
-//! `~/.cargo/git/checkouts/alacritty-*/*/alacritty_terminal/src/`, since Zed's own
-//! `vendor/zed/crates/terminal/src/alacritty.rs` wraps these through Zed-specific types:
-//! - `Term::new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T>`
-//!   (`term/mod.rs:410`) and `Term::resize<S: Dimensions>(&mut self, size: S)`
-//!   (`term/mod.rs:655`). `Dimensions` (`grid/mod.rs:486`) needs only `total_lines`/
-//!   `screen_lines`/`columns` - see [`GridSize`].
-//! - `Term<T>` only requires `T: EventListener` for `renderable_content`/the `Handler` impl.
-//!   This pane polls the grid directly every tick (see `crate::terminal::pane`'s poll loop)
-//!   rather than reacting to most events (bell, clipboard, ...), which [`TermEventSink`] does
-//!   still drop. `Event::PtyWrite` and `Event::Title`/`Event::ResetTitle` are the real
-//!   exceptions - see that type's own docs for why each is captured.
-//! - Feeding bytes: `Processor::<StdSyncHandler>::advance(&mut self, handler: &mut H, bytes:
-//!   &[u8]) where H: Handler` (`vte-0.15.0/src/ansi.rs:298`); `Term<T: EventListener>`
-//!   implements `Handler`. `alacritty_terminal` re-exports its exact `vte` dependency as
-//!   `alacritty_terminal::vte`, so this crate depends on `alacritty_terminal` alone rather than
-//!   also pinning a separate top-level `vte` that could drift out of lockstep with it.
-//! - Reading the grid: `Term::renderable_content(&self) -> RenderableContent<'_>` whose
-//!   `display_iter` yields `Indexed<&Cell> { point: Point, cell: &Cell }` for exactly the
-//!   visible viewport (at `display_offset == 0`: `point.line` ranges `0..screen_lines`,
-//!   `point.column` ranges `0..columns`) - not the whole scrollback. `Cell`'s real fields are
-//!   `c: char, fg: Color, bg: Color, flags: Flags, extra: ...` (`term/cell.rs:134`).
-//!
-//! ## Scrollback (GitHub issue #331)
-//!
-//! `Term` retains scrollback history (`Config::scrolling_history`, default 10000 lines) - this
-//! used to go entirely unused: `display_iter` was only ever read at `display_offset == 0` (the
-//! live viewport), and nothing here ever called `Term::scroll_display`. [`TerminalGrid::
-//! scroll_display`] is the real fix: a thin wrapper over it, taking this module's own
-//! [`ScrollAmount`] rather than leaking `alacritty_terminal::grid::Scroll` across the module
-//! boundary (the same convention [`CellSide`]/[`CellPosition`] already follow).
-//! `crate::terminal::pane` drives it from a real `on_scroll_wheel` handler and PageUp/PageDown
-//! keys - see that module's own docs for the input side.
-//!
-//! `display_iter` itself needed no change for this: `Grid::display_iter` already yields
-//! `Indexed<Point>`s whose `point.line` is relative to the *viewport*, not the underlying grid -
-//! at `display_offset > 0` those points simply run negative for the (now-visible) history rows
-//! above the live screen. [`Self::visible_rows`] shifts every yielded `point.line` by the real
-//! `display_offset` (`RenderableContent::display_offset`, `Term`'s own field, never a second
-//! copy) before indexing into the row `Vec`, which is the one line that changed there - verified
-//! against the real, pinned rev's source at `grid/mod.rs:422-427`'s own `display_iter` doc
-//! comment ("Iterate over all visible cells").
-//!
-//! **Staying put when new output arrives while scrolled back** needs no bookkeeping here either:
-//! `alacritty_terminal`'s own `Grid::scroll_up` (the internal call every newline past the bottom
-//! row makes) already increments `display_offset` by the same number of lines the screen just
-//! scrolled by, *whenever* `display_offset != 0` (`grid/mod.rs:262-265`, verified against the
-//! pinned rev) - so a caller sitting in history keeps looking at the exact same historical lines
-//! as new output arrives underneath, rather than being yanked back to the live tail. This is the
-//! same convention every real terminal emulator (iTerm2, Alacritty itself, Windows Terminal)
-//! follows, and it falls out of not fighting `Term`'s own state rather than anything this module
-//! added.
-//!
-//! **The alt screen has no scrollback of its own.** `Term::swap_alt` (entering `vim`/`less`/an
-//! agent CLI's full-screen UI) swaps in a second `Grid` constructed with `history_size: 0`
-//! (`Term::new`, `term/mod.rs:412-413` - see this module's own "API surface" section above), so
-//! [`Self::scroll_history_len`] is naturally `0` there and [`Self::scroll_display`] is a
-//! real no-op: a mouse-wheel/PageUp that reaches a full-screen program does nothing to this
-//! app's own view, exactly as if scrollback genuinely didn't exist for the duration of the alt
-//! screen - no special-casing needed, since `alacritty_terminal`'s own `Scroll::Delta`/`PageUp`/
-//! `PageDown` clamp to `history_size()` internally (`grid/mod.rs:163-172`).
-//!
-//! ## Scope cut: no OSC 4/10/11 customization
-//!
-//! `Term::colors` (a palette OSC 4/10/11 sequences can override) starts out entirely `None` and
-//! this module never populates or consults it. A program that repalettes its own colors via OSC
-//! renders with the theme's palette instead.
-//!
-//! ## The palette is the caller's, not this module's (GitHub issue #208)
-//!
-//! Named/indexed colors resolve against a [`TerminalPalette`] the caller passes into
-//! [`TerminalGrid::visible_rows`], plus the standard xterm 256-color cube/grayscale formulas for
-//! `Color::Indexed(16..=255)` (matching `vendor/zed/crates/terminal/src/terminal.rs`'s
-//! `get_color_at_index`/`rgb_for_index`, a public xterm convention).
-//!
-//! Those sixteen-plus-four colors used to be hardcoded module constants, which is why the terminal
-//! rendered as one fixed set of VS Code default values regardless of which of this app's six themes
-//! was selected. They are now real, registered `crate::theme::terminal` tokens - but this module
-//! deliberately does not read them itself. It stays entirely free of `gpui::Window`/theme access
-//! (the same pure-module discipline `crate::code_surface::fold` keeps, and for the same reason:
-//! grid state and color resolution have to stay unit-testable with no real GPUI window), so
-//! resolving the live theme is `crate::terminal::pane`'s job - it has the theme at paint time -
-//! and this module only consumes the already-resolved RGB it hands over.
-//!
-//! ## Double-width characters (GitHub issue #211)
-//!
-//! `alacritty_terminal` already tracks, per cell, whether a character is double-width - a CJK
-//! ideograph, most emoji, anything `unicode-width` reports as two columns. Verified against the
-//! pinned rev's real source (`term/mod.rs:1103-1130`, `Term::input`): a wide character is written
-//! into its own cell with `Flags::WIDE_CHAR` set, and the *next* cell is then written with a
-//! literal `' '` and `Flags::WIDE_CHAR_SPACER` set. That spacer is a placeholder holding the
-//! second column the glyph occupies, not a character of its own - `Term::line_to_string`
-//! (`term/mod.rs:605`) skips it when building selection/clipboard text, and no real terminal
-//! paints it.
-//!
-//! Neither flag used to be read here at all, so [`GridCell`] had no way to tell the renderer any
-//! of that apart: a row containing `你好` reached `crate::terminal::pane` as the four cells
-//! `['你', ' ', '好', ' ']`, which it painted as four glyph advances of ordinary monospace text -
-//! the two wide glyphs each taking roughly two advances of their own, plus two stray spaces, so
-//! everything after them on the row sat two columns too far right. [`CellWidth`] is what closes
-//! that: see its own docs, and `crate::terminal::pane::row_runs` for what the renderer does with
-//! it.
-//!
-//! Not covered: zero-width characters (combining marks, variation selectors, ZWJ) that
-//! `alacritty_terminal` stacks onto a cell's `Cell::zerowidth()` side-channel rather than into
-//! `Cell::c`. [`GridCell`] still carries exactly one `char` per cell, so those are dropped -
-//! `e` + U+0301 renders as a bare `e`, and `❤` + U+FE0F renders in its text presentation. That is
-//! unchanged from before this issue, and picking it up means letting one cell contribute more than
-//! one character to a row's text, which the link scanner's char-offset-per-cell contract
-//! (`crate::terminal::links::LinkMatch`) is currently built on - a real follow-up, not a one-line
-//! addition.
-//!
-//! ## Text selection (GitHub issue #158)
-//!
-//! Selection is not tracked here at all - it lives in `alacritty_terminal`'s own
-//! `Term::selection` field (`term/mod.rs:275`, a real `pub Option<Selection>`), driven through
-//! its own `Selection::new`/`Selection::update` API (`selection.rs:125`/`:133`) and read back
-//! through `Term::selection_to_string` (`term/mod.rs:529`). This module only translates between
-//! that API's `Point`/`Side` coordinates and the row/column [`CellPosition`] the pane's mouse
-//! handling produces, so no second, drifting copy of "what is selected" exists. Selection
-//! invalidation is likewise `Term`'s own and not re-implemented here: it rotates the selection
-//! with the grid when the screen scrolls (`Term::scroll_down_relative`/`scroll_up_relative`'s
-//! own `Selection::rotate` calls) and drops it on `ClearMode::All` (`term/mod.rs:1803`) and on
-//! an alt-screen swap (`Term::swap_alt`, `:733`) - which is why [`TerminalGrid::clear`], itself
-//! just an `ESC[2J` through the same parser, needs no selection handling of its own.
 
 use crate::terminal::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
@@ -174,37 +36,6 @@ impl Dimensions for GridSize {
 /// window-title pair [`AlacEvent::Title`]/[`AlacEvent::ResetTitle`] - and drops every other one
 /// (bell, clipboard, cursor-blink requests, ...): see the module docs' API surface section for
 /// why those others are a deliberate scope cut.
-///
-/// `PtyWrite` is the original reason this type exists at all: `alacritty_terminal`'s own
-/// `Handler` impl for `Term` emits it
-/// whenever the VT parser sees a query the *terminal* (not the running program) is supposed to
-/// answer back into the pty's stdin - e.g. `ESC[6n` (Device Status Report / cursor position
-/// report), already correctly formatted as `ESC[<row>;<col>R` by `Term::device_status`
-/// (`term/mod.rs:1332`, verified against the pinned rev's real source per this module's own API
-/// surface docs). Dropping it (this type's predecessor, `NoopEventListener`, did) isn't just a
-/// missed nicety: on real Windows hardware, ConPTY sends exactly this query as part of its own
-/// startup handshake and blocks its *entire* output stream - the child process's own banner,
-/// prompt, everything - until it receives a real answer. A terminal that never answers doesn't
-/// just render `ESC[6n` oddly, it hangs the pty forever after that first, tiny query - confirmed
-/// live: a real Windows build spawned a real `cmd.exe`, the child process itself stayed alive
-/// and idle at its own prompt, and `pty-core`'s reader thread read exactly the 4-byte query and
-/// then never read another byte, because ConPTY was sitting there waiting on the CPR reply this
-/// listener used to throw away.
-///
-/// `Title`/`ResetTitle` are the second capture (GitHub issue #239). `alacritty_terminal` emits
-/// `Event::Title(String)` for OSC 0 (icon name + window title) and OSC 2 (window title only),
-/// and `Event::ResetTitle` for OSC 0/2 with no argument - confirmed against the pinned rev's
-/// own `Term::set_title`/`reset_title` (`term/mod.rs`) and `vte::ansi`'s `b"0" | b"2"`
-/// `osc_dispatch` arm. Real agent CLIs put a live status glyph in that title (Claude Code and
-/// Gemini CLI both do - observed directly, see `crate::rail::title_signal`), which is a far
-/// faster and more honest "is this agent busy or waiting on me" signal than the pty-quiescence
-/// timer `crate::rail::status` otherwise has to fall back on.
-///
-/// `Rc<RefCell<..>>`, not a channel: [`EventListener::send_event`] takes `&self`
-/// (`Term<T>` only ever holds a `T`, no `&mut` access once constructed), and this needs to be
-/// cheaply `Clone`d so [`TerminalGrid`] can hand `Term::new` its own copy while keeping one to
-/// drain from - a `Rc`'d interior-mutable buffer is the direct way to satisfy both without a
-/// background thread/channel this is far too small to warrant.
 #[derive(Debug, Clone, Default)]
 struct TermEventSink {
     /// Bytes the VT parser generated as a reply owed back to the pty, appended in arrival order.
@@ -266,14 +97,6 @@ pub struct GridCell {
 /// How many grid columns one [`GridCell`] actually paints into, derived from
 /// `alacritty_terminal`'s own `Flags::WIDE_CHAR`/`Flags::WIDE_CHAR_SPACER` (GitHub issue #211 -
 /// see the module docs for the exact `Term::input` behaviour this mirrors).
-///
-/// The three variants' [`CellWidth::columns`] deliberately sum back to the grid's own column
-/// count: a `Wide` cell paints the two columns it owns and its following `Spacer` paints none, so
-/// the painted x offset of grid column `k` stays exactly `k * cell_width` no matter how many wide
-/// characters precede it. That is what keeps `crate::terminal::pane`'s pixel-to-column mouse
-/// arithmetic correct on a row full of CJK without it needing to know the row's contents at all -
-/// pinned by `crate::terminal::pane::wide_char_render_tests::
-/// painted_columns_always_sum_to_the_grid_column_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellWidth {
     /// An ordinary single-column cell.
@@ -368,10 +191,6 @@ pub enum ScrollAmount {
 
 /// Every real colour a terminal grid resolves against, already reduced to concrete RGB - the whole
 /// interface between the live theme and this pure module (GitHub issue #208).
-///
-/// Built from `crate::theme::terminal`'s real registered tokens by
-/// `crate::terminal::pane::theme_terminal_palette`, which runs at paint time where the live theme
-/// is actually reachable. This module never resolves a token itself; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalPalette {
     /// The pane's own fill, and what `NamedColor::Background` resolves to.
@@ -389,15 +208,6 @@ pub struct TerminalPalette {
 
 /// Jerry Dark's own terminal palette, transcribed - the exact literal values
 /// `crate::theme::terminal`'s tokens carry as their compiled defaults.
-///
-/// Duplicated here rather than resolved from `crate::theme` so this module stays theme-free (see
-/// the module docs), and kept honest about it by
-/// `crate::terminal::pane::terminal_theme_tests::the_pure_grid_default_palette_is_exactly_jerry_darks_own`,
-/// which resolves the real tokens and asserts they equal this value - so a retuned token can't
-/// leave this stale.
-///
-/// This is what the module's own tests render against, and what a caller that has no theme to offer
-/// gets. The app itself always passes the live theme's palette.
 impl Default for TerminalPalette {
     fn default() -> Self {
         Self {
@@ -469,10 +279,6 @@ fn named_color_rgb(name: NamedColor, palette: &TerminalPalette) -> (u8, u8, u8) 
 /// The standard xterm 256-color cube (indices `16..=231`) and grayscale ramp (`232..=255`)
 /// formulas - matches `vendor/zed/crates/terminal/src/terminal.rs`'s `get_color_at_index`/
 /// `rgb_for_index` (a public xterm convention, cited from the same source there).
-///
-/// Only `0..=15` is themeable: the cube and the ramp are fixed arithmetic on the index itself, the
-/// same in every real terminal, and a program asking for `Color::Indexed(196)` is asking for that
-/// exact well-known RGB rather than for "the theme's red".
 fn indexed_color_rgb(index: u8, palette: &TerminalPalette) -> (u8, u8, u8) {
     match index {
         0..=15 => palette.ansi[index as usize],
@@ -588,11 +394,6 @@ impl TerminalGrid {
     /// drives the real `Term` grid state (cursor movement, SGR colors, screen clears, etc.) and
     /// may also queue bytes into [`Self::events`] for [`Self::take_pending_pty_writes`]
     /// to hand back to the pty, and update [`Self::title`] - see [`TermEventSink`]'s own docs.
-    ///
-    /// The same slice is also tee'd into [`Self::osc`], the independent parser that recovers the
-    /// OSC 9 / 9;4 / 777 sequences `Processor` drops on the floor (see
-    /// [`crate::terminal::osc`]). Both parsers must see identical bytes in identical order:
-    /// either one's state machine can be mid-sequence at a chunk boundary.
     pub fn append_bytes(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
         self.osc.feed(bytes);
@@ -635,11 +436,6 @@ impl TerminalGrid {
     /// (see `crate::terminal::pane::maybe_resize_pty`) - the two are separate resizes that need
     /// to stay in sync, or the rendered grid's geometry would diverge from what the child
     /// process believes its terminal size is.
-    ///
-    /// Ends by re-establishing [`Self::discard_blank_scrollback`]'s invariant (GitHub issue
-    /// #368): a resize is the one thing that can push a line the human never watched scroll
-    /// past into retained history, and when that line is *blank* the result is a visibly empty
-    /// pane that still scrolls.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.size = GridSize {
             rows: rows.max(1) as usize,
@@ -673,10 +469,6 @@ impl TerminalGrid {
     /// exactly `columns` cells). The cell at the cursor's current position (if visible) has its
     /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph, and
     /// every cell inside the live selection is flagged [`GridCell::selected`].
-    ///
-    /// `palette` is what every `NamedColor`/`Color::Indexed(0..=15)` the running program asked for
-    /// resolves against (GitHub issue #208) - passed in per call rather than stored, so a theme
-    /// switch is picked up by the very next repaint with no invalidation step that could go stale.
     pub fn visible_rows(&self, palette: &TerminalPalette) -> Vec<Vec<GridCell>> {
         let content = self.term.renderable_content();
         let cursor_point =
@@ -775,14 +567,6 @@ impl TerminalGrid {
     /// first real resize that genuinely reached the live pty, to reset the baseline before a
     /// real user-driven resize (window resize, font-size change) can ever legitimately create
     /// scrollback of its own.
-    ///
-    /// Only the *retained history* is dropped, via [`Self::retain_history`] - the live viewport,
-    /// cursor position and terminal mode `append_bytes` has already built up from whatever the
-    /// child printed at the placeholder size all stay exactly as they are.
-    ///
-    /// This is the blunt instrument, for content that is real but was never *seen*.
-    /// [`Self::discard_blank_scrollback`] is the narrow, always-on companion for the other half
-    /// of the same issue: history a resize manufactured out of nothing at all.
     pub fn discard_scrollback(&mut self) {
         self.retain_history(0);
     }
@@ -790,32 +574,6 @@ impl TerminalGrid {
     /// Drops the run of *entirely blank* lines at the **oldest** end of retained scrollback
     /// (GitHub issue #368), leaving everything from the oldest line that has real content
     /// onward exactly as it was.
-    ///
-    /// The invariant this restores: **a pane can never scroll up into a blank void.** Whatever
-    /// is at the very top of the scroll track is a line that actually has something on it, so
-    /// "there is scrollback" and "there is something to scroll to" stay the same statement -
-    /// which is what makes `scroll_history_len`, the scrollbar's own `max_scroll_offset`, and
-    /// the wheel handler's real behavior agree with what the human can see.
-    ///
-    /// This exists because [`Self::resize`] can manufacture exactly such a line out of nothing.
-    /// `alacritty_terminal`'s reflow (`grid/resize.rs`'s `shrink_columns`) re-wraps every row to
-    /// the narrower width, and a pane that gets narrower - the app's own layout settling, a real
-    /// window resize, a font-size change - makes the wrapped content taller, which pushes the
-    /// topmost row out of the viewport and into history. On a freshly opened pane that topmost
-    /// row is the blank line a shell prints before its prompt: **measured live** on a
-    /// just-opened `zsh` pane, a `110x36 -> 38x26` resize took `history_size` from `0` to `1`,
-    /// and that one retained line was all spaces. A genuinely empty terminal then scrolled - the
-    /// live report behind this issue.
-    ///
-    /// Blankness is `alacritty_terminal`'s own `Row::is_clear` (`grid/row.rs:155`), i.e. every
-    /// cell is `Cell::is_empty` (`term/cell.rs:226`): a space *and* default fg/bg *and* no
-    /// inverse/underline/strikeout/wrapline flags. A row painted with a background colour, or
-    /// one that is the wrapped continuation of a real line, is therefore not blank and is never
-    /// trimmed - only rows with genuinely nothing on them.
-    ///
-    /// Deliberately trims only the contiguous run at the *oldest* end rather than every blank
-    /// line in history: a blank line *between* two lines of real output is part of that output's
-    /// own shape and must stay scrollable, exactly where the program printed it.
     pub fn discard_blank_scrollback(&mut self) {
         let history = self.scroll_history_len();
         let grid = self.term.grid();
@@ -840,11 +598,6 @@ impl TerminalGrid {
     /// which is what `Grid::update_history` (`grid/mod.rs:154`) already does - then restores the
     /// real `Config::scrolling_history` capacity so later output accumulates history exactly as
     /// before.
-    ///
-    /// The two-call `update_history(keep)` / `update_history(real_cap)` idiom rather than
-    /// rebuilding `Term` from scratch: a fresh `Term` would also lose the cursor position/mode
-    /// state `append_bytes` has already built up, which needs to stay exactly as it is - only
-    /// the *retained history* is ever spurious here, never the live viewport.
     fn retain_history(&mut self, keep: usize) {
         let real_cap = Config::default().scrolling_history;
         let grid = self.term.grid_mut();
@@ -857,17 +610,6 @@ impl TerminalGrid {
     /// `max_lines` of it. GitHub issue #227's real transcript capture: what an agent's own pane
     /// actually said, kept when its run ends so History can show the run's own output rather than
     /// a synthesised stand-in.
-    ///
-    /// Deliberately *not* [`Self::visible_rows`]: that is one screenful resolved against a
-    /// palette for painting, and a transcript that stopped at the last 30 rows would cut the run
-    /// off mid-sentence. This reads the raw grid, history included, exactly as
-    /// `Term::line_to_string` does for a clipboard copy - the same `Flags::WIDE_CHAR_SPACER` skip
-    /// (see the module docs) and the same "text only, no colour" contract [`Self::selected_text`]
-    /// has, since nothing downstream of a stored transcript re-renders ANSI attributes.
-    ///
-    /// Blank lines at both ends are dropped: a pane is a fixed-height grid, so a short run leaves
-    /// the rest of the screen as empty rows that are an artefact of the grid's shape, not
-    /// something the program printed.
     pub fn retained_text_lines(&self, max_lines: usize) -> Vec<String> {
         let grid = self.term.grid();
         let history = grid.history_size() as i32;
@@ -962,30 +704,6 @@ impl TerminalGrid {
     /// `crate::terminal::pane::TerminalPane::forward_scroll_as_page_keys`'s decision, not this
     /// one's - see its docs for why PageUp/PageDown rather than the arrow keys #362 first
     /// shipped (GitHub issue #368).
-    ///
-    /// Two real `Term::mode()` bits, both read live rather than latched for the same reason
-    /// [`Self::bracketed_paste_enabled`] is: a running program can flip either at any point in
-    /// its own lifetime.
-    ///
-    /// - `TermMode::ALT_SCREEN` (`Term::swap_alt`, entering `vim`/`less`/an agent CLI's
-    ///   full-screen UI) - the module docs' "alt screen has no scrollback of its own" section:
-    ///   `scroll_display` is a real no-op there, since the alt grid's `history_size` is always
-    ///   `0` (`Term::new`, `term/mod.rs:412-413`), so a mouse-wheel reaching a full-screen
-    ///   program did nothing at all before this - not "nothing to scroll to", genuinely inert
-    ///   input the running program never saw either.
-    /// - `TermMode::ALTERNATE_SCROLL` (`DECSET 1007`, xterm's own name for exactly this
-    ///   feature) - the real, standard signal a program uses to opt out again even while the
-    ///   alt screen is active (`term/mod.rs:1980`/`:2032`), on by default
-    ///   (`TermMode::default()`, `term/mod.rs:113-118`). Respecting it means a full-screen
-    ///   program that explicitly disables it (rare, but real - some `less` configurations do)
-    ///   keeps getting exactly the pre-this-fix inert behavior instead of unwanted synthetic
-    ///   key presses.
-    ///
-    /// This is the same convention xterm itself documents for `alternateScroll`, and the one
-    /// iTerm2/Alacritty/kitty/Windows Terminal all implement: `less`/`vim`/`htop`/an agent
-    /// CLI's own interface responds to the mouse wheel as if the human had pressed a real
-    /// navigation key, because - unlike the normal screen - there is no real scrollback grid
-    /// underneath for a wheel event to move instead.
     pub fn alt_scroll_forwarding_active(&self) -> bool {
         let mode = self.term.mode();
         self.alt_screen_active() && mode.contains(TermMode::ALTERNATE_SCROLL)
@@ -993,17 +711,6 @@ impl TerminalGrid {
 
     /// Whether a full-screen program currently owns this terminal's alt screen (`TermMode::
     /// ALT_SCREEN`, set by `Term::swap_alt` - `vim`, `less`, `htop`, an agent CLI's own UI).
-    ///
-    /// The alt grid keeps no scrollback of its own (`Term::new`, `term/mod.rs:412-413`), so
-    /// every *local* scroll action this pane can take - [`Self::scroll_display`] from the wheel,
-    /// from a PageUp/PageDown key, from the scrollbar - is a guaranteed no-op while this is
-    /// `true`. That is what makes it the right condition for handing those inputs to the child
-    /// process instead (see `crate::terminal::pane::TerminalPane::handle_key_down`).
-    ///
-    /// Separate from [`Self::alt_scroll_forwarding_active`], which additionally requires
-    /// `TermMode::ALTERNATE_SCROLL`: that bit (`DECSET 1007`) is specifically a program's opt-out
-    /// for having the *mouse wheel* synthesised into keys, and says nothing about a key the
-    /// human really did press.
     pub fn alt_screen_active(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
@@ -1026,15 +733,6 @@ mod tests {
         assert!(row_text(&rows[0]).starts_with("hello"));
     }
 
-    /// [`TermEventSink`]'s real regression coverage: a Device Status Report query (`ESC[6n`,
-    /// "where's the cursor?") must produce a real, correctly formatted `ESC[<row>;<col>R` reply
-    /// queued for the pty - not silently dropped, which is exactly what real Windows ConPTY
-    /// hangs on during its own startup handshake (see [`TermEventSink`]'s own docs for the live
-    /// Windows repro this fixes). Uses `\x1b[3;5H` first (the same cursor-positioning sequence
-    /// [`cursor_positioning_places_text_at_the_addressed_cell`] already proves lands the cursor
-    /// correctly) so the expected reply has a real, non-default row/col to check against - a
-    /// query answered from the default `1;1` cursor position wouldn't tell a wrong-position bug
-    /// apart from a right one.
     #[test]
     fn a_cursor_position_query_is_queued_as_a_real_reply_not_dropped() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -1065,9 +763,6 @@ mod tests {
         );
     }
 
-    /// [`TermEventSink`]'s title half (GitHub issue #239): a real OSC 0 / OSC 2 sequence through
-    /// the real parser must land in [`TerminalGrid::title`], and must not print anything into
-    /// the grid - a title is metadata about the window, not screen content.
     #[test]
     fn a_real_osc_title_sequence_is_captured_and_prints_nothing() {
         let mut grid = TerminalGrid::new(5, 40);
@@ -1077,7 +772,6 @@ mod tests {
             "sanity check: no title before any is set"
         );
 
-        // Exactly what Claude Code writes while working, byte for byte (OSC 0, BEL-terminated).
         grid.append_bytes("\x1b]0;\u{25d0} Claude Code\x07".as_bytes());
         assert_eq!(grid.title(), Some("\u{25d0} Claude Code"));
 
@@ -1088,16 +782,10 @@ mod tests {
             "an OSC title must be consumed by the parser, never painted into the grid"
         );
 
-        // OSC 2 (title only) and ST termination are the other real spellings.
         grid.append_bytes(b"\x1b]2;second title\x1b\\");
         assert_eq!(grid.title(), Some("second title"));
     }
 
-    /// The [`AlacEvent::ResetTitle`] half of the same capture. `alacritty_terminal` only ever
-    /// emits it from `Term::pop_title` (`term/mod.rs:2249`) restoring a `None` that was pushed
-    /// before any title existed - the XTPUSHTITLE/XTPOPTITLE pair `ESC[22t`/`ESC[23t`
-    /// (`vte-0.15.0/src/ansi.rs:1742`) - so that is what this drives, rather than a synthetic
-    /// event a real process could never produce.
     #[test]
     fn a_real_title_reset_clears_the_captured_title() {
         let mut grid = TerminalGrid::new(5, 40);
@@ -1113,8 +801,6 @@ mod tests {
         );
     }
 
-    /// The tee'd OSC parser reached through the same `append_bytes` the renderer uses - proof
-    /// that both parsers really see the same bytes (see [`crate::terminal::osc`]'s module docs).
     #[test]
     fn osc_9_family_sequences_reach_the_teed_parser_through_append_bytes() {
         let mut grid = TerminalGrid::new(5, 40);
@@ -1137,24 +823,16 @@ mod tests {
         assert_eq!(row_text(&rows[0]).trim_end(), "hello world");
     }
 
-    /// The key proof that this is real cursor-addressed grid emulation rather than a plain-text
-    /// scan: a cursor-positioning CSI sequence (`ESC [ row ; col H`) must place text at that
-    /// exact cell, not just append it to a growing line.
     #[test]
     fn cursor_positioning_places_text_at_the_addressed_cell() {
         let mut grid = TerminalGrid::new(5, 20);
-        // Move to row 3, column 5 (1-indexed, per CSI CUP), then write "X".
         grid.append_bytes(b"\x1b[3;5HX");
         let rows = grid.visible_rows(&TerminalPalette::default());
-        // Row index 2 (0-indexed), column index 4.
         assert_eq!(rows[2][4].c, 'X');
-        // Everywhere else on that row is still blank.
         assert_eq!(rows[2][0].c, ' ');
         assert_eq!(rows[2][3].c, ' ');
     }
 
-    /// A second CSI-positioned write to an earlier cell must overwrite in place, not append
-    /// after the first - "redraw in place" behavior step 3's plain-text scan couldn't represent.
     #[test]
     fn redrawing_at_an_earlier_position_overwrites_in_place() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -1173,14 +851,9 @@ mod tests {
         assert_eq!(rows[0][0].fg, TerminalPalette::default().ansi[1]);
     }
 
-    /// GitHub issue #208's pure half. Two renders of the *same* grid state under two different
-    /// palettes must produce two different sets of colours - which is only true because every
-    /// resolution path (unstyled default fg/bg, a named ANSI colour, and `Color::Indexed(0..=15)`)
-    /// reads the passed-in palette rather than a module constant.
     #[test]
     fn every_themeable_colour_comes_from_the_supplied_palette_not_a_hardcoded_one() {
         let mut grid = TerminalGrid::new(2, 10);
-        // "P" unstyled, "R" in named red (SGR 31), "B" in indexed blue (SGR 38;5;4).
         grid.append_bytes(b"P\x1b[31mR\x1b[0m\x1b[38;5;4mB\x1b[0m");
 
         let mut ansi = TerminalPalette::default().ansi;
@@ -1213,9 +886,6 @@ mod tests {
         }
     }
 
-    /// A cell the running program gave a real 24-bit colour (`SGR 38;2;r;g;b`) is *not* themeable -
-    /// the program asked for that exact colour, and a terminal that repainted it in a theme colour
-    /// would be corrupting output, not theming it.
     #[test]
     fn a_program_specified_truecolor_is_left_exactly_alone_by_the_palette() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1230,8 +900,6 @@ mod tests {
         assert_eq!(grid.visible_rows(&themed)[0][0].fg, (1, 2, 3));
     }
 
-    /// The xterm 256-colour cube and grayscale ramp (`16..=255`) are fixed arithmetic, not palette
-    /// entries - see [`indexed_color_rgb`]'s own docs.
     #[test]
     fn the_xterm_256_cube_stays_fixed_while_the_first_sixteen_follow_the_palette() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1334,7 +1002,6 @@ mod tests {
 
         #[test]
         fn a_transcript_reaches_back_past_the_visible_screen_into_real_scrollback() {
-            // Five visible rows, thirty printed lines - twenty-five of them are only in history.
             let grid = grid_with_numbered_lines(5, 20, 30);
             let lines = grid.retained_text_lines(1000);
             assert_eq!(
@@ -1362,8 +1029,6 @@ mod tests {
             );
         }
 
-        /// A pane is a fixed-height grid, so a two-line run leaves the rest of the screen as
-        /// empty rows. Those are the grid's shape, not the program's output.
         #[test]
         fn the_empty_rest_of_the_screen_is_not_part_of_the_transcript() {
             let mut grid = TerminalGrid::new(10, 20);
@@ -1374,8 +1039,6 @@ mod tests {
             );
         }
 
-        /// The same wide-character rule the painter and the clipboard already follow: the spacer
-        /// cell's `' '` belongs to the emulator, not to the program.
         #[test]
         fn a_wide_character_contributes_one_char_not_two() {
             let mut grid = TerminalGrid::new(4, 20);
@@ -1397,19 +1060,6 @@ mod tests {
         const SHELL_STARTUP: &[u8] =
             b"\r\n/tmp/fix-terminal-scroll-round3 on main! at 0:55:28\r\n$ ";
 
-        /// **GitHub issue #368, the live report: "terminal base scroll ... can scroll up when
-        /// empty and just created".**
-        ///
-        /// Root cause, measured live against the running app: narrowing a pane makes
-        /// `alacritty_terminal`'s reflow (`grid/resize.rs`'s `shrink_columns`) re-wrap the
-        /// prompt taller, which pushes the topmost row of the screen out of the viewport and
-        /// into real retained history - and on a just-opened pane that topmost row is the
-        /// *blank* line the shell printed before its prompt. `history_size` went `0 -> 1` on a
-        /// real `110x36 -> 38x26` resize, the scrollbar appeared, and a mouse wheel really moved
-        /// `display_offset` to `1` on a terminal with nothing in it but a prompt.
-        ///
-        /// The exact numbers here are the ones that were measured in the running app, so this
-        /// fails against the pre-fix code rather than being a synthetic construction.
         #[test]
         fn narrowing_a_just_opened_pane_leaves_it_with_nothing_to_scroll_to() {
             let mut grid = TerminalGrid::new(36, 110);
@@ -1439,16 +1089,6 @@ mod tests {
             assert!(!grid.is_scrolled_back());
         }
 
-        /// The general invariant behind the fix, swept across a range of real pane geometries
-        /// rather than the one measured pair above: **after any resize, the top of the scroll
-        /// track is always a line with something on it.**
-        ///
-        /// Stated this way rather than as "a prompt-only pane never has scrollback", because at
-        /// genuinely tiny widths it legitimately does: re-wrapping a 52-character prompt at 20
-        /// columns really does push its first segment off the top of the screen, and being able
-        /// to scroll up to read it is correct - that line has real content on it. What must
-        /// never happen is the case this issue reported, where scrolling up reveals nothing at
-        /// all.
         #[test]
         fn a_resize_never_leaves_a_blank_line_at_the_top_of_the_scroll_track() {
             for (rows, cols) in [
@@ -1475,10 +1115,6 @@ mod tests {
             }
         }
 
-        /// The other side of the same fix, and the thing that keeps it honest: a resize must
-        /// still evict *real* content into real scrollback exactly as before. Only the blank
-        /// run at the oldest end of history is ever dropped - one line of real output at the
-        /// very top of history is not blank, so it stays reachable.
         #[test]
         fn a_resize_still_evicts_real_content_into_real_scrollback() {
             let mut grid = grid_with_numbered_lines(10, 40, 9);
@@ -1502,10 +1138,6 @@ mod tests {
             );
         }
 
-        /// A blank line *between* two lines of real output is part of that output's own shape
-        /// and must stay exactly where the program printed it - [`TerminalGrid::
-        /// discard_blank_scrollback`] only ever trims the contiguous blank run at the oldest
-        /// end, never blank lines with real content above them.
         #[test]
         fn a_blank_line_inside_real_output_is_never_trimmed_away() {
             let mut grid = TerminalGrid::new(20, 40);
@@ -1531,9 +1163,6 @@ mod tests {
             );
         }
 
-        /// The core of GitHub issue #331: scrolling up must actually reveal lines that were
-        /// pushed off the top of the visible screen into history, not just move a cursor over
-        /// the same five lines that were always on screen.
         #[test]
         fn scrolling_up_reveals_lines_pushed_into_history() {
             // A 5-row screen, 30 lines written - the first 25 are pushed into scrollback, and
@@ -1554,9 +1183,6 @@ mod tests {
             assert_eq!(row_text(&rows[4]).trim(), "line 25");
         }
 
-        /// `Scroll::Top`/`Scroll::Bottom` reach the real extremes: the oldest retained line, and
-        /// back to the live tail - proof the whole retained history is really reachable, not
-        /// just the one page `PageUp` moves by.
         #[test]
         fn top_and_bottom_reach_the_real_extremes() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1581,12 +1207,6 @@ mod tests {
             );
         }
 
-        /// The real "stay put" behavior GitHub issue #331 asks for: new output arriving while
-        /// scrolled back must not yank the viewport back to the live tail - the same historical
-        /// lines stay on screen, only the retained-history count grows underneath. Exercised
-        /// through the exact same `TerminalGrid::append_bytes` path live pty output takes, not a
-        /// synthetic offset write - see the module docs' scrollback section for why this falls
-        /// out of `alacritty_terminal`'s own `Grid::scroll_up` rather than needing code here.
         #[test]
         fn new_output_while_scrolled_back_does_not_move_the_viewport() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1620,9 +1240,6 @@ mod tests {
             );
         }
 
-        /// [`TerminalGrid::set_scroll_offset`] - the scrollbar's click/drag path, which computes
-        /// an absolute target line count from where the pointer landed rather than a relative
-        /// delta.
         #[test]
         fn set_scroll_offset_jumps_directly_to_an_absolute_target() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1643,9 +1260,6 @@ mod tests {
             );
         }
 
-        /// `ScrollAmount::Lines` must clamp at both ends rather than under/overflowing - `Delta`
-        /// past the top must stop at the oldest retained line, and a `Delta` back down past live
-        /// must stop at `0`, matching `alacritty_terminal`'s own real clamping.
         #[test]
         fn scroll_amount_lines_clamps_at_both_ends() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1658,9 +1272,6 @@ mod tests {
             assert_eq!(grid.scroll_offset(), 0);
         }
 
-        /// A selection anchored while scrolled back must land on the real historical cell the
-        /// pointer is over - not on whatever is currently live at that same on-screen row (the
-        /// bug the module docs' `CellPosition::to_alacritty` update exists to prevent).
         #[test]
         fn a_selection_anchored_while_scrolled_back_selects_the_real_historical_line() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1670,7 +1281,6 @@ mod tests {
                 "line 21"
             );
 
-            // Select across the whole first on-screen row (viewport row 0 = the real "line 21").
             grid.start_selection(CellPosition {
                 row: 0,
                 column: 0,
@@ -1690,10 +1300,6 @@ mod tests {
             );
         }
 
-        /// The alt screen keeps no scrollback of its own (see the module docs) - entering it
-        /// (`\x1b[?1049h`, real `smcup`, what `vim`/`less`/full-screen agent CLIs send) must make
-        /// [`TerminalGrid::scroll_history_len`] genuinely `0`, and a scroll attempt while inside
-        /// it a real no-op rather than silently doing nothing for some other, wrong reason.
         #[test]
         fn the_alt_screen_reports_no_scrollback_and_a_scroll_attempt_is_a_real_no_op() {
             let mut grid = grid_with_numbered_lines(5, 20, 30);
@@ -1717,12 +1323,6 @@ mod tests {
             );
         }
 
-        /// GitHub issue #362: [`TerminalGrid::alt_scroll_forwarding_active`] must flip on the
-        /// instant the alt screen is entered (`\x1b[?1049h`, real `smcup`) and back off the
-        /// instant it's exited (`\x1b[?1049l`, real `rmcup`) - the normal screen must never be
-        /// treated as alt-scroll-forwarding, and a program that leaves the alt screen (a full
-        /// `vim`/`less`/agent-CLI session ending) must hand real scrollback control straight
-        /// back to the mouse wheel with no leftover forwarding state.
         #[test]
         fn alt_scroll_forwarding_tracks_the_real_alt_screen_state() {
             let mut grid = TerminalGrid::new(5, 20);
@@ -1744,10 +1344,6 @@ mod tests {
             );
         }
 
-        /// The real xterm `DECSET 1007` opt-out (`ALTERNATE_SCROLL`): a program can stay on the
-        /// alt screen yet explicitly disable scroll-to-key translation, in which case a
-        /// wheel event reaching it must go back to being the pre-issue-#362 inert no-op - not
-        /// forwarded input the program never asked to receive.
         #[test]
         fn alt_scroll_forwarding_respects_the_real_alternate_scroll_opt_out() {
             let mut grid = TerminalGrid::new(5, 20);
@@ -1766,12 +1362,8 @@ mod tests {
         }
     }
 
-    /// End-to-end through a genuinely spawned process on a real pty (via `pty_core::spawn`)
-    /// using real cursor-positioning output (`tput cup`), proving grid *addressing*, not just
-    /// line commits.
     #[test]
     fn end_to_end_real_pty_cursor_positioning_lands_correctly() {
-        // `printf` with a real CUP escape sequence: move to row 2 col 3, print "OK".
         let session = pty_core::spawn(pty_core::SpawnOptions::new("printf").arg("\\033[2;3HOK"))
             .expect("spawning `printf` should succeed - this environment must have printf on PATH");
 
@@ -1805,8 +1397,6 @@ mod wide_char_tests {
         row.iter().map(|cell| cell.width).collect()
     }
 
-    /// The core fact this issue rests on, straight out of real parsed UTF-8: a CJK ideograph
-    /// occupies its own cell plus a following spacer cell, and both are now labelled as such.
     #[test]
     fn a_cjk_character_is_a_wide_cell_followed_by_a_spacer_cell() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1828,10 +1418,6 @@ mod wide_char_tests {
         );
     }
 
-    /// The spacer's own `c` is a literal space `alacritty_terminal` wrote there
-    /// (`term/mod.rs:1127-1129`), not a copy of the character or a NUL - which is precisely why
-    /// painting it used to insert a stray blank column after every wide glyph. Pinned so a future
-    /// dependency bump that changed it can't silently invalidate the renderer's assumption.
     #[test]
     fn the_spacer_cell_really_holds_a_plain_space_of_its_own() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1841,8 +1427,6 @@ mod wide_char_tests {
         assert_eq!(rows[0][1].width, CellWidth::Spacer);
     }
 
-    /// Emoji, not just CJK - the other half of what issue #211 asks for. `🎉` (U+1F389) is a real
-    /// 4-byte UTF-8 sequence and `unicode-width` reports it as two columns.
     #[test]
     fn an_emoji_is_a_wide_cell_too() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1856,9 +1440,6 @@ mod wide_char_tests {
         assert_eq!(rows[0][2].width, CellWidth::Narrow);
     }
 
-    /// A multi-byte UTF-8 character that is *not* double-width (`é`, two bytes, one column) must
-    /// stay [`CellWidth::Narrow`] - "multi-byte" and "double-width" are different properties, and
-    /// conflating them would push every accented Latin character a column to the right.
     #[test]
     fn a_multi_byte_but_single_width_character_stays_narrow() {
         let mut grid = TerminalGrid::new(2, 10);
@@ -1868,14 +1449,9 @@ mod wide_char_tests {
         assert_eq!(widths(&rows[0][..2]), vec![CellWidth::Narrow; 2]);
     }
 
-    /// The end-of-row case: a wide character that doesn't fit in the last column wraps, and
-    /// `alacritty_terminal` leaves a `LEADING_WIDE_CHAR_SPACER` behind in that last column. That
-    /// one is a real, standalone blank column (the character itself is on the *next* row), so it
-    /// must stay [`CellWidth::Narrow`] - see [`grid_cell_from_alacritty`]'s comment.
     #[test]
     fn a_wide_character_wrapped_off_the_row_end_leaves_a_real_blank_column_not_a_spacer() {
         let mut grid = TerminalGrid::new(3, 5);
-        // Four narrow characters fill columns 0..=3, leaving only column 4 - too narrow for `好`.
         grid.append_bytes("abcd好".as_bytes());
         let rows = grid.visible_rows(&TerminalPalette::default());
 
@@ -1891,10 +1467,6 @@ mod wide_char_tests {
         assert_eq!(rows[1][1].width, CellWidth::Spacer);
     }
 
-    /// End-to-end through a genuinely spawned process on a real pty, so the UTF-8 travels as real
-    /// bytes over a real file descriptor rather than being handed to the parser in one clean
-    /// slice - which is the case that would break if anything on the read path were byte- rather
-    /// than stream-oriented (a 3-byte character split across two `read(2)` calls).
     #[test]
     fn end_to_end_real_pty_utf8_output_lands_as_wide_cells() {
         let session = pty_core::spawn(pty_core::SpawnOptions::new("printf").arg("日本語 🎉 ok"))
@@ -2034,10 +1606,6 @@ mod selection_tests {
         assert_eq!(grid.selected_text(), None);
     }
 
-    /// Pins the module docs' claim that selection invalidation is `alacritty_terminal`'s job:
-    /// [`TerminalGrid::clear`] is only an `ESC[2J` through the parser and has no selection code
-    /// of its own, so a stale selection surviving a clear would be a real bug (copy would then
-    /// return text that is no longer on screen).
     #[test]
     fn clearing_the_screen_drops_the_selection_without_this_module_doing_anything() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -2062,9 +1630,6 @@ mod selection_tests {
         );
     }
 
-    /// The selection has to be *visible*, not just readable - a `GridCell` that never carried
-    /// the flag would leave the renderer with nothing to paint, so a user dragging across the
-    /// terminal would see no feedback at all.
     #[test]
     fn selected_cells_are_flagged_for_the_renderer() {
         let mut grid = TerminalGrid::new(5, 20);
@@ -2093,25 +1658,17 @@ mod selection_tests {
         assert!(rows.iter().flatten().all(|cell| !cell.selected));
     }
 
-    /// A wide character's *trailing spacer* column is genuinely part of the selection as far as
-    /// `alacritty_terminal` is concerned, but the copied text must still contain the character
-    /// exactly once - `Term::line_to_string` skips spacer cells (`term/mod.rs:605`). Proves
-    /// [`GridCell::width`] didn't have to teach the clipboard anything: dragging over the second
-    /// half of `好` copies `好`, not `好 `.
     #[test]
     fn selecting_a_wide_character_copies_it_once_not_once_plus_its_spacer() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes("你好".as_bytes());
 
-        // Columns 0..=3 are `[你][spacer][好][spacer]` - a drag across all four.
         grid.start_selection(left(0, 0));
         grid.update_selection(right(0, 3));
 
         assert_eq!(grid.selected_text().as_deref(), Some("你好"));
     }
 
-    /// Paste framing depends on this being read from the *live* `Term::mode()` - a program that
-    /// turns bracketed paste on (`DECSET 2004`) and later off must be tracked both ways.
     #[test]
     fn bracketed_paste_mode_tracks_the_real_terminal_mode() {
         let mut grid = TerminalGrid::new(5, 20);

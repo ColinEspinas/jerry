@@ -1,38 +1,4 @@
 //! Real, on-disk transcripts for finished runs, **keyed by run id** (GitHub issue #227).
-//!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3: "Archived runs carry their own
-//! transcript, keyed by run id (`runOutputs`), never the live agent's buffer." This module is that
-//! key-value store, and the key is the same [`crate::review::state::baseline_key`] every other
-//! per-run persisted thing in this app is filed under, so a transcript can never end up attached
-//! to a different run than the record beside it.
-//!
-//! ## Why a directory of files rather than more fields in `agent-status.toml`
-//!
-//! [`crate::hooks::store`]'s file is rewritten and `fsync`ed under a process-wide lock on **every
-//! status change**, for up to 500 records. A transcript is kilobytes of text; putting them in that
-//! file would multiply the cost of every routine `Run` -> `Idle` transition by the whole
-//! history's worth of terminal output. Here, a transcript is written exactly once - when its run
-//! ends - and read exactly once - when its tab is opened.
-//!
-//! ## What is stored
-//!
-//! Plain UTF-8 text, one line per line, exactly as the run's own pane held it
-//! (`crate::terminal::pane::TerminalPane::retained_text_lines`). Deliberately no colours: the tab
-//! renders a recording at 70% opacity in one body tone (see
-//! `crate::run_history::model::LineTone`), and storing per-cell attributes would be storing
-//! something nothing reads.
-//!
-//! Bounded twice, because a terminal's retained scrollback is bounded only by
-//! `alacritty_terminal`'s own 10 000-line history: at most [`MAX_TRANSCRIPT_LINES`] lines and
-//! [`MAX_TRANSCRIPT_BYTES`] bytes, keeping the **end** of the run in both cases - the tail is
-//! where a run says what it did.
-//!
-//! ## Failure is never fatal
-//!
-//! Every function here degrades to "no transcript" rather than to an error the user has to deal
-//! with. A run whose transcript could not be written, or could not be read back, gets the
-//! synthesised body `crate::run_history::model::transcript_body` produces from its own record -
-//! which is a real, honest surface, not a fallback that pretends.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -62,14 +28,6 @@ pub fn transcript_dir_for(settings_path: &Path) -> PathBuf {
 }
 
 /// The file one run's transcript lives in.
-///
-/// The run key is hashed rather than used directly, because it is a real
-/// [`crate::review::state::baseline_key`] - a worktree path, a kind and a timestamp joined by
-/// `|`. That contains `/`, `\` and (on the `bytes:` arm) arbitrary escaped bytes, none of which
-/// are legal in a filename on every platform, and it can be far longer than the 255-byte component
-/// limit of most filesystems. SHA-256 is already a direct dependency of this crate and of
-/// `wt-core` (whose `review::baseline_ref_name` hashes the very same keys, for the very same
-/// reason), so this is the established answer to this exact problem here rather than a new one.
 pub fn transcript_path(dir: &Path, run_key: &str) -> PathBuf {
     let digest = Sha256::digest(run_key.as_bytes());
     dir.join(format!("{digest:x}.txt"))
@@ -92,12 +50,6 @@ fn bounded(lines: &[String]) -> Vec<String> {
 /// Writes one run's transcript. A run with nothing to store writes no file at all, so "this run
 /// has no stored transcript" and "this run stored an empty one" are the same state on disk rather
 /// than two that read differently.
-///
-/// Not atomic (no temp-and-rename) unlike this app's other persisted state, and deliberately: a
-/// transcript is written exactly once, by exactly one instance, for a key nothing else will ever
-/// write again, so there is no concurrent writer to lose a race with. A torn write from a crash
-/// mid-`write_all` leaves a truncated transcript, which reads back as a shorter transcript - not
-/// as corruption, because there is no structure to corrupt.
 pub fn save(dir: &Path, run_key: &str, lines: &[String]) -> io::Result<()> {
     let lines = bounded(lines);
     if lines.is_empty() {
@@ -116,14 +68,6 @@ pub fn load(dir: &Path, run_key: &str) -> Option<Vec<String>> {
 }
 
 /// Deletes every transcript whose run is no longer in `live_keys`.
-///
-/// [`crate::hooks::store::AgentStatusState::prune_to_most_recent`] caps the record file at 500
-/// runs, and a transcript whose record has been pruned is unreachable: nothing can open a tab for
-/// a run that is not in the history list. Without this, the directory would be the one piece of
-/// this feature that grows forever.
-///
-/// Errors are counted, not propagated: a file that will not delete is a wasted few kilobytes, and
-/// failing a run's *close* over it would be absurd. Returns how many files were really removed.
 pub fn prune(dir: &Path, live_keys: &std::collections::BTreeSet<String>) -> usize {
     let live_names: std::collections::HashSet<PathBuf> = live_keys
         .iter()
@@ -171,8 +115,6 @@ mod tests {
         assert_eq!(load(dir.path(), key), Some(lines));
     }
 
-    /// The key is a real `baseline_key` - a path with separators in it. It must never reach the
-    /// filesystem as a filename.
     #[test]
     fn a_run_key_full_of_path_separators_still_produces_one_legal_filename() {
         let dir = Path::new("/tmp/jerry-transcripts");

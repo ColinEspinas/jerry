@@ -1,49 +1,5 @@
 //! The OSC 9 / OSC 9;4 / OSC 777 side-channel: desktop notifications and progress reports that
 //! real agent CLIs already emit into their pty and that `alacritty_terminal` throws away.
-//!
-//! ## Why this is a second, independent parser
-//!
-//! The primary rendering pipeline (`crate::terminal::grid`) drives
-//! `alacritty_terminal::vte::ansi::Processor` over a `Term`, and `Processor`'s own
-//! `vte::Perform::osc_dispatch` impl (`vte-0.15.0/src/ansi.rs:1329`, read from the vendored
-//! source this workspace actually compiles) has match arms for exactly OSC
-//! `0`/`2`/`4`/`8`/`10`/`11`/`12`/`22`/`50`/`52`/`104`/`110`/`111`/`112`. Everything else -
-//! including the whole OSC 9 family and OSC 777 - falls into its catch-all `_ => unhandled(params)`
-//! arm, which formats the params into a `debug!` log line and drops them. There is no
-//! `alacritty_terminal::event::Event` variant for them either, so no amount of widening
-//! `crate::terminal::grid`'s `EventListener` can recover them: the data is gone before any
-//! listener could see it.
-//!
-//! So this module tees: [`OscWatcher::feed`] is handed the *same* byte slice
-//! `crate::terminal::grid::TerminalGrid::append_bytes` hands `Processor::advance`, and runs its
-//! own [`vte::Parser`] over it with a [`vte::Perform`] impl that implements *only*
-//! `osc_dispatch` (every other `Perform` method keeps its no-op default, so printing, CSI
-//! dispatch, DCS, etc. cost nothing here beyond the state machine's own transitions).
-//!
-//! Teeing rather than extending is deliberate and load-bearing: the primary pipeline has a
-//! documented history of subtle real bugs (see `crate::terminal::grid`'s `TermEventSink` docs
-//! for the ConPTY handshake hang), so it is treated as untouchable - a bug in this module's OSC
-//! handling can make Jerry's rail guess wrong, but it can never corrupt what the user sees on
-//! screen.
-//!
-//! ## What is parsed
-//!
-//! - **OSC 9** (`ESC ] 9 ; <message> BEL`) - iTerm2's "post a desktop notification", also emitted
-//!   by Claude Code and Gemini CLI. A point-in-time "the human's attention is wanted" event; the
-//!   message text is deliberately *not* kept (see the parent issue: coarse status only, no
-//!   free-text activity in this phase).
-//! - **OSC 9;4** (`ESC ] 9 ; 4 ; <state> ; <progress> BEL`) - ConEmu's taskbar-progress protocol,
-//!   also spoken by Windows Terminal, WezTerm and others. `state` is `0` clear / `1` normal /
-//!   `2` error / `3` indeterminate / `4` paused; `progress` is a percentage `0..=100`, and is
-//!   meaningless for `0` and `3`. See [`ProgressState`].
-//! - **OSC 777** (`ESC ] 777 ; notify ; <title> ; <body> BEL`) - urxvt's `notify` module, the
-//!   other notification convention agent CLIs emit. Only the `notify` sub-command counts;
-//!   OSC 777 has other sub-commands (e.g. `precmd`) that are not attention requests.
-//!
-//! Everything else is ignored, including OSC 0/2 - the window title arrives through
-//! `alacritty_terminal`'s own `Event::Title` on the primary pipeline (see
-//! `crate::terminal::grid::TermEventSink`), and parsing it twice would just create a second copy
-//! to drift.
 
 use alacritty_terminal::vte::{Parser, Perform};
 
@@ -62,11 +18,6 @@ pub enum ProgressState {
 
 impl ProgressState {
     /// Whether this state means "work is actively happening right now".
-    ///
-    /// [`ProgressState::Error`] and [`ProgressState::Paused`] are deliberately *not* busy: both
-    /// describe work that has stopped advancing, which is exactly when a human's attention may
-    /// be wanted, so claiming "still running" for them would be the false-positive this whole
-    /// signal exists to remove.
     pub fn is_active(self) -> bool {
         matches!(self, ProgressState::Normal | ProgressState::Indeterminate)
     }
@@ -192,12 +143,6 @@ impl OscWatcher {
 
     /// Consumes the "a notification fired" flag: `true` if at least one OSC 9 notification or
     /// OSC 777 `notify` arrived since the last call, and clears it.
-    ///
-    /// Consume-on-read because these are point-in-time events, not state - the sender says "now",
-    /// never "still". The caller (`crate::terminal::pane::TerminalPane`'s poll loop) is
-    /// responsible for turning that instant into whatever durable state it needs; leaving the
-    /// flag latched here instead would make it stick forever, since nothing in the protocol ever
-    /// un-fires a notification.
     pub fn take_attention_ping(&mut self) -> bool {
         std::mem::take(&mut self.signals.attention_pinged)
     }
@@ -233,7 +178,6 @@ mod tests {
 
     #[test]
     fn an_st_terminated_osc_9_also_pings() {
-        // OSC can be terminated by BEL *or* by ST (`ESC \`); real senders use both.
         let mut watcher = watch(b"\x1b]9;done\x1b\\");
         assert!(watcher.take_attention_ping());
     }

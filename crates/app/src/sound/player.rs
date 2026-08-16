@@ -2,23 +2,6 @@
 //! spawned lazily the first time [`SoundPlayer::play`] is actually called, never before. A user
 //! who leaves `settings.sound.enabled` off (the default) never causes this app to open an audio
 //! device at all: [`crate::sound::flow`]'s gating happens before `play` is ever reached.
-//!
-//! ## Why a dedicated thread
-//!
-//! `rodio`'s output stream (`rodio::MixerDeviceSink`, from `DeviceSinkBuilder::open_default_sink`)
-//! has to stay alive for as long as anything might play through it, and opening it is real,
-//! possibly slow device I/O that has no business running on the GPUI foreground thread. One
-//! thread, opened once, outliving every individual sound - not one thread per play.
-//!
-//! ## Failure is silent by design
-//!
-//! No audio device, a corrupt/missing file, a thread that failed to spawn at all - every one of
-//! these is a `log::warn!` and nothing else, never a panic and never surfaced back to the caller.
-//! [`SoundPlayer::play`] is a fire-and-forget queue push specifically so a caller (the status-poll
-//! tick, a settings-page preview button) never has anything to handle. A device-open failure logs
-//! exactly once: the audio thread returns immediately after that warning, so every later `play`
-//! call just pushes onto a channel with no receiver left and is silently dropped - not a
-//! re-attempted, repeatedly-logged failure on every subsequent transition.
 
 use std::io::Cursor;
 use std::sync::mpsc::{self, Sender};

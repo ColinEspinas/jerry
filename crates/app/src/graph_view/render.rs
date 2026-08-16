@@ -19,25 +19,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wt_core::graph::{DotKind, ElbowKind, Graph, GraphRow, GraphScope, RefKind};
 
 /// GitHub issue #221: how many further commits each "load more" adds to the walk cap.
-///
-/// One full `wt_core::graph::DEFAULT_MAX_COMMITS` batch, for a reason specific to how loading
-/// more actually works here: `build_graph` has no resumable cursor, so every batch re-walks the
-/// history *from the tips* with a bigger cap. Total work to reach `n` commits is therefore
-/// quadratic in the number of batches (`n²/2b` commits walked), so a small batch is not merely
-/// slower to fill the screen - it makes the whole feature progressively more expensive the
-/// further back the user goes. 500 is also the one batch size already known to be acceptable in
-/// practice: it is exactly the walk every single graph-tab open already pays for.
-///
-/// At `theme::graph::ROW`'s 26px, 500 rows is ~13000px of content - many viewports' worth, so
-/// combined with [`LOAD_MORE_PREFETCH_ROWS`] below the user should never actually watch it load.
 const LOAD_MORE_BATCH: usize = wt_core::graph::DEFAULT_MAX_COMMITS;
 
 /// How close to the last loaded row the visible range has to get before the next batch starts
 /// walking - roughly one 1080p viewport of `theme::graph::ROW` rows (~41 fit), so the walk starts
 /// about a screen before the user can actually reach the end of the loaded rows.
-///
-/// Must stay far below [`LOAD_MORE_BATCH`], or a completed batch would land the visible range
-/// still inside the trigger zone and immediately start another one.
 const LOAD_MORE_PREFETCH_ROWS: usize = 40;
 
 impl AdeApp {
@@ -193,18 +179,6 @@ impl AdeApp {
     /// Common bookkeeping whenever the graph tab stops being the active centre-pane content -
     /// selecting an agent or file tab while it was showing, or closing it outright. A no-op if
     /// it wasn't active (e.g. closing it via its `×` while an agent tab is showing).
-    ///
-    /// `graph_focus_handle` is about to stop being `track_focus`'d (`Self::render_center_pane`
-    /// only renders the graph view while `graph_tab_active` is `true`), so real keyboard focus is
-    /// moved off it *first*, before anything else has a chance to capture it as its own
-    /// `OverlayFocus` return target - and any target already holding it from earlier is swept.
-    /// This mirrors `crate::sidebar::render::AdeApp::set_right_sidebar_view`'s identical
-    /// `tree_focus_handle` sweep; see that function's docs for the exact "restore later lands on
-    /// a handle nothing renders any more" bug class this closes. Called from
-    /// `crate::root::state::AdeApp::select_worktree`, `crate::code_surface::tabs::AdeApp::
-    /// open_and_focus_file` (the single real chokepoint every "open a file" entry point already
-    /// goes through) and `crate::code_surface::tabs::AdeApp::activate_file_tab`, and
-    /// [`Self::close_git_graph_tab`] above.
     pub(crate) fn leave_graph_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.graph_tab_active {
             return;
@@ -329,24 +303,6 @@ impl AdeApp {
 
     /// GitHub issue #221 ("Git graph only displays 500 commits"): walks further back and replaces
     /// the loaded graph with the longer walk, keeping the user exactly where they were.
-    ///
-    /// `wt_core::graph::build_graph` is a one-shot walk with no resumable cursor, so "load more"
-    /// is a *re-walk with a bigger cap*, not an append. That is sound because the walk is
-    /// deterministic - same tips, same `Sorting::ByCommitTime(NewestFirst)` - and
-    /// `wt_core::graph::layout_lanes` is a single forward pass whose output for row `i` depends
-    /// only on commits `0..=i`. A bigger cap therefore produces a strict prefix-identical
-    /// superset: every already-visible row keeps its index, its lane and its elbows, so the
-    /// scroll offset (owned by `uniform_list` itself, untouched here) still points at the same
-    /// commits after the swap. `wt_core::graph::graph_walk_is_prefix_stable_across_caps` is the
-    /// real test pinning that property.
-    ///
-    /// Unlike [`Self::load_graph`] this deliberately does *not* reset `selected_row`,
-    /// `row_menu_open` or `commit_files_cache`: nothing the user was looking at moved. The two
-    /// index-carrying fields are still re-resolved by commit id rather than simply left alone,
-    /// because the one row that genuinely *can* shift every index is the synthetic "Uncommitted
-    /// changes" row - it is not subject to `max_commits` at all and appears/disappears purely
-    /// from a live `is_dirty` check, so a save landing between the two walks would otherwise
-    /// silently slide the selection onto the neighbouring commit.
     pub(crate) fn load_more_graph_rows(&mut self, cx: &mut Context<Self>) {
         if self.graph_state.load_more_in_flight || self.graph_state.load_more_failed {
             return;
@@ -535,20 +491,6 @@ impl AdeApp {
     /// button-anchored point above. Always (re)opens at the given position, even if a menu - for
     /// this row or another - was already open, so a second right-click never leaves a stale
     /// popover at the old position or two popovers open at once.
-    ///
-    /// Two things `open_tree_context_menu` also does that a first draft of this method missed
-    /// (an adversarial audit of this exact change caught both):
-    /// - **Clamped inside the window**, via the same `crate::menu::model::clamp_menu_origin` the tree
-    ///   menu uses, rather than painting off-screen for any row in the lower half of a
-    ///   reasonably tall list - `theme::graph::ROW_MENU_WIDTH`/`ROW_MENU_HEIGHT` are this menu's
-    ///   own real, fixed painted size (its content never varies).
-    /// - **Explicitly focused**, via `window.focus`. The row's own right-click handler
-    ///   (`Self::render_graph_row`) calls `cx.stop_propagation()` so a right-click doesn't also
-    ///   select the row underneath it, but that same `stop_propagation` also preempts the graph
-    ///   container's own auto-focus-on-mousedown listener that a left-click would otherwise get
-    ///   for free - so without this explicit call, a right-click opened the menu but left
-    ///   keyboard focus wherever it was before. Mirrors `open_tree_context_menu`'s own
-    ///   `self.focus_file_tree(window, cx)` call, made for the identical reason.
     pub(crate) fn open_graph_row_menu_at(
         &mut self,
         index: usize,
@@ -601,16 +543,6 @@ impl AdeApp {
     ///   popover would run straight off it for *every* row.
     /// - **Always (re)opens** at the given position, even if a menu for this or another branch was
     ///   already open, so a second right-click never leaves a stale popover at the old position.
-    ///
-    /// Two deliberate differences from the row menu, both because this menu belongs to the right
-    /// sidebar rather than the centre pane:
-    /// - it does **not** move keyboard focus. The row menu focuses the graph view because a
-    ///   right-click's own `stop_propagation` preempts the graph container's click-to-focus and
-    ///   would otherwise leave the menu open with focus nowhere useful; here the equivalent move
-    ///   would be to yank focus out of the panel's own filter box (the only focusable thing in
-    ///   this panel) and into a different pane entirely, for a menu that is driven purely by
-    ///   clicks. Leaving focus alone is the honest behaviour, and nothing here depends on it.
-    /// - it is keyed by branch name rather than a row index - see [`GraphBranchMenu`]'s docs.
     pub(crate) fn open_graph_branch_menu_at(
         &mut self,
         branch: String,
@@ -792,10 +724,6 @@ impl AdeApp {
     /// Opens the branch menu's "Rename Branch…" prompt (GitHub issue #241) - the *same* prompt
     /// [`Self::start_graph_create_branch`] opens, in [`state::GraphBranchPromptKind::Rename`]
     /// mode (see [`state::GraphBranchPrompt`]'s own docs on why there is deliberately only one).
-    ///
-    /// Pre-filled with the branch's real current name via `TextField::seeded`, so a rename starts
-    /// from what the branch is actually called rather than an empty box - the one real difference
-    /// from the create case beyond which `wt_core::checkout` call Enter ends up making.
     pub(crate) fn start_graph_rename_branch(
         &mut self,
         old_name: String,
@@ -846,17 +774,6 @@ impl AdeApp {
 
     /// Enter on the branch-name prompt - runs whichever real `wt_core::checkout` mutation this
     /// prompt was opened for ([`state::GraphBranchPromptKind`]).
-    ///
-    /// The only hand-rolled validation here is "not empty" - just enough to avoid a
-    /// clearly-broken `git checkout -b '' <sha>` / `git branch -m <old> ''` invocation. A name
-    /// colliding with an existing branch, or one git rejects as invalid, is deliberately *not*
-    /// pre-checked here and instead surfaces as git's own real error through
-    /// [`Self::run_graph_remote_op`]'s status-message path, exactly like every other menu
-    /// mutation's real-conflict handling.
-    ///
-    /// A rename whose "new" name is byte-for-byte the branch's current name is also left to git:
-    /// `git branch -m <name> <name>` really does succeed as a no-op, which is an honest outcome
-    /// for a user who confirmed a rename without changing anything.
     pub(crate) fn commit_graph_branch_prompt(
         &mut self,
         window: &mut Window,
@@ -912,9 +829,6 @@ impl AdeApp {
     /// like every other graph mutation (a branch rename is repository-wide either way, but the
     /// invocation still has to happen *somewhere*, and that somewhere is never the main checkout
     /// unless it happens to be the focused one).
-    ///
-    /// A collision with an existing name, or a name git rejects outright, surfaces through
-    /// [`Self::run_graph_remote_op`]'s status-message path with git's own real error text.
     pub(crate) fn request_graph_rename_branch(
         &mut self,
         old_name: String,
@@ -930,17 +844,6 @@ impl AdeApp {
     /// The branch menu's "Checkout Branch" action (GitHub issue #241) - `git switch -- <branch>`
     /// in the focused worktree (`wt_core::checkout::checkout_branch`), landing on the *branch*
     /// with `HEAD` attached, not a detached commit.
-    ///
-    /// Deliberately not `wt_core::checkout::checkout` (the row menu's own "Check out"): that
-    /// function is safe only because every one of *its* callers passes a commit id resolved from
-    /// this app's own graph, never user-typed or taken from a branch listing - see its own docs.
-    /// This action's `branch` comes from the Branches panel's own list instead, so it needs
-    /// `checkout_branch`'s `--`-guarded implementation; see that function's docs for the real,
-    /// live-reproduced flag-injection failure mode reusing plain `checkout` here would reopen.
-    ///
-    /// A branch already checked out in another worktree, or uncommitted changes that would be
-    /// overwritten, are git's own refusals to make - surfaced verbatim through
-    /// [`Self::run_graph_remote_op`], never pre-checked here.
     pub(crate) fn request_graph_branch_checkout(&mut self, branch: String, cx: &mut Context<Self>) {
         self.graph_state.delete_branch_confirm_armed = None;
         self.run_graph_remote_op("Check out", cx, move |root| {
@@ -952,20 +855,6 @@ impl AdeApp {
     /// branch…" row, read off real app state for the **focused worktree** - never the repository's
     /// main checkout (the branch menu's own footer rule; see [`Self::run_graph_remote_op`] for the
     /// same `diff_root` discipline every other graph mutation already follows).
-    ///
-    /// Every field is a fact this app has already loaded for that worktree, so this performs no
-    /// blocking I/O and is safe to call from a render path: the current branch comes from
-    /// [`AdeApp::worktrees`] (`wt_core::list_worktrees`), the uncommitted count from
-    /// [`AdeApp::dirty_files`] (`wt_core::stage::dirty_paths`), and the agent counts from the live
-    /// [`AdeApp::agents`] plus [`Self::agent_status`] - the single status source the rail and the
-    /// work surface already share, so this can never disagree with them about which agents are
-    /// working.
-    ///
-    /// A `dirty_files` that hasn't landed yet reads as zero rather than as "blocked": `None` there
-    /// means *unknown*, and blocking a real merge on an answer that simply hasn't arrived would be
-    /// a reason the user cannot act on. `wt_core::merge::attempt_merge_into_current` re-checks
-    /// dirtiness against git itself immediately before merging, so an unknown-then-dirty worktree
-    /// costs an honest `MergeTargetDirty` refusal in the resolver, never a merge onto dirty state.
     pub(crate) fn graph_branch_merge_facts(
         &self,
         source_branch: String,
@@ -1006,11 +895,6 @@ impl AdeApp {
     /// The branch menu's "Push Branch…" action (GitHub issue #241) - a plain, never-forced push
     /// of that specific branch (`wt_core::remote::push_branch`), regardless of what is checked
     /// out in the focused worktree.
-    ///
-    /// Deliberately no force variant on this menu at all: the toolbar's own `Push ▾` menu is
-    /// where the two remote-history-losing postures live, behind the two-click confirmation
-    /// [`GraphTabState::push_force_confirm_armed`] documents. A plain push can only ever
-    /// fast-forward the remote, so like that menu's own "Push" row it runs on a single click.
     pub(crate) fn request_graph_push_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         self.graph_state.delete_branch_confirm_armed = None;
         self.run_graph_remote_op("Push branch", cx, move |root| {
@@ -1025,18 +909,6 @@ impl AdeApp {
     /// without deleting anything; a second click on that *same* branch's Delete row is what
     /// actually runs the delete. Clicking Delete on a *different* branch arms that branch instead
     /// of inheriting the previous arm.
-    ///
-    /// Nothing about the branch is pre-validated: git itself refuses an unmerged branch and a
-    /// branch checked out in any worktree, and its own refusal text is what the status line shows
-    /// (see `wt_core::checkout::delete_branch`'s docs).
-    ///
-    /// The single-flight guard is checked **here**, before the confirmation is touched, rather
-    /// than being left to [`Self::run_graph_remote_op`]'s own identical check at the far end (an
-    /// adversarial audit's finding): that later check returns without running anything, but by
-    /// then this method has already disarmed - so a confirmed second click landing while some
-    /// other graph operation was still in flight silently deleted nothing, cleared the
-    /// confirmation, and left the menu open with a stale status line, i.e. a dead click. Refusing
-    /// up front keeps the arm intact, so the click the user is about to repeat still counts.
     pub(crate) fn request_graph_delete_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         if self.graph_state.remote_op_in_flight {
             self.report_graph_op_in_flight(cx);
@@ -1057,17 +929,6 @@ impl AdeApp {
 
     /// The row menu's "Soft"/"Mixed"/"Hard" reset actions (GitHub issue #241) - real `git reset`
     /// against the focused worktree's current branch (`wt_core::checkout::reset`).
-    ///
-    /// `Soft`/`Mixed` run immediately on a single click - neither ever discards uncommitted work
-    /// (see `wt_core::checkout::ResetMode`'s own docs on what each really does), so like the Push
-    /// menu's plain "Push" row they need no confirmation. `Hard` genuinely discards uncommitted
-    /// changes and detaches whatever commits sat after `sha`, so it follows the exact two-click
-    /// discipline [`Self::request_graph_push`] already established for its own Force rows: the
-    /// first click on a given commit's "Hard" row only arms
-    /// [`GraphTabState::hard_reset_confirm_armed`] and re-labels the row, without resetting
-    /// anything; a second click on that *same* commit's "Hard" row is what actually runs the
-    /// reset. Any other mode, or "Hard" on a *different* commit, disarms rather than carrying a
-    /// stale confirmation over onto a reset the user never confirmed for that commit.
     pub(crate) fn request_graph_reset(
         &mut self,
         mode: wt_core::checkout::ResetMode,
@@ -1123,11 +984,6 @@ impl AdeApp {
     /// real success or a real git error message and reloads the graph either way - a fetch/pull/
     /// push always changes what the graph/ahead-behind counts should show, success or not (a
     /// failed pull can still have fetched new remote-tracking data, for one).
-    ///
-    /// A click that arrives while another graph operation is still in flight is **refused out
-    /// loud**, on the same status line every other outcome uses (GitHub issue #241's own rule for
-    /// this menu: never a silent no-op). It used to return in silence, which read as a dead click:
-    /// nothing happened, nothing was said, and the menu the click came from stayed open.
     fn run_graph_remote_op(
         &mut self,
         action: &'static str,
@@ -1310,11 +1166,6 @@ impl AdeApp {
     /// `.occlude()`d panel that stops its own click from bubbling up and dismissing it. Assumes
     /// `Self::graph_state.branch_prompt` is `Some` - the caller (`crate::root::AdeApp::render`)
     /// only renders this when it is.
-    ///
-    /// One panel for both kinds ([`state::GraphBranchPrompt`]): only the title, the subtitle line
-    /// (the target commit for a create, the branch's current name for a rename) and the footer
-    /// hint differ - everything else, including the real text field and its caret, is literally
-    /// the same element tree.
     pub(crate) fn render_graph_branch_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = self.graph_state.branch_prompt.clone();
         let name = self.graph_state.branch_prompt_name.as_str().to_string();
@@ -1916,43 +1767,6 @@ impl AdeApp {
 
     /// The row list - a real `gpui::uniform_list` (GitHub issue #218: "when displaying a big git
     /// history the git graph is laggy").
-    ///
-    /// **Scrolling lives in the list itself, not in a wrapper.** Until this fix every one of the
-    /// up to `wt_core::graph::DEFAULT_MAX_COMMITS` (500) loaded rows was built, laid out and
-    /// painted on *every single frame*, inside a plain `div().overflow_y_scroll()` - including
-    /// all the ones scrolled off screen (at `theme::graph::ROW`'s 26px, a 1080p window shows on
-    /// the order of 30 of them), each carrying a `gpui::canvas` lane painter, its ref chips and
-    /// a `⋯` trigger button. That is structurally the same per-frame cost
-    /// `crate::sidebar::render::AdeApp::render_file_tree` was carrying before it was virtualized,
-    /// where it measured as ~72% of a whole `Window::draw` - that number is the file tree's, on
-    /// its own row shape, not a measurement of this list; what is measured here is
-    /// `super::render::graph_virtualization_tests`' own before/after, i.e. that a row far below
-    /// the viewport stopped being built at all. This method deliberately follows that one's
-    /// structure rather than inventing a second pattern.
-    ///
-    /// Two things about `uniform_list` are load-bearing:
-    /// - its default `ListSizingBehavior::Auto` gives it zero intrinsic height, so every pixel
-    ///   of its height comes from the `.flex_1().min_h_0()` below - drop either and the list
-    ///   renders zero rows, with no panic and no warning;
-    /// - it sets its own `overflow.y = Scroll` and owns the scroll offset, so it needs no
-    ///   `overflow_y_scroll()` wrapper and must not be given one. (Re-adding one here was tried
-    ///   directly and did *not* defeat the virtualization the way `render_file_tree`'s docs warn
-    ///   it can - the `.flex_1().min_h_0()` still resolved against the wrapper's definite height
-    ///   - so this is redundancy to avoid, not a live trap on this particular call site.)
-    ///
-    /// Its one real requirement - a fixed row height - is already satisfied: every commit row is
-    /// exactly `theme::graph::ROW` tall (see [`Self::render_graph_row`]), and so is the trailing
-    /// "loading more commits" row ([`render_graph_load_more_row`]), which is a genuine item of
-    /// this list rather than a sibling appended outside it.
-    ///
-    /// **The visible range is also the "load more" trigger** (GitHub issue #221). The range
-    /// `uniform_list` hands the row builder every frame already *is* the scroll position, so
-    /// nothing extra needs measuring: once it reaches within [`LOAD_MORE_PREFETCH_ROWS`] of the
-    /// last loaded row, [`Self::load_more_graph_rows`] walks further back. That function is
-    /// single-flight guarded (`GraphTabState::load_more_in_flight`), which it has to be - this
-    /// closure runs several times per frame (`uniform_list` calls it once at `0..1` to measure the
-    /// row height, again during layout, then once more with the real visible range) and on every
-    /// frame the user lingers near the bottom.
     fn render_graph_rows(&self, graph: &Graph, cx: &mut Context<Self>) -> gpui::AnyElement {
         if graph.rows.is_empty() {
             return div()
@@ -2217,11 +2031,6 @@ impl AdeApp {
 
     /// The working-tree row's `N files · +A −B` note - the real union figure for everything dirty
     /// in this checkout, whoever wrote it.
-    ///
-    /// Every number comes from `AdeApp::uncommitted_change_set`, which is one row per path
-    /// (`crate::provenance::change_set`), so the file count here is the worktree's own and not the
-    /// sum of per-agent counts - a file two agents share is one dirty file, and
-    /// `REVISION-2026-07-31.md` §4's "honest arithmetic" is exactly that those two figures differ.
     fn render_graph_working_tree_note(&self) -> impl IntoElement {
         let stat = self.uncommitted_change_set.total();
         div()
@@ -2595,24 +2404,6 @@ impl AdeApp {
     /// The Branches panel's own branch right-click context menu (GitHub issue #241) - the seven
     /// real actions VSCode's Git Graph extension offers on a local branch, scoped to exactly
     /// those: Checkout / Rename / Delete, then Merge / Rebase, then Push, then Copy.
-    ///
-    /// Structurally the row `⋯` menu's twin ([`Self::render_graph_row_menu`]) and deliberately
-    /// so: the same `menu_popover_chrome` panel, the same [`render_dropdown_menu_row`] rows and
-    /// group headers, and the same scrim contract, including both of that menu's own
-    /// adversarial-audit-found fixes:
-    /// - the scrim's left-click dismiss `cx.stop_propagation()`s, so a click that dismisses this
-    ///   menu can never *also* re-trigger whatever sits underneath it in the same `MouseUpEvent`;
-    /// - the popover itself `.occlude()`s, so a right-click inside its own bounds can never fall
-    ///   through to the branch row it is painted over and retarget the menu to that branch.
-    ///
-    /// A right-click on the scrim (outside the popover) deliberately does *not* stop propagation,
-    /// so it dismisses and then still reaches whichever branch row it landed on, opening fresh
-    /// there in the same click - see the row menu's own matching comment.
-    ///
-    /// Anchored to the position captured once at open time
-    /// ([`GraphBranchMenu::origin_x`]/`origin_y`), never recomputed here, and keyed by branch
-    /// *name*: the panel's list is rebuilt and re-filtered constantly, so a row index would go
-    /// stale while an index-keyed menu stayed open.
     pub(crate) fn render_graph_branch_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(menu) = self.graph_state.branch_menu_open.clone() else {
             return gpui::Empty.into_any_element();
@@ -3165,10 +2956,6 @@ fn unix_now() -> i64 {
 /// plus a trailing row while - and only while - a real "load more" walk is in flight. Shared by
 /// the `item_count` argument and the row builder's own clamp so the two can never disagree about
 /// where that row lives.
-///
-/// Note what is *not* here any more (GitHub issue #221): the walk being truncated no longer adds
-/// an item of its own. A truncated walk is not a fact worth a permanent line of chrome - it is
-/// simply history that has not been walked yet, and scrolling to it loads it.
 fn graph_item_count(graph: &Graph, load_more_in_flight: bool) -> usize {
     graph.rows.len() + usize::from(load_more_in_flight)
 }
@@ -3176,17 +2963,6 @@ fn graph_item_count(graph: &Graph, load_more_in_flight: bool) -> usize {
 /// The trailing "loading more commits" row, shown only while a real
 /// [`AdeApp::load_more_graph_rows`] walk is genuinely running (GitHub issue #221) - it replaces
 /// the former "showing the first 500 commits" notice, which stated a limit that no longer exists.
-///
-/// Deliberately the same "loading …" wording, font and colour the whole-tab loading state uses
-/// (`AdeApp::render_graph_view`) rather than a new visual language, but left-aligned on the row
-/// grid like the notice it replaces instead of centred, so it reads as the next item in the list
-/// it is extending.
-///
-/// The final *item* of the row list rather than a sibling below it, which is what keeps it
-/// scrolling with the rows it is talking about. That makes it subject to `uniform_list`'s fixed
-/// row height, which is sized from item 0 alone, so it carries the same `theme::graph::ROW`
-/// height every commit row does - a taller row would simply be clipped, with no panic and no
-/// warning.
 fn render_graph_load_more_row() -> impl IntoElement {
     div()
         .debug_selector(|| "graph-rows-load-more".to_string())
@@ -3243,11 +3019,6 @@ fn render_graph_footer_action_button(
 
 /// One "Files changed" row - the change-row visual's spirit (git's own status letter + path),
 /// simplified since a historical commit has no review checkbox or per-file stat counts to show.
-///
-/// The commit file list is the third of the three places `STAGE-A-CHANGELOG.md` §4j names as
-/// having carried the old word badge, and like the Uncommitted rows it is a *list*, so the letter
-/// sits in its fixed column ahead of the directory and every filename below it starts on the same
-/// x - `Jerry.dc.html`'s own `gFiles` rows, in that order.
 fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoElement {
     let (dir, name) = changes::split_dir_name(&file.path);
     let letter = changes::status_letter(file.status);
@@ -3291,13 +3062,6 @@ fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoEle
 
 /// One Branches-panel row (design spec §5): a lane-coloured dot, the branch name, and a `HEAD`
 /// badge when it is the checked-out one.
-///
-/// Right-clicking it opens the branch context menu (GitHub issue #241), mirroring
-/// `AdeApp::render_graph_row`'s own right-click handler exactly: `cx.stop_propagation()` so the
-/// click reaches no ancestor handler, and the anchor resolved once from the real
-/// `event.position`. The menu itself is a single window-level overlay
-/// ([`AdeApp::render_graph_branch_menu`]) keyed by branch name, not a per-row child - a per-row
-/// popover would be clipped by the panel's own scroll container and would repaint with the row.
 fn render_graph_branch_row(
     name: String,
     kind: RefKind,
@@ -3441,28 +3205,6 @@ enum LaneJoin {
 
 /// One quarter-circle curve piece, as a real paintable `div()`: where it sits, how tall it is, and
 /// which two edges carry the border (and so which corner gets the radius).
-///
-/// Two GPUI behaviors drive every non-obvious number in here, and both are ordinary and fully
-/// deterministic - neither is anti-aliasing.
-///
-/// **1. A corner radius is clamped to half the box's shorter side.** `Style::paint`
-/// (`vendor/zed/crates/gpui/src/style.rs`) always calls `Corners::clamp_radii_for_quad_size`. So
-/// `theme::graph::ELBOW_CURVE_SIZE` is deliberately `2 * ELBOW_RADIUS`: the clamp's own threshold
-/// then exactly equals the requested radius and never reduces it. A corollary that shapes the rest
-/// of this module: the arc only ever occupies an `ELBOW_RADIUS` square in the box's own corner, so
-/// each bordered edge always carries exactly `ELBOW_RADIUS` of *straight* lead-in beyond it.
-///
-/// **2. A border is painted *inside* the box's own bounds**, exactly like CSS
-/// `box-sizing: border-box`. The quad shader (`fs_quad` in `crates/gpui_wgpu/src/shaders.wgsl`)
-/// tests each pixel against `corner_to_point + border_widths`, measured *inward* from the bounds
-/// edge. For the [`ELBOW_STROKE`]-wide borders painted here that means:
-///
-/// * `border_t`/`border_l` on an edge at `v` paint the pixel rows/columns `[v, v + stroke)`;
-/// * `border_b`/`border_r` on an edge at `v` paint the pixel rows/columns `[v - stroke, v)`.
-///
-/// So two boxes whose *edges* meet at a shared coordinate paint their strokes on two **different,
-/// adjacent** pixels. Anchoring therefore has to be stated in terms of the *painted* stroke, never
-/// the box edge - which is what [`CurveBox::anchored`] does on both axes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CurveBox {
     left: Pixels,
@@ -3474,12 +3216,6 @@ struct CurveBox {
     /// Not always `width`: a `HorizontalEdge::Bottom` curve is exactly one
     /// [`ELBOW_STROKE`] taller, so that its inside-painted bottom border lands *on* the waist row
     /// instead of one stroke above it.
-    ///
-    /// Growing the height (rather than moving the box) is what makes that correction safe: GPUI
-    /// anchors the arc at the box's own corner, so on a `rounded_bl`/`rounded_br` box the extra
-    /// stroke slides the arc down by exactly one pixel and lengthens the straight vertical lead-in
-    /// above it by the same amount - leaving `top`, the end that has to meet the row's dot or the
-    /// neighbouring row's own stub, exactly where it was.
     height: Pixels,
     horizontal: HorizontalEdge,
     vertical: VerticalEdge,
@@ -3489,14 +3225,6 @@ impl CurveBox {
     /// Positions one curve so that **both** its painted strokes land where they have to: its
     /// horizontal stroke on the `waist_y` row, and its vertical stroke on (or, for
     /// [`LaneJoin::LeavesDot`], one stroke beside) the lane vertical at `lane_x`.
-    ///
-    /// Every offset here is a direct consequence of GPUI painting borders inside the box - see the
-    /// type's own docs. There is deliberately no uniform "nudge" applied afterwards: `border_l` and
-    /// `border_r` need corrections of *different* signs, so no single shift can serve both.
-    /// `lane_x`, `waist_y`, `stroke` and `size` must already be device-grid-snapped values (see
-    /// [`SnapGrid`]) - every offset below is a sum/difference of them, so the resulting box edges
-    /// stay on exact device pixels and GPUI's own per-primitive rounding cannot move any of them
-    /// relative to each other.
     fn anchored(
         lane_x: Pixels,
         waist_y: Pixels,
@@ -3544,44 +3272,9 @@ impl CurveBox {
 /// bridge's `h(...)`, and each curve box's parametric `border_*(...)` widths - all four take this
 /// exact constant, so the painted widths and the geometry corrections stated in stroke terms
 /// ([`CurveBox::anchored`]'s offsets are *exactly* one stroke width) can never drift apart.
-///
-/// Aliases [`theme::graph::LINE_WIDTH`] (2px) rather than owning its own number: the width is a
-/// fractional-display-scale correctness choice shared with the rebase surface's fold elbow - see
-/// that constant's own docs for the full GPUI device-pixel-snapping story (GitHub issue #346).
 const ELBOW_STROKE: Pixels = theme::graph::LINE_WIDTH;
 
 /// The device-pixel grid one frame's lane canvas is authored on (GitHub issue #346, round 2).
-///
-/// **Why this exists.** GPUI rounds every painted primitive to whole *device* pixels
-/// independently: authored lengths are pre-rounded before layout (`Style::to_taffy` via
-/// `round_to_device_pixel`), resolved boxes get absolute edge rounding
-/// (`TaffyLayoutEngine::layout_bounds`, `Window::snap_bounds` - both `round_half_toward_zero`
-/// in device space), and border widths are snapped as lengths clamped to one device pixel
-/// (`Window::snap_stroke`). At a fractional scale factor, two logically coincident stroke
-/// positions reached through *different arithmetic* - a filled rect's `inset + length` against a
-/// border painted inward from a box's own far edge - can legally land one device pixel apart.
-/// Issue #346's first fix (2px strokes) turned that from a 100% break into a guaranteed overlap,
-/// but a one-device-pixel *step* at the junction still rendered at 1.25x/1.5x: the curve's waist
-/// stroke sat on device rows `[n, n+2)` while the bridge sat on `[n-1, n+1)` - connected, but
-/// visibly jagged at every elbow (the user's follow-up report).
-///
-/// **The by-construction fix.** Author every coordinate the canvas paints as a value that
-/// already sits exactly on the device grid: `round(v * scale) / scale`, the very rounding GPUI
-/// itself applies. Then GPUI's pre-layout rounding reproduces the same whole device pixel for
-/// every authored length, layout runs on integer device values, and per
-/// `vendor/zed/crates/gpui/src/taffy.rs`'s own layout-rounding notes ("This gives both closure
-/// and translation stability in the case that all local metrics are integer device-pixel
-/// lengths"), logically shared edges become the *same integer* through the whole pipeline - the
-/// junction disagreement is not tolerated but eliminated, at every scale factor. Pinned by
-/// `elbow_fractional_scale_tests`, which now demand exact junction agreement (not "at least 1px
-/// of overlap") across a fine scale sweep.
-///
-/// One caveat this cannot cover: the snapping here is relative to the canvas's own origin. That
-/// origin is itself a sum of pre-rounded authored lengths (row heights, fixed column widths), so
-/// it lands on the device grid too in every layout this view produces; a hypothetical ancestor
-/// that positioned rows at fractional device offsets (e.g. an unsnapped scroll transform) would
-/// shift all pieces *uniformly*, which still cannot re-open a junction except at exact
-/// half-device-pixel float ties.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SnapGrid {
     scale: f32,
@@ -3631,19 +3324,6 @@ impl SnapGrid {
 }
 
 /// A plain [`ELBOW_STROKE`]-tall filled segment bridging the entry and exit curves.
-///
-/// Always present, even between adjacent lanes where the two curves' own boxes already overlap, and
-/// always overlapping `ELBOW_RADIUS` into each - far enough to cover each curve's whole straight
-/// border lead-in (see [`CurveBox`] for why that run is always exactly `ELBOW_RADIUS` long). A real
-/// user report found a hairline gap at this seam: a border-radius arc and a filled rect are two
-/// different rendering paths, and GPUI (like CSS) does not guarantee their anti-aliased edges land
-/// on the same physical pixel even when the coordinates agree exactly. Covering the straight run
-/// with the fill takes the border's own rendering out of that stretch entirely.
-///
-/// `top` sits at the plain, unadjusted `waist_y`: a stroke-tall filled rect there occupies the
-/// rows `[waist_y, waist_y + stroke)`, which are exactly the rows a `border_t` on a box starting
-/// at `waist_y` paints. It is the `border_b` curve that needs correcting, and it is corrected via
-/// its own height rather than by moving this bridge - see [`CurveBox::anchored`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StraightSegment {
     left: Pixels,
@@ -3653,11 +3333,6 @@ struct StraightSegment {
 
 /// One elbow's S-curve geometry: two quarter-circle corners joined by a straight middle segment.
 /// Pure and GPUI-element-free, so it is testable with plain `Pixels` values.
-///
-/// A real user report against an earlier single-corner design ("curve the start and end of branch
-/// lines to make them join the horizontal lines instead of continuing... the end of the lines need
-/// to have corners too so they rejoin after merge") asked for exactly this shape: both ends of the
-/// connector get their own curve, not one rounded corner and one flat dead-end.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ElbowGeometry {
     entry: CurveBox,
@@ -3667,17 +3342,6 @@ struct ElbowGeometry {
 
 /// Computes one elbow's S-curve geometry. Pure and GPUI-element-free, so it is testable with plain
 /// `Pixels` values. `x_from`/`x_to` are `lane_x(elbow.from_lane)`/`lane_x(elbow.to_lane)`.
-///
-/// Which end sits on this row's dot differs by kind, and that is what decides each curve's
-/// [`LaneJoin`]. `Diverging`'s `from_lane` always *is* `own_lane` (`wt_core::graph::layout_lanes`
-/// Step 4 sets it so), so its entry curve leaves this row's dot and its exit curve delivers the
-/// line to `to_lane`'s own vertical. `Converging` is the mirror: Step 2 sets `from_lane` to the
-/// *ending* lane, so its entry curve continues that lane's already-painted line from the row above
-/// and its exit curve lands on `own_lane`'s dot.
-///
-/// The two kinds occupy opposite row halves (design spec §2 puts a real merge's elbow "in the lower
-/// half"; `Converging` is the same shape mirrored into the upper half), which is the only thing
-/// that tells them apart geometrically - both use the same entry/exit border-edge pattern.
 fn elbow_geometry(
     kind: ElbowKind,
     x_from: Pixels,
@@ -3801,27 +3465,6 @@ fn elbow_color_lane(kind: ElbowKind, from_lane: usize, to_lane: usize) -> usize 
 /// The order `render_graph_lane_canvas` paints one row's elbows in, paired with each elbow's own
 /// index in `row.elbows` so its `debug_selector` tag stays tied to the layout's own numbering
 /// rather than to paint position.
-///
-/// Every elbow of one kind in one row shares a single `waist_y` (see [`elbow_geometry`] - it is a
-/// function of the row height and the kind, nothing else), so *N* elbows landing on the same lane
-/// all paint their horizontal stroke on the very same pixel row, and their spans nest: the elbow
-/// from the furthest lane covers the whole stretch every nearer one occupies, its own arc columns
-/// included.
-///
-/// In `row.elbows`' own order that is fatal. `wt_core::graph::layout_lanes` Step 2 emits
-/// `Converging` elbows by ascending lane, so the *furthest* lane is painted **last** and wipes out
-/// every nearer elbow outright - not just its bridge but the arc that turns that lane's line onto
-/// the waist. This repository's own history renders exactly that: master's `HEAD` is the shared
-/// parent of eight worktree branches, so its row carries eight `Converging` elbows, and it painted
-/// as one flat full-width bar in lane 8's colour with the other seven lanes' lines stopping dead at
-/// the top of the row - a boxy rectangle where eight separate coloured curves belong. The
-/// single-elbow geometry was never wrong (`elbow_geometry_tests` covers one elbow exhaustively and
-/// all of it still passes); what was missing is that a row can hold more than one.
-///
-/// Painting longest span first and shortest last nests them the other way up, which is the shape a
-/// commit graph actually wants: the horizontal changes colour at every lane it crosses, each lane's
-/// own arc sits on top of the strokes running past it, and the innermost elbow owns the arc that
-/// lands on the dot. `sort_by_key` is stable, so equal spans keep the layout's own order.
 fn elbow_paint_order(elbows: &[wt_core::graph::Elbow]) -> Vec<(usize, wt_core::graph::Elbow)> {
     let mut ordered: Vec<(usize, wt_core::graph::Elbow)> =
         elbows.iter().copied().enumerate().collect();
@@ -3830,31 +3473,6 @@ fn elbow_paint_order(elbows: &[wt_core::graph::Elbow]) -> Vec<(usize, wt_core::g
 }
 
 /// The vertical span (`top`, `height`) one plain lane segment occupies in its row.
-///
-/// Pure and GPUI-element-free, like `elbow_geometry`/`elbow_color_lane`, so it is directly testable
-/// rather than only reachable through a real painted repo.
-///
-/// A segment whose line continues into the row below - a plain through-lane, or a `starts_here`
-/// stub whose line runs on down to the parent - **overshoots the row's bottom edge by one stroke**
-/// and relies on the row's own `overflow_hidden()` clip (see `render_graph_lane_canvas`) to cut it
-/// back. At an integer display scale the clip removes the overshoot exactly at the boundary and
-/// the next row's own segment resumes on the very next device row, same as the old edge-to-edge
-/// spans. At a *fractional* scale (GitHub issue #346) GPUI's per-primitive device-pixel snapping
-/// can land this row's painted bottom and the next row's painted top one device row apart, leaving
-/// a blank device row mid-line; the overshoot paints that seam row, while the clip - whose mask is
-/// GPUI's `cover_bounds`, a ceiled superset of the row box, i.e. at most one device row of slack -
-/// still guarantees at most one device row ever bleeds past the boundary, where it lands on pixels
-/// the next row's own same-coloured segment paints anyway. This is the same closure mechanism the
-/// elbows' clipped lead-outs (which genuinely cross the boundary) get for free.
-///
-/// An `ends_here` stub's *top* edge needs no mirrored overshoot: the row above always paints the
-/// continuing half of that line (a through segment or a `starts_here` stub, both of which now
-/// overshoot downward), so every shared boundary is covered from above.
-///
-/// History: this used to inset the neighbour by an `ELBOW_OVERSHOOT` constant, then ran exactly
-/// edge-to-edge once clipping removed the elbows' overlap at its source. The overshoot's return
-/// here is deliberate and one stroke *outward* (clipped), never an inset - the clip keeps it
-/// invisible at integer scales rather than reintroducing the doubled-line bug the inset era fixed.
 fn lane_segment_span(
     segment: &wt_core::graph::LaneSegment,
     row_h: Pixels,
@@ -3868,7 +3486,6 @@ fn lane_segment_span(
     let bottom = grid.length(row_h);
     let stroke = grid.stroke(ELBOW_STROKE);
     match (segment.starts_here, segment.ends_here) {
-        // Starts and ends in this one row: nothing continues below, nothing to overshoot for.
         (true, true) => (half, bottom - half),
         (true, false) => (half, bottom - half + stroke),
         (false, true) => (px(0.0), half),
@@ -3886,14 +3503,6 @@ fn lane_segment_span(
 /// regardless of what precedes the single flex item, this header's `author`/`age`/`sha`/spacer
 /// land on exactly the same x as the row's do. Proven, not assumed, by
 /// `graph_header_tests::the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below`.
-///
-/// Labels are uppercased in Rust (`.to_uppercase()`) rather than via a CSS-style text-transform -
-/// GPUI's `Styled` trait has no such property, so every uppercase label in this codebase already
-/// does this (`crate::rail::render::AdeApp::render_urgency_worktree_group`,
-/// `crate::settings::render::AdeApp::render_settings_nav`). The spec's `.07em` letter-tracking is
-/// dropped for the same reason those two also drop their own `.08em`/tracking values: GPUI's
-/// `TextStyle` (`vendor/zed/crates/gpui/src/style.rs`) has no letter-spacing field to set it
-/// with - a pre-existing gap in this GPUI build, not something newly cut for this header.
 fn render_graph_header() -> impl IntoElement {
     fn label(text: &'static str) -> impl IntoElement {
         div()
@@ -3970,23 +3579,6 @@ fn render_graph_header() -> impl IntoElement {
 /// spec §2). Every element is a flat rect - "Emit one element per lane per row... do not draw two
 /// stacked halves per row", so a `starts_here`/`ends_here` segment renders as a single half-height
 /// rect anchored to the correct edge, never two.
-///
-/// That "one element per lane per row" rule holds across row boundaries too, and `overflow_hidden()`
-/// is what enforces it. An elbow's far curve is `ELBOW_CURVE_SIZE` tall against only `ROW / 2` of
-/// row past the dot, so it always reaches past this row's own box; `elbow_geometry` guarantees the
-/// part that spills over is nothing but the curve's *straight* vertical lead-out, on exactly the
-/// column the neighbouring row's own full-height `LaneSegment` already draws.
-///
-/// Clipping it is not merely tidiness. Each row is its own `div()` and rows paint in order, so a
-/// later row's opaque `surface::ROW_HOVER`/`ROW_SELECTED` background paints *over* anything an
-/// earlier row spilled into its rectangle - which is precisely the reported "lines disappear at
-/// elbow connections when hovering" bug: hovering row N erased the tail of row N-1's branch-start
-/// elbow. GPUI clips nothing by default (`Style::overflow_mask` returns `None` for the default
-/// `Overflow::Visible`, `gpui/src/style.rs`), so this has to be asked for. Note GPUI's content mask
-/// is a single rectangle, so this bounds x at the canvas' own width as well - safe because
-/// `graph_lane_canvas_width` always reserves `LANE_X_BASE` past the rightmost lane while no elbow
-/// piece ever reaches more than one stroke past it (pinned by
-/// `elbow_geometry_tests::no_elbow_piece_ever_reaches_past_the_lane_canvas_own_width`).
 fn render_graph_lane_canvas(
     row_index: usize,
     row: &GraphRow,
@@ -4098,7 +3690,6 @@ fn render_graph_lane_canvas(
                 .absolute()
                 .left(curve.left)
                 .top(curve.top)
-                // The geometry's own snapped width, never the raw constant - see `CurveBox::width`.
                 .w(curve.width)
                 // Never `width` unconditionally - see `CurveBox::height`. The box only
                 // ever *grows* on one axis, so `min(width, height) / 2` stays (within one device
@@ -4192,21 +3783,6 @@ fn render_graph_lane_canvas(
 
 /// Ref chips for one row (design spec §2): local branches on their lane-colour dim pair, `HEAD`,
 /// outlined remotes, and tags.
-///
-/// GitHub issue #277: a local-branch chip is a right-click target in its own right, distinct
-/// from the row it sits on. Right-clicking directly on one opens the *branch*-scoped menu
-/// ([`AdeApp::render_graph_branch_menu`], via [`AdeApp::open_graph_branch_menu_at`]) with its
-/// real "Checkout Branch" action (`AdeApp::request_graph_branch_checkout` -
-/// `git switch -- <branch>`), rather than falling through to the row's own commit-scoped `⋯`
-/// menu (`AdeApp::request_graph_checkout`, a detached-HEAD checkout of the row's SHA). This
-/// mirrors `render_graph_branch_row`'s own right-click handler in the Branches panel byte for
-/// byte - same target function, same `cx.stop_propagation()` so the click never also reaches
-/// the row's handler underneath - the chip is just a second, row-embedded entry point onto the
-/// exact same branch menu. Scoped to `LocalBranch` only, same as the Branches panel itself
-/// (`Self::render_graph_branches_panel` filters on `RefKind::LocalBranch`): a remote branch or a
-/// tag has no "Checkout Branch" operation of its own - checking either out is inherently a
-/// detached-HEAD move, so those chips are left non-interactive and a right-click on them falls
-/// through to the row's own (correct, commit-scoped) menu, same as clicking bare row space.
 fn render_graph_ref_chips(row: &GraphRow, cx: &mut Context<AdeApp>) -> impl IntoElement {
     let mut chips = div()
         .flex_none()
@@ -4416,15 +3992,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// GitHub issue #277: right-clicking a branch chip *directly* - `main`'s own ref chip,
-    /// painted on row 0 by `render_graph_ref_chips` since `seed_three_commits` leaves `main`
-    /// checked out on the newest commit - must open the branch-scoped menu
-    /// (`AdeApp::render_graph_branch_menu`) naming that branch, with a real "Checkout Branch"
-    /// action behind it (`AdeApp::request_graph_branch_checkout`, `git switch -- <branch>`), not
-    /// the row's own commit-scoped menu (`AdeApp::request_graph_checkout`, a detached-HEAD
-    /// checkout of the row's SHA). Before the fix, the chip was a purely decorative div with no
-    /// handler of its own, so this click fell through to the row's handler and opened
-    /// `row_menu_open` instead.
     #[gpui::test]
     fn right_clicking_a_branch_chip_opens_the_branch_menu_not_the_row_menu(
         cx: &mut TestAppContext,
@@ -4464,12 +4031,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// The other half of GitHub issue #277's fix: right-clicking the *same* row that carries a
-    /// real branch chip, but away from the chip itself (over the commit subject, same spot
-    /// `right_clicking_a_row_opens_its_menu_at_the_real_click_position` above already uses),
-    /// must still open the row's own commit-scoped menu targeting that commit - a right-click
-    /// that isn't on the branch chip has no branch to scope to, so it stays a plain (correct)
-    /// detached-HEAD-style commit checkout, exactly as before this fix.
     #[gpui::test]
     fn right_clicking_the_bare_row_still_targets_the_commit_not_the_branch(
         cx: &mut TestAppContext,
@@ -4544,13 +4105,6 @@ mod graph_row_menu_tests {
         );
     }
 
-    /// `theme::graph::ROW_MENU_HEIGHT` is a hand-measured constant (this menu's content is fixed,
-    /// so unlike `crate::menu::model::menu_height` it has no analytical formula to
-    /// compute it from - see that constant's own docs) that `AdeApp::open_graph_row_menu_at`'s
-    /// edge clamp relies on being accurate. If the menu's real content ever changes (a row added
-    /// or removed, a header renamed to wrap onto two lines), this is what catches the constant
-    /// having quietly gone stale - a menu clamped against the wrong height can still paint
-    /// off-screen, the exact bug this whole change fixed.
     #[gpui::test]
     fn the_row_menu_pins_the_real_height_this_edge_clamp_relies_on(cx: &mut TestAppContext) {
         let (_repo, _app, cx) = open_seeded_graph(cx);
@@ -4569,20 +4123,6 @@ mod graph_row_menu_tests {
         );
     }
 
-    /// The scenario the design conversation flagged by name: right-clicking a different,
-    /// unobscured row while another row's menu is already open must close the old one and open
-    /// the new one at the new position - never leave the stale popover up, and never open the
-    /// new one at the old row's position.
-    ///
-    /// Opens on row 2 (the *last* row) first and right-clicks row 0 (well above it) second -
-    /// deliberately in that order, not row 0 then row 1: this popover's real painted height
-    /// (`theme::graph::ROW_MENU_HEIGHT`) is far taller than the gap between two adjacent rows in
-    /// this small fixture, so a menu opened on an *earlier* row would visually cover a *later*
-    /// one, and right-clicking through an open popover onto whatever it covers is a different,
-    /// separately-covered scenario (see
-    /// `right_clicking_inside_the_open_popover_does_not_retarget_to_the_row_underneath`) with a
-    /// deliberately different outcome (occluded, not retargeted). Row 0 sits above row 2's click
-    /// point, so its own popover never reaches back up over it.
     #[gpui::test]
     fn right_clicking_a_different_unobscured_row_replaces_the_open_menu_at_the_new_position(
         cx: &mut TestAppContext,
@@ -4624,12 +4164,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// `gpui`'s own `on_click` only ever fires for `MouseButton::Left`
-    /// (`~/.cargo/git/checkouts/zed-*/*/crates/gpui/src/elements/div.rs`, the
-    /// `event.button == MouseButton::Left` gate around its mouse-down tracking), so this is
-    /// structurally guaranteed rather than something `cx.stop_propagation()` in the row's own
-    /// right-click handler achieves - still worth a real assertion, since it is exactly the kind
-    /// of "surely that's fine" gap an adversarial audit exists to catch.
     #[gpui::test]
     fn right_clicking_a_row_does_not_also_select_it(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -4654,13 +4188,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// Critical fix: unlike a left-click, `MouseDownEvent::is_focusing()` is `false` for a
-    /// right-click (`vendor` `gpui`'s own default), so `gpui`'s automatic click-to-focus never
-    /// ran for it - an adversarial audit found a right-click opened the menu but left keyboard
-    /// focus wherever it was before. `AdeApp::open_graph_row_menu_at`'s own explicit
-    /// `window.focus` is the fix, mirroring `crate::sidebar::tree_ops::AdeApp::
-    /// open_tree_context_menu`'s identical `self.focus_file_tree(window, cx)` call for the same
-    /// reason.
     #[gpui::test]
     fn right_clicking_a_row_focuses_the_graph_view(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -4699,10 +4226,6 @@ mod graph_row_menu_tests {
         );
     }
 
-    /// The `⋯` button's own anchor: derived from that row's real captured trigger bounds
-    /// (`row_menu_bounds`), not a formula involving the row's index - proven here with a bounds
-    /// value far down the y axis, standing in for a row deep in a scrolled list, which a fixed
-    /// `index * row_height` formula would get wrong (the real, adversarial-audit-relevant case).
     #[gpui::test]
     fn the_dots_button_anchors_off_its_own_real_captured_bounds(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4752,16 +4275,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// `revision 3/REVISION-2026-07-31.md` §6.1 added a real 22px column header band between
-    /// the toolbar and the row list. The `⋯` button's own anchor
-    /// (`AdeApp::toggle_graph_row_menu`) is built entirely from that row's own real captured
-    /// `row_menu_bounds` - never `TOOLBAR`/`HEADER`/the row's index - so adding the header should
-    /// shift it down for free, with zero code changes to the anchor formula itself. This proves
-    /// that, end to end, through a *real* click on row 1's own `⋯` button (not a synthetic bounds
-    /// value like `the_dots_button_anchors_off_its_own_real_captured_bounds` above uses): first
-    /// that the row list genuinely starts immediately under the header's own real painted bottom
-    /// edge (not an assumed offset), then that the button click opens the menu at exactly that
-    /// real, header-shifted button position.
     #[gpui::test]
     fn the_dots_button_anchor_reflects_the_real_header_band_now_above_the_rows(
         cx: &mut TestAppContext,
@@ -4819,13 +4332,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// Real dispatch, not a direct method call: an adversarial audit of an earlier draft of this
-    /// change found that a *real* second click on the same button did not close the menu the way
-    /// a direct `toggle_graph_row_menu` call in a test claimed - the already-open menu's own
-    /// scrim paints on top of the button (see `Self::render_graph_row_menu`'s docs) and, without
-    /// `cx.stop_propagation()` in the scrim's dismiss handler, that same click *also* reached the
-    /// button underneath and reopened what the scrim had just closed. This exercises the real fix
-    /// through the real click path.
     #[gpui::test]
     fn a_real_second_click_on_the_same_dots_button_closes_the_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -4853,11 +4359,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// `toggle_graph_row_menu`'s own decision logic, given manually-seeded `row_menu_bounds` -
-    /// deliberately a direct-call, pure-state test (not a claim about real click dispatch; see
-    /// `a_real_second_click_on_the_same_dots_button_closes_the_menu` above for that): it proves
-    /// the `already_open_here` branch keys off `row_index`, not "any menu is open at all", so
-    /// switching to a different row's button reanchors rather than toggling the first one closed.
     #[gpui::test]
     fn toggle_graph_row_menu_reanchors_for_a_different_row_rather_than_toggling_closed(
         cx: &mut TestAppContext,
@@ -4898,12 +4399,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// Critical fix: a right-click *inside the open popover's own painted bounds* (but not on any
-    /// actual menu row) must not fall through to whatever graph row the popover happens to be
-    /// painted on top of - an adversarial audit reproduced exactly this by right-clicking inside
-    /// an open menu and getting a *different commit's* menu back at the cursor. `.occlude()` on
-    /// the popover panel (`Self::render_graph_row_menu`) is the fix; this proves it holds via a
-    /// real click, not by reading the code and trusting it.
     #[gpui::test]
     fn right_clicking_inside_the_open_popover_does_not_retarget_to_the_row_underneath(
         cx: &mut TestAppContext,
@@ -4943,11 +4438,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// A real, adversarial-audit-found gap in this change (pre-existing, not introduced by it):
-    /// the row `⋯`/right-click menu and the Push `▾` menu are independent state, with nothing
-    /// stopping both from being open at once - opening one left the other's own full-window scrim
-    /// painted underneath it, silently eating the next click aimed at dismissing it.
-    /// `Self::open_graph_row_menu_at` and `Self::toggle_graph_push_menu` now each close the other.
     #[gpui::test]
     fn opening_the_row_menu_closes_an_open_push_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -4974,8 +4464,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// The other direction of the same fix: opening the Push menu while a row menu is open must
-    /// close the row menu.
     #[gpui::test]
     fn opening_the_push_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -5002,11 +4490,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// GitHub issue #176 generalised the pairwise rule above into one shared invariant across all
-    /// six menu surfaces (`crate::root::menus`). This is the part that pair could never cover: a
-    /// real right-click on a graph row must also close a menu that has nothing to do with the
-    /// graph - here the tab strip's `+`, whose own scrim ignores right-clicks entirely and so used
-    /// to stay painted right alongside the row menu.
     #[gpui::test]
     fn opening_the_row_menu_closes_an_open_plus_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -5040,12 +4523,6 @@ mod graph_row_menu_tests {
         );
     }
 
-    /// Real, reachable-without-Settings bug an adversarial audit found: `open_git_graph` only
-    /// calls `load_graph` (which is what actually clears `row_menu_open`) while the graph is
-    /// still `NotLoaded`, so switching away from an *already-loaded* graph tab with a row menu
-    /// open and then back does not reload - and, before this fix, left the stale menu's
-    /// `graph_tab_active`-gated overlay (`crate::root::AdeApp::render`) reappear the instant the
-    /// tab became active again, with no click at all. `Self::leave_graph_tab` now clears it.
     #[gpui::test]
     fn switching_away_from_the_graph_tab_and_back_does_not_resurrect_a_stale_row_menu(
         cx: &mut TestAppContext,
@@ -5096,10 +4573,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// Real, adversarial-audit-found bug: opening Settings does not clear `graph_tab_active` (the
-    /// graph tab, if showing, is still "active" underneath Settings), so an open row or Push menu
-    /// kept painting its full-window scrim over the Settings surface, swallowing the first click
-    /// aimed at it. `Self::open_settings` now dismisses both.
     #[gpui::test]
     fn opening_settings_dismisses_an_open_row_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -5126,14 +4599,6 @@ mod graph_row_menu_tests {
         });
     }
 
-    /// `revision 3/REVISION-2026-07-31.md` §6.1: "Verify the fixed columns land on the same x as
-    /// a real row's." The spec gives illustrative numbers for its own 1520-wide reference build;
-    /// this compares this app's own real painted bounds against each other instead of hardcoding
-    /// those numbers, since a real column width here would make a hardcoded literal the thing
-    /// that's wrong, not the layout. Covers `author`/`age`/`sha` - the three fixed-width columns
-    /// both the header and a row genuinely share (the header's `graph`/`commit` cells stand in
-    /// for the row's `lane canvas`/`ref chips`/`subject` cells, which don't have single matching
-    /// counterparts to compare against 1:1).
     #[gpui::test]
     fn the_fixed_header_columns_land_on_the_same_x_as_the_row_columns_below(
         cx: &mut TestAppContext,
@@ -5214,9 +4679,7 @@ mod elbow_geometry_tests {
     /// this module spent four failed attempts on was the difference between those two.
     fn painted_horizontal_row(curve: &CurveBox) -> Pixels {
         match curve.horizontal {
-            // `border_t` on a box whose top edge is `y` paints `[y, y + 1)`.
             HorizontalEdge::Top => curve.top,
-            // `border_b` on a box whose bottom edge is `y` paints `[y - 1, y)`.
             HorizontalEdge::Bottom => curve.top + curve.height - ELBOW_STROKE,
         }
     }
@@ -5854,15 +5317,12 @@ mod elbow_geometry_tests {
         // *far* lane - the branch end that has to visibly turn onto the waist - still belongs to
         // that elbow. Under the old order every lane but the furthest fails this.
         for (kind, far_lanes, dot_lane) in [
-            // Eight branch tips sharing one ancestor: this repository's own real `HEAD` row.
             (
                 ElbowKind::Converging,
                 vec![1usize, 2, 3, 4, 5, 6, 7, 8],
                 0usize,
             ),
-            // The mirror: an octopus merge opening several lanes from one dot.
             (ElbowKind::Diverging, vec![1, 2, 3, 4], 0),
-            // Non-contiguous lanes, and one adjacent-lane elbow whose two boxes overlap.
             (ElbowKind::Converging, vec![1, 3, 6], 0),
         ] {
             let elbows: Vec<wt_core::graph::Elbow> = far_lanes
@@ -5964,27 +5424,6 @@ mod elbow_geometry_tests {
 /// junctions at every display scale factor - fractional ones included (1.25x, 1.5x - #216's
 /// `GPUI_X11_SCALE_FACTOR` override, or any fractional-DPI monitor), where GPUI's device-pixel
 /// snapping is what actually places every stroke.
-///
-/// Every logical-geometry test in this file was already exact - and that is precisely why four
-/// earlier rounds of 1px seam fixes each looked complete while the user kept seeing jagged
-/// elbows "on some screens": the breakage only exists after GPUI rounds each primitive to whole
-/// device pixels *independently*. GPUI pre-rounds every authored inset and length to whole
-/// device pixels before layout (`to_taffy` / `layout_bounds`,
-/// `vendor/zed/crates/gpui/src/taffy.rs`), and snaps border widths as lengths clamped to at
-/// least one device pixel (`Window::snap_stroke` via `round_stroke_to_device_pixel`,
-/// `gpui/src/util.rs`) - so two logically coincident stroke positions reached through
-/// *different* arithmetic (a filled rect's inset+length vs a border painted inward from a box
-/// edge) could legally land one device pixel apart at a fractional scale.
-///
-/// The first #346 fix (2px strokes) pinned ">= 1 device pixel of overlap" here - which
-/// guarantees *connection* but still allows a one-device-pixel **step** at each junction, and
-/// that step really rendered (measured at 1.25x on the fixed build: the curve's waist stroke on
-/// device rows `[n, n+3)` against a bridge on `[n, n+2)`, a visible jag at every elbow - the
-/// user's follow-up report). The geometry is therefore now authored pre-snapped to the device
-/// grid ([`SnapGrid`]), which upgrades the invariant these tests pin from "overlaps" to
-/// **"identical device-pixel interval"** at every junction - swept over a fine scale grid and a
-/// seeded random sample, not a handful of hand-picked values, so a scale that breaks the
-/// arithmetic cannot hide between test points. Each helper cites the GPUI function it mirrors.
 #[cfg(test)]
 mod elbow_fractional_scale_tests {
     use super::elbow_geometry_tests::ALL_SHAPES_AND_GAPS;
@@ -6229,7 +5668,6 @@ mod elbow_fractional_scale_tests {
         let mut stepped_junctions = 0;
         for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
             let geo = elbow_geometry(kind, x_from, x_to, ROW_H, SnapGrid::IDENTITY);
-            // What round 1 authored: raw `ELBOW_STROKE` everywhere.
             let bridge = fill(geo.straight.top, ELBOW_STROKE, scale);
             for curve in [geo.entry, geo.exit] {
                 let stroke_dev = device_stroke(ELBOW_STROKE, scale);
@@ -6315,17 +5753,13 @@ mod graph_elbow_render_tests {
     /// Where a painted curve's own vertical stroke must land, derived from the elbow's own lanes
     /// and the documented painting rules only - deliberately *not* by calling `elbow_geometry`,
     /// so this is a real independent check of it rather than a restatement.
-    ///
-    /// `is_entry` picks which end. Returns `(expected_stroke_x, stroke_x_from(bounds))`.
     fn expected_stroke_x(
         canvas_x: Pixels,
         elbow: &wt_core::graph::Elbow,
         is_entry: bool,
     ) -> (Pixels, fn(gpui::Bounds<Pixels>) -> Pixels) {
         let rightward = lane_x(elbow.to_lane) >= lane_x(elbow.from_lane);
-        // The entry curve's vertical faces the other lane; the exit curve's faces back.
         let vertical_is_left = if is_entry { rightward } else { !rightward };
-        // `Diverging` leaves this row's dot on its entry; `Converging` on its exit.
         let leaves_dot = match elbow.kind {
             wt_core::graph::ElbowKind::Diverging => is_entry,
             wt_core::graph::ElbowKind::Converging => !is_entry,
@@ -6572,7 +6006,6 @@ mod graph_elbow_render_tests {
              real Diverging elbow: {elbow_kinds:?}"
         );
 
-        // See the Converging test above for why this anchors off the lane canvas, not the row.
         let row_selector: &'static str =
             Box::leak(format!("graph-row-{merge_row_index}-lane-canvas").into_boxed_str());
         let row_bounds = cx
@@ -6592,7 +6025,6 @@ mod graph_elbow_render_tests {
         let exit_bounds = cx
             .debug_bounds(exit_selector)
             .unwrap_or_else(|| panic!("{exit_selector} must be painted"));
-        // Measured on the waist, for the reason spelled out in the Converging test above.
         let straight_selector: &'static str = Box::leak(
             format!("graph-row-{merge_row_index}-elbow-0-diverging-straight").into_boxed_str(),
         );
@@ -6634,15 +6066,6 @@ mod graph_elbow_render_tests {
         }
     }
 
-    /// Real regression for a real user report against the two tests above: "the vertical lines
-    /// are going too far at the end and at the start" - a lane that starts (or ends) here *and*
-    /// has a real elbow at this same row was getting both a plain `starts_here`/`ends_here` stub
-    /// *and* the elbow's own vertical stroke painted over the exact same pixels, at the exact
-    /// same x - not visually distinguishable from one continuous line running further than it
-    /// should. Reuses the same real Diverging-merge fixture as the test above: lane 1 both
-    /// `starts_here` at the merge row (a real `new_lane_segments` push, `layout_lanes` Step 4)
-    /// and has a real Diverging elbow (`to_lane: 1`) there - the plain segment for lane 1 must
-    /// not be painted at all once the elbow already covers it.
     #[gpui::test]
     fn a_lane_with_a_diverging_elbow_does_not_also_paint_a_plain_starts_here_stub(
         cx: &mut TestAppContext,
@@ -6717,26 +6140,6 @@ mod graph_elbow_render_tests {
         );
     }
 
-    /// The real regression test for the reported "the lines and elbows do not align correctly
-    /// vertically", and for a whole class of subpixel bugs the sibling tiling test below cannot
-    /// see: it only ever compares one lane canvas against *another* lane canvas, so a constant
-    /// offset shared by every row passes it untouched.
-    ///
-    /// `render_graph_row` used to be `.h(ROW).border_b_1()`, and GPUI's taffy layout is
-    /// border-box (`Style::to_taffy` in `vendor/zed/crates/gpui/src/taffy.rs` never sets
-    /// `box_sizing`, so taffy's `BoxSizing::BorderBox` default applies) - so with that border
-    /// present the row's *content* box was 25px while the lane canvas is a full `ROW` = 26px.
-    /// The row's own `.items_center()` then centred it to `(25 - 26) / 2` = -0.5px, and every
-    /// horizontal 1px stroke in the canvas - the elbow's straight bridge and both curve boxes'
-    /// horizontal borders - landed on a half-pixel boundary, rendering smeared over two physical
-    /// pixel rows while the vertical lane lines stayed crisp. The row's bottom border is gone now
-    /// (a real, reported design bug in its own right - see `render_graph_row`'s own docs), so
-    /// content box and border box are equal and this could no longer occur even without
-    /// `render_graph_lane_canvas`'s own `.self_start()` - which stays regardless, since it costs
-    /// nothing and keeps this correct independent of the row's own box model.
-    ///
-    /// Asserted on the canvas' offset *within its own row*, and on the offset being a whole
-    /// pixel - the two facts the centring broke, neither of which any existing test looked at.
     #[gpui::test]
     fn every_lane_canvas_sits_on_whole_pixels_at_its_own_rows_top_edge(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded(cx, seed_converging_history);
@@ -6778,18 +6181,6 @@ mod graph_elbow_render_tests {
         }
     }
 
-    /// The layout fact `render_graph_lane_canvas`'s `overflow_hidden()` rests on, and the real
-    /// paint-level regression for the "lines disappearing at elbow connections when hovering"
-    /// report. That clip is what stops an elbow's straight lead-out from spilling into the next
-    /// row's rectangle, where that row's own opaque hover background - painted later, since rows
-    /// are siblings drawn in order - would cover it.
-    ///
-    /// Clipping is only *lossless* because consecutive lane canvases tile exactly: each is `ROW`
-    /// tall and each sits `ROW` below the last, so the pixel row where one canvas' clip cuts the
-    /// line is the very pixel row where the next canvas' own full-height `LaneSegment` resumes it.
-    /// A gap or an overlap here would turn the clip into a visible dash (or bring back the doubled
-    /// line an earlier round fixed), and neither is visible from geometry alone - it depends on
-    /// the row's own real flex layout, not just the two numbers this test's own docs cite.
     #[gpui::test]
     fn consecutive_lane_canvases_tile_exactly_so_the_row_clip_loses_no_line(
         cx: &mut TestAppContext,
@@ -6901,15 +6292,10 @@ mod graph_selection_render_tests {
         (repo, app, cx)
     }
 
-    /// `STAGE-A-CHANGELOG.md` §4j's third site: "Applied in all three places that carried a
-    /// badge: the Uncommitted rows, the file header above the diff, and **the commit file list**."
-    /// The selected commit here really touched `a.txt` and nothing else, so its one row must
-    /// carry git's own `M`.
     #[gpui::test]
     fn the_commit_file_list_carries_gits_own_status_letter(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
 
-        // Row 0 is the newest commit (`second`), which modified `a.txt`.
         assert_eq!(
             app.read_with(cx, |app, _| app.graph_state.selected_row),
             Some(0),
@@ -6967,18 +6353,6 @@ mod graph_selection_render_tests {
         );
     }
 
-    /// The reported "double border left and bottom" - GPUI's `Style::border_color` is one
-    /// shared value for every edge of a single element (confirmed directly in `gpui`'s own
-    /// `style.rs`: `border_color: Option<Hsla>`, not per-edge), so a row using both
-    /// `border_b_1()` (its own permanent separator) and a conditional `border_l_2()` (its
-    /// selection edge) on the *same* div used to have the second `.border_color()` call
-    /// silently overwrite the first - recolouring the bottom separator to the selection colour
-    /// too, on every selected row, everywhere this pattern was used. The fix is a real, separate
-    /// child element for the left edge (`Self::render_graph_row`'s own docs). This proves that
-    /// child exists and is genuinely unconditional - painted with the same bounds whether or not
-    /// the row is selected, only its colour differs (which this test harness has no way to
-    /// inspect directly, but a `debug_bounds` miss on the unselected row would mean the child is
-    /// still conditionally created, i.e. this fix regressed back to the broken pattern).
     #[gpui::test]
     fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
         cx: &mut TestAppContext,
@@ -7019,15 +6393,6 @@ mod graph_selection_render_tests {
         );
     }
 
-    /// GitHub issue #127: `AdeApp::graph_view_focused` - the bool `Self::render_graph_row`'s own
-    /// selected-row highlight reads, since that render call chain never carries a real `&Window`
-    /// to check `FocusHandle::is_focused` against directly - is set explicitly alongside every
-    /// real `window.focus(&self.graph_focus_handle, ...)`/graph-tab-exit call site
-    /// (`Self::open_git_graph`, `Self::open_graph_row_menu_at`, `Self::leave_graph_tab`), not via
-    /// a `cx.on_focus` subscription - one was tried and, live-tested, never fired for
-    /// `graph_focus_handle`, since it's only ever `track_focus`'d conditionally
-    /// (`Self::render_center_pane` renders `Self::render_graph_view` only while `graph_tab_active`
-    /// is `true`). Direct coverage of every site that flips the bool.
     #[gpui::test]
     fn graph_view_focused_tracks_real_focus_and_blur_of_the_graph_view(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
@@ -7157,13 +6522,6 @@ mod graph_focus_tests {
         assert!(app.read_with(cx, |app, _| app.graph_tab_open && app.graph_tab_active));
     }
 
-    /// Regression: `NewGitGraph` was bound to `mod+shift+G` in `crate::default_key_bindings` but
-    /// `root::mod::AdeApp::render`'s `.on_action` chain never registered a handler for it, so the
-    /// real dispatch path (walked via `cx.dispatch_action`, exactly like a live keystroke) silently
-    /// no-opped - the palette's "Open git graph" row called `Self::open_git_graph` directly and
-    /// masked the gap. `cx.dispatch_action` (not a direct `app.open_git_graph(..)` call) is the
-    /// point: it proves the action reaches the handler through the same on_action chain a real
-    /// keystroke uses, not merely that the handler function itself works.
     #[gpui::test]
     fn mod_shift_g_actually_opens_the_graph_tab_through_real_action_dispatch(
         cx: &mut TestAppContext,
@@ -7180,11 +6538,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// Regression for a real, adversarial-audit-found gap (CRITICAL C2): opening the graph tab
-    /// while a file tab was focused cleared `open_change` (unrendering the code surface) but only
-    /// swept `tree_focus_handle`, not `code_focus_handle` - so `graph_focus`'s captured return
-    /// target could be a handle that had *already* stopped being rendered by the time it was
-    /// captured, dangling the moment the graph tab later closed back to it.
     #[gpui::test]
     fn opening_the_graph_tab_with_a_file_open_never_captures_the_unrendered_code_focus_handle(
         cx: &mut TestAppContext,
@@ -7232,10 +6585,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// Regression for a real, adversarial-audit-found gap (CRITICAL C1): `leave_graph_tab` only
-    /// checked `graph_focus_handle`, not the Branches panel's own real text-input surface
-    /// (`graph_state.branches_filter_focus_handle`), which is only rendered while the graph tab
-    /// is active and can independently hold real keyboard focus.
     #[gpui::test]
     fn leaving_the_graph_tab_from_the_branches_filter_lands_on_the_real_agent_pane(
         cx: &mut TestAppContext,
@@ -7287,9 +6636,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// Closing the graph tab's `×` while some *other* tab is showing (it is open but not active)
-    /// must be a real no-op focus-wise - a second real, adversarial-audit-style scenario:
-    /// `leave_graph_tab`'s own early-return for `!graph_tab_active` is what this proves.
     #[gpui::test]
     fn closing_an_inactive_graph_tab_does_not_touch_focus(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded(cx);
@@ -7357,13 +6703,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// GitHub issue #45 ("Input blink only on focused input or file") plus a live follow-up
-    /// report: this filter row had *no* caret element at all - confirmed by reading
-    /// `render_graph_branches_filter_row` before this fix, and `branches_filter_focus_handle`
-    /// was never threaded through `AdeApp::wire_caret_blink` either (it didn't exist yet when
-    /// that call in `Self::new_with_settings` was first wired - the Branches panel is a later
-    /// Revision R12 addition). Real interaction coverage, mirroring
-    /// `crate::rail::render::rail_filter_caret_tests`' own measured-bounds technique.
     #[gpui::test]
     fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
         cx: &mut TestAppContext,
@@ -7427,22 +6766,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// GitHub issue #45's own title, taken literally: before this fix,
-    /// `branches_filter_focus_handle` was never wired into `AdeApp::wire_caret_blink` at all, so
-    /// *blurring* it never called the real [`AdeApp::stop_caret_blink`] that pins the shared
-    /// flag straight to "dimmed" the instant focus leaves - the same real, immediate effect
-    /// every already-wired handle has always had.
-    ///
-    /// This deliberately checks *blur*, not *focus*: typing into the field also calls
-    /// `Self::reset_caret_blink` directly (`Self::handle_branches_filter_key_down`'s own real
-    /// "solid mid-keystroke" behaviour, GitHub issue #27) regardless of whether
-    /// `branches_filter_focus_handle` is wired into the shared loop at all - so a test that only
-    /// focuses-then-types would pass even with the wiring gap this fix closes, and prove
-    /// nothing about it. Blurring is the one real effect that only a genuine `AdeApp::
-    /// wire_caret_blink` subscription produces: an *immediate*, synchronous flip to
-    /// `caret_blink_visible == false`, not something that could be explained by the still-live
-    /// timer from the earlier keystroke (which hasn't been given time to fire - the background
-    /// clock is never advanced in this test).
     #[gpui::test]
     fn blurring_the_branches_filter_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded(cx);
@@ -7492,17 +6815,6 @@ mod graph_focus_tests {
         );
     }
 
-    /// GitHub issue #90 (independent audit, second round): a genuinely empty window has no real
-    /// repo to graph at all. `mod+shift+G` is bound with no key context - see
-    /// `crate::default_key_bindings`'s own docs - so it dispatches on the root element regardless
-    /// of whether a repo is focused, reaching `AdeApp::open_git_graph` directly. Before this fix,
-    /// that call would move real keyboard focus onto `graph_focus_handle` - a handle only ever
-    /// tracked inside `Self::render_center_pane` (part of `Self::render_workspace_body`, never
-    /// rendered while `Self::render_empty_state` is showing instead) - dangling it exactly like
-    /// the `empty_state_focus_handle` bug `AdeApp::open_repo_in_current_window`'s own
-    /// `forget_target` calls fix - and would load a real graph from `self.diff_root`, an empty
-    /// `PathBuf` in this state, which `gix::open` silently resolves relative to the process's own
-    /// real working directory.
     #[gpui::test]
     fn open_git_graph_is_a_no_op_with_no_focused_repo(cx: &mut TestAppContext) {
         let settings_dir = tempfile::tempdir().expect("tempdir");
@@ -7956,13 +7268,9 @@ mod graph_remote_action_tests {
         })
     }
 
-    /// GitHub issue #241 folded the row menu's two rebase entries into one: "Rebase onto this
-    /// commit" now opens the Planning banner, whose own `Start rebase` runs the replay. The
-    /// replay itself is what this proves - the same history a plain `git rebase <onto>` produces.
     #[gpui::test]
     async fn rebase_onto_really_replays_the_branch_and_reports_success(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
-        // A second branch line the app's own worktree branch will be rebased onto.
         git(local.path(), &["checkout", "-b", "target-branch"]);
         commit(local.path(), "b.txt", "target content", "target advances");
         let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
@@ -7997,11 +7305,6 @@ mod graph_remote_action_tests {
         );
     }
 
-    /// GitHub issue #241's real fix for this action, and the reason it moved onto the engine at
-    /// all: rebasing onto a commit used to report `Rebase failed: …` and stop there, leaving
-    /// `.git/rebase-merge/` on disk with **nothing in this app able to continue, skip or abort
-    /// it**. It now stops in [`RebasePhase::Stopped`], whose banner carries real
-    /// `Continue`/`Skip`/`Abort` and `Resolve in the diff view`.
     #[gpui::test]
     async fn rebase_onto_a_real_conflict_stops_in_the_recoverable_rebase_mode_not_a_dead_end(
         cx: &mut TestAppContext,
@@ -8049,7 +7352,6 @@ mod graph_remote_action_tests {
              that state actionable rather than a dead end"
         );
 
-        // And the recovery really works: the banner's own `Abort` restores the branch.
         app.update_in(cx, |app, _window, cx| {
             app.abort_rebase(cx);
         });
@@ -8069,9 +7371,6 @@ mod graph_remote_action_tests {
         );
     }
 
-    /// Entering rebase mode must never start a second one over a live one - the first one's
-    /// banner is the only surface that can recover it. The row menu itself is unreachable while
-    /// rebase mode is showing, so this covers `enter_rebase_mode_inner`'s own backstop guard.
     #[gpui::test]
     async fn rebase_onto_refuses_while_a_rebase_mode_is_already_live(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_local_repo(cx);
@@ -8103,7 +7402,6 @@ mod graph_remote_action_tests {
                 .expect("stopped rebase mode is live")
         });
 
-        // A second entry on a different commit while the first is still stopped.
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(other_row, cx);
         });
@@ -8125,8 +7423,6 @@ mod graph_remote_action_tests {
         cx.run_until_parked();
         assert!(!local.path().join(".git/rebase-merge").exists());
     }
-
-    // GitHub issue #241: "Check out" / "Create branch here" / Soft-Mixed-Hard reset.
 
     #[gpui::test]
     async fn checkout_really_moves_head_and_reports_success(cx: &mut TestAppContext) {
@@ -8480,27 +7776,6 @@ mod graph_remote_action_tests {
 /// Real, live-rendered proof that the commit row list is genuinely virtualized (GitHub issue
 /// #218) - that a row scrolled far below the viewport is not merely *invisible* but never becomes
 /// a painted element at all.
-///
-/// This is the property the whole fix rests on, and none of it is observable from the pure
-/// `wt_core::graph` logic: `build_graph` returns exactly the same rows either way. Only a real
-/// render can tell "built 200 rows and clipped 170 of them" apart from "built 30". These tests
-/// therefore also assert the *positive* half - that the rows which should paint really do, and
-/// that the ones which don't are still reachable by really scrolling - so a future change that
-/// "virtualizes" by rendering nothing fails here rather than passing.
-///
-/// Both of the first two tests were run against the pre-fix eager `flex_col` before being
-/// committed, and both genuinely failed against it (row 199 was painted); they pass against the
-/// `uniform_list`. That is what they measure and all they measure.
-///
-/// **What they do not catch, honestly:** re-wrapping the list in an outer `overflow_y_scroll()`
-/// container - the trap `crate::sidebar::render::AdeApp::render_file_tree`'s docs warn about -
-/// was tried here directly, and this list kept virtualizing anyway, because the `uniform_list`'s
-/// own `.flex_1().min_h_0()` still resolves against the outer scroller's definite height rather
-/// than growing to the full virtual one. So no assertion below claims to guard that; the only
-/// thing keeping the wrapper away is [`AdeApp::render_graph_rows`]' own structure and docs.
-///
-/// Mirrors `crate::sidebar::render::virtualization_tests`, the same proof for the file tree and
-/// the Changes list.
 #[cfg(test)]
 mod graph_virtualization_tests {
     use super::*;
@@ -8530,9 +7805,6 @@ mod graph_virtualization_tests {
 
     /// `count` real commits, and a clean working tree at the end so `build_graph` adds no
     /// "Working tree" row to shift the indices these tests name by literal selector.
-    ///
-    /// `--allow-empty` keeps the seed cheap: what is being measured here is how many *rows* get
-    /// painted, and an empty commit is as real a `GraphRow` as any other.
     fn seed_commits(dir: &std::path::Path, count: usize) {
         init_repo(dir);
         std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
@@ -8583,11 +7855,6 @@ mod graph_virtualization_tests {
         );
     }
 
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable. This scrolls the real list with a real `gpui::ScrollWheelEvent`
-    /// and asserts the row that was absent genuinely materializes - which simultaneously proves
-    /// the list still scrolls at all now that the former `div().overflow_y_scroll()` wrapper is
-    /// gone, the one behaviour this change could plausibly have broken outright.
     #[gpui::test]
     fn scrolling_the_virtualized_graph_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
@@ -8628,18 +7895,6 @@ mod graph_virtualization_tests {
         );
     }
 
-    /// The trailing "loading more commits" row is the final *item* of the virtualized list rather
-    /// than a sibling appended below it, so it has to (a) sit directly below the last loaded row
-    /// rather than floating anywhere else, and (b) respect the fixed row height every other item
-    /// has - `uniform_list` sizes every slot from item 0 alone, so a row that disagreed with
-    /// `theme::graph::ROW` would be laid out at the wrong height with no panic and no warning.
-    ///
-    /// The truncated graph here is real `wt_core::graph::build_graph` output, walked with an
-    /// explicit small `max_commits` rather than a repository of 501 commits - the same real code
-    /// path and the same real `Graph::truncated` flag `DEFAULT_MAX_COMMITS` sets, at a seed cost
-    /// this test suite can afford. `load_more_in_flight` is set the same way the real trigger sets
-    /// it, and left set, so the frame under assertion is stable: the real walk is never allowed to
-    /// finish and take the row away mid-test.
     #[gpui::test]
     fn the_load_more_row_is_the_last_item_of_the_list_at_the_shared_row_height(
         cx: &mut TestAppContext,
@@ -8688,9 +7943,6 @@ mod graph_virtualization_tests {
     /// scroll to the bottom is enough to reach the true end.
     const OVER_CAP_COMMITS: usize = 520;
 
-    /// The issue itself: the graph must not stop at 500. Scrolling the real `uniform_list` to the
-    /// bottom of the initially-capped walk has to load the rest, and rows that could not possibly
-    /// exist before (index >= 500) have to become genuinely paintable elements.
     #[gpui::test]
     fn scrolling_to_the_bottom_of_a_capped_walk_really_loads_more_commits(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8753,10 +8005,6 @@ mod graph_virtualization_tests {
         );
     }
 
-    /// A load-more replaces the whole `Graph`, so the user's selection has to survive it. It does
-    /// because a bigger cap is an element-identical prefix superset of the smaller walk
-    /// (`wt_core::graph::tests::graph_walk_is_prefix_stable_across_caps` pins that), and this
-    /// asserts the consequence end to end: the same row index still names the same real commit.
     #[gpui::test]
     fn loading_more_commits_keeps_the_selected_row_on_the_same_commit(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8796,17 +8044,6 @@ mod graph_virtualization_tests {
         });
     }
 
-    /// The single-flight guard. `AdeApp::load_more_graph_rows` is what every frame near the
-    /// bottom calls - and `uniform_list` runs the row builder several times per frame - so a
-    /// second call while a walk is already running must start nothing.
-    ///
-    /// This calls that real function directly rather than through a second simulated scroll,
-    /// because mid-flight is not reachable through one: `VisualTestContext::simulate_event` runs
-    /// the executor until parked itself, so by the time it returns the walk has already finished.
-    /// The observable is `_load_more_task`, which only `load_more_graph_rows` ever writes: it is
-    /// cleared between the two calls, so the slot being `None` afterwards means no second walk was
-    /// spawned. (Clearing it also cancels the first walk, which is what pins `load_more_in_flight`
-    /// true for the rest of the test - exactly the state the guard exists to handle.)
     #[gpui::test]
     fn a_second_call_while_a_walk_is_in_flight_starts_nothing(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8839,10 +8076,6 @@ mod graph_virtualization_tests {
         });
     }
 
-    /// The other half of the guard: a walk that genuinely failed must not be retried on every
-    /// frame the user spends near the bottom. The failure here is real - the repository is
-    /// deleted out from under the walk, which is exactly what `build_graph` errors on - and the
-    /// real error has to reach the user through the toolbar's own status line.
     #[gpui::test]
     fn a_failed_load_more_reports_the_real_error_and_stops_retrying(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8890,10 +8123,6 @@ mod graph_virtualization_tests {
         });
     }
 
-    /// The true end of history is not noteworthy: a fully-scrolled small repository must show no
-    /// trailing row at all - no loading indicator, and above all none of the old "showing the
-    /// first N commits" notice the issue asked for the removal of - and must not spin on a
-    /// reload loop that never terminates.
     #[gpui::test]
     fn reaching_the_true_end_of_history_shows_nothing_and_loads_nothing(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -9087,10 +8316,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The Branches panel sits hard against the window's right edge, so *every* branch row's
-    /// right-click would open a popover running off-screen without the same
-    /// `clamp_menu_origin` the row menu uses. That makes this the one menu in the app where the
-    /// clamp is not an edge case at all.
     #[gpui::test]
     fn the_branch_menu_is_clamped_fully_inside_the_window(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9125,9 +8350,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// `theme::graph::BRANCH_MENU_HEIGHT` is a hand-measured constant the edge clamp above relies
-    /// on - see [`theme::graph::ROW_MENU_HEIGHT`]'s own docs for why it can't be a formula, and
-    /// what to do when this fails (re-measure, don't guess).
     #[gpui::test]
     fn the_branch_menu_pins_the_real_height_this_edge_clamp_relies_on(cx: &mut TestAppContext) {
         let (_repo, _app, cx) = open_seeded_branches_panel(cx);
@@ -9195,9 +8417,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The exact adversarial-audit-found bug the popover's own `.occlude()` exists for, ported to
-    /// this menu: the popover paints *over* the branch list, so without it a right-click on the
-    /// panel itself retargeted the menu to whichever branch row happened to be underneath.
     #[gpui::test]
     fn right_clicking_inside_the_open_branch_popover_does_not_retarget_to_the_row_underneath(
         cx: &mut TestAppContext,
@@ -9212,7 +8431,6 @@ mod graph_branch_menu_tests {
             .debug_bounds("graph-branch-menu-popover")
             .expect("popover painted");
 
-        // A point genuinely inside the popover, and genuinely over a *different* branch row.
         let row_b = cx
             .debug_bounds("graph-branch-row-feature-b")
             .expect("feature-b row painted");
@@ -9255,7 +8473,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// GitHub issue #176's shared one-menu-at-a-time invariant, at this menu's own real trigger.
     #[gpui::test]
     fn opening_the_branch_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9283,8 +8500,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The mirror direction: the row menu's own opener sweeps this one closed too, which is what
-    /// registering `MenuSurface::GraphBranch` buys.
     #[gpui::test]
     fn opening_the_row_menu_closes_an_open_branch_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9311,9 +8526,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// A left-click anywhere off the popover dismisses it, and - the second
-    /// adversarial-audit-found fix this menu inherits - that same click must not also reach
-    /// whatever it landed on and re-open something.
     #[gpui::test]
     fn a_left_click_away_dismisses_the_branch_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9343,9 +8555,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The menu's rows are really wired to the real actions - driven by a genuine click on the
-    /// painted row rather than by calling the handler, so this covers the row → handler → git
-    /// path the user actually takes.
     #[gpui::test]
     fn clicking_the_checkout_row_really_checks_that_branch_out(cx: &mut TestAppContext) {
         let (repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9378,10 +8587,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The Rename row through its whole real path: a real click opens the shared branch-name
-    /// prompt, real keystrokes edit it, and a real Enter runs the real `git branch -m` - so the
-    /// prompt's own key handler and focus wiring are covered for the rename kind too, not just
-    /// for the create kind it was originally built for.
     #[gpui::test]
     fn renaming_through_the_real_prompt_keystrokes_really_renames_the_branch(
         cx: &mut TestAppContext,
@@ -9432,10 +8637,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// Every remaining row, driven by a real click on the real painted row - so each label is
-    /// pinned to the action actually behind it. Without this, a row wired to the wrong handler (or
-    /// to the right handler with the wrong argument) would still pass every handler-level test,
-    /// because those call the handlers directly.
     #[gpui::test]
     fn each_menu_row_is_really_wired_to_its_own_action(cx: &mut TestAppContext) {
         let (repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9452,7 +8653,6 @@ mod graph_branch_menu_tests {
             "the Copy row must copy the branch it was opened for"
         );
 
-        // Delete Branch - a first click arms *that* branch and deletes nothing.
         open_menu_at(cx, "graph-branch-row-feature-a");
         click_menu_row(cx, "dropdown-menu-row-Delete Branch\u{2026}");
         app.read_with(cx, |app, _| {
@@ -9511,7 +8711,6 @@ mod graph_branch_menu_tests {
         });
         cx.run_until_parked();
 
-        // Merge into current branch - fills the app's one existing merge flow.
         open_menu_at(cx, "graph-branch-row-feature-a");
         click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
         cx.run_until_parked();
@@ -9542,10 +8741,6 @@ mod graph_branch_menu_tests {
         cx.run_until_parked();
     }
 
-    /// Why the menu is keyed by branch **name** and not by the branch row's index: the panel's
-    /// list is re-filtered live, so the row a menu was opened over genuinely moves (or vanishes)
-    /// while that menu stays open. An index-keyed menu would then act on whatever branch now sits
-    /// at that index - or on nothing at all.
     #[gpui::test]
     fn the_open_menu_keeps_targeting_its_branch_when_the_filtered_list_reorders(
         cx: &mut TestAppContext,
@@ -9592,8 +8787,6 @@ mod graph_branch_menu_tests {
         );
     }
 
-    /// Switching away from the graph tab and back must never resurrect a stale popover with no
-    /// click at all - the exact gap `leave_graph_tab` documents for the row/push menus, mirrored.
     #[gpui::test]
     fn leaving_the_graph_tab_dismisses_the_branch_menu(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9629,14 +8822,6 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// The design's own first content precondition (`mergeReady: … && !uncommitted.length`), as a
-    /// real disabled row: a dirty worktree must show the reason *on the row* and the row must
-    /// genuinely have no click handler at all, not one that silently no-ops.
-    ///
-    /// This is also the one precondition that would otherwise only be discovered after the click:
-    /// `wt_core::merge::attempt_merge_into_current` refuses a dirty target with
-    /// `Error::MergeTargetDirty`, which would land in the resolver as a failed merge rather than
-    /// on the control the user is looking at.
     #[gpui::test]
     fn merge_row_is_disabled_with_the_designs_own_reason_while_the_worktree_is_dirty(
         cx: &mut TestAppContext,
@@ -9698,10 +8883,6 @@ mod graph_branch_menu_tests {
         );
     }
 
-    /// Merging the branch that is already checked out into itself is a guaranteed no-op
-    /// (`wt_core::Error::MergeSourceIsCurrentBranch`) - refused on the row rather than after the
-    /// click, and phrased as the state it really is rather than as something the user could fix by
-    /// committing.
     #[gpui::test]
     fn merge_row_is_disabled_on_the_branch_that_is_already_checked_out(cx: &mut TestAppContext) {
         let (repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9736,9 +8917,6 @@ mod graph_branch_menu_tests {
         );
     }
 
-    /// The other half of the gate: the facts it decides from must really be read off this app's
-    /// own loaded state for the **focused worktree**, not from constants. The pure decision itself
-    /// is covered branch-by-branch in `super::state`'s own unit tests; this pins the reading.
     #[gpui::test]
     fn merge_facts_are_read_from_the_focused_worktrees_own_real_state(cx: &mut TestAppContext) {
         let (repo, app, cx) = open_seeded_branches_panel(cx);
@@ -9767,7 +8945,6 @@ mod graph_branch_menu_tests {
             assert!(graph_branch_merge_gate(&facts).is_ready());
         });
 
-        // A real merge really running is a real fact, read the same way.
         app.update_in(cx, |app, window, cx| {
             app.start_merge_from_graph_branch("feature-a".to_string(), window, cx);
         });
@@ -9855,7 +9032,6 @@ mod graph_branch_action_tests {
             merge::MergeFlowState::AlreadyUpToDate { .. } => "AlreadyUpToDate".to_string(),
             merge::MergeFlowState::Clean { .. } => "Clean".to_string(),
             merge::MergeFlowState::Conflicted { .. } => "Conflicted".to_string(),
-            // The real error text matters far more than the variant name here.
             merge::MergeFlowState::Error { message, .. } => format!("Error({message})"),
         }
     }
@@ -10068,8 +9244,6 @@ mod graph_branch_action_tests {
         );
     }
 
-    /// The confirmation is keyed by branch name for exactly this reason: one branch's armed
-    /// confirmation must never authorize a *different* branch's delete.
     #[gpui::test]
     async fn arming_delete_on_one_branch_never_deletes_another(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
@@ -10104,12 +9278,6 @@ mod graph_branch_action_tests {
         );
     }
 
-    /// An adversarial audit's finding: a Delete click that lands while some other graph operation
-    /// is still in flight must not arm a confirmation at all. Before the guard moved to the top of
-    /// `request_graph_delete_branch`, that click armed silently (`run_graph_remote_op`'s own
-    /// single-flight check sits at the far end, well past the arming), so the *next* click - the
-    /// first one the user makes after the lane clears, and to them a first click - ran a real
-    /// delete with no confirmation of its own.
     #[gpui::test]
     async fn a_delete_click_while_another_op_is_in_flight_arms_nothing(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
@@ -10161,7 +9329,6 @@ mod graph_branch_action_tests {
              (success or git's own failure) - got {after:?}"
         );
 
-        // The user's next click is, to them, a first click - so it must arm, not delete.
         app.update_in(cx, |app, _window, cx| {
             app.request_graph_delete_branch("feature".to_string(), cx);
         });
@@ -10186,7 +9353,6 @@ mod graph_branch_action_tests {
     async fn deleting_an_unmerged_branch_surfaces_gits_own_real_refusal(cx: &mut TestAppContext) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
 
-        // Two real clicks, past the confirmation - the refusal under test is git's, not the UI's.
         for _ in 0..2 {
             app.update_in(cx, |app, _window, cx| {
                 app.request_graph_delete_branch("feature".to_string(), cx);
@@ -10276,7 +9442,6 @@ mod graph_branch_action_tests {
         cx: &mut TestAppContext,
     ) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
-        // `main` has its own commit that `feature` doesn't - so there is something real to replay.
         commit(local.path(), "c.txt", "own", "own work");
         let feature_tip = git_output(local.path(), &["rev-parse", "feature"]);
 
@@ -10521,9 +9686,6 @@ mod graph_branch_action_tests {
         );
     }
 
-    /// The resolver renders inside an agent's work surface, so with no agent tab there is
-    /// genuinely nowhere to show it. Refused honestly, with nothing started - never a merge run
-    /// into a surface the user can't see.
     #[gpui::test]
     async fn merge_into_current_branch_refuses_with_no_agent_tab_in_the_worktree(
         cx: &mut TestAppContext,

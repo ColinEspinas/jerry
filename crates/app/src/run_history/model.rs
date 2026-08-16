@@ -1,16 +1,5 @@
 //! The pure, GPUI-free half of agent history (GitHub issue #227): outcomes, drift bands, the
 //! repo → worktree → run tree, every word this surface says, and the synthesised transcript.
-//!
-//! Nothing here touches a window, a file or a `git` process, so "does an abandoned run at the tip
-//! really read as the most resumable thing in the list", "does a single commit say `1 commit
-//! since` rather than `1 commits since`" and "does a run with no stored transcript describe *its
-//! own* record" are all decisions asserted directly, the same contract [`crate::rail::state`] and
-//! [`crate::rail::strip`] already hold.
-//!
-//! Every count in this module goes through [`crate::root::plural`], per
-//! `REVISION-2026-08-13.md` §8a: "Every derived count in the window goes through
-//! `n(count, singular, plural?)`… Never inline a ternary for a count." That rule exists because
-//! the two hand-written ternaries in the mock both read `1 files`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,13 +11,6 @@ use crate::theme;
 use crate::work_surface::agents::AgentKind;
 
 /// How a run ended - `REVISION-2026-08-13.md` §5's four values.
-///
-/// **There is deliberately no `merged`.** §5, verbatim: "Merging happens to a branch, not to a
-/// run. A run whose code later merged simply finished; whether the branch merged is already on the
-/// worktree row in the rail (`merged · prunable`)." Adding a fifth variant here would put the same
-/// fact in two places with two vocabularies.
-///
-/// Outcome and drift are independent axes (§5) - see [`DriftBand`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Its last turn ended cleanly, and Jerry watched the run end.
@@ -43,19 +25,6 @@ pub enum Outcome {
 
 impl Outcome {
     /// The real outcome of a real record.
-    ///
-    /// Every arm is a rule over facts this app genuinely persisted, not a guess:
-    ///
-    /// | Recorded | Outcome | Why |
-    /// |---|---|---|
-    /// | no [`PastAgent::ended_at_unix`] | `abandoned` | Jerry never saw this run end. The app quit, the machine slept, or the agent's hooks simply stopped. "Left unfinished" is the honest reading, and it is exactly the state §5's fourth value names |
-    /// | ended, last status [`Status::Fail`] | `failed` | its own last real signal was a failure |
-    /// | ended, last status [`Status::Run`] or [`Status::Ask`] | `interrupted` | it was still working, or still blocked on a human, when it was ended |
-    /// | ended, last status [`Status::Review`] or [`Status::Idle`] | `done` | its turn had ended cleanly before it was closed |
-    ///
-    /// Note what this deliberately does *not* do: it never reads the diffstat. A run that
-    /// finished cleanly having changed nothing is still `done` - "did it produce changes" is a
-    /// different question, answered by the header's own diffstat.
     pub fn of(run: &PastAgent) -> Outcome {
         if run.ended_at_unix.is_none() {
             return Outcome::Abandoned;
@@ -169,9 +138,6 @@ pub fn drift_sentence(commits: usize) -> String {
 
 /// Which runs the History view is showing - `REVISION-2026-08-14.md` §6's `all` / `this worktree`
 /// toggle.
-///
-/// `All` is the default, matching `Jerry.dc.html`'s own `hScope` default, and it is the one that
-/// makes this surface worth visiting: the rail already tells you about the worktree you are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistoryScope {
     #[default]
@@ -224,19 +190,6 @@ pub fn filtered_away_note(hidden: usize) -> String {
 // ---------------------------------------------------------------------- one run's own wording
 
 /// A run's title - `REVISION-2026-08-13.md` §3's first line, "agent chip · title · duration".
-///
-/// The real title is the first prompt the run's human typed
-/// ([`crate::hooks::store::PersistedAgentStatus::title`]). Where hooks never caught one, this
-/// falls back through what the record genuinely does have, ending at a label that claims nothing:
-///
-/// 1. the run's own title,
-/// 2. the last question it asked, then the last activity it reported - both real, dated statements
-///    the agent made about itself,
-/// 3. `<kind> session` - the honest "this record has no description in it".
-///
-/// Never the worktree's directory name, which is what the rail's own agent rows use: that is the
-/// same string for every run in a checkout, so in a list *of* that checkout's runs it names
-/// nothing.
 pub fn run_title(run: &PastAgent) -> String {
     run.title
         .clone()
@@ -247,10 +200,6 @@ pub fn run_title(run: &PastAgent) -> String {
 
 /// How long the run really lasted, from its own spawn moment to its own end - the row's trailing
 /// `6m` and the transcript header's `24m`.
-///
-/// `None` when the run has no recorded ending ([`Outcome::Abandoned`]): the gap between spawning
-/// and the last hook Jerry happened to hear is not the run's duration, it is how long Jerry was
-/// listening, and printing it as a duration would be a fabrication.
 pub fn run_duration(run: &PastAgent) -> Option<String> {
     let ended = run.ended_at_unix?;
     let seconds = ended.saturating_sub(run.spawned_at_unix);
@@ -258,11 +207,6 @@ pub fn run_duration(run: &PastAgent) -> Option<String> {
 }
 
 /// A finished run's duration, in the design's own `6m` / `1h 02m` shape.
-///
-/// Deliberately not [`crate::rail::state::format_elapsed`], which is whole-units-only (`1h`) on
-/// purpose: that label ticks live in the rail, where a second component would be noise. A finished
-/// run's duration is a fixed fact printed once, where `1h 02m` and `1h 58m` are genuinely
-/// different things and `1h` for both loses the difference.
 pub fn format_run_duration(seconds: i64) -> String {
     if seconds < 60 {
         return format!("{seconds}s");
@@ -276,13 +220,6 @@ pub fn format_run_duration(seconds: i64) -> String {
 
 /// When the run finished, in the design's own `today 09:41` / `yesterday 16:12` / `2 days ago`
 /// shape.
-///
-/// **The clock is UTC, not the viewer's local time**, and so is the day boundary - the same
-/// documented trade-off [`crate::rail::state::format_utc_hhmm`] already makes for the rail's own
-/// timestamps, reused here rather than grown into a second, subtly different copy: `std` has no
-/// timezone database, and pulling one in was not worth it for a label. A viewer several hours off
-/// UTC can therefore see `yesterday 23:40` for a run they remember as this morning. That is a
-/// known, app-wide limitation of this build, not something specific to History.
 pub fn run_when(finished_at_unix: i64, now_unix: i64) -> String {
     const DAY: i64 = 86_400;
     let days_ago = now_unix.div_euclid(DAY) - finished_at_unix.div_euclid(DAY);
@@ -310,11 +247,6 @@ pub fn run_finished_at(run: &PastAgent) -> i64 {
 
 /// The transcript header's meta line - §3's
 /// `<agent> · <when> · 24m · 21 turns · 6 files · +148 −96`.
-///
-/// Every part is omitted rather than faked when the record does not carry it: a run with no
-/// recorded ending prints no duration, a run whose hooks never counted a turn prints no turn
-/// count, and a run whose diffstat could not be measured prints no file count *and* no `+/−` (they
-/// are one measurement - see [`crate::hooks::history::RunDiffstat`]).
 pub fn run_meta_line(run: &PastAgent, now_unix: i64) -> String {
     let mut parts: Vec<String> = vec![
         run.kind.label().to_string(),
@@ -350,9 +282,6 @@ pub fn run_tab_label(run: &PastAgent, now_unix: i64) -> String {
 /// Whether a run matches the History view's filter text, over exactly the strings the row shows:
 /// its title, its branch (supplied by the caller, since a run record stores a path, not a branch)
 /// and its agent kind. A blank query matches everything.
-///
-/// The same shape [`crate::rail::strip::Problem::matches_filter`] uses, deliberately: one filter
-/// field serves every sidebar view, so the two must behave the same way about case and blankness.
 pub fn matches_filter(run: &PastAgent, branch: Option<&str>, query: &str) -> bool {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -451,15 +380,6 @@ impl RunTree {
     /// The view's own count line - `REVISION-2026-08-13.md` §1: "each view's body opens with its
     /// own count line", and §2's rule for what one may say: "Both list headers ... are **tallied
     /// over their own data**".
-    ///
-    /// So this counts *this tree* - what the body is actually showing after the scope and the
-    /// filter - rather than the whole history, and it names both levels of the hierarchy it is
-    /// showing, the way §2's own `10 results · 5 files · 3 worktrees` does. Both terms go through
-    /// [`crate::root::plural`] (§7 rule 9).
-    ///
-    /// `None` when there is nothing to count: the empty note ([`empty_note`]) or the
-    /// filtered-away note ([`filtered_away_note`]) says the real thing instead, exactly as
-    /// [`crate::rail::strip::ProblemTally::count_line`] does for a clean worktree.
     pub fn count_line(&self) -> Option<String> {
         let total = self.total();
         if total == 0 {
@@ -474,28 +394,11 @@ impl RunTree {
 }
 
 /// The rail's own `↺ 2 earlier runs` line under a worktree row - `REVISION-2026-08-13.md` §6.
-///
-/// Agreement through [`crate::root::plural::form`] rather than [`crate::root::plural::count`]
-/// because the count is not adjacent to its noun here: `2 earlier runs` puts a word between them,
-/// which is exactly the case §8a's helper docs name ("For anything else that has to agree with a
-/// count ... call `form` directly, so the sentence still has exactly one place that looks at the
-/// number").
 pub fn earlier_runs_label(count: usize) -> String {
     format!("{count} earlier {}", plural::form(count, "run", "runs"))
 }
 
 /// Builds the real repo → worktree → run tree.
-///
-/// `worktrees` is every checkout the window knows about, in the rail's own order - the tree
-/// follows it, so History and the rail can never disagree about which repo a worktree belongs to
-/// or what order they come in. A run whose worktree is not in that list is dropped: it belongs to
-/// a checkout that has been removed or pruned, there is no place left to resume it into, and
-/// `crate::hooks::flow::AdeApp::resume_past_agent` would honestly refuse it anyway.
-///
-/// `collapsed` names the worktrees whose group the user has explicitly folded. A group not in it
-/// opens if it is the active worktree, or if the scope is already narrowed to one worktree -
-/// `Jerry.dc.html`'s own default, and the reason `REVISION-2026-08-14.md` §6 says the active
-/// worktree "opens by default" rather than "is the only one open".
 pub fn build_run_tree(
     runs: &[PastAgent],
     worktrees: &[HistoryWorktree],
@@ -627,17 +530,6 @@ fn resume_command_line(run: &PastAgent, branch: Option<&str>) -> String {
 /// The full body of a run-transcript tab: `captured` where a real transcript was stored for this
 /// run, a short synthesis from the run's *own* record where none was, and in both cases the
 /// synthesised closing line.
-///
-/// `REVISION-2026-08-13.md` §3 is unusually emphatic about the rule this implements, because
-/// breaking it is what the design caught itself doing: transcripts are keyed by run id, **never**
-/// the live agent's buffer - "Borrowing the live buffer produces a pane whose header and body
-/// describe two different runs, whose diffstats contradict each other, and - worst - one that ends
-/// on an unanswered question with a highlighted, apparently-selectable option list. A completed
-/// run cannot be awaiting an answer, and 70% opacity does not disambiguate that."
-///
-/// This function structurally cannot break it: its only inputs are one run's own record and one
-/// run's own captured lines, and it always appends a real closing line, so no transcript can end
-/// on a pending question.
 pub fn transcript_body(
     run: &PastAgent,
     branch: Option<&str>,
@@ -698,19 +590,6 @@ fn synthesised_body(run: &PastAgent, branch: Option<&str>) -> Vec<TranscriptLine
 
 /// The two closing lines every transcript ends on - §3's
 /// `● Finished. 2 files changed, +41 −0.` and `⎿ run ended today 09:41 after 6m`.
-///
-/// **The detail glyph is `└` (U+2514), not the design's `⎿` (U+23BF).** U+23BF is Claude Code's
-/// own tree mark, and this app's bundled `IBM Plex Mono` has no glyph for it - nor does anything
-/// in the fallback chain on the platforms checked, so it rendered as a tofu box in the real
-/// window (caught by a screenshot, not by a test: a `String` comparison cannot see a missing
-/// glyph). U+2514 is the same mark from the box-drawing block, is really in the bundled font, and
-/// is what `●`/`❯` are already relying on the renderer for. Substituting a character the design
-/// meant *to be seen* is honouring it, not departing from it.
-///
-/// This is the "one signal that this is a recording" that actually carries the meaning: the pane's
-/// 70% opacity says it is not live, and these say what happened and when it stopped. A transcript
-/// therefore never ends on a pending question, whatever its captured lines ended on - which is
-/// §9's checklist item in as many words.
 pub fn closing_lines(run: &PastAgent, now_unix: i64) -> Vec<TranscriptLine> {
     let outcome = Outcome::of(run);
     let lead = match run.diffstat {
@@ -812,8 +691,6 @@ mod tests {
         }
     }
 
-    /// §5: "an abandoned run at the tip is the most resumable thing in the list" - the two axes
-    /// really are independent, and nothing here couples them.
     #[test]
     fn outcome_and_drift_are_independent_axes() {
         let mut past = run("/repo/wt", 1);
@@ -826,8 +703,6 @@ mod tests {
         assert_eq!(entry.band(), Some(DriftBand::Tip));
     }
 
-    /// The rule §5 states as a prohibition, pinned as a test so a later "completeness" pass
-    /// cannot quietly add the fifth value back.
     #[test]
     fn there_is_no_merged_outcome() {
         for outcome in [
@@ -923,7 +798,6 @@ mod tests {
 
     #[test]
     fn when_reads_today_yesterday_and_then_whole_days() {
-        // 1_700_000_000 is 2023-11-14 22:13:20 UTC.
         let day = 86_400;
         let at = 1_700_000_000;
         assert_eq!(run_when(at, at), "today 22:13");
@@ -1065,7 +939,6 @@ mod tests {
         assert!(beta.is_active);
         assert!(beta.open, "the active worktree opens by default");
 
-        // An explicit fold wins over the default, in both directions.
         let collapsed: HashMap<PathBuf, bool> = [
             (PathBuf::from("/a/wt-1"), false),
             (PathBuf::from("/b/wt-2"), true),
@@ -1169,8 +1042,6 @@ mod tests {
         );
     }
 
-    /// §3's hard-won rule, as a test: a run with no stored transcript describes **its own**
-    /// record, and the result cannot end on a pending question.
     #[test]
     fn a_run_with_no_stored_transcript_describes_only_its_own_record() {
         let mut past = run("/a/wt-1", 1_700_000_000);
@@ -1233,8 +1104,6 @@ mod tests {
         );
     }
 
-    /// §2's "tallied over their own data": the line counts the tree the body is really painting,
-    /// both levels of it, and says nothing at all when there is nothing to count.
     #[test]
     fn the_count_line_tallies_the_tree_the_body_is_really_showing() {
         let runs = vec![run("/a/wt-1", 10), run("/a/wt-2", 20), run("/b/wt-3", 30)];
@@ -1280,7 +1149,6 @@ mod tests {
         );
     }
 
-    /// §6's rail line, singular and plural both.
     #[test]
     fn the_rail_link_says_one_earlier_run_in_the_singular() {
         assert_eq!(earlier_runs_label(1), "1 earlier run");

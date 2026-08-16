@@ -2,21 +2,6 @@
 //! architecture is it on. Used by the terminal footer, the status bar chip, and the Settings
 //! "Default environment" row (the latter two land in Revision R6) - kept as one small,
 //! GPUI-free module so all three read the same answer.
-//!
-//! ## Detection
-//!
-//! [`is_wsl`] checks `WSL_DISTRO_NAME` first - the env var WSL itself sets on every distro for
-//! exactly this purpose - rather than parsing `/proc/version`, since it needs no blocking file
-//! read. That var is only set by WSL's interop layer at shell startup, so a process launched a
-//! different way (e.g. systemd-managed) may never inherit it even on a real WSL2 kernel;
-//! [`is_wsl`] falls back to checking whether `/run/WSL` exists (a marker file WSL2 itself
-//! creates) when the env var is absent.
-//!
-//! [`is_wsl_from`] is the pure decision, injected with both signals as plain `bool`s so every
-//! combination is unit-testable regardless of what environment the test runner itself runs in.
-//!
-//! Both signals are constant for the process lifetime, so [`is_wsl`]/[`wsl_distro_name`] cache
-//! behind a `OnceLock` rather than re-deriving on every render.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -68,8 +53,6 @@ mod tests {
         assert!(is_wsl_from(true, false));
     }
 
-    /// A real WSL2 process that never inherited `WSL_DISTRO_NAME` (e.g. a systemd-managed
-    /// launch) must still be detected via the `/run/WSL` marker alone.
     #[test]
     fn the_run_wsl_marker_alone_is_also_detected_as_wsl() {
         assert!(is_wsl_from(false, true));

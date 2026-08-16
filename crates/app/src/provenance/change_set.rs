@@ -1,54 +1,4 @@
 //! One row per path, with the authors that wrote it (GitHub issue #284).
-//!
-//! This is the join between a real `wt_core::diff::WorktreeDiff` and
-//! [`super::store::WorktreeProvenance`]. It exists because attribution is only useful attached to
-//! the list a human actually reads, and because the design's first "rule that is easy to get
-//! wrong" is a rule about *that list*:
-//!
-//! > **A path appears once per worktree**, however many agents touched it - `by: ['s3','s10']`
-//! > with a combined diffstat, never two rows. Two rows give one path two staging checkboxes, let
-//! > it be staged twice, and suppress the `⚠` shared-file ring entirely, because nothing then has
-//! > two authors.
-//! >
-//! > — `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1
-//!
-//! [`ChangeSet`] enforces that structurally rather than by convention: it is built through a map
-//! keyed by path, so a second row for one path is not a thing that can be constructed. A diff
-//! that somehow reported the same path twice is *merged* into the one row, not appended after it.
-//!
-//! ## `split`, and why it sums
-//!
-//! `STAGE-A-CHANGELOG.md` §5 left this as the open question for the real build:
-//!
-//! > **Open question for Stage B:** `split` is authored demo data. In the real app it has to come
-//! > from the same per-line provenance that feeds the gutter - the run diff and the split are the
-//! > same fact counted two ways. Worth stating in the build spec so they can't drift.
-//!
-//! They cannot drift here, because they are not two computations. [`ChangeSetEntry::stat`] is
-//! **defined as** the sum of [`ChangeSetEntry::split`] - there is no independently-counted total
-//! to disagree with it. The split itself is a genuine partition of the diff's own lines:
-//!
-//! - Every **added** line goes to the author of that line, asked of the very same
-//!   [`super::store::PathProvenance::author_at`] the gutter will ask (GitHub issue #287).
-//! - Every **removed** line goes to the author who removed it, from
-//!   [`super::store::RemovalMark`] - the ledger exists precisely because a deleted line has no
-//!   surviving line to carry an author.
-//! - Anything neither can answer for goes to [`super::Author::Unattributed`], which is a real
-//!   bucket in the split rather than a silent shortfall.
-//!
-//! Each of the diff's lines therefore lands in exactly one bucket, so
-//! `entry.split().values().sum() == entry.stat()` holds by construction, and summing that across
-//! the change set gives [`ChangeSet::split`] - the per-run diffstats the Runs section needs
-//! (GitHub issue #285), guaranteed to add up to [`ChangeSet::total`].
-//!
-//! ## What the honest arithmetic looks like
-//!
-//! `REVISION-2026-07-31.md` §4's rule falls straight out of one row per path: a file both agents
-//! touched is one row in the worktree's count and one file in *each* agent's count, so
-//! [`ChangeSet::file_count_for`] summed over the agents deliberately **exceeds**
-//! [`ChangeSet::len`]. That is not double-counting to be fixed; it is what "they are both working
-//! on this file" means, and [`ChangeSet::shared_paths`] is the same fact seen from the row's side
-//! - the `⚠` ring.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -114,10 +64,6 @@ impl ChangeSetEntry {
 
     /// The `⚠` ring's single meaning, verbatim from `REVISION-2026-08-14.md` §1: *"this path has
     /// lines from more than one agent"*.
-    ///
-    /// Deliberately counts **agents**, not authors: a file one agent wrote and the human then
-    /// hand-edited is not a file two agents are fighting over, and lighting the ring for it would
-    /// make the ring mean "someone touched this twice", which is every file.
     pub fn is_shared(&self) -> bool {
         self.agents().len() > 1
     }
@@ -184,10 +130,6 @@ impl ChangeSet {
 
     /// Everyone who wrote anything anywhere in this worktree, de-duplicated, in [`Author`]'s own
     /// order - the working-tree graph row's `by` union (GitHub issue #287).
-    ///
-    /// The union of the rows' own author lists, read off the same partition every row's `+n`/`−n`
-    /// is read off, so the graph row and the panel can never name different sets of authors for
-    /// one worktree.
     pub fn authors(&self) -> Vec<Author> {
         self.split()
             .into_iter()
@@ -207,11 +149,6 @@ impl ChangeSet {
 }
 
 /// Builds the change set for one worktree from a real diff and the recorded provenance.
-///
-/// `provenance` may be `None` (or simply know nothing about these paths), in which case every
-/// line lands in [`Author::Unattributed`] and the result is exactly the file list and diffstat
-/// the app already had - which is what makes this safe to put on the real path before any
-/// attribution UI exists.
 pub fn build_change_set(diff: &WorktreeDiff, provenance: Option<&WorktreeProvenance>) -> ChangeSet {
     // Keyed by path, so "one row per path" is a property of the data structure rather than a rule
     // the loop below has to remember.
@@ -252,17 +189,6 @@ pub fn build_change_set(diff: &WorktreeDiff, provenance: Option<&WorktreeProvena
 
 /// Every diff line's author, hunk by hunk, index-aligned with `file.hunks[h].lines` - **the**
 /// per-line answer, and the one the diff view's gutter bar paints (GitHub issue #287).
-///
-/// A **context** line is deliberately [`Author::Unattributed`]: it is a line this diff does not
-/// change, so "who wrote it" is a question about history, not about this diff, and answering it
-/// would paint an unchanged line as somebody's work. That is also why context lines contribute
-/// nothing to [`split_for`]'s buckets - they are not part of the diffstat either.
-///
-/// [`split_for`] is **defined as** a fold over this, rather than a second walk of the same hunks
-/// with the same rules. `STAGE-A-CHANGELOG.md` §5's open question was exactly that the run diff
-/// and the split must not be able to drift; the gutter is a third reader of the same fact, and
-/// the only way three readers cannot disagree is if there is one computation. So a line's tint
-/// and its contribution to the row's `+n`/`−n` are the same decision, taken once.
 pub fn line_authors(file: &DiffFile, provenance: Option<&WorktreeProvenance>) -> Vec<Vec<Author>> {
     let record = provenance.and_then(|records| records.get(&file.path));
 
@@ -326,10 +252,6 @@ pub fn line_authors(file: &DiffFile, provenance: Option<&WorktreeProvenance>) ->
 
 /// Partitions one file's diff lines by author - a fold over [`line_authors`], never a second
 /// walk of its own.
-///
-/// Every added and removed line lands in exactly one bucket, which is the whole reason the shares
-/// sum to the total. Context lines are in neither, exactly as they are in neither half of a
-/// diffstat.
 fn split_for(
     file: &DiffFile,
     provenance: Option<&WorktreeProvenance>,
@@ -479,7 +401,6 @@ impl UserApi {
                 &s10,
                 "fn search() {}\nfn search_cached() {}\n",
             );
-            // The human's own edit, through the same door `AdeApp::record_hand_edit` uses.
             std::fs::write(repo.join("src/api/users.rs"), USERS_RS_AFTER_YOU).expect("hand edit");
             store.record_hand_edit(repo, &repo.join("src/api/users.rs"));
 
@@ -561,7 +482,6 @@ impl UserApi {
             "while the `impl UserApi` opening line - which nobody touched - stays nobody's"
         );
 
-        // The combined diffstat is the real one git reports for this path.
         assert_eq!(
             (entry.stat().added, entry.stat().removed),
             {
@@ -642,10 +562,6 @@ impl UserApi {
         );
     }
 
-    /// GitHub issue #287's gutter, at the level the gutter actually reads: one author per diff
-    /// line. The mock's own acceptance criterion for `users.rs` is "**three distinct gutter
-    /// tints, one of which is the neutral hand-edit tint**", which is only reachable if this
-    /// really returns three different authors over the file's own lines.
     #[test]
     fn every_diff_line_of_the_shared_file_carries_the_author_who_really_wrote_it() {
         let fixture = Fixture::two_agent_worktree();
@@ -716,8 +632,6 @@ impl UserApi {
         }
     }
 
-    /// The gutter and the row's `+n`/`−n` are one computation, not two that agree today -
-    /// `STAGE-A-CHANGELOG.md` §5's own open question, closed structurally.
     #[test]
     fn the_per_author_split_is_exactly_the_fold_of_the_per_line_authors() {
         let fixture = Fixture::two_agent_worktree();
@@ -747,7 +661,6 @@ impl UserApi {
         }
     }
 
-    /// The `by` union for a whole worktree - the graph's working-tree row (audit item I4).
     #[test]
     fn the_worktree_wide_author_union_is_everyone_who_wrote_anything_in_it() {
         let fixture = Fixture::two_agent_worktree();

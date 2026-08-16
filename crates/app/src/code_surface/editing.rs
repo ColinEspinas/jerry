@@ -1,43 +1,5 @@
 //! Real text editing for Surface C's File view (Revision R8.5a) - the GPUI-facing half of
 //! `crate::code_surface::edit_buffer::EditBuffer`'s pure logic. Three real pieces live here:
-//!
-//! 1. `impl EntityInputHandler for AdeApp` - the trait GPUI's real keyboard/IME platform layer
-//!    calls into (see `vendor/zed/crates/gpui/src/input.rs`'s own docs, and this module's own
-//!    `render_editable_file_view_line`, which is the one real call site that registers it via
-//!    `Window::handle_input`). Every method resolves its target buffer through
-//!    [`AdeApp::active_editable_path`]/`AdeApp::edit_buffers` and returns an honest empty/`None`
-//!    result when there's no active File-view tab or buffer for it - an input-handler call
-//!    arriving while, say, a terminal agent or the read-only Diff view has focus is a safe
-//!    no-op, never a panic or a wrong-buffer edit (the Diff view's own dispatch path never even
-//!    gets the `"file-editor"` key context these actions are scoped to - see
-//!    `crate::code_surface::render::AdeApp::render_code_surface`'s own docs for exactly where that
-//!    context lives and why - but the input-handler trait methods have no such context gate of
-//!    their own, so this module's own checks are the real, structural guard).
-//! 2. The `Editor*` keyboard action handlers (arrows, Backspace/Delete/Enter, selection,
-//!    save) - bound with a `"file-editor"` `key_context` in `crate::default_key_bindings`,
-//!    registered on `render_code_surface`'s outer, focused container (see that method's docs).
-//! 3. Real per-row painting: [`render_editable_file_view_line`] renders each visible row's real
-//!    visible glyphs from real, content-sized `div`s (matching the read-only File view's own
-//!    proven text rendering - see that function's own docs for why, not a bare `gpui::canvas`),
-//!    while a sibling `Window::text_system().shape_line` call (via an absolutely-positioned
-//!    `gpui::canvas` overlay) provides the real pixel-accurate selection/cursor math (on every
-//!    row the selection touches, not only the caret's own row) and registers the real
-//!    `EntityInputHandler` wiring from the one row that actually contains the caret.
-//!
-//! ## A documented, honest gap: typing while the caret's own row is scrolled out of view
-//!
-//! `window.handle_input` is only ever registered from the caret's own row's paint (see point 3
-//! above) - if that row isn't in the currently-*painted* range at all (the user scrolled away
-//! without moving the caret - `Self::sync_cursor_and_scroll` keeps it in view after every real
-//! cursor-moving action/edit, so this is a narrow window: a manual scroll with no intervening
-//! action, then typing immediately), the platform window has no real input handler registered
-//! that frame at all, and a literal character keystroke has nowhere real to go - not silently
-//! misapplied to the wrong buffer/position, just genuinely dropped, with no visual feedback.
-//! `Editor*` action-based input (arrows, Backspace/Delete/Enter, Save) is unaffected - those
-//! dispatch as ordinary GPUI actions independent of the input-handler registration, and moving
-//! the caret via any of them immediately re-scrolls it into view. A real, deliberate scope cut
-//! for this phase rather than a fabricated fallback (e.g. guessing which row "should" get focus)
-//! - flagged here rather than silently left undocumented.
 
 use std::ops::Range;
 #[cfg(test)]
@@ -199,13 +161,6 @@ impl AdeApp {
     /// A single slot per path in [`AdeApp::_rehighlight_tasks`]: assigning a fresh task here drops
     /// (cancels) whatever earlier debounce timer for the same path was still waiting, so only the
     /// most recent keystroke's timer ever actually fires - real debounce, not a queue.
-    ///
-    /// GitHub issue #178: the same background task also rebuilds the File view breadcrumb's
-    /// enclosing-symbol outline (`crate::code_surface::symbols::symbol_outline`), and
-    /// [`EditBuffer::apply_highlight`] installs the two together under one content-snapshot
-    /// guard. Riding along here rather than getting its own timer is deliberate: the outline is
-    /// stale for exactly as long as the highlighting is, so the breadcrumb can never claim a
-    /// symbol structure that disagrees with the colours on screen.
     pub(crate) fn schedule_rehighlight(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(buffer) = self.edit_buffer(&path) else {
             return;
@@ -433,7 +388,6 @@ impl AdeApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // See `Self::handle_editor_enter_action`'s own docs.
         if self.completions_open_for_active_path() {
             return;
         }
@@ -721,12 +675,6 @@ impl AdeApp {
     /// top docs) always falls back straight to the user's own [`crate::settings::store::
     /// EditorSettings`] default. `None`/no edit target also falls back to the same user default -
     /// harmless, since every real caller already returns before using it in that case.
-    ///
-    /// `pub(in crate::code_surface)`, not private: `crate::code_surface::file_view::
-    /// AdeApp::render_file_view`'s own row builder reuses this exact same resolution for GitHub
-    /// issue #122's real indent-guide spacing, rather than re-deriving a second, possibly-drifting
-    /// notion of "the current indent width" from `Settings::editor` alone (which would ignore a
-    /// real `.editorconfig` override the same file's own Tab/Shift+Tab already honors).
     pub(in crate::code_surface) fn resolved_indent_settings_for_target(
         &self,
     ) -> indent::IndentSettings {
@@ -982,14 +930,6 @@ impl AdeApp {
     /// The real explicit save (`secondary-s`, scoped to `"file-editor"`) - see this module's own
     /// docs and `AdeApp::file_external_conflict`'s own docs for the real conflict this refuses to
     /// silently paper over.
-    ///
-    /// The freshness check here is authoritative and synchronous: a single, cheap
-    /// `std::fs::metadata` stat call (mirroring `crate::code_surface::file_view::AdeApp::
-    /// render_file_view`'s own established precedent for doing this inline rather than off the
-    /// foreground thread) compared against [`EditBuffer::saved_mtime`]/[`EditBuffer::saved_len`],
-    /// stronger than relying only on the render-time, throttled [`AdeApp::file_external_conflict`]
-    /// flag (which can be up to `FILE_FRESHNESS_CHECK_INTERVAL` stale), though that flag is also
-    /// updated here for the File view's own banner to read.
     pub(crate) fn save_active_file(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.active_editable_path() else {
             return;
@@ -1054,13 +994,6 @@ impl AdeApp {
     /// scope: this is a real, explicit "keep mine" choice, not a silent one) - reusing the exact
     /// same [`Self::enqueue_save`]/[`Self::spawn_file_save_loop`] dispatch [`Self::save_active_file`]
     /// itself uses once its own gate passes, so there is still only ever one real write path.
-    ///
-    /// Still real-guarded by [`crate::code_surface::edit_buffer::EditBuffer::is_dirty`], though (finding 7's own
-    /// low-priority fix): without it, triggering this real "save anyway" override on an already-
-    /// clean buffer (e.g. a stale keybinding fired after an unrelated save already succeeded)
-    /// would perform a real, genuinely unnecessary disk write and bump the file's real mtime for
-    /// no reason - a needless write, not a needless *safety check* (the freshness gate itself is
-    /// still deliberately skipped, per this method's whole point).
     pub(in crate::code_surface) fn force_save_active_file(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.active_editable_path() else {
             return;
@@ -1102,23 +1035,6 @@ impl AdeApp {
     /// the buffer's *current* content fresh at each iteration (not a value captured once at
     /// dispatch time), so a keystroke landing while an earlier write is still in flight is picked
     /// up by this same loop's next pass rather than needing a second, racing task.
-    ///
-    /// [`AdeApp::file_save_running`] must be cleared on *every* real exit path from the loop
-    /// below, not just one of them - a real, if previously only latent, bug an audit caught: an
-    /// earlier version only cleared it in the "no pending save left" branch, so a pending save
-    /// whose [`AdeApp::edit_buffers`] entry vanished before this loop got to check it (a real,
-    /// live path - `crate::sidebar::tree_ops::AdeApp::forget_deleted_paths` really does remove a
-    /// deleted file's buffer entry via `edit_buffers.retain`, and a save can genuinely still be
-    /// pending for it at that moment; also directly simulated in this module's own tests via the
-    /// test-only `AdeApp::remove_edit_buffer`) left `file_save_running` stuck containing that path
-    /// forever, since the closure below returned `None` without clearing it and the loop broke on
-    /// exactly that `None`. [`Self::enqueue_save`] then treats any path still in
-    /// `file_save_running` as "a writer loop is already alive for it" and silently no-ops every
-    /// future save for that path -
-    /// a real, silent, permanent, data-loss-adjacent failure the user would have no way to notice
-    /// (Ctrl+S would appear to do nothing, forever, for that one file). Restructured so there is
-    /// exactly one real place this flag is set ([`Self::enqueue_save`]) and every `None`-producing
-    /// branch here clears it before returning `None`, impossible to desync.
     fn spawn_file_save_loop(&mut self, cwd: PathBuf, path: PathBuf, cx: &mut Context<Self>) {
         let task = cx.spawn({
             let path = path.clone();
@@ -1513,10 +1429,6 @@ pub(in crate::code_surface) struct EditableLineContext<'a> {
 }
 
 /// One row's fold affordance - see [`EditableLineContext::fold_state`].
-///
-/// Carries the *absolute* path rather than reusing [`EditableLineContext::path`] (which is
-/// worktree-relative) because `AdeApp::file_view_folds` is keyed absolutely; both are needed at
-/// the click, so the chevron's handler gets one of each.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::code_surface) struct RowFoldState {
     pub path: PathBuf,
@@ -1531,18 +1443,6 @@ pub(in crate::code_surface) struct RowFoldState {
 }
 
 /// The `▾`/`▸` fold chevron in a foldable row's line-number gutter (GitHub issue #202).
-///
-/// Absolutely positioned inside the gutter's own fixed 52px box rather than added as a flex
-/// sibling of the line number: the gutter's exact width is test-locked
-/// (`crate::code_surface::zoom::code_zoom_tests::zoom_scales_text_but_not_the_gutter_width`) and
-/// widening it would shift every row's code column. An absolute child contributes nothing to its
-/// parent's layout, so the number keeps its existing right-aligned position and the chevron sits
-/// in the empty space to its left.
-///
-/// Uses the same `▾`/`▸` glyph pair the file tree's own expand caret uses
-/// (`crate::sidebar::render::render_tree_caret`) so "this thing collapses" reads the same way in
-/// both surfaces, and the same `editor::GUTTER_TEXT`/`GUTTER_TEXT_ACTIVE` pair the line numbers
-/// beside it already use, so a collapsed region reads as active without a new colour token.
 fn render_fold_chevron(
     fold: &RowFoldState,
     relative_path: PathBuf,
@@ -1594,13 +1494,6 @@ fn render_fold_chevron(
 
 /// The `⋯ N lines` marker a collapsed row grows at the end of its own text (GitHub issue #202) -
 /// the visible evidence that content is hidden here rather than simply absent.
-///
-/// Reuses the Diff view's own `theme::diff::FOLD_BG`/`FOLD_FG` pair
-/// (`crate::code_surface::diff_view::render_fold_marker`, the `⋯ N unchanged lines` band between
-/// hunks), so the app's two "content is collapsed here" affordances read identically.
-///
-/// `N` is the region's real hidden line count, straight from
-/// `crate::code_surface::fold::FoldRange::hidden_count` - never an estimate.
 fn render_fold_marker(hidden_count: usize, line_number: usize) -> impl IntoElement {
     gpui::div()
         .debug_selector(move || format!("file-view-fold-marker-{line_number}"))
@@ -1631,12 +1524,6 @@ fn render_fold_marker(hidden_count: usize, line_number: usize) -> impl IntoEleme
 /// [`settings_store::CaretStyle::Underline`] (the width of the character at the caret); pass
 /// `start_x` again for [`settings_store::CaretStyle::Line`] callers with nothing convenient to
 /// measure it from.
-///
-/// Returns `None` exactly when the caret should be invisible this frame: the surface isn't
-/// focused at all (GitHub issue #107 - an earlier version instead painted a dimmed, non-blinking
-/// caret while unfocused; Colin asked for it to disappear entirely, like every other
-/// unfocused-state affordance in this app), or - while genuinely focused - mid-blink "off" phase
-/// (`!blink_visible`).
 pub(crate) fn caret_paint_quad(
     start_x: Pixels,
     end_x: Pixels,
@@ -2313,25 +2200,6 @@ fn build_text_runs(
 
 /// Guarantees `runs`' byte lengths sum to exactly `text.len()`, trimming any excess and appending
 /// one plain [`code_view::HighlightKind::Text`] run for any shortfall.
-///
-/// Both inputs of a row's real caret math depend on this holding: `gpui::TextSystem::shape_line`
-/// silently shapes only the prefix `runs` actually covers (leaving `x_for_index` answering with
-/// the *short* line's width for every offset past it), and `gpui::StyledText::with_runs` -
-/// [`render_editable_file_view_line`]'s single shaped text element - outright `assert!`s the
-/// exact same invariant, so an under-covering run list would take the whole window down rather
-/// than mis-place a caret.
-///
-/// Today `code_view::build_lines` is documented and tested to produce a gapless run list per
-/// line (`fold_highlight_events` never emits overlapping spans), and every transform applied on
-/// top of it here - `diagnostics_view::overlay_diagnostic_runs`, [`split_runs_for_marked_range`] -
-/// only ever *splits* runs, preserving the total. This is therefore a real structural backstop
-/// for a future highlighter/diagnostic-range change breaking that invariant, not a workaround for
-/// a known-broken producer: it converts what would be a panic (or an invisibly mis-placed caret)
-/// into a row that still renders all of its real text, just with the uncovered tail unstyled.
-/// Every emitted boundary is also snapped back to a real UTF-8 char boundary, since
-/// `StyledText::with_runs` walks the text by `str::get(run.len..)` and a run ending mid-character
-/// fails that just as hard as one running off the end - a real concern for this app's own text,
-/// which is arbitrary file content (accented letters, CJK, emoji), not ASCII.
 pub(crate) fn force_runs_to_cover(text: &str, runs: Vec<TextRun>) -> Vec<TextRun> {
     // `covered` is a real char boundary at every step by induction: it starts at 0 and only ever
     // advances to an `end` this loop has already snapped onto one.
@@ -2366,35 +2234,6 @@ pub(crate) fn force_runs_to_cover(text: &str, runs: Vec<TextRun>) -> Vec<TextRun
 }
 
 /// Builds the one real, visible text element for an editable row's glyphs (GitHub issue #170).
-///
-/// One `gpui::StyledText` carrying the *same* `runs` the row's `gpui::canvas` overlay hands to
-/// `Window::text_system().shape_line` - not one `div` per syntax run, which is what this used to
-/// be. That older shape had a real, measured caret-misplacement bug: GPUI rounds every
-/// custom-measured leaf node's size *up* to a whole device pixel before layout
-/// (`snap_measured_size_to_device_pixels` in `vendor/zed/crates/gpui/src/taffy.rs`, and the
-/// "Custom-measured leaf nodes have their measured sizes rounded up to integer device-pixel
-/// lengths" note in that file's own pixel-snapping docs), so a row painted as N separately-
-/// measured text leaves places its glyphs at the running sum of N *rounded-up* run widths, while
-/// the caret, the selection fill and every click-to-offset hit test are all computed from
-/// `ShapedLine::x_for_index`/`closest_index_for_x` over the line shaped *once*, unrounded. The
-/// two disagree by up to one device pixel per preceding run, and the error accumulates left to
-/// right across the line.
-///
-/// That is not a sub-pixel curiosity: measured live in this repo's own test window (IBM Plex
-/// Mono at the default 13px code size, `scale_factor` 2), a single 70-character Rust line that
-/// `tree-sitter` splits into 39 runs painted 556px wide against a 546px shaped line - 10px of
-/// drift, about 1.3 whole characters at that font's 7.8px advance. It is also exactly the
-/// "sometimes" in the issue's own title: a plain-text file, or a line whose caret sits before the
-/// first token boundary, is a single run and drifts by nothing at all, while a densely tokenized
-/// line drifts further the further right the caret goes.
-///
-/// Shaping the row once removes the disagreement structurally rather than trying to re-derive
-/// GPUI's rounding in the caret math (which could not work anyway - post-layout edge snapping
-/// depends on each box's *absolute* window position, not just its own metrics). The per-run
-/// diagnostic/hover/composition treatment is unchanged in substance: it now rides on
-/// `TextRun::underline`, which [`build_text_runs`] was already computing and already feeding to
-/// `shape_line`, instead of on a `div` bottom border - see that function's own docs for the one
-/// deliberate visual substitution this forced (dashed diagnostic border -> wavy underline).
 pub(crate) fn build_visible_line_text(
     line_text: gpui::SharedString,
     runs: Vec<TextRun>,
@@ -2465,11 +2304,6 @@ pub(crate) fn split_runs_for_marked_range(
 /// `offset`, for hover token detection - mirrors the read-only File view's own per-run
 /// boundaries (`crate::code_surface::file_view::render_file_view_line`), computed here from a
 /// hit-tested offset instead of from per-run `div` boundaries.
-///
-/// `pub(in crate::code_surface)` since GitHub issue #186: `crate::code_surface::lsp_ui::
-/// AdeApp::hover_anchor_at` resolves the pointer to a token through this exact same function
-/// rather than a second, independently-drifting notion of where one token ends and the next
-/// begins.
 pub(in crate::code_surface) fn token_at_offset(
     runs: &[(gpui::SharedString, code_view::HighlightKind)],
     offset: usize,
@@ -2567,18 +2401,6 @@ mod editing_tests {
         });
     }
 
-    /// Real test (a): typing changes the real buffer content immediately, and the real
-    /// `tree-sitter` highlight (deliberately debounced - see this module's own "Re-highlighting
-    /// cost" docs) lands once the debounce elapses, changing a token's real classification from
-    /// plain `Text` to `Keyword`/`Function`.
-    ///
-    /// Also GitHub issue #48's own real regression coverage at the `AdeApp`/`replace_text_in_range`
-    /// level (`crate::code_surface::edit_buffer`'s own test module covers the same fix directly
-    /// against `EditBuffer::splice_lines`): this file already carried real, live `tree-sitter`
-    /// highlighting for "foo"/the punctuation before the edit (`open_file_for_editing`'s
-    /// background load ran a real highlight), so before the fix this same edit reset the *whole*
-    /// line back to plain `Text` for the ~150ms until the debounce fired - the real flicker the
-    /// issue reports. It must not do that anymore.
     #[gpui::test]
     fn typing_changes_real_content_and_updates_syntax_highlighting_after_the_debounce(
         cx: &mut TestAppContext,
@@ -2686,8 +2508,6 @@ mod editing_tests {
         );
     }
 
-    /// Real test (b): real arrow-key cursor movement, including crossing a real line boundary -
-    /// driven through the real, bound `EditorRight` keystroke, not a direct method call.
     #[gpui::test]
     fn arrow_keys_move_the_real_caret_and_cross_a_real_line_boundary(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2729,8 +2549,6 @@ mod editing_tests {
         );
     }
 
-    /// Real test (c): real shift+arrow selection, driven through the real, bound
-    /// `EditorSelectRight` keystroke.
     #[gpui::test]
     fn shift_arrow_extends_a_real_selection_through_the_real_key_bindings(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2752,10 +2570,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #27: "Ctrl+Shift+arrows (word-wise)" - driven through the real, bound
-    /// `EditorSelectWordRight`/`EditorWordLeft` keystrokes, matching this module's own
-    /// established "through the real key bindings, not a direct method call" discipline for
-    /// every other `Editor*` action test in this file.
     #[gpui::test]
     fn ctrl_shift_arrow_extends_a_real_selection_word_wise_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -2801,11 +2615,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #27: "double-click selects a word, triple-click selects a line" - driven
-    /// through real `MouseDownEvent`s with a real, non-1 `click_count`
-    /// (`vendor` GPUI's own real click-count field, not a hand-rolled double-click timer this
-    /// app would otherwise need), matching `clicking_a_real_editable_row_places_the_real_cursor_
-    /// without_panicking`'s own established real-click-simulation precedent.
     #[gpui::test]
     fn double_click_selects_the_real_word_and_triple_click_selects_the_real_line(
         cx: &mut TestAppContext,
@@ -2860,13 +2669,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #122's real *painted* effect - other docs in this codebase
-    /// (`crate::settings::store::AppearanceSettings::show_indent_guides`'s own doc comment,
-    /// `settings::render::indent_guide_settings_tests`' module docs) describe this as covered
-    /// separately here; this is that real coverage, proving an indent guide actually paints, not
-    /// just that the setting's own boolean flips (a toggle that flips a field but changes nothing
-    /// on screen is the exact "looks wired up but isn't" gap CONTRIBUTING.md's "no fake
-    /// functionality" rule targets).
     #[gpui::test]
     fn an_indented_lines_indent_guide_paints_when_the_setting_is_on(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2885,9 +2687,6 @@ mod editing_tests {
         );
     }
 
-    /// The mirror of the test above: the same indented line paints no guide at all once the
-    /// setting is off - proves `indent_guide_xs` really does end up empty, not merely that the
-    /// setting *could* gate it.
     #[gpui::test]
     fn no_indent_guide_paints_when_the_setting_is_off(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2905,18 +2704,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #27: "selection survives scrolling with virtualized/windowed rendering - no
-    /// dropped highlight on rows recycled out of view." A real regression risk in this app's own
-    /// architecture: [`AdeApp::file_view_row_layout`] is pruned to only the currently *painted*
-    /// range on every render (`crate::code_surface::file_view::AdeApp::render_file_view`'s own
-    /// `.retain(...)`, matching `uniform_list`'s real virtualization), so a selection that lived
-    /// only in some per-row cache keyed by that map could plausibly vanish once its row scrolls
-    /// out and back in. It doesn't: [`EditBuffer::selected_range`] is the one real source of
-    /// truth every row's [`EditBuffer::selection_within_line`] is derived from fresh on every
-    /// single render, not cached per-row at all - this test proves that structurally, by
-    /// selecting text, forcing far-scroll-away-and-back (two real render passes with a distant
-    /// [`Self::code_cursor`] each time, exactly what a real scroll would do to which rows get
-    /// painted), and confirming the real selection is still exactly what it was.
     #[gpui::test]
     fn selection_survives_a_row_scrolling_out_of_the_virtualized_range_and_back(
         cx: &mut TestAppContext,
@@ -2928,7 +2715,6 @@ mod editing_tests {
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
-        // A real selection on line 1 (offsets 0..4, "line").
         app.update(cx, |app, cx| {
             let buffer = app.edit_buffer_mut(&relative).unwrap();
             buffer.move_to(0);
@@ -2969,7 +2755,6 @@ mod editing_tests {
              from the real scroll position - otherwise this test isn't proving anything"
         );
 
-        // Scroll back - line 1 is repainted (a real, freshly-built row, not reused state).
         app.update(cx, |app, cx| {
             app.file_view_scroll_handle
                 .scroll_to_item(0, gpui::ScrollStrategy::Top);
@@ -2991,11 +2776,6 @@ mod editing_tests {
         );
     }
 
-    /// Multi-cursor (Revision R13, issue #28): `Ctrl+D` through the real, bound
-    /// `EditorSelectNextOccurrence` keystroke - first press selects the real word under the
-    /// caret, second press adds the next real occurrence as a new cursor, and typing afterward
-    /// (through the real `EntityInputHandler::replace_text_in_range` path, not a direct
-    /// `EditBuffer` call) lands at *both* cursors at once.
     #[gpui::test]
     fn ctrl_d_through_real_key_bindings_adds_a_cursor_and_typing_fans_out_to_both(
         cx: &mut TestAppContext,
@@ -3044,8 +2824,6 @@ mod editing_tests {
         );
     }
 
-    /// Multi-cursor (Revision R13, issue #28): `Ctrl+Shift+L` through the real, bound
-    /// `EditorSelectAllOccurrences` keystroke selects every real occurrence at once.
     #[gpui::test]
     fn ctrl_shift_l_through_real_key_bindings_selects_every_occurrence(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3071,9 +2849,6 @@ mod editing_tests {
         );
     }
 
-    /// Multi-cursor (Revision R13, issue #28): `Ctrl+K Ctrl+D` (a real, space-separated chord
-    /// binding) through the real, bound `EditorSkipOccurrence` keystroke skips the current
-    /// occurrence rather than keeping it selected.
     #[gpui::test]
     fn ctrl_k_ctrl_d_through_real_key_bindings_skips_without_adding_a_cursor(
         cx: &mut TestAppContext,
@@ -3101,8 +2876,6 @@ mod editing_tests {
         assert_eq!(selected, 8..13, "skip should move to the second \"value\"");
     }
 
-    /// Multi-cursor (Revision R13, issue #28): `Esc` through the real, bound
-    /// `EditorCollapseCursors` keystroke collapses back to a single cursor.
     #[gpui::test]
     fn escape_through_real_key_bindings_collapses_multi_cursor_state(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3138,7 +2911,6 @@ mod editing_tests {
         );
     }
 
-    /// Real test (d): real Backspace/Delete through the real, bound key bindings.
     #[gpui::test]
     fn backspace_and_delete_remove_real_text_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -3176,8 +2948,6 @@ mod editing_tests {
         );
     }
 
-    /// Real test (e): explicit save actually writes real content to a real temp file and clears
-    /// the real dirty flag - driven through the real, bound `EditorSave` keystroke.
     #[gpui::test]
     fn editor_save_writes_real_content_to_disk_and_clears_the_dirty_flag(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3212,12 +2982,6 @@ mod editing_tests {
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
     }
 
-    /// Real test (f): the external-change-vs-unsaved-edit conflict from point 8 - a real,
-    /// constructed scenario (dirty buffer, then a real out-of-band rewrite of the same file on
-    /// disk, matching `code_view_cache_tests::a_real_on_disk_change_to_the_open_file_invalidates_
-    /// the_cache`'s own precedent for simulating an external change). Confirms the app neither
-    /// silently reloads over the unsaved edit nor lets a save silently overwrite the external
-    /// change.
     #[gpui::test]
     fn external_change_while_dirty_is_detected_and_blocks_save_without_overwriting_either_version(
         cx: &mut TestAppContext,
@@ -3233,7 +2997,6 @@ mod editing_tests {
         });
         assert!(app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
 
-        // A real external change, bypassing this app entirely.
         std::fs::write(&file_path, "changed on disk, a completely different size\n")
             .expect("external rewrite");
         std::thread::sleep(crate::root::FILE_FRESHNESS_CHECK_INTERVAL + Duration::from_millis(50));
@@ -3268,8 +3031,6 @@ mod editing_tests {
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_some()));
     }
 
-    /// The other half of test (f): a save that follows a load with no external interference must
-    /// not be falsely flagged as a conflict - a real, non-vacuous negative case.
     #[gpui::test]
     fn a_save_with_no_external_interference_is_not_falsely_flagged_as_a_conflict(
         cx: &mut TestAppContext,
@@ -3312,17 +3073,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #89 ("Changes not showing in editor and file tree"): saving a file never
-    /// called `AdeApp::load_diff`, so `AdeApp::diff_state` - the one thing both the file tree's
-    /// "M"/"A" marks (`crate::sidebar::render::tree_change_marks`) and the Changes/diff view
-    /// are computed from - stayed on whatever it was the last time something else happened to
-    /// reload it (a worktree switch, a tree op via `crate::sidebar::tree_ops::AdeApp::
-    /// refresh_after_file_op`), never the save itself. This drives a real `git`-backed repo one
-    /// branch off `main` (so there is a real base to diff against and this hits `DiffBase::Diff`
-    /// specifically, not the `DiffBase::NoBase` uncommitted-vs-HEAD fallback a same-branch setup
-    /// would also report changes through, per `wt_core::diff::diff_against_base`'s own docs),
-    /// saves a real edit through the app, and asserts the
-    /// reloaded `diff_state` reports the file as changed without any other trigger in between.
     #[gpui::test]
     fn saving_a_file_immediately_refreshes_diff_state_for_issue_89(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3380,14 +3130,6 @@ mod editing_tests {
         );
     }
 
-    /// Regression coverage for a real bug caught while writing test (f) above: an earlier version
-    /// of the conflict check was based on `AdeApp::file_view_cache`'s own freshness, which
-    /// `spawn_file_load` always catches up to match disk regardless of whether the edit buffer is
-    /// dirty - so the conflict banner would silently clear itself a `FILE_FRESHNESS_CHECK_INTERVAL`
-    /// or two after the external change, even though the buffer was still genuinely dirty and
-    /// still didn't match the new disk content. This drives *two* full freshness-check intervals
-    /// (enough for `file_view_cache` to have already caught up after the first) and asserts the
-    /// conflict is still reported on the second.
     #[gpui::test]
     fn the_conflict_flag_does_not_self_clear_once_file_view_cache_catches_up_while_still_dirty(
         cx: &mut TestAppContext,
@@ -3432,13 +3174,6 @@ mod editing_tests {
         );
     }
 
-    /// Real IME coverage: GPUI's test harness (`vendor/zed/crates/gpui/src/platform/test/
-    /// window.rs`) has no simulated OS-level IME composition event to drive - only a real
-    /// `PlatformInputHandler`/`take_input_handler` plumbing point real platform backends use.
-    /// This calls `EntityInputHandler::replace_and_mark_text_in_range`/`unmark_text` directly,
-    /// exactly the way GPUI's real platform layer would (per that trait's own documented
-    /// contract), rather than claiming an end-to-end simulated IME keystroke that doesn't
-    /// actually exist in this GPUI version's test support.
     #[gpui::test]
     fn replace_and_mark_text_in_range_records_a_real_composition_and_unmark_clears_it(
         cx: &mut TestAppContext,
@@ -3483,9 +3218,6 @@ mod editing_tests {
         assert_eq!(marked_after, None);
     }
 
-    /// Correct interaction with the Diff view: `EditorLeft` etc. must not fire while the Diff
-    /// view (not File view) has focus for the same open tab - the whole point of scoping these
-    /// actions to the `"file-editor"` key context rather than binding them globally.
     #[gpui::test]
     fn editor_actions_are_a_safe_no_op_while_the_diff_view_is_active(cx: &mut TestAppContext) {
         fn git(dir: &std::path::Path, args: &[&str]) {
@@ -3546,27 +3278,6 @@ mod editing_tests {
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
     }
 
-    /// Regression coverage for two related real, live-reproduced bugs an audit caught in an
-    /// earlier version of this row: (a) every real left-click on an editable row panicked
-    /// (`row_entity.read(cx)` inside a `cx.listener` closure, where `AdeApp` is already leased by
-    /// that same `cx.listener`'s own `entity.update()` - GPUI's `EntityMap::read` double-lease
-    /// panic); (b) the editable row's real text used to be painted from a bare `gpui::canvas`
-    /// alone, which contributes no intrinsic content size to GPUI's layout, so the row collapsed
-    /// to a near-fixed handful of pixels regardless of the real line's length - real content
-    /// past roughly the first character or two was never actually clickable. Fixed by (a)
-    /// reading `this.edit_buffers` directly instead of a second entity handle, and (b) rendering
-    /// the visible glyphs from real, content-sized `div`s (matching the read-only path) with the
-    /// `canvas` demoted to an absolutely-positioned overlay - see `render_editable_file_view_line`'s
-    /// own docs for both fixes in full.
-    ///
-    /// A later revision (this one) made every row `.w_full()` (see that call's own docs) to fix a
-    /// *third* bug in the same family: a row that stayed content-sized could never be clicked
-    /// anywhere past its own last glyph. That real behavior change is exactly what this test now
-    /// measures instead of the old "longer content paints a wider row" assertion, which the fix
-    /// makes structurally false (every row now paints the list's own full available width,
-    /// regardless of content) - `clicking_past_the_end_of_a_short_line_places_the_cursor_at_the_
-    /// end_of_that_line`, below, is what now covers the "real content past the first glyph is
-    /// genuinely clickable" property this test used to be the one proving.
     #[gpui::test]
     fn clicking_a_real_editable_row_places_the_real_cursor_without_panicking(
         cx: &mut TestAppContext,
@@ -3624,15 +3335,6 @@ mod editing_tests {
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(2));
     }
 
-    /// Real regression coverage for real bug 1 in this revision's brief: "click-to-place-cursor
-    /// only works on existing text, not anywhere in the editor". Before the `.w_full()` fix (see
-    /// that call's own docs, in `render_editable_file_view_line`), a short line's row painted
-    /// only as wide as its own glyphs, so a click landing in the real, visible blank space to the
-    /// right of a short line's text had no element under it at all - the click was silently
-    /// swallowed, nothing moved. `gpui::LineLayout::closest_index_for_x` (which the row's own
-    /// `on_mouse_down` already calls) has always correctly clamped an out-of-range `x` to the
-    /// shaped line's own real length; the missing piece was purely that the row never extended
-    /// far enough to receive that click in the first place.
     #[gpui::test]
     fn clicking_past_the_end_of_a_short_line_places_the_cursor_at_the_end_of_that_line(
         cx: &mut TestAppContext,
@@ -3680,11 +3382,6 @@ mod editing_tests {
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(1));
     }
 
-    /// Real regression coverage for the other half of real bug 1: clicking on a real blank line
-    /// (no glyphs at all) must still place the real caret there, not silently do nothing. Before
-    /// the `.w_full()` fix, an empty line's row had essentially zero content-derived width, so -
-    /// like a short line's trailing blank space - there was no real element for a click landing
-    /// anywhere but the very first pixel column to hit-test against.
     #[gpui::test]
     fn clicking_on_a_real_blank_line_places_the_cursor_there(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3718,11 +3415,6 @@ mod editing_tests {
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(2));
     }
 
-    /// Real regression coverage for the other real symptom bug 1's brief calls out: clicking in
-    /// the real blank area *below* the last line of content (still inside the File view's own
-    /// viewport, just past every real rendered row) must place the real caret at the real end of
-    /// the buffer, matching every real code editor, instead of being silently swallowed because
-    /// `uniform_list` only ever paints rows for real line indices.
     #[gpui::test]
     fn clicking_below_the_last_line_places_the_cursor_at_the_end_of_the_buffer(
         cx: &mut TestAppContext,
@@ -3769,12 +3461,6 @@ mod editing_tests {
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(3));
     }
 
-    /// Regression coverage for a real bug an audit caught: seeding an editable buffer from a
-    /// file whose real bytes aren't valid UTF-8 (`code_view::load_file_with_source`'s `source` is
-    /// already a lossy decode with every invalid byte replaced by `U+FFFD` at that point) and
-    /// later saving it would silently rewrite the file's real original bytes with replacement
-    /// characters. Such a file must stay read-only, the same real reasoning already applied to a
-    /// truncated file.
     #[gpui::test]
     fn a_file_with_invalid_utf8_bytes_does_not_get_a_real_edit_buffer(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3800,13 +3486,6 @@ mod editing_tests {
         );
     }
 
-    /// Regression coverage for a real, live-reproduced bug an audit caught: once
-    /// `AdeApp::file_external_conflict` was set for a path, nothing but a *successful* save ever
-    /// cleared it, and `AdeApp::save_active_file`'s own freshness gate could never pass again
-    /// after any real external touch (even reverting the file back to byte-identical content
-    /// still changes its real mtime) - so the file became permanently unsavable for the rest of
-    /// the agent, with no real way out. `EditorSaveAnyway`/`AdeApp::force_save_active_file` is
-    /// the real, explicit, opt-in escape hatch this fixes it with.
     #[gpui::test]
     fn editor_save_anyway_resolves_a_real_permanently_stuck_conflict(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3890,10 +3569,6 @@ mod editing_tests {
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
     }
 
-    /// Regression coverage (finding 7, low priority): `EditorSaveAnyway`/
-    /// `AdeApp::force_save_active_file` must be a genuine no-op on an already-clean buffer -
-    /// without a real dirty-check guard, triggering it there would perform a needless real disk
-    /// write and bump the file's real mtime for no reason.
     #[gpui::test]
     fn force_save_active_file_is_a_real_no_op_on_an_already_clean_buffer(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3926,14 +3601,6 @@ mod editing_tests {
         );
     }
 
-    /// Regression coverage (finding 6): the real, if previously only latent, bug where
-    /// `file_save_running` could leak forever for a path whose buffer vanished after a save was
-    /// enqueued but before the writer loop got to check it - see `AdeApp::spawn_file_save_loop`'s
-    /// own docs for the full real, silent-permanent-failure reasoning this fixes. Removes the
-    /// `edit_buffers` entry directly to simulate the buffer vanishing mid-flight (the loop task is
-    /// spawned, but hasn't run yet - `cx.spawn` doesn't poll until the executor is next run) - a
-    /// real, if synthetic, reproduction of the exact race the audit described, since this app has
-    /// no other real way to force that interleaving deterministically.
     #[gpui::test]
     fn a_pending_save_whose_buffer_vanished_before_the_writer_loop_checked_it_does_not_leak_file_save_running(
         cx: &mut TestAppContext,
@@ -3994,14 +3661,6 @@ mod editing_tests {
         assert!(app.read_with(cx, |app, _| app.file_save_error.is_none()));
     }
 
-    /// CRITICAL regression coverage (finding 1): the real, live-reproduced panic an audit caught
-    /// with real Japanese IME composition input, driven through the real `EntityInputHandler`
-    /// trait methods (not just `EditBuffer` directly - see `edit_buffer::tests::
-    /// replace_and_mark_range_computes_the_composition_selection_relative_to_new_text_not_the_whole_buffer`
-    /// for that lower-level regression). `new_selected_range_utf16` is a real, non-`None` value
-    /// here (unlike `replace_and_mark_text_in_range_records_a_real_composition_and_unmark_clears_it`
-    /// above, whose `None` argument can never exercise this bug) - a real platform IME reporting a
-    /// composing caret at a UTF-16 offset *within the composing text itself*, not the whole buffer.
     #[gpui::test]
     fn real_cjk_ime_composition_with_a_non_default_caret_does_not_corrupt_the_selection_or_panic_on_the_next_keystroke(
         cx: &mut TestAppContext,
@@ -4057,17 +3716,6 @@ mod editing_tests {
         assert_eq!(content_after, "prefix \u{65e5}\u{672c}!\u{8a9e}ok\n");
     }
 
-    /// CRITICAL regression coverage (finding 2): the real, live-reproduced bug where a literal
-    /// `]` keystroke typed while the File view is actively being edited was silently swallowed
-    /// by the pre-existing, unrelated `]` -> `NextChangedFile` binding instead of reaching the
-    /// real edit buffer - the fourth time this project has shipped this exact "silently swallowed
-    /// keystroke" bug class (Revisions R2, R4a, R4b, and this one). Fixed by changing that
-    /// binding's own registered predicate from `Some("diff")` to `Some("diff && !file-editor")`
-    /// (`crate::default_key_bindings`) - driven here through a real, simulated keystroke (not a
-    /// direct method call, and not `dispatch_action`, which would validate the handler but not
-    /// prove the *binding* itself no longer intercepts the keystroke first), matching this
-    /// project's own established lesson that only a real keystroke-simulation test actually
-    /// catches this bug class.
     #[gpui::test]
     fn a_literal_right_bracket_keystroke_reaches_the_real_edit_buffer_while_the_file_view_is_editing(
         cx: &mut TestAppContext,
@@ -4099,18 +3747,6 @@ mod editing_tests {
         );
     }
 
-    /// Regression coverage for the keybinding-collision bug class this project has now shipped
-    /// four times (R2, R4a, R4b, R8.5a) - Revision R8.5b's own instance, for the real Completions
-    /// popup's `Up`/`Down`/`Enter`/`Escape` bindings. Two real, keystroke-simulated states, not
-    /// just one: with the popup closed, `up`/`down`/`enter` must still behave exactly as the
-    /// plain `Editor*` actions always have (the real regression risk from narrowing their own
-    /// predicate to `!completions`); with the popup genuinely open, the same keystrokes must
-    /// route to the popup instead, never touching the real caret/buffer, and `Escape` must
-    /// dismiss it. The popup state itself is seeded directly (a real `Ready` `CompletionsEntry`,
-    /// not a real LSP round trip) - matching `crate::lsp::client::lsp_client_eviction_tests`' own
-    /// established precedent for isolating real routing/bookkeeping proofs from a real process
-    /// spawn; the real end-to-end proof (a genuine server's completions actually opening this
-    /// same popup) lives in `crate::lsp::client::lsp_diagnostics_wiring_tests`.
     #[gpui::test]
     fn completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state(
         cx: &mut TestAppContext,
@@ -4150,7 +3786,6 @@ mod editing_tests {
              exactly as before"
         );
 
-        // State 2: a real, seeded `Ready` popup.
         let fake_item = |label: &str| lsp_core::lsp_types::CompletionItem {
             label: label.to_string(),
             ..Default::default()
@@ -4227,7 +3862,6 @@ mod editing_tests {
             "accepting must close the real popup"
         );
 
-        // A fresh popup, dismissed by a real `Escape` keystroke without touching the buffer.
         app.update(cx, |app, cx| {
             app.completions = Some(crate::lsp::completion_popup::CompletionsEntry {
                 path: relative.clone(),
@@ -4322,17 +3956,6 @@ mod editing_tests {
         });
     }
 
-    /// GitHub issue #189, test (a): the real bug. With a popup already open, typing more real
-    /// characters must narrow what it shows *immediately* - on the keystroke itself, with no
-    /// `textDocument/completion` round trip in between - and an item the typed text doesn't match
-    /// at all must genuinely disappear.
-    ///
-    /// Driven through real, bound keystrokes (`cx.simulate_input`), so this exercises the whole
-    /// real path a user's typing takes: `EntityInputHandler::replace_text_in_range` ->
-    /// `AdeApp::schedule_lsp_sync` -> `AdeApp::refilter_completions`. No clock is advanced
-    /// afterwards on purpose: the 50ms debounced server re-request must not be what makes this
-    /// pass (there is no real LSP client in this test at all), because instant narrowing between
-    /// round trips is precisely what the issue asks for.
     #[gpui::test]
     fn typing_past_the_trigger_point_narrows_the_real_completions_list(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4393,11 +4016,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #189, test (b): the matching semantics actually chosen - a real fuzzy
-    /// *subsequence* match (VSCode-equivalent), not a prefix/substring one. `vrs` is genuinely
-    /// non-contiguous inside `version` (`v`, then `r`, then `s`, with characters skipped between
-    /// them), so a substring matcher would drop it; `verify` and `unwrap` must still be dropped,
-    /// so this isn't passing by simply matching everything.
     #[gpui::test]
     fn a_real_non_contiguous_typed_prefix_still_matches_the_right_item(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4425,11 +4043,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #189, test (c): keyboard selection must stay pinned to the *item* the user
-    /// picked as the list narrows underneath it, never to a stale row number - and whatever row is
-    /// selected must be the item a real `Enter` actually inserts. This is the real desync risk
-    /// filtering introduces: "the Nth visible row" and "the Nth item in the server's list" stop
-    /// being the same thing the moment anything is filtered out.
     #[gpui::test]
     fn keyboard_selection_stays_aligned_with_the_filtered_completions_view(
         cx: &mut TestAppContext,
@@ -4493,12 +4106,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, test (a): pressing a real `Enter` keystroke after an indented line
-    /// carries that exact same real leading whitespace over to the new line, through the real,
-    /// bound `EditorEnter` keystroke (not a direct handler call) - matching this file's own
-    /// established "simulate the real keystroke" precedent for `Enter` regression coverage (see
-    /// `completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state` just
-    /// above).
     #[gpui::test]
     fn enter_carries_the_real_leading_whitespace_of_the_previous_line_over(
         cx: &mut TestAppContext,
@@ -4511,7 +4118,6 @@ mod editing_tests {
         let relative = PathBuf::from("sample.rs");
 
         app.update(cx, |app, cx| {
-            // Right after the `;`, before that line's own trailing newline.
             app.edit_buffer_mut(&relative)
                 .unwrap()
                 .move_to("fn main() {\n    let x = 1;".len());
@@ -4532,8 +4138,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, test (b): pressing `Enter` on a real column-0 line (no leading
-    /// whitespace at all) inserts a bare newline - no whitespace fabricated out of nowhere.
     #[gpui::test]
     fn enter_adds_no_whitespace_after_a_column_zero_line(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4561,12 +4165,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, test (c) - stretch goal: `Enter` right after a real opening bracket
-    /// adds one more real indent unit on top of the carried-over whitespace, using the exact same
-    /// real indent-unit resolution (tabs/spaces/width) `Self::handle_editor_indent_action`'s own
-    /// `Tab` uses - proven here by checking the inserted whitespace is real 4 literal spaces (the
-    /// default `EditorSettings::tab_width`/`insert_spaces`, not a hardcoded `"    "` this test
-    /// would pass even if the production code had a different, wrong hardcoded width).
     #[gpui::test]
     fn enter_adds_one_extra_real_indent_level_after_an_opening_bracket(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4615,10 +4213,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, PR #136 review (Colin Espinas: "Missing indent when no opening
-    /// character is there like when we use ':' in python"): a real Python file's block header
-    /// ending in `:` (no opening bracket at all) must still get one extra real indent level,
-    /// the same way an opening bracket already does for every language.
     #[gpui::test]
     fn enter_adds_one_extra_real_indent_level_after_a_python_colon_header(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4649,17 +4243,6 @@ mod editing_tests {
         );
     }
 
-    /// Revision R8.5b audit finding 1's direct regression test: the sixth instance of this
-    /// project's recurring "a keystroke gets swallowed" bug class. Before this fix, `Self::
-    /// completions_open_for_active_path` returned `true` for *any* real [`CompletionsEntry`],
-    /// including a merely `Loading`/`Failed` one - which `AdeApp::prepare_lsp_sync` seeds on
-    /// *every* completion-worthy keystroke, before the real request even completes - so the real
-    /// `"completions"` key context stayed active (claiming `Enter`/`Down`) for the *entire* real
-    /// round trip a completion request takes, live-reproduced against a real rust-analyzer as:
-    /// pressing Enter while a request was merely loading inserted no newline at all, and Down did
-    /// nothing either. Verified here by simulating real keystrokes (not calling handlers
-    /// directly) against a real, seeded `Loading` entry, then a real `Failed` one - both must
-    /// fall all the way through to the plain `Editor*` behavior, exactly as if no popup existed.
     #[gpui::test]
     fn enter_and_down_are_not_swallowed_while_completions_are_merely_loading_or_failed(
         cx: &mut TestAppContext,
@@ -4783,8 +4366,6 @@ mod editing_tests {
         })
     }
 
-    /// The headline behaviour of GitHub issue #17 §2, end to end through the real key bindings:
-    /// a real typing burst is one undo step, undo puts the real caret back, and redo replays both.
     #[gpui::test]
     fn a_real_typing_burst_undoes_and_redoes_as_one_step_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -4830,12 +4411,6 @@ mod editing_tests {
         );
     }
 
-    /// The `!file-editor` half of the Changes footer's `space stage` binding, live rather than
-    /// asserted off the predicate string: `space` is bound to `ToggleChangeStaged` under
-    /// `"diff && !file-editor"`, and `"diff"`'s File arm adds `"file-editor"` *onto the same node*
-    /// rather than replacing it (see `crate::code_surface::render`), so a bare `Some("diff")`
-    /// would have swallowed every space typed into a real file. This types one through the real
-    /// dispatch and checks it landed in the buffer.
     #[gpui::test]
     fn a_real_space_typed_into_the_file_view_is_text_not_the_stage_binding(
         cx: &mut TestAppContext,
@@ -4860,8 +4435,6 @@ mod editing_tests {
         );
     }
 
-    /// `ctrl-y` as a real, alternative redo key - GitHub issue #17's checklist asks for it
-    /// explicitly, and it is a literal `Ctrl` on every OS (see `crate::default_key_bindings`).
     #[gpui::test]
     fn ctrl_y_really_redoes_in_the_code_editor(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4878,9 +4451,6 @@ mod editing_tests {
         assert_eq!(buffer_content(&app, cx, &relative), "xyab\n");
     }
 
-    /// The central scoping guarantee of GitHub issue #17 §3, proven by dispatch rather than by
-    /// reading the predicate: with a real file editor focused, `secondary-z` must reach **text**
-    /// undo.
     #[gpui::test]
     fn secondary_z_in_the_code_editor_reaches_text_undo(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4899,16 +4469,11 @@ mod editing_tests {
             "the text undo must genuinely have run"
         );
 
-        // Same again for redo, in both of its real spellings.
         cx.simulate_keystrokes(SECONDARY_SHIFT_Z);
         cx.simulate_keystrokes("ctrl-y");
         assert_eq!(buffer_content(&app, cx, &relative), "zab\n");
     }
 
-    /// The same routing guarantee with the real Completions popup **also** open - a real
-    /// overlapping-scope case (`"file-editor text-input completions"` all live on one node at
-    /// once) that the narrower `"file-editor && completions"` bindings share a dispatch path
-    /// with.
     #[gpui::test]
     fn secondary_z_still_reaches_text_undo_while_the_completions_popup_is_open(
         cx: &mut TestAppContext,
@@ -4954,8 +4519,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #17 §2's "history survives switching tabs" requirement, driven through the
-    /// real tab-activation path rather than by poking `edit_buffers` directly.
     #[gpui::test]
     fn a_files_undo_history_survives_switching_to_another_tab_and_back(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4969,7 +4532,6 @@ mod editing_tests {
         cx.simulate_input("AAA");
         assert_eq!(buffer_content(&app, cx, &first_relative), "AAAone\n");
 
-        // Switch to a genuinely different file, edit it too, then come back.
         open_file_for_editing(&app, cx, second.clone());
         cx.simulate_input("B");
         assert_eq!(
@@ -4997,9 +4559,6 @@ mod editing_tests {
         );
     }
 
-    /// A real external rewrite of a **clean** buffer, landing through the real file-load path the
-    /// freshness check dispatches - not a direct `reload_from_disk` call. The reload must be one
-    /// real undo step with the pre-reload history still behind it.
     #[gpui::test]
     fn an_external_rewrite_of_a_clean_buffer_reloads_as_one_undoable_step(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5011,7 +4570,6 @@ mod editing_tests {
 
         cx.simulate_input("X");
         assert_eq!(buffer_content(&app, cx, &relative), "Xoriginal\n");
-        // Save, so the buffer is genuinely clean against disk before the external write.
         cx.simulate_keystrokes(if cfg!(target_os = "macos") {
             "cmd-s"
         } else {
@@ -5023,10 +4581,8 @@ mod editing_tests {
             "sanity check: the buffer must really be clean before the external rewrite"
         );
 
-        // A real external writer rewrites the file, with a genuinely newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&file_path, "rewritten by an agent\n").expect("external rewrite");
-        // Force the throttled freshness check to run, then let the load it dispatches resolve.
         app.update(cx, |app, _| {
             app.file_view_last_freshness_check = None;
         });
@@ -5059,9 +4615,6 @@ mod editing_tests {
         );
     }
 
-    /// The dirty half of the same case: an external rewrite while the user has real unsaved edits
-    /// must leave the buffer *and* its history completely alone, and surface the real conflict
-    /// instead.
     #[gpui::test]
     fn an_external_rewrite_of_a_dirty_buffer_leaves_the_buffer_and_its_history_untouched(
         cx: &mut TestAppContext,
@@ -5106,16 +4659,6 @@ mod editing_tests {
         );
     }
 
-    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §1 ("the open file tabs, the active tab ... the commit composer"
-    /// is worktree-scoped) and the coordinator's own explicit call-out: a user with an unsaved
-    /// edit open who switches worktrees must never lose it - real data loss, no confirm dialog,
-    /// nothing, was the bug. Drives two *real* worktrees (temp directories) that both have a file
-    /// at the identical relative path `sample.txt`, edits both with different, real unsaved
-    /// content, and proves: (1) each survives a switch away and back to its own worktree with the
-    /// buffer's real content and dirty flag intact, and (2) the two same-relative-path buffers
-    /// never merge or overwrite each other - the "worse than the current bug" collision risk the
-    /// coordinator flagged for `AdeApp::edit_buffers`'s composite `(worktree, path)` key.
     #[gpui::test]
     fn switching_worktrees_and_back_preserves_unsaved_edits_without_cross_worktree_collision(
         cx: &mut TestAppContext,
@@ -5166,7 +4709,6 @@ mod editing_tests {
         });
         cx.run_until_parked();
 
-        // A real, unsaved edit in worktree A.
         open_file_for_editing(&app, cx, file_a);
         app.update_in(cx, |app, window, cx| {
             app.replace_text_in_range(None, "A-EDIT ", window, cx);
@@ -5233,13 +4775,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #168: toggling `appearance.bracket_pair_colorization` really re-highlights
-    /// content that is **already open**, rather than only affecting the next file loaded.
-    ///
-    /// This is the test that would catch the whole feature being wired correctly at the pipeline
-    /// level but doing nothing visible when the user actually flips the switch - the failure mode
-    /// that matters here, because the ring is baked into cached `RenderedLine`s rather than
-    /// resolved at paint time like every other appearance toggle in this app.
     #[gpui::test]
     fn toggling_bracket_pair_colorization_re_highlights_an_already_open_buffer(
         cx: &mut TestAppContext,
@@ -5274,7 +4809,6 @@ mod editing_tests {
         app.update(cx, |app, cx| {
             app.toggle_bracket_pair_colorization(cx);
         });
-        // The re-highlight goes through the same debounced background path typing uses.
         cx.background_executor
             .advance_clock(REHIGHLIGHT_DEBOUNCE + Duration::from_millis(50));
         cx.run_until_parked();
@@ -5386,15 +4920,6 @@ let last = 5;
         );
     }
 
-    /// Live-reported: the chevron was too small to notice, sized up in response
-    /// (`render_fold_chevron`: 9px/12px box -> 11px/16px box, `left` 3px -> 2px). A real
-    /// regression guard that the bigger box still sits where it's coded to, inside the gutter's
-    /// own real measured bounds - not a claim about the line number's own glyph bounds, which
-    /// nothing paints a separately-measurable box for, but the arithmetic the comment below
-    /// gives is real: the gutter is a fixed 52px box with 12px of right padding
-    /// (`render_editable_file_view_line`), so real text has 40px to paint in; the chevron's own
-    /// right edge at 2+16=18px inside that box leaves 22px clear before it, comfortably more
-    /// than a real 3-digit line number needs at the gutter's 11px mono font.
     #[gpui::test]
     fn the_bigger_fold_chevron_still_sits_inside_the_gutters_own_left_margin(
         cx: &mut TestAppContext,
@@ -5424,9 +4949,6 @@ let last = 5;
         );
     }
 
-    /// The core of the feature: a real click on the real chevron makes the block's rows stop
-    /// existing on screen, leaves the block's own first line in place with a marker reporting the
-    /// real hidden count, and keeps everything after the block rendering.
     #[gpui::test]
     fn clicking_the_chevron_really_collapses_the_block(cx: &mut TestAppContext) {
         let (app, cx, path) = open_foldable_file(cx);
@@ -5466,7 +4988,6 @@ let last = 5;
              content is hidden rather than absent"
         );
 
-        // And the real state behind it, so a marker drawn without a real fold would still fail.
         let folded = app.read_with(cx, |app, _| {
             app.file_view_folds.get(&path).cloned().unwrap_or_default()
         });
@@ -5484,7 +5005,6 @@ let last = 5;
         click_fold_chevron(cx, 1);
         assert!(cx.debug_bounds("file-view-text-row-3").is_none());
 
-        // The chevron is still there (now pointing right) on the collapsed row.
         click_fold_chevron(cx, 1);
 
         for line_number in 1..=8 {
@@ -5505,10 +5025,6 @@ let last = 5;
         );
     }
 
-    /// Regression guard for the one real hazard `render_fold_chevron`'s `cx.stop_propagation()`
-    /// exists for: nothing else in the gutter handles a click, so without it the event reaches
-    /// the `uniform_list` container's own "clicked below the last line" fallback and slams the
-    /// caret to the end of the buffer.
     #[gpui::test]
     fn folding_does_not_fling_the_caret_to_the_end_of_the_buffer(cx: &mut TestAppContext) {
         let (app, cx, _path) = open_foldable_file(cx);
@@ -5534,10 +5050,6 @@ let last = 5;
         );
     }
 
-    /// Collapsing the block the caret is sitting in is not merely a cosmetic problem: only the
-    /// caret's *own* painted row registers the real `window.handle_input` wiring, so a caret left
-    /// on a row that no longer paints would make typing silently stop working. The caret must be
-    /// lifted onto the collapsed region's own still-visible line.
     #[gpui::test]
     fn folding_the_block_the_caret_is_inside_lifts_the_caret_onto_the_visible_row(
         cx: &mut TestAppContext,
@@ -5545,7 +5057,6 @@ let last = 5;
         let (app, cx, _path) = open_foldable_file(cx);
         let relative = PathBuf::from("sample.rs");
 
-        // Click a real row inside the block to put the caret there, the way a user would.
         let row_bounds = cx
             .debug_bounds("file-view-text-row-3")
             .expect("line 3 should paint");
@@ -5579,10 +5090,6 @@ let last = 5;
         );
     }
 
-    /// Folding must not break where the hover/diagnostic cards anchor. Those read
-    /// `AdeApp::file_view_row_layout`, which is keyed by *buffer line number* and written by each
-    /// row's own paint - so this measures a real line's real painted row before and after a fold
-    /// and asserts it is still filed under its own line number, at the row it actually moved to.
     #[gpui::test]
     fn a_row_below_a_fold_keeps_its_own_line_number_in_the_popup_anchor_map(
         cx: &mut TestAppContext,
@@ -5626,9 +5133,6 @@ let last = 5;
         }
     }
 
-    /// Folding is per file, and reopening a file keeps whatever was collapsed in it (the fold set
-    /// is keyed by absolute path, like `edit_buffers` is keyed per worktree) - while a *different*
-    /// file opened in between is entirely unaffected.
     #[gpui::test]
     fn fold_state_is_per_file(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5658,23 +5162,8 @@ let last = 5;
     /// own last line. Built specifically so folding line 2 leaves the collapsed region's closer
     /// sitting on the buffer's real end, which is exactly the case a click in the blank space
     /// below the content has to reveal correctly.
-    ///
-    /// Deliberately **no** trailing newline: `EditBuffer::lines` treats content ending in `\n` as
-    /// carrying one further, real, empty trailing line (`"a\n".split('\n')` is `["a", ""]`) - and
-    /// that phantom-looking-but-real line always sits *outside* any fold's own `hidden_lines()`,
-    /// so a source ending in `\n` cannot exercise this bug at all: the click's target line would
-    /// be the empty line after the fold, never the folded line itself.
     const LAST_LINE_FOLD_SOURCE: &str = "let a = 1;\nfn main() {\n    let b = 2;\n}";
 
-    /// Real regression test for a bug a review caught before this ever shipped: clicking the
-    /// blank space below a short file's content places the caret at the real end of the buffer
-    /// (`file_view.rs`'s own "click past the end of the buffer" fallback), but that fallback only
-    /// moved the caret - it never called [`AdeApp::scroll_file_view_to_line`]. Whenever the
-    /// collapsed region closest to the end of the file is still folded, the caret's own line
-    /// never gets expanded back into view, its row never paints, and
-    /// [`AdeApp::render_editable_file_view_line`]'s own `window.handle_input` registration (which
-    /// only exists on the caret's painted row) never fires - so typing after that click would
-    /// silently do nothing at all.
     #[gpui::test]
     fn clicking_below_a_folded_files_content_still_reveals_the_caret_row(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5720,12 +5209,6 @@ let last = 5;
         );
     }
 
-    /// Real regression test for a second bug the same review caught: fold state is a plain line
-    /// index, and a real external rewrite of the open file (an agent CLI or formatter, not the
-    /// user's own edit) replaces `lines` wholesale without touching `AdeApp::file_view_folds` at
-    /// all. A stale index can end up naming a *different*, larger region than the one the user
-    /// actually folded - silently swallowing whatever line the caret is on, with nothing left to
-    /// expand it back into view.
     #[gpui::test]
     fn a_real_external_rewrite_clears_stale_fold_state_for_that_file(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5781,8 +5264,6 @@ let last = 5;
         );
     }
 
-    /// The rows the list actually builds come from the fold map, so a collapsed file really is a
-    /// shorter list - not the same rows with some of them painted invisibly.
     #[gpui::test]
     fn a_collapsed_file_really_has_fewer_visual_rows(cx: &mut TestAppContext) {
         let (app, cx, path) = open_foldable_file(cx);
@@ -5812,14 +5293,6 @@ let last = 5;
 
 /// GitHub issue #170 ("Sometimes the carrets are not at the right place"): real, measured proof
 /// that an editable row's visible glyphs and its caret geometry come out of the same shaping.
-///
-/// See [`build_visible_line_text`]'s own docs for the root cause these cover. The bug was
-/// invisible to every existing test because both sides of the disagreement were individually
-/// self-consistent: the caret quad, the selection fill and click-to-offset hit testing all read
-/// the same `ShapedLine`, so tests written against any one of them agreed with the others while
-/// all three disagreed with what the user could actually see. Only a measurement that crosses
-/// from the shaped geometry into the *painted element bounds* can catch it, which is what these
-/// do.
 #[cfg(test)]
 mod caret_alignment_tests {
     use super::*;
@@ -5865,15 +5338,6 @@ mod caret_alignment_tests {
         (app, cx, PathBuf::from("dense.rs"), repo)
     }
 
-    /// The core invariant. `file-view-code-text-2` is the row's real painted glyph box; the
-    /// `ShapedLine` built from the very same text and runs is what every caret/selection/click x
-    /// on that row is derived from. If the two widths disagree, the caret is painted somewhere
-    /// the user's own letters are not.
-    ///
-    /// Before the fix this measured 556px painted against a 545.99963px shaping - 10px, roughly
-    /// 1.3 characters at IBM Plex Mono 13px. One device pixel of slack is the real, irreducible
-    /// remainder: GPUI rounds the single measured text leaf's own size up to a whole device pixel
-    /// (`snap_measured_size_to_device_pixels`), which the shaping itself does not do.
     #[gpui::test]
     fn painted_code_text_is_exactly_as_wide_as_the_shaping_the_caret_math_uses(
         cx: &mut TestAppContext,
@@ -5927,11 +5391,6 @@ mod caret_alignment_tests {
         );
     }
 
-    /// The same width invariant on a line of real multi-byte text. Nothing in the fix is
-    /// ASCII-specific - the caret math and the glyphs now come from one shaping of one byte
-    /// string - but a caret bug reported as "not placed correctly to the letter we are typing"
-    /// deserves coverage for the letters whose byte length and column count disagree, which is
-    /// also where a byte-vs-char mistake in any future change here would surface first.
     #[gpui::test]
     fn painted_code_text_matches_the_caret_shaping_for_real_multi_byte_text(
         cx: &mut TestAppContext,
@@ -5999,13 +5458,6 @@ mod caret_alignment_tests {
         );
     }
 
-    /// The same disagreement stated the way a user meets it: put the caret at the very end of a
-    /// densely highlighted line and it must sit at the end of the visible text.
-    ///
-    /// Both sides here are the app's own real geometry, not recomputed by the test:
-    /// `AdeApp::file_view_last_bounds`/`file_view_last_layout` are what the row's paint closure
-    /// actually stored this frame, and `bounds.left() + shaped.x_for_index(offset)` is verbatim
-    /// the expression the caret quad is built from in `render_editable_file_view_line`.
     #[gpui::test]
     fn an_end_of_line_caret_lands_on_the_end_of_the_real_painted_text(cx: &mut TestAppContext) {
         let (app, cx, relative, _repo) = open_dense_rust_file(cx);
@@ -6121,10 +5573,6 @@ mod force_runs_to_cover_tests {
         assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![3, 2]);
     }
 
-    /// The real multi-byte case: "é" is two bytes, so a run boundary landing between them is not
-    /// a char boundary at all. `StyledText::with_runs` walks the text with `str::get(run.len..)`,
-    /// which returns `None` there and panics - so trimming has to snap *back* onto a real
-    /// boundary, never just clamp to a byte count.
     #[test]
     fn a_trimmed_boundary_snaps_back_onto_a_real_char_boundary() {
         let text = "café"; // 5 bytes: 'c','a','f' then a 2-byte 'é'

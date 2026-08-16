@@ -8,29 +8,6 @@ impl AdeApp {
     /// B/C already do. Renders whichever [`merge::MergeFlowState`] `self.merge_flow` is
     /// currently in for `agent`; every value shown (branch names, file paths, conflict line
     /// content) comes from the `wt_core::merge` call [`Self::start_merge`] made.
-    ///
-    /// Real per-token syntax coloring ([`code_view::highlight_block`], cached in
-    /// [`Self::merge_highlight_cache`]) and a real two-column line-number gutter now render for
-    /// the active hunk, matching the Diff view's own treatment
-    /// (`code_surface::diff_view::AdeApp::render_diff_file_detail`). Unlike the Diff view's gutter (genuine
-    /// old-file/new-file line numbers, since a diff hunk really does have two distinct files on
-    /// either side), this one is **not** an old/new pair: both numbers are real line positions
-    /// within the *same* conflicted working file - the file as it actually sits on disk, markers
-    /// and all - so "old/new" framing would incorrectly suggest "ours' version of the file" vs.
-    /// "theirs' version of the file" as two logically separate files, which they aren't here.
-    /// The gutter is real, not fabricated: `wt_core::merge::ConflictHunk::ours_start_line`/
-    /// `theirs_start_line` are captured while actually parsing the file's real
-    /// `<<<<<<</=======/>>>>>>>` markers (the 1-indexed line immediately after each marker), so
-    /// [`Self::render_conflict_columns`] just increments from a real anchor per rendered line -
-    /// this surface used to omit the gutter entirely because no such anchor existed yet; it does
-    /// now. [`Self::render_conflict_columns`] is a pure reader of [`Self::merge_highlight_cache`],
-    /// and the cache itself is only ever (re)computed at a real state-transition point (see
-    /// [`Self::ensure_active_merge_highlight_cache`]'s docs), never from this render path, so
-    /// this whole surface stays `&self`.
-    ///
-    /// The left ("ours"/base) column is labelled with the base branch name rather than an agent
-    /// identity, since `attempt_merge` always runs `git merge` from the base worktree - real git
-    /// state, not a running agent, so there's no agent to attribute a tint to.
     pub(crate) fn render_merge_flow_surface(
         &self,
         agent: &Agent,
@@ -391,13 +368,6 @@ impl AdeApp {
     /// (`zoom_scoped`, matching the Diff/File views). See [`Self::render_merge_flow_surface`]'s
     /// docs for why the left column is labelled with the base branch rather than an agent
     /// identity, and for where the gutter's real position data comes from.
-    ///
-    /// Row count for each column is driven by `hunk.ours`/`hunk.theirs` themselves - the real
-    /// ground truth - never by the cached `RenderedLine` `Vec`'s own length: a genuinely empty
-    /// side (real, reachable - base deletes a line, feature edits it) must render zero rows, and
-    /// a cache that hasn't caught up yet (or doesn't match `relative_path`/`hunk`) must still
-    /// show every real line (in plain, uncoloured text - see the per-line fallback below),
-    /// rather than either fabricating a phantom row or silently hiding real conflict content.
     pub(in crate::merge) fn render_conflict_columns(
         &self,
         base_branch: &str,

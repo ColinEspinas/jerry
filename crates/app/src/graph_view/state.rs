@@ -47,18 +47,6 @@ pub(crate) struct GraphRowMenu {
 
 /// An open branch-row right-click context menu in the Branches panel (GitHub issue #241): which
 /// branch it targets, and the already-resolved window-space origin its popover paints at.
-///
-/// Keyed by **branch name**, not by the row's index in the panel's own list, unlike
-/// [`GraphRowMenu`]: that list is rebuilt from the loaded graph on every render and re-filtered
-/// live by [`GraphTabState::branches_filter`], so a background reload (or a keystroke in the
-/// filter box) genuinely reorders and re-lengthens it while a menu is open. A name still names
-/// the same branch afterwards; an index does not. Every action the menu offers is therefore
-/// expressed in terms of that name, which is also exactly what the real `git` invocations behind
-/// them take.
-///
-/// Anchor resolved once at open time from the real click position, never recomputed per render -
-/// the same "resolve once, at open time" shape [`GraphRowMenu`] and
-/// `crate::sidebar::tree_ops::TreeContextMenu` both have.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GraphBranchMenu {
     pub branch: String,
@@ -71,10 +59,6 @@ pub(crate) struct GraphBranchMenu {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GraphBranchPromptKind {
     /// The row menu's "Create branch here": `git checkout -b <typed name> <sha>`.
-    ///
-    /// `sha`/`short_sha`/`subject` are captured once, at open time, from the row that was
-    /// right-clicked/`⋯`'d - not re-looked-up from the graph on every render, which a background
-    /// reload racing with the still-open prompt could otherwise change out from under it.
     CreateAt {
         sha: String,
         short_sha: String,
@@ -91,12 +75,6 @@ pub(crate) enum GraphBranchPromptKind {
 /// Mirrors `crate::root::new_file::NewFileInputState`'s own shape - this app's one established
 /// "prompt for a name" idiom (append/backspace-only [`TextField`], Enter to confirm, Escape to
 /// cancel) - rather than a second, competing one.
-///
-/// Deliberately **one** prompt serving both "Create branch here" and "Rename Branch…"
-/// ([`GraphBranchPromptKind`]) rather than a second, near-identical modal with its own focus
-/// handle, key handler and text field: the two differ only in their title, their pre-filled text
-/// and the one `wt_core::checkout` call Enter makes. Building a second one would be exactly the
-/// "one hand-rolled prompt idiom, not a second competing one" this prompt's own docs warn about.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GraphBranchPrompt {
     pub kind: GraphBranchPromptKind,
@@ -113,12 +91,6 @@ pub(crate) struct GraphBranchPrompt {
 /// it - is what makes every precondition below unit-testable without a GPUI window, the same split
 /// `crate::rail::state::prunable_worktree_paths` already uses for the rail's own destructive
 /// action.
-///
-/// Every field describes the **focused worktree** (`AdeApp::diff_root`), never the repository's
-/// main checkout - the branch menu's own footer rule ("check out, merge, rebase, push and delete
-/// all run in the focused worktree, never the main checkout"), and the same `diff_root` discipline
-/// every other graph mutation already follows through
-/// `crate::graph_view::render::AdeApp::run_graph_remote_op`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GraphBranchMergeFacts {
     /// The branch the merge would land *in*: the focused worktree's own checked-out branch.
@@ -179,32 +151,6 @@ impl GraphBranchMergeGate {
 
 /// The one place the graph decides whether "Merge into current branch…" may run (GitHub issue
 /// #241).
-///
-/// The two *content* preconditions and their exact wording come straight from the design's own
-/// `mergeReady`/`mergeWhy` (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`):
-/// `!uncommitted.length && !liveAgents.length`, reported as `N files still uncommitted` /
-/// `N agents still working`. The structural ones ahead of them are this app's own: they describe
-/// states in which `wt_core::merge::attempt_merge_into_current` could not do anything meaningful
-/// at all, and each mirrors a real `wt_core::Error` variant that function would otherwise return
-/// only *after* the user clicked (`MergeTargetDetached`, `MergeSourceIsCurrentBranch`,
-/// `MergeTargetDirty`) - checked here so the reason is visible on the row instead of arriving as
-/// an error in the resolver.
-///
-/// Order is deliberate: a structurally impossible merge outranks a merely blocked one, because
-/// "3 files still uncommitted" on a detached `HEAD` would imply that committing them is enough to
-/// unblock it, which is false.
-///
-/// Every reason is kept short enough to render *whole* in the row's sub-label at
-/// [`theme::graph::BRANCH_MENU_WIDTH`] - a truncated reason ("2 files still uncom…") is not a
-/// reason. The design's own two are already short; this app's own structural ones were shortened
-/// to match after measuring the real painted row, and that width was widened for the same reason
-/// (see its own docs).
-///
-/// This is a *pre-flight* gate, not the authority: `wt_core::merge` re-checks the detached-`HEAD`,
-/// same-branch and dirty-worktree preconditions against git's own ground truth immediately before
-/// running `git merge`, so a fact that goes stale between the render and the click (a background
-/// `load_diff`, an agent waking up, a file written under the worktree) can only ever cost an
-/// honest refusal in the resolver - never a merge this gate would have blocked.
 pub(crate) fn graph_branch_merge_gate(facts: &GraphBranchMergeFacts) -> GraphBranchMergeGate {
     let Some(current_branch) = facts.current_branch.clone() else {
         return GraphBranchMergeGate::Blocked(
@@ -333,10 +279,6 @@ pub(crate) struct GraphTabState {
     /// [`wt_core::checkout::delete_branch`]. Keyed by branch name rather than a bare `bool` for
     /// the identical reason: a Delete click on a *different* branch must arm its own
     /// confirmation, never ride on a stale arm left over from another row.
-    ///
-    /// Deleting is not the same kind of destructive as a hard reset - `git branch -d` is the safe
-    /// delete and git itself refuses an unmerged branch - but it is still a real, one-click ref
-    /// removal, and the confirmation costs one click.
     pub delete_branch_confirm_armed: Option<String>,
     /// GitHub issue #241: the graph tab's one branch-name prompt, shared by the row menu's
     /// "Create branch here" and the branch menu's "Rename Branch…" - see [`GraphBranchPrompt`]'s
@@ -364,13 +306,6 @@ pub(crate) struct GraphTabState {
     /// currently loaded [`Graph`] was really walked with - `wt_core::graph::DEFAULT_MAX_COMMITS`
     /// after a fresh [`AdeApp::load_graph`], then one
     /// `crate::graph_view::render::LOAD_MORE_BATCH` higher per completed "load more".
-    ///
-    /// The next cap is derived from *this*, not from `graph.rows.len()`, for two real reasons:
-    /// `rows` can carry a synthetic "Working tree" row that was never subject to the cap
-    /// at all (`wt_core::graph::build_graph`), and deriving it from the last *requested* cap makes
-    /// the sequence strictly monotonic, so even a history that shrinks under us (an amend, a
-    /// rebase, a `gc` between two walks) still terminates instead of ping-ponging between two
-    /// caps forever.
     pub loaded_cap: usize,
     /// `true` while a real "load more" walk is running on the background executor. Guards the row
     /// builder - which runs several times per frame, on every frame the user is scrolled near the
@@ -390,12 +325,6 @@ pub(crate) struct GraphTabState {
     /// `crate::root::scrollbar::AdeApp::render_vertical_scrollbar` has a real handle to draw
     /// against - every other scrollable region in the app has had one since GitHub issue #30;
     /// the graph tab shipped after that audit and was never retrofitted.
-    ///
-    /// A `UniformListScrollHandle` rather than a plain `ScrollHandle` since GitHub issue #218:
-    /// the row list is a real `gpui::uniform_list` now, which owns its own scroll offset and
-    /// tracks it through this type (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`).
-    /// `crate::root::scrollbar::ScrollableHandle` is implemented for both kinds, so the
-    /// scrollbar call site is unchanged - see that trait's own docs.
     pub rows_scroll_handle: UniformListScrollHandle,
     /// The Commit panel's own scroll position - see [`Self::rows_scroll_handle`]'s docs.
     pub commit_panel_scroll_handle: ScrollHandle,
@@ -571,7 +500,6 @@ mod tests {
 
     #[test]
     fn merge_gate_blocks_on_uncommitted_files_in_the_designs_own_wording() {
-        // The design's own `mergeWhy`: `this.n(uncommitted.length, 'file') + ' still uncommitted'`.
         let one = GraphBranchMergeFacts {
             uncommitted_files: 1,
             ..ready_merge_facts()
@@ -592,7 +520,6 @@ mod tests {
 
     #[test]
     fn merge_gate_blocks_on_live_agents_in_the_designs_own_wording() {
-        // The design's own `mergeWhy`: `this.n(liveAgents.length, 'agent') + ' still working'`.
         let one = GraphBranchMergeFacts {
             live_agents: 1,
             ..ready_merge_facts()

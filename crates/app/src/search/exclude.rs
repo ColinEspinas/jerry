@@ -3,69 +3,6 @@
 //! [`crate::search::engine`]'s file source into, after a direct live pushback on #387/#388's own
 //! fix: "Wait what you made the search respect gitignore? This should have nothing to do with
 //! git?"
-//!
-//! ## Two layers, composed like VS Code's are
-//!
-//! VS Code's search layers three independent things: `files.exclude` (a glob denylist),
-//! `search.exclude` (a second, additive glob denylist just for search) and
-//! `search.useIgnoreFiles` (default `true`) - an independently toggleable setting that
-//! *additionally* consults `.gitignore`/`.ignore` on top of the two glob lists, never instead of
-//! them. Jerry doesn't need the `files.exclude`/`search.exclude` split (there is no separate
-//! file-explorer walk to share it with), so this module is the combined equivalent of both: one
-//! small, real, always-on glob denylist ([`DEFAULT_EXCLUDES`]), checked per-directory during a
-//! real filesystem walk so an excluded directory is never even descended into - which is what
-//! makes a `target/`-sized directory genuinely cheap to skip rather than walked and its results
-//! discarded.
-//!
-//! [`crate::settings::store::EditorSettings::respect_gitignore`] is the second, independently
-//! toggleable layer - the direct descendant of #387/#388's own fix. `crate::search::engine::
-//! collect_candidate_files` reuses [`wt_core::worktree_files::list_worktree_files`] (the exact
-//! `git ls-files --cached --others --exclude-standard` idiom #388 introduced) as an *additive*
-//! filter checked on top of this module's walk, not as the sole file source #388 originally made
-//! it - see that function's own docs for exactly how the two compose.
-//!
-//! ## GitHub issue #401: the list itself is now real, user-editable settings state
-//!
-//! [`DEFAULT_EXCLUDES`] below is still the real, compiled-in list, but as of #401 it is no longer
-//! the list layer one's own walk actually prunes against in production. That list now lives at
-//! [`crate::settings::store::EditorSettings::search_excludes`] - a real, persisted `Vec<String>`
-//! the Editor settings page's own Search section lets the user add a pattern to or remove a
-//! pattern from - and [`exclude_list_from`] is what compiles *that* list into the same
-//! [`GlobList`] [`default_exclude_list`] used to build from the constant alone.
-//!
-//! [`EditorSettings::search_excludes`]'s own default is [`default_search_excludes`], i.e.
-//! [`DEFAULT_EXCLUDES`] copied into an owned, editable `Vec<String>` - so [`DEFAULT_EXCLUDES`]
-//! survives as this module's real floor for a *fresh install with no settings file yet* (and as
-//! the value every existing test in this module below still exercises directly), while a user who
-//! has actually opened Settings is editing their own real copy of it, not a second list layered on
-//! top of an invisible one they can't see or change. This is the deliberate "seed, don't hide"
-//! answer to the replace-vs-additive question: VS Code's own `search.exclude` is the editable,
-//! visible source of truth, seeded with real defaults, not a hidden base plus an add-on - see
-//! `EditorSettings::search_excludes`'s own docs for the full reasoning, including why this
-//! repository's own checkout (`target`/`.shared-target`) is the concrete case that reasoning has to
-//! hold up against if a user ever trims their own copy of the list too far.
-//!
-//! ## Why `target` and `.shared-target` are both in the default list
-//!
-//! This repository's own checkout is the real, live case [`DEFAULT_EXCLUDES`] has to hold up
-//! against without depending on `.gitignore` at all: a real `target/` (31 GB, Rust's own build
-//! output) and a real, sibling `.shared-target/` (28 GB - this project's own second build-cache
-//! directory, previously only kept out of search by being added to `.gitignore` in #388). With
-//! `respect_gitignore` off, only this list stands between search and re-walking 59 GB of build
-//! output on every query - the exact regression #387 reported - so both must be real entries
-//! here, not merely relying on either one being `.gitignore`d.
-//!
-//! ## Why a real walk, not a shell-out to `find`/`fd`
-//!
-//! Each directory's own worktree-relative path is checked against [`DEFAULT_EXCLUDES`] with the
-//! same [`crate::search::glob::GlobList`] the panel's own include/exclude fields already use -
-//! reusing the pattern language rather than inventing a second one, and keeping the "a bare
-//! pattern matches the basename at any depth" rule (`target` reads as `**/target`) identical
-//! between the two. The walk itself parallelizes sibling subdirectories across `rayon`'s global
-//! thread pool - the same pool `crate::search::engine::search_worktree_cancellable`'s own batched
-//! scan already uses (see that module's own "Parallel" docs) - so pruning a big excluded
-//! directory at one worker never blocks the walk from making progress on every other real
-//! directory at the same time.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,14 +17,6 @@ use crate::search::glob::GlobList;
 /// rule turns into `**/<name>`, matching that directory at any depth - `target` excludes both
 /// `./target` and `crates/app/target`, the same way the panel's own `*.lock` exclude field
 /// already matches a lockfile at any depth.
-///
-/// - `target` - Rust's own build output.
-/// - `.shared-target` - this repository's own second, sibling build-cache directory - see this
-///   module's own "Why `target` and `.shared-target` are both in the default list" docs.
-/// - `node_modules` - JS/TS dependencies.
-/// - `.git` - this app's own VCS bookkeeping; mostly binary, and a hit in it is never actionable.
-/// - `dist`, `build`, `.next` - common JS/TS build output directory names.
-/// - `__pycache__`, `venv`, `.venv` - common Python build/dependency directory names.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "target",
     ".shared-target",
@@ -123,14 +52,6 @@ pub fn default_search_excludes() -> Vec<String> {
 /// stand-in for it) into the same [`GlobList`] [`default_exclude_list`] builds from the constant -
 /// one real compilation path for "whatever list of bare/glob directory patterns is currently in
 /// force," whether that list is the compiled-in default or the user's own edited copy of it.
-///
-/// Reuses [`GlobList::parse`]'s own comma-joined-list parsing rather than a `Vec`-specific one:
-/// each pattern is validated and normalized exactly the way a single pattern typed into the
-/// panel's own include/exclude fields already is (bare name -> basename-anywhere, blank entries
-/// dropped) - see [`crate::search::glob`]'s own module docs for the full rule set. An empty
-/// `patterns` slice (a user who has genuinely deleted every entry) compiles to an empty
-/// [`GlobList`], which [`GlobList::is_empty`]/[`GlobList::matches`] already treat as "never
-/// excludes anything" - a real, honest state this function does not second-guess.
 pub fn exclude_list_from(patterns: &[String]) -> GlobList {
     GlobList::parse(&patterns.join(","))
 }
@@ -139,22 +60,6 @@ pub fn exclude_list_from(patterns: &[String]) -> GlobList {
 /// `/`-separated form, skipping any directory [`excludes`] matches **before** it is ever opened -
 /// see this module's own docs for why that, not a filter applied after the fact, is what makes an
 /// excluded directory genuinely cheap.
-///
-/// `cap` bounds the same way [`crate::search::engine::MAX_SCANNED_FILES`] always has: once the
-/// running file count reaches it, every worker still in flight finishes its own current directory
-/// (so no directory is left half-read) and no new subdirectory is descended into. The count is
-/// only approximately exact under concurrent workers (an `AtomicUsize` racing several `fetch_add`s
-/// at once) - acceptable for a defense-in-depth bound that was never meant to be a precise cutoff,
-/// the same way the old single-threaded walk's own cap was a real limit rather than a guarantee
-/// about exactly which file it landed on.
-///
-/// Symlinks are not followed (`DirEntry::file_type` does not follow them), so a worktree
-/// containing a link back to its own root cannot make this walk unbounded - the same real
-/// property `crate::search::engine`'s own retired `collect_files_by_walking` had.
-///
-/// Returns `(files, truncated)` - `truncated` is `true` only when `cap` was actually reached, and
-/// the caller (`crate::search::engine::collect_candidate_files`) is what turns that into
-/// [`crate::search::engine::SearchOutcome::truncated`].
 pub fn collect_files_excluding(
     root: &Path,
     excludes: &GlobList,
@@ -362,7 +267,6 @@ mod tests {
         write(root, "src/lib.rs", "fn main() {}\n");
         write(root, "coverage/report.html", "<html></html>\n");
 
-        // Not on the built-in list at all - only real once the user has actually added it.
         let excludes = exclude_list_from(&["coverage".to_string()]);
         let (files, _truncated) = collect_files_excluding(root, &excludes, 20_000);
         assert_eq!(

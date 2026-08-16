@@ -81,144 +81,6 @@ use settings::store as settings_store;
 /// startup) and this crate's own regression test
 /// (`root::focus::palette_focus_tests::secondary_keystroke_opens_the_palette`) bind, so the two
 /// can never silently drift apart.
-///
-/// `"secondary-"`, not `"cmd-"`, is deliberate and was the fix for a live-reproduced bug: GPUI's
-/// keystroke parser (`vendor/zed/crates/gpui/src/platform/keystroke.rs:127-159`) treats
-/// `"cmd"`/`"super"`/`"win"` as three spellings of the *same* alias, which always sets
-/// `modifiers.platform` regardless of OS - on Linux/Windows that's the Super/Windows key, never
-/// Ctrl. Binding `"cmd-k"` left the shortcut on Super+K while `crate::keymap`'s rendering
-/// (correctly) showed a `Ctrl` keycap on those platforms: `Ctrl+K` did nothing, and `Ctrl+,`
-/// fell through to whatever had keyboard focus and typed a literal `,` into it (e.g. a live
-/// terminal agent).
-///
-/// `"secondary"` (same file, lines 143-150) is GPUI's own answer to exactly this: it resolves to
-/// the `platform` modifier on macOS and `control` everywhere else, at compile time - the same OS
-/// fact `crate::keymap::detected_platform_is_macos` resolves for rendering, so this is one
-/// source of truth by construction. `f12` is untouched: it's the same physical key on every OS
-/// (confirmed against `vendor/zed/assets/keymaps/default-linux.json`'s own
-/// `"f12": "editor::GoToDefinition"` binding), so no per-platform alias applies.
-///
-/// This list is bound once, at app startup, fixed by the compiled-in `target_os`;
-/// `crate::keymap::WindowControlsStyle`'s runtime title-bar/keycap override can't change which
-/// physical key it matches (see that type's own docs for why).
-///
-/// A few entries need their own rationale:
-/// - `"ctrl-shift-t"` (New terminal in worktree) is deliberately a literal Ctrl on every OS,
-///   including macOS, matching the mockup's own `ctrl+shift+T` spec - unlike every other binding
-///   here, which uses `"secondary-"`.
-/// - The `+` menu's "Open file…" row has **no** global keybinding of its own, despite the
-///   mockup's own `mod+P` spec: `"secondary-p"` is now claimed by `TogglePalette` (below) instead
-///   of this narrower action - see that entry's own docs for the real terminal-readline tradeoff
-///   that decision accepts. The `+` menu row itself is still a working, click-only way to open
-///   the palette scoped to files.
-/// - `"]"` (Next changed file) has no modifier, and is scoped to `Some("diff && !file-editor")`
-///   rather than global - the only one of this app's bindings with a non-`'rail'`/`'agent'`
-///   context. A global `"]"` would swallow a literal `]` typed into any focused terminal/agent
-///   agent (closing a bracket, an array literal, a regex class) - the same bug class as above.
-///   Scoping to `"diff"` (`crate::code_surface`'s `.key_context("diff")` on the Surface C
-///   container) means it only fires while a file tab already has focus, matching the design's
-///   intent: `]` cycles *through an already-open review*, not a global "jump into reviewing"
-///   shortcut. The `&& !file-editor` half is a real, live-reproduced fix (not part of the
-///   original design): Revision R8.5a's real File view text editing adds a `"file-editor"`
-///   context *alongside* `"diff"` on that same container (see the `Editor*` entry below) rather
-///   than replacing it, so a bare `Some("diff")` predicate kept matching - and kept swallowing a
-///   literal `]` keystroke before it ever reached the real edit buffer - even while a file was
-///   actively being edited, reproduced live by typing `]` into real content. `!`/`&&` are real,
-///   supported `KeyBindingContextPredicate` syntax (`vendor/zed/crates/gpui/src/keymap/
-///   context.rs:172-420`'s own `Not`/`And` variants and parser), not invented here.
-/// - `"secondary-1"` through `"secondary-8"` back agent-jumping
-///   (`root::AdeApp::jump_to_agent_at`), expanding the design's `mod+1…8` spec into eight
-///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component. No longer
-///   advertised by an on-screen keycap hint (removed per a direct product-owner request), but the
-///   bindings themselves are still real.
-/// - The `Editor*` entries (Revision R8.5a's real File view text editing) are scoped to
-///   `Some("file-editor")`, a real *additional* context alongside `"diff"` above - both live on
-///   the *same* focused "code-surface" container (`code_surface::render::AdeApp::
-///   render_code_surface`'s outer div, the one `code_focus_handle` is actually `track_focus`'d
-///   on), with `"file-editor"` only added to that node's own context string (space-separated:
-///   `"diff file-editor"`) while the editable File view - not the read-only Diff view - is
-///   showing for an open tab with a real `EditBuffer`. GPUI's real key dispatch only bubbles
-///   `on_action`/context from the *focused* node up through its ancestors, never down into a
-///   descendant, so binding these on a separate inner container (an earlier draft of this code
-///   tried exactly that) would never actually fire - see `render_code_surface`'s own docs for the
-///   real, live-verified bug this was. The read-only Diff view genuinely never receives a single
-///   one of these bindings: its context string never gains `"file-editor"`. Plain letters/arrows
-///   are deliberately *not* globally bound (unlike, say, `f12`) - binding them at `None` scope
-///   would swallow ordinary typing in every focused terminal agent the same way an unscoped
-///   `"]"` would have (see that entry's own docs above) - `"file-editor"` is the only context
-///   they're ever active in. `EditorSave` is `"secondary-s"`, following this list's own
-///   `"secondary-"` convention (verified against this same list: no other entry already claims
-///   it). `EditorSaveAnyway` (`"secondary-shift-s"`) is the real, explicit, opt-in override for
-///   an `AdeApp::file_external_conflict` - see `code_surface::editing::AdeApp::force_save_active_file`'s
-///   own docs for the real permanent-deadlock bug (a conflict that, once flagged, could never
-///   clear again through the ordinary save path) this exists to let the user deliberately break
-///   out of.
-/// - The `Completions*` entries (Revision R8.5b) back the real Completions popup
-///   (`crate::lsp::completion_popup`), scoped to `Some("file-editor && completions")` - a real,
-///   narrower sibling context added to the same node only while the popup is genuinely open (see
-///   `crate::code_surface::render::AdeApp::render_code_surface`'s own docs). `enter`/`up`/`down`
-///   above are correspondingly narrowed to `!completions` so the two mutually-exclusive predicate
-///   sets can never both match the same keystroke - the same real `&&`/`!`
-///   `KeyBindingContextPredicate` mechanism the `"]"` entry already established for this exact
-///   bug class.
-/// - `TextUndo`/`TextRedo` (GitHub issue #17, `crate::text_history`) back this app's one real
-///   undo system: per-widget **text** undo. `"secondary-z"`/`"secondary-shift-z"` follow this
-///   list's own `"secondary-"` convention, but - unlike every other entry above except `"]"` -
-///   are **not** globally scoped (`None`): `"secondary-z"` resolves to plain `Ctrl+Z` on
-///   Linux/Windows, which `crate::terminal::pane::keystroke_to_bytes` already maps to the real
-///   `SIGTSTP` control byte (`0x1a`) - the terminal-suspend keystroke essentially every
-///   interactive terminal program relies on. A global binding here would swallow it before it
-///   ever reached a focused terminal's own key handling, the same "app-level shortcut steals
-///   terminal input" bug class this list's own `secondary-p`/`"]"` docs already cover, just for a
-///   far more disruptive keystroke to silently lose than either of those.
-///   - `TextUndo`/`TextRedo` are scoped `Some("text-input")` - one shared context tag carried by
-///     every real text-typing surface in the app and by nothing else: `crate::palette`'s query
-///     panel, `crate::rail`'s filter row, `crate::settings`' Keybindings filter row,
-///     `crate::root::new_file`'s name prompt, `crate::code_surface::render`'s code surface (only
-///     while the editable File view is genuinely showing, alongside its existing `"file-editor"`
-///     tag), `crate::merge::editing`'s hand-edit surface (alongside `"merge-editor"`), and
-///     `crate::sidebar::render`'s file tree (only while its inline New File / New Folder / Rename
-///     name editor is open, alongside `"file-tree tree-editing"` - see
-///     `crate::keymap_overrides::file_tree_key_context`). That last one arrived by *merge* rather
-///     than by an edit to this file: GitHub issue #19 built those editors on a branch where this
-///     tag did not exist, and until they gained it `Ctrl+Z` mid-filename ran the worktree-level
-///     undo/redo this app used to also have (removed - GitHub issue #47). Keeping this
-///     enumeration complete is exactly what that incident argues for.
-///   - No terminal surface ever carries `"text-input"` (a real terminal wants `Ctrl+Z` as the
-///     literal `SIGTSTP` byte), so `TextUndo`/`TextRedo` never fire there and the keystroke stays
-///     free to reach the pty, exactly as before.
-///   - `"ctrl-y"` is bound to `TextRedo` as well, per GitHub issue #17's own checklist, and is
-///     deliberately a literal `Ctrl` on every OS (like `"ctrl-shift-t"` above, unlike this list's
-///     usual `"secondary-"`): `Ctrl+Y` is the Windows-convention redo key, and `Cmd+Y` means
-///     nothing on macOS. Safe to bind only because `"text-input"` is never live over a terminal,
-///     where `Ctrl+Y` is a real control byte (`0x19`, readline `yank`).
-///   - Routing between the seven text surfaces is *not* done by inspecting app state inside one
-///     handler: each surface registers its own `on_action` listener on the exact node that carries
-///     its `"text-input"` tag, and GPUI only dispatches an action along the focused node's own
-///     ancestor path (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_action_on_node`), so the
-///     focused widget's handler is the only one that can run. This matters for a real, reachable
-///     case a state-inspecting handler would get wrong: the command palette can be open with a
-///     typed query while a file editor is still open behind it, and Ctrl+Z must undo the query.
-/// - GitHub issue #26 added four more real entries, each documented at its own binding below:
-///   `"ctrl-space"` (`CompletionsInvoke`, manual completion trigger/refresh), `"tab"`/`"shift-tab"`
-///   (`EditorIndent`/`EditorDedent`, real Tab/Shift+Tab indentation, replacing the old "falls
-///   through to plain-text-insertion" behavior `Tab` used to have with the popup closed),
-///   `"escape"` (the real accessibility escape hatch `Tab`'s new meaning inside the editor
-///   requires - `EditorCollapseCursors` in the File view, since GitHub issue #28's own multi-
-///   cursor collapse and this escape hatch both want the File view's plain `Escape` and only one
-///   binding can genuinely own it at equal context depth; a separate `EditorEscape` in the merge
-///   hand-edit view, which never gets multi-cursor actions and so never faces that collision -
-///   see `crate::code_surface::editing::AdeApp::handle_editor_collapse_cursors_action`'s own docs
-///   for exactly how the File view composes both real behaviors from one binding), and `"ctrl-w"`
-///   (`CloseFocusedTab`, close the focused tab) - the last of these follows the exact same
-///   literal-`ctrl`/`!terminal`-scoping precedent `"ctrl-shift-t"` above already established, for
-///   the same real reasons. `EditorIndent`/`EditorDedent` are scoped
-///   `"file-editor && !completions"`/`"merge-editor"` like every other plain `Editor*` action,
-///   never `"text-input"` - that tag is GitHub issue #17's own **text-history** context, a
-///   different real concept from "is real text editing allowed here" (see the `TextUndo`/
-///   `TextRedo` entry above), and `Tab`/`Shift+Tab`/`Escape` have no meaning at all in this app's
-///   five non-editor text-input surfaces (a filter row, a query field, a rename prompt) that
-///   would need claiming there.
 pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
     // GitHub issue #235: `cmd-q` (macOS only - appended below, not part of this literal list) is
     // the one real exception to this function's own "no new global keybinding" discipline every
@@ -871,19 +733,6 @@ pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
 /// the Dock "reopen" handler registered via `cx.on_reopen` further down - share one definition
 /// rather than risk silently drifting apart, the same "no second copy of a decision" reasoning
 /// [`default_key_bindings`]'s own docs already give for the window options themselves.
-///
-/// `repo_path` is threaded through rather than hardcoded to `None`: the initial launch still
-/// needs to honor a real CLI argument (`Some(path)`, which makes `use_remembered_repo`
-/// irrelevant - see [`root::AdeApp::new`]'s own docs), while the reopen handler always passes
-/// `None`, since a Dock click never carries a path.
-///
-/// The production settings load (`Settings::load_or_init`, a real read of - and, on a first run,
-/// a real write to - `~/.config/jerry/settings.toml`) happens here rather than inside
-/// [`open_ade_window_with_settings`], mirroring [`root::AdeApp::new`]'s own split from
-/// `new_with_settings`: that split exists specifically so tests can supply an in-memory
-/// [`settings_store::Settings`] and a temp-dir path instead, never touching whatever machine
-/// happens to run `cargo test` - see `open_ade_window_tests` below, which exercises the shared
-/// half through that seam.
 fn open_ade_window(
     repo_path: Option<PathBuf>,
     cx: &mut App,
@@ -922,25 +771,6 @@ pub const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 /// [`GPUI_X11_SCALE_FACTOR_ENV`] before GPUI starts - the whole decision, factored out of `main`
 /// so it can be tested without a process to mutate. `existing_env` is whatever that variable
 /// already holds in the real process environment (`std::env::var` at the call site).
-///
-/// Why an environment variable at all: GPUI resolves the X11 scale factor exactly once, while its
-/// X11 client initialises inside `gpui_platform::application()`, and this variable is the only
-/// override it offers - there is no runtime API, and `gpui` is a pinned git dependency with no
-/// `[patch]` section, so it cannot be changed from here. That is also why the Appearance page's
-/// hint says a restart is required.
-///
-/// Two decisions worth stating, both visible in the tests below:
-///
-/// - An override already present in the environment wins. A user who exported
-///   `GPUI_X11_SCALE_FACTOR` in their shell profile or launcher meant it for this launch
-///   specifically; silently overwriting it from a persisted setting would make that export
-///   look broken. An empty or whitespace-only value is not an override - GPUI itself treats the
-///   empty string as "not set" (`DpiMode::NotSet`) - so it is passed over.
-/// - The value is re-clamped through
-///   [`settings::store::sanitize_display_scale_override`] rather than trusted. Loading normally
-///   sanitizes it already, but GPUI *panics* (not falls back) on a non-positive or non-normal
-///   float, so the last step before handing it over does not assume anything about how the
-///   `Settings` value was obtained.
 pub fn x11_scale_factor_env_value(
     settings: &settings::store::Settings,
     existing_env: Option<&str>,
@@ -958,16 +788,6 @@ pub fn x11_scale_factor_env_value(
 /// Opens the ADE window against `repo_path` and runs the GPUI event loop until the window is
 /// closed. Blocks the calling thread for the application's lifetime, mirroring
 /// `gpui::Application::run`'s own contract (`vendor/zed/crates/gpui/examples/hello_world.rs`).
-///
-/// GitHub issue #90: `repo_path` is now optional. `Some(path)` behaves exactly as before (the
-/// real CLI-argument case, `crate::main`'s own docs). `None` - a fresh launch with no CLI
-/// argument - is handed straight through to `root::AdeApp::new`/`new_with_settings`, which
-/// resolves it against whatever repo (if any) was last focused and persisted to `repos.toml`:
-/// reopen that one, or - if nothing was ever persisted, or the remembered path no longer exists -
-/// a genuinely empty window with no folder open at all. This is the real fix for "launching the
-/// editor should be in an 'empty' state by default": there is no `env::current_dir()` fallback
-/// anywhere in this path anymore (removed from `crate::main` itself) for `None` to silently
-/// become.
 pub fn run(repo_path: Option<PathBuf>) {
     // `with_assets` registers `fonts::Assets` as the app's `AssetSource`
     // (`vendor/zed/crates/gpui/src/app.rs:198`) before the launch callback runs, since
@@ -1054,11 +874,6 @@ pub fn run(repo_path: Option<PathBuf>) {
 
 /// GitHub issue #216's real decision, tested without a process environment to mutate - see
 /// [`x11_scale_factor_env_value`]'s own docs.
-///
-/// What these tests deliberately do **not** claim: that GPUI then renders at the forced scale.
-/// That happens inside a pinned dependency, at X11-client init, against a real display - there is
-/// no headless way to assert it from here. What is proven is the whole of this app's side of the
-/// contract: which string, if any, reaches the variable GPUI reads.
 #[cfg(test)]
 mod x11_scale_factor_env_tests {
     use super::x11_scale_factor_env_value;
@@ -1090,8 +905,6 @@ mod x11_scale_factor_env_tests {
         );
     }
 
-    /// GPUI panics rather than falling back on a value outside its `valid_scale_factor`, so this
-    /// last step re-clamps instead of trusting that the `Settings` came from a sanitizing load.
     #[test]
     fn an_unsanitized_settings_value_is_still_clamped_before_it_reaches_gpui() {
         let mut settings = Settings::default();
@@ -1153,11 +966,6 @@ mod open_ade_window_tests {
     use super::{open_ade_window_with_settings, settings_store};
     use crate::root::AdeApp;
 
-    /// The actual bug report: with a real repo remembered from an earlier launch, "reopening"
-    /// (`repo_path: None`, the same shape the Dock handler always passes) must bring that repo -
-    /// and its tab session - back, exactly like a fresh relaunch would (GitHub issue #90). Not a
-    /// bare empty window, which is what this app showed before issue #278's fix existed at all
-    /// (there was no handler, so nothing opened anything).
     #[gpui::test]
     fn reopen_shape_restores_the_remembered_repo(cx: &mut gpui::TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1208,11 +1016,6 @@ mod open_ade_window_tests {
         });
     }
 
-    /// The other real case: nothing was ever persisted (a first-ever launch, or a remembered
-    /// repo since deleted - `root::mod`'s own
-    /// `a_remembered_repo_that_no_longer_exists_falls_back_to_a_genuinely_empty_window` covers
-    /// the latter at the `AdeApp` level already). A Dock reopen in that state must still succeed
-    /// and open a real, genuinely empty window - never panic, never silently do nothing.
     #[gpui::test]
     fn reopen_shape_opens_a_genuinely_empty_window_when_nothing_is_remembered(
         cx: &mut gpui::TestAppContext,
@@ -1246,19 +1049,6 @@ mod open_ade_window_tests {
 
 /// GitHub issue #17's scoping matrix, proven as predicate logic against every real key-context
 /// stack this app actually produces - not as a dispatch-order observation.
-///
-/// This is deliberately *stronger* than the `simulate_keystrokes` routing tests in
-/// `crate::root::focus::text_undo_scoping_tests` and `crate::code_surface::editing::editing_tests`,
-/// and complements them rather than duplicating them. GPUI dispatches only the highest-precedence
-/// matching binding (`vendor/zed/crates/gpui/src/keymap.rs`'s `bindings_for_input`, then
-/// `window.rs`'s `replay_pending_input`, which stops at the first handler that doesn't propagate),
-/// so a live keystroke test can only ever observe the *winner*, which would happily pass even if
-/// `TextUndo`/`TextRedo` were live somewhere this list's own docs don't claim. This asserts the
-/// thing that actually matters: for every real context stack, `TextUndo`/`TextRedo` are enabled
-/// in exactly the contexts `Some("text-input")` is documented to mean, and nowhere else. See
-/// [`default_key_bindings`]'s own docs for the full rationale, and this project's documented
-/// seven-plus instances of the "keystroke reaches the wrong handler" bug class for why it is
-/// checked this precisely.
 #[cfg(test)]
 mod undo_scoping_matrix_tests {
     use gpui::{KeyBinding, KeyContext};
@@ -1268,15 +1058,6 @@ mod undo_scoping_matrix_tests {
     /// truth, guarded against drift by that module's own `every_real_key_context_call_site_is_covered`
     /// test, so this matrix and the Settings rebind collision checker can never disagree about the
     /// app they are both reasoning over.
-    ///
-    /// Includes the **empty** stack. An earlier version of this matrix restated its own list and
-    /// omitted it while claiming to cover "every real context stack this app can produce" - which
-    /// was exactly wrong in the place it mattered, since the empty stack is what GPUI falls back to
-    /// when the focused `FocusId` is not in the last rendered frame, and an independent adversarial
-    /// audit found a real, reachable dangling-focus site (Settings page navigation) living there.
-    /// `TextUndo`/`TextRedo` are disabled on that stack, which is asserted explicitly, with its
-    /// own honest meaning: the keystroke is silently swallowed, a real bug class this app fixes at
-    /// the focus sites rather than in the keymap.
     fn real_context_stacks() -> Vec<Vec<&'static str>> {
         crate::keymap_overrides::real_context_stacks()
     }
@@ -1328,8 +1109,6 @@ mod undo_scoping_matrix_tests {
             .collect()
     }
 
-    /// `TextUndo` is enabled in exactly the real contexts `Some("text-input")` is documented to
-    /// mean, and nowhere else.
     #[test]
     fn secondary_z_reaches_text_undo_in_exactly_the_real_text_input_contexts() {
         let keystroke = if cfg!(target_os = "macos") {
@@ -1340,7 +1119,6 @@ mod undo_scoping_matrix_tests {
         let text = bindings_for("app::TextUndo", keystroke);
         assert_eq!(text.len(), 1, "one real text-undo binding");
 
-        // Index-aligned with `real_context_stacks()`/`stack_descriptions()`.
         let expectations: Vec<bool> = vec![
             // A dangling focus handle: GPUI evaluates every predicate against an empty stack and
             // `eval_inner` short-circuits to false, so the keystroke is silently swallowed.
@@ -1394,15 +1172,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// GitHub issue #336's own scoping claim, in exactly the same shape as `TextUndo`'s above:
-    /// `TextCopy`/`TextCut`/`TextPaste`/`TextSelectAll` are live in every real *simple* text-input
-    /// context and nowhere else - specifically **not** on the code surface or the merge hand-edit
-    /// surface, where the `Editor*` actions already own `secondary-c`/`x`/`v`/`a` and would
-    /// otherwise tie with these at exactly the same predicate depth.
-    ///
-    /// A live `simulate_keystrokes` test can only ever observe whichever binding won that tie, so
-    /// it would pass just as happily with the ambiguity in place. This asserts the predicate logic
-    /// itself, which is the thing that actually has to hold.
     #[test]
     fn the_text_clipboard_actions_are_live_in_exactly_the_simple_input_contexts() {
         let cases = [
@@ -1478,9 +1247,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// The other half of the same claim: on the two editor surfaces the `Editor*` actions really
-    /// are still the only live owner of those four keystrokes, so nothing was taken away from them
-    /// by GitHub issue #336's additions.
     #[test]
     fn the_editor_surfaces_keep_sole_ownership_of_their_own_clipboard_keystrokes() {
         let pairs = [
@@ -1552,10 +1318,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// GitHub issue #158's root cause, asserted directly: before the fix there was **no**
-    /// binding of any kind that reached an action while a terminal had focus for either copy or
-    /// paste, so both keystrokes fell through to `crate::terminal::pane::keystroke_to_bytes`
-    /// and did something else entirely. This fails against the pre-fix keymap.
     #[test]
     fn a_focused_terminal_has_real_copy_and_paste_bindings() {
         let contexts = stack(&["app", "terminal"]);
@@ -1572,10 +1334,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// The copy/paste bindings must be *terminal-only*. A global one would claim the keystroke
-    /// over the File view and the file tree, where `secondary-c`/`secondary-v` already have
-    /// their own real, differently-scoped bindings - the exact "keystroke reaches the wrong
-    /// handler" bug class this whole matrix exists for.
     #[test]
     fn terminal_copy_and_paste_are_dead_everywhere_but_a_terminal() {
         for parts in real_context_stacks() {
@@ -1596,12 +1354,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// Plain `Ctrl+C`/`Ctrl+V` must stay genuinely unbound over a terminal - they are the pty's
-    /// own `SIGINT` (`0x03`) and readline `quoted-insert` (`0x16`) bytes. This is what forces
-    /// issue #158's copy/paste onto the shifted variants instead of the obvious `secondary-c`/
-    /// `secondary-v`, so it is asserted rather than left as a comment. (On macOS `secondary-` is
-    /// `cmd-`, which is a different physical keystroke from `ctrl-c` and never reaches the pty
-    /// anyway, so the literal `ctrl-` keystrokes are what matters on every platform.)
     #[test]
     fn plain_ctrl_c_and_ctrl_v_are_never_claimed_over_a_focused_terminal() {
         let contexts = stack(&["app", "terminal"]);
@@ -1622,8 +1374,6 @@ mod undo_scoping_matrix_tests {
         }
     }
 
-    /// `ctrl-y` must be genuinely dead over a terminal: it is a real control byte there
-    /// (`0x19`, readline `yank`), and this app binds it globally to nothing.
     #[test]
     fn ctrl_y_is_never_live_over_a_focused_terminal() {
         let contexts = stack(&["app", "terminal"]);

@@ -2,13 +2,6 @@
 //! the real `git worktree list --porcelain` output) into a UI-friendly, GPUI-independent shape
 //! for the left sidebar. Kept separate from the rendering code so the mapping logic is
 //! unit-testable without a GPUI window.
-//!
-//! GitHub issue #12 ("worktrees panel is populated once and never invalidated"): this is the
-//! **one** place `wt_core::WorktreeStatus` becomes a [`WorktreeItem`], used identically by the
-//! app's very first load, `crate::rail::render::AdeApp::execute_prune`'s post-prune reload, and
-//! the live watcher/poll refresh (`crate::rail::worktree_watch`) - see
-//! `crate::root::AdeApp::load_worktrees`'s own docs. There is no separate "optimistic insert"
-//! path that could diverge from what a real re-parse produces.
 
 use std::path::{Path, PathBuf};
 
@@ -179,26 +172,6 @@ pub fn recover_selection(
 /// "Open Folder…") should land on - the pure half of this revision's central invariant: *a
 /// focused repo always has a real, genuinely selected worktree, never a `None` limbo state that
 /// merely happens to render a plausible-looking tab through a fallback.*
-///
-/// `opened_path` is the path the user actually named, and it is tried first for a real reason:
-/// launching directly inside a linked worktree (`jerry ~/repo-wt/feature`) is an ordinary
-/// gesture, and landing that window on the repo's *main* worktree instead of the one the user
-/// pointed at would be a silent, surprising redirect. Only when `opened_path` is not itself a
-/// worktree does this fall back to [`WorktreeItem::is_main`] - which covers both the common
-/// `jerry .` case (where the two are the same row anyway) and the real, live-reproduced
-/// subdirectory launch (`jerry ./crates`), where `opened_path` is a genuine directory that is
-/// nonetheless not any worktree at all.
-///
-/// `None` only when the repo has no *usable* worktree whatsoever (an empty list, or one whose
-/// every entry is [`WorktreeItem::error`]-bearing) - a real, honest "there is nothing here to
-/// select" state, deliberately distinct from "we forgot to select something that exists". See
-/// `crate::root::AdeApp::current_worktree_path`'s own docs for the single documented last resort that
-/// covers it.
-///
-/// Unusable ([`WorktreeItem::error`]) entries are skipped by both rules, matching the identical
-/// `error.is_none()` gate every other selection/spawn/diff call site in this crate already
-/// applies - selecting a prunable worktree would hand every one of those a path that no longer
-/// exists on disk.
 pub fn selection_for_opened_repo(opened_path: &Path, items: &[WorktreeItem]) -> Option<usize> {
     items
         .iter()
@@ -292,10 +265,6 @@ mod tests {
         assert!(!items[0].is_main);
     }
 
-    /// The central "don't silently list a broken worktree as healthy" guarantee (issue #12):
-    /// a prunable entry must be both flagged via `is_broken`/`broken_reason` *and* rejected by
-    /// the plain `error.is_none()` gate every existing selection/agent-spawn/diff call site
-    /// already uses, with no changes needed at those call sites.
     #[test]
     fn a_prunable_entry_is_marked_broken_and_unusable() {
         let mut gone = status("/repo-wt/gone", Some("gone-branch"), false);
@@ -420,8 +389,6 @@ mod tests {
 
     // --- `selection_for_opened_repo` -----------------------------------------------------
 
-    /// The overwhelmingly common `jerry .` case: the opened path *is* the main worktree, so
-    /// both of this function's rules agree and it lands on the one obvious row.
     #[test]
     fn opening_a_repo_root_selects_its_own_main_worktree() {
         let items = vec![
@@ -434,8 +401,6 @@ mod tests {
         );
     }
 
-    /// `jerry ~/repo-wt/feature` - launching directly inside a linked worktree must land on
-    /// *that* worktree, never silently redirect to main.
     #[test]
     fn opening_a_linked_worktree_directly_selects_that_worktree_not_main() {
         let items = vec![
@@ -449,12 +414,6 @@ mod tests {
         );
     }
 
-    /// The real, live-reproduced subdirectory launch (`jerry ./crates`): the opened path is a
-    /// genuine directory but not any worktree, so nothing can match it exactly. Before this
-    /// rule existed, `AdeApp::current_worktree_path` fell back to that bare subdirectory path, and
-    /// the startup shell it spawned there belonged to no rail row at all - a real, live tab
-    /// that no worktree claimed, and which became permanently unreachable the moment any
-    /// worktree row was clicked.
     #[test]
     fn opening_a_subdirectory_of_a_repo_falls_back_to_the_main_worktree() {
         let items = vec![
@@ -469,15 +428,11 @@ mod tests {
         );
     }
 
-    /// A repo with genuinely nothing usable to select is a real, honest state - reported as
-    /// such rather than papered over with an index that doesn't resolve to a usable row.
     #[test]
     fn opening_a_repo_with_no_usable_worktree_at_all_selects_nothing() {
         assert_eq!(selection_for_opened_repo(Path::new("/repo"), &[]), None);
     }
 
-    /// An exact path match that is nonetheless *broken* must not be selected - it would hand
-    /// every downstream consumer a path that isn't on disk. Falls through to main instead.
     #[test]
     fn a_broken_exact_match_is_skipped_in_favour_of_a_usable_main() {
         let items = vec![
@@ -491,8 +446,6 @@ mod tests {
         );
     }
 
-    /// And a broken *main* is skipped too, leaving the honest "nothing usable" answer rather
-    /// than an index pointing at an unusable row.
     #[test]
     fn a_broken_main_worktree_is_not_selected_either() {
         let items = vec![item("/repo", true, Some("worktree is prunable"))];

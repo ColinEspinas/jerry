@@ -9,14 +9,6 @@ use crate::status_bar::resources::{
 };
 
 /// This machine's real core count, read once and cached.
-///
-/// `std::thread::available_parallelism` is not the cheap `sched_getaffinity` call it looks like:
-/// on Linux it also performs the cgroup quota lookup, opening and reading `/proc/self/cgroup`,
-/// `/proc/self/mountinfo` and the cgroup's `cpu.max`/`cpu.cfs_quota_us` files. Calling it from
-/// the per-frame resource-tree build meant real blocking filesystem I/O on the UI thread on
-/// *every frame*, for a value that cannot change while the process is running. This is one
-/// `OnceLock` instead - and deliberately not a field on `AdeApp`, since it is a property of the
-/// machine rather than of any window.
 pub(crate) fn available_cores() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CORES.get_or_init(|| {
@@ -31,10 +23,6 @@ pub(crate) fn available_cores() -> usize {
 /// `STAGE-A-CHANGELOG.md` §4c's diagnosis: "the cause was not density - it was that after the
 /// cut, **all thirteen-then-five readouts sat at 10px in `#4a5057`**, one flat tone on `#101214`.
 /// No hierarchy means the eye has to read all of it to find any of it").
-///
-/// A named enum rather than three ad-hoc `.text_color(...)`/`.text_size(...)` pairs at each call
-/// site: the whole defect was that every readout independently picked the same tone, so the fix
-/// has to be a closed set of tiers a readout is *assigned to*, not a colour it chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusTier {
     /// §3: `main ↑2 ↓0`'s branch, `4 agents running` - "the readouts you are meant to find
@@ -77,9 +65,6 @@ impl StatusTier {
 
 /// A composite readout split into §4c's "bright head and dim tail" - "the count is the fact you
 /// scan for, the size is the detail you read only if the count surprised you".
-///
-/// Pure, and returned rather than rendered directly, so which half is which is a testable fact
-/// rather than a property of a `div` tree.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SplitReadout {
     /// Rendered at [`StatusTier::Primary`].
@@ -108,32 +93,6 @@ fn running_agents_label(count: usize) -> String {
 }
 
 /// The 30px status bar, rebuilt for rev 6 (GitHub issue #293).
-///
-/// ## What this bar carries, and what it deliberately no longer does
-///
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b counted the old bar's thirteen
-/// readouts and found eight of them lifted from VS Code's status bar: "VS Code's footer answers
-/// 'what am I typing into'; Jerry's job is watching agents. Wrong app's chrome." Deleted with
-/// this rebuild, code paths and all (§7 rule 5: "Replacing a control means deleting its old keys
-/// in the same edit"): `ln N`, the indent width, the line ending, the encoding, the editor-zoom
-/// readout, the UI-scale readout, `N servers · M errors`, the five urgency-counter dots, and the
-/// `N wt · Y GB` cluster.
-///
-/// - **Editor zoom** survives as `mod+plus`/`mod+minus` only (§4b's table: "keyboard only
-///   (`⌘+`/`⌘−`); state and handlers kept, both controls gone"). `AdeApp::zoom_in`/`zoom_out`/
-///   `reset_zoom` and `settings.appearance.editor_zoom_percent` are all untouched - only the two
-///   *readouts* are gone.
-/// - **The urgency-counter dots** are §4b's "footer dot cluster", folded into the title bar's own
-///   compact dot chips (`crate::title_bar::render`). §7 rule 4 - "Two states distinguished
-///   anywhere in the app are never summed anywhere in it" - is why the bar's remaining agent
-///   readout counts one state (`running`) rather than every open agent.
-/// - **`N wt · Y GB`** is §4d's one removed duplicate: "the rail owns worktree inventory and its
-///   prune action, the bar owns activity and cost". The rail footer carries it 30px away.
-/// - **`N servers · M errors`** is §4b's "diagnostics count ... strip badge only".
-///
-/// What is left is three visible groups, each on its own tier, separated by §4c's heavier 13-high
-/// divider (`theme::status_bar::DIVIDER`; "at `#22262a` they were invisible, so the groups they
-/// were meant to separate ran together").
 impl AdeApp {
     pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -183,24 +142,6 @@ impl AdeApp {
     /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree` (`worktree_history::flow`,
     /// Revision R10) - `None` (nothing rendered at all) whenever
     /// [`AdeApp::worktree_history_status`] is `None`.
-    ///
-    /// Deliberately shown here, in the status bar, rather than the rail footer's own status slot
-    /// (`Self::render_rail_footer`) - an audit found two real problems with that shared slot:
-    /// [`AdeApp::prune_status`] took priority there and is never cleared once set (see that
-    /// field's own docs), so a single prune click permanently hid every future worktree-history
-    /// status for the rest of the agent; and the rail footer disappears entirely while Settings
-    /// is open (`AdeApp::render_workspace_body` isn't called - `root/mod.rs`'s `Render` impl
-    /// swaps it out for `Self::render_settings`), leaving *no* real status surface at all for
-    /// this feedback while Settings is open. The status bar is rendered as an unconditional
-    /// sibling of that swap, so it stays visible either way.
-    ///
-    /// Long, load-bearing text (`Error::DiscardRemovalFailedAfterStash`'s real stash id,
-    /// `Error::HeadMovedSinceRecorded`'s two full 40-character commit shas, ...) is truncated
-    /// with an ellipsis and carries a real tooltip ([`text_tooltip`]) with the untruncated text -
-    /// an audit found this exact text rendered with no truncation or tooltip at all before.
-    ///
-    /// Rendered at [`StatusTier::Primary`]: a notice only exists when there is genuinely
-    /// something to tell you, which is by definition the thing to read first.
     fn render_status_worktree_history_notice(&self) -> Option<gpui::AnyElement> {
         let status = self.worktree_history_status.clone()?;
         Some(
@@ -218,15 +159,6 @@ impl AdeApp {
     /// The environment chip and the palette keycap hint - all that is left on the right after
     /// §4b's subtractive pass (the file/editor cluster and the LSP counts were the rest of it,
     /// and both are gone).
-    ///
-    /// This used to also carry a second hint, a `secondary-1`..`secondary-8` agent-jump keycap
-    /// row (`Self::render_status_agent_hint`, mirroring the tab strip's own right-aligned copy -
-    /// `work_surface::render::AdeApp::render_tab_strip`). GitHub issue #397, a direct
-    /// product-owner report: at zero real agent sessions in the current worktree the keycap row
-    /// rendered empty and left the bare word "agent" floating with nothing in front of it, which
-    /// read as clutter rather than a useful hint. The underlying `secondary-1`..`secondary-8`
-    /// jump keybindings (`root::AdeApp::jump_to_agent_at`) are unaffected - only the advertising
-    /// hint is gone.
     fn render_status_bar_right(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         render_status_segment_row(vec![
             render_env_chip().into_any_element(),
@@ -242,32 +174,6 @@ impl AdeApp {
     /// `HEAD` still shows real text (`"(detached)"`), matching the agent context bar's own
     /// convention, and a not-yet-computed ahead/behind is honestly omitted rather than shown as
     /// a fabricated `↑0 ↓0`.
-    ///
-    /// Split across two tiers per §4c - see [`branch_readout`]. The cluster as a whole is a real
-    /// click target that opens the graph tab via
-    /// `crate::graph_view::render::AdeApp::open_git_graph`, the same entry point the `+` menu and
-    /// the palette's "Open git graph" use.
-    ///
-    /// ## Why this is gated on [`Self::focused_repo`], not on an active agent
-    ///
-    /// It used to open with `self.agents.active()?`, and that `?` was **not** a deliberate
-    /// visibility rule - it was how the branch got a `cwd` to look itself up by. When this
-    /// function was written (Revision R6) the app had no `repos` and no [`Self::focused_repo`]
-    /// at all, so the active pane's `cwd` was the only path available, and hiding the row when
-    /// there was no pane was an incidental side effect nobody was designing for. The git graph
-    /// tab then hung its click target, fork glyph and
-    /// `crate::graph_view::render::AdeApp::open_git_graph` call off this same function, which
-    /// silently promoted that leftover `?` into the visibility policy for the graph's primary
-    /// entry point.
-    ///
-    /// The result was a real bug: `open_git_graph` refuses only when
-    /// [`Self::focused_repo`] is `None`, so with a repo focused and simply no agent open (every
-    /// tab closed) the action worked perfectly while its only button was hidden - and the whole
-    /// cluster (fork glyph, branch, `↑ahead ↓behind`) vanished with it. The gate is now the
-    /// action's own precondition, so the button is visible exactly when clicking it does
-    /// something, and the path comes from [`Self::current_worktree_path`] - the app's real current
-    /// git context, which already resolves the selected worktree and falls back to
-    /// [`Self::focused_repo_path`] - rather than from whichever pane happens to be focused.
     fn render_status_branch_cluster(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         // Exactly `open_git_graph`'s own guard: this cluster is that action's button, so the two
         // must not be able to disagree about when it is available. Unlike the `self.agents
@@ -320,13 +226,6 @@ impl AdeApp {
 
     /// §4b's `footRun`: `"4 agents running"`, the real count of agents whose derived
     /// [`Status`] is [`Status::Run`] right now.
-    ///
-    /// Counting one state rather than summing every open agent is §7 rule 4 - "Two states
-    /// distinguished anywhere in the app are never summed anywhere in it". The title bar
-    /// distinguishes `ask`/`fail`/`run`, so a bar readout that added them back together would be
-    /// the exact restatement that rule forbids. The count comes from [`rail::urgency_counts`]
-    /// over [`Self::build_agent_rows`] - the same real per-agent classification the rail and the
-    /// title bar's own chips use, so the three can never disagree.
     fn render_status_running_agents(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.build_agent_rows(cx);
         let running = rail::urgency_counts(&rows)
@@ -341,24 +240,6 @@ impl AdeApp {
     }
 
     /// §4d's one resource readout: `41% cpu · 3.4 GB`, clickable, opening the Resources popover.
-    ///
-    /// **The number is the sum of that popover's own tree** - see
-    /// [`crate::status_bar::resources`]. Nothing here aggregates a second time.
-    ///
-    /// **No meter here**, verbatim from §4d: "the budget meter beside it fills with *headroom* -
-    /// full is good. A load meter fills with *usage* - full is bad. Two meters 40px apart meaning
-    /// opposite things is the exact incoherence this pass keeps removing." The load meters live
-    /// inside the popover, under `CPU`/`MEMORY` labels that make the direction unambiguous.
-    ///
-    /// The text takes the load hue only once the machine is genuinely strained
-    /// ([`resources::load_level`]); a healthy load stays [`StatusTier::Recessive`] and spends no
-    /// attention colour at all.
-    ///
-    /// `None` - no readout, and so no popover trigger - on a build with no real sampling backend
-    /// at all (`process_stats::PLATFORM_SAMPLING_SUPPORTED`, which today means FreeBSD). A
-    /// permanent `...% cpu` that can never resolve is the one placeholder that must not reach the
-    /// screen; shipping `…` off-Linux was explicitly rejected for issue #293's own dependency
-    /// (#283), and this is the same rule for the platform where there really is nothing to show.
     fn render_status_resources_readout(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !process_stats::PLATFORM_SAMPLING_SUPPORTED {
             return None;
@@ -425,26 +306,6 @@ impl AdeApp {
 
     /// The real `repo → worktree → agent` cost tree behind both the bar readout and the popover -
     /// §4d: "the same hierarchy as the rail".
-    ///
-    /// Built by walking [`Self::build_repo_groups`]'s already-ranked
-    /// `RepoGroup → WorktreeRow → AgentRow` structure rather than re-deriving a second grouping:
-    /// the rail's grouping *is* the hierarchy this popover is specified in terms of, so a second
-    /// implementation of it could only ever drift from the rail it is supposed to mirror.
-    ///
-    /// [`rail::RepoGroup::all_rows`], not `rows`: the rail's filter box narrows what the rail
-    /// *displays*, and a resource total that shrank as you typed in an unrelated text field would
-    /// be a lie about what the machine is doing.
-    ///
-    /// Jerry's own process is a real row of its own (`JERRY_GROUP_LABEL`), because the readout's
-    /// tooltip promises "what Jerry is costing this machine right now" and a total that excluded
-    /// the window, its editors and its language servers would not be that number.
-    ///
-    /// Known, accepted redundancy: this calls `build_repo_groups`, which the rail already calls
-    /// once in the same frame - the same shape (and the same reason) as the redundant
-    /// `build_agent_rows` call the title bar's chips already make. Both are `&self` renders, so
-    /// caching a frame's result on `self` would need either widened `&mut self` signatures across
-    /// several rail methods or interior mutability; neither is worth it for a computation that
-    /// does no I/O.
     pub(crate) fn build_resource_tree(&self, cx: &mut Context<Self>) -> ResourceTree {
         let cores = available_cores();
         let mut rows: Vec<ResourceRow> = Vec::new();
@@ -587,8 +448,6 @@ impl AdeApp {
 /// Lays out already-built segments with a real 1px vertical divider between each consecutive
 /// pair - segments that don't apply right now are simply never pushed into the `Vec` by the
 /// caller, so no divider ever appears next to a missing field.
-///
-/// §4c: "group gap 9 -> 14, dividers `#22262a` -> `#2b3137` at 13 high".
 fn render_status_segment_row(segments: Vec<gpui::AnyElement>) -> impl IntoElement {
     let mut row = div().flex().items_center().gap(px(14.0));
     for (index, segment) in segments.into_iter().enumerate() {
@@ -694,12 +553,6 @@ impl AdeApp {
     /// §4d's three headline stats, each under a label that makes the meter's direction
     /// unambiguous: `CPU` and `MEMORY` fill with *usage* (full is bad), which is exactly why they
     /// are here and not next to the budget meter in the bar.
-    ///
-    /// `ON DISK` deliberately carries **no meter**. A meter needs an honest denominator, and Jerry
-    /// has no real one for disk: the mock's own `18%` fill is a literal, and a fill against a
-    /// guessed total is the "hardcoded number that drifts from its own breakdown" §4d names as the
-    /// defect this panel would otherwise ship with. The value itself is real
-    /// ([`Self::disk_usage_label`], the same figure the rail footer shows).
     fn render_resources_headline_stats(&self, tree: &ResourceTree) -> impl IntoElement {
         let cpu = tree.cpu_percent();
         let memory = tree.memory_bytes();
@@ -939,13 +792,6 @@ impl AdeApp {
     }
 
     /// §4d's disk line: `N worktrees prunable · X MB · Prune`.
-    ///
-    /// Every part of it is the rail footer's own real state, reached through the same methods:
-    /// the candidate list is [`Self::prunable_worktree_paths`] (so what is shown always matches
-    /// what a click will do), the size sums those candidates' own entries in
-    /// [`Self::worktree_disk_usage`], and `Prune` calls [`Self::request_prune`] - the same
-    /// two-click confirmation the rail footer's button uses, not a second, unconfirmed path to a
-    /// destructive action.
     fn render_resources_disk_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let candidates = self.prunable_worktree_paths();
         let known_sizes: Vec<u64> = candidates
@@ -1009,10 +855,6 @@ impl AdeApp {
     }
 
     /// §4d's footer: `Updated Ns ago` and `this machine only`.
-    ///
-    /// The age is measured against [`Self::process_stats_sampled_at`], the real instant the
-    /// background poll last wrote a sample - never a render-time `Instant::now()`, which would
-    /// always read "just now" and tell you nothing.
     fn render_resources_footer(&self) -> impl IntoElement {
         let since = self
             .process_stats_sampled_at
@@ -1069,8 +911,6 @@ mod status_bar_tier_tests {
         );
     }
 
-    /// A hierarchy is type *and* colour: the recessive tier is also the smaller one, so the tail
-    /// of a split readout recedes even in a screenshot with no colour.
     #[test]
     fn the_recessive_tier_is_also_the_smaller_type() {
         assert!(StatusTier::Primary.text_size() > StatusTier::Recessive.text_size());
@@ -1078,9 +918,6 @@ mod status_bar_tier_tests {
         assert_eq!(StatusTier::Recessive.weight(), gpui::FontWeight::NORMAL);
     }
 
-    /// §4c: "every composite readout is split so it has a bright head and a dim tail". The branch
-    /// cluster is the bar's one surviving composite, and the branch - not the arrow counts - is
-    /// the head.
     #[test]
     fn the_branch_cluster_splits_into_a_branch_head_and_an_arrow_tail() {
         let split = branch_readout("main".to_string(), Some((2, 0)));
@@ -1088,14 +925,11 @@ mod status_bar_tier_tests {
         assert_eq!(split.tail.as_deref(), Some("\u{2191}2 \u{2193}0"));
     }
 
-    /// A not-yet-computed ahead/behind is honestly absent, never a fabricated `↑0 ↓0` - which
-    /// would be indistinguishable from a real, measured "level with the base".
     #[test]
     fn an_unmeasured_ahead_behind_has_no_tail_at_all() {
         assert_eq!(branch_readout("main".to_string(), None).tail, None);
     }
 
-    /// Rev 6 §7 rule 9, on the bar's one remaining count.
     #[test]
     fn the_running_agent_count_conjugates() {
         assert_eq!(running_agents_label(0), "0 agents running");
@@ -1113,8 +947,6 @@ mod status_bar_deletion_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
-    /// The editor-zoom readout is gone from the bar - and its *behaviour* is not. §4b's table:
-    /// "editor zoom ... keyboard only (`⌘+`/`⌘−`); state and handlers kept, both controls gone".
     #[gpui::test]
     fn the_zoom_readout_is_gone_but_the_keyboard_zoom_still_works(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1148,9 +980,6 @@ mod status_bar_deletion_tests {
         );
     }
 
-    /// The three readouts §4b/§4d name, and the one the design keeps. Driven through the real
-    /// rendered bar rather than by reading source: the point is that these elements are not on
-    /// screen, whatever the code looks like.
     #[gpui::test]
     fn the_bar_keeps_exactly_the_segments_rev_six_kept(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1190,14 +1019,6 @@ mod status_bar_deletion_tests {
 
 /// Regression coverage for the status bar's branch cluster disappearing - and taking the git
 /// graph's primary entry point with it - whenever no agent pane happened to be open.
-///
-/// `render_status_branch_cluster` opened with `self.agents.active()?`, which was never a
-/// visibility decision: at Revision R6 the app had no `repos`/`focused_repo` at all, so the
-/// active pane's `cwd` was simply the only way to look a branch up, and hiding the row when
-/// there was no pane was an accident of that. The git graph tab later hung its click target and
-/// fork glyph off the same function, promoting the leftover `?` into the gate for its own
-/// button - while `AdeApp::open_git_graph` itself refuses only when `focused_repo()` is `None`.
-/// So with a repo focused and every tab closed, the action worked and its only button was gone.
 #[cfg(test)]
 mod status_bar_branch_cluster_visibility_tests {
     use crate::root::focus::palette_focus_tests;
@@ -1270,14 +1091,12 @@ mod status_bar_branch_cluster_visibility_tests {
              open_git_graph still works but its button used to vanish"
         );
 
-        // The regression itself.
         let bounds = cx.debug_bounds("status-bar-branch-cluster").expect(
             "the branch cluster - and so the git graph's status-bar button - must still render \
              with a repo focused and no agent open, because AdeApp::open_git_graph still works \
              in exactly this state",
         );
 
-        // ...and it must be a genuinely live click target, not merely painted pixels.
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(
@@ -1334,9 +1153,6 @@ mod resources_popover_tests {
         );
     }
 
-    /// §4d's `repo → worktree → agent`, built from the app's own real state: opening a real git
-    /// repo spawns a real startup agent in a real worktree, so the tree must carry that agent
-    /// under that repo's name, through the rail's own grouping, plus Jerry's own row.
     #[gpui::test]
     fn the_tree_is_keyed_repo_then_worktree_then_agent_and_includes_jerry_itself(
         cx: &mut TestAppContext,
@@ -1388,10 +1204,6 @@ mod resources_popover_tests {
         );
     }
 
-    /// Every open agent with a real pid appears exactly once in the tree, whatever the rail's
-    /// grouping currently knows about its worktree - a directory that is not a git repo at all
-    /// still runs a real startup shell that really costs this machine something, and a readout
-    /// claiming to be the whole cost must not silently drop it.
     #[gpui::test]
     fn every_open_agent_is_accounted_for_exactly_once(cx: &mut TestAppContext) {
         // Deliberately *not* a git repo: this is the case where the rail has no worktree rows to
@@ -1429,9 +1241,6 @@ mod resources_popover_tests {
         );
     }
 
-    /// The popover trigger carries **no** worktree or agent count (§3: "Do not put worktree or
-    /// agent counts here; the rail footer already carries them 30px away"), and no meter (§4d).
-    /// Checked against the real derived readout text.
     #[gpui::test]
     fn the_readout_carries_only_cost_no_counts(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

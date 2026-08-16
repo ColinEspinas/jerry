@@ -1,41 +1,5 @@
 //! Builds a flattened, indented file tree for the right sidebar by walking a directory with
 //! `std::fs::read_dir`. Pure and GPUI-independent so it's unit testable without a window.
-//!
-//! Dotfiles/dot-directories are skipped, matching most file explorers' defaults and, more
-//! importantly, keeping this fast: `.git` can contain many thousands of loose objects, and
-//! walking it would make browsing unusably slow.
-//!
-//! ## No entry is hidden, and no entry is left unloaded (GitHub issues #18 §4, #160)
-//!
-//! There is no render-time cap: `crate::sidebar::render::AdeApp::render_file_tree` is a real
-//! virtualized `gpui::uniform_list`, so every visible row is rendered and only the rows genuinely
-//! on screen become elements. The old `MAX_RENDERED_FILE_ENTRIES` (500) cap and its
-//! "... and N more entries not shown" row are gone.
-//!
-//! There is no *load*-time cap either, as of issue #160 ("File tree should load all folders and
-//! files"). The walk used to stop at `Settings.file_tree.max_entries` (20,000 by default) and the
-//! sidebar showed a "Stopped at N entries - load more" action that re-walked with a tenfold
-//! larger budget. Both are gone: this walk collects the whole tree.
-//!
-//! Removing that bound was only safe because the two costs it was really guarding no longer scale
-//! with the size of the loaded tree on the foreground thread:
-//!
-//! - The walk itself has always run on `gpui::BackgroundExecutor`
-//!   (`crate::root::AdeApp::load_file_tree`), so a huge `node_modules`/`target` never blocked a
-//!   frame - it only decided *how much* the completion handler then had to do.
-//! - That completion handler used to build the palette's file-candidate list
-//!   (`crate::root::AdeApp::rebuild_palette_file_candidates`, one allocation-heavy
-//!   `crate::palette::state::FileCandidate` per file) on the foreground thread. It is now built on
-//!   the background executor too, in the same task, before anything is applied to the app.
-//! - [`FileTree::visible_indices`] - called once per frame by `render_file_tree` - used to scan
-//!   *every* loaded entry to decide which rows are showing, so a collapsed million-entry subtree
-//!   still cost a million iterations per frame. It now skips a collapsed directory's whole subtree
-//!   in one step using [`FileTree`]'s precomputed spans, making it O(visible rows) instead of
-//!   O(loaded entries).
-//!
-//! What survives is [`MAX_DEPTH`], which is not an entry budget at all but a stack-overflow guard
-//! on a recursive walk, and it reports itself through [`FileTreeListing::partial`] exactly as
-//! before.
 
 use std::collections::HashSet;
 use std::fs;
@@ -60,15 +24,6 @@ pub struct FileTreeEntry {
 
 /// The loaded tree: [`build_file_tree`]'s pre-order entries, plus the derived per-entry subtree
 /// spans [`Self::visible_indices`] uses to skip a collapsed directory's descendants in one step.
-///
-/// The spans are deliberately *not* a public field and cannot be supplied by a caller: [`FileTree::new`]
-/// is the only way to make one, and it always derives them from the entries it is given. This is
-/// the same "a derived value gets exactly one assignment point" discipline
-/// `crate::root::AdeApp::set_file_tree_root` applies to `fold_state_root_key` - here it matters
-/// because a stale span wouldn't error, it would silently show a collapsed folder's children.
-///
-/// Derefs to `[FileTreeEntry]`, so everything that just reads rows (`len`, `iter`, indexing) uses
-/// it exactly as it used the old `Vec<FileTreeEntry>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTree {
     entries: Vec<FileTreeEntry>,
@@ -92,21 +47,6 @@ impl FileTree {
     /// The rows that should be rendered given which directories are **expanded**, as indices into
     /// this tree. An unexpanded directory's own row still shows; everything nested underneath it
     /// is skipped.
-    ///
-    /// Keyed on expanded-ness, not collapsed-ness, and that inversion is the whole of GitHub
-    /// issue #18 §1: absence from this set means *collapsed*, so a worktree nobody has ever
-    /// expanded anything in - including a freshly created one - opens showing only its root-level
-    /// entries, with no separate "first open" special case anywhere.
-    ///
-    /// Costs O(visible rows), not O(loaded entries): a collapsed directory is stepped over
-    /// wholesale via its [span](Self::new) rather than by scanning its descendants and discarding
-    /// them one at a time. `crate::sidebar::render::AdeApp::render_file_tree` calls this once per
-    /// frame, so before issue #160 removed the load cap that scan was the per-frame cost the cap
-    /// was partly there to bound.
-    ///
-    /// Indices rather than borrowed entries because `render_file_tree` needs the result inside a
-    /// `'static` closure that cannot hold a borrow of the app; [`Self::visible_entries`] is the
-    /// borrowing twin, defined in terms of this one so the two can never disagree.
     pub fn visible_indices(&self, expanded: &HashSet<PathBuf>) -> Vec<usize> {
         let mut visible = Vec::new();
         let mut index = 0;
@@ -167,9 +107,6 @@ fn subtree_spans(entries: &[FileTreeEntry]) -> Vec<usize> {
 /// deeper than [`MAX_DEPTH`] - which are deliberately *not* surfaced as a user-facing action but
 /// must still stop `crate::sidebar::render::AdeApp::prune_stale_fold_state` from treating this
 /// listing as a complete inventory of the worktree's directories.
-///
-/// There is no `truncated` counterpart any more: the walk has no entry budget to stop at (issue
-/// #160 - see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTreeListing {
     pub tree: FileTree,
@@ -193,10 +130,6 @@ pub const MAX_DEPTH: usize = 64;
 
 /// Recursively lists `root`'s contents (directories first, then alphabetically within each
 /// group) as a flattened, depth-annotated list suitable for indented rendering.
-///
-/// Genuinely unbounded in entry count (GitHub issue #160): every folder and file under `root`
-/// that isn't a dotfile and isn't deeper than [`MAX_DEPTH`] is collected. See the module docs for
-/// why that is safe here and what had to change on the foreground thread to keep it that way.
 pub fn build_file_tree(root: &Path) -> io::Result<FileTreeListing> {
     let mut walk = Walk::default();
     visit(root, 0, &mut walk)?;
@@ -237,7 +170,6 @@ fn visit(dir: &Path, depth: usize, walk: &mut Walk) -> io::Result<()> {
     children.sort_by(|a, b| {
         let a_is_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let b_is_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // Directories first (`false < true`, so flip the comparison), then alphabetically.
         b_is_dir
             .cmp(&a_is_dir)
             .then_with(|| a.file_name().cmp(&b.file_name()))
@@ -344,12 +276,6 @@ pub const ROW_LEFT_PAD: f32 = 8.0;
 pub const INDENT_STEP: f32 = 13.0;
 
 /// Where level `level`'s vertical indent guide sits, in pixels from the row's left edge.
-///
-/// Deliberately derived from the same two constants the row's own `pl` indent is, plus half of
-/// `render_tree_caret`'s real 8px width, so the guide lands exactly under the expand chevron of
-/// the ancestor directory it belongs to (issue #18 §3: "aligned with the expand chevrons")
-/// instead of at some independently-chosen offset that would drift the first time the indent
-/// step changes.
 pub fn indent_guide_x(level: usize) -> f32 {
     ROW_LEFT_PAD + INDENT_STEP * level as f32 + CARET_WIDTH / 2.0
 }
@@ -376,7 +302,6 @@ mod tests {
 
         let entries = tree_of(dir.path());
 
-        // Directories sort before files at the same depth; "sub" (dir) before "a.txt"/"b.txt".
         assert_eq!(entries[0].name, "sub");
         assert!(entries[0].is_dir);
         assert_eq!(entries[0].depth, 0);
@@ -418,10 +343,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A directory the walk can't read is skipped (so one bad folder never blanks the sidebar),
-    /// but the listing must *say* it is incomplete - otherwise
-    /// `crate::sidebar::render::AdeApp::prune_stale_fold_state` would read the missing subtree
-    /// as deleted and permanently drop its fold state.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_subdirectory_makes_the_listing_partial_but_not_an_error() {
@@ -443,7 +364,6 @@ mod tests {
         }
 
         let listing = build_file_tree(dir.path()).expect("build_file_tree");
-        // Restore before any assertion can fail, or `TempDir`'s own cleanup fails too.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
 
         assert!(
@@ -457,7 +377,6 @@ mod tests {
         );
     }
 
-    /// The recursion bound - a defensive stack guard, reported the same honest way.
     #[test]
     fn a_tree_deeper_than_the_depth_cap_is_reported_as_partial() {
         let dir = TempDir::new().expect("tempdir");
@@ -473,9 +392,6 @@ mod tests {
         assert!(listing.partial);
     }
 
-    /// The listing has to hold hundreds of entries in a single directory without any cap of its
-    /// own - the sidebar's virtualized list is what keeps that cheap to render, not a cut-off
-    /// here (issue #18 §4).
     #[test]
     fn a_large_directory_is_listed_completely() {
         let dir = TempDir::new().expect("tempdir");
@@ -496,13 +412,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #160, at the level the walk itself decides it: a tree with more entries than
-    /// the removed 20,000-entry default cap must come back whole, with no truncation flag left
-    /// anywhere to hang a "load more" row off.
-    ///
-    /// Built as a wide, shallow fan (200 directories x 105 files) rather than 21,000 files in one
-    /// folder, so it also exercises the recursive descent the old budget used to cut short
-    /// mid-subtree.
     #[test]
     fn a_tree_larger_than_the_removed_twenty_thousand_entry_cap_loads_completely() {
         const DIRS: usize = 200;
@@ -546,8 +455,6 @@ mod tests {
         );
     }
 
-    /// The span-based skip must agree with the depth-scan it replaced on a real, nested tree -
-    /// for every combination of expanded folders, not just the one a hand-written case picks.
     #[test]
     fn span_based_visibility_matches_the_depth_scan_for_every_expansion() {
         let dir = TempDir::new().expect("tempdir");
@@ -643,8 +550,6 @@ mod tests {
         FileTree::new(entries)
     }
 
-    /// Issue #18 §1's default state, at the level it's actually decided: nothing expanded means
-    /// root-level entries only.
     #[test]
     fn nothing_expanded_shows_only_root_level_entries() {
         let entries = tree(vec![
@@ -692,8 +597,6 @@ mod tests {
         assert_eq!(names, vec!["sub", "deeper", "deepest.txt"]);
     }
 
-    /// A stale deep expansion (e.g. one restored from disk whose parent the user has since
-    /// collapsed) must never punch a hole through a collapsed ancestor.
     #[test]
     fn an_expanded_directory_under_a_collapsed_ancestor_stays_hidden() {
         let entries = tree(vec![

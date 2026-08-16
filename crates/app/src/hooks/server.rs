@@ -1,55 +1,4 @@
 //! The loopback listener Claude Code's hooks report into (GitHub issue #239, phase 2).
-//!
-//! One listener per Jerry process, started once at app startup and serving every Claude agent
-//! this instance ever spawns - not one per agent. The port is OS-assigned (bind to `:0`, read the
-//! real port back) so Jerry never fights another program, another Jerry instance, or a stale
-//! socket for a hardcoded number.
-//!
-//! ## Why a socket rather than a file or a pipe
-//!
-//! A hook is a *detached subprocess*: Claude Code spawns it without the interactive TUI's stdio,
-//! so there is no existing channel back to Jerry to reuse. The forwarder needs a destination it
-//! can address knowing nothing but two environment variables, from a shell one-liner, with no
-//! Jerry code running inside it. A loopback TCP port is the one such destination that needs no
-//! filesystem coordination, no cleanup if Jerry dies, and no per-agent setup.
-//!
-//! ## Threat model, and what is actually defended
-//!
-//! This listener accepts unauthenticated TCP connect attempts from anything running as this user
-//! - that is unavoidable for any loopback port. So the real defences are, in order:
-//!
-//! - **Loopback only.** Bound to `127.0.0.1`, never `0.0.0.0`, so nothing off-host can reach it
-//!   at all. [`HookListener::start`] also re-checks `peer_addr()` per connection and drops
-//!   anything non-loopback - belt and braces against a future refactor changing the bind address.
-//! - **A real token.** A 256-bit CSPRNG token generated fresh per app launch, required in an
-//!   `Authorization` header, compared in constant time ([`constant_time_eq`]). A request without
-//!   it is refused before its body is read, let alone parsed. There is deliberately no "no token
-//!   configured" fallback path: the token is generated in [`HookListener::start`] and is not
-//!   optional, so there is no configuration under which the check silently becomes a no-op.
-//! - **Hard bounds on everything read.** An 8 KiB cap on the request line plus headers, a
-//!   100-header cap, and [`crate::hooks::event::MAX_PAYLOAD_BYTES`] on the body - refused by
-//!   `Content-Length` *before* a single body byte is buffered, and enforced again while reading
-//!   in case the header lied.
-//! - **A bound on request *time*, not just size.** [`REQUEST_DEADLINE`] caps the whole exchange
-//!   from a single absolute instant, and each blocking read is clamped to the time left. A
-//!   per-read timeout alone is not enough and was a real hole: `SO_RCVTIMEO` resets on every byte
-//!   that arrives, so a client dripping one byte per second held a handler for hours - pre-auth,
-//!   since the token is not checked until the headers are read.
-//! - **A cap on concurrent handlers.** [`MAX_IN_FLIGHT`] connections are handled at once; past
-//!   that, new connections are closed immediately rather than spawning unbounded threads. Slots
-//!   are released by an RAII guard ([`InFlightSlot`]), so a panic cannot leak one.
-//!
-//! What this deliberately does *not* defend against: another process running as this same user
-//! reading Jerry's generated settings file to learn the token. That is not a boundary this can
-//! hold - a process running as you can already read `~/.claude`, attach a debugger to Jerry, or
-//! read the pty directly. The token defends against *unauthenticated* local processes (a browser
-//! page's fetch to `127.0.0.1:<port>`, another user's process, a stray port scanner), which is
-//! the real exposure a loopback port creates.
-//!
-//! The worst a forged, correctly-tokened request can do is set a wrong status glyph on one rail
-//! row until the next real event or the TTL expires. No hook payload is executed, none is
-//! rendered as markup, and none can reach a `ProcessKind::Shell` row (see
-//! [`crate::rail::status::derive_status`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
@@ -62,24 +11,9 @@ use crate::hooks::event::{self, EditedFile, HookFact, HookReport, MAX_PAYLOAD_BY
 use crate::work_surface::agents::AgentId;
 
 /// How long a single blocking read may wait for *some* data to arrive.
-///
-/// This alone is not a bound on the request: see [`REQUEST_DEADLINE`].
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The wall-clock budget for one entire request, start to finish.
-///
-/// [`READ_TIMEOUT`] is a socket option (`SO_RCVTIMEO`) and therefore bounds each individual
-/// `recv`, not the request - every byte that arrives resets it. A client dripping one byte just
-/// inside that window, never sending a newline, keeps a handler thread alive for
-/// `MAX_HEAD_BYTES * READ_TIMEOUT` - hours - and doing that on [`MAX_IN_FLIGHT`] connections
-/// starves every real hook for as long as it cares to. Worse, it costs nothing to mount: the
-/// token is not checked until the headers have been read, so this is reachable *pre-auth*.
-///
-/// So every read is additionally bounded by an absolute deadline taken once per connection, and
-/// each blocking read's timeout is clamped to the time actually left. Five seconds is generous
-/// for a loopback POST of a few hundred bytes from a `curl` on the same machine, and is the
-/// timeout the forwarder itself gives up at anyway (`--max-time 5`), so a request still running
-/// past this has already lost its client.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Cap on the request line plus all headers. Real Claude Code hook requests carry a handful of
@@ -92,34 +26,12 @@ const MAX_HEADERS: usize = 100;
 
 /// How many connections are handled concurrently. Hook traffic is a trickle (a few events per
 /// agent turn), so this is purely a bound on pathological behaviour, not a throughput knob.
-///
-/// ## Known, accepted limitation: aggregate starvation by reconnect
-///
-/// [`REQUEST_DEADLINE`] bounds any *single* connection, which is what closed the original
-/// slow-drip hole. It does not bound the *aggregate*: a process that holds all `MAX_IN_FLIGHT`
-/// sockets and immediately reconnects as each one expires keeps every slot occupied
-/// indefinitely, and real hook connections are then closed on arrival. Because the forwarder
-/// always exits 0 (deliberately - see [`crate::hooks::settings_file`]), that failure is silent,
-/// and affected agents fall back to the Phase 1 title/quiescence signals.
-///
-/// Accepted rather than fixed, for now, because it sits inside the threat model this feature
-/// already documents: it requires a sustained same-user, same-machine reconnect loop, and such a
-/// process can already read the token straight out of `/proc/<pid>/environ`, which buys it
-/// strictly more than degrading a status glyph. It is also strictly weaker than the bug it
-/// replaced - a one-shot drip is no longer enough.
-///
-/// A future pass should reserve some slots for connections that have already authenticated, so
-/// unauthenticated churn cannot crowd out real hooks.
 const MAX_IN_FLIGHT: usize = 16;
 
 /// The header the forwarder puts the token in.
 const AUTH_HEADER: &str = "authorization";
 
 /// Most agents [`HookInbox`] will track at once - see [`HookInbox::record`].
-///
-/// Far above any real usage (each entry is one live agent pane) and far below anything that
-/// matters for memory, which is the right place for a bound whose only job is to stop unbounded
-/// growth.
 const MAX_TRACKED_AGENTS: usize = 512;
 
 /// How long [`HookListener::drop`]'s self-connect may block the dropping thread - see that impl.
@@ -130,16 +42,6 @@ const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 const REPLY_WRITE_FLOOR: Duration = Duration::from_millis(500);
 
 /// How many un-drained agent edits [`EditLog`] will hold before it starts dropping the oldest.
-///
-/// The UI thread drains this every [`crate::root::STATUS_POLL_INTERVAL`], and a real agent lands
-/// a few file writes per turn, so this is roughly three orders of magnitude of headroom over the
-/// worst realistic burst. It exists for the same reason [`MAX_TRACKED_AGENTS`] does: the listener
-/// cannot check ids against live agents, so anything that knows the token can push entries, and
-/// an unbounded queue behind a paused UI thread is a memory leak with a network trigger.
-///
-/// Oldest-first eviction, not newest-first: an edit that has been waiting longest is the one
-/// whose file has most likely already been overwritten again, so its `PostToolUse` diff would be
-/// the least accurate of the queue. Dropping it costs the least truth.
 const MAX_PENDING_EDITS: usize = 4096;
 
 /// One agent's most recent hook fact, as stored for the rail to read, plus the two facts about
@@ -153,27 +55,14 @@ pub struct HookRecord {
     pub received_at: Instant,
     /// How many turns this agent has really completed - one per `Stop`
     /// ([`HookFact::TurnEnded`]) it has reported.
-    ///
-    /// Accumulated here rather than derived from the stored report, because "latest wins" is the
-    /// whole design of [`HookInbox`] (see its docs) and a count is by definition not a latest.
-    /// It is the real number GitHub issue #227's transcript header prints (`21 turns`); nothing
-    /// estimates it from elapsed time or from output volume.
     pub turns: u32,
     /// The first prompt this agent's human typed, latched once and never overwritten - the run's
     /// **title** (`crate::hooks::event::HookReport::prompt`).
-    ///
-    /// *First*, not latest, and that is the whole point: a run is named by the task it was
-    /// started for. Taking the latest would rename a run in the history list every time the user
-    /// typed a follow-up ("yes", "try again"), which describes a moment rather than the run.
     pub first_prompt: Option<String>,
 }
 
 /// What an agent's hooks have said about its **run**, as opposed to about its current state
 /// (GitHub issue #227) - see [`HookRecord::turns`] and [`HookRecord::first_prompt`].
-///
-/// A named struct rather than a tuple because both halves end up persisted, side by side, in
-/// [`crate::hooks::store::PersistedAgentStatus`], and a `(u32, Option<String>)` at that call site
-/// would be two anonymous values in the wrong order waiting to happen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunFacts {
     /// Completed turns - one per `Stop`.
@@ -183,21 +72,6 @@ pub struct RunFacts {
 }
 
 /// Every agent's latest hook fact, shared between the listener thread and the UI thread.
-///
-/// Deliberately "latest wins" rather than an accumulated history: a hook stream is a sequence of
-/// state *transitions*, so the most recent event is by definition the agent's current state.
-/// This is what keeps a routine `PostToolUseFailure` (a failing test, a `grep` that matched
-/// nothing - both extremely common and both things Claude Code recovers from without help) from
-/// pinning a row to "Failed": the very next `PreToolUse` overwrites it. A failure only *stays*
-/// visible if the agent produced no further events after it, which is exactly the case where a
-/// human really does want to know something broke and nothing has happened since.
-///
-/// The one real exception - found by watching a live session rather than by reading the docs - is
-/// that not every hook event *is* a transition. A `Notification` is Claude Code re-announcing a
-/// state it has already reported precisely, with a fixed generic message, so under a literal
-/// "latest wins" it destroyed the better fact that had arrived moments earlier. See
-/// [`merge_nudge`] and [`event::EventKind`] for the two bugs that caused and for the rule that
-/// replaced it.
 #[derive(Debug, Default)]
 pub struct HookInbox {
     latest: HashMap<AgentId, HookRecord>,
@@ -211,21 +85,6 @@ impl HookInbox {
 
     /// Records a freshly parsed event as `id`'s current state, evicting the oldest entry if that
     /// would push the inbox past [`MAX_TRACKED_AGENTS`].
-    ///
-    /// "Latest wins" holds for real lifecycle *transitions* only. A `Notification`
-    /// ([`event::EventKind::BlockedNudge`]/[`event::EventKind::IdleNudge`]) is Claude Code
-    /// re-announcing a state it has already reported through a precise event, and is folded into
-    /// what Jerry already knows rather than replacing it - see [`merge_nudge`] and
-    /// [`event::EventKind`] for the two real, live-observed bugs that came from treating them as
-    /// equals.
-    ///
-    /// The cap exists because the id in a request is not checked against the set of live agents -
-    /// the listener has no view of that, and adding one would couple it to `AdeApp` state behind
-    /// a lock it would then hold on every request. So a client that knows the token (see the
-    /// module docs on what that does and does not defend) can name arbitrary ids, and without a
-    /// cap each one would allocate a permanent entry. Eviction is by arrival time, which keeps
-    /// the real agents - the ones actually emitting events - and sheds invented ids that never
-    /// report again.
     pub fn record(&mut self, id: AgentId, report: HookReport) {
         // GitHub issue #227's run-level accumulation, taken from the *incoming* payload before
         // any nudge merging: a turn really ended if this payload said so, and the first prompt is
@@ -289,33 +148,10 @@ pub struct AgentEdit {
     pub file: EditedFile,
     /// The file's content as it stood when a [`crate::hooks::event::EditPhase::Before`] event
     /// arrived - always `None` for an `After` event.
-    ///
-    /// Read **here**, on the connection thread, rather than by the reader that eventually consumes
-    /// this entry, and that is not an optimisation - it is the only correct moment. `PreToolUse`
-    /// fires *before* the agent writes; the UI thread drains this log up to one
-    /// `crate::root::STATUS_POLL_INTERVAL` later, by which time the write has landed. A snapshot
-    /// taken then would be the *after* content wearing the before's name, every recorded edit
-    /// would diff clean, and nothing would ever be attributed to anyone.
-    ///
-    /// `None` also for a file `crate::provenance::store::snapshot_for_edit` will not track
-    /// (binary, unreadable, past its caps), in which case no baseline is taken at all.
     pub before: Option<String>,
 }
 
 /// Every file write no reader has taken yet, oldest first.
-///
-/// Deliberately **not** [`HookInbox`]'s "latest wins" shape, and the difference is the whole
-/// reason this is a second structure rather than another field on `HookRecord`. A status is a
-/// state: the newest one is the truth and the previous one is worthless. An edit is an *event*:
-/// a turn that writes six files produces six facts, every one of which has to be applied, and the
-/// UI thread only looks every [`crate::root::STATUS_POLL_INTERVAL`]. Stored latest-wins, five of
-/// those six writes would be silently dropped, and the provenance store would attribute the
-/// sixth file's diff while five others drifted out of date - the exact "confidently wrong" shape
-/// this codebase refuses.
-///
-/// Ordering across agents is preserved as it arrived rather than grouped per agent: two agents
-/// writing the same file interleave in real time, and replaying them out of order would hand one
-/// agent's lines to the other.
 #[derive(Debug, Default)]
 pub struct EditLog {
     pending: VecDeque<AgentEdit>,
@@ -357,23 +193,6 @@ impl EditLog {
 
 /// Folds a `Notification` into the fact Jerry already holds for the same agent, returning the
 /// report that should actually be stored.
-///
-/// A real lifecycle transition is returned untouched - it is the whole truth about where the agent
-/// now is, and it supersedes everything before it. A `Notification` is not: Claude Code emits one
-/// *because of* an event it has already reported, with a fixed generic message, so taken as an
-/// equal it destroys strictly better information. Both of these were observed live against a real
-/// `claude` 2.1.228 driven through Jerry's own spawn path:
-///
-/// - `PermissionRequest` ("Write needs permission: notes.txt") followed milliseconds later by a
-///   `permission_prompt` `Notification` ("Claude needs your permission"). Every permission
-///   question the rail could ever show was that one constant, and the real per-tool question this
-///   codebase parses was unreachable in practice.
-/// - `Stop` ([`HookFact::TurnEnded`] - the review boundary) followed about a minute later by an
-///   `idle_prompt` `Notification`, which flipped the finished agent to `Ask` and erased the
-///   review-ready state phase 2 exists to produce.
-///
-/// So: a nudge keeps the previous fact whenever the previous fact already *implies* it, and only
-/// takes over when it genuinely carries news.
 fn merge_nudge(previous: &HookReport, incoming: HookReport) -> HookReport {
     let keep_previous = match incoming.kind {
         // Not a nudge at all.
@@ -421,13 +240,6 @@ fn merge_nudge(previous: &HookReport, incoming: HookReport) -> HookReport {
 }
 
 /// Holds one of the [`MAX_IN_FLIGHT`] connection slots, releasing it on drop.
-///
-/// An RAII guard rather than a `fetch_sub` at the end of the handler: the handler parses
-/// untrusted input, and a panic anywhere in it would skip a trailing decrement and leak the slot
-/// permanently. Sixteen such panics and the listener stops accepting anything, for the rest of
-/// the session, with no error path that would ever say so. No such panic exists today - every
-/// parse step returns `Option` - but "no panic today" is a property of the current code, whereas
-/// this is a property of the type.
 struct InFlightSlot(Arc<AtomicUsize>);
 
 impl InFlightSlot {
@@ -455,10 +267,6 @@ pub struct HookListener {
 impl HookListener {
     /// Binds `127.0.0.1:0`, reads back the real assigned port, generates this launch's token and
     /// starts the accept loop on a dedicated thread.
-    ///
-    /// Returns the bind error rather than panicking: a machine with no usable loopback is a real
-    /// (if strange) state, and it must degrade to "no hook signal, quiescence heuristic as
-    /// before" rather than failing app startup - see `crate::root::state`'s call site.
     pub fn start() -> std::io::Result<HookListener> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
@@ -588,10 +396,6 @@ impl HookListener {
     /// Returns `(edits, dropped)`; `dropped` counts entries evicted un-drained by
     /// [`MAX_PENDING_EDITS`], which is a real (if never-yet-observed) failure worth logging rather
     /// than swallowing.
-    ///
-    /// A poisoned lock reports "nothing pending" rather than panicking - the same rule
-    /// [`Self::signal_for`] follows, and for the same reason: attribution is a refinement, and
-    /// losing it must never take the app down.
     pub fn drain_edits(&self) -> (Vec<AgentEdit>, usize) {
         let Ok(mut edits) = self.edits.lock() else {
             return (Vec::new(), 0);
@@ -602,12 +406,6 @@ impl HookListener {
     /// This agent's most recently reported real Claude Code `session_id` (GitHub issue #227),
     /// if it has ever reported one - the id `claude --resume`/`-r` takes, verified against a real
     /// binary (see [`crate::hooks::event::HookReport::session_id`]).
-    ///
-    /// Deliberately **not** gated by [`event::HOOK_SIGNAL_TTL`] the way [`Self::text_for`] is: an
-    /// activity/question line describes the *present* and must not outlive its truth, but a
-    /// session id identifies a *conversation*, which stays exactly as resumable an hour after the
-    /// agent went quiet as it was the instant its last hook fired - the whole reason GitHub
-    /// issue #227 wants to persist it at all.
     pub fn session_id_for(&self, id: AgentId) -> Option<String> {
         let inbox = self.inbox.lock().ok()?;
         inbox.get(id)?.report.session_id.clone()
@@ -616,10 +414,6 @@ impl HookListener {
     /// This agent's real run-level facts - its completed-turn count and the first prompt its human
     /// typed (GitHub issue #227). `RunFacts::default()` for an agent that has never reported a
     /// hook, or if the lock is poisoned.
-    ///
-    /// Ungated by [`event::HOOK_SIGNAL_TTL`] for exactly the reason [`Self::session_id_for`] is:
-    /// these describe the run, not the present. A run that completed nine turns completed nine
-    /// turns whether or not it has said anything in the last half hour.
     pub fn run_facts_for(&self, id: AgentId) -> RunFacts {
         let Ok(inbox) = self.inbox.lock() else {
             return RunFacts::default();
@@ -636,16 +430,6 @@ impl HookListener {
 
 impl Drop for HookListener {
     /// Signals the accept loop to stop and wakes it so it notices.
-    ///
-    /// `incoming()` is blocking, so setting the flag alone would leave the thread parked in
-    /// `accept` until the next real connection; a self-connect is the portable way to wake it.
-    /// It uses `connect_timeout` rather than a plain `connect` because this runs on whichever
-    /// thread drops `AdeApp` - in practice the UI thread - and a bare loopback connect, though
-    /// almost always instant, has no upper bound the OS is obliged to honour.
-    ///
-    /// The accept thread is deliberately *not* joined. It exits on its own as soon as it observes
-    /// the flag, holding nothing but its own listener, and joining would trade a bounded wake-up
-    /// for an unbounded wait on the UI thread - the very thing the timeout above is avoiding.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
@@ -669,12 +453,6 @@ fn is_loopback(stream: &TcpStream) -> bool {
 }
 
 /// A 256-bit token, hex encoded.
-///
-/// Uses `rand`'s CSPRNG (`rand::rngs::OsRng` via `rand::rng`) rather than this codebase's usual
-/// `std::process::id()` + `AtomicU64` uniqueness convention: that convention exists to make temp
-/// *filenames* unique, where predictability costs nothing. Here predictability is the whole
-/// attack - a token derived from a pid and a counter is guessable by any local process that can
-/// read `/proc`.
 fn generate_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
@@ -915,9 +693,6 @@ fn time_left(deadline: Instant) -> Option<Duration> {
 
 /// Arms the socket so the *next* blocking read cannot outlast `deadline`, returning `None` once
 /// there is no time left.
-///
-/// Clamping to the remaining budget is what makes [`REQUEST_DEADLINE`] real rather than advisory:
-/// without it a drip-feeding client resets [`READ_TIMEOUT`] forever and no single read ever fails.
 fn arm_read(reader: &BufReader<TcpStream>, deadline: Instant) -> Option<()> {
     let left = time_left(deadline)?;
     reader
@@ -928,11 +703,6 @@ fn arm_read(reader: &BufReader<TcpStream>, deadline: Instant) -> Option<()> {
 
 /// Reads one `\n`-terminated line under both a byte budget and an absolute deadline. Returns the
 /// bytes consumed.
-///
-/// Reads a byte at a time deliberately. [`BufRead::read_until`] loops internally until it finds
-/// the delimiter, so the deadline could only be checked *after* it returned - which is exactly
-/// the hole a drip-feeding client walks through. Going byte by byte puts a deadline check between
-/// every byte; it is not a syscall per byte, because [`BufReader`] serves them from its buffer.
 fn read_line_bounded(
     reader: &mut BufReader<TcpStream>,
     out: &mut String,
@@ -1075,7 +845,6 @@ mod tests {
             "event=PreToolUse&agent=7",
             &edit_body("PreToolUse", &file),
         );
-        // The agent's own write, after the event and before anyone drains.
         std::fs::write(&file, "after\n").expect("agent write");
         post(
             listener.port(),
@@ -1196,7 +965,6 @@ mod tests {
         let (activity, question) = listener.text_for(7);
         assert_eq!(activity.as_deref(), Some("Bash: cargo test"));
         assert_eq!(question, None);
-        // A different agent id must be untouched by another agent's event.
         assert_eq!(listener.signal_for(8).fact, None);
     }
 
@@ -1218,7 +986,6 @@ mod tests {
             listener.session_id_for(11).as_deref(),
             Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c")
         );
-        // No event ever recorded for this id: no session id to report.
         assert_eq!(listener.session_id_for(12), None);
     }
 
@@ -1241,7 +1008,6 @@ mod tests {
         let listener = HookListener::start().expect("listener must start");
         let body = r#"{"hook_event_name":"Stop"}"#;
 
-        // Wrong token.
         let wrong = post(
             listener.port(),
             "0000000000000000000000000000000000000000000000000000000000000000",
@@ -1250,7 +1016,6 @@ mod tests {
         );
         assert!(wrong.starts_with("HTTP/1.1 401"), "got {wrong:?}");
 
-        // No Authorization header at all.
         let missing = raw_request(
             listener.port(),
             &format!(
@@ -1260,7 +1025,6 @@ mod tests {
         );
         assert!(missing.starts_with("HTTP/1.1 400"), "got {missing:?}");
 
-        // A token that is a prefix of the real one must not be accepted either.
         let prefix = post(
             listener.port(),
             &listener.token()[..32],
@@ -1306,11 +1070,9 @@ mod tests {
             format!("POST /evil?event=Stop&agent=1 HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n{{}}"),
             format!("POST /hook?event=Stop&agent=1 HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: notanumber\r\n\r\n"),
             format!("POST /hook?event=Stop&agent=1 HTTP/1.1\r\nAuthorization Bearer {token}\r\n\r\n"),
-            // A header line far past the head budget, never terminated.
             format!("POST /hook?event=Stop&agent=1 HTTP/1.1\r\nX-Huge: {}", "A".repeat(MAX_HEAD_BYTES * 2)),
         ];
         for request in hostile {
-            // The assertion that matters is that this returns at all - a hang here is the bug.
             let _ = raw_request(port, &request);
         }
 
@@ -1320,7 +1082,6 @@ mod tests {
             "none of the hostile requests may have recorded a fact"
         );
 
-        // The listener must still be alive and correct after all of that.
         let good = post(
             port,
             &token,
@@ -1390,7 +1151,6 @@ mod tests {
         let listener = HookListener::start().expect("listener");
         let port = listener.port();
 
-        // Every slot occupied by a client that drips for ~25s and never completes a request.
         let mut drips = Vec::new();
         for _ in 0..MAX_IN_FLIGHT {
             drips.push(std::thread::spawn(move || {
@@ -1441,7 +1201,6 @@ mod tests {
             MAX_TRACKED_AGENTS,
             "the inbox must not grow past its cap"
         );
-        // Eviction is oldest-first, so the most recent ids - the ones still reporting - survive.
         assert!(inbox.get(MAX_TRACKED_AGENTS as u64 + 49).is_some());
         assert!(inbox.get(0).is_none());
     }
@@ -1461,7 +1220,6 @@ mod tests {
 
     #[test]
     fn a_request_with_no_usable_agent_id_is_accepted_but_records_nothing() {
-        // Exactly what a forwarder run outside a Jerry-spawned pane would produce.
         let listener = HookListener::start().expect("listener must start");
         for query in [
             "event=Stop",
@@ -1507,15 +1265,6 @@ mod tests {
         );
     }
 
-    /// The real event sequence a permission prompt produces, captured verbatim from a `claude`
-    /// 2.1.228 session driven through Jerry's own spawn path: `PreToolUse`, then
-    /// `PermissionRequest` carrying the real tool and argument, then - milliseconds later - a
-    /// `Notification` whose entire message is the constant `"Claude needs your permission"`.
-    ///
-    /// Under plain "latest wins" the rail could therefore *never* show the specific question this
-    /// codebase goes to the trouble of parsing: it was overwritten by the constant every single
-    /// time, for every tool, which made `crate::hooks::event`'s whole `PermissionRequest` arm
-    /// unreachable in practice. Observed live on the real rail before it was fixed.
     #[test]
     fn a_generic_permission_notification_cannot_overwrite_the_real_permission_question() {
         let listener = HookListener::start().expect("listener must start");
@@ -1558,14 +1307,6 @@ mod tests {
         );
     }
 
-    /// The other half of the same real sequence: a completed turn fires `Stop`, and about a minute
-    /// later Claude Code fires an `idle_prompt` `Notification` because nobody has typed since.
-    ///
-    /// Treating that as a state transition flipped every finished agent from `Review`/`Idle` back
-    /// to `Ask` roughly one minute after it finished - erasing the "a turn that ended is a review
-    /// boundary even though the process is still alive" capability that is the entire point of
-    /// this phase, and replacing its question with the constant "Claude is waiting for your
-    /// input". Also observed live on the real rail.
     #[test]
     fn an_idle_notification_cannot_erase_the_turn_boundary_a_real_stop_established() {
         let listener = HookListener::start().expect("listener must start");
@@ -1597,7 +1338,6 @@ mod tests {
             None,
             "a finished row must not carry a question describing nothing it doesn't already say"
         );
-        // ...and the session id a resume needs must survive the fold.
         assert_eq!(listener.session_id_for(6).as_deref(), Some("s-2"));
     }
 
@@ -1632,7 +1372,6 @@ mod tests {
             "with no better question on record, the notification's own message is the best there is"
         );
 
-        // And a real transition after it still wins outright - the fold applies to nudges only.
         post(
             port,
             &token,
@@ -1643,8 +1382,6 @@ mod tests {
         assert_eq!(listener.text_for(7).1, None);
     }
 
-    /// GitHub issue #227's run-level facts, over a real socket: the title is the **first** prompt
-    /// the human typed (not the latest), and the turn count is one per real `Stop`.
     #[test]
     fn a_runs_title_and_turn_count_come_off_its_own_real_hook_stream() {
         let listener = HookListener::start().expect("listener must start");
@@ -1687,7 +1424,6 @@ mod tests {
             "each real Stop is one completed turn"
         );
 
-        // A follow-up prompt renames nothing: a run is named by the task it was started for.
         post(
             port,
             &token,
@@ -1700,7 +1436,6 @@ mod tests {
             "the title is the first prompt, never the latest one"
         );
 
-        // An idle nudge is not a turn boundary, however much it looks like the end of one.
         post(
             port,
             &token,
@@ -1710,8 +1445,6 @@ mod tests {
         assert_eq!(listener.run_facts_for(11).turns, 2);
     }
 
-    /// Forgetting an agent must drop its run facts too, for exactly the reason it drops its
-    /// status: a recycled id must not inherit a dead run's turn count or title.
     #[test]
     fn forgetting_an_agent_drops_its_run_facts_as_well_as_its_status() {
         let listener = HookListener::start().expect("listener must start");

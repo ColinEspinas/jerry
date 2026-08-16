@@ -6,41 +6,6 @@
 //! is answered - both the Windows/Linux in-window popover (`crate::title_bar::menu`) and the real
 //! macOS menu (`crate::title_bar::native_menu`) go through them rather than each keeping its own
 //! copy, so enablement and effect can never drift between the two surfaces.
-//!
-//! Every real effect in [`AdeApp::perform_menu_command`] is copied verbatim from the `on_click`
-//! closure the pre-issue-#235 popover already had for that same row - this file does not invent
-//! new behavior, it centralizes existing behavior so a second real caller (the native macOS menu)
-//! can reach it too.
-//!
-//! ## Enablement drives real `gpui` action availability, not just the popover's dimming
-//!
-//! [`Self::menu_command_enabled`] is also what gates whether this file's own `handle_*_menu_command`
-//! listeners are attached to the root element at all (see `impl Render for AdeApp` in
-//! `crate::root::mod`) - a command whose predicate is currently `false` has **no** `on_action`
-//! listener on the dispatch path this render, so `gpui::App::is_action_available` genuinely
-//! returns `false` for it. That is what lets the real macOS `NSMenu` grey the item out on its own
-//! (`gpui_macos`'s `on_validate_app_menu_command` calls exactly that), with no manual `disabled:`
-//! bookkeeping anywhere in `crate::title_bar::native_menu` - see that module's own docs.
-//!
-//! ## Not every command gets a `handle_*_menu_command` here
-//!
-//! Several [`MenuCommand`] variants reuse an already-existing `gpui::Action` that already has a
-//! real handler registered somewhere else in the tree, scoped to the surface that action is
-//! really about (`EditorSave`/`EditorCut`/`EditorCopy`/`EditorPaste`/`EditorSelectAll` on the
-//! code-surface container in `crate::code_surface::render`; `TextUndo`/`TextRedo` on every real
-//! text-input surface; `TogglePalette`/`ToggleSettings`/`NewTerminal`/`NewAgentPane` already
-//! unconditionally on this very root). Adding a *second*, root-level handler for one of those
-//! would either never fire (a more specific node's own handler already stops propagation first)
-//! or - worse - fire from a context that action was never meant to run in. Those commands'
-//! [`Self::perform_menu_command`] arm still calls the real handler directly (the popover's own
-//! click path, which never goes through `gpui` action dispatch at all - see that function's own
-//! docs), but they get **no** entry in the `handle_*_menu_command` methods below and **no** new
-//! `.on_action`/`.when(...)` registration in `impl Render for AdeApp` - their existing
-//! registration (already unconditional for `TogglePalette`/`ToggleSettings`, or already correctly
-//! scoped for the editor/text-input actions) is left exactly as it was. `NewTerminal`/
-//! `NewAgentPane` are the one pre-existing pair that *did* need a change - from unconditional to
-//! `.when(self.menu_command_enabled(...), ..)` - so `is_action_available` can genuinely reflect
-//! [`Self::menu_command_enabled`]; see the comment at that call site in `crate::root::mod`.
 use super::*;
 use crate::title_bar::menu_model::MenuCommand;
 
@@ -459,8 +424,6 @@ mod menu_command_tests {
     use crate::root::focus::palette_focus_tests::open_test_app;
     use gpui::TestAppContext;
 
-    /// `menu_command_enabled(Save)` must track real edit-buffer state: `false` with nothing
-    /// open, `true` once a real file is loaded into the File view.
     #[gpui::test]
     fn menu_command_enabled_save_tracks_the_real_active_edit_buffer(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -484,8 +447,6 @@ mod menu_command_tests {
         );
     }
 
-    /// `menu_command_enabled(ZoomIn)` requires a real code surface actually on screen - `false`
-    /// in a genuinely empty window.
     #[gpui::test]
     fn menu_command_enabled_zoom_requires_a_real_code_surface(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -497,11 +458,6 @@ mod menu_command_tests {
         );
     }
 
-    /// `menu_command_enabled(ArchiveAgent)` requires a real active agent - `true` for
-    /// `open_test_app`'s own real initial shell agent, `false` once every agent has really been
-    /// archived (a genuinely reachable state, not a premise the test only imagines - `open_test_app`
-    /// opens a real repo, which `AdeApp::new_with_settings`'s own docs say always spawns one
-    /// initial shell agent, so "no active agent" has to be reached by really archiving it).
     #[gpui::test]
     fn menu_command_enabled_archive_agent_tracks_the_real_active_agent(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -534,9 +490,6 @@ mod menu_command_tests {
         );
     }
 
-    /// A real `cx.dispatch_action(ZoomIn)` with a code surface genuinely on screen must reach
-    /// `Self::zoom_in` through the exact same path the native macOS menu's own "Zoom In" row
-    /// will dispatch through - not just a direct method call.
     #[gpui::test]
     fn dispatching_zoom_in_action_reaches_the_real_zoom_in_handler(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -563,9 +516,6 @@ mod menu_command_tests {
         );
     }
 
-    /// With no code surface showing, `is_action_available` for `ZoomIn` must genuinely be
-    /// `false` - the real signal the native macOS menu greys its own "Zoom In" row from, with no
-    /// separate `disabled:` bookkeeping.
     #[gpui::test]
     fn zoom_in_action_is_unavailable_with_no_code_surface_showing(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

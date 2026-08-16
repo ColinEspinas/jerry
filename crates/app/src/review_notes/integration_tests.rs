@@ -80,16 +80,6 @@ fn repo_with_an_agent_authored_change(spawned_at: i64) -> (TempDir, ProvenanceSt
 
 /// A real, executable stand-in for an agent CLI: it turns bracketed paste on (exactly as a real
 /// agent's full-screen TUI does) and then writes back whatever is typed into it.
-///
-/// Real, not simulated. It is spawned through this app's own spawn path onto a real pty, so the
-/// prompt appearing in its pane is round-tripped evidence that the bytes genuinely left the app.
-///
-/// `stty -echo` is load-bearing, not tidiness: with the pty's own line-discipline echo left on,
-/// every delivered byte would appear on the pane **twice** (once echoed by the driver, once
-/// written by `cat`), and "how many prompts arrived" - the one thing
-/// [`two_notes_are_delivered_as_one_prompt_not_two`] exists to measure - would be uncountable.
-/// The same technique `crate::terminal::pane`'s own
-/// `shutdown_joins_reader_thread_even_with_local_echo_disabled` already uses.
 fn agent_stand_in(dir: &Path) -> String {
     let script = dir.join("agent-stand-in.sh");
     std::fs::write(
@@ -108,12 +98,6 @@ fn agent_stand_in(dir: &Path) -> String {
 
 /// Opens the app on `repo` with the Changes panel showing and `PATH`'s diff open, plus one real
 /// agent tab whose child is [`agent_stand_in`].
-///
-/// The tab is spawned as a `Shell` (which is the one spawn path that lets a test name the real
-/// program) and then retagged to a real agent kind through `Agents::set_kind_for_test` - the
-/// established seam this crate already uses for exactly this ("everything downstream of the
-/// recorded `kind` field behaves exactly as if a real agent CLI had been spawned, without the
-/// process weight of one"). The *process* is real either way, which is the half this test needs.
 fn open_review<'a>(
     cx: &'a mut TestAppContext,
     repo: &TempDir,
@@ -197,12 +181,6 @@ fn click_line(cx: &mut gpui::VisualTestContext, row: usize) {
     cx.run_until_parked();
 }
 
-/// **The acceptance sequence, exactly as `STAGE-A-CHANGELOG.md` §3 states it:** *"Note pins on
-/// click, bar reads `1 note on this file`, send → `1 note sent — awaiting revision` + `✓ sent`,
-/// card mark `draft → sent`, note still pinned."*
-///
-/// Every step is a real gesture on a real painted element, and the send really writes into a real
-/// child process's real pty.
 #[gpui::test]
 fn the_mocks_acceptance_sequence_runs_end_to_end_against_a_real_agent(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -311,8 +289,6 @@ fn the_mocks_acceptance_sequence_runs_end_to_end_against_a_real_agent(cx: &mut T
     );
 }
 
-/// The rule the audit calls out as the thing Orca learned the hard way: **one** prompt, however
-/// many notes. Two notes on one file must produce one delivery containing both, never two.
 #[gpui::test]
 fn two_notes_are_delivered_as_one_prompt_not_two(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -357,9 +333,6 @@ fn two_notes_are_delivered_as_one_prompt_not_two(cx: &mut TestAppContext) {
     );
 }
 
-/// *"Editing after send starts a new draft state for that note"*, observed through the surface
-/// rather than only through the model: the bar goes back to counting notes, and the card's mark
-/// goes back to `draft`, while the note itself stays pinned.
 #[gpui::test]
 fn editing_a_sent_note_puts_the_card_and_the_bar_back_into_draft(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -409,8 +382,6 @@ fn editing_a_sent_note_puts_the_card_and_the_bar_back_into_draft(cx: &mut TestAp
     });
 }
 
-/// *"`noteTarget` resolves to the file's first author"* - the live agent whose key the provenance
-/// store recorded against this file, not merely whichever tab happens to be open.
 #[gpui::test]
 fn the_target_is_the_files_own_author_when_one_is_live(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -441,8 +412,6 @@ fn the_target_is_the_files_own_author_when_one_is_live(cx: &mut TestAppContext) 
     });
 }
 
-/// The fallback half: a file this worktree has no attribution for still has a target - *"falling
-/// back to the worktree's primary agent"*.
 #[gpui::test]
 fn a_file_with_no_author_falls_back_to_the_worktrees_primary_agent(cx: &mut TestAppContext) {
     let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -462,9 +431,6 @@ fn a_file_with_no_author_falls_back_to_the_worktrees_primary_agent(cx: &mut Test
     });
 }
 
-/// A shell shares the worktree but authors nothing and cannot revise anything, so it is never a
-/// send target - and with no real agent open at all there is no button rather than one that names
-/// a target it does not have.
 #[gpui::test]
 fn a_worktree_whose_only_tab_is_a_shell_offers_no_send_target(cx: &mut TestAppContext) {
     let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -504,25 +470,6 @@ fn a_worktree_whose_only_tab_is_a_shell_offers_no_send_target(cx: &mut TestAppCo
     );
 }
 
-/// **Live report: *"I can't really submit the comments, maybe there is something I don't
-/// understand"*.**
-///
-/// There was nothing to understand. The bar drew its send button only once
-/// [`AdeApp::review_note_target`] resolved a live agent session in the worktree, and drew nothing
-/// whatsoever otherwise - so a reviewer who opened a diff before starting an agent (the ordinary
-/// order: read the change, *then* ask for the revision) saw a bar that counted their notes,
-/// promised they would go out as one prompt, and offered no control, no keycaps and no
-/// explanation. `mod+enter` was bound the whole time, but the only place that shortcut is ever
-/// advertised is inside the button that was not being drawn.
-///
-/// So this asserts the two halves that were missing, in the state that produced the report - a
-/// real note on a real diff in a worktree with no agent at all:
-///
-/// 1. a send control is really painted, and
-/// 2. it says what is missing, rather than naming an agent that is not there.
-///
-/// And it asserts the recovery: the moment a real agent session exists, the same slot becomes the
-/// real button.
 #[gpui::test]
 fn the_send_control_says_why_it_cannot_send_rather_than_vanishing(cx: &mut TestAppContext) {
     let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -580,13 +527,6 @@ fn the_send_control_says_why_it_cannot_send_rather_than_vanishing(cx: &mut TestA
     );
 }
 
-/// A `NoTarget` failure is a statement about the worktree, and starting an agent makes it false.
-///
-/// Observed on a real window while reproducing this feature's other reports: pressing `mod+enter`
-/// with no agent open left `no agent open in this worktree to send to` sitting in the bar, in red,
-/// where it stayed after an agent was started - directly beside the live `Send notes to Claude`
-/// button it was contradicting. The bar now filters the recorded failure against what is true at
-/// render time, which is why `AdeApp::note_send_error` holds the error rather than its sentence.
 #[gpui::test]
 fn a_no_target_failure_stops_being_shown_once_an_agent_really_is_open(cx: &mut TestAppContext) {
     let (repo, _store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -634,8 +574,6 @@ fn a_no_target_failure_stops_being_shown_once_an_agent_really_is_open(cx: &mut T
     );
 }
 
-/// *"Notes are keyed per worktree + path + line and survive scrolling/reopening."* Opening another
-/// file and coming back must find the note exactly where it was, with its state intact.
 #[gpui::test]
 fn a_note_survives_leaving_the_file_and_coming_back(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -679,8 +617,6 @@ fn a_note_survives_leaving_the_file_and_coming_back(cx: &mut TestAppContext) {
     );
 }
 
-/// A card opened by a stray click and never written into is not a note: clicking the same line
-/// again takes it away, and nothing about it is ever counted or delivered.
 #[gpui::test]
 fn a_blank_card_toggles_away_again_but_a_written_one_stays(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -711,7 +647,6 @@ fn a_blank_card_toggles_away_again_but_a_written_one_stays(cx: &mut TestAppConte
     );
 }
 
-/// The `mod+enter` keycaps the bar draws are a real binding, not decoration (ride-along I10).
 #[gpui::test]
 fn the_send_shortcut_the_bar_draws_really_sends(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -746,7 +681,6 @@ fn the_send_shortcut_the_bar_draws_really_sends(cx: &mut TestAppContext) {
     );
 }
 
-/// `C note on line`, the footer hint's own wording, as a real binding on the note cursor.
 #[gpui::test]
 fn the_note_shortcut_toggles_a_note_on_the_line_the_cursor_is_on(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -781,8 +715,6 @@ fn the_note_shortcut_toggles_a_note_on_the_line_the_cursor_is_on(cx: &mut TestAp
     );
 }
 
-/// A note pinned to a removed line has its own anchor, and it says so in the prompt - the half a
-/// single-integer line key would have silently collapsed.
 #[gpui::test]
 fn a_note_on_a_removed_line_anchors_and_reads_as_removed(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -826,11 +758,6 @@ fn a_note_on_a_removed_line_anchors_and_reads_as_removed(cx: &mut TestAppContext
     });
 }
 
-/// A note has to survive the window closing, and "written when the card closes" is not that: the
-/// realistic way to lose one is to type it and then quit with the caret still in it.
-///
-/// So this types into a card, never closes it, and asserts the note really reached the real file
-/// on disk once the debounce elapsed - and, before that, that nothing was written per keystroke.
 #[gpui::test]
 fn a_note_still_being_typed_reaches_the_real_file_on_its_own(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -873,19 +800,6 @@ fn a_note_still_being_typed_reaches_the_real_file_on_its_own(cx: &mut TestAppCon
     );
 }
 
-/// Regression: a plain letter bound over the **diff** must not be swallowed while a note card is
-/// being typed into.
-///
-/// The note card is a real `"text-input"` node *inside* `crate::code_surface::render`'s own
-/// `"diff"` node, so `v` (`ToggleChangeSeen`), `]` (`NextChangedFile`) and `space`
-/// (`ToggleChangeStaged`) - all scoped `Some("diff && !file-editor")` before GitHub issue #288 -
-/// were live over it, and GPUI dispatches a matching `KeyBinding` before any `on_key_down`
-/// listener. Typing "survives" into a note produced "suries", `]` jumped to another file
-/// mid-sentence, and a space staged the file instead of separating two words. All three bindings
-/// now carry `&& !text-input`.
-///
-/// The typed string below is chosen to exercise every one of them: it contains a `v`, a `]`, and
-/// real spaces.
 #[gpui::test]
 fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -924,15 +838,6 @@ fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mu
     });
 }
 
-/// **Regression for the worst failure this feature can have: input silently going nowhere.**
-///
-/// The pinned card is a row of a virtualized `uniform_list`, so it stops being built at all once
-/// it scrolls out of view. If the card were the element carrying the note's `FocusHandle`, that
-/// would delete the focused node from GPUI's dispatch tree mid-sentence - and GPUI then evaluates
-/// every predicate against an empty context stack, where they all short-circuit to `false`. Typed
-/// characters, `mod+enter` and `c` would all stop working, with nothing on screen saying so.
-///
-/// So: open a note near the top of a long diff, scroll it far out of view, and keep typing.
 #[gpui::test]
 fn typing_into_a_note_keeps_working_after_the_card_scrolls_out_of_view(cx: &mut TestAppContext) {
     let repo = TempDir::new().expect("tempdir");
@@ -1019,8 +924,6 @@ fn typing_into_a_note_keeps_working_after_the_card_scrolls_out_of_view(cx: &mut 
     });
 }
 
-/// A send that really failed says so in the bar, and - critically - does **not** mark anything
-/// sent. Audit item I12's whole complaint about this design is that nothing in it ever fails.
 #[gpui::test]
 fn a_send_to_a_dead_agent_fails_loudly_and_marks_nothing(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -1075,11 +978,6 @@ fn a_send_to_a_dead_agent_fails_loudly_and_marks_nothing(cx: &mut TestAppContext
     );
 }
 
-/// A draft opened in one worktree must never write into another checkout's notes.
-///
-/// `AdeApp::diff_root` is reassigned wholesale on a worktree switch, so a draft that re-read it at
-/// each store call would land every subsequent keystroke under the *new* worktree's key -
-/// overwriting its note on the same path and line, and persisting it there.
 #[gpui::test]
 fn a_draft_left_open_across_a_worktree_switch_never_writes_into_the_other_checkout(
     cx: &mut TestAppContext,
@@ -1123,13 +1021,6 @@ fn a_draft_left_open_across_a_worktree_switch_never_writes_into_the_other_checko
     });
 }
 
-/// A second window's notes must survive this one saving.
-///
-/// `save_merged_at` rewrites every worktree key this window claims **ownership** of, from its own
-/// in-memory snapshot. Claiming the whole file at startup (which is what `crate::provenance` does,
-/// and what this used to copy) makes that a real loss path: launch, let another window add a note
-/// elsewhere, then save anything at all and the other window's note is overwritten by a
-/// launch-time copy. Ownership is now taken per worktree, only where this window really wrote.
 #[gpui::test]
 fn saving_does_not_overwrite_a_worktree_this_window_only_read(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -1179,17 +1070,6 @@ fn saving_does_not_overwrite_a_worktree_this_window_only_read(cx: &mut TestAppCo
     );
 }
 
-/// **Live report: *"when clicking on the line the comment popover is changing width strangely"*.**
-///
-/// It really was. A `gpui::uniform_list` lays each item out through `Drawable::layout_as_root`,
-/// which - unlike the *window* root, the only node `TaffyLayoutEngine::stretch_auto_size_to_fill`
-/// is ever applied to - leaves an `auto` width sized to the item's own **content**. So the card's
-/// `flex_1` body resolved against the note's text rather than against the pane: the card grew a
-/// few pixels per keystroke, and jumped to a different width on every line clicked.
-///
-/// Measured against the diff's own rows rather than against a hardcoded number, because "the
-/// pane's width" is the actual claim: a card is the row's width less the mock's own
-/// `margin: … 14px … 74px` inset, whatever the note says.
 #[gpui::test]
 fn a_note_card_is_the_panes_width_whatever_the_note_says(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -1231,21 +1111,6 @@ fn a_note_card_is_the_panes_width_whatever_the_note_says(cx: &mut TestAppContext
     );
 }
 
-/// **Live report: *"Caret is not right, does not follow the typing of the user and just stays on
-/// the right side"*.**
-///
-/// The third caret defect this one field shipped, and the second one of a class that has now hit
-/// nine hand-rolled inputs in this app: `.flex_1().min_w_0()` sat on the note's **text** element,
-/// so that element's box stretched across the whole card whatever the text said, and the
-/// `flex_none` caret after it was pushed to the card's far right edge - beside the `draft` mark,
-/// not against the last glyph. It is invisible in any field narrow enough for the text to fill it,
-/// which is why it kept shipping; it became unmissable here the moment the card above was given
-/// its real, full pane width.
-///
-/// The structure now comes from `AdeApp::render_simple_input_row`, which owns that placement in
-/// one place. This measures the result the same way `rail::render::rail_filter_caret_tests` does:
-/// against real painted bounds, in both the empty state (caret at position 0, before the
-/// placeholder) and the typed state (caret against the text, nowhere near the card's edge).
 #[gpui::test]
 fn the_note_caret_sits_against_the_text_not_at_the_far_edge_of_the_card(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -1293,13 +1158,6 @@ fn the_note_caret_sits_against_the_text_not_at_the_far_edge_of_the_card(cx: &mut
     );
 }
 
-/// Exactly one card carries a caret: the one being typed into.
-///
-/// There is one `note_focus_handle` for the whole feature (one draft at a time - see
-/// `crate::review_notes::flow::NoteDraft`'s own docs), so a card that rendered the shared caret
-/// unconditionally would paint one in *every* pinned card the moment any of them was focused.
-/// `AdeApp::render_simple_input_row` takes an `Option<&FocusHandle>` rather than a handle plus a
-/// hope for exactly this reason.
 #[gpui::test]
 fn only_the_card_being_typed_into_paints_a_caret(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);
@@ -1334,14 +1192,6 @@ fn only_the_card_being_typed_into_paints_a_caret(cx: &mut TestAppContext) {
     );
 }
 
-/// A click in the empty space to the right of a short diff line must pin a note.
-///
-/// Found while reproducing the two reports above, on a real window: it did nothing at all. The
-/// diff row is the note gesture's hit target, and a `uniform_list` item with an `auto` width is
-/// laid out at its *content* width (the same mechanism as
-/// [`a_note_card_is_the_panes_width_whatever_the_note_says`]), so the hit box, the hover lift and
-/// the add/remove tint all stopped at the last glyph of the line - several hundred pixels short of
-/// the pane on a short line, with nothing on screen saying where the clickable part ended.
 #[gpui::test]
 fn a_click_past_the_end_of_a_short_line_still_pins_a_note(cx: &mut TestAppContext) {
     let (repo, store) = repo_with_an_agent_authored_change(1_700_000_000);

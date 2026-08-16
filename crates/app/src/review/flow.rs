@@ -1,14 +1,6 @@
 //! The `impl AdeApp` glue behind the agent review surface: capturing a baseline when an agent
 //! spawns, loading a review off the UI thread, advancing the baseline on `Mark reviewed`, and
 //! releasing a baseline's ref when its agent closes. See `super`'s module docs for scope.
-//!
-//! ## Every git call here is real blocking I/O
-//!
-//! `wt_core::review::snapshot_worktree_tree`, `diff_against_tree`, `changed_paths_against_tree`,
-//! `anchor_tree` and `delete_ref` all spawn real `git` child processes. Every one of them runs on
-//! `cx.background_executor()` and mutates [`AdeApp`] state only afterwards, from inside
-//! `this.update` - the exact shape `crate::code_surface::tabs::AdeApp::load_diff` and
-//! `crate::graph_view::render::AdeApp::load_graph` already established.
 
 use super::state::{baseline_key, AgentReview, BaselineReason, ReviewBaseline, ReviewLoadState};
 use super::*;
@@ -29,16 +21,6 @@ struct BaselineIdentity {
 impl AdeApp {
     /// Whether agent `id`'s review surface should be shown at all right now - GitHub issue
     /// #225's single-agent gate, in the one place every caller reads it from.
-    ///
-    /// Two real conditions, both required:
-    /// 1. A baseline has actually been captured (the snapshot is a background task, so there is a
-    ///    real window right after spawn where there is genuinely nothing to review *against*
-    ///    yet - and a review surface with no baseline would have to invent one).
-    /// 2. This agent is the only one open in its worktree
-    ///    (`Agents::is_sole_agent_in_worktree` - see that method's docs for why).
-    ///
-    /// Read by the footer's `Review` action, the rail's review-ready status, the tab strip, and
-    /// the Review tab's own open path, so none of them can drift from each other.
     pub(crate) fn review_available_for(&self, id: AgentId) -> bool {
         self.agent_reviews.contains_key(&id) && self.agents.is_sole_agent_in_worktree(id)
     }
@@ -46,40 +28,6 @@ impl AdeApp {
     /// Captures agent `id`'s review baseline: a real `wt_core::review::snapshot_worktree_tree` of
     /// its worktree, anchored under its own `refs/jerry/review/*` ref, recorded in memory and
     /// persisted.
-    ///
-    /// Called from the *callers* of `Agents::spawn`, not from `Agents::spawn` itself, mirroring
-    /// how `load_diff` is triggered by a caller rather than baked into a lower-level type -
-    /// `Agents` has no business knowing about git snapshots. Called unconditionally after every
-    /// spawn, [`ProcessKind::Shell`] included - the kind check below is what makes that safe
-    /// rather than something every caller has to remember.
-    ///
-    /// **Every** real spawn door must call it, and that is the one thing this arrangement cannot
-    /// enforce for itself. The full set: `crate::work_surface::render::AdeApp::new_agent`,
-    /// `::new_agent_pane` and `::respawn_agent`, `crate::work_surface::session::AdeApp::
-    /// restore_worktree_session`'s two arms, `crate::hooks::flow::AdeApp::resume_past_agent`, and
-    /// `crate::root::AdeApp::select_worktree`'s startup tab. The middle two were missing it until
-    /// GitHub issue #381 - `new_agent_pane` in particular is `ctrl-shift-N`, the title bar's
-    /// `New Agent Pane` row and the empty pane's own `Start an agent` CTA, i.e. how most agents
-    /// in this app are really started, and none of them could ever open a review surface.
-    ///
-    /// ## The accepted race
-    ///
-    /// The agent's process starts immediately; this snapshot lands a real moment later (it's a
-    /// background task spawning `git`). Anything the agent writes inside that window is captured
-    /// *into* the baseline and therefore won't appear as an unreviewed change. That is accepted
-    /// for phase 1 rather than papered over - which is exactly why
-    /// [`ReviewBaseline::taken_at_unix`] records when the snapshot really happened, so the tab
-    /// header can say "09:31" honestly instead of implying it is the process's own start instant.
-    ///
-    /// Captured for **every real agent session**, including agents in worktrees that already have
-    /// others open: the multi-agent gate is a display-time decision
-    /// ([`Self::review_available_for`]), so a worktree that later drops back to one agent finds a
-    /// real baseline already waiting, taken at the right moment rather than retroactively
-    /// invented. A plain [`ProcessKind::Shell`] is a different exclusion entirely - not gated at
-    /// display time at all, because there is nothing for it to eventually reveal: a shell has no
-    /// turns, so a baseline captured for one would only ever be able to show "whatever changed in
-    /// this worktree while the shell happened to be open", attributed to a shell that did not
-    /// necessarily do it. No baseline is ever captured for one, full stop.
     pub(crate) fn capture_review_baseline(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
@@ -189,12 +137,6 @@ impl AdeApp {
     /// `crate::work_surface::render::AdeApp::persist_tab_order` uses, including the merge against
     /// [`Self::review_baselines_owned`] so a second window can't erase baselines it never saw. A
     /// genuine no-op with a `None` path (every GPUI test that hasn't opted into a real one).
-    ///
-    /// Really on the background executor, not merely documented as such. An earlier version ran
-    /// `save_merged_at` inline here, which meant the main thread performed two `fsync`s (the temp
-    /// file and its parent directory) while holding `crate::persisted_state_lock`'s process-wide
-    /// mutex - a lock that background writers of `repos.toml`/`tab-order.toml` also hold across
-    /// *their* fsyncs, so the UI thread could block on an entirely unrelated save.
     fn persist_review_baselines(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.review_baseline_path.clone() else {
             return;
@@ -216,10 +158,6 @@ impl AdeApp {
 
     /// Loads (or reloads) agent `id`'s review diff against its own baseline, off the UI thread.
     /// Mirrors `crate::code_surface::tabs::AdeApp::load_diff`'s shape exactly.
-    ///
-    /// A no-op if `id` has no baseline yet - there is genuinely nothing to diff against, and
-    /// falling back to any *other* base point would produce a number this surface would then
-    /// present as "this agent's changes", which it would not be.
     pub(crate) fn load_agent_review(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(review) = self.agent_reviews.get_mut(&id) else {
             return;
@@ -284,15 +222,6 @@ impl AdeApp {
 
     /// The Review tab's `Mark reviewed` action: re-snapshots the worktree *right now*, advances
     /// this agent's baseline onto it, and reloads.
-    ///
-    /// After this, the review is empty (nothing has changed since a snapshot taken a moment
-    /// ago), and that is the correct, good outcome, not an error (see
-    /// `super::state::review_empty_message`). The reload is what makes the surface actually show
-    /// it, rather than leaving the pre-mark file list on screen next to a baseline it no longer
-    /// describes.
-    ///
-    /// Re-anchors the same ref onto the new tree (`anchor_tree` moves an existing ref), so a
-    /// baseline never accumulates one ref per mark.
     pub(crate) fn mark_reviewed(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if !self.review_available_for(id) || self.review_mark_in_flight.is_some() {
             return;
@@ -373,12 +302,6 @@ impl AdeApp {
 
     /// Drops agent `id`'s in-memory review and deletes its baseline ref, releasing the snapshot's
     /// objects to a future `git gc`. Called from `Self::close_agent`.
-    ///
-    /// The **persisted metadata entry is deliberately left in place** - see
-    /// `super::baseline_state`'s module docs. The ref goes because a closed agent's snapshot has
-    /// no live consumer and shouldn't pin objects forever; the record of what was captured, when,
-    /// and why stays, because that is exactly the groundwork GitHub issue #227 ("Agent history and
-    /// resume/recover") will need and this app should not be actively destroying.
     pub(crate) fn release_review_baseline(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(review) = self.agent_reviews.remove(&id) else {
             return;
@@ -408,13 +331,6 @@ impl AdeApp {
 
     /// The rail's real per-agent `N files` count for a [`crate::rail::status::Status::Review`]
     /// row - how many files this agent has changed since *its own* baseline.
-    ///
-    /// A pure read of an already-loaded review, never a fresh git call: this is consumed by
-    /// `build_agent_rows`, which runs on every rail render. The loading itself happens in
-    /// [`Self::load_agent_review`].
-    ///
-    /// `None` (rather than a fabricated `0`) whenever the number would be a guess: no baseline
-    /// yet, nothing loaded yet, a failed load, or a multi-agent worktree the gate holds back.
     pub(crate) fn agent_review_file_count(&self, id: AgentId) -> Option<usize> {
         if !self.review_available_for(id) {
             return None;
@@ -424,11 +340,6 @@ impl AdeApp {
 
     /// Every agent that currently has a baseline, as `(id, worktree, tree id)` - what the rail's
     /// status-poll tick needs to measure each agent's unreviewed set on the background executor.
-    ///
-    /// Deliberately **not** filtered by the single-agent gate: measuring is cheap and the answer
-    /// is genuinely correct per-agent-baseline regardless of how many agents share a worktree.
-    /// Only *presenting* it is gated (`Self::review_available_for`), so a worktree dropping back
-    /// to one agent has a fresh measurement already in hand rather than waiting a tick for one.
     pub(crate) fn review_measure_targets(
         &self,
     ) -> Vec<(AgentId, PathBuf, String, wt_core::review::UntrackedCoverage)> {
@@ -450,10 +361,6 @@ impl AdeApp {
     /// Writes back one status-poll tick's real measurements. An agent whose measurement failed
     /// (or that closed mid-tick) is skipped, leaving its previous answer in place rather than
     /// being reset to a fabricated empty set off the back of a git call that errored.
-    ///
-    /// Also drops a stale entry whose baseline moved while the tick was in flight (a concurrent
-    /// `Mark reviewed`): that measurement describes the *old* baseline, and applying it would
-    /// briefly show already-reviewed files as unreviewed.
     pub(crate) fn apply_review_measurements(
         &mut self,
         measurements: Vec<(AgentId, String, Vec<PathBuf>)>,
@@ -470,10 +377,6 @@ impl AdeApp {
     /// `true` when agent `id` has a real, loaded, non-empty review against its own baseline and
     /// the single-agent gate allows showing it - the replacement for the old
     /// "is the *worktree's* git diff non-empty" input to `crate::rail::status::derive_status`.
-    ///
-    /// This is the correctness fix at the heart of GitHub issue #225: an agent that changed
-    /// nothing, in a worktree whose branch had already diverged from `main`, used to be reported
-    /// `Review ready` off the back of the *branch's* diff.
     pub(crate) fn agent_has_unreviewed_changes(&self, id: AgentId) -> bool {
         self.review_available_for(id)
             && self

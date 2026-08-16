@@ -1,45 +1,5 @@
 //! The `impl AdeApp` half of per-agent line provenance (GitHub issue #284) - where the pure store
 //! meets the running app.
-//!
-//! Three real wires, and nothing else:
-//!
-//! 1. **Agent edits in.** [`AdeApp::apply_agent_edits`] drains
-//!    `crate::hooks::server::EditLog` on the same status-poll tick that already drains the hook
-//!    inbox (`crate::rail::render::AdeApp::start_status_polling`), joins each edit's `AgentId` to
-//!    the live agent's worktree and durable key, and hands it to the store.
-//! 2. **Hand edits in.** [`AdeApp::record_hand_edit`] is called from the one place in this crate
-//!    that writes editor content into a worktree
-//!    (`crate::code_surface::editing::AdeApp::spawn_file_save_loop`), with the exact bytes it just
-//!    wrote. That is Orca's rule, wired: your own save flips those lines to `you`.
-//! 3. **The change set out.** [`AdeApp::current_change_set`] joins the diff the app already loads
-//!    (`crate::code_surface::tabs::AdeApp::load_diff`) with the store, producing the one-row-per-
-//!    path list `crate::sidebar::changes` renders from and GitHub issue #287 will tint.
-//!
-//! ## Why the drain is on the poll, and what could not be deferred with it
-//!
-//! Nothing in the hook layer pushes: `HookListener` runs on its own threads with no `AdeApp`
-//! handle, and every existing consumer (`signal_for`, `text_for`, `session_id_for`) is polled from
-//! `start_status_polling`. Adding a push channel for this one consumer would mean a second,
-//! differently-timed delivery path into the same state.
-//!
-//! Two things follow from that, and only one of them is free.
-//!
-//! **Losing edits is not acceptable**, which is why `crate::hooks::server::EditLog` exists at all:
-//! the status inbox is latest-wins, so a six-file turn drained from *it* would arrive as one file.
-//! An append-only log fixes that for the cost of a bound.
-//!
-//! **Deferring the "before" snapshot is not acceptable either**, and this one cannot be fixed on
-//! this side of the wire. `PreToolUse` fires before the agent writes; a drain up to one
-//! `crate::root::STATUS_POLL_INTERVAL` later reads a file the write has already landed in. Taken
-//! then, every "before" would equal its own "after", every diff would come back clean, and nothing
-//! would ever be attributed to anybody - a feature that silently does nothing, which is worse than
-//! one that visibly fails. So the snapshot is read on the connection thread, at the instant the
-//! event arrives, and travels with the edit: `crate::hooks::server::AgentEdit::before`.
-//!
-//! What genuinely is harmless to defer is the *recording*: an `After` event's diff is taken
-//! against the file as it stands when drained, and a burst of writes between two ticks replays in
-//! arrival order with the last one seeing the final content - the same answer as applying each
-//! instantly.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -56,11 +16,6 @@ use crate::work_surface::agents::ProcessKind;
 
 impl AdeApp {
     /// Applies every file write the hook layer has reported since the last tick.
-    ///
-    /// Runs on the UI thread, on the status poll, next to `record_agent_statuses` - the same shape
-    /// `play_agent_status_sounds` already uses for a second pass over the same tick. The file
-    /// reads it does are the reads of files an agent just wrote, so they are warm in the page
-    /// cache and bounded by `crate::provenance::store::MAX_TRACKED_BYTES`.
     pub(crate) fn apply_agent_edits(&mut self, cx: &mut Context<Self>) {
         let Some(runtime) = &self.hook_runtime else {
             return;
@@ -130,11 +85,6 @@ impl AdeApp {
 
     /// Records a hand edit: the human saved `content` over `relative` in the worktree rooted at
     /// `worktree`, so every line that changed is now [`super::Author::You`]'s.
-    ///
-    /// Deliberately takes the content the caller just wrote rather than re-reading the file: the
-    /// save loop writes on the background executor and this runs on the UI thread afterwards, so a
-    /// re-read could race a *second* save and attribute the newer content's lines to the older
-    /// save's author.
     pub(crate) fn record_hand_edit(
         &mut self,
         worktree: &Path,
@@ -161,10 +111,6 @@ impl AdeApp {
 
     /// The current worktree's change set: one row per changed path, each carrying the
     /// de-duplicated author union and the per-author `split`.
-    ///
-    /// Built from the diff the app has already loaded, so it costs no git work. Empty while the
-    /// diff is still loading or failed, which is the same "nothing to show yet" the Changes
-    /// sidebar already renders for that state.
     pub(crate) fn current_change_set(&self) -> ChangeSet {
         let Some(diff) = self.current_diff() else {
             return ChangeSet::default();
@@ -175,10 +121,6 @@ impl AdeApp {
     /// The current worktree's **uncommitted** change set - the same join as
     /// [`Self::current_change_set`], over `wt_core::diff::diff_against_head`'s scope rather than
     /// the merge-base one (GitHub issue #285).
-    ///
-    /// This is the one the Runs section reads: a run's share has to be a share of *what is dirty*,
-    /// not of what the branch differs from `main` by, or an agent would be credited with lines
-    /// that are already committed and Runs could never sum to Uncommitted.
     pub(crate) fn current_uncommitted_change_set(&self) -> ChangeSet {
         let Some(diff) = self.uncommitted_diff.loaded() else {
             return ChangeSet::default();

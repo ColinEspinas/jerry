@@ -1,18 +1,5 @@
 //! The fallback [`ProcessSampler`](super::ProcessSampler) backend for a target with no real
 //! per-process sampling implementation - everything that is not Linux, macOS or Windows.
-//!
-//! In practice that is FreeBSD, the one remaining target this workspace can genuinely be built
-//! for (`gpui_linux` is a dependency under `cfg(any(target_os = "linux", target_os =
-//! "freebsd"))` - see `crates/app/Cargo.toml`'s own comment on why that predicate is deliberately
-//! wider than Linux alone). FreeBSD has a real `/compat/linux`-style procfs and a `kvm`/`sysctl`
-//! route to the same numbers, so this is a "not written yet" backend rather than an
-//! "impossible" one; it exists so that adding a target can never silently produce a build that
-//! reads a path that cannot exist there.
-//!
-//! Both readings are honestly `None`, always. That makes [`SUPPORTED`] `false`, which is what
-//! `crate::status_bar::render` reads to omit the cpu/memory fields entirely on such a build - see
-//! the parent module's docs on why a permanently-unresolvable `...% cpu` is the one `None` that
-//! must not reach the screen.
 
 use super::ProcessSampler;
 use std::time::Duration;
@@ -49,8 +36,6 @@ pub fn system_memory_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// Honestly `None` even for this very process, which certainly exists - there is genuinely no
-    /// implementation here, and that is reported rather than guessed at.
     #[test]
     fn every_reading_is_an_honest_none() {
         let pid = std::process::id();

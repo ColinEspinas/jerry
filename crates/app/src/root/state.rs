@@ -11,12 +11,6 @@ static NEXT_TREE_UNDO_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 /// Why a `git worktree list --porcelain` fetch is happening - the one thing that differs between
 /// [`AdeApp::load_worktrees`] and [`AdeApp::load_worktrees_for_opened_repo`], passed explicitly
 /// rather than inferred from state once the fetch lands.
-///
-/// It has to be explicit: by the time the fetch resolves, "this repo was just opened" and "a
-/// background poll tick fired for a repo that happens to have nothing selected" are
-/// indistinguishable from [`AdeApp`]'s own fields alone, and they must behave in opposite ways -
-/// the first *must* land on a real worktree (leaving it unselected is the reported bug), the
-/// second must never select anything on the user's behalf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorktreeLoadIntent {
     /// A steady-state reload: the live watcher/poll loop, a post-prune or post-merge refresh, or
@@ -36,13 +30,6 @@ impl AdeApp {
     /// and delegates to [`Self::new_with_settings`]. Blocking the foreground thread here is a
     /// deliberate exception to this codebase's usual rule: it's a single tiny file read that
     /// runs exactly once, before a window even exists, not a per-render or per-poll cost.
-    ///
-    /// GitHub issue #90: `repo_path` is `None` for a fresh launch with no CLI argument (there is
-    /// deliberately no `env::current_dir()` fallback anywhere upstream of this - see
-    /// `crate::main`'s own docs) or for a brand-new window opened via `crate::title_bar::menu`'s
-    /// "New Window" row. `use_remembered_repo` disambiguates those two `None` cases from each
-    /// other - see [`Self::new_with_settings`]'s own docs for exactly what it controls; `Some`
-    /// makes it irrelevant either way, since an explicit path always wins.
     pub fn new(
         repo_path: Option<PathBuf>,
         use_remembered_repo: bool,
@@ -67,32 +54,6 @@ impl AdeApp {
     /// can each supply their own. Test instances get in-memory-only defaults and a `None` path,
     /// so [`Self::persist_settings`] is a genuine no-op for them, never a write to whatever
     /// machine happens to run `cargo test`.
-    ///
-    /// ## `repo_path`/`use_remembered_repo` (GitHub issue #90)
-    ///
-    /// `repo_path`:
-    /// - `Some(path)`: behaves exactly as this app always has - `path` is added and focused,
-    ///   unconditionally. `use_remembered_repo` has no effect in this case.
-    /// - `None`, `use_remembered_repo == true` (the real process-launch path, `Self::new`'s own
-    ///   `run` caller): looks at whatever [`repo::RepoState`] was just loaded into `repos` below
-    ///   for a real, still-existing last-focused repo
-    ///   ([`repo::RepoState::last_focused_existing_path`]) and focuses that one if there is one -
-    ///   "the app remembers the last-opened folder and reopens it automatically next launch". If
-    ///   there is no such repo (nothing was ever persisted, or the remembered directory has since
-    ///   been deleted/moved), the window opens in a genuinely empty state instead: no crash, no
-    ///   silent fallback to a hardcoded path, just [`Self::focused_repo`] staying `None`.
-    /// - `None`, `use_remembered_repo == false` (`crate::title_bar::menu`'s "New Window" row):
-    ///   always a genuinely empty state, even if a real last-focused repo *is* on record - the
-    ///   issue's own words are explicit that a new window opens empty, "not" whatever folder the
-    ///   window it was opened from happens to have open.
-    ///
-    /// A genuinely empty window ([`Self::focused_repo`] left `None`) skips every single-repo-
-    /// scoped piece of startup work below that would otherwise need a real path to run against -
-    /// no initial shell agent is spawned, and `Self::load_worktrees`/`load_file_tree`/`load_diff`/
-    /// `start_status_polling`/`start_worktree_watch` are never called at all. [`Render`]'s own
-    /// `AdeApp` impl (`crate::root::mod`) renders a dedicated empty-state view instead of the
-    /// three-zone workspace body whenever [`Self::focused_repo`] is `None` - see
-    /// `Self::render_empty_state`'s own docs.
     pub(crate) fn new_with_settings(
         repo_path: Option<PathBuf>,
         use_remembered_repo: bool,
@@ -989,12 +950,6 @@ impl AdeApp {
     /// `Self::start_worktree_watch`) - there is no separate "optimistic insert" that patches
     /// [`Self::worktrees`] directly anywhere else in this crate, so the panel can never diverge
     /// from a real `git worktree list --porcelain` re-parse.
-    ///
-    /// Also runs [`crate::rail::worktrees::recover_selection`] against the previously selected
-    /// worktree (by path - the only stable identity a worktree has across a refresh) every time:
-    /// still present and usable → [`Self::selected`] is remapped to its new index with no other
-    /// effect; gone or newly broken → falls back to the main worktree and sets
-    /// [`Self::worktree_selection_notice`]. See that function's docs for the full state machine.
     pub(crate) fn load_worktrees(&mut self, cx: &mut Context<Self>) {
         self.load_worktrees_with_intent(WorktreeLoadIntent::Refresh, cx);
     }
@@ -1003,19 +958,6 @@ impl AdeApp {
     /// selected* a moment earlier - the second half of [`Self::load_worktrees_for_opened_repo`]'s
     /// own contract, split out so the "which worktree" decision and the "spawn into it" step are
     /// visibly separate steps rather than one tangled block.
-    ///
-    /// Spawns into [`Self::current_worktree_path`] and refuses outright when that is `None`, which is
-    /// the whole point: there is no such thing as a tab attributed to a repo rather than to a
-    /// worktree, so if nothing real is selected there is nothing legitimate to spawn. (Today the
-    /// caller has already either selected a real worktree or fallen into
-    /// `current_worktree_path`'s one documented last resort, so `None` here means the repo stopped
-    /// being focused entirely between the fetch being issued and it landing - a real race, worth
-    /// refusing rather than guessing through.)
-    ///
-    /// Idempotent against a worktree that already has a real agent open - a repo revisited after
-    /// being unfocused keeps whatever agents it already had running (see
-    /// [`crate::root::AdeApp::open_repo_in_current_window`]'s cross-repo persistence docs), so
-    /// this must never stack a redundant second shell onto one that is already there.
     fn spawn_initial_shell_for_opened_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.current_worktree_path() else {
             return;
@@ -1034,7 +976,6 @@ impl AdeApp {
                 cwd.clone(),
                 self.settings.appearance.terminal_font_size,
                 self.settings.terminal.shell_override(),
-                // A shell, so no hook injection - `Agents::spawn` would discard one anyway.
                 None,
                 window,
                 cx,
@@ -1065,32 +1006,6 @@ impl AdeApp {
     /// [`Self::load_worktrees`] for the two real "this repo is being opened for genuine work"
     /// gestures - a CLI launch ([`Self::new_with_settings`]) and GitHub issue #90's "Open
     /// Folder…" ([`crate::root::AdeApp::open_repo_in_current_window`]).
-    ///
-    /// Both used to spawn their guaranteed initial shell *immediately*, into the bare repo path,
-    /// and leave [`Self::selected`] at `None` - so the tab that shell produced belonged to no
-    /// worktree at all and only rendered because [`Self::current_worktree_path`]'s old repo-root
-    /// fallback happened to coincide with the main worktree's own path. That is the reported bug
-    /// ("at the start of the program you select something and a tab bar has a terminal; then I
-    /// select a worktree and this is lost"), and its fix is not to patch the fallback but to make
-    /// the opening gesture do the real thing: resolve the repo's actual worktree list, genuinely
-    /// select the right worktree of it ([`crate::rail::worktrees::selection_for_opened_repo`]),
-    /// and spawn the initial shell into *that concretely-selected worktree*.
-    ///
-    /// The initial shell is therefore deliberately deferred until this real fetch lands rather
-    /// than spawned synchronously beforehand. `git worktree list --porcelain` is a background
-    /// call (this method never blocks the main thread on git - see [`Self::load_worktrees`]'s own
-    /// task), and there is genuinely nothing correct to spawn *into* until it answers: a
-    /// synchronous spawn would have to guess a cwd, and guessing the repo root is precisely the
-    /// bug being removed. The interim frame or two is a real, honest "focused repo, nothing
-    /// selected yet, empty tab strip" - not a fabricated tab - and [`Self::rail_focus_handle`]
-    /// holds keyboard focus meanwhile so no frame ever renders with `Window::focus` dangling.
-    ///
-    /// Seeding synchronously from already-known data (the trick
-    /// [`Self::select_worktree_by_path`]'s cross-repo case uses) is deliberately *not* used here:
-    /// that case can only work because the row the user clicked was itself rendered from a
-    /// [`crate::rail::repo::Repo::worktrees`] list that had already been fetched. A repo being
-    /// opened for the first time has no such list by definition, so there would be nothing real
-    /// to seed from in exactly the case that matters.
     pub(crate) fn load_worktrees_for_opened_repo(
         &mut self,
         opened_path: PathBuf,
@@ -1241,21 +1156,6 @@ impl AdeApp {
     /// focused_repo`] and the single-slot [`Self::worktrees`] field the file tree/diff/agent-
     /// spawn machinery reads (see that field's own docs for why the two are deliberately kept
     /// separate rather than merged into one).
-    ///
-    /// Called once per newly [`Self::add_repo`]-ed repo (so a freshly added repo shows a real
-    /// count within moments, rather than waiting for [`Self::start_repo_worktrees_polling`]'s own
-    /// [`REPO_WORKTREES_POLL_INTERVAL`] tick) and once per repo restored from `repos.toml` at
-    /// startup (`Self::new_with_settings`) - both real, one-time "get this repo a first real
-    /// answer promptly" calls, not part of the steady-state keep-fresh cadence itself.
-    ///
-    /// A no-op if `repo_id` isn't (or is no longer) a known repo - defensive, matching every
-    /// other `RepoId`-keyed lookup in this crate. On a genuine fetch failure (an inaccessible or
-    /// since-deleted path - `wt_core::list_worktrees_porcelain` itself already reports that as a
-    /// real `Err`, never a panic), this still marks the repo [`Repo::worktrees_loaded`] `true`
-    /// with an empty list: the identical "attempted, got a definitive (if disappointing) answer"
-    /// contract [`Self::load_worktrees`] already applies to the focused repo's own [`Self::
-    /// worktrees_error`] case, so a broken repo shows a real, honest "no worktrees" rather than
-    /// spinning on "not loaded yet" forever.
     pub(crate) fn load_repo_worktrees(&mut self, repo_id: RepoId, cx: &mut Context<Self>) {
         let Some(path) = self
             .repos
@@ -1290,28 +1190,6 @@ impl AdeApp {
     /// (see that method's docs) plus the real filesystem watcher/poll fallback ([`Self::
     /// start_worktree_watch`]); fetching it a second time here would be genuine duplicate `git`
     /// subprocess work for data this app already has.
-    ///
-    /// Started once, at startup (`Self::new_with_settings`) - unlike [`Self::
-    /// start_worktree_watch`]/[`Self::start_status_polling`], this loop is never restarted on a
-    /// repo switch, since it reads [`Self::repos`]/[`Self::focused_repo`] fresh on every tick
-    /// rather than closing over one repo's path at spawn time; one instance already serves
-    /// however many repos are added, for the whole life of the window.
-    ///
-    /// ## Cadence
-    ///
-    /// Ticks every [`REPO_WORKTREES_POLL_INTERVAL`] - see that constant's own docs for why it is
-    /// deliberately slower than [`STATUS_POLL_INTERVAL`].
-    ///
-    /// ## Concurrency cap
-    ///
-    /// Firing one real `git worktree list` subprocess per non-focused repo *simultaneously* on
-    /// every tick would be unbounded process-spawn cost for a user with many repos added. Each
-    /// tick instead splits the due repos into fixed-size batches of [`REPO_WORKTREES_FETCH_CONCURRENCY`]
-    /// (`crate::rail::repo::batch_repos_for_refresh` - see its own docs/tests for the exact
-    /// chunking), spawning one batch's real subprocesses concurrently on the background executor
-    /// and fully awaiting all of them before starting the next batch - so no more than
-    /// [`REPO_WORKTREES_FETCH_CONCURRENCY`] of this sweep's own `git` processes are ever in
-    /// flight at once, regardless of how many repos are due.
     pub(crate) fn start_repo_worktrees_polling(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             'outer: loop {
@@ -1386,9 +1264,6 @@ impl AdeApp {
     /// worktree list, offloaded to the background executor (`crate::rail::state::disk_usage_bytes`).
     /// Run once per worktree-list load, not on the 3s status-poll cadence - a `std::fs` walk per
     /// worktree every 3s would be needless cost for numbers that rarely change.
-    ///
-    /// [`Self::disk_usage`] (the rail footer's aggregate) is always derived from the same
-    /// per-path map the Settings › Worktrees page reads - one computation, two consumers.
     pub(super) fn load_disk_usage(&mut self, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self
             .worktrees
@@ -1450,21 +1325,6 @@ impl AdeApp {
     }
 
     /// Walks [`Self::file_tree_root`] and applies the result, off the foreground thread.
-    ///
-    /// GitHub issue #160 removed this walk's entry cap ("File tree should load all folders and
-    /// files"), so the amount of work here is now bounded only by what is actually on disk. Two
-    /// steps run on `gpui::BackgroundExecutor` because of it, not one:
-    ///
-    /// 1. the walk itself (`file_tree::build_file_tree`), as it always has; and
-    /// 2. the palette's file-candidate list, which allocates a
-    ///    `crate::palette::state::FileCandidate` per file and used to be built by
-    ///    [`Self::rebuild_palette_file_candidates`] right here in the completion handler - on the
-    ///    foreground thread, which was one of the two real costs the old cap existed to bound.
-    ///
-    /// The diff marks those candidates carry are snapshotted between the two
-    /// (`palette::render::file_diff_marks`), on the foreground, because they live on `self`. That
-    /// snapshot is bounded by the *diff's* size (tens of files), not the tree's, so it is the one
-    /// piece of this that stays on the foreground thread and is genuinely cheap there.
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.set_file_tree_root(root.clone(), cx);
         let task = cx.spawn(async move |this, cx| {
@@ -1555,27 +1415,6 @@ impl AdeApp {
     /// previously watching the worktree just left - `Self::set_file_tree_root`'s own early
     /// return is what keeps this from happening on every unrelated `load_file_tree` call, not
     /// this method itself re-checking anything.
-    ///
-    /// A no-op (clearing both fields rather than starting anything) unless both:
-    /// - `root` is really part of a git worktree (production never has a non-git
-    ///   [`Self::file_tree_root`] - see
-    ///   `crate::sidebar::file_tree_watch::spawn_file_tree_watcher`'s own docs on that gate), and
-    /// - [`Self::settings_path`] is real (`Some`) - the same "this is a real, persisted session,
-    ///   not a throwaway test instance" signal [`Self::persist_settings`] already gates its own
-    ///   real disk write on (see that method's own docs).
-    ///
-    /// Both checks matter operationally, not just semantically: a real, reproduced regression
-    /// found while building this - a real `notify::RecommendedWatcher` OS thread/instance spun
-    /// up for essentially every one of this crate's own GPUI tests (the overwhelming majority
-    /// construct an `AdeApp` against a real git repo purely for unrelated reasons, e.g. `wt_core`
-    /// diff/merge/undo coverage, with a `None` settings path per `root::focus::palette_focus_
-    /// tests::open_test_app`'s own docs) - was enough cumulative resource pressure, across a full
-    /// `cargo test` run, to start starving `crate::rail::worktree_watch`'s own real-OS-thread-
-    /// driven tests past their real-time budget. The `settings_path` check alone would already
-    /// fix that (it's `None` for effectively every test but the handful that deliberately opt
-    /// into a real settings path to test real persistence), but the git-repo check is kept too
-    /// since it's independently correct for production, matching
-    /// `crate::rail::worktree_watch::spawn_worktree_watcher`'s own identical gate.
     pub(crate) fn start_file_tree_watch(&mut self, cx: &mut Context<Self>) {
         let root = self.file_tree_root.clone();
         if self.settings_path.is_none() || wt_core::git_common_dir(&root).is_err() {
@@ -1631,56 +1470,12 @@ impl AdeApp {
     /// path the tab strip is scoped to, a new agent spawns into, and the rail draws its selected
     /// row from. See the module docs' "Agents/tabs" section for why this is resolved on demand
     /// rather than tracked as a per-tab "current worktree".
-    ///
-    /// ## Why this returns `Option`
-    ///
-    /// This used to be infallible, falling back to [`Self::focused_repo_path`] whenever
-    /// [`Self::selected`] was `None`. That fallback was the shared root cause of a family of
-    /// reported bugs - the same underlying flaw as the three already fixed on this branch, not a
-    /// separate one - because *a repo root is not a worktree*. Concretely, live-reproduced:
-    ///
-    /// - **A real tab that no rail row claims.** Launching against a subdirectory of a repo
-    ///   (`jerry ./crates` - an entirely ordinary invocation) made this resolve to
-    ///   `<repo>/crates`, which `git worktree list --porcelain` reports as no worktree at all.
-    ///   The startup shell spawned there rendered a real tab in the strip while *every* rail row
-    ///   read as unselected, and the instant any worktree row was clicked the tab vanished with
-    ///   no path back - its `cwd` could never again equal any row's path, so the live PTY was
-    ///   permanently orphaned.
-    /// - **The rail, the tab strip, and the centre pane disagreeing three ways.** With
-    ///   [`Self::selected`] `None` but a real agent already open in the repo root, the rail drew
-    ///   its main-worktree row as selected (this fallback matched it), the tab strip drew that
-    ///   agent's tab (`Self::combined_tab_order` scoped to this same fallback), and the centre
-    ///   pane rendered nothing at all (`Agents::active` having been genuinely cleared).
-    /// - **The reported "I select a worktree and the startup terminal is lost."** The startup
-    ///   shell's tab showed only because this fallback happened to coincide with the main
-    ///   worktree's own path while nothing was selected - so the user never performed the
-    ///   selection that owned it, and had no model of where it went or that clicking the main
-    ///   row brings it back.
-    ///
-    /// `None` is therefore a real, honest state now - "no worktree is genuinely selected" - and
-    /// every caller renders it as such (an empty tab strip, an empty centre pane, no rail row
-    /// reading as selected, and no spawn) rather than silently substituting the repo root.
-    ///
-    /// ## The one documented last resort
-    ///
-    /// A focused repo whose worktree list has genuinely *landed* and contains nothing usable -
-    /// an unreadable path, or a directory that isn't a git repository at all, both of which
-    /// `wt_core::list_worktrees_porcelain` reports as a real `Err` that
-    /// [`Self::load_worktrees`] turns into an empty [`Self::worktrees`] - still resolves to the
-    /// repo root. This is a real error state, not the common path, and it is self-consistent in
-    /// a way the old blanket fallback never was: there are no worktree rows at all, so there is
-    /// no row that could disagree with it, and the repo root is the only honest place left to
-    /// work in. Gated on [`crate::rail::repo::Repo::worktrees_loaded`] specifically so the
-    /// window *before* the first fetch lands - when [`Self::worktrees`] is empty merely because
-    /// nothing has been asked yet - reports the honest `None` instead of briefly reintroducing
-    /// the very fallback this removes.
     pub(crate) fn current_worktree_path(&self) -> Option<PathBuf> {
         if let Some(item) = self.selected.and_then(|index| self.worktrees.get(index)) {
             if item.error.is_none() {
                 return Some(item.path.clone());
             }
         }
-        // See "The one documented last resort" above.
         let list_has_landed = self
             .focused_repo()
             .is_some_and(|repo| repo.worktrees_loaded);
@@ -1701,7 +1496,6 @@ impl AdeApp {
             return;
         };
         if item.error.is_some() {
-            // An unreadable entry has no usable path; nothing to select into.
             return;
         }
         let path = item.path.clone();
@@ -1755,32 +1549,12 @@ impl AdeApp {
     /// this window revolves around" - every piece of per-worktree/per-repo transient UI state
     /// this app has, reset, plus the real reload ([`Self::load_file_tree`]/[`Self::load_diff`]/
     /// [`Self::evict_stale_lsp_clients`]/a graph-tab refresh if open) against `new_root`.
-    ///
-    /// Two real callers, extracted here (an independent audit's own finding) so they can never
-    /// drift apart on which state gets reset: [`Self::select_worktree`] (switching worktrees
-    /// *within* the same repo) and [`Self::open_repo_in_current_window`] (GitHub issue #90's
-    /// "Open Folder", switching to an entirely different repo, or out of a genuinely empty
-    /// window). Both are the same real invariant - "nothing here may still point at whatever was
-    /// open before" - reached through different UI gestures; before this extraction,
-    /// `open_repo_in_current_window` only reset four of these fields
-    /// (`staged_files`/`open_change`/`expanded_dirs`/`selected_tree_path`), leaving every other
-    /// one - `tree_undo_stack`/`tree_redo_stack`, `tree_clipboard`, `tree_context_menu`, `tree_inline_edit`,
-    /// `discard_confirm_armed`, `prune_confirm_armed`, `commit_menu_open`, every file/LSP/blame
-    /// cache and in-flight task - armed against whatever repo was open *before* the folder was
-    /// switched. Concretely: arming a delete confirmation on `<old repo>/x`, opening a different
-    /// folder, and confirming the still-rendered modal used to delete inside the *old* repo.
-    ///
-    /// Callers are responsible for whatever is genuinely different between "switching worktrees"
-    /// and "switching repos" themselves: `self.selected`/`self.agents.activate_for_worktree`
-    /// (`select_worktree`) vs. `self.focused_repo`/spawning an initial agent
-    /// (`open_repo_in_current_window`) - this only owns the part identical to both.
     pub(crate) fn reset_repo_scoped_state(
         &mut self,
         new_root: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Browsing away disarms a pending prune confirmation - see `Self::request_prune`'s docs.
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         // Same reasoning for every floating menu (`crate::root::menus`): the commit composer's
@@ -2097,46 +1871,6 @@ impl AdeApp {
     /// Selects a worktree by its real path (rather than an index into [`Self::worktrees`], which
     /// the rail's rows don't carry) - the click handler behind every worktree row in the rail
     /// (`crate::rail::render::AdeApp::render_worktree_row`).
-    ///
-    /// ## Cross-repo
-    ///
-    /// [`Self::worktrees`] only ever holds the **focused** repo's own live list, so the plain
-    /// index lookup below can only ever find a worktree of the repo already showing. That used to
-    /// be this method's whole body, and it was fine right up until the multi-repo rail landed: a
-    /// non-focused repo's worktrees had no rendered rows to click (its group showed "not loaded
-    /// yet" instead), so the "path isn't in the list" branch was genuinely only ever a stale click
-    /// racing a reload. Now every added repo renders its own real, clickable worktree rows from
-    /// its own [`crate::rail::repo::Repo::worktrees`], and clicking one belonging to a *different*
-    /// repo silently did nothing at all - the reported "I can't switch from a worktree to another
-    /// repo's worktree".
-    ///
-    /// So a path not in [`Self::worktrees`] is now searched for across every added repo's own
-    /// worktree list, and finding it means this is a real cross-repo switch:
-    /// [`Self::checkout_repo_from_rail`] does the entire repo switch (cross-repo agent
-    /// persistence, [`Self::reset_repo_scoped_state`], the watchers, `Agents::activate_for_
-    /// worktree`) - nothing of it is reimplemented here - and then the specific worktree is
-    /// selected within it.
-    ///
-    /// That second step needs [`Self::worktrees`] to already contain the target, and it does not:
-    /// `checkout_repo_from_rail`'s own [`Self::load_worktrees`] call is a real *background* `git
-    /// worktree list --porcelain` fetch, so [`Self::worktrees`] still holds the repo just **left**
-    /// when it returns. Rather than chaining onto that fetch's completion, this seeds
-    /// [`Self::worktrees`] synchronously from the target repo's own already-fetched
-    /// [`crate::rail::repo::Repo::worktrees`] - the exact same data, from the exact same
-    /// `list_worktrees_porcelain` call, kept fresh in the background by
-    /// [`Self::load_repo_worktrees`]/[`Self::start_repo_worktrees_polling`], and the very list the
-    /// row that was just clicked was rendered from in the first place. Selecting against it is
-    /// therefore selecting against precisely what the user saw and clicked, which a continuation
-    /// racing a fresh fetch would not guarantee. The in-flight fetch is not wasted or cancelled:
-    /// it lands moments later and overwrites this seed with an equally real, slightly newer list,
-    /// and because the selection below is recorded *before* it does,
-    /// `crate::rail::worktrees::recover_selection` re-anchors it by path - so a worktree that
-    /// really did vanish between the seed and the fetch falls back to main with a real notice,
-    /// exactly as it would for any other refresh, instead of leaving a dangling index.
-    ///
-    /// Still does nothing at all when `path` isn't found in *any* repo - a stale click racing a
-    /// reload, or a worktree removed on disk since the last render - which is the same documented
-    /// fallback the focused-repo-only version already had.
     pub(crate) fn select_worktree_by_path(
         &mut self,
         path: &std::path::Path,
@@ -2176,29 +1910,6 @@ impl AdeApp {
 /// survive that (its absolute path simply never matches anything in the new tree, so nothing
 /// would ever remove it). A free, `gpui`-free function so this is unit-testable without constructing an
 /// `AdeApp`.
-///
-/// `staged_files` is cleared here too, but only as the *synchronous* half of a two-step reset:
-/// this stops the worktree just left's staged set from flashing on screen for the frame or two
-/// before the new worktree's own diff lands, but it is not itself where the new worktree's real
-/// staged set comes from. `AdeApp::select_worktree` calls `AdeApp::load_diff` immediately after
-/// this function returns, and `load_diff`'s own background task re-derives `staged_files` from a
-/// real `git diff --cached --name-only` (`wt_core::stage::staged_paths`) against the worktree
-/// being switched *to* - so a file already staged in the real index before Jerry ever opened this
-/// worktree reads as staged once the load lands, rather than this reset leaving it looking
-/// unstaged forever (see `load_diff`'s own docs for why this is a live re-query on every diff
-/// load, not a per-worktree cache).
-///
-/// **Deliberately does *not* touch `open_files`/`edit_buffers` anymore.** Both moved to real,
-/// per-worktree-keyed storage (`AdeApp::open_files_by_worktree`, keyed by
-/// [`AdeApp::file_tree_root`]; `AdeApp::edit_buffers`, keyed by `(file_tree_root, path)`) -
-/// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3's explicit requirement that
-/// each worktree remembers its own open files, and that an unsaved edit must survive fluidly
-/// hopping between worktrees rather than being silently discarded. Clearing them here used to be
-/// how this function kept one worktree's tabs/buffers from leaking into another's; now that both
-/// are looked up *through* the worktree they belong to, the worktree switch happening around this
-/// call (`AdeApp::select_worktree` reassigning `file_tree_root` a few lines below) is itself what
-/// makes the old worktree's entries stop being "current" - nothing here needs to delete them, and
-/// deleting them would be exactly the silent data loss this revision set out to fix.
 pub(super) fn reset_per_worktree_ui_state(
     staged_files: &mut HashSet<PathBuf>,
     open_change: &mut Option<PathBuf>,
@@ -2302,10 +2013,6 @@ mod tests {
         assert!(additional_tree_selection.is_empty());
     }
 
-    /// [`AdeApp::open_files`]/[`AdeApp::open_files_mut`] resolve through
-    /// [`AdeApp::open_files_by_worktree`], keyed by [`AdeApp::file_tree_root`] - a worktree that
-    /// has never opened a file reads as a real empty slice, and two different worktree keys never
-    /// see each other's entries.
     #[test]
     fn open_files_by_worktree_keeps_each_worktree_s_tabs_independent() {
         let mut open_files_by_worktree: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -2336,8 +2043,6 @@ mod tests {
         );
     }
 
-    /// `edit_buffers` is keyed by `(worktree, worktree-relative path)` - a same-named file open
-    /// with different unsaved content in two worktrees must never collide or merge.
     #[test]
     fn edit_buffers_composite_key_never_collides_across_worktrees() {
         let mut edit_buffers: HashMap<(PathBuf, PathBuf), edit_buffer::EditBuffer> = HashMap::new();
@@ -2525,10 +2230,6 @@ mod load_worktrees_integration_tests {
         assert_eq!(locked.lock_reason.as_deref(), Some("on a USB drive"));
     }
 
-    /// The real reproduction of the issue's "prunable / missing worktree" case: the working
-    /// directory is deleted by hand, not via `git worktree remove` - `git` itself (not a guess
-    /// on this app's side) is what flags it prunable, and a refresh must mark it broken rather
-    /// than silently listing it as a healthy, selectable row.
     #[gpui::test]
     fn a_manually_deleted_worktree_directory_is_marked_broken_after_a_refresh(
         cx: &mut TestAppContext,
@@ -2599,10 +2300,6 @@ mod load_worktrees_integration_tests {
         );
     }
 
-    /// GitHub issue #12's own acceptance criterion: "the currently active worktree stays
-    /// highlighted across refreshes; if it disappears, the user is notified and the selection
-    /// falls back to the main worktree" - proven here against a *real* `wt_core::remove_worktree`
-    /// call, not a directly-mutated `worktrees` vec.
     #[gpui::test]
     fn selecting_a_worktree_then_really_removing_it_falls_back_to_main_with_a_notice(
         cx: &mut TestAppContext,
@@ -2725,9 +2422,6 @@ mod multi_repo_worktree_loading_tests {
         );
     }
 
-    /// The core ask: repo B is added but never focused, yet its own real worktree list still
-    /// loads in the background and lands in `AdeApp::repos` once the fetch resolves - not just
-    /// the currently focused repo A's.
     #[gpui::test]
     fn a_non_focused_repos_worktrees_load_in_the_background(cx: &mut TestAppContext) {
         let repo_a = init_repo();
@@ -2786,11 +2480,6 @@ mod multi_repo_worktree_loading_tests {
         });
     }
 
-    /// A repo whose path becomes inaccessible before its first real fetch resolves must not
-    /// panic, and must still land on a real, definitive answer (`worktrees_loaded: true`, an
-    /// empty list) rather than spinning on "not loaded yet" forever - the identical honest
-    /// "attempted, got a disappointing but real answer" contract `AdeApp::load_worktrees` already
-    /// gives the focused repo's own `AdeApp::worktrees_error` case on a real fetch failure.
     #[gpui::test]
     fn a_repo_whose_path_disappears_before_its_first_load_does_not_panic(cx: &mut TestAppContext) {
         let repo_a = init_repo();
@@ -2826,10 +2515,6 @@ mod multi_repo_worktree_loading_tests {
         });
     }
 
-    /// The cadence contract: a non-focused repo's worktree list must not be refetched before it
-    /// has genuinely gone stale (`REPO_WORKTREES_POLL_INTERVAL`), and must be refetched once that
-    /// interval elapses - proven with a real `git worktree add` landing between the two checks,
-    /// so "unchanged" and "changed" both mean something real rather than an unobservable no-op.
     #[gpui::test]
     fn a_non_focused_repos_worktrees_are_not_refetched_before_the_poll_interval_elapses(
         cx: &mut TestAppContext,
@@ -2854,7 +2539,6 @@ mod multi_repo_worktree_loading_tests {
             );
         });
 
-        // A real new worktree lands in repo B's real git metadata...
         add_worktree(repo_b.path(), "feature", "added-wt");
 
         // ...but less than a full poll interval has elapsed since repo B's last real fetch, so
@@ -2897,13 +2581,6 @@ mod multi_repo_worktree_loading_tests {
         });
     }
 
-    /// The real concurrency cap end to end, with more due repos than
-    /// `REPO_WORKTREES_FETCH_CONCURRENCY`: one real sweep still drains every batch to completion
-    /// - not just the first cap-sized chunk - proven with a real change landing in *every* extra
-    /// repo, which only the periodic sweep (not each repo's own already-completed, one-shot
-    /// `add_repo`-time fetch) can ever observe. `crate::rail::repo::batch_repos_for_refresh`'s own
-    /// unit tests prove the exact chunk sizes the cap produces; this proves the sweep built on
-    /// top of it actually processes every one of those chunks, not just the first.
     #[gpui::test]
     fn the_periodic_sweep_refreshes_every_repo_even_with_more_than_the_concurrency_cap(
         cx: &mut TestAppContext,

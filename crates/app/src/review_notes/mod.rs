@@ -1,40 +1,6 @@
 //! Diff-line review notes (GitHub issue #288): line-anchored comments on a diff, **batched** into
 //! one prompt, delivered to a **named** agent's pty, and **kept pinned** afterwards so the
 //! revision can be checked against them.
-//!
-//! Spec of record: `design_handoff_jerry_ade/revision 5/AUDIT-2026-08-13-competitive-v2.md`
-//! §6 top-5 #2, `STAGE-A-CHANGELOG.md` §1 (the two `§6.2` rows) and §3's verification list, and
-//! `Jerry.dc.html`'s `Review · uncommitted` state for the markup.
-//!
-//! ## The three rules, and where each one lives
-//!
-//! The audit is explicit that this is Orca's `Annotate AI Diff` *"including the parts they learned
-//! the hard way"*, and it names three:
-//!
-//! 1. **Batch.** *"sending comments one at a time causes the agent to swing back and forth"*.
-//!    [`prompt`] composes every note on the file into **one** string, and
-//!    [`crate::terminal::pane::TerminalPane::send_prompt`] delivers it with exactly **one**
-//!    submit byte. That is not a convention here, it is a checked invariant - see `send_prompt`'s
-//!    own docs for the real, reachable way a multi-line payload would otherwise become N separate
-//!    messages, and the refusal that stops it.
-//! 2. **Send from the top of the diff.** [`render`]'s notes bar, above the hunks.
-//! 3. **Keep them pinned after the revision.** [`flow`]'s send path only ever *sets*
-//!    [`ReviewNote::sent`]; there is no code path anywhere in this folder that removes a note as
-//!    a consequence of sending one.
-//!
-//! ## Layout
-//!
-//! Split the way every feature folder in this crate is (see `crate::provenance`'s own docs):
-//!
-//! - this file - the pure, GPUI-free model: what a note is, what it is anchored to, and the
-//!   draft/sent state machine.
-//! - [`prompt`] - the pure composition of a batch of notes into the one string that goes down the
-//!   pty, including the two delivery forms and the sanitisation that keeps a note's text from
-//!   ever being read as terminal control input.
-//! - [`persist_state`] - `review-notes.toml`, so a note survives closing the file and the app.
-//! - [`flow`] - the `impl AdeApp` glue: toggling a note on a line, typing into one, resolving the
-//!   target agent, and the send itself.
-//! - [`render`] - the notes bar and the pinned card. The only module here that knows a colour.
 
 pub mod flow;
 #[cfg(test)]
@@ -47,18 +13,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Which line of a diff a note is pinned beneath.
-///
-/// **Not a row index.** `Jerry.dc.html`'s own `noteDefs` key notes by their position in the
-/// rendered line array, which is fine for a mock whose diff never changes and fatal here: this
-/// app re-reads the working tree constantly, and a row index would silently re-anchor every note
-/// on a file the moment a hunk above it grew by a line. The issue's requirement is that notes are
-/// *"keyed per worktree + path + line"*, and the only stable meaning of "line" in a unified diff
-/// is a **file** line number.
-///
-/// Two variants rather than one number, because a unified diff has two line-number columns and a
-/// removed line genuinely has no new-file number at all. *"Why did you delete this?"* is a real
-/// review note, so removed lines have to be annotatable; collapsing both columns into one integer
-/// would make old line 7 and new line 7 the same anchor, which they are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NoteAnchor {
     /// A line that exists in the new file - an added line, or a context line.
@@ -70,11 +24,6 @@ pub enum NoteAnchor {
 impl NoteAnchor {
     /// The anchor for a diff line whose gutter numbers are `(old, new)` -
     /// `crate::sidebar::changes::hunk_line_numbers`' own output shape.
-    ///
-    /// New wins when both are present (a context line is a line of the file as it stands now).
-    /// `None` for a line with neither, which is not a shape git produces but is what the numbers
-    /// degrade to when they cannot be parsed - and a line whose own identity is unknown is a line
-    /// no note can honestly be pinned to.
     pub fn from_gutter(numbers: (Option<usize>, Option<usize>)) -> Option<NoteAnchor> {
         match numbers {
             (_, Some(new)) => Some(NoteAnchor::New(new)),
@@ -116,9 +65,6 @@ impl NoteAnchor {
 }
 
 /// The `draft`/`sent` mark on a card, and the word it renders as.
-///
-/// Derived from [`ReviewNote`] rather than stored beside it - see [`ReviewNote::mark`] for why
-/// that is the whole of the issue's "editing after send starts a new draft state" requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteMark {
     /// Written, not yet delivered - or delivered and since edited.
@@ -138,13 +84,6 @@ impl NoteMark {
 }
 
 /// One review note.
-///
-/// `sent` is **the exact text that was delivered**, not a boolean, and that is the whole of the
-/// issue's *"Editing after send starts a new draft state for that note"* requirement: with a
-/// boolean, editing a sent note would either leave it claiming `sent` (a lie - the agent never saw
-/// this wording) or clear the flag outright (also a lie - something *was* sent, and the review
-/// history is supposed to stay honest). Keeping the delivered wording means the card can go back
-/// to `draft` while still being able to say what the agent actually received.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewNote {
     /// What the note says right now.
@@ -166,11 +105,6 @@ impl ReviewNote {
     }
 
     /// The card's mark. `sent` **only** while what was delivered still says what this note says.
-    ///
-    /// Compared through [`delivered_form`] rather than by raw string equality, because the batch
-    /// does not deliver the buffer verbatim - it collapses control characters and whitespace runs
-    /// (`crate::review_notes::prompt`). Without that, a note containing a tab or a double space
-    /// would come back reading `draft` the instant it was sent, having changed not at all.
     pub fn mark(&self) -> NoteMark {
         match self.sent.as_deref() {
             Some(sent) if sent == delivered_form(&self.text) => NoteMark::Sent,
@@ -190,9 +124,6 @@ impl ReviewNote {
 
 /// How a note's text reads once the batch has composed it - the one place the model and
 /// [`prompt`] agree on what "the same note" means.
-///
-/// Re-exported from [`prompt`] rather than reimplemented, so [`ReviewNote::mark`]'s comparison and
-/// the string actually delivered can never drift apart.
 pub fn delivered_form(text: &str) -> String {
     prompt::sanitize(text.trim())
 }
@@ -214,10 +145,6 @@ impl NoteRef {
 }
 
 /// Every review note this window is holding, keyed worktree -> path -> anchor.
-///
-/// Nested rather than flat, for the same two reasons `crate::provenance::store` is: the persisted
-/// shape is the same nesting, and every real read here is *"the notes on this one open file"*,
-/// which a flat map would have to scan for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NoteStore {
     worktrees: BTreeMap<PathBuf, BTreeMap<PathBuf, BTreeMap<NoteAnchor, ReviewNote>>>,
@@ -292,11 +219,6 @@ impl NoteStore {
     }
 
     /// Removes a note. Returns whether one was really there.
-    ///
-    /// The **only** removal path in this folder, and it is reachable from exactly two places -
-    /// a card that lost focus with nothing typed into it, and the explicit toggle-off of such a
-    /// card. Nothing about sending calls it: *"it never clears the notes"* is structural here,
-    /// not a rule the send path has to remember.
     pub fn remove(&mut self, worktree: &Path, path: &Path, anchor: NoteAnchor) -> bool {
         let Some(files) = self.worktrees.get_mut(worktree) else {
             return false;
@@ -324,12 +246,6 @@ impl NoteStore {
 
     /// Records that every deliverable note on this file has just been sent, exactly as it reads
     /// now. Returns how many notes were marked.
-    ///
-    /// Blank cards are deliberately skipped rather than marked: nothing about them went down the
-    /// pty, so nothing about them may claim to have.
-    ///
-    /// Real sends go through [`Self::mark_sent_as`] instead - see its docs for why the *delivered*
-    /// wording, not the buffer, is what belongs in [`ReviewNote::sent`].
     pub fn mark_sent(&mut self, worktree: &Path, path: &Path) -> usize {
         let Some(file) = self
             .worktrees
@@ -350,15 +266,6 @@ impl NoteStore {
     }
 
     /// The same, but recording **what the agent actually received** for each anchor.
-    ///
-    /// [`ReviewNote::sent`] is documented, here and in the persisted file, as *the exact text that
-    /// was delivered*, and the batched prompt does not deliver the buffer verbatim: it sanitises
-    /// control characters and collapses whitespace runs
-    /// (`crate::review_notes::prompt`). Marking with the buffer would make the card's own
-    /// "sent earlier, and since edited" tooltip quote wording the agent never saw - which is
-    /// precisely the dishonesty keeping the delivered wording exists to prevent.
-    ///
-    /// An anchor with no delivered entry is left alone: nothing about it went down the pty.
     pub fn mark_sent_as(
         &mut self,
         worktree: &Path,
@@ -385,11 +292,6 @@ impl NoteStore {
 
     /// The bar's own state for one file: how many real notes it carries, and whether every one of
     /// them has been delivered exactly as it currently reads.
-    ///
-    /// The second half is what makes the bar honest after an edit: `STAGE-A-CHANGELOG.md` §1 has
-    /// the bar flip to *"N notes sent — awaiting revision"* on send, and the issue then requires
-    /// that editing a sent note goes back to being a draft. A per-file boolean (which is what the
-    /// mock stores) would leave the bar claiming the agent had seen wording it never saw.
     pub fn file_state(&self, worktree: &Path, path: &Path) -> FileNoteState {
         let notes = self.deliverable(worktree, path);
         FileNoteState {
@@ -446,8 +348,6 @@ mod tests {
         PathBuf::from("src/api/users.rs")
     }
 
-    /// A context line has both numbers; the new one wins, because a context line is a line of the
-    /// file as it stands now and that is what an agent will go and read.
     #[test]
     fn a_line_with_both_numbers_anchors_to_the_new_file() {
         assert_eq!(
@@ -460,8 +360,6 @@ mod tests {
         );
     }
 
-    /// The half a single-integer key would have lost: a removed line is annotatable, and its
-    /// anchor is a different thing from the new-file line of the same number.
     #[test]
     fn a_removed_line_anchors_to_its_old_number_and_never_collides_with_a_new_one() {
         assert_eq!(
@@ -472,7 +370,6 @@ mod tests {
         assert_ne!(NoteAnchor::Old(7).encode(), NoteAnchor::New(7).encode());
     }
 
-    /// A line whose own identity is unknown carries no note, rather than one pinned to a guess.
     #[test]
     fn a_line_with_no_numbers_at_all_cannot_be_anchored() {
         assert_eq!(NoteAnchor::from_gutter((None, None)), None);
@@ -488,7 +385,6 @@ mod tests {
         assert_eq!(NoteAnchor::decode("new"), None);
     }
 
-    /// The exact acceptance sequence's state half, at the level the model decides it.
     #[test]
     fn a_note_is_draft_until_it_is_sent_and_sent_only_while_it_still_reads_that_way() {
         let mut store = NoteStore::default();
@@ -527,8 +423,6 @@ mod tests {
         );
     }
 
-    /// *"Editing after send starts a new draft state for that note"* - and the record of what was
-    /// really delivered survives the edit, which is the half a boolean flag would have thrown away.
     #[test]
     fn editing_a_sent_note_goes_back_to_draft_without_losing_what_was_actually_sent() {
         let mut store = NoteStore::default();
@@ -566,8 +460,6 @@ mod tests {
         );
     }
 
-    /// The requirement stated as a property of the type rather than of the send path: the store's
-    /// send-side operation cannot remove anything, whatever it is handed.
     #[test]
     fn marking_a_file_sent_never_removes_a_note() {
         let mut store = NoteStore::default();
@@ -584,7 +476,6 @@ mod tests {
         );
     }
 
-    /// A blank card is a click, not a note: it is never counted and never delivered.
     #[test]
     fn a_blank_card_is_not_a_note() {
         let mut store = NoteStore::default();
@@ -618,8 +509,6 @@ mod tests {
         assert_eq!(store.anchors(&wt(), &file()), vec![NoteAnchor::New(9)]);
     }
 
-    /// Notes on one file must never be visible on another, or in another checkout of the same
-    /// path - the issue's "keyed per worktree + path + line".
     #[test]
     fn notes_are_keyed_by_worktree_and_path_together() {
         let mut store = NoteStore::default();
@@ -630,8 +519,6 @@ mod tests {
         assert_eq!(store.deliverable(&wt(), &file()).len(), 1);
     }
 
-    /// Removing the last note on a path must not leave an empty shell behind that later reads as
-    /// "this file has notes".
     #[test]
     fn removing_the_last_note_leaves_no_empty_file_or_worktree_entry() {
         let mut store = NoteStore::default();

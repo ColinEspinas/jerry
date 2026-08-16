@@ -3,82 +3,6 @@
 //! and user-authored ones (`~/.config/jerry/themes/<slug>.toml`, GitHub issue #5) alike. There is
 //! no second, privileged mechanism for the bundled themes: they are the same files, parsed by the
 //! same code, validated by the same rules.
-//!
-//! ## The format
-//!
-//! A theme file names a theme, optionally a base theme to inherit from, and any subset of the
-//! app's real colour tokens, grouped into one TOML table per `crate::theme` module:
-//!
-//! ```toml
-//! name = "Midnight Coral"
-//! subtitle = "warm accent, dark base"
-//! base = "Jerry Dark"
-//! preview = ["#0c0d10", "#181a1e", "#5cb87f", "#e2a336", "#e07a5f"]
-//!
-//! [surface]
-//! window = "#0c0d10"
-//! card = "#181a1e"
-//!
-//! [syntax]
-//! keyword = "#ff79c6"
-//! string = "#f1fa8c"
-//! ```
-//!
-//! - **`name`** (required, non-empty, must not collide with a built-in theme's name).
-//! - **`subtitle`** (optional) - the one-line description shown under the name on a Themes card.
-//! - **`base`** (optional) - the name of another theme (built-in or custom) every key this file
-//!   *doesn't* name is inherited from. Omitted means "inherit nothing": anything unnamed falls
-//!   back to the compiled-in Jerry Dark default of that token
-//!   (`crate::theme::ColorToken::default`), which is also exactly what `base = "Jerry Dark"`
-//!   resolves to, since Jerry Dark *is* the compiled default palette. See [`compile_palette`] for
-//!   the real chain walk, including its cycle guard.
-//! - **`preview`** (optional) - the five swatches this theme's Themes-page card paints, purely
-//!   cosmetic. Omitted means they're read off the theme's own `surface.window`/`surface.rail`/
-//!   `status.review`/`status.ask`/`status.run` - see [`CustomTheme::preview_swatches`].
-//! - **every other table** is a `crate::theme` module (`surface`, `border`, `text`, `status`,
-//!   `syntax`, `term`, `diff`, `graph`, ...) and every key inside it is one of that module's real
-//!   tokens, lowercased: `[surface] window` is `theme::surface::WINDOW`, `[syntax]
-//!   function_method` is `theme::syntax::FUNCTION_METHOD`. `crate::theme::TOKEN_GROUPS` is the
-//!   complete, authoritative list, and an unknown table or key is a real, specific
-//!   [`ThemeFileError::UnknownKey`], never a silently-ignored typo.
-//!
-//! A `(fg, bg)` pair token is two keys (`[agent] sonnet.fg`/`sonnet.bg`), an array token one key
-//! per element (`[graph] lanes.0` .. `lanes.5`).
-//!
-//! Hex colours are `#rrggbb` (a leading `#`, exactly six hex digits) - `#rgb` shorthand, alpha
-//! channels, and named CSS colours are all rejected with a real, specific
-//! [`ThemeFileError::InvalidColor`] rather than guessed at.
-//!
-//! ## Partial by design
-//!
-//! A file naming three keys is a complete, valid theme - the other ~270 tokens simply keep coming
-//! from its `base` (ultimately Jerry Dark's own compiled defaults). This mirrors how a VSCode
-//! theme file works, and it is why the app's whole palette no longer has to be *derived* from a
-//! handful of swatches the way it was before this rewrite: a theme can now be as coarse or as
-//! precise as its author wants, one token at a time.
-//!
-//! The five bundled non-Jerry-Dark themes are, by contrast, *complete* files: they were generated
-//! (`crate::settings::builtin_themes`) by running the old HSL derivation over every registered
-//! token once and writing the literal results out, so they render bit-identically to what that
-//! derivation produced live, while now being ordinary, hand-editable files with no special status.
-//!
-//! ## Icon colours ride along for free; there is no separate icon-pack loader
-//!
-//! This app's own "icons" (`crate::sidebar::render::render_folder_icon`/`render_lang_chip`) are
-//! not a glyph/image-asset pack system - they're `div`-composed rectangles and 1-3 letter text
-//! labels coloured entirely by ordinary [`crate::theme::ColorToken`]s
-//! (`theme::surface::CHIP_NEUTRAL`, `theme::text::FAINT`/`GHOST`, `theme::lang::*`). Since every
-//! one of those tokens already resolves through the same live theme selection every other token
-//! does, a custom theme automatically re-colours the folder icon and every language chip too -
-//! and now, unlike before, a theme can give `[lang] rs.fg` its own colour directly.
-//!
-//! ## Storage: one file per theme, not one combined file
-//!
-//! Deliberately one file per theme (not a single `themes.toml` list) so [`export_theme_to_path`]
-//! can hand a user exactly one shareable file and [`import_theme_file`] can validate and adopt
-//! exactly one at a time - matching how someone would actually receive a theme from another user
-//! (a single attached/downloaded `.toml` file), and letting [`load_custom_themes_from_dir`] skip
-//! one malformed file without losing every other already-working custom theme in the directory.
 
 use std::collections::HashMap;
 use std::io;
@@ -92,10 +16,6 @@ use crate::theme;
 /// A defensive upper bound on a single theme file's size - see [`load_custom_themes_from_dir`]'s
 /// own docs for why. [`import_theme_file`] enforces this same cap against the *source* file it's
 /// about to import, not just files already sitting in a custom-themes directory.
-///
-/// 64 KiB was generous headroom for the old five-swatch format and is merely comfortable for this
-/// one: a *complete* generated palette (every one of the app's ~270 tokens, one `key = "#rrggbb"`
-/// line each, plus table headers) is around 8 KiB, so a real file still has ~8x room.
 const MAX_THEME_FILE_BYTES: u64 = 64 * 1024;
 
 /// The five keys a theme's Themes-page card previews when the file names no `preview` of its own -
@@ -113,18 +33,6 @@ const PREVIEW_KEYS: [&str; 5] = [
 /// The real text/background pairs a theme has to keep legible, checked against its own fully
 /// compiled palette by [`check_palette_readability`]. Each entry is
 /// `(what, foreground key, background key)`.
-///
-/// These are *text on the surface it is painted on*, which is what actually determines whether a
-/// theme can be read. An earlier version of this check compared two **surfaces** to each other
-/// (`surface.window` against `surface.card`) on the theory that a card indistinguishable from the
-/// window behind it is unusable. That turned out to be a real, user-reported functional bug rather
-/// than a safety net: it rejected Visual Studio Code's own current default theme, Dark Modern, on
-/// import - a theme used by millions - purely because it sets `editor.background` to `#1F1F1F` and
-/// `editorWidget.background` to `#202020`, one hex step apart. That is not an unreadable theme; it
-/// is a deliberate flat-surface design that separates regions with *borders* instead of brightness,
-/// and Jerry renders it perfectly well (`border.card` is its own token). Checking surface-against-
-/// surface encoded one of Jerry Dark's own design choices as a validity rule for everyone else's
-/// themes, which it never should have been.
 const READABILITY_PAIRS: [(&str, &str, &str); 2] = [
     ("body text", "text.body", "surface.window"),
     ("code", "syntax.text", "surface.center"),
@@ -133,16 +41,6 @@ const READABILITY_PAIRS: [(&str, &str, &str); 2] = [
 /// The minimum WCAG 2.x contrast ratio (as an integer hundredth, so
 /// [`ThemeFileError::LowContrast`] can stay `#[derive(Eq)]` - `f64` cannot) a theme's text has to
 /// keep against the surface it is painted on.
-///
-/// `1.6:1` is deliberately far below WCAG's own `4.5:1` "normal text" minimum, and that is a real,
-/// measured choice rather than a shrug. This is a *validity* floor whose only job is to reject a
-/// theme nobody could read at all - text the same colour as its background, or a hair off it - not
-/// an accessibility grade. Setting it near WCAG's number would reject a large fraction of real,
-/// widely used themes (and, for that matter, this app's own `syntax::COMMENT`, deliberately dim at
-/// a measured 3.03:1 in Jerry Dark - see `crate::theme::syntax_contrast_tests`). The real measured
-/// values this floor sits under: every bundled theme clears 5:1 on both pairs, and every VSCode
-/// default theme this crate imports in its own tests clears 8:1 - while identical
-/// foreground/background is exactly `1.0:1` and a couple-of-hex-digits miss lands near `1.1:1`.
 const MIN_CONTRAST_PER_HUNDRED: u32 = 160;
 
 /// WCAG 2.x relative luminance (<https://www.w3.org/TR/WCAG21/#dfn-relative-luminance>), applied
@@ -170,17 +68,6 @@ fn contrast_per_hundred(a: Rgba, b: Rgba) -> u32 {
 
 /// Checks a **fully compiled** palette - the theme's own entries layered over everything up its
 /// real `base` chain - for genuinely unreadable text/background pairs ([`READABILITY_PAIRS`]).
-///
-/// Taking a compiled palette is what makes this honest, and is the reason this check no longer
-/// lives inside [`CustomThemeFile::validate`]. Validation runs for the six built-in theme files
-/// from *inside* [`THEME_DEFS`]'s own `LazyLock` initializer, so anything there that needed to
-/// resolve a `base` by name would deadlock on that same `LazyLock` - which is why the old check
-/// evaluated a theme's own entries over *Jerry Dark's* defaults rather than over what the theme
-/// really resolves to. Moving the check to the two places that genuinely have the whole theme set
-/// ([`load_custom_themes_from_dir`] and [`validate_and_write`]) removes the reentrancy problem
-/// entirely instead of approximating around it: a key this palette doesn't name is now a key that
-/// really does render as `crate::theme::ColorToken::default`, so reading that default here is the
-/// exact truth rather than a stand-in for it.
 #[allow(clippy::expect_used)] // every `key` here is a real registered token
 pub fn check_palette_readability(palette: &theme::Palette) -> Result<(), ThemeFileError> {
     let resolved = |key: &str| -> Rgba {
@@ -404,14 +291,6 @@ pub(crate) fn slugify(name: &str) -> String {
 
 /// Flattens one `[module]` table's entries into `"{module}.{key}"` pairs, recursing through any
 /// nested sub-table.
-///
-/// The recursion is what makes the two natural spellings of a dotted key both work. A pair token's
-/// key is `agent.sonnet.fg`, and inside `[agent]` a hand-author can write it either as a quoted
-/// flat key (`"sonnet.fg" = "#d8a94a"`, what this module's own writer emits) or as the nested
-/// table TOML would otherwise read a bare dotted key as (`sonnet.fg = "#d8a94a"`, which TOML
-/// itself turns into `sonnet = { fg = ... }`). Accepting both is honest tolerance, not guesswork:
-/// they are the same document to TOML, and rejecting one of them would be rejecting a file the
-/// user reasonably wrote.
 fn collect_table(
     prefix: &str,
     table: &toml::Table,
@@ -437,13 +316,6 @@ impl CustomThemeFile {
     /// Parses one theme file's raw TOML text into this shape - structural checks only (is this
     /// even a TOML document of the right shape), never colour or key validation, which is
     /// [`Self::validate`]'s job.
-    ///
-    /// Hand-walked over a `toml::Table` rather than derived through `serde` on purpose: the format
-    /// is "four known scalar fields plus an open-ended set of `[module]` tables", which `serde`
-    /// can only express through `#[serde(flatten)]` - real, known to be fragile with `toml`
-    /// specifically (mixed scalar/table flattening, and a serializer that insists every value
-    /// precede every table). Walking the document directly is both simpler and lets every failure
-    /// carry the real offending key, which a flattened deserialize error would not.
     pub fn from_toml_str(contents: &str) -> Result<Self, ThemeFileError> {
         let document: toml::Table =
             toml::from_str(contents).map_err(|err| ThemeFileError::Parse(err.to_string()))?;
@@ -519,10 +391,6 @@ impl CustomThemeFile {
     /// initialized. Every other check still runs regardless. Built-in name uniqueness is instead
     /// guarded the ordinary way, by `crate::settings::state::tests::
     /// every_theme_def_name_is_unique_and_jerry_dark_is_the_default_named_theme`.
-    ///
-    /// Nothing here touches `THEME_DEFS` for any *other* reason, and nothing here walks the `base`
-    /// chain - see [`compile_palette`], which is where inheritance (and the deadlock-free ordering
-    /// that keeps it out of this function) really happens.
     pub(crate) fn validate_with_builtin_check(
         &self,
         check_builtin_collision: bool,
@@ -578,13 +446,6 @@ impl CustomTheme {
     /// file names one (every bundled theme does, so the cards look exactly as they always have),
     /// otherwise read off [`PREVIEW_KEYS`] - this theme's own entries where it has them, the
     /// compiled Jerry Dark default otherwise.
-    ///
-    /// Deliberately *not* a full [`compile_palette`] walk: a card is cosmetic, it is painted for
-    /// every loaded theme on every Themes-page frame, and compiling every theme's whole base chain
-    /// to draw five 34px rectangles would be real work for no real gain. The only case where this
-    /// differs from the fully-compiled truth is a partial hand-authored theme that inherits one of
-    /// those five keys from a non-Jerry-Dark base - which is exactly what the explicit `preview`
-    /// field exists for.
     #[allow(clippy::expect_used)] // every `key` in PREVIEW_KEYS is a real registered token
     pub fn preview_swatches(&self) -> [u32; 5] {
         if let Some(preview) = self.preview {
@@ -647,13 +508,6 @@ fn ordered_overrides(overrides: &HashMap<&'static str, Rgba>) -> Vec<(&'static s
 
 /// Writes one theme file's real TOML text - see [`crate::settings::theme_file_format`], which owns
 /// the layout, ordering and the comments derived from `crate::theme`'s own source.
-///
-/// Hand-written rather than `toml::to_string_pretty`d for two real reasons: it controls key
-/// *order* (a generated 270-key palette grouped and explained the way `crate::theme` itself is is
-/// genuinely hand-editable, while a serde-serialized map sorted arbitrarily is not), and it can
-/// carry comments at all, which `toml`'s serializer cannot. String values still go through
-/// `toml::Value`'s own real escaping, never a bare `format!`, so a name containing a quote or a
-/// backslash round-trips correctly.
 fn write_theme_toml(file: &CustomThemeFile) -> String {
     crate::settings::theme_file_format::write_theme_toml(file, DEFAULT_THEME_FILE_HEADER)
 }
@@ -666,22 +520,6 @@ pub(crate) const DEFAULT_THEME_FILE_HEADER: &str =
 /// Compiles `theme` into the real, flat [`crate::theme::Palette`] the live app resolves every
 /// colour token against: everything up its `base` chain first (root-most base first), then each
 /// theme's own explicit entries layered on top, so a nearer theme always wins.
-///
-/// `known` is every theme a `base` can name - built-in and custom alike (see
-/// [`compile_palette_by_name`], the one real caller in the app, which passes both).
-///
-/// Keys nothing in the chain ever names are simply absent from the returned palette: the token's
-/// own compiled default (`crate::theme::ColorToken::default`, i.e. Jerry Dark) is what
-/// `resolve()` falls back to, which is why `base = "Jerry Dark"` and no `base` at all compile to
-/// exactly the same thing.
-///
-/// ## The cycle guard is real, not decorative
-///
-/// A `base` chain is user-authored across independent files, so `A -> B -> A` (or a theme naming
-/// itself) is genuinely reachable by hand-editing two files, and would otherwise be an infinite
-/// loop or a stack overflow at *theme selection* time - i.e. a hang or a crash of the whole app,
-/// triggered by a text file. Every visited name is recorded; revisiting one is a real, reported
-/// [`ThemeFileError::BaseCycle`] carrying the actual chain.
 pub fn compile_palette(
     theme_def: &CustomTheme,
     known: &[&CustomTheme],
@@ -719,15 +557,6 @@ pub fn compile_palette(
 /// The real, live "which palette does the selected theme name compile to" lookup
 /// `crate::settings::render::AdeApp::apply_theme_selection` uses: finds `name` among the six
 /// built-in [`THEME_DEFS`] themes first, then `customs`, and compiles it against both sets.
-///
-/// `Ok(None)` means "Jerry Dark", the identity case - either because that is genuinely the
-/// selection, or because the compiled palette turned out to be empty (a theme that overrides
-/// nothing). `crate::theme::set_current_theme(None)` is exactly right for both, and skips a
-/// pointless per-token hash lookup on every resolve.
-///
-/// A name matching nothing at all is *not* an error here: it is only reachable through a
-/// hand-edited `settings.toml` or a custom theme file that has since been deleted, and falling
-/// back to Jerry Dark is the same real behaviour that case has always had.
 pub fn compile_palette_by_name(
     name: &str,
     customs: &[CustomTheme],
@@ -749,13 +578,6 @@ pub fn compile_palette_by_name(
 /// file - not a second, parallel parser. Only the built-in-collision half of that check is skipped
 /// (see [`CustomThemeFile::validate_with_builtin_check`]'s own docs for why that one specific
 /// check is self-referential here).
-///
-/// Panics on a malformed file. That's a real, deliberate choice, not a shortcut: these six files
-/// are compiled into the binary from this repository at build time (not user input reachable at
-/// runtime), and `crate::settings::builtin_themes`' own tests already prove every one of them
-/// parses, validates, and reproduces its intended palette exactly - a failure here could only mean
-/// a real, committed asset went bad, which should fail loudly rather than silently reducing the
-/// Themes page below six cards.
 #[allow(clippy::expect_used)] // panics only on a corrupt built-in asset - see doc comment above
 pub(crate) fn parse_builtin_theme_file_str(contents: &str) -> CustomTheme {
     let file = CustomThemeFile::from_toml_str(contents)
@@ -793,18 +615,6 @@ pub fn parse_theme_file_str(contents: &str) -> Result<CustomTheme, ThemeFileErro
 /// real error, prefixed with the file name, is appended to the returned tuple's second element so
 /// a caller can surface it (`crate::root::AdeApp::custom_theme_load_errors`) rather than a bad
 /// hand-edit quietly vanishing.
-///
-/// Two *different* files that both validate to the same theme `name` are also a real, reported
-/// skip, not two identically-named cards - `crate::settings::render::AdeApp::apply_theme_selection`'s
-/// own name-keyed lookup can only ever resolve to one of them anyway, and two GPUI elements
-/// sharing one `.id()` is a real rendering bug. Files are processed in a sorted-by-path order
-/// first, so which one "wins" a name collision is deterministic rather than dependent on
-/// `std::fs::read_dir`'s own unspecified iteration order.
-///
-/// A final pass compiles every surviving theme ([`compile_palette`]) purely to *check* it: a
-/// `base` naming a theme nobody loaded, or a chain that loops, is a real error reported against
-/// the offending file and the theme is dropped, rather than being left on the Themes page as a
-/// card that would fail (and silently fall back to Jerry Dark) the moment it was clicked.
 pub fn load_custom_themes_from_dir(dir: &Path) -> (Vec<CustomTheme>, Vec<String>) {
     let mut errors = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -904,12 +714,6 @@ pub fn load_custom_themes_from_dir(dir: &Path) -> (Vec<CustomTheme>, Vec<String>
 /// (not a byte-for-byte copy - see [`CustomTheme::to_toml_string`], so a source file with extra
 /// whitespace or key ordering still lands as a canonical file) into `dest_dir`. A malformed source
 /// file is rejected with a real [`ThemeFileError`] and nothing is written.
-///
-/// The destination filename ([`non_colliding_dest_path`]) is the theme's own slug when that's
-/// either free or already holds *this same* theme (an intentional "re-import to update") - but
-/// never a *different*, unrelated theme's file: an adversarial audit caught the first version of
-/// this function joining `dest_dir` with the bare slug unconditionally, so importing a theme whose
-/// slug happened to collide with an existing, differently-named file silently destroyed it.
 pub fn import_theme_file(
     source_path: &Path,
     dest_dir: &Path,
@@ -971,14 +775,6 @@ pub(crate) fn validate_and_write(
 /// a file that doesn't even parse as one, or a *dangling* symlink) means the slug is taken by
 /// something unrelated, so this tries `{slug}-2.toml`, `{slug}-3.toml`, ... until it finds either
 /// a free path or one already holding this same theme.
-///
-/// `symlink_metadata`, not `Path::exists` - an adversarial audit caught the original
-/// `candidate.exists()` here as a real vulnerability, not just a style nit: `exists()` follows
-/// symlinks and reports `false` for a *dangling* `{slug}.toml -> /some/other/path` symlink sitting
-/// in `dest_dir`, so this loop would treat that path as free, and the caller's own
-/// `std::fs::write` (which also follows symlinks) would then write straight through it into
-/// whatever it points at - a real clobber of an unrelated file, just staged via a symlink instead
-/// of a same-named regular file.
 fn non_colliding_dest_path(dest_dir: &Path, name: &str) -> PathBuf {
     let base_slug = slugify(name);
     let mut candidate = dest_dir.join(format!("{base_slug}.toml"));
@@ -1014,14 +810,6 @@ pub const CUSTOM_THEME_TEMPLATE_TOML: &str =
 /// bytes - comments and all - not a re-serialized [`CustomTheme::to_toml_string`] copy: the whole
 /// point of a "well-commented template" is that a user who clicks the button gets the same
 /// explanatory comments as one who copies the file straight out of the repository.
-///
-/// Uses the same [`non_colliding_dest_path`] collision handling [`import_theme_file`] does: a
-/// second click reuses (refreshes) the one file this already wrote, rather than spawning a `-2`
-/// sibling every time - *as long as that file's contents are still the pristine, unedited
-/// template*. An adversarial audit caught the original version of this function always overwriting
-/// that path unconditionally, silently losing a user's in-place edits. Fixed by checking the
-/// existing file's real bytes first: if they've diverged, this leaves the file untouched and hands
-/// back the user's own edited theme instead of clobbering it.
 pub fn write_template_theme(dest_dir: &Path) -> Result<CustomTheme, ThemeFileError> {
     let mut theme = parse_theme_file_str(CUSTOM_THEME_TEMPLATE_TOML)?;
     std::fs::create_dir_all(dest_dir).map_err(|err| ThemeFileError::Io(err.to_string()))?;
@@ -1100,7 +888,6 @@ keyword = "#ff79c6"
         assert_eq!(theme.source_path, None);
     }
 
-    /// A file may name as few keys as it likes - the whole point of the partial-override format.
     #[test]
     fn a_file_naming_a_single_key_is_a_real_complete_theme() {
         let theme =
@@ -1179,8 +966,6 @@ keyword = "#ff79c6"
         assert!(matches!(err, ThemeFileError::Parse(_)));
     }
 
-    /// A real round trip through this module's own writer and reader - the property
-    /// `import_theme_file`/`export_theme_to_path` depend on.
     #[test]
     fn a_theme_round_trips_through_to_toml_string_and_back_byte_for_byte() {
         let theme = valid_file().validate().expect("should validate");
@@ -1197,11 +982,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// The writer's own escaping is real, not a `format!("{s}")` that would produce a file this
-    /// module could never read back.
-    /// The writer groups by table itself rather than trusting its input's ordering - an
-    /// out-of-order entry list must still produce a file TOML (and this module) can read back,
-    /// not one with a duplicate table header.
     #[test]
     fn the_writer_groups_tables_even_when_the_entries_arrive_interleaved() {
         let file = CustomThemeFile {
@@ -1279,8 +1059,6 @@ keyword = "#ff79c6"
 
     // ---- readability ------------------------------------------------------------------------
 
-    /// A palette whose body text is literally the same colour as the surface behind it is the real
-    /// unreadable case this check exists for.
     #[test]
     fn text_the_same_colour_as_its_background_is_rejected() {
         let mut palette = theme::Palette::new();
@@ -1299,8 +1077,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// A real near-miss, not just the identical-colour extreme: a hand-author could easily mistake
-    /// this for "different enough", but it is still unreadable.
     #[test]
     fn text_a_few_hex_digits_off_from_its_background_is_still_rejected() {
         let mut palette = theme::Palette::new();
@@ -1315,8 +1091,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// The code surface is checked independently of the chrome - a theme can be perfectly legible
-    /// in its panels and still have unreadable code.
     #[test]
     fn unreadable_code_is_caught_even_when_the_chrome_reads_fine() {
         let mut palette = theme::Palette::new();
@@ -1329,10 +1103,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// The real regression for the user-reported bug this check was redesigned around: a flat
-    /// surface design - every surface within a hex step or two of the others, separation carried
-    /// by borders instead of brightness, exactly how VSCode's own Dark Modern is built - is a
-    /// perfectly readable theme and must not be rejected.
     #[test]
     fn a_flat_surface_design_with_readable_text_is_accepted() {
         let mut palette = theme::Palette::new();
@@ -1347,8 +1117,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// An empty palette is Jerry Dark itself - trivially readable, and the case every partial
-    /// theme file that names no text or surface keys at all lands on.
     #[test]
     fn an_empty_palette_is_jerry_dark_and_reads_fine() {
         assert!(check_palette_readability(&theme::Palette::new()).is_ok());
@@ -1369,9 +1137,6 @@ keyword = "#ff79c6"
         }
     }
 
-    /// Pins the real measured headroom every bundled theme has over the floor - so a future edit
-    /// that quietly weakened the floor, or a palette change that quietly ate the margin, shows up
-    /// as a real test failure rather than passing on a technicality.
     #[test]
     fn every_built_in_theme_clears_the_floor_with_real_headroom() {
         for def in THEME_DEFS.iter() {
@@ -1440,18 +1205,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// GitHub issue #208's custom-theme half. A user's own theme file almost never mentions the
-    /// terminal at all, so what it renders the terminal with is entirely a question of inheritance
-    /// - and it must resolve to something real and coherent either way:
-    ///
-    /// - a theme based on a bundled one gets *that theme's* terminal, so a custom theme built on
-    ///   Paper gets Paper's light terminal rather than Jerry Dark's dark one;
-    /// - a theme based on nothing gets Jerry Dark's own compiled defaults, the same as every other
-    ///   key it doesn't name.
-    ///
-    /// Nothing terminal-specific makes this true - it is the same generic `base`-chain layering
-    /// every other token already gets - which is exactly the point of asserting it: these tokens
-    /// really are ordinary registry entries, not a second mechanism.
     #[test]
     fn a_custom_theme_that_names_no_terminal_colours_inherits_its_bases() {
         let builtins: Vec<&CustomTheme> = THEME_DEFS.iter().map(|def| def.theme).collect();
@@ -1555,8 +1308,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// A real, loaded-from-disk broken base chain is reported against its own file and the theme
-    /// is dropped, rather than left as a card that fails when clicked.
     #[test]
     fn load_custom_themes_from_dir_reports_and_drops_a_theme_with_a_broken_base() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1601,7 +1352,6 @@ keyword = "#ff79c6"
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("good.toml"), MIDNIGHT_CORAL).expect("write good file");
         std::fs::write(dir.path().join("bad.toml"), "not valid toml {{{").expect("write bad file");
-        // Non-`.toml` files are ignored entirely, not treated as errors.
         std::fs::write(dir.path().join("notes.txt"), "hello").expect("write unrelated file");
 
         let (themes, errors) = load_custom_themes_from_dir(dir.path());
@@ -1711,9 +1461,6 @@ keyword = "#ff79c6"
         assert_eq!(loaded[0].overrides["syntax.keyword"], rgba(0xff79c6));
     }
 
-    /// Regression for a real bug an adversarial audit found: importing a theme whose slug happens
-    /// to collide with an *unrelated*, differently-named theme already on disk must never silently
-    /// overwrite that file.
     #[test]
     fn import_theme_file_never_clobbers_an_unrelated_theme_with_a_colliding_slug() {
         let source_dir = tempfile::tempdir().expect("tempdir");
@@ -1744,8 +1491,6 @@ keyword = "#ff79c6"
         assert!(names.contains(&"Midnight Coral"));
     }
 
-    /// Regression for a real, concurrency-incident-lost fix: a *dangling* symlink planted at the
-    /// exact path `import_theme_file` would otherwise write to must not be followed.
     #[cfg(unix)]
     #[test]
     fn import_theme_file_does_not_follow_a_dangling_symlink_planted_at_the_slug_path() {
@@ -1775,8 +1520,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// A symlink pointing at a real, *unrelated* theme file is treated as a collision (redirected
-    /// to a new candidate name), and the unrelated file it points at survives untouched.
     #[cfg(unix)]
     #[test]
     fn import_theme_file_does_not_follow_a_symlink_to_an_unrelated_theme_file() {
@@ -1808,8 +1551,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// The flip side: a symlink that genuinely points at a file already holding *this same* theme
-    /// is a real re-import-to-update, not a collision.
     #[cfg(unix)]
     #[test]
     fn non_colliding_dest_path_reuses_a_symlink_that_points_at_a_file_holding_the_same_theme() {
@@ -1825,8 +1566,6 @@ keyword = "#ff79c6"
         assert_eq!(candidate, symlink_path);
     }
 
-    /// A second import of the *same* theme (by name) is a real, intentional update - it must land
-    /// back at the exact same path, not spawn a `-2` sibling.
     #[test]
     fn import_theme_file_reimporting_the_same_theme_overwrites_its_own_file_not_a_new_one() {
         let source_dir = tempfile::tempdir().expect("tempdir");
@@ -1882,8 +1621,6 @@ keyword = "#ff79c6"
         assert!(matches!(err, ThemeFileError::Io(_)));
     }
 
-    /// Regression for a real, concurrency-incident-lost fix: an oversized *source* file must be
-    /// rejected before it is ever read into memory or written anywhere.
     #[test]
     fn import_theme_file_rejects_an_oversized_source_before_reading_or_writing_it() {
         let source_dir = tempfile::tempdir().expect("tempdir");
@@ -1927,10 +1664,6 @@ keyword = "#ff79c6"
         assert_eq!(imported.base, theme.base);
     }
 
-    /// Real proof (not an assumption) that `toml`'s parsing genuinely ignores `#`-prefixed
-    /// comments: [`CUSTOM_THEME_TEMPLATE_TOML`] is mostly comment lines, and this feeds its
-    /// *real, checked-in* contents through the exact same parser a user's own disk file goes
-    /// through.
     #[test]
     fn the_real_template_file_parses_and_validates_as_a_well_formed_theme() {
         let theme = parse_theme_file_str(CUSTOM_THEME_TEMPLATE_TOML)
@@ -1979,8 +1712,6 @@ keyword = "#ff79c6"
         assert_eq!(loaded.len(), 1);
     }
 
-    /// Adversarial-audit regression: a user who edits the template-created file in place (keeping
-    /// its default `name`) must not have those edits silently destroyed by a second click.
     #[test]
     fn write_template_theme_never_clobbers_a_file_the_user_has_since_edited() {
         let dest_dir = tempfile::tempdir().expect("tempdir");
@@ -2057,11 +1788,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// Proves the built-in files really do go through the *same* parse/validate core a
-    /// user-supplied file does, not a second parser: feeding one's raw embedded contents to the
-    /// ordinary user-facing [`parse_theme_file_str`] (which - unlike
-    /// [`parse_builtin_theme_file_str`] - does check for a built-in-name collision) is correctly
-    /// rejected, since by definition its name already is a real `THEME_DEFS` entry.
     #[test]
     fn a_built_in_theme_files_raw_contents_are_rejected_by_the_user_facing_parser_as_a_collision() {
         let contents = include_str!("../../../../assets/themes/slate.toml");
@@ -2072,9 +1798,6 @@ keyword = "#ff79c6"
         );
     }
 
-    /// [`CustomThemeFile::validate_with_builtin_check`]'s `false` branch must still run every
-    /// *other* real check - a bad hex colour or an empty name in a built-in file would be a real
-    /// bug in that file, not something to silently wave through.
     #[test]
     fn validate_with_builtin_check_false_skips_only_the_collision_check_not_the_others() {
         let mut colliding = valid_file();

@@ -7,57 +7,6 @@
 //! module rather than folded into `crate::keymap` (which stays GPUI-free by design - see that
 //! module's own docs) or `crate::settings::state` (which only *reads* already-registered
 //! `gpui::KeyBinding`s, never constructs new ones).
-//!
-//! None of this needs a live `gpui::Window`/`App` - `gpui::KeyBinding`, `gpui::Keystroke`, and
-//! `gpui::KeyBindingContextPredicate` are all plain data types once built, so every function here
-//! is a real `#[test]`, not a `#[gpui::test]`.
-//!
-//! ## Identity: how one override maps to one default binding
-//!
-//! `crate::default_key_bindings()` has no stable id per entry - two different bindings can share
-//! the same action (`CompletionsAccept` is bound twice, to `tab` and to `enter`) or the same
-//! command label across disjoint contexts (`Editor::copy` under `"file-editor"` and again under
-//! `"merge-editor"`). [`BindingIdentity`] is the real, unique key this module uses instead: the
-//! action's real [`gpui::Action::name`], its real registered context predicate's `Display` string
-//! (`"global"` when `None`, matching `crate::settings::state::KeybindingRow::context`'s own convention),
-//! and the real *default* keystroke(s) it originally shipped with, joined the same
-//! space-separated way `gpui::KeyBinding::load` itself splits a multi-keystroke chord string
-//! (each part `gpui::Keystroke::unparse()`'d). Two default bindings can only collide under this
-//! identity if they share all three - command, context, *and* default keystroke - which would
-//! already make them indistinguishable rows on the Keybindings page itself
-//! (`crate::settings::state::tests::every_keybinding_row_is_genuinely_distinguishable_from_every_other`
-//! guards against exactly that in the default set).
-//!
-//! ## Collision detection is exact for this app, by enumeration
-//!
-//! `vendor/zed/crates/gpui/src/keymap/context.rs`'s `KeyBindingContextPredicate` has no built-in
-//! "could these two predicates ever both be true for some real context stack" check - only
-//! `eval`/`depth_of` (against one concrete, already-known stack) and `is_superset` (whether every
-//! context the other predicate matches, this one also matches). Rather than approximate the
-//! missing check, [`contexts_could_overlap`] **evaluates both predicates against every context
-//! stack this app really produces** ([`real_context_stacks`]), through GPUI's own `depth_of` -
-//! the same function `Keymap::binding_enabled` uses to decide whether a binding is live. Two
-//! predicates "could overlap" exactly when some real stack makes both live. That is not a
-//! heuristic: it is exact over this app's real state space, and it needs no `Or`/`Not` solver
-//! because it never reasons about predicate *structure* at all.
-//!
-//! It replaced an `is_superset`-plus-special-cases heuristic that GitHub issue #17 made newly and
-//! dangerously wrong, found by an independent adversarial audit. `is_superset` answers `false` in
-//! *both* directions for two different bare `Identifier`s, and the old code read that absence of
-//! evidence as proof of disjointness. That was survivable only while distinct identifiers really
-//! did live on distinct nodes; issue #17 put `"text-input"` on the *same* node as `"file-editor"`
-//! and `"merge-editor"`, so `"text-input"` vs `"file-editor"` reported "disjoint" when they are in
-//! fact always live together - and a user could rebind `Text: undo` onto Backspace, Ctrl+V or
-//! Escape through the real Settings UI with no warning at all.
-//!
-//! The one place it is deliberately conservative is coverage of its own enumeration: a predicate
-//! that is live on **no** stack in [`real_context_stacks`] reports "could overlap" rather than
-//! certifying a disjointness this module evidently cannot see. That is a strictly safe direction
-//! for a rebind guard - an extra warning on the Keybindings page, never a missed collision - and
-//! it earned its keep at the merge that brought GitHub issue #19's file tree into this branch:
-//! the tree's five bindings were live on no enumerated stack, so every one of them reported
-//! "could overlap" until the four `file-tree*` stacks were added, which is what surfaced the
-//! omission instead of letting it pass silently.
 
 use gpui::{KeyBinding, KeyBindingContextPredicate, Keystroke};
 
@@ -153,42 +102,6 @@ pub fn effective_key_bindings(overrides: &[KeybindingOverride]) -> Vec<KeyBindin
 /// Every real key-context stack this app's own render code can actually produce, as the
 /// space-separated context literals each node contributes, ordered root-first exactly the way
 /// GPUI's own `dispatch_path` builds them.
-///
-/// This is the single source of truth for "what contexts really exist", shared by
-/// [`contexts_could_overlap`] and by `crate::undo_scoping_matrix_tests`, so the two can never
-/// disagree about the app they are both reasoning over. Derived by hand from the fourteen
-/// `.key_context(..)` call sites in the crate - `crate::root::AdeApp::render`'s baseline `"app"`,
-/// `crate::terminal::pane`, `crate::code_surface::render` (one call site, three literals from a
-/// `match`), `crate::merge::editing`, the eight single-line inputs (the rail's agent filter,
-/// Settings' keymap filter, the palette's own query field, `root::new_file`'s inline name editor,
-/// `crate::graph_view::render`'s Branches filter box, the Themes page's "Generate from colour"
-/// seed field, the General page's "Shell" field (GitHub issue #213), and - newest, GitHub issue
-/// #241 - the git graph row menu's "Create branch here" prompt), plus GitHub issue #242 phase B's
-/// own new single-line input (`crate::graph_view::rebase_render`'s interactive-rebase plan row
-/// reword field), which all emit the same bare `"text-input"`, and
-/// `crate::sidebar::render::AdeApp::file_tree_shell` (one call site, four literals from a
-/// `match`) - and guarded against drift by this module's own
-/// `every_real_key_context_call_site_is_covered` test, which fails the moment a fifteenth call
-/// site appears. (That test earned its keep immediately: this comment originally said "six",
-/// counting distinct emitted literals rather than real call sites, and the test caught it on its
-/// first run; it has since caught this comment drifting behind four more real inputs.)
-///
-/// The four `file-tree*` stacks arrived with a merge, not with an edit to this file, which is
-/// exactly why they are called out here. GitHub issue #19's file tree and issue #17's text-undo
-/// scoping were built on separate branches; this list was issue #17's and knew nothing about the
-/// tree. Omitting them was not a silent hole in the *checker* - `contexts_could_overlap` refuses
-/// to certify a predicate it never sees live and returned "could overlap" for all five file-tree
-/// bindings, which is what surfaced this at merge time. It was a real hole in every *positive*
-/// claim built on the list, including `crate::undo_scoping_matrix_tests`' "at most one undo
-/// system is live anywhere", which held vacuously over the tree's inline name editor.
-///
-/// The empty stack is deliberately included: GPUI falls back to the dispatch root with **no**
-/// context frames whenever the focused `FocusId` isn't in the last rendered frame, and
-/// `KeyBindingContextPredicate::eval_inner` short-circuits to `false` for an empty stack
-/// (`vendor/zed/crates/gpui/src/keymap/context.rs`), so *every* scoped binding is dead there. That
-/// is a real, reachable state (a dangling focus handle) and leaving it out of the enumeration
-/// would quietly make every claim built on this list unsound for exactly the case that has bitten
-/// this project repeatedly.
 pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
     vec![
         vec![],
@@ -248,20 +161,6 @@ pub fn real_context_stacks() -> Vec<Vec<&'static str>> {
 /// inline name editor is open. (GitHub issue #105 removed the other one, the delete
 /// confirmation - delete now runs immediately, with no modal state of its own to add a context
 /// word for.)
-///
-/// This lives here, beside [`real_context_stacks`], rather than inline in
-/// `crate::sidebar::render::AdeApp::file_tree_shell` where it is used, because the two must never
-/// disagree and "a `match` in the renderer plus a hand-copied list of its literals here" is
-/// exactly how they would. That is not hypothetical: the merge that brought GitHub issue #19's
-/// tree onto issue #17's branch added a `.key_context(..)` call site whose literals this
-/// enumeration knew nothing about, and the drift test written to catch precisely that was blind
-/// to it. Deriving both from one function makes that class of drift structurally impossible
-/// rather than merely test-detectable - a guard that has to be extended by hand every time the
-/// thing it guards grows is not a guard.
-///
-/// `"text-input"` is emitted for the editor-open case: an inline name editor is a real
-/// text-typing surface, and the tag is what routes `Ctrl+Z` mid-filename to `TextUndo` rather
-/// than `FileTreeUndo`.
 pub fn file_tree_key_context(inline_edit: bool) -> &'static str {
     if inline_edit {
         "file-tree tree-editing text-input"
@@ -288,26 +187,6 @@ fn parsed_context_stacks() -> Vec<Vec<gpui::KeyContext>> {
 /// `true` when a binding scoped to `a` and one scoped to `b` could realistically both be active
 /// for the same live context stack, so giving them the same keystroke would leave GPUI's own
 /// dispatch order (not this app) to decide which one actually fires.
-///
-/// Decided by **evaluating both predicates against every stack this app really produces**
-/// ([`real_context_stacks`]) through GPUI's own `depth_of` - the exact same function
-/// `Keymap::binding_enabled` uses to decide whether a binding is live
-/// (`vendor/zed/crates/gpui/src/keymap.rs`). Exact for this app, rather than a heuristic.
-///
-/// It replaced a `is_superset`-based approximation that GitHub issue #17 made newly, dangerously
-/// wrong, found by an independent adversarial audit. `is_superset`
-/// (`vendor/zed/crates/gpui/src/keymap/context.rs`) evaluates `false` in *both* directions for two
-/// different bare `Identifier`s, and the old code read that absence of evidence as proof of
-/// disjointness. That was survivable while distinct identifiers really did live on distinct nodes
-/// (but this issue put `"text-input"` on the *same* node as `"file-editor"` and `"merge-editor"`,
-/// so `"text-input"` vs `"file-editor"` reported "disjoint" when they are in fact always live
-/// together). A user could rebind `Text: undo` onto Backspace, Ctrl+V or Escape through the real
-/// Settings UI with no warning at all, and the rebind would then silently lose to the editor's own
-/// binding on dispatch-order grounds. This module's own tests now pin exactly that case.
-///
-/// Conservative where it doesn't understand something: a predicate that isn't live on any real
-/// stack at all reports "could overlap" rather than clearing a risk this function can't actually
-/// reason about.
 fn contexts_could_overlap(
     a: Option<&KeyBindingContextPredicate>,
     b: Option<&KeyBindingContextPredicate>,
@@ -342,22 +221,6 @@ fn contexts_could_overlap(
 /// the form a real captured chord is serialized to before this is called) would collide with any
 /// *other* binding in `effective` that could realistically share a live context with
 /// `for_binding` - see the module docs.
-///
-/// `defaults` and `effective` must be the same real, index-aligned pair
-/// `crate::default_key_bindings()`/`effective_key_bindings(overrides)` always produces (the
-/// latter is a straight `.map()` over the former, one output per input, in order) - self-exclusion
-/// compares `for_binding`'s identity against each **default** binding's identity at the same
-/// index, not against `effective[i]`'s own identity. This is deliberate, not incidental: if the
-/// row being rebound already carries a real override, `effective[i]` for that same row is the
-/// *already-rebuilt* binding, whose own `BindingIdentity` reports its current (overridden)
-/// keystroke as `default_keystrokes` - comparing that against `for_identity` (derived from the
-/// real, original default binding) would never match, so a second rebind of an already-overridden
-/// row would falsely report a collision against its own, about-to-be-replaced binding. Comparing
-/// against `defaults[i]` instead is stable across any number of rebinds.
-///
-/// Returns the first real colliding binding, if any, or `None` if `candidate_keystroke` is
-/// genuinely safe to bind - including when it fails to parse at all (an invalid chord can't
-/// collide with anything; the caller surfaces the parse failure itself, not this function).
 pub fn find_colliding_binding<'a>(
     defaults: &[KeyBinding],
     effective: &'a [KeyBinding],
@@ -432,7 +295,6 @@ mod tests {
             "the override's own keystroke must be the one that's actually registered"
         );
 
-        // Every other binding must be completely untouched.
         for (default, actual) in defaults.iter().zip(effective.iter()) {
             if default.action().name() == "app::TogglePalette" {
                 continue;
@@ -460,7 +322,6 @@ mod tests {
 
         let effective = effective_key_bindings(std::slice::from_ref(&override_entry));
 
-        // No panic reaching this line is the real assertion; the default must still be intact.
         let untouched = effective
             .iter()
             .find(|b| b.action().name() == "app::TogglePalette")
@@ -608,9 +469,6 @@ mod tests {
         );
     }
 
-    /// The exact reason GitHub issue #17 needed this checker made precise: `"file-editor"` and
-    /// `"text-input"` are emitted by the **same node**, so a `file-editor`-scoped binding rebound
-    /// onto `secondary-z` really does collide - with `TextUndo`.
     #[test]
     fn a_file_editor_binding_rebound_onto_secondary_z_collides_with_text_undo() {
         let bindings = crate::default_key_bindings();
@@ -639,11 +497,6 @@ mod tests {
         );
     }
 
-    /// The audit's own reproduction, pinned: `"text-input"` and `"file-editor"` live on the same
-    /// node, so rebinding `Text: undo` onto a key the editor already claims must warn. The
-    /// heuristic this replaced reported no collision at all for every one of these, letting a user
-    /// silently rebind text undo onto Backspace, Ctrl+V or Escape through the real Settings UI and
-    /// then find it did nothing in the editor.
     #[test]
     fn rebinding_text_undo_onto_a_key_the_editor_already_claims_is_flagged() {
         let bindings = crate::default_key_bindings();
@@ -670,7 +523,6 @@ mod tests {
                 "rebinding Text: undo onto {keystroke} must be flagged"
             );
         }
-        // `secondary-v` resolves per-OS exactly the way `EditorPaste`'s own binding does.
         let paste = bindings
             .iter()
             .find(|b| {
@@ -692,25 +544,11 @@ mod tests {
 
     /// Counts real `.key_context(..)` call sites in **every** `.rs` file under this crate's
     /// `src/`, by reading the real directory at test time.
-    ///
-    /// The hand-listed file set this replaced is why a merge could add a ninth call site with the
-    /// drift test still green: it named eight files and `include_str!`'d each one, and GitHub
-    /// issue #19's file tree put its `.key_context(..)` in `sidebar/render.rs`, which was not
-    /// among them - so the sum stayed at 8 and the guard built to catch "a new call site
-    /// appeared" reported success. `include_str!` needs literal paths, so the file set could not
-    /// be globbed at compile time; `std::fs` at test time can be.
-    ///
-    /// Counts occurrences within a line rather than only lines that *start* with the call, so a
-    /// chained `div().id("x").key_context("y")` is not invisible to it. Lines whose first
-    /// non-space characters are `//` are skipped, which is a real (if coarse) filter now that the
-    /// match is no longer anchored - it does not understand block comments or string literals,
-    /// and does not need to: over-counting fails loudly and safely.
     fn key_context_call_sites() -> Vec<(String, usize)> {
         fn walk(dir: &std::path::Path, out: &mut Vec<(String, usize)>, root: &std::path::Path) {
             let entries = std::fs::read_dir(dir).expect("this crate's own src/ must be readable");
             let mut paths: Vec<std::path::PathBuf> =
                 entries.map(|e| e.expect("dir entry").path()).collect();
-            // Sorted so a failure message is stable run to run.
             paths.sort();
             for path in paths {
                 if path.is_dir() {
@@ -749,10 +587,6 @@ mod tests {
         out
     }
 
-    /// Drift guard for [`real_context_stacks`], which the collision checker's exactness depends
-    /// on entirely: that list is hand-derived from this crate's `.key_context(..)` call sites, so
-    /// a new call site appearing without a matching entry would silently make every disjointness
-    /// answer unsound. Reads the real source rather than trusting a comment.
     #[test]
     fn every_real_key_context_call_site_is_covered() {
         let sites = key_context_call_sites();
@@ -823,9 +657,6 @@ mod tests {
         }
     }
 
-    /// The negated-conjunct scan must still be conservative in the *other* direction: a
-    /// `"!terminal && !text-input"` binding and a plain `"diff"` one really can both be live (the
-    /// read-only Diff view is neither a terminal nor a text input), so that pair must still flag.
     #[test]
     fn a_conjunction_of_negations_still_flags_a_scope_it_cannot_rule_out() {
         let undo = KeyBindingContextPredicate::parse("!terminal && !text-input")
@@ -835,12 +666,6 @@ mod tests {
         assert!(contexts_could_overlap(Some(&diff), Some(&undo)));
     }
 
-    /// Regression for a real bug an audit caught: rebinding an *already-overridden* row a second
-    /// time falsely reported a collision against itself. Root cause: the old self-exclusion check
-    /// compared `for_binding`'s identity (derived from the real *default* binding) against each
-    /// candidate's identity as read off `effective` - but `effective[i]` for an already-overridden
-    /// row is the *rebuilt* binding, whose own `BindingIdentity` reports its current (overridden)
-    /// keystroke, which never equals the original default's, so the row never excluded itself.
     #[test]
     fn rebinding_an_already_overridden_row_a_second_time_does_not_collide_with_itself() {
         let defaults = crate::default_key_bindings();
@@ -849,7 +674,6 @@ mod tests {
             .find(|b| b.action().name() == "app::TogglePalette")
             .expect("TogglePalette should be a real default binding");
 
-        // A real override already in place - `TogglePalette` rebound once already.
         let identity = BindingIdentity::of(palette_default);
         let override_entry = KeybindingOverride {
             action: identity.action.clone(),
@@ -869,7 +693,6 @@ mod tests {
              report a false self-collision"
         );
 
-        // A genuinely different new chord must also not self-collide.
         let collision =
             find_colliding_binding(&defaults, &effective, palette_default, "ctrl-alt-shift-q");
         assert!(collision.is_none());
@@ -887,10 +710,6 @@ mod tests {
         assert!(collision.is_none());
     }
 
-    /// A drift guard proving [`BindingIdentity::of`]'s `default_keystrokes` join format really is
-    /// what a rebuilt `KeyBinding::load` call (inside [`effective_key_bindings`]) can round-trip
-    /// through `Keystroke::parse` - not a format this module invented independently of what gpui
-    /// itself expects.
     #[test]
     fn identity_default_keystrokes_round_trips_through_keystroke_parse() {
         for binding in crate::default_key_bindings() {

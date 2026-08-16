@@ -38,14 +38,6 @@ pub(crate) struct ReleaseInfo {
 /// The update feature's whole state machine - one field on `AdeApp`
 /// (`crate::root::AdeApp::update_state`), driven entirely by `crate::updater::flow`'s real
 /// background checks/downloads, drawn entirely by `crate::updater::render`.
-///
-/// `Idle` deliberately covers three different real situations - "never checked yet", "checked
-/// and genuinely up to date", and "the most recent *check* failed (offline, DNS, GitHub
-/// rate-limit, bad JSON, TLS)" - because all three render identically (nothing shown) and none
-/// of them should ever interrupt normal use. Only a *download* failure (after the user has
-/// already clicked "Update available") is a distinct, shown `Failed` state - see
-/// `crate::updater::flow`'s module docs for the full "never intrusive on a check failure" rule
-/// this distinction exists to enforce.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdateState {
     Idle,
@@ -75,25 +67,6 @@ pub(crate) enum UpdateState {
 /// optional here, stripped either way, since this is also exercised directly against
 /// already-stripped input in tests below) is a genuinely newer, real, actionable update over
 /// `current` (this build's own `env!("CARGO_PKG_VERSION")`, never `v`-prefixed).
-///
-/// Pure and deterministic - no GPUI, no network - delegates the actual semver comparison to
-/// `self_update::version::bump_is_greater` rather than adding a direct `semver` dependency on
-/// top of the one `self_update` already pulls in transitively.
-///
-/// Three deliberate real-world safety nets beyond a plain "is it greater" check:
-/// - Malformed/unparseable version strings (`bump_is_greater` returning `Err` - not real
-///   semver, e.g. a hand-pushed non-release tag or a future tagging-convention change this app
-///   doesn't understand yet) are treated as "no update available", not "newer" - a `log::warn!`
-///   only, never a false positive that would offer to install something that isn't a real,
-///   parseable release.
-/// - A pre-release remote version (a `-`-suffixed semver, e.g. `"0.2.0-beta.1"`) never counts
-///   as an update, even if semver ordering alone would call it newer than `current` (e.g.
-///   `"0.2.0-beta.1"` really is `>` `"0.1.0"` under plain semver precedence rules) - this repo
-///   has no pre-release-tag convention today (`release.yml` only ever tags real, final `vX.Y.Z`
-///   releases), so treating one as "newer" would offer an update to a tag no real release
-///   process here produces yet.
-/// - Equal-or-older is "no update available", the ordinary case `bump_is_greater` itself
-///   already handles correctly.
 pub(crate) fn is_remote_version_newer(current: &str, remote_tag: &str) -> bool {
     let remote_version = remote_tag.trim_start_matches(['v', 'V']);
     if remote_version.contains('-') {

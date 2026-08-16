@@ -1,68 +1,6 @@
 //! The file tree's real write operations (GitHub issue #19): the context menu's state, the
 //! inline name editors behind New File / New Folder / Rename, the cut/copy/paste clipboard, and
 //! the confirmed delete.
-//!
-//! Split the way every feature folder in this crate is split: the pure decisions live in
-//! [`crate::sidebar::context_menu`] (which rows a target offers, where the popover fits) and
-//! [`crate::sidebar::file_ops`] (name validation, collision-free naming, the real `std::fs`
-//! calls), and this file is the `impl AdeApp` glue that sequences them and repairs the app's own
-//! state afterwards. [`crate::sidebar::render`] only draws what these two decide.
-//!
-//! ## Keybinding scoping (the bug class this project keeps re-finding)
-//!
-//! `Ctrl+C`/`Ctrl+X`/`Ctrl+V` are the most dangerous keystrokes this app could bind:
-//! `crate::terminal::pane::keystroke_to_bytes` maps an unmodified `Ctrl+<letter>` to the control
-//! byte a focused shell expects, and `Ctrl+C` in particular is SIGINT - a version of this that
-//! swallowed it would make it impossible to interrupt a running agent CLI. Two independent
-//! things stop that here, and it is worth being precise about which one does what, because a
-//! first draft of these docs got it wrong and this project's own revert-verification caught it:
-//!
-//! 1. **The `key_context` predicate**, `Some("file-tree && !tree-editing")` (see
-//!    `crate::default_key_bindings`). `Window::dispatch_key_event` resolves bindings against the
-//!    context stack of the *focused node's own dispatch path*, before any listener is consulted
-//!    (`vendor/zed/crates/gpui/src/window.rs`'s `dispatch_key` call). A focused terminal pane is
-//!    not inside the tree, so `file-tree` is not on that stack and the action is never produced
-//!    at all.
-//! 2. **Where the handlers are registered.** `.on_action` for all five tree actions lives on
-//!    `crate::sidebar::render::AdeApp::file_tree_shell`'s node - the tree's own container - and
-//!    nowhere else. (That node carries seven `on_action` listeners in total: these five, plus the
-//!    `TextUndo`/`TextRedo` pair the inline name editor gained when GitHub issue #17's per-widget
-//!    text undo merged in. The reasoning below is unchanged by those two - they are scoped
-//!    `Some("text-input")`, which the tree only emits while an editor is open.)
-//!    A listener found in the dispatch path sets `cx.propagate_event = false`
-//!    before running ("Actions stop propagation by default during the bubble phase", same file),
-//!    so a listener that *is* found genuinely swallows the keystroke; one that isn't leaves
-//!    `propagate_event` true and `finish_dispatch_key_event` still delivers the key to the
-//!    focused pane's own `on_key_down`.
-//!
-//! These two are **independent** - either alone protects a focused terminal, which was confirmed
-//! by deliberately breaking each in turn and re-running the tests. An earlier draft of these docs
-//! claimed point 2 was the only real protection and that point 1 "isn't doing the
-//! terminal-protection work"; that was wrong, and it mattered, because it would have justified a
-//! later refactor dropping the `file-tree` half as dead weight.
-//!
-//! The `!tree-editing` half is a different matter: it has no redundant partner, and it is the one
-//! whose absence is directly reproducible. While an inline name editor is open the tree *is* the
-//! focused node, so both mechanisms line up in its favour - the listener runs, propagation stops,
-//! and the keystroke the user was typing into the name field is genuinely swallowed
-//! (`Shift+F10` reopens the context menu on top of the editor; `Ctrl+V` pastes a *file* into the
-//! tree). It is the same shape as Revision R8.5b's `"file-editor && !completions"` fix, and it is
-//! revert-verified by
-//! `tree_ops_regression_tests::shift_f10_while_an_inline_editor_is_open_neither_opens_a_menu_nor_disturbs_the_name`,
-//! which fails against a bare `Some("file-tree")`.
-//!
-//! ## Delete has no confirmation - undo does that job instead (GitHub issue #105)
-//!
-//! An earlier version of this module armed a delete behind a modal confirmation panel and only
-//! removed anything once a second, explicit click confirmed it. That is gone: [`Self::
-//! request_tree_delete`] now runs the real delete immediately, the same single-gesture shape
-//! every other tree mutation (rename, cut/paste move) already had. What replaced the safety net
-//! is [`Self::tree_undo_stack`]/[`Self::tree_redo_stack`] - a real, app-owned undo history for
-//! delete, rename, and cut/paste-move alike (never for copy, which never destroys or relocates
-//! anything to begin with). A delete's own undo entry carries a real backup of the deleted
-//! content (see [`Self::tree_undo_backup_root`]'s own docs for why a copy, not a reliance on
-//! whatever the OS trash happens to support restoring), so undo works identically whether the
-//! resolved [`file_ops::DeleteMechanism`] was `Trash` or `Permanent`.
 
 use super::*;
 use crate::sidebar::context_menu::{ContextTarget, MenuAction};
@@ -113,18 +51,6 @@ impl InlineEditKind {
 }
 
 /// An in-progress inline name editor.
-///
-/// **This lives on `AdeApp`, never inside `AdeApp::file_tree`, and that is the whole of issue
-/// #19 §4's "a watcher refresh must not clobber an in-progress editor" requirement.** The file
-/// tree is a `Vec<FileTreeEntry>` that `AdeApp::load_file_tree`'s background walk *replaces
-/// wholesale* every time it completes - which is exactly what happens when an agent CLI creates
-/// or deletes a file mid-agent and something triggers a re-walk. Any editor state stored in
-/// that vector, or keyed by an index into it, would be silently destroyed by that replacement,
-/// mid-keystroke. Keeping it here means the walk can replace every row without the typed text
-/// ever being at risk, and the renderer re-locates the editor's anchor row by *path* on each
-/// frame (falling back to the top of the list if the anchor has genuinely gone) rather than by a
-/// position that a re-walk can invalidate. This is the same discipline issue #18 applied to fold
-/// state, which is likewise held outside the walked tree and re-derived against it.
 // Not `Eq`: `text_history::TextField` holds a recorded history whose `Instant` timestamps have no
 // meaningful total equality, so it is deliberately `PartialEq` only.
 #[derive(Debug, Clone, PartialEq)]
@@ -220,16 +146,6 @@ fn cleanup_tree_undo_backup(entry: &TreeUndoEntry) {
 impl AdeApp {
     /// Moves keyboard focus onto the tree, so its `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10`
     /// bindings - all scoped to the `"file-tree"` context - can match at all.
-    ///
-    /// Called from a right-click on any row or on the empty area, and from a left-click on a
-    /// *folder* row. Deliberately **not** from a left-click on a *file* row: that path
-    /// (`Self::open_file_view`) opens the file and moves focus to the code surface, which is
-    /// what the user asked for, and stealing it back would break typing in the editor they just
-    /// opened. The honest consequence is that `F2`/`Shift+F10` on a file need a right-click (or a
-    /// folder click) first rather than a plain left-click - which is also where the issue's own
-    /// keyboard requirement stops: there are no up/down bindings to *move* the selection within
-    /// the tree, and inventing a focus-stealing left-click to paper over that would be worse than
-    /// the gap.
     pub(in crate::sidebar) fn focus_file_tree(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.tree_focus_handle, cx);
     }
@@ -283,20 +199,6 @@ impl AdeApp {
     /// One tree row's real click - the single place `Self::render_file_tree_row`'s file and
     /// folder click handlers both funnel through, so Ctrl/Cmd-click and Shift-click can never
     /// mean something different depending on which kind of row was clicked.
-    ///
-    /// - A plain click collapses the selection to just `path` (the existing, pre-#145 behavior).
-    /// - Ctrl/Cmd-click (`Modifiers::secondary`) toggles `path`'s own membership, leaving every
-    ///   other selected row alone. Toggling the anchor itself off promotes an arbitrary remaining
-    ///   member to anchor (there is no real "next" ordering to prefer one over another once the
-    ///   anchor is gone) rather than collapsing the whole selection just because its first member
-    ///   happened to be clicked again.
-    /// - Shift-click range-selects from the anchor to `path`, using the tree's own real display
-    ///   order (`file_tree::visible_indices`) - not insertion order, not a path comparison, since
-    ///   neither would match what the user actually sees between the two rows. Replaces whatever
-    ///   [`Self::additional_tree_selection`] held before (matching every mainstream file
-    ///   manager's own "Shift-click" - a second Shift-click resizes the range, it doesn't extend
-    ///   it further from wherever the first one left off). Falls back to a plain single-select
-    ///   when there is no anchor yet to range from.
     pub(in crate::sidebar) fn tree_click_select(
         &mut self,
         path: PathBuf,
@@ -367,9 +269,6 @@ impl AdeApp {
 
     /// Opens the context menu for `target` at a real click position, clamped so the whole
     /// popover stays inside the window (`crate::menu::model::clamp_menu_origin`).
-    ///
-    /// Also focuses the tree and selects the targeted row - a right-click is a real selection
-    /// gesture in its own right, independent of the menu it also opens.
     pub(in crate::sidebar) fn open_tree_context_menu(
         &mut self,
         target: ContextTarget,
@@ -623,9 +522,6 @@ impl AdeApp {
     /// The inline editor's key handler - append/backspace/Enter/Escape, the same minimal shape
     /// `crate::root::new_file::AdeApp::handle_new_file_key_down` established, including its
     /// "leave modified keystrokes unhandled so app-level shortcuts still work" rule.
-    ///
-    /// Also handles `Escape` for the context menu when no editor is open, so a keyboard-opened
-    /// menu can be dismissed the same way a mouse-opened one can (issue #19 §1).
     pub(in crate::sidebar) fn handle_tree_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -689,20 +585,6 @@ impl AdeApp {
 
     /// `Ctrl/Cmd+Z` inside the inline name editor - the tree's half of GitHub issue #17's
     /// per-widget text undo.
-    ///
-    /// This surface and that feature were built on two branches in parallel and only met at the
-    /// merge, which is exactly why this handler needs to exist rather than being assumed: with
-    /// the editor open the tree's own node is the deepest focused one, so without the
-    /// `"text-input"` context word `crate::sidebar::AdeApp::file_tree_shell` now emits, plain
-    /// `Ctrl+Z` while typing a filename reached the worktree-level undo/redo this app used to
-    /// also have (removed - GitHub issue #47) instead of undoing the typed name. The tag makes
-    /// that predicate unsatisfiable here; this listener is what the resulting `TextUndo` lands
-    /// on. Registered on the same node that carries the tag and the focus handle, per
-    /// `crate::default_key_bindings`' own rule.
-    ///
-    /// A no-op when no editor is open: the tag is only emitted while one is, so the action
-    /// cannot normally be produced then, and an unconditional `cx.notify()` would repaint for
-    /// nothing.
     pub(in crate::sidebar) fn handle_tree_text_undo(
         &mut self,
         _: &TextUndo,
@@ -895,17 +777,6 @@ impl AdeApp {
     }
 
     /// The real paste: a `Cut` moves, a `Copy` copies.
-    ///
-    /// A **copy**'s destination name is resolved by [`file_ops::unique_destination`], so pasting
-    /// back into the folder something was copied from produces a real `name copy.ext` rather than
-    /// an overwrite or a collision error (issue #19 §3).
-    ///
-    /// A **cut** deliberately does *not* auto-suffix against its own source. Cutting `util.rs`
-    /// and pasting it into the folder it came from means "move it here", and it is already here -
-    /// the honest answer is a no-op, not an unrequested rename to `util copy.rs` with no undo,
-    /// which is what an unconditional `unique_destination` produced in an earlier version of this
-    /// method (found in review). Against a *different* occupant of that name it still suffixes,
-    /// since refusing outright would be worse than landing beside it.
     pub(in crate::sidebar) fn paste_into_dir(&mut self, dir: &Path, cx: &mut Context<Self>) {
         let Some(entry) = self.tree_clipboard.clone() else {
             return;
@@ -965,36 +836,6 @@ impl AdeApp {
     /// generalized to a whole list of sources (a dragged multi-selection) instead of the
     /// clipboard's single entry - a real second real caller of the same move primitive, not a
     /// second, parallel move implementation.
-    ///
-    /// Each source is handled independently: one real name collision or one attempt to drop a
-    /// folder into its own subtree reports a real error for *that* source and moves on to the
-    /// rest, rather than a single bad source aborting an otherwise-valid bulk move partway
-    /// through. `sources` already inside `dir` are silently skipped (dropping a selection back
-    /// onto its own current parent is a real no-op, not an error, matching `paste_into_dir`'s
-    /// identical "already exactly where it was asked to go" rule).
-    /// The real directory a drop *on* `entry_path` resolves to - `crate::sidebar::render::
-    /// AdeApp::render_file_tree_row`'s one real call site for both the directory-row and
-    /// file-row `on_drop` handlers, so the row wiring itself stays a thin call into logic this
-    /// module can test directly (GPUI has no drag/drop gesture simulator - see
-    /// `tree_drag_move_tests`'s own module docs - so the closures themselves can't be driven by a
-    /// test, but the rule they apply can be).
-    ///
-    /// A directory is dropped *into* - the folder itself is the target, matching every file
-    /// manager's own convention. A file has nowhere "inside" it to drop into, so a drop on a file
-    /// row resolves to that file's own *parent* directory instead - GitHub issue #152's real fix:
-    /// before this existed, a file row had no `on_drop` of its own at all, so a drop landing on
-    /// one (the overwhelmingly common case in any populated folder, since most rows are files,
-    /// not a folder's own header row) fell all the way through to `render::AdeApp::
-    /// file_tree_shell`'s catch-all fallback, which unconditionally resolved to the *worktree
-    /// root* - so releasing a file roughly back where it already was silently relocated it to
-    /// the repo root instead of leaving it alone. Resolving to the file's own parent here means
-    /// `Self::move_paths_into_dir`'s existing "already inside `dir`" no-op skip (see that
-    /// method's own docs) sees the real, correct directory for a genuine same-location drop.
-    ///
-    /// `None` only for a file with no parent component at all, which cannot happen for a real
-    /// path inside a worktree (even a root-level file's parent is the worktree root itself) -
-    /// kept as a real `Option` rather than an `unwrap`/`expect` so a future caller with a less
-    /// guaranteed path shape fails honestly instead of panicking.
     pub(in crate::sidebar) fn tree_drop_target_dir(
         entry_path: &Path,
         entry_is_dir: bool,
@@ -1083,17 +924,6 @@ impl AdeApp {
     /// Runs a real [`file_ops::copy_path`] on the background executor and applies the result on
     /// the foreground thread - the same "gather / compute / write back" shape
     /// [`AdeApp::load_file_tree`] and [`Self::delete_path_with_mechanism`] use.
-    ///
-    /// Background, not inline in the click handler, and that is a correctness point rather than a
-    /// micro-optimization: `copy_path` recurses over a whole directory tree, so duplicating a
-    /// `node_modules`-sized folder from a click listener would freeze the window for as long as
-    /// the copy took. An earlier version of this method did exactly that, contradicting this
-    /// module's own delete path (whose own docs insist on "never the foreground thread") - found
-    /// in review.
-    ///
-    /// Nothing that could race a concurrent operation is captured: the destination name is
-    /// resolved by the caller immediately before this runs, and a collision that appears in
-    /// between is refused by `copy_path`'s own existence check rather than silently overwritten.
     fn spawn_tree_copy(&mut self, source: PathBuf, destination: PathBuf, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             let outcome = cx
@@ -1227,17 +1057,6 @@ impl AdeApp {
     /// redoable), by `Self::redo_tree_op` replaying a previously-undone delete (`clear_redo:
     /// false` - redo must not wipe out *other* still-pending redo entries above it in the stack),
     /// and by `Self::request_tree_delete_with_mechanism_for_test`.
-    ///
-    /// Backs up `path`'s real content to `Self::tree_undo_backup_root` *before* removing
-    /// anything: if that copy fails, nothing is deleted at all, since a delete with no real
-    /// backup would be exactly the unrecoverable operation removing the confirmation dialog was
-    /// supposed to stop being. Both the backup copy and the real removal (a trash-backed delete
-    /// shells out to the resolved command; a permanent one runs [`file_ops::delete_permanently`])
-    /// run on the background executor, never the foreground thread.
-    ///
-    /// A failed trash command is reported as a real error and **does not** fall back to a
-    /// permanent delete: quietly escalating a trash-move into an irreversible removal because a
-    /// command failed would be exactly the kind of dishonest convenience this app avoids.
     fn delete_path_with_mechanism(
         &mut self,
         path: PathBuf,
@@ -1377,22 +1196,6 @@ impl AdeApp {
 
     /// `Ctrl+Z` while the file tree is focused (`crate::root::FileTreeUndo`) - reverses the most
     /// recent entry in [`AdeApp::tree_undo_stack`], in place.
-    ///
-    /// A `Relocate` (rename or cut/paste move) is reversed by moving `new_path` back to
-    /// `old_path` ([`file_ops::move_path`]) - always a same-filesystem `fs::rename`, since both
-    /// paths live inside the same worktree.
-    ///
-    /// A `Delete` is reversed by *copying* `backup_path` back to `original_path` ([`file_ops::
-    /// copy_path`], not `move_path`): `backup_path` lives under [`Self::tree_undo_backup_root`],
-    /// a plain OS temp directory not guaranteed to share a filesystem with the worktree, where a
-    /// `rename`-based restore could fail with a real cross-device error. Copying also leaves the
-    /// backup intact for a later [`Self::redo_tree_op`] to clean up, rather than needing a fresh
-    /// one.
-    ///
-    /// A restore/move that fails (the original location has since been reoccupied by something
-    /// else) reports a real error and pushes the entry straight back onto the undo stack, rather
-    /// than silently discarding it or leaving the app's own bookkeeping out of sync with what's
-    /// really on disk.
     pub(in crate::sidebar) fn undo_tree_op(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.tree_undo_stack.pop() else {
             return;
@@ -1430,13 +1233,6 @@ impl AdeApp {
 
     /// `Ctrl+Shift+Z`/`Ctrl+Y` while the file tree is focused (`crate::root::FileTreeRedo`) -
     /// re-applies the most recently undone entry.
-    ///
-    /// A `Relocate` replays the original move (`old_path` -> `new_path`). A `Delete` re-runs a
-    /// real delete of `original_path` through [`Self::delete_path_with_real_undo`] (`clear_redo:
-    /// false`, so any *other* pending redo entries above this one survive) rather than reusing
-    /// the old backup as-is: content at `original_path` may have changed since it was restored,
-    /// and a redo should capture what's really there now, the same as any other fresh delete.
-    /// The superseded old backup is cleaned up first, since nothing can reach it once this runs.
     pub(in crate::sidebar) fn redo_tree_op(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.tree_redo_stack.pop() else {
             return;
@@ -1473,20 +1269,6 @@ impl AdeApp {
     /// buffers, every path-keyed side table [`Self::rename_open_paths`] remaps, the LSP's own
     /// per-document bookkeeping, the selection, and this worktree's recorded expansion of a
     /// deleted folder (and of everything under it).
-    ///
-    /// Structurally the *mirror* of [`Self::rename_open_paths`], and reviewed as one: every field
-    /// that method remaps, this one drops. An earlier version handled only tabs, buffers and the
-    /// selection, which left a deleted file's `staged_files` entry, its
-    /// `file_external_conflict` flag, its `file_save_error`, and - worst - its
-    /// `lsp_opened_files`/`lsp_document_versions` entries behind. That last one is not cosmetic:
-    /// `crate::lsp::client`'s `didOpen` dispatch early-returns for a path already in
-    /// `lsp_opened_files`, so recreating a file at the deleted path would silently get no
-    /// diagnostics and no completions for the rest of the agent.
-    ///
-    /// Deliberately **not** a `close_file_tab` call: that method restores focus and picks a
-    /// neighbouring tab, both of which need a `Window` this async completion handler doesn't
-    /// have. It removes the tab entries directly and lets `open_change` fall back to whatever
-    /// tab is still open, which is the same end state without the focus move.
     fn forget_deleted_paths(&mut self, deleted: &Path, cx: &mut Context<Self>) {
         let deleted_relative = self.worktree_relative(deleted);
         let under_relative = |path: &Path| file_ops::is_self_or_descendant(&deleted_relative, path);
@@ -1518,7 +1300,6 @@ impl AdeApp {
             self.tree_clipboard = None;
         }
 
-        // The same field list `Self::rename_open_paths` remaps - see this method's own docs.
         self.staged_files.retain(|path| !under_relative(path));
         self.file_external_conflict
             .retain(|path| !under_relative(path));
@@ -1567,22 +1348,6 @@ impl AdeApp {
     }
 
     /// Drops every `crate::lsp::client` per-document entry for a path that has gone away.
-    ///
-    /// Split out because these six maps do not share a key space, and the split is not the one
-    /// their names suggest - each field's own docs in `crate::root` are the authority and were
-    /// read one by one for this:
-    ///
-    /// - **absolute**: `lsp_opened_files`, `lsp_document_versions`, `lsp_uri_cache`;
-    /// - **worktree-relative** (`AdeApp::edit_buffers`' convention): `lsp_last_synced_content`,
-    ///   `lsp_synced_version`, `lsp_diagnostics_confirmed_version` - the last two are documented
-    ///   as "keyed the same worktree-relative way as `lsp_last_synced_content`", *not* the same
-    ///   way as `lsp_document_versions` beside them.
-    ///
-    /// Passing one predicate for both groups would silently retain half of these, which is
-    /// exactly the kind of no-op this whole method exists to avoid. `lsp_clients` itself is keyed
-    /// by `(worktree root, language)` and so is untouched by a file-level rename or delete;
-    /// `file_view_diagnostics` is keyed by line number and is dropped wholesale by
-    /// [`Self::invalidate_code_surface_caches`]' callers instead.
     fn forget_lsp_document_state(
         &mut self,
         absolute: &dyn Fn(&Path) -> bool,
@@ -1698,11 +1463,6 @@ impl AdeApp {
     /// through the exact same real per-platform mechanism the Settings page's "Open file" button
     /// uses (`crate::settings::widgets`' `open_command_for`/`spawn_open_command`:
     /// `xdg-open`/`open`/`cmd /c start`), rather than a second implementation of it.
-    ///
-    /// A *file* is revealed by opening its parent directory: none of those three commands has a
-    /// portable "select this entry" form, and handing a file path to `xdg-open` would open the
-    /// file in its default application - a completely different action from the one the row
-    /// promises.
     pub(in crate::sidebar) fn reveal_in_file_manager(
         &mut self,
         path: &Path,
@@ -1720,22 +1480,6 @@ impl AdeApp {
 
     /// Carries every path-keyed piece of app state across a rename or a cut+paste (issue #19 §2:
     /// "open tabs / the diff view follow the renamed path - no orphaned buffers").
-    ///
-    /// Handles a renamed *directory* too, by prefix: every open tab, edit buffer, expanded
-    /// folder and staged-file entry underneath it is remapped, not just an exact match.
-    ///
-    /// **Half of this app's path-keyed state is worktree-relative and half is absolute**, and
-    /// getting one wrong is a silent no-op rather than a compile error (`strip_prefix` simply
-    /// fails and the entry is left alone) - see the `staged_files` line below for the real bug
-    /// that produced. Each field is remapped with the pair matching its own documented key space.
-    /// [`Self::forget_deleted_paths`] is this method's mirror and must move field-for-field with
-    /// it.
-    ///
-    /// The derived caches ([`AdeApp::file_view_cache`], the diff-highlight cache, the row layout
-    /// map, the hover card, the completions popup) are *invalidated* rather than remapped: every
-    /// one of them is keyed by the path it was computed for, and a rename changes the file's
-    /// identity for `git` as well, so recomputing them against the new path is both simpler and
-    /// the only way to get an honest answer.
     pub(in crate::sidebar) fn rename_open_paths(
         &mut self,
         old: &Path,
@@ -1866,16 +1610,6 @@ impl AdeApp {
     }
 
     /// Re-reads the tree and the diff after a real filesystem change.
-    ///
-    /// Both are genuinely necessary and neither is redundant, which is the honest answer to issue
-    /// #19 §4's "do these operations just touch the filesystem, or do they need to trigger a
-    /// refresh?": the operations *are* plain filesystem changes, so `git` sees them with no help
-    /// at all - but nothing in this app polls the working tree for the sidebar. The file tree is
-    /// only ever re-walked by an explicit `load_file_tree` (there is no filesystem watcher in
-    /// this app), and the Changes list / diff view is only recomputed by an explicit `load_diff`
-    /// (`crate::rail::render::AdeApp::start_status_polling`'s 3-second timer refreshes the
-    /// *rail's* per-worktree summary, not `AdeApp::diff_state`). Without this call the row would
-    /// stay on screen after a delete and the diff would keep showing the pre-rename file.
     pub(in crate::sidebar) fn refresh_after_file_op(&mut self, cx: &mut Context<Self>) {
         self.load_file_tree(self.file_tree_root.clone(), cx);
         self.load_diff(self.diff_root.clone(), cx);
@@ -1949,8 +1683,6 @@ mod tree_ops_regression_tests {
         fs::write(repo.path().join("README.md"), "hi\n").expect("write");
     }
 
-    /// §2, the headline requirement: "open tabs / the diff view follow the renamed path - no
-    /// orphaned buffers". Drives the real inline editor, not `rename_open_paths` directly.
     #[gpui::test]
     fn renaming_an_open_file_carries_its_tab_and_buffer_with_no_orphan_left_behind(
         cx: &mut TestAppContext,
@@ -2015,8 +1747,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// The subtree half of the same requirement: renaming a *folder* has to carry every tab and
-    /// buffer underneath it, not just an exact path match.
     #[gpui::test]
     fn renaming_a_folder_carries_every_open_tab_underneath_it(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2057,14 +1787,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// GitHub issue #105: Delete no longer asks for confirmation - clicking the menu row (or
-    /// pressing the keyboard shortcut) removes the file immediately, and the deleted file's tab
-    /// and buffer go with it. `DeleteMechanism` is forced to `Permanent` via `Self::
-    /// request_tree_delete_with_mechanism_for_test` rather than letting the real resolution run:
-    /// on a developer machine with `gio` installed the real resolution is `Trash`, and running it
-    /// here would move a test fixture into the developer's own `~/.local/share/Trash`. The
-    /// resolution logic itself is covered purely in `crate::sidebar::file_ops`'s own tests; what
-    /// this test exercises is the real removal, state repair, and undo bookkeeping.
     #[gpui::test]
     fn deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry(
         cx: &mut TestAppContext,
@@ -2119,9 +1841,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// GitHub issue #105: undo/redo replaces the confirmation dialog as the safety net for
-    /// delete. `Ctrl+Z` must really restore the deleted file's real content from its backup, and
-    /// `Ctrl+Shift+Z` must really delete it again.
     #[gpui::test]
     fn undoing_then_redoing_a_delete_restores_then_removes_the_file_again(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2167,14 +1886,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// Two separate `AdeApp` instances (as any two `#[gpui::test]`s in the same `cargo test`
-    /// binary really are - one process, one pid) each delete a same-named file. Before
-    /// [`AdeApp::tree_undo_instance_id`] existed, [`AdeApp::tree_undo_backup_root`] was keyed by
-    /// `std::process::id()` alone and [`AdeApp::tree_undo_backup_counter`] always restarted at 0,
-    /// so both deletes' first backup landed at the exact same path - the second app's backup copy
-    /// failed with `AlreadyExists`, silently leaving its "deleted" file still on disk. This is
-    /// what actually made `undoing_then_redoing_a_delete_restores_then_removes_the_file_again`
-    /// fail intermittently in full-suite runs while always passing alone.
     #[gpui::test]
     fn two_app_instances_deleting_a_same_named_file_never_collide_on_their_backup_paths(
         cx: &mut TestAppContext,
@@ -2225,8 +1936,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// The same real undo/redo, for a rename - the other half of GitHub issue #105's scope
-    /// beyond delete.
     #[gpui::test]
     fn undoing_then_redoing_a_rename_restores_then_reapplies_it(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2272,8 +1981,6 @@ mod tree_ops_regression_tests {
         assert!(!old.exists());
     }
 
-    /// Cut/paste is a move, the same `Relocate` shape a rename is - undo/redo must work
-    /// identically for it.
     #[gpui::test]
     fn undoing_a_cut_and_paste_move_restores_the_original_location(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2302,10 +2009,6 @@ mod tree_ops_regression_tests {
         assert!(!moved.exists());
     }
 
-    /// The same "a fresh edit invalidates redo" rule every undo/redo stack in this app follows -
-    /// undoing a delete, then making a genuinely new edit, must drop the now-unreachable redo
-    /// entry (and best-effort clean up its backup, though that part isn't directly observable
-    /// from a test).
     #[gpui::test]
     fn a_fresh_edit_after_an_undo_clears_the_redo_stack(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2356,7 +2059,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// A guard on the app's one most destructive operation.
     #[gpui::test]
     fn deleting_something_outside_the_worktree_is_refused_outright(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2380,8 +2082,6 @@ mod tree_ops_regression_tests {
         assert!(outside.path().join("precious.txt").exists());
     }
 
-    /// §3: "pasting into the source folder auto-suffixes the copy's name" - a real second file,
-    /// never an overwrite and never a collision error.
     #[gpui::test]
     fn pasting_into_the_source_folder_creates_a_real_suffixed_copy(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2420,7 +2120,6 @@ mod tree_ops_regression_tests {
             );
         });
 
-        // A second paste must not fail either - it steps to the next suffix.
         app.update(cx, |app, cx| {
             app.paste_into_dir(&repo.path().join("src"), cx);
         });
@@ -2428,8 +2127,6 @@ mod tree_ops_regression_tests {
         assert!(repo.path().join("src/main copy 2.rs").exists());
     }
 
-    /// A cut is a move, so it has to repair open tabs exactly like a rename does - and must
-    /// clear the clipboard, since the entry is no longer where it said it was.
     #[gpui::test]
     fn cutting_and_pasting_moves_the_entry_and_its_open_tab(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2459,12 +2156,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// §4: "watcher refreshes must not clobber an in-progress inline rename/create editor".
-    ///
-    /// Drives the real race: an agent creates a file on disk, the tree is genuinely re-walked
-    /// (`load_file_tree` - the one mechanism that replaces `AdeApp::file_tree` wholesale, and the
-    /// one a filesystem watcher would drive), and the half-typed name must survive it, still
-    /// painted as a real row.
     #[gpui::test]
     fn a_tree_reload_during_an_inline_rename_keeps_the_typed_text(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2484,7 +2175,6 @@ mod tree_ops_regression_tests {
             "premise: the editor must be a real painted row before the reload"
         );
 
-        // An agent CLI creating a file mid-agent, followed by the real re-walk.
         fs::write(repo.path().join("src/agent-made.rs"), "// new\n").expect("write");
         app.update(cx, |app, cx| {
             let root = app.file_tree_root.clone();
@@ -2511,10 +2201,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// §1: the empty-area menu's "Collapse All" must be issue #18's *real* reset - the one that
-    /// also clears this worktree's persisted entry - not a second mechanism that only empties the
-    /// in-memory set. Asserted against the real on-disk fold-state file, which is the only thing
-    /// that can tell the two apart.
     #[gpui::test]
     fn the_empty_area_collapse_all_clears_the_persisted_fold_state_too(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2564,15 +2250,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// **The merge regression this whole group exists for.** GitHub issue #19 (this file tree)
-    /// and issue #17 (per-widget text undo) were built on two branches in parallel and only met
-    /// at a merge. Nothing about that merge conflicted textually here, and the merged tree
-    /// compiled and passed both sides' suites - but this editor was a bare `String` with no
-    /// `"text-input"` key-context word, so while typing a filename plain `Ctrl+Z` reached the
-    /// worktree-level undo/redo this app used to also have (removed - GitHub issue #47): the
-    /// name stayed unchanged and there was no indication of what had happened. Verbatim the "a
-    /// keystroke reaches the wrong handler" bug class `crate::default_key_bindings`' own docs
-    /// catalogue.
     #[gpui::test]
     fn ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2616,15 +2293,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// The rename editor opens *pre-filled* with the entry's current name, and that pre-fill is
-    /// the field's baseline rather than an edit to it - so the first `Ctrl+Z` must do nothing at
-    /// all, not blank the box to `""`.
-    ///
-    /// This is what `crate::text_history::TextField::seeded` exists for; building the field as
-    /// `new()` + `set(current_name)` would record the pre-fill as a real undoable step and leave
-    /// the user in a state they never typed and cannot type their way back to (the name is gone
-    /// and only redo returns it). Also asserts the keystroke did not fall through to the
-    /// worktree history when the text field had nothing to give it.
     #[gpui::test]
     fn the_first_ctrl_z_in_a_rename_editor_does_not_blank_the_prefilled_name(
         cx: &mut TestAppContext,
@@ -2668,8 +2336,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// The redo half of the same routing, on both real spellings this app binds
-    /// (`secondary-shift-z` and `ctrl-y`).
     #[gpui::test]
     fn redo_in_the_tree_inline_editor_restores_the_undone_name(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2721,9 +2387,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// A right-click while a name is being typed must not leave the editor open underneath a menu
-    /// whose actions all act on a different path - [`AdeApp::open_tree_context_menu`] cancels any
-    /// open inline editor first.
     #[gpui::test]
     fn opening_the_context_menu_cancels_an_open_inline_editor(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2758,20 +2421,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// The same discipline for the clipboard bindings, and the highest-stakes case: `Ctrl+C` in a
-    /// focused terminal is SIGINT, and a version of this feature that intercepted it would make
-    /// it impossible to interrupt a running agent CLI.
-    ///
-    /// What this test proves, precisely: with a terminal focused, none of the three clipboard
-    /// keystrokes reaches the tree's own handler. It does **not** prove the keystroke still
-    /// reached the pty - that is a separate property, guaranteed by *where* the handlers are
-    /// registered (see this module's own docs, point 1) and covered by
-    /// `crate::terminal::pane`'s own `keystroke_to_bytes` tests. Stated explicitly because this
-    /// test was checked against a deliberately un-scoped (`None`) binding and still passed: with
-    /// the handlers on the tree's own node, an unmatched *handler* is what saves the terminal
-    /// there, not the context predicate. The predicate's own load-bearing half is verified by
-    /// the two tests above and by
-    /// [`every_file_tree_binding_is_scoped_away_from_the_inline_editor`].
     #[gpui::test]
     fn ctrl_c_with_a_focused_terminal_never_reaches_the_trees_clipboard(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2800,8 +2449,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// And the positive half of *that* pair: with the tree focused, the same keystroke really
-    /// does work.
     #[gpui::test]
     fn ctrl_c_with_the_tree_focused_copies_the_selected_entry(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2827,12 +2474,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// Structural, read off the *real* registered bindings rather than a hand-copied list (the
-    /// same discipline `crate::settings::state::keybinding_rows` follows): every file-tree
-    /// action must be scoped to a context that excludes both modal states. A future edit that
-    /// widened one of them to `None`, or dropped either negated half, would silently start
-    /// swallowing keystrokes typed into the tree's own inline name editor, or firing behind the
-    /// delete confirmation's own scrim.
     #[test]
     fn every_file_tree_binding_is_scoped_away_from_the_inline_editor() {
         let expected = "file-tree && !tree-editing";
@@ -2871,8 +2512,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// §1: a real right-click on a real painted row opens that row's own menu (not the empty-area
-    /// one), positioned inside the window.
     #[gpui::test]
     fn right_clicking_a_folder_row_opens_the_folder_menu_at_a_clamped_origin(
         cx: &mut TestAppContext,
@@ -2936,7 +2575,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// §1's dismissal requirement, driven through the real key handler.
     #[gpui::test]
     fn escape_dismisses_the_context_menu(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2953,7 +2591,6 @@ mod tree_ops_regression_tests {
         app.read_with(cx, |app, _| assert!(app.tree_context_menu.is_none()));
     }
 
-    /// §2: New Folder really creates a directory, and the inline editor is what drives it.
     #[gpui::test]
     fn the_new_folder_editor_creates_a_real_directory(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2986,8 +2623,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// §2: "invalid names are rejected with a hint" - and the editor stays open so the name can
-    /// be corrected, exactly like the `+` menu's prompt.
     #[gpui::test]
     fn an_invalid_name_is_refused_with_a_real_hint_and_the_editor_stays_open(
         cx: &mut TestAppContext,
@@ -3017,7 +2652,6 @@ mod tree_ops_regression_tests {
             });
         }
 
-        // A name that collides with something already there is refused the same way.
         app.update_in(cx, |app, window, cx| {
             app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
             app.tree_inline_edit.as_mut().expect("editor").name =
@@ -3040,7 +2674,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// §1's "Collapse Subtree": only that folder's own chain, never a sibling's.
     #[gpui::test]
     fn collapse_subtree_collapses_only_that_folders_own_descendants(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3075,7 +2708,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// "Copy Relative Path" really writes to the real system clipboard, and really is relative.
     #[gpui::test]
     fn copy_relative_path_writes_the_worktree_relative_path(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3111,10 +2743,6 @@ mod tree_ops_regression_tests {
         use super::*;
         use crate::sidebar::render::RightSidebarView;
 
-        /// `staged_files` is keyed by `wt_core::diff::DiffFile::path` - worktree-*relative* -
-        /// while the paths a rename works in are absolute. Remapping it with the absolute pair
-        /// was a guaranteed silent no-op (`strip_prefix` failed for every entry), so a file's
-        /// staged checkbox quietly reset on every rename and every cut+paste.
         #[gpui::test]
         fn a_rename_carries_the_files_staged_checkbox_with_it(cx: &mut TestAppContext) {
             let repo = TempDir::new().expect("tempdir");
@@ -3143,10 +2771,6 @@ mod tree_ops_regression_tests {
             });
         }
 
-        /// `crate::lsp::client`'s `didOpen` dispatch early-returns for a path already in
-        /// `lsp_opened_files`, and that set is documented as never being cleared on close. So a
-        /// rename (or a delete) that left the old absolute path in it meant recreating a file at
-        /// that path silently got no diagnostics and no completions for the rest of the agent.
         #[gpui::test]
         fn renaming_and_deleting_both_clear_the_lsp_per_document_bookkeeping(
             cx: &mut TestAppContext,
@@ -3185,7 +2809,6 @@ mod tree_ops_regression_tests {
                 assert!(!app.lsp_synced_version.contains_key(&relative));
             });
 
-            // And the delete half, on the renamed path.
             let renamed = repo.path().join("src/renamed.rs");
             let renamed_relative = PathBuf::from("src/renamed.rs");
             app.update(cx, |app, _cx| {
@@ -3208,9 +2831,6 @@ mod tree_ops_regression_tests {
             });
         }
 
-        /// Cutting a file and pasting it back into the folder it came from means "move it here",
-        /// and it is already here. An unconditional `unique_destination` turned that into an
-        /// unrequested rename to `util copy.rs`, with no error and no undo.
         #[gpui::test]
         fn cutting_and_pasting_into_the_source_folder_is_a_no_op_not_a_rename(
             cx: &mut TestAppContext,
@@ -3241,10 +2861,6 @@ mod tree_ops_regression_tests {
             });
         }
 
-        /// Switching to the Changes tab unrenders `file_tree_shell` - and with it the node
-        /// `tree_focus_handle` is tracked on. Leaving `Window::focus` there makes GPUI fall back
-        /// to the dispatch root, silently killing every keybinding until the next click: this
-        /// project's single most-repeated bug class.
         #[gpui::test]
         fn leaving_the_files_tab_does_not_leave_focus_dangling_on_the_tree(
             cx: &mut TestAppContext,
@@ -3288,8 +2904,6 @@ mod tree_ops_regression_tests {
         }
     }
 
-    /// A worktree switch must not leave a cut entry, a half-typed name, an open menu, or a
-    /// recorded undo/redo entry pointing at the worktree just left.
     #[gpui::test]
     fn switching_worktrees_clears_every_tree_operation_in_flight(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3377,20 +2991,6 @@ mod tree_ops_regression_tests {
         assert!(repo.path().join("README.md").exists());
     }
 
-    /// The reported "the context menu still lets you hover and select the rows underneath it"
-    /// bug, driven as a real click at a real row's real painted bounds.
-    ///
-    /// The reported symptom had two halves with two different causes, and only one of them is
-    /// observable from a test: the click must not reach the row's own `on_click` (asserted here,
-    /// via `open_change`), and the row must not paint its hover fill or its tooltip (not
-    /// observable - GPUI resolves both inside `Interactivity::paint` from
-    /// `Hitbox::is_hovered`, with no app state to read back). Both come from the same one-line
-    /// cause and the same one-line fix, which is why this test is honest coverage of the pair
-    /// rather than of only the half it names: `Window::hit_test` stops walking hitboxes at the
-    /// first `HitboxBehavior::BlockMouse` one, so with `.occlude()` on the scrim the row's
-    /// hitbox is not in the hit test's ids at all - which is exactly what both the click
-    /// dispatch and `is_hovered` consult. Note a `cx.stop_propagation()` in the scrim's own
-    /// handler would have fixed only the click half; hover styling is not an event.
     #[gpui::test]
     fn a_click_on_a_tree_row_under_an_open_context_menu_does_not_reach_that_row(
         cx: &mut TestAppContext,
@@ -3434,11 +3034,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// GitHub issue #176's literal report - "2 context menus open at the same time" - through the
-    /// two real surfaces that used to reach it most easily. The tab strip's `+` menu paints a
-    /// full-window scrim, but that scrim only listens for a *left* click, so a right-click in the
-    /// file tree sailed past it, opened this menu, and left both popovers painted. Driven by a
-    /// genuine `MouseButton::Right` platform event, not by calling `open_tree_context_menu`.
     #[gpui::test]
     fn a_real_right_click_in_the_file_tree_closes_an_open_plus_menu(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3490,13 +3085,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// The other direction, so the rule above can't pass by making the `+` menu permanently
-    /// unopenable. This one lands on the tree menu's own **occluding** scrim, which deliberately
-    /// absorbs the click that dismisses it (see `crate::sidebar::render::AdeApp::
-    /// render_tree_context_menu`'s docs - a dismiss must not also run whatever was underneath) -
-    /// so the first click closes the tree menu *without* opening the `+` menu, and a second click
-    /// on the now-uncovered `+` opens it. Two menus are never open at the same time in either
-    /// step, which is the property GitHub issue #176 is actually about.
     #[gpui::test]
     fn clicking_the_tab_strip_plus_under_an_open_tree_context_menu_never_leaves_both_open(
         cx: &mut TestAppContext,
@@ -3552,9 +3140,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// The positive half of the same pair, so the `.occlude()` above can't pass by making the
-    /// tree permanently unclickable: with no menu open, the identical click really does open the
-    /// file.
     #[gpui::test]
     fn the_same_click_with_no_menu_open_really_does_open_the_file(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3575,11 +3160,6 @@ mod tree_ops_regression_tests {
         );
     }
 
-    /// GitHub issue #105: clicking a file used to hand keyboard focus to the editor, silently
-    /// killing every `"file-tree"`-scoped shortcut (`Ctrl+C`/`X`/`V`, `F2`, `Shift+F10`, `Delete`)
-    /// the instant a file was selected. Driven as a real click at the row's own painted bounds -
-    /// not a manual `focus_file_tree` call - because that manual call is exactly what would have
-    /// masked the original bug.
     #[gpui::test]
     fn clicking_a_file_row_keeps_the_tree_focused_so_the_next_shortcut_still_fires(
         cx: &mut TestAppContext,
@@ -3619,19 +3199,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// GitHub issue #105: `Delete` had no keyboard shortcut at all. This drives the real
-    /// keystroke through the keymap (not by calling `Self::request_tree_delete` directly) to
-    /// prove the binding really reaches `Self::request_tree_delete_for_selection`.
-    ///
-    /// Deliberately does **not** `cx.run_until_parked()` after the keystroke: this test
-    /// environment has a real `gio` on `$PATH`, so letting the spawned background task actually
-    /// run would move a real test fixture into the developer's own trash - the same hygiene
-    /// concern `Self::request_tree_delete_with_mechanism_for_test` exists for elsewhere. Mechanism
-    /// resolution and spawning the delete task both happen synchronously, before anything
-    /// destructive runs, so checking `_tree_delete_tasks` right after dispatch - without ever
-    /// draining the executor - proves the keystroke reached the real delete path without letting
-    /// the real removal command run. `deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry`
-    /// covers the real end-to-end removal, with a mechanism it fully controls.
     #[gpui::test]
     fn the_delete_key_reaches_the_real_delete_handler(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3656,12 +3223,6 @@ mod tree_ops_regression_tests {
         });
     }
 
-    /// `menu_height` is what the window-edge flip is computed from, so it has to equal what the
-    /// popover *actually paints* - not just what its own formula restates. Asserted against real
-    /// painted bounds for all three targets, which is the only form of this assertion that can
-    /// catch a term going missing (an earlier version of `menu_height` omitted the panel's own
-    /// 2px border, making every edge flip 2px optimistic, and a formula-only test could not see
-    /// it).
     #[gpui::test]
     fn the_context_menu_paints_exactly_the_height_it_measures(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -3695,9 +3256,6 @@ mod tree_ops_regression_tests {
         }
     }
 
-    /// The Files tree's footer hint strip advertises real keystrokes or none at all: each spec it
-    /// prints must resolve to a keystroke some real, registered binding actually carries. A hint
-    /// that named a keystroke nothing dispatches would be worse than no hint.
     #[test]
     fn the_file_tree_footer_only_advertises_real_registered_bindings() {
         use crate::sidebar::render::FILE_TREE_RENAME_SPEC;
@@ -3814,7 +3372,6 @@ mod tree_multiselect_tests {
             assert_eq!(app.tree_selection_len(), 2);
         });
 
-        // A second Ctrl/Cmd+click on the same row toggles it back off.
         app.update(cx, |app, _cx| {
             app.tree_click_select(b.clone(), secondary_modifiers());
         });
@@ -3838,7 +3395,6 @@ mod tree_multiselect_tests {
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
-            // Ctrl/Cmd+click the anchor itself off.
             app.tree_click_select(a.clone(), secondary_modifiers());
         });
         app.read_with(cx, |app, _| {
@@ -4045,7 +3601,6 @@ mod tree_multiselect_tests {
         app.update_in(cx, |app, window, cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
-            // Right-clicking `c` - outside the {a, b} selection - must collapse to just `c`.
             app.open_tree_context_menu(ContextTarget::File(c.clone()), 10.0, 10.0, window, cx);
         });
         app.read_with(cx, |app, _| {
@@ -4213,12 +3768,6 @@ mod tree_drag_move_tests {
         });
     }
 
-    /// GitHub issue #152's real end-to-end regression: a drop landing on a *file* row (not the
-    /// folder's own header row) must still resolve to that file's own current parent, the same
-    /// directory `Self::tree_drop_target_dir` (see `tree_drop_target_dir_tests` for its own unit
-    /// coverage) hands `render_file_tree_row`'s file-row `on_drop` closure - proving the fix at
-    /// the real API boundary those closures call into, not just the pure resolution rule in
-    /// isolation.
     #[gpui::test]
     fn dropping_a_selection_back_onto_a_sibling_file_row_in_the_same_folder_is_a_real_no_op(
         cx: &mut TestAppContext,

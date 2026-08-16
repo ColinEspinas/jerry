@@ -1,22 +1,5 @@
 //! The real GPUI Search panel - the middle tab of `Files · Search · Changes`, as `impl AdeApp`
 //! methods.
-//!
-//! Built from top to bottom exactly as `Jerry.dc.html`'s own `showFind` block is:
-//!
-//! - the **query row** (30 high): leading `⌕`, the real query input, then the `Aa` / `ab` / `.*`
-//!   modifier buttons,
-//! - the **replace row** (28) behind `⇄`, with `Replace all` when there is something to replace,
-//! - the two **glob rows** (25 each) behind the funnel: `include` and `exclude`,
-//! - the **count row** (24): the count, then `⇄`, the funnel, a divider, and fold-all,
-//! - the **body**: the two-level match tree, or one of the message states.
-//!
-//! Every one of those four fields is a real, editable `crate::text_history::TextField` with its
-//! own focus handle and its own caret - `REVISION-2026-08-14.md` §5: "A fake field directly below
-//! a real one is a dead end the user will click."
-//!
-//! The state machine behind all of it is `crate::search::state::SearchPanel`, and the searching
-//! and replacing themselves are `crate::search::engine`'s. This module only draws, routes
-//! keystrokes, and owns the two background tasks.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,11 +23,6 @@ use crate::sidebar::render::RightSidebarView;
 use crate::theme;
 
 /// How long the panel waits after the last keystroke before it really walks the worktree.
-///
-/// A search is real filesystem work over a whole checkout, so running one per keystroke would
-/// start (and then have to discard) a walk for every prefix of what the user is typing. Sits at
-/// the same value as `crate::code_surface::editing::REHIGHLIGHT_DEBOUNCE`, and for the same
-/// reason: it must fire *within* a typing burst, not survive one.
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// How far past `AdeApp::search_list_state`'s own viewport `AdeApp::render_search_body`'s
@@ -73,13 +51,6 @@ impl AdeApp {
 
     /// The worktree this search is scoped to, named the way the design's two body sentences name
     /// it (`Search the files in <branch>.`).
-    ///
-    /// `STAGE-A-CHANGELOG.md` §4u: search is "scoped to the active worktree like the tree beside
-    /// it - a hit in another checkout is not something you can act on from here without switching
-    /// first". So this is the same root `crate::sidebar::render::AdeApp::render_file_tree` walks,
-    /// `AdeApp::file_tree_root`, and the branch label is that worktree's own. A detached or
-    /// unnamed checkout falls back to the directory name rather than printing nothing, since the
-    /// sentence has to name *something* the user can recognise.
     fn search_branch_label(&self) -> String {
         let root = &self.file_tree_root;
         self.worktrees
@@ -177,10 +148,6 @@ impl AdeApp {
     /// The shared shell every one of the four input rows is built on: the focus handle it tracks,
     /// the `"text-input"` context that makes Ctrl+Z mean *this* field, its key handler, and the
     /// click that focuses it.
-    ///
-    /// One function rather than four copies specifically because the omission this codebase keeps
-    /// finding (GitHub issue #45, five times over) is a field wired into some of those four and
-    /// not the rest.
     fn search_input_row(
         &self,
         field: SearchField,
@@ -832,22 +799,6 @@ impl AdeApp {
     }
 
     /// One match row: the line number, then the line with **this** hit highlighted.
-    ///
-    /// One row per *match*, not per line (`STAGE-A-CHANGELOG.md` §4v: "one row per match with its
-    /// line number and the hit highlighted"), so two hits on one line are two rows that each
-    /// point at their own - which is also what makes the count row's total and the rows on screen
-    /// agree.
-    ///
-    /// `is_first`/`is_last` place this row within its own file's run of match rows in the
-    /// flattened list (`SearchListItem::MatchRow` no longer has a shared parent to hang the
-    /// group's own top/bottom breathing room or its vertical guide rule on - see
-    /// `crate::search::state::SearchListItem`'s own docs on why match rows are now flat siblings
-    /// rather than a file row's children). The old wrapping div's `pt(2)`/`pb(3)` becomes this
-    /// row's own top/bottom padding exactly when it is the first/last row of that run - a flex
-    /// column's padding only ever visually affects its first and last child's leading/trailing
-    /// edge, so this is pixel-identical to the old wrapper's own spacing. The guide rule likewise
-    /// becomes a per-row absolutely-positioned segment spanning this row's own height: consecutive
-    /// rows' segments abut with no gap, reading as the one continuous rule the old wrapper drew.
     #[allow(clippy::too_many_arguments)]
     fn render_search_match(
         &self,
@@ -945,14 +896,6 @@ impl AdeApp {
 }
 
 /// A field row's leading mark - the `/` of the query row and the `⇄` of the replace row.
-///
-/// Deliberately **text**, not an icon, and deliberately not a magnifying glass. The panel's own
-/// tab, 30px directly above this row, already *is* a magnifying glass, and
-/// `REVISION-2026-08-14.md` §7 rule 8 is exactly about that: "Before adding an icon, check what it
-/// sits beside. Two marks from the same family one divider apart are one mark with a rendering
-/// bug, as far as the eye is concerned." Caught on the first real screenshot of this panel, where
-/// the two magnifiers read as one control drawn twice. `/` is also what the rail's own filter row
-/// uses, so the two filter fields in this window speak one language.
 fn render_search_row_mark(mark: &'static str, text_size: gpui::Pixels) -> impl IntoElement {
     div()
         .flex_none()
@@ -976,15 +919,6 @@ fn render_search_caret(open: bool, text_size: gpui::Pixels) -> impl IntoElement 
 /// A field's stable slug, for element ids and debug selectors.
 /// One search field's own [`TextFieldHandle`] - what click/drag selection and GitHub issue #336's
 /// four clipboard/select-all actions act on.
-///
-/// Carries [`AdeApp::on_search_input_changed`] as its `on_changed`, which is exactly what
-/// [`AdeApp::handle_search_key_down`] already runs after an ordinary keystroke: a paste or a cut
-/// changes what the search would return just as much as typing does, and without this the panel
-/// would sit showing results for a query that is no longer in the box.
-/// The in-file find bar's own field handle - the same shape [`search_field_handle`] has, with the
-/// bar's own "the query changed, so re-run the match set and reveal the current hit" follow-up
-/// (exactly what `AdeApp::handle_find_bar_key_down` runs after a keystroke). `None` whenever the
-/// bar is closed, which is the case [`TextFieldHandle`]'s own `Option` exists for.
 fn find_bar_query_handle() -> TextFieldHandle {
     TextFieldHandle::new(|app: &mut AdeApp| app.find_bar.as_mut().map(|bar| &mut bar.query))
         .on_changed(|app: &mut AdeApp, cx| {
@@ -1044,10 +978,6 @@ impl AdeApp {
     }
 
     /// One keystroke into one of the four fields.
-    ///
-    /// Everything but `Tab` and `Esc` is `TextField::handle_editing_key`'s, so all four fields get
-    /// the same real editing vocabulary - caret movement included - rather than each row growing
-    /// its own half of it.
     fn handle_search_key_down(
         &mut self,
         field: SearchField,
@@ -1097,9 +1027,6 @@ impl AdeApp {
 
     /// Anything that changes what the search would return: a keystroke in any of the four fields,
     /// a modifier toggle, an undo.
-    ///
-    /// Clears the replace notice too - it described a replace against results that no longer
-    /// answer what is typed, and a stale report is worse than none.
     fn on_search_input_changed(&mut self, cx: &mut Context<Self>) {
         self.search.notice = None;
         self.start_search(cx);
@@ -1108,17 +1035,6 @@ impl AdeApp {
 
     /// Compiles the query and, if it compiles to something, starts a real debounced search of the
     /// active worktree on the background executor.
-    ///
-    /// Generation-guarded on the *result*: a slow search over a big worktree must never overwrite
-    /// a newer, faster one's results, and that check is one comparison at the moment the result
-    /// lands. The walk itself is also cooperatively cancelled while it runs - GitHub issue #162's
-    /// own live-report follow-up found that the generation guard alone let a fast typist pile up
-    /// several full worktree walks competing for CPU at once, since a superseded walk kept running
-    /// to completion only to have its result thrown away. `self.search_generation` (a real,
-    /// cross-thread `Arc<AtomicU64>` - see that field's own docs) is bumped here alongside
-    /// `self.search.generation`, and `crate::search::engine::search_worktree_cancellable` polls it
-    /// once per scan batch, so a superseded walk stops within one batch of being superseded. The
-    /// debounce is `SEARCH_DEBOUNCE` - see its own docs for why a search is not run per keystroke.
     pub(crate) fn start_search(&mut self, cx: &mut Context<Self>) {
         self.search.generation += 1;
         let generation = self.search.generation;
@@ -1206,10 +1122,6 @@ impl AdeApp {
 
     /// Replaces every match in `paths` for real, on disk, then re-runs the search so the tree
     /// reflects what the files now hold rather than what they held a moment ago.
-    ///
-    /// Files open in the editor with **unsaved** edits are refused and named - see
-    /// `crate::search::engine::replace_across`'s own docs for why writing them would destroy
-    /// those edits. The notice this leaves behind is the issue's "report what changed".
     pub(crate) fn replace_search_matches(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if paths.is_empty() {
             return;
@@ -1255,18 +1167,6 @@ impl AdeApp {
     }
 
     /// Opens the file a match row points at, in the editor, scrolled to that line.
-    ///
-    /// `line_number` is [`engine::LineMatch::line_number`], already 1-based - the exact number the
-    /// row itself prints (see this row's own leading `line_number.to_string()` label and its
-    /// `"{path}:{line_number}"` tooltip above). [`Self::open_file_at_line`] (`crate::code_surface::
-    /// lsp_ui`) already takes a 1-based line and does its own internal conversion for the editor's
-    /// 0-based scroll target - every other real caller (`Self::trigger_goto_definition`'s own
-    /// `target_range.start.line as usize + 1`, the Problems row's `problem.line`, a terminal
-    /// `path:line` link's parsed `line`) passes it a real 1-based line number for exactly that
-    /// reason. A live report ("result is line 482 but when clicking it goes to line 481") was this
-    /// function subtracting 1 *again* before handing off an already-1-based number to a callee
-    /// that subtracts its own 1 - the real fix is passing `line_number` straight through, not
-    /// re-adding a compensating `+1` here to paper over the double subtraction.
     fn open_search_match(
         &mut self,
         path: PathBuf,
@@ -1279,10 +1179,6 @@ impl AdeApp {
 }
 
 /// One sentence saying exactly what a replace did, including what it refused to do.
-///
-/// Pure so the wording is a real unit test rather than something only a screenshot can check -
-/// and there is real wording to get wrong here, since "nothing changed" and "3 files were skipped"
-/// are different facts that a single count would flatten into one.
 pub fn replace_notice(outcome: &ReplaceOutcome) -> String {
     let mut parts = Vec::new();
     if outcome.matches_replaced == 0 {
@@ -1364,10 +1260,6 @@ mod tests {
 /// The panel driven the way a user drives it: a real window, real keystrokes into the real
 /// fields, real clicks on the real controls, and - for replace - real files on disk that really
 /// change.
-///
-/// These sit beside `crate::search::state`'s pure tests rather than replacing them: those pin the
-/// three-state gate's *decisions*, these pin that the gate is really what the panel reads, that
-/// the four fields are really editable, and that `Replace all` really writes.
 #[cfg(test)]
 mod panel_tests {
     use super::*;
@@ -1414,7 +1306,6 @@ mod panel_tests {
     fn type_and_settle(cx: &mut gpui::VisualTestContext, text: &str) {
         cx.simulate_input(text);
         cx.run_until_parked();
-        // The search itself is behind a real `SEARCH_DEBOUNCE` timer on the background executor.
         cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
         cx.run_until_parked();
     }
@@ -1427,11 +1318,6 @@ mod panel_tests {
         cx.run_until_parked();
     }
 
-    /// Regression for the screenshot-reported "icons in buttons are too big" bug: the count row's
-    /// `⇄`/funnel toggle buttons kept their real 17px hit box, but the SVG glyph inside each one
-    /// was wrongly stretched to fill that whole box instead of painting at
-    /// `icons::IconSize::Control`'s real 12px optical box (`icons.rs`'s doc comment has the
-    /// bounding-box measurements off `Jerry.dc.html` this 12 comes from).
     #[gpui::test]
     fn the_count_row_toggle_icons_paint_smaller_than_their_hit_box(cx: &mut TestAppContext) {
         let repo = fixture_repo();
@@ -1458,7 +1344,6 @@ mod panel_tests {
             );
             assert_eq!(icon.size.height, px(12.0));
 
-            // Centred, not pinned to a corner of the larger hit box.
             let left_gap = icon.origin.x - button.origin.x;
             let right_gap =
                 (button.origin.x + button.size.width) - (icon.origin.x + icon.size.width);
@@ -1615,7 +1500,6 @@ mod panel_tests {
             );
         });
 
-        // Tab walks to exclude, which is a real, separate field.
         cx.simulate_keystrokes("tab");
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -1632,7 +1516,6 @@ mod panel_tests {
             assert_eq!(app.search.count_label(), "3 results in 2 files");
         });
 
-        // The fourth field, behind `⇄`.
         click(cx, "search-toggle-replace");
         app.read_with(cx, |app, _| {
             assert!(app.search.replace_open);
@@ -1718,14 +1601,6 @@ mod panel_tests {
         );
     }
 
-    /// Real coverage for a live report: "no loading indicator either so it is weird" - typing a
-    /// query with a real, in-flight search still running (behind `SEARCH_DEBOUNCE`, then the
-    /// background walk itself) must visibly say so, not silently keep showing whatever the panel
-    /// last painted. `BodyState::Searching` and its own count-row/body text already exist
-    /// (`SearchPanel::body_state`/`count_label`/`body_message`) - this proves the *render* layer
-    /// really reaches them while a search is genuinely still in flight, not only once it has
-    /// already settled, which is all `type_and_settle`'s own helper (used by every other panel
-    /// test) ever exercises.
     #[gpui::test]
     fn a_real_in_flight_search_shows_the_searching_state_not_a_stale_or_blank_one(
         cx: &mut TestAppContext,
@@ -1774,14 +1649,6 @@ mod panel_tests {
         );
     }
 
-    /// Real regression coverage for a live report: "when we click on a search result the line we
-    /// go to is one line less than what we select (result is line 482 but when clicking it goes
-    /// to line 481)". `Self::open_search_match` used to subtract 1 from the row's own, already
-    /// 1-based `line_number` before handing it to `Self::open_file_at_line` - which itself already
-    /// expects (and converts) a 1-based line, exactly as `Self::trigger_goto_definition` and the
-    /// Problems row both already pass it. The fixture below deliberately puts its one match well
-    /// past line 1, so a real off-by-one lands on visibly the wrong line rather than accidentally
-    /// clamping to a valid one.
     #[gpui::test]
     fn clicking_a_match_row_opens_the_file_on_exactly_the_line_it_reports(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -2068,10 +1935,6 @@ mod search_virtualization_tests {
         Box::leak(format!("search-match-0-{line_number}-0").into_boxed_str())
     }
 
-    /// Before this fix, this row would have painted too: `render_search_body` built every match
-    /// row unconditionally, regardless of scroll position. `crate::sidebar::render::
-    /// virtualization_tests`' own docs record the same class of measurement for the file tree
-    /// before *that* surface's equivalent fix.
     #[gpui::test]
     fn a_match_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
         let repo = fixture_repo();
@@ -2099,8 +1962,6 @@ mod search_virtualization_tests {
         );
     }
 
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable by scrolling.
     #[gpui::test]
     fn scrolling_the_virtualized_results_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
@@ -2154,9 +2015,6 @@ mod search_virtualization_tests {
         );
     }
 
-    /// The live report itself, made falsifiable: hovering a row that is really on screen must
-    /// never materialize one that is not, even though GPUI's own `.hover()` forces a full
-    /// `Window::refresh()` on the transition.
     #[gpui::test]
     fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
         cx: &mut TestAppContext,
@@ -2193,11 +2051,6 @@ mod search_virtualization_tests {
 
 /// The in-file find bar (`mod+F`) - `crate::search::in_file`'s model, drawn in the file view's
 /// own column between its toolbar and its content.
-///
-/// Deliberately built from the panel's own helpers rather than a second vocabulary: the same
-/// modifier buttons, the same 17x17 icon-button box, the same leading text mark, the same
-/// `SimpleInput` row, the same three-state count. GitHub issue #162's own instruction for the
-/// unspecced half: "match the panel's vocabulary rather than inventing a new one."
 impl AdeApp {
     /// `mod+F` - a real toggle, same idiom as [`Self::handle_toggle_palette_action`]: opens the
     /// bar over the focused file view and puts the caret in it if it is closed, closes it (same
@@ -2368,7 +2221,6 @@ impl AdeApp {
                         .into_iter()
                         .map(|modifier| self.render_find_bar_modifier(modifier, cx)),
                 )
-                // Rule 2 once more: with nothing to step through, next/prev do not exist.
                 .children(
                     has_results
                         .then(|| self.render_find_bar_step(false, bar.step_tooltip(false), cx)),
@@ -2540,7 +2392,6 @@ impl AdeApp {
                 cx.stop_propagation();
                 return;
             }
-            // Enter / Shift+Enter step, the way every editor's find does.
             "enter" => {
                 self.step_find_bar(!keystroke.modifiers.shift, cx);
                 cx.stop_propagation();
@@ -2632,11 +2483,6 @@ mod find_bar_tests {
         "ctrl-f"
     };
 
-    /// GitHub issue #379: the first cut only ever opened (or re-focused) the bar, so a second
-    /// `mod+F` press could not close it - unlike every other toggle shortcut in this app (e.g.
-    /// `secondary-p` / `TogglePalette`). Drives the real keybinding, not `FindInFile` dispatched
-    /// directly, for the same reason `tabless_window_keybinding_tests` does: a direct dispatch
-    /// would miss a bug in which *keystroke* the action is actually reachable by.
     #[gpui::test]
     fn mod_f_toggles_the_bar_closed_on_a_second_press(cx: &mut TestAppContext) {
         let (_repo, app, cx) = repo_with_open_file(cx);
@@ -2708,7 +2554,6 @@ mod find_bar_tests {
         assert!(cx.debug_bounds("find-bar-next").is_some());
         assert!(cx.debug_bounds("find-bar-prev").is_some());
 
-        // A real query with no hits is its own, differently-worded state.
         cx.simulate_input("_nonexistent");
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -2742,7 +2587,6 @@ mod find_bar_tests {
             assert_eq!(app.code_cursor, Some(2));
         });
 
-        // Enter steps too, the way every editor's find does.
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         app.read_with(cx, |app, _| {

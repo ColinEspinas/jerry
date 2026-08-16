@@ -1,70 +1,6 @@
 //! Off-thread, cached inline git blame (GitHub issue #29, part of the umbrella issue #14
 //! "Editor polish"): the current line's author/relative-date/summary, rendered dimmed at the
 //! end of the line, with a real hover tooltip carrying the full sha and commit message.
-//!
-//! ## Threading and caching - mirrors this crate's existing background-load conventions
-//!
-//! `wt_core::blame::blame_file` performs blocking I/O (opens the repository via `gix`, spawns a
-//! real `git blame` child process) - see that crate's own module docs. Exactly like
-//! [`AdeApp::spawn_file_load`] (syntax highlighting) and `AdeApp::dispatch_did_open`/
-//! `Self::schedule_lsp_sync` (LSP), it is never called inline during `render()`:
-//! [`AdeApp::spawn_blame_load`] hands it to `cx.background_executor().spawn(..)` and only
-//! touches `self` again inside a `this.update(cx, ..)` callback once that resolves - so a slow
-//! `git blame` (a large file, a deep history) can never block typing or freeze the frame.
-//!
-//! The real result is cached per file **and revision** in [`AdeApp::blame_cache`]
-//! (`crate::code_surface::state::BlameCacheEntry`), keyed by absolute path, with a fingerprint
-//! of `(head_commit, mtime, len)` - see `crate::code_surface::blame`'s own "What 'revision'
-//! means" docs for why both the resolved `HEAD` commit id *and* the file's own on-disk
-//! `(mtime, len)` are needed: either one changing (a new commit landed, a branch/HEAD switch, or
-//! the file itself was saved/externally rewritten) means the cached attribution can no longer
-//! be trusted.
-//!
-//! ## Recompute triggers: save, commit, branch/HEAD change - via one honest freshness check
-//!
-//! Rather than hooking every individual code path that can change history (a real commit action,
-//! a branch checkout, an external `git commit` run in one of this app's own terminal panes,
-//! Self::save_active_file's own write, ...) - which risks silently missing one - blame staleness
-//! is instead detected the same way [`AdeApp::render_file_view`] already detects a stale syntax-
-//! highlight cache: a throttled recheck of the real fingerprint below, run only while the file
-//! view for that exact path is genuinely on screen (see [`AdeApp::maybe_refresh_blame`]'s own
-//! docs for why this is deliberately scoped to the *visible* file, not a background loop over
-//! every open tab - the same "scope polling to the visible pane" lesson this codebase's own
-//! history already learned once for the terminal poll cadence). A file whose fingerprint hasn't
-//! changed costs nothing beyond the [`BLAME_FRESHNESS_CHECK_INTERVAL`]-throttled `git blame`
-//! re-run's own real wall-clock cost, entirely off the foreground thread; one whose fingerprint
-//! *has* changed - a save, a commit, a checkout, or any other real history/content change -
-//! gets a fresh, real result within one throttle window of it happening, without this module
-//! needing to know or enumerate *why* it changed.
-//!
-//! [`AdeApp::force_refresh_blame_for_save`] additionally forces an immediate recompute right
-//! after [`AdeApp::spawn_file_save_loop`]'s own write succeeds, rather than waiting up to
-//! [`BLAME_FRESHNESS_CHECK_INTERVAL`] for the next throttled poll to notice the new mtime - a
-//! save is the one trigger this module can know about directly (it's this same crate's own
-//! write), so there's no reason to make it wait on the generic poll when a same-tick refresh is
-//! free.
-//!
-//! ## Graceful absence
-//!
-//! [`AdeApp::spawn_blame_load`] maps `wt_core::blame::BlameOutcome::NotARepo`/`NotTracked` (and
-//! any real `Err`) to [`BlameLoadState::Unavailable`]/[`BlameLoadState::Error`] - never
-//! `panic!`s, never shows a toast, and [`AdeApp::render_file_view`]'s inline blame span simply
-//! doesn't render in either case (see that method's own call site). A file with no LSP identity,
-//! a plain-text file, or one in a shallow clone all fall out of this the same honest way `wt_core
-//! ::blame`'s own docs describe - nothing here special-cases any of them.
-//!
-//! ## Scope: gutter/full-file blame view is not built
-//!
-//! GitHub issue #29 also asks for a secondary "gutter blame / full-file blame view" mode. That
-//! is genuinely not implemented in this phase: [`AdeApp::blame_cache`] already holds a whole
-//! file's worth of [`wt_core::blame::BlameLine`]s (one per line, not just the current one - the
-//! same cache entry the current-line inline label reads from), so the *data* a gutter mode would
-//! need already exists, but the *rendering* (a real secondary gutter-column mode toggled in the
-//! toolbar, replacing or augmenting the line-number column for every visible row) is real UI
-//! work this phase's priority (a correct, off-thread, gracefully-absent current-line inline
-//! blame) intentionally left out rather than shipping a half-built toggle bound to nothing. No
-//! settings field or UI control claims to offer it - see `crate::settings::store::
-//! BlameSettings`'s own docs.
 
 use std::time::{Duration, SystemTime};
 
@@ -88,10 +24,6 @@ impl AdeApp {
     /// `Settings.blame.show_inline` is off (GitHub issue #29's own "user setting to hide it
     /// entirely" requirement) - no background work happens at all for a user who's turned this
     /// off, not just no rendering.
-    ///
-    /// Called from [`Self::render_file_view`] itself (never from a free-running timer loop
-    /// enumerating every open tab) - see this module's own top docs for why that's what actually
-    /// scopes this to the *visible* file/pane.
     pub(in crate::code_surface) fn maybe_refresh_blame(
         &mut self,
         absolute_path: &Path,
@@ -348,18 +280,6 @@ impl AdeApp {
 /// `crate::sidebar`/`crate::status_bar` already use for their own truncated-text tooltips)
 /// carrying the sha/full message. `line_number` only seeds the element id, so two rows never
 /// collide.
-///
-/// This span is placed *in-flow*, immediately after the current line's code runs inside the same
-/// `text_row` (see the caller's own docs in `editing::render_editable_file_view_line` and
-/// `file_view::render_file_view_line`): the runs sit in their own `flex_none` box and keep their
-/// natural width, so this span is the only shrinkable sibling. `min_w_0()` + `max_w()` +
-/// `truncate()` (the same combination `crate::status_bar`'s own
-/// `render_status_worktree_history_notice` uses for its long, load-bearing text) therefore let it
-/// begin right at the end of the line's text and ellipsize exactly when it would reach the pane's
-/// right edge, instead of being pinned to the far right of the row where a long line's own
-/// overflowing glyphs used to paint through it. `pl()` gives the small gap after the code text;
-/// `bg(theme::surface::CURRENT_LINE)` matches the current-line highlight `row` already carries on
-/// every row this renders on, so the backdrop stays seamless.
 pub(in crate::code_surface) fn render_inline_blame_span(
     label: &blame::InlineBlameLabel,
     line_number: usize,

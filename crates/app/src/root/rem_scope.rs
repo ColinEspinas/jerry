@@ -1,26 +1,5 @@
 //! A scoped GPUI rem-size override for a subtree of plain declarative elements - backs Surface
 //! C's editor zoom.
-//!
-//! [`Window::with_rem_size`] (`vendor/zed/crates/gpui/src/window.rs`) pushes/pops a value on
-//! [`Window`]'s rem-size override stack only for the dynamic extent of the closure it wraps, and
-//! its own doc comment requires it be "called as part of element drawing" - it only scopes
-//! anything real if the closure is where GPUI's request_layout/prepaint/paint traversal of the
-//! subtree *happens*, not merely where that subtree's `div()` values get *constructed*.
-//! Ordinary declarative `div().child(...)` composition in a `Render::render()` body returns its
-//! element tree to the framework *before* that traversal runs, so wrapping `with_rem_size`
-//! around plain construction code has no effect (`Div`'s own `request_layout`/`prepaint` in
-//! `vendor/zed/crates/gpui/src/elements/div.rs` only read `window.rem_size()` when the
-//! framework's traversal actually reaches that `Div`).
-//!
-//! The fix here is a direct, minimal port of `vendor/zed/crates/ui/src/utils/with_rem_size.rs`
-//! (Zed's own `ui` crate - `crates/app` doesn't depend on it, since it has its own `crate::theme`
-//! tokens instead): a small custom [`Element`] wrapping a [`Div`], whose `request_layout`/
-//! `prepaint`/`paint` each call `window.with_rem_size(...)` around the corresponding `Div`
-//! method call. Since a `Div`'s implementation of those methods recurses into its children's
-//! same three methods synchronously, wrapping each one here scopes the override across this
-//! element's entire child subtree, including nested `gpui::uniform_list` row callbacks (which lay
-//! out each measured row via `layout_as_root` - itself a request_layout/prepaint/paint chain
-//! reached like any other descendant while the override is still pushed).
 
 use gpui::{
     div, AnyElement, App, Bounds, Div, DivFrameState, Element, ElementId, GlobalElementId, Hitbox,

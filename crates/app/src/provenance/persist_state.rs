@@ -2,38 +2,6 @@
 //! `settings.toml`, in the same shape `crate::review::baseline_state` and
 //! `crate::sidebar::fold_state` already use, including their atomic write, their multi-instance
 //! merge and their "a corrupt file is an empty file, never a failed startup" rule.
-//!
-//! ## What crosses a restart, and what deliberately does not
-//!
-//! Attribution is *spans*, not content. This file records, per worktree and per path, which runs
-//! of lines belong to which author and what the deletion ledger says - a few dozen bytes per
-//! path. It never records the file's text: that would duplicate the user's own repository into
-//! `~/.config/jerry`, at a size nobody agreed to and with contents nobody expects to find there.
-//!
-//! The store still needs that text on the other side (it is the "before" half of the next diff -
-//! see `super::store`), and it gets it from the only honest place: **the file itself**. So each
-//! record carries a SHA-256 of the exact content its spans were computed against, and
-//! [`LineProvenanceState::restore_into`] re-reads the file and checks it.
-//!
-//! ## The stale case, and why it drops rather than guesses
-//!
-//! If the digest does not match, the file changed while Jerry was not running. By the model's own
-//! rule that is a hand edit and those lines are `you`'s - but *which* lines is genuinely
-//! unanswerable, because the content the spans described is gone and nothing on disk can
-//! reconstruct it. The two dishonest options are to keep the spans (attributing agent tints to
-//! lines the user may have written themselves, which is the exact failure Orca's rule exists to
-//! prevent) or to flip the whole file to `you` (claiming the user wrote five hundred lines they
-//! did not). The record is therefore **discarded**, and the path reads as unattributed until
-//! something real is recorded for it again - the checklist's "degrades honestly: lines with no
-//! recorded author render unattributed rather than guessed".
-//!
-//! ## Format
-//!
-//! Author values are string tags (`you`, `agent:<key>`), not a serialized enum - the same call
-//! `crate::work_surface::tab_order_state::PersistedTab::kind` and
-//! `crate::hooks::store::status_key` already make, for the same reason: the on-disk format must
-//! not be coupled to a Rust type this codebase renames freely, and an unrecognised tag must be
-//! skippable rather than fatal.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -155,11 +123,6 @@ impl LineProvenanceState {
     /// The app's real write path: replaces only the worktree keys this instance owns, then writes
     /// the result - so a second `jerry` instance (or a second window) working in a different
     /// worktree cannot erase attribution it knows nothing about.
-    ///
-    /// A key in `owned` but absent from `self` **is** removed, unlike
-    /// `ReviewBaselineState::save_merged_at`: provenance is live state describing files as they
-    /// are right now, not history. A worktree this instance owns and has nothing recorded for
-    /// really does have nothing recorded.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = LineProvenanceState::load_at(path);
@@ -620,7 +583,6 @@ mod tests {
 
     #[test]
     fn a_hand_edited_record_that_names_a_path_outside_its_worktree_is_refused() {
-        // The traversal guard every hand-editable per-path key in this codebase carries.
         for key in [
             "../../etc/passwd",
             "/etc/passwd",

@@ -36,18 +36,6 @@ pub fn diff_file_stats(file: &DiffFile) -> (u32, u32) {
 
 /// Git's own status letter for one file row - `A`, `M` or `D`
 /// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j).
-///
-/// **Total, not optional**, and that is the whole point of §4j: the `new`/`del` word pills this
-/// replaced marked only the exceptions, so a *modified* file - the common case - got no mark at
-/// all and "the row could not answer 'what happened to this file', which is the first thing a
-/// reviewer asks". Every row gets a letter, in a fixed column, so every filename also starts on
-/// the same x.
-///
-/// There is deliberately no `conflict` variant, and never was one to remove here: §4j's second
-/// fault is that "`conflict` is not a git status - it was an overlay meaning 'two agents touched
-/// this', which the pair of author chips beside it already states", and
-/// `wt_core::diff::diff_against_base` is a plain two-way diff with no unmerged-path signal to
-/// derive one from anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusLetter {
     Added,
@@ -56,12 +44,6 @@ pub enum StatusLetter {
 }
 
 /// The letter for a file's `FileChangeStatus`.
-///
-/// `Renamed` maps to `Modified`, not to a fourth `R` letter: §4j's table is exactly three
-/// letters, each with one colour, and the rename fact already has its own dedicated channel on
-/// the row - `crate::sidebar::render::render_moved_tag`'s neutral `moved` chip, which
-/// [`is_real_rename`] gates and which this change does not touch. Adding `R` here would be a
-/// fourth colour the design never allocated, stating a fact the row already states.
 pub fn status_letter(status: FileChangeStatus) -> StatusLetter {
     match status {
         FileChangeStatus::Added => StatusLetter::Added,
@@ -168,17 +150,6 @@ pub fn stat_bar_segments(add: u32, del: u32) -> [StatSegment; STAT_BAR_LEN] {
 /// Whether `path` is a change that is **already committed and clean** - it differs from the base
 /// branch (that is why `wt_core::diff::diff_against_base` listed it at all), but a real commit on
 /// this branch already holds that difference and nothing about it is uncommitted right now.
-///
-/// GitHub issue #220: `diff_against_base` diffs the working tree against the *merge-base with the
-/// default branch*, so its file list deliberately mixes committed and uncommitted changes and
-/// `DiffFile` itself carries no signal to tell them apart. `dirty` is that signal -
-/// `wt_core::stage::dirty_paths`' real `git status --porcelain` result, as cached in
-/// [`crate::root::AdeApp::dirty_files`].
-///
-/// `dirty` is an `Option` and `None` means **not known yet** (the query hasn't landed, or it
-/// failed), never "nothing is dirty": with no evidence this returns `false`, so a row falls back
-/// to the ordinary stageable presentation rather than claiming a file is committed on the strength
-/// of an absent answer.
 pub fn is_committed_clean(path: &Path, dirty: Option<&HashSet<PathBuf>>) -> bool {
     match dirty {
         Some(dirty) => !dirty.contains(path),
@@ -202,10 +173,6 @@ pub fn stageable_count(files: &[DiffFile], dirty: Option<&HashSet<PathBuf>>) -> 
 /// from real state (how many files are in [`crate::root::AdeApp::staged_files`], out of
 /// [`stageable_count`]'s genuinely stageable files), never tracked as an independent counter that
 /// could drift.
-///
-/// `total` is the *stageable* count, not the diff's whole file list: a committed-clean file
-/// (GitHub issue #220) has nothing to stage, so including it would permanently pin the fraction
-/// below 1.0 for a worktree where everything stageable really is staged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StagedProgress {
     pub staged: usize,
@@ -438,9 +405,6 @@ mod tests {
         assert_eq!(diff_file_stats(&file), (0, 0));
     }
 
-    /// `STAGE-A-CHANGELOG.md` §4j: every status maps to a letter, including the common case.
-    /// The word pills this replaced returned `None` for `Modified`, which is the exact defect
-    /// §4j names - "only the exceptions were marked".
     #[test]
     fn every_file_status_gets_a_letter_including_the_common_case() {
         assert_eq!(status_letter(FileChangeStatus::Added), StatusLetter::Added);
@@ -470,9 +434,6 @@ mod tests {
         assert_eq!(StatusLetter::Deleted.tooltip(), "Deleted");
     }
 
-    /// §4j's own colour table, and its stated reason for the middle row: added is green, deleted
-    /// is red, and modified is *neutral* - "the common case does not shout". A `M` painted in
-    /// either hue would put the loudest colour in the panel on the least remarkable row.
     #[test]
     fn modified_is_neutral_while_added_and_deleted_carry_their_hues() {
         assert_eq!(StatusLetter::Added.color(), theme::tag::STATUS_ADDED.into());
@@ -751,7 +712,6 @@ mod tests {
 
     #[test]
     fn an_old_path_identical_to_the_current_path_is_not_a_real_rename() {
-        // Defensive: `wt_core::diff` shouldn't produce this, but never assume it away.
         let file = renamed_file(Some(PathBuf::from("src/new_name.rs")));
         assert!(!is_real_rename(&file));
         assert_eq!(rename_label(&file), None);

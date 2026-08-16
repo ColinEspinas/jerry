@@ -1,19 +1,6 @@
 //! Pure width-clamping logic for Zone 1/Zone 3's drag-to-resize splitters
 //! (`design_handoff_jerry_ade/README.md`'s Layout table: rail "276 (range 240–340)", files/
 //! changes panel "320 (260 in empty states)").
-//!
-//! Deliberately `gpui`-free (plain `f32`s, not `gpui::Pixels`) so the clamp math is directly
-//! unit-testable without a window, mirroring `crate::work_surface::state`/`crate::rail::status`'s own
-//! pure-logic split. `crate::root::AdeApp::apply_pane_resize` converts to/from `Pixels` at the
-//! one GPUI call site that owns the drag.
-//!
-//! Widths are computed from the drag's *absolute* cursor position and the window body's bounds
-//! on every `on_drag_move` tick, rather than a delta from an "armed" drag-start baseline that
-//! would need explicit clearing on mouse-up - matching the equivalent precedent in
-//! `vendor/zed/crates/workspace/src/workspace.rs`'s own dock-resize `on_drag_move` handler,
-//! which computes `resize_left_dock(e.event.position.x - workspace.bounds.left(), ..)` directly
-//! from the current event with no armed-drag baseline at all. This removes the "drag state left
-//! dangling if the mouse is released outside the window" leak by construction.
 
 /// The rail's default width and adjustable range (README Layout table: "276 (range 240–340)").
 pub const RAIL_DEFAULT: f32 = 276.0;

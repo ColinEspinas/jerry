@@ -1,55 +1,6 @@
 //! Reading an agent CLI's own window title as a coarse status signal (GitHub issue #239).
-//!
-//! GPUI-free and terminal-free: takes the plain title string
-//! `crate::terminal::pane::TerminalPane::title` captured off the pty and returns a
-//! [`TitleSignal`], so every classification rule below is directly `#[test]`-able without a
-//! window or a child process - the same contract [`crate::rail::status`] holds.
-//!
-//! ## Why a terminal title is a real signal
-//!
-//! TUI programs have set their status into the terminal title since long before agent CLIs
-//! existed - it is how `vim` shows the open file, how `ssh` shows the host, and the mechanism
-//! tmux's `set-titles`/`automatic-rename` and every terminal multiplexer's window list is built
-//! on. Agent CLIs reuse it the same way, so a terminal that reads the title learns what the
-//! agent is doing *the moment the agent decides it*, instead of inferring it from how long the
-//! pty has been quiet.
-//!
-//! ## What was verified on real CLIs, and what was not
-//!
-//! Observed directly on this machine, by driving each CLI under a real pty and logging every OSC
-//! sequence it wrote:
-//!
-//! - **Claude Code 2.1.228** - verified across three independent sessions. It rests on
-//!   `OSC 0 ; "\u{2733} <task>"` and, while actually working, alternates a two-frame half-circle
-//!   spinner between `\u{25d0}` and `\u{25d1}` at roughly 1Hz. A representative capture:
-//!   `\u{2733} Claude Code` at startup, `\u{25d0} Claude Code` 0.1s after the prompt was
-//!   submitted, then `\u{25d0}`/`\u{25d1}` alternating for the next 16 seconds *including a
-//!   9-second stretch where three `sleep 3` tool calls produced no terminal output at all*, then
-//!   back to `\u{2733}` the moment it finished. That silent stretch is precisely the
-//!   false-positive class `crate::rail::status`'s new busy refinement exists to fix, caught live.
-//!   (The issue's research called `\u{2733}` the idle glyph and did not name the busy one; the
-//!   idle half is confirmed, and `\u{25d0}`/`\u{25d1}` is the missing half.)
-//! - **Gemini CLI** - emits `OSC 0 ; "\u{25c7}  Ready (<dir>)"` when idle, confirming the
-//!   `\u{25c7}` idle glyph from the research. Its other three documented glyphs (`\u{2726}`
-//!   working, `\u{23f2}` silently working, `\u{270b}` needs permission) were **not** reproduced:
-//!   the captured sessions only ever reached the idle state. Those three are implemented from
-//!   the documented set and are **unverified by observation here**.
-//! - **OSC 9 / OSC 777 notifications** - neither CLI emitted one in any captured session, not
-//!   even Claude Code at a live permission prompt (its notification channel is configurable and
-//!   was evidently not set to a terminal-escape one). `crate::terminal::osc`'s handling of those
-//!   is therefore verified against the protocol specs and its own tests, not against a live CLI.
-//!
-//! Everything below is therefore an explicitly heuristic layer, ordered most-specific first, and
-//! it always answers [`TitleSignal::Unknown`] rather than guessing when nothing matches -
-//! `crate::rail::status` treats `Unknown` as "no opinion" and falls back entirely to its own
-//! quiescence heuristic.
 
 /// A coarse read of what an agent CLI's window title is claiming about itself.
-///
-/// Deliberately four states and no free text: a title glyph can honestly support "busy / idle /
-/// wants you", and nothing finer. Anything textual about *what* the agent is doing (tool name,
-/// the actual question) needs a real structured payload, not a title scrape - see the parent
-/// issue's Phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleSignal {
     /// The agent says it is actively working.
@@ -95,16 +46,6 @@ const IDLE_WORDS: [&str; 3] = ["ready", "idle", "done"];
 const ATTENTION_WORDS: [&str; 4] = ["waiting", "permission", "approve", "confirm"];
 
 /// Classifies a terminal title into a coarse [`TitleSignal`].
-///
-/// Rule order is most-specific first, and it matters: a Gemini title reads
-/// `"\u{270b}  Waiting for permission (jerry)"`, where the glyph and the keywords agree, but a
-/// title like `"\u{2726} finishing up, almost done"` has a working glyph and an idle *word* -
-/// the glyph is the deliberate signal and the prose is incidental, so glyphs win.
-///
-/// 1. A recognized per-CLI status glyph anywhere in the title.
-/// 2. A Braille spinner frame anywhere in the title (busy).
-/// 3. Whole-word keyword match, attention first, then busy, then idle.
-/// 4. [`TitleSignal::Unknown`].
 pub fn classify_title(title: &str) -> TitleSignal {
     for c in title.chars() {
         match c {
@@ -131,12 +72,6 @@ pub fn classify_title(title: &str) -> TitleSignal {
 }
 
 /// Whether `haystack` (already lowercased) contains `word` as a whole word.
-///
-/// A plain `contains` is wrong here and would misfire constantly in practice: terminal titles
-/// are overwhelmingly *paths*, and `~/src/already/threading.rs` contains "ready" and "reading"
-/// contains neither of the words anyone meant. A word boundary is any non-alphanumeric byte -
-/// so `"ready."`, `"[ready]"` and `"working…"` all match, while `"already"`, `"readyish"` and
-/// `"networking"` do not.
 fn has_word(haystack: &str, word: &str) -> bool {
     let mut from = 0;
     while let Some(offset) = haystack[from..].find(word) {
@@ -327,7 +262,6 @@ mod tests {
 
     #[test]
     fn multibyte_titles_do_not_panic_and_classify_by_their_glyph() {
-        // `has_word`'s byte-offset arithmetic must never split a UTF-8 character.
         assert_eq!(classify_title("日本語のタイトル"), TitleSignal::Unknown);
         assert_eq!(classify_title("\u{25c7} 準備完了"), TitleSignal::Idle);
         assert_eq!(classify_title("……ready……"), TitleSignal::Idle);

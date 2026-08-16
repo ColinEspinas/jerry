@@ -2,66 +2,6 @@
 //! ([`TextEdit`]), the coalescing policy that turns a stream of real keystrokes into natural undo
 //! steps ([`EditGroup`]/[`TextHistory::record`]), and a small [`TextField`] wrapper that gives the
 //! app's five hand-rolled single-line inputs a real history of their own.
-//!
-//! Deliberately cross-cutting and top-level (next to `crate::keymap`/`crate::keymap_overrides`)
-//! rather than living inside one feature folder: `crate::code_surface::edit_buffer`, `crate::rail`,
-//! `crate::palette`, `crate::settings`, `crate::root::new_file` and `crate::sidebar` all drive the
-//! exact same mechanism, and duplicating a second, subtly-different coalescing policy per widget
-//! is precisely
-//! the silent-drift bug class this project's own history (Revision R5.5) already flagged once.
-//!
-//! ## This app's one undo system
-//!
-//! This is **text** undo, strictly per widget - the only undo system this app has. It used to
-//! share `secondary-z`/`secondary-shift-z` with a second, worktree-level system that undid real
-//! *git* actions (committing a worktree's changes, discarding a worktree); that system was
-//! removed (GitHub issue #47) since it was out of the app's original scope. `crate::
-//! default_key_bindings`' own `"text-input"` context predicate is what this history is scoped by
-//! - see that function's own docs for the full scoping rationale.
-//!
-//! ## Cursor, not two `Vec`s
-//!
-//! [`TextHistory`] is one `Vec<EditGroup>` plus a `cursor`: groups `[0..cursor)` are currently
-//! *applied*, `[cursor..)` are currently *undone* (available to redo), so "a new edit after an
-//! undo drops the redo branch" - the standard linear-history rule this issue asks for - falls out
-//! of one `truncate(cursor)` in [`TextHistory::record`] rather than ad-hoc bookkeeping.
-//!
-//! ## The coalescing policy, and why it is exactly this
-//!
-//! GitHub issue #17 names four group boundaries: **pauses, caret jumps, paste, and programmatic
-//! edits**. All four are implemented here, and nothing beyond them is:
-//!
-//! - **Pause** - [`COALESCE_IDLE`] since the group's own last edit. Time comes in as an explicit
-//!   `now: Instant` parameter rather than being read from `Instant::now()` inside, so the policy is
-//!   directly testable with real, controlled gaps instead of `sleep`.
-//! - **Caret jump** - the new edit's own `before` selection must be exactly the group's current
-//!   `after` selection. An arrow key, a click, a `Home`/`End`, or a fresh selection all move the
-//!   caret without recording an edit, so the next edit's `before` no longer matches and a new group
-//!   starts. This is a stronger and simpler check than comparing raw offsets, and it catches
-//!   selection changes (not just caret moves) for free.
-//! - **Paste / programmatic** - [`EditKind::Programmatic`] never coalesces in either direction, and
-//!   callers additionally [`TextHistory::seal`] around such an edit so the *next* ordinary
-//!   keystroke can't merge backwards into it either.
-//!
-//! An **undo itself** is a fifth, implicit boundary: [`TextHistory::commit_undo`] seals both the
-//! group it stepped over and the one it landed on, so whatever the user does next is a new step
-//! rather than a continuation of a step they have already walked back past.
-//!
-//! Deliberately *not* implemented: a word/whitespace boundary rule, or a newline boundary. Real
-//! editors differ on both, this issue asks for neither, and each would be one more untested policy
-//! knob - this project's standing "don't over-engineer beyond what's actually needed" discipline.
-//! `vendor/zed`'s own editor undo grouping is materially larger than this because it also serves
-//! multi-buffer excerpts, collaborative transactions and vim mode, none of which exist here.
-//! [`MAX_EDITS_PER_GROUP`] is a hard ceiling rather than a policy knob - see its own docs for the
-//! real unbounded-growth case it closes.
-//!
-//! ## Forward-compatible with multi-cursor (issue #14 §3)
-//!
-//! An [`EditGroup`] holds a `Vec<TextEdit>`, not a single edit, and applies them forward in order /
-//! inverts them in reverse order. That is exactly what one multi-cursor edit needs: N simultaneous
-//! splices recorded into one group become one undo step. Nothing here assumes a group has exactly
-//! one edit, so multi-cursor can land without reshaping this type - only by pushing N edits before
-//! sealing instead of one.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -85,27 +25,9 @@ pub const MAX_GROUPS: usize = 200;
 
 /// How many [`TextEdit`]s one [`EditGroup`] may hold before the next edit is forced into a fresh
 /// group, whatever the coalescing policy would otherwise say.
-///
-/// A real bound, not a formality, added during this change's own self-review pass: the
-/// idle+contiguity rule bounds a
-/// `Type`/`Delete` group to one uninterrupted burst, but a held key with autorepeat never pauses,
-/// and [`EditKind::Ime`] has no idle rule at all by design - so a composition the platform never
-/// terminates (focus lost, window closed mid-composition) had nothing stopping it growing forever,
-/// with every update carrying the whole composing string in *both* `removed` and `inserted`. High
-/// enough that no real editing burst or real composition ever reaches it, so this changes nothing
-/// a user can observe; low enough to be a real ceiling.
 pub const MAX_EDITS_PER_GROUP: usize = 10_000;
 
 /// Total retained bytes across a history's groups, above which the oldest groups are evicted.
-///
-/// [`MAX_GROUPS`] alone bounds the wrong dimension for the one case that actually costs memory:
-/// [`TextHistory::record_replacement`] stores two full document copies per group, and
-/// `crate::code_surface::edit_buffer::EditBuffer::reload_from_disk` calls it with content up to
-/// `code_view::MAX_FILE_BYTES` (2 MiB). 200 external rewrites of a 2 MiB file - an agent CLI
-/// rewriting a file in a loop, which is this app's whole domain - would retain roughly 800 MB in a
-/// single buffer, times one per open file. Bounding bytes as well as groups is what actually closes
-/// that. Generous enough that no ordinary editing agent ever reaches it (a full undo stack of
-/// real keystrokes is kilobytes), so this only ever bites the pathological case it exists for.
 pub const MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// A real caret/selection snapshot, restored verbatim by undo/redo alongside the text. Mirrors
@@ -234,21 +156,6 @@ impl EditGroup {
     /// `true` when this whole group's edits, applied in order, leave the text exactly as they
     /// found it - so undoing it would visibly do nothing and the user would have to press Ctrl+Z
     /// again to make progress.
-    ///
-    /// Real and reachable, not theoretical: a cancelled IME composition produces exactly this
-    /// shape. Composing `\u{3042}` records `+"\u{3042}"`, extending it to `\u{3042}\u{3044}`
-    /// records `-"\u{3042}" +"\u{3042}\u{3044}"`, and the platform cancelling by sending an empty
-    /// preedit records `-"\u{3042}\u{3044}" +""`. Every individual edit changes something, so
-    /// [`TextEdit::is_noop`] rejects none of them, they all coalesce into one
-    /// [`EditKind::Ime`] group, and that group's net effect is identity.
-    ///
-    /// Deliberately structural rather than a general splice composition: it recognises a *chain*
-    /// (every edit at the same offset, each one's `removed` exactly the previous one's `inserted`)
-    /// and reports identity only when the chain's first `removed` equals its last `inserted`.
-    /// That is precisely the shape every real IME composition produces, and it is conservative
-    /// everywhere else - a group this can't prove is identity is simply kept, never wrongly
-    /// dropped. A general "compose N arbitrary splices" implementation would be materially more
-    /// code for a case nothing in this app can currently produce.
     fn is_net_noop(&self) -> bool {
         let Some(first) = self.edits.first() else {
             return true;
@@ -349,18 +256,6 @@ impl TextHistory {
     /// [`Self::record`] will see as `groups.last()` after its own `truncate(cursor)`. The next
     /// record therefore always starts a fresh group, whatever the timing/contiguity would
     /// otherwise allow. A no-op when there's nothing to close.
-    ///
-    /// Keyed off `cursor`, not `groups.last()`. An earlier version guarded on
-    /// `cursor == groups.len()` and so did nothing at all whenever a redo branch existed - which
-    /// silently voided every caller-driven boundary (paste, cut, an accepted completion, the end
-    /// of an IME composition) for the whole window between an undo and the next recorded edit,
-    /// exactly the guarantee those call sites exist to provide. Found during this change's own
-    /// self-review pass, with a real reproduction: undo, then paste, and the paste merged into the
-    /// typing burst before it.
-    /// Closing a group is also where a **net no-op** group is dropped rather than sealed - see
-    /// [`EditGroup::is_net_noop`] for the real cancelled-IME-composition shape that produces one.
-    /// Only ever at the tip (`cursor == groups.len()`): dropping a group with a redo branch above
-    /// it would silently renumber that branch, and the case this exists for never has one.
     pub fn seal(&mut self) {
         let Some(index) = self.cursor.checked_sub(1) else {
             return;
@@ -382,10 +277,6 @@ impl TextHistory {
     /// Records one real, already-applied edit, coalescing it into the current group when this
     /// module's own policy allows (see the module docs). Any redo branch is dropped first - the
     /// standard linear-history rule.
-    ///
-    /// `before`/`after` are the real selection on either side of *this* edit; when the edit
-    /// coalesces, the group keeps its original `before` and takes this edit's `after`, so undo
-    /// still lands where the whole burst started.
     pub fn record(
         &mut self,
         edit: TextEdit,
@@ -508,15 +399,6 @@ impl TextHistory {
     /// "never coalesces" rule would otherwise split them into N separate groups if each were
     /// recorded through [`Self::record`] individually, since consecutive splices at *different,
     /// disjoint* line-start offsets never satisfy the caret-continuity check `can_coalesce` needs).
-    ///
-    /// `edits` must already be in the real order [`apply_forward`] should replay them - i.e. each
-    /// edit's own `at` must be valid against the text as it exists *after* every earlier edit in
-    /// `edits` has been applied (exactly how [`Self::record`]'s own per-keystroke coalescing already
-    /// builds up a multi-edit group one real, already-applied splice at a time - this just accepts
-    /// the whole run up front instead). [`Self::commit_undo`]/[`Self::commit_redo`]'s existing
-    /// forward/reverse replay handles the rest unchanged. A no-op if `edits` is empty, so a caller
-    /// that computed zero real changes (e.g. `Shift+Tab` on lines already at column 0) never pushes
-    /// an empty step the user would have to press Ctrl+Z past for nothing.
     pub fn record_group(
         &mut self,
         edits: Vec<TextEdit>,
@@ -547,16 +429,6 @@ impl TextHistory {
     /// The group an undo would act on, **without** moving the cursor. The caller applies
     /// [`apply_inverse`] to each of its edits **in reverse order**, restores `before`, and only
     /// then calls [`Self::commit_undo`].
-    ///
-    /// Peek-then-commit rather than one `undo()` that does both: every real caller here has to
-    /// validate that the group genuinely describes the text it is about to be applied to, and a
-    /// combined call would leave the cursor moved after a refusal - a silent desynchronization
-    /// between the cursor and the content, which is exactly the failure the validation exists to
-    /// prevent.
-    ///
-    /// Returned by value (a clone) rather than by reference: every real caller mutates the same
-    /// object that owns this history while applying it, which a live borrow would forbid. Groups
-    /// hold only the bytes an edit actually touched, so this is cheap for ordinary typing.
     pub fn peek_undo(&self) -> Option<EditGroup> {
         let index = self.cursor.checked_sub(1)?;
         self.groups.get(index).cloned()
@@ -631,12 +503,6 @@ pub fn word_class(ch: char) -> WordClass {
 
 /// The modifier state one keystroke carries into [`TextField::handle_editing_key`], in this
 /// module's own GPUI-free vocabulary rather than `gpui::Modifiers`.
-///
-/// Two booleans rather than the raw platform modifier set on purpose: *which* physical key means
-/// "word-wise" differs by platform (Alt on macOS, Ctrl everywhere else) and that is a decision
-/// about keyboards, not about text, so it belongs at the GPUI boundary
-/// (`crate::root::widgets::text_editing_modifiers`) and not in here. Everything below this line
-/// only ever needs to know "extend the selection?" and "move by word?".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EditingModifiers {
     /// Shift: extend the selection from its existing anchor rather than collapsing/moving it.
@@ -659,57 +525,6 @@ impl EditingModifiers {
 /// the git graph tab's Branches filter, GitHub issue #242 phase B's interactive-rebase plan
 /// rows' own per-row `reword` message field, and GitHub issue #162's four search-panel fields)
 /// with a real undo history attached.
-///
-/// ## A real caret (GitHub issue #162)
-///
-/// These fields used to be append/backspace-only, with every history snapshot a collapsed caret
-/// pinned at the end of the text. `REVISION-2026-08-14.md` §5 ended that: "the shared single-line
-/// input needs to become a real editable field - caret positioning, not append/backspace-only;
-/// that upgrade is part of this issue and benefits every other filter row." A search panel with
-/// four real fields is where the old shape stops being defensible - a user *will* arrow back into
-/// a mistyped query rather than backspacing out eight characters of a regex to fix the first one.
-///
-/// ## A real selection (GitHub issue #336)
-///
-/// The version of this type that issue #162 left behind carried exactly one `caret: usize` and
-/// said, in this docstring, that selection was "deliberately not implemented". GitHub issue #336
-/// is the live report that ended that: "Text inputs do not have selection and standard
-/// copy/paste/cut."
-///
-/// So the state below is a real **anchor/head** pair, in exactly the shape
-/// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput` and this app's own
-/// `crate::code_surface::edit_buffer::EditBuffer` already use: an ordered
-/// [`Self::selection`] range plus a [`Self::selection_reversed`] flag saying which end the caret
-/// is really sitting on. That is the same information an explicit `(anchor, head)` pair carries -
-/// a selection can be built in either direction - stored so that the common questions ("what is
-/// selected?", "is anything selected?") are answered without a `min`/`max` at every call site,
-/// and so a [`SelectionSnapshot`] round-trips through it with no conversion at all. A *collapsed*
-/// selection (`start == end`) is the ordinary single-caret case, which is why every pre-#336
-/// caller keeps working unchanged.
-///
-/// Everything else follows from that one pair:
-///
-/// - [`Self::insert_str`] **replaces** the selection rather than splicing beside it, and
-///   [`Self::backspace`]/[`Self::delete_forward`] delete the whole selection when there is one -
-///   the standard behaviour of every real text input.
-/// - [`Self::move_left`] and friends **collapse** to the near edge instead of moving, again
-///   standard; [`Self::select_left`] and friends extend from the anchor.
-/// - [`Self::copy`]/[`Self::cut`]/[`Self::paste`] are the pure halves of Ctrl/Cmd+C/X/V; the real
-///   OS clipboard lives at the GPUI boundary (`crate::root::widgets`), so this module stays
-///   GPUI-free and directly unit-testable.
-/// - Undo/redo restore the whole [`SelectionSnapshot`], not just the caret - so undoing a
-///   type-over-a-selection really does put the selection back, which is what makes a second
-///   Ctrl+Z land where the user expects.
-///
-/// Word boundaries come from the shared [`word_class`] above rather than a second, subtly
-/// different classification of this module's own - the same anti-drift discipline that put the
-/// coalescing policy here in the first place.
-///
-/// The `String` and the selection are private on purpose: every mutation has to go through a
-/// method that records and that re-clamps to a real grapheme boundary, so a future call site
-/// physically cannot bypass the history or leave the caret mid-cluster the way bare `pub` fields
-/// would allow. That is the same silent-divergence bug class this project's own audits keep
-/// finding.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TextField {
     text: String,
@@ -731,12 +546,6 @@ impl TextField {
     /// A field that opens *already holding* `text`, with an empty history and the caret at the
     /// end - the file tree's inline **rename** editor (GitHub issue #19), which pre-fills with the
     /// entry's current name.
-    ///
-    /// Deliberately not `new()` followed by [`Self::set`]: that would record the pre-fill as a
-    /// real undoable step, so the very first `Ctrl+Z` after opening a rename would blank the
-    /// field down to `""` - a state the user never typed and cannot get back to by any other
-    /// means. The pre-fill is this widget's *baseline*, not an edit to it, so `can_undo()` is
-    /// false until the user genuinely changes something.
     pub fn seeded(text: &str) -> Self {
         Self {
             selection: text.len()..text.len(),
@@ -841,11 +650,6 @@ impl TextField {
     /// `crate::code_surface::edit_buffer::EditBuffer::previous_word_boundary` minus its
     /// line-scoping (a single-line field has exactly one line), and sharing that method's own
     /// [`word_class`] so the two surfaces cannot drift.
-    ///
-    /// Deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`
-    /// (this type's own grapheme-boundary methods' crate): UAX #29's word boundaries are designed
-    /// for natural-language prose and keep e.g. `foo.bar` as one unbroken word, which is wrong for
-    /// the paths, branch names, globs and regexes these fields actually hold.
     fn previous_word_boundary(&self, offset: usize) -> usize {
         let chars: Vec<(usize, char)> = self.text.char_indices().collect();
         let mut cursor = chars.iter().rposition(|&(index, _)| index < offset);
@@ -1193,11 +997,6 @@ impl TextField {
     /// The pure half of Ctrl/Cmd+V: replaces the selection (or inserts at the caret) with real
     /// clipboard content, as its own sealed undo step in both directions - a paste is one of
     /// GitHub issue #17's four named group boundaries.
-    ///
-    /// Newlines are flattened to spaces: these are one-line fields, and a `\n` in one would render
-    /// as an unpaintable box and corrupt every offset the row's own hit-testing derives. The same
-    /// choice `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::paste` makes
-    /// (`text.replace("\n", " ")`), and for the same reason.
     pub fn paste(&mut self, text: &str, now: Instant) -> bool {
         let flattened = text.replace(['\n', '\r'], " ");
         if flattened.is_empty() && !self.has_selection() {
@@ -1270,7 +1069,6 @@ impl TextField {
         let mut candidate = self.text.clone();
         for edit in group.edits.iter().rev() {
             if !apply_inverse(&mut candidate, edit) {
-                // Refused *before* the cursor moves - see `TextHistory::peek_undo`'s own docs.
                 return false;
             }
         }
@@ -1300,20 +1098,6 @@ impl TextField {
     /// One keystroke's worth of ordinary single-line editing, so every call site gets the whole
     /// vocabulary rather than whichever half it remembered to wire - which is precisely how these
     /// fields ended up append/backspace-only for eight surfaces in the first place.
-    ///
-    /// `key`/`key_char` come straight off `gpui::Keystroke`; `modifiers` is
-    /// `crate::root::widgets::text_editing_modifiers`' own translation of that keystroke's real
-    /// modifier set (see [`EditingModifiers`] for why the platform decision lives there and not
-    /// here). Returns whether anything changed (text *or* selection), i.e. whether the caller
-    /// should `cx.notify()` and stop propagation.
-    ///
-    /// Deliberately does **not** handle `escape`, `enter`, `tab` or the arrow keys' `up`/`down`:
-    /// every one of those means something different per surface (cancel, accept, move a list
-    /// selection), and a shared default would silently take them away from the handler that owns
-    /// them. A caller matches its own keys first and falls through to this. Clipboard and
-    /// select-all are not here either - those arrive as real, rebindable
-    /// `crate::root::TextCopy`/`TextCut`/`TextPaste`/`TextSelectAll` actions rather than as
-    /// hard-coded keystrokes, and only the action path can reach the OS clipboard.
     pub fn handle_editing_key(
         &mut self,
         key: &str,
@@ -1427,7 +1211,6 @@ mod tests {
         let start = t0();
         let at = type_burst(&mut history, 0, "abc", start);
         assert_eq!(history.len(), 1);
-        // A real pause, expressed as a real `Instant` gap rather than a `sleep`.
         let later = start + COALESCE_IDLE + Duration::from_millis(1);
         type_burst(&mut history, at, "def", later);
         assert_eq!(
@@ -1742,14 +1525,6 @@ mod tests {
         );
     }
 
-    /// [`TextField::seeded`]'s whole contract, asserted directly in the module that owns it
-    /// rather than only through the file tree's rename editor that uses it: the pre-fill is the
-    /// field's *baseline*, not an undoable edit.
-    ///
-    /// The contrast with `new()` + `set(..)` is asserted in the same test, because that is the
-    /// construction `seeded` exists to prevent and the difference is invisible from the text
-    /// alone - both hold `"README.md"` immediately after construction, and only `can_undo()`
-    /// distinguishes them until the first Ctrl+Z blanks one of them to `""`.
     #[test]
     fn text_field_seeded_holds_its_text_with_no_undoable_step_behind_it() {
         let seeded = TextField::seeded("README.md");
@@ -1775,7 +1550,6 @@ mod tests {
              so this test is genuinely discriminating"
         );
 
-        // A real edit on top of a seeded field undoes back to the baseline, not past it.
         let mut field = TextField::seeded("README.md");
         field.insert_str("x", t0());
         assert_eq!(field.as_str(), "README.mdx");
@@ -1931,7 +1705,6 @@ mod tests {
     fn the_caret_never_lands_inside_a_grapheme_cluster() {
         let mut field = TextField::new();
         let now = t0();
-        // A family emoji is a single UAX #29 cluster made of several code points and 25 bytes.
         let cluster = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
         field.insert_str(cluster, now);
         field.insert_str("x", now);
@@ -2042,14 +1815,10 @@ mod tests {
         assert_eq!(field.as_str(), "abc");
     }
 
-    /// Regression for a real, reachable data-losing sequence found in self-review: `commit_undo`
-    /// sealed only the group it stepped *over*, leaving the one it landed on open, so the very next
-    /// keystroke could merge into a step the user had already walked back past.
     #[test]
     fn typing_right_after_an_undo_never_merges_into_the_group_the_cursor_landed_on() {
         let mut history = TextHistory::new();
         let now = t0();
-        // "abc", then a Backspace - a second group, split by kind, not by time.
         let at = type_burst(&mut history, 0, "abc", now);
         history.record(
             TextEdit {
@@ -2084,10 +1853,6 @@ mod tests {
         );
     }
 
-    /// The second manifestation of the same bug: `seal` guarded on `cursor == groups.len()`, so
-    /// every caller-driven boundary silently did nothing while a redo branch existed - and a paste
-    /// (recorded as ordinary `Type`, bounded *only* by those seals) merged backwards into the
-    /// typing before it.
     #[test]
     fn a_seal_still_takes_effect_while_a_redo_branch_exists() {
         let mut history = TextHistory::new();
@@ -2102,11 +1867,9 @@ mod tests {
         );
         assert_eq!(history.len(), 2);
 
-        // Step back over the programmatic edit, so a redo branch now exists.
         history.commit_undo();
         assert!(history.can_redo());
 
-        // Exactly what `AdeApp::handle_editor_paste_action` does around a real paste.
         history.seal();
         history.record(
             insert(3, "PASTED"),
@@ -2155,9 +1918,6 @@ mod tests {
         assert_eq!(group.edits.len(), 5);
     }
 
-    /// Audit finding: a cancelled IME composition left a group whose individual edits each changed
-    /// something but whose net effect was identity - `can_undo()` reported `true` and Ctrl+Z
-    /// visibly did nothing.
     #[test]
     fn a_cancelled_composition_leaves_no_dead_undo_step_behind() {
         let mut history = TextHistory::new();
@@ -2180,7 +1940,6 @@ mod tests {
             EditKind::Ime,
             now,
         );
-        // The platform cancels by sending an empty preedit.
         history.record(
             TextEdit {
                 at: 5,
@@ -2207,8 +1966,6 @@ mod tests {
         assert!(!history.can_undo());
     }
 
-    /// The conservative half: a group that really does change something must never be mistaken
-    /// for a net no-op and dropped.
     #[test]
     fn a_composition_that_really_committed_is_never_dropped_as_a_no_op() {
         let mut history = TextHistory::new();
@@ -2236,8 +1993,6 @@ mod tests {
         assert!(history.can_undo());
     }
 
-    /// The IME arm keeps its time exemption but not its caret exemption - a real composition
-    /// chains through the caret check, an abandoned one does not.
     #[test]
     fn a_composition_coalesces_across_a_long_pause_but_not_across_a_caret_jump() {
         let mut history = TextHistory::new();
@@ -2249,7 +2004,6 @@ mod tests {
             EditKind::Ime,
             start,
         );
-        // Seconds later, still the same composition, caret exactly where the last update left it.
         history.record(
             TextEdit {
                 at: 5,
@@ -2267,7 +2021,6 @@ mod tests {
             "a real composition must survive an arbitrarily long pause"
         );
 
-        // A real caret jump, then a completely unrelated composition - no time passes at all.
         history.record(
             insert(0, "\u{304b}"),
             SelectionSnapshot::caret(0),
@@ -2283,9 +2036,6 @@ mod tests {
         );
     }
 
-    /// Audit finding: `MAX_GROUPS` bounds the group *count*, not bytes, while
-    /// `record_replacement` stores two whole-document copies per group - so repeated external
-    /// rewrites of a large file could retain hundreds of megabytes.
     #[test]
     fn a_run_of_whole_document_replacements_is_bounded_by_real_bytes_not_just_group_count() {
         let mut history = TextHistory::new();
@@ -2333,7 +2083,6 @@ mod tests {
         let with_branch = history.retained_bytes();
         assert!(with_branch >= 4096);
         history.commit_undo();
-        // A fresh edit discards the redo branch - its bytes must go with it.
         history.record(
             insert(0, "z"),
             SelectionSnapshot::caret(0),
@@ -2617,7 +2366,6 @@ mod tests {
         assert!(path.select_word_at(9));
         assert_eq!(path.selected_text(), "main");
 
-        // A double-click on whitespace selects nothing and just places a caret.
         assert!(field.select_word_at(3));
         assert!(!field.has_selection());
         assert_eq!(field.caret(), 3);
@@ -2682,14 +2430,12 @@ mod tests {
         field.select_to(6);
         let copied = field.copy().expect("a real selection was copied");
 
-        // Paste over a *different* selection: the whole range goes, the clipboard text lands.
         field.move_to(7);
         field.select_to(11);
         assert!(field.paste(&copied, now));
         assert_eq!(field.as_str(), "origin/origin");
         assert_eq!(field.caret(), "origin/origin".len());
 
-        // ...and a collapsed paste inserts at the caret.
         field.move_to(0);
         assert!(field.paste("upstream-", now));
         assert_eq!(field.as_str(), "upstream-origin/origin");
@@ -2781,7 +2527,6 @@ mod tests {
         let mut field = TextField::new();
         type_into(&mut field, "abc", now);
         assert_eq!(field.history_len(), 1);
-        // No text edit at all here - only the selection moved.
         assert!(field.select_left());
         type_into(&mut field, "d", now);
         assert_eq!(
@@ -2815,7 +2560,6 @@ mod tests {
         assert!(field.handle_editing_key("left", None, word_shift(), now));
         assert_eq!(field.selected_text(), "/");
 
-        // A word-modified letter is an application shortcut, never text to insert.
         let before = field.as_str().to_string();
         assert!(!field.handle_editing_key("a", Some("a"), word(), now));
         assert_eq!(field.as_str(), before);
@@ -2825,7 +2569,6 @@ mod tests {
     fn every_selection_edge_lands_on_a_real_grapheme_boundary() {
         let now = t0();
         let mut field = TextField::new();
-        // A flag is one grapheme cluster made of two 4-byte scalars.
         type_into(&mut field, "caf\u{e9}\u{1f1eb}\u{1f1f7}x", now);
         field.move_to_start();
         assert!(field.select_right());
@@ -2840,7 +2583,6 @@ mod tests {
             "one Shift+Right crosses the whole flag cluster, never half of it"
         );
 
-        // An out-of-range or mid-cluster offset from a click hit-test is clamped, never a panic.
         field.move_to(usize::MAX);
         assert_eq!(field.caret(), field.as_str().len());
         field.move_to(0);

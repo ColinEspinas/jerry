@@ -45,20 +45,6 @@ impl AdeApp {
     /// `vendor/zed/crates/gpui/src/window.rs:2016,5520`). Left-to-right order (close, minimize,
     /// maximize) follows the macOS traffic-light convention; the design doesn't colour-code
     /// these dots, so there's no ordering hint from the mockup itself.
-    ///
-    /// The third dot deliberately calls `Window::toggle_fullscreen`, not `Window::zoom_window`:
-    /// an earlier version called `zoom_window` here, copied from
-    /// `vendor/zed/crates/platform_title_bar/src/platforms/platform_linux.rs`'s own
-    /// `WindowControl::on_click` - correct for Linux, where the third caption button really is a
-    /// zoom/restore toggle, but wrong for macOS, where the green traffic light's real convention
-    /// is a fullscreen toggle. `Window::zoom_window` calls AppKit's `zoom(_:)`, which Apple
-    /// documents as a no-op while the window is already in full-screen mode - so the old code
-    /// could enter fullscreen (via the real, OS-drawn traffic light underneath, before this dot
-    /// existed) but this dot itself could never leave it again: a real, reproduced dead end,
-    /// found running this app on macOS for the first time.
-    ///
-    /// The wrapping row stops left-click propagation on mouse-down so pressing a dot can never
-    /// also arm [`Self::render_title_bar`]'s window-move drag.
     pub(in crate::title_bar) fn render_window_controls(&self) -> impl IntoElement {
         div()
             .id("window-controls")
@@ -118,12 +104,6 @@ impl AdeApp {
     /// [`AdeApp::title_menu_button_bounds`] via a `gpui::canvas` child, the same pattern
     /// [`crate::work_surface::render::AdeApp::render_tab_strip_plus`] uses for the `+`
     /// menu's single button.
-    ///
-    /// The wrapping row stops left-click propagation on mouse-down, the same guard
-    /// [`Self::render_window_controls`] uses - now that these labels are real click targets
-    /// (unlike their earlier inert form, which deliberately let a press-and-drag starting on one
-    /// fall through into [`Self::render_title_bar`]'s window-move arming), a click here must
-    /// never also start a window move.
     fn render_windows_title_bar_left(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .id("windows-title-bar-menu")
@@ -241,23 +221,6 @@ impl AdeApp {
     /// [`Self::window_controls_style`]), the real project name/branch, and, on the
     /// Windows/Linux variant only, [`Self::render_windows_caption_buttons`] pinned to the right
     /// edge.
-    ///
-    /// ## Dragging the window
-    ///
-    /// GPUI has no single "make this element drag the window" method. The real pattern (matching
-    /// `vendor/zed/crates/platform_title_bar/src/platform_title_bar.rs`'s own title bar, which
-    /// faces the same "no native draggable titlebar for a client-side-decorated window on
-    /// Wayland/X11" problem): mark the area with `.window_control_area(WindowControlArea::Drag)`
-    /// (a hit-test hint the compositor consults, `vendor/zed/crates/gpui/src/elements/
-    /// div.rs:1166`), then drive the actual move from ordinary mouse events - arm
-    /// [`Self::title_bar_move_armed`] on left mouse-down, and on the next mouse-move (still
-    /// armed) call `Window::start_window_move` (`window.rs:2502`) and disarm.
-    /// `on_mouse_up`/`on_mouse_down_out` also disarm, so a click that never moves (e.g. clicking
-    /// to focus the window) never starts a move. [`Self::render_window_controls`],
-    /// [`Self::render_windows_caption_buttons`], and (now that its five labels are real click
-    /// targets, not inert text - see [`TitleMenu`]'s own docs) [`Self::
-    /// render_windows_title_bar_left`] all stop propagation on their own mouse-down, so pressing
-    /// any of those controls can never also arm this drag.
     pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // GitHub issue #90: a genuinely empty window (`Self::render_empty_state`) has no real
         // repo to name - `Self::focused_repo_path`'s own defensive fallback would otherwise
@@ -421,16 +384,6 @@ fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, usize, String)
 /// (`Status::Ask`/`Status::Fail`/`Status::Run`), and finished/idle counts already have a
 /// real home - the rail's own agent rows, and the status bar's five-way dot row - so repeating
 /// them a third time here would just restate the same number in a fourth place.
-///
-/// Each string names its own unit (`"N agents ..."`, never bare `"N ..."`) per §4's own rule
-/// ("No two counters in the window may share wording while counting different units"), and
-/// pluralizes correctly at exactly 1 vs 2+ - `Status::Ask` conjugates its verb too (`"1 agent
-/// needs input"` vs `"2 agents need input"`), matching the design's own two example counts.
-///
-/// Both halves of that agreement come from [`crate::root::plural`]: the noun via
-/// [`plural::count`], the verb via [`plural::form`]. This is the sentence-conjugation case
-/// rev 6 §7 rule 9 calls out, and it deliberately goes through the same helper as every bare
-/// `"N files"` in the window rather than keeping its own `== 1` test.
 fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<String> {
     if count == 0 {
         return None;
@@ -451,22 +404,6 @@ fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<Strin
 /// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b's table: "agent status counts |
 /// title-bar text badges · footer dot cluster | **title bar, compact dots**, words in the
 /// tooltip").
-///
-/// The sentence is not deleted, it *moves*: `sentence` - still
-/// [`title_bar_agent_state_chip_text`]'s fully conjugated `"2 agents need input"` - becomes this
-/// chip's real tooltip, so nothing is lost, only demoted from a permanent claim on the window's
-/// centre line to something you point at. The pill background goes with the words: a 5×5 square
-/// and a bare number need no plate behind them, and the plate was most of what made three of
-/// these read as a banner.
-///
-/// `count` is passed in rather than parsed back out of `sentence`: the two must be the same
-/// number by construction, not by string surgery, so [`title_bar_agent_state_chips`] hands over
-/// both halves of one derivation.
-///
-/// The count's own colour follows the mock's `titleCounts`: `ask`/`fail` keep their state hue
-/// (those are the two you are meant to see across the room), `run` drops to a neutral tone -
-/// running agents are the ordinary condition and spending the attention colour on them devalues
-/// it everywhere else, the same rule §4c applies to the load meter and §4b to the platform pill.
 fn render_title_bar_agent_state_chip(
     status: Status,
     count: usize,
@@ -601,33 +538,11 @@ fn render_close_glyph(color: gpui::Rgba) -> impl IntoElement {
 /// Real, interactive coverage for the Windows/Linux caption buttons, driven through GPUI's
 /// `TestAppContext`/`VisualTestContext` harness (a real window, real hit-testing, real click
 /// dispatch).
-///
-/// ## Why only `close` gets a live-click test here
-///
-/// Minimise calls the same real `Window::minimize_window` the macOS dot cluster's own minimize
-/// dot already uses; maximise calls `Window::zoom_window` (see
-/// [`Self::render_windows_caption_buttons`]'s own docs for why that's Windows/Linux-only now).
-/// Either way, the test backend's `TestWindow: PlatformWindow` impl
-/// (`vendor/zed/crates/gpui/src/platform/test/window.rs`) has both `fn minimize(&self) {
-/// unimplemented!() }` and `fn zoom(&self) { unimplemented!() }` as deliberate panics
-/// (`is_maximized` always returns `false` too, so there's no toggled state to assert against
-/// even if the call didn't panic). A live click on either would crash the test process - so this
-/// suite covers `close` only, the one caption button whose backing call
-/// ([`Window::remove_window`], which just flips an internal `removed` flag) is implemented and
-/// observable in the test harness. Minimise/maximise were instead verified manually against a
-/// real running window.
-///
-/// Click coordinates are computed from the real, already-rendered window's own
-/// `Window::viewport_size` rather than a hardcoded guess: the close button is the rightmost of
-/// the three 44px-wide caption buttons pinned flush to the title bar's right edge, so its center
-/// is always `(viewport_width - 22, 19)` regardless of the test display's own size.
 #[cfg(test)]
 mod caption_button_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Clicking the real close caption button on the Windows/Linux title bar variant actually
-    /// calls the real `Window::remove_window` and closes the real window - not a mock.
     #[gpui::test]
     fn clicking_the_close_caption_button_closes_the_real_window(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -660,15 +575,6 @@ mod caption_button_tests {
         );
     }
 
-    /// GitHub issue #106's own real `click_count() == 2` guard on the title bar's double-click-
-    /// to-maximize handler - a *single* click on empty title-bar space must not call `Window::
-    /// zoom_window`/`Window::titlebar_double_click` at all. The positive case (a real double
-    /// click really does maximize) can't be driven live here for the same reason minimise/
-    /// maximise have no live-click test above: the test backend's `zoom_window`/
-    /// `titlebar_double_click` are `unimplemented!()` and would panic the test process - verified
-    /// manually against a real running window instead. This test is what a bug letting a *single*
-    /// click reach that same call would actually crash, so it's real coverage of the guard, not a
-    /// placeholder.
     #[gpui::test]
     fn a_single_click_on_empty_title_bar_space_never_reaches_the_maximize_call(
         cx: &mut TestAppContext,
@@ -701,24 +607,11 @@ mod caption_button_tests {
 /// real implementation (`vendor/zed/crates/gpui/src/platform/test/window.rs`: flips a real
 /// `is_fullscreen` flag, no `unimplemented!()`), so a click here can be asserted against instead
 /// of only verified manually.
-///
-/// `#[cfg(not(target_os = "macos"))]`: this test clicks the coordinates the *custom* dot cluster
-/// paints at, which [`host_draws_native_traffic_lights`] now means only exist on a non-Mac host
-/// running the macOS-style skin (`WindowControlsStyle::MacosStyle`, forced below regardless of
-/// the real host) - on a real Mac, that spot is a plain spacer reserving room for AppKit's own
-/// native buttons instead (see [`AdeApp::render_macos_title_bar_left`]), so this test would just
-/// click empty space there.
 #[cfg(all(test, not(target_os = "macos")))]
 mod macos_dot_cluster_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Clicking the real macOS "maximize" dot toggles the real window's fullscreen state both
-    /// ways - into fullscreen, and back out again. Before this module's fix, the second click
-    /// called `Window::zoom_window` (AppKit's `zoom(_:)`), which Apple documents as a no-op while
-    /// already fullscreen: the window would have stayed stuck in fullscreen exactly as it did
-    /// running this app on macOS for the first time - this test would have caught that
-    /// regression by failing its second assertion.
     #[gpui::test]
     fn clicking_the_macos_maximize_dot_toggles_fullscreen_both_ways(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -815,11 +708,6 @@ mod agent_state_chip_text_tests {
         assert_eq!(title_bar_agent_state_chip_text(Status::Idle, 5), None);
     }
 
-    /// The title bar's half of revision 6's `Review ready` → `Finished` rename (GitHub issue
-    /// #280) - twin of `crate::rail::render`'s `status_wording_tests`, which sweeps every other
-    /// status-derived string in the window. Kept here because this formatter is private to this
-    /// module. Today [`Status::Review`] produces no chip at all, so this passes vacuously for
-    /// that status; the point is that it keeps passing if a future revision gives it one.
     #[test]
     fn no_title_bar_chip_text_ever_says_review_ready() {
         for status in Status::ORDER {
@@ -878,13 +766,6 @@ mod agent_state_chip_text_tests {
         );
     }
 
-    /// Rev 6 §7 rule 4, quoted verbatim: "Two states distinguished anywhere in the app are never
-    /// summed anywhere in it."
-    ///
-    /// The title bar is where `ask`/`fail`/`run` are distinguished, so no agent may contribute to
-    /// more than one chip, and no chip may carry a count larger than the number of agents really
-    /// in that state. Proved by construction over a mixed row set: the chip counts must partition
-    /// the rows exactly, never overlap.
     #[test]
     fn no_agent_is_ever_counted_in_two_chips_at_once() {
         let rows = vec![
@@ -919,9 +800,6 @@ mod agent_state_chip_text_tests {
         );
     }
 
-    /// A single agent can only ever be in one state, so exactly one chip can ever exist for a
-    /// one-agent window - the degenerate case of the rule above, and the one a "count it in both"
-    /// bug would show up in first.
     #[test]
     fn one_agent_produces_exactly_one_chip_whatever_its_state() {
         for status in [Status::Ask, Status::Fail, Status::Run] {
@@ -935,9 +813,6 @@ mod agent_state_chip_text_tests {
         }
     }
 
-    /// §4b's compaction: the chip shows a bare count, and the fully conjugated sentence is what
-    /// the tooltip carries - so the two halves must come out of the same call, and the number
-    /// shown must be the number the sentence names.
     #[test]
     fn each_chip_carries_both_its_compact_count_and_its_full_sentence() {
         let rows = vec![
@@ -1026,17 +901,6 @@ mod agent_state_chip_text_tests {
 /// [`crate::rail::render::AdeApp::build_agent_rows`]/[`Self::render_title_bar_agent_state_chips`]/
 /// [`Self::render_title_bar`] path - proves the wiring itself, not just the pure formatting
 /// logic `agent_state_chip_text_tests` above already covers exhaustively.
-///
-/// Only `Status::Run` is driven live here (a freshly spawned agent is real, immediately
-/// observable, and needs no artificial delay or environment-dependent trick to reach): getting
-/// a real, deterministic `Status::Fail`/`Status::Ask` out of a live process without either a
-/// slow real wait (15s+ for `Status::Ask`'s idle threshold) or mutating process-global
-/// environment state (`$SHELL`/`$PATH`, which this workspace's own established discipline
-/// forbids in a test - see `pty_core::resolve_in_path_var`'s and `lsp_core::client::
-/// resolve_server_binary_with`'s docs for the exact same call) isn't practical through
-/// [`crate::work_surface::agents::Agents::spawn`]'s real `ProcessKind`-only spec. Those two states'
-/// text/visibility rules are instead covered - just as really, over the identical `Status`/
-/// `AgentRow` types - by the pure tests above.
 #[cfg(test)]
 mod agent_state_chip_live_tests {
     use super::*;
@@ -1060,22 +924,6 @@ mod agent_state_chip_live_tests {
         }
     }
 
-    /// `AdeApp::new_with_settings` (`crate::root::state`, see its own "a fresh window starts
-    /// with one shell in the repo root" comment) always auto-spawns exactly one real
-    /// `ProcessKind::Shell` agent at startup, so `open_test_app` never actually starts at zero
-    /// agents - there is no real "empty app" state to observe live. This closes that one real
-    /// startup agent via the real `Self::close_agent` path (the same one the tab strip's `×`
-    /// and `Self::archive_agent` use) to reach a genuine, live zero-agents state, and proves
-    /// the title bar's chip row really disappears in response - not just that it starts out
-    /// `None` before anything has run. `Self::render_title_bar` itself is also exercised at
-    /// both ends, unmodified, to prove the real production method doesn't panic either way.
-    ///
-    /// The startup shell is retagged to a real `AgentKind` via `Agents::set_kind_for_test`
-    /// immediately after spawn: the rail (and so the title bar chip it drives) never produces a
-    /// row for a plain shell at all (`AdeApp::build_agent_rows`'s own docs), so this test's real
-    /// subject - "the chip row disappears once the one open real agent closes" - needs a real
-    /// agent kind to have anything to observe in the first place. The retag doesn't touch the
-    /// real spawned process, only the bookkeeping `kind` the rail/chip logic reads.
     #[gpui::test]
     fn closing_the_only_real_agent_makes_the_chip_row_disappear(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1124,17 +972,6 @@ mod agent_state_chip_live_tests {
         });
     }
 
-    /// Spawning a real second agent on top of the real startup shell is a genuine state change
-    /// over live process data - not a hand-built row - and the chip text must track it,
-    /// including the exact singular → plural flip at 1 → 2.
-    ///
-    /// Both the startup shell and the second spawned process are retagged to a real `AgentKind`
-    /// via `Agents::set_kind_for_test` (see the sibling test's own docs for why): the rail no
-    /// longer produces any row at all for a plain shell, but this test is specifically about the
-    /// chip's real PTY-activity/idle-duration tracking, which is genuinely cheaper and more
-    /// deterministic to exercise against real shell processes than against real `claude`/`codex`
-    /// CLI spawns - the retag keeps that real PTY behavior while making the two agents count as
-    /// real agents for the chip logic under test.
     #[gpui::test]
     fn a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural(
         cx: &mut TestAppContext,

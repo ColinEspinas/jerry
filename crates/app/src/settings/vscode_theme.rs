@@ -1,59 +1,6 @@
 //! GitHub issue #141: importing a real VSCode theme JSON file and converting it into one of this
 //! app's own theme files (`crate::settings::custom_theme`) - a real, per-token palette, not a
 //! handful of swatches.
-//!
-//! ## What a converted theme actually contains
-//!
-//! Two layers, in this order, both written literally into the resulting `.toml`:
-//!
-//! 1. **A full derived base.** Five representative colours are picked out of the VSCode theme
-//!    (`editor.background`, a sidebar/panel background, and three accents - see
-//!    [`swatches_from_vscode`]) and run through `crate::theme::derive_shift`/`derived_palette`,
-//!    producing a real value for every one of this app's ~270 tokens. This is what stops an
-//!    imported theme from being a patchwork: a light VSCode theme re-tints *all* of Jerry's
-//!    chrome, including the many tokens (border levels, the twelve `text::*` steps, rail and graph
-//!    chrome, ...) no VSCode colour key has any equivalent for.
-//! 2. **Every real, directly-mapped key on top.** [`COLOR_KEY_MAP`] maps this app's tokens onto
-//!    the VSCode `colors` keys that genuinely mean the same thing, and [`build_syntax_overrides`]
-//!    maps every syntax bucket onto the theme's own `tokenColors` textmate scopes. Wherever the
-//!    theme really says something, its own literal colour wins over the derived one.
-//!
-//! Before the theme system's rewrite only the first layer existed for chrome (there was no
-//! per-token override mechanism at all) and the second existed only for syntax. Both layers now
-//! land in the same flat, hand-editable file, so an imported theme is exactly as adjustable
-//! afterwards as a hand-written one.
-//!
-//! ## Which VSCode keys are mapped, and which deliberately aren't
-//!
-//! [`COLOR_KEY_MAP`] covers the parts of VSCode's colour surface that have a real counterpart
-//! here: the editor and its gutter/selection/line highlight, the sidebar/activity bar/panel/status
-//! bar/title bar backgrounds Jerry's own rail, panels, header and footer correspond to, list
-//! rows (hover/active/inactive selection), input and dropdown surfaces, buttons, badges, the
-//! sixteen-colour terminal ANSI palette, diff/git decoration colours, editor error/warning
-//! squigglies, scrollbar slider states, and the four `foreground` text levels
-//! (`foreground`/`descriptionForeground`/`disabledForeground`).
-//!
-//! Deliberately **not** mapped, and why: VSCode's peek view, notebook, testing, merge-conflict,
-//! debug-toolbar, chart, and extension-button colour families have no counterpart in this app at
-//! all (there is no such surface to paint); its `*.border` keys are mostly per-widget and would
-//! flatten onto Jerry's four structural border levels in a way that reads worse than the derived
-//! values. Every one of those keeps its derived value, which is a real colour in the theme's own
-//! family, not a Jerry Dark leftover.
-//!
-//! Its `editorBracketHighlight.foreground1..6` family *is* mapped, as of GitHub issue #168 - onto
-//! `theme::syntax::BRACKET_1..BRACKET_6`, this app's own real bracket-pair depth ring. It is
-//! handled in [`COLOR_KEY_MAP`] rather than [`build_syntax_overrides`] because it lives in
-//! VSCode's `colors` map, not in `tokenColors`; see [`syntax_scope_rule`]'s own note on why there
-//! is no textmate scope for a bracket's nesting depth. (`editorBracketMatch.background`, a
-//! different feature - the matching-bracket *box* around the caret's own bracket - stays mapped
-//! onto `theme::editor::MATCHING_BRACKET`, which is still a real token nothing paints yet.)
-//!
-//! ## JSONC tolerance
-//!
-//! Real, downloaded VSCode theme files are JSONC (`//` line comments, `/* */` block comments, and
-//! trailing commas - none of which plain JSON allows), not strict JSON - [`strip_jsonc_noise`]
-//! is a small, real, string-aware stripper run before `serde_json::from_str`, not a guess that
-//! `serde_json` alone would happen to tolerate real-world files.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -148,17 +95,6 @@ impl VscodeThemeFile {
 const MAX_INCLUDE_DEPTH: usize = 8;
 
 /// Reads a real VSCode theme file, following its `include` chain relative to its own directory.
-///
-/// This exists because it is genuinely load-bearing, not for completeness: VSCode's current
-/// default dark theme, `dark_modern.json`, contains almost no `colors` of its own, and `Dark+`
-/// (`dark_plus.json`) contains **none** - it is `tokenColors` plus `"include": "./dark_vs.json"`.
-/// Without following that, importing the actual shipped Dark+ file failed outright with
-/// [`VscodeThemeError::MissingBackground`], because as far as the converter could see the theme
-/// defined no background at all. A real, user-reported bug.
-///
-/// A missing include target is a real error rather than a silent partial import: a theme that
-/// resolves to "no colours" would otherwise convert into something that is not the theme the user
-/// asked for. Cycles and runaway chains are bounded by [`MAX_INCLUDE_DEPTH`].
 fn load_vscode_theme_with_includes(
     source_path: &Path,
     depth: usize,
@@ -222,20 +158,6 @@ impl ScopeField {
 
     /// How specifically this rule applies to the textmate scope `query`, or `None` if it doesn't
     /// apply at all - the length of the longest selector that is a real scope-prefix of `query`.
-    ///
-    /// The *direction* here is the whole correctness of this module's syntax mapping, and it is
-    /// the opposite of what an earlier version did. A theme rule applies to a token when the
-    /// rule's selector is a prefix of the token's scope, not the other way round: asking "what
-    /// colour is a plain `variable`?" must **not** be answered by a rule for
-    /// `variable.parameter` (that rule is about something more specific), while asking "what
-    /// colour is `variable.parameter`?" *is* legitimately answered by a rule for `variable` when
-    /// the theme has nothing more specific. Matching the loose way round silently gave
-    /// `syntax.variable` a parameter's colour for any theme that styled parameters - a real bug
-    /// this module's own `a_child_scope_the_theme_styles_diverges_from_the_parent_it_used_to_alias`
-    /// test now pins.
-    ///
-    /// Prefixes are compared at `.`-segment boundaries, so `variable` matches
-    /// `variable.parameter` but `var` does not match `variable`.
     fn specificity_for(&self, query: &str) -> Option<usize> {
         self.selectors()
             .into_iter()
@@ -251,29 +173,6 @@ impl ScopeField {
 /// The real mapping from this app's own token keys to the VSCode `colors` keys that genuinely
 /// mean the same thing, most-specific first - the first key a given theme actually defines wins,
 /// and a token whose whole list is absent simply keeps its derived value (see the module docs).
-///
-/// Every VSCode key here is a real one from VSCode's own published theme-colour reference, not a
-/// guess. The mapping choices worth stating explicitly:
-///
-/// - Jerry's three background levels (`surface.window`/`surface.center`/`surface.pty`) all come
-///   from `editor.background`, with the terminal surface preferring `terminal.background` and
-///   `panel.background` when a theme defines them - those are genuinely the same surfaces.
-/// - Jerry's rail, panel headers and footers correspond to VSCode's sidebar/activity bar/status
-///   bar chrome, so they read from `sideBar.background` first and fall back through
-///   `activityBar.background`/`panel.background`/`editorGroupHeader.tabsBackground`.
-/// - `surface.row_hover`/`row_selected` map to VSCode's own list row states
-///   (`list.hoverBackground`, `list.activeSelectionBackground` with the inactive variant as a
-///   fallback), which is exactly what Jerry's file-tree and change rows are.
-/// - The `status::*` family is agent urgency, not VSCode's status *bar*: green/amber/red/blue come
-///   from the terminal ANSI palette (`terminal.ansiGreen`/`ansiYellow`/`ansiRed`/`ansiBlue`), the
-///   most reliably-defined semantic colour set in a VSCode theme, with the editor's own
-///   error/warning foregrounds as fallbacks.
-/// - `term.*`'s sixteen-colour block maps one-to-one onto `terminal.ansi*`, the one place this
-///   app and VSCode agree exactly.
-/// - `diff.*` maps onto VSCode's own diff editor and git decoration colours; the `*_bg` tokens
-///   prefer `diffEditor.insertedTextBackground`/`removedTextBackground` (which are often
-///   translucent in VSCode - the alpha channel is dropped, see [`normalize_vscode_hex`], leaving
-///   the intended hue) and fall back to the git decoration foregrounds.
 const COLOR_KEY_MAP: &[(&str, &[&str])] = &[
     // ---- surfaces -------------------------------------------------------------------------
     ("surface.window", &["editor.background", "background"]),
@@ -748,12 +647,6 @@ fn first_valid_color<'a>(
 }
 
 /// The real colour this theme gives the first of `queries` it says anything about at all.
-///
-/// `queries` is one bucket's own preference order (most specific textmate scope first - see
-/// [`syntax_scope_rule`]), and within a single query the *best* rule wins, not merely the first:
-/// the most specific matching selector ([`ScopeField::specificity_for`]), with a later rule
-/// beating an earlier one of equal specificity - which is VSCode's own "later `tokenColors`
-/// entries override earlier ones" precedence, not a guess.
 fn first_scope_foreground(
     token_colors: &[VscodeTokenColorRule],
     queries: &[&str],
@@ -796,25 +689,6 @@ fn derive_panel_fallback(background_hex: &str) -> String {
 /// Whether this theme's own panel colour can be used as the second swatch of the derived base
 /// layer's lightness fit (`crate::theme::derive_shift`), or whether a synthesized one
 /// ([`derive_panel_fallback`]) has to stand in for it.
-///
-/// The fit solves a line through `(jerry_bg, theme_bg)` and `(jerry_panel, theme_panel)`, and
-/// Jerry Dark's own panel is *lighter* than its window. So:
-///
-/// - A theme whose window background is dark, like Jerry's, must have its panel lighter than its
-///   window for the fit to keep Jerry's own light/dark structure. Plenty of real dark themes
-///   (Dracula among them) make their sidebar *darker* than the editor instead - a perfectly good
-///   choice for VSCode, but feeding it into the fit solves a **negative** slope, which inverts
-///   every token: Jerry's light text would map below zero lightness and clamp to black on a dark
-///   background. That is not a subtle quality loss, it is an unusable palette.
-/// - A theme whose window background is light *should* invert (that is exactly how the bundled
-///   "Paper" theme is derived from Jerry Dark), so there the negative slope is correct and a panel
-///   darker than the window is what we want.
-///
-/// So the usable direction is simply "does this theme's panel sit on the same side of its window
-/// as the derivation needs" - lighter for a dark theme, darker for a light one. When it doesn't,
-/// [`derive_panel_fallback`] synthesizes one that does, nudging in exactly that direction. The
-/// theme's real sidebar colour is not lost by this: it is still mapped directly onto
-/// `surface.rail` by [`COLOR_KEY_MAP`], which is the token that actually paints it.
 fn panel_direction_is_usable(background_hex: &str, panel_hex: &str) -> bool {
     let luma = |hex: &str| -> i32 {
         let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
@@ -918,9 +792,6 @@ fn swatches_from_vscode(file: &VscodeThemeFile) -> Result<[u32; 5], VscodeThemeE
 /// [`super::custom_theme::validate_and_write`]'s own validate-then-write path) the same as any
 /// other theme file, so a converted-but-unreadable result is rejected the same honest way a
 /// hand-authored one would be.
-///
-/// `source_stem` is the source file's own name without extension (e.g. `"dracula"` for
-/// `dracula.json`) - the real fallback display name, see [`title_case_from_stem`].
 pub fn convert_vscode_theme_str(
     contents: &str,
     source_stem: &str,
@@ -992,11 +863,6 @@ fn parse_normalized_hex(value: &str) -> Option<u32> {
 /// time, so a VSCode theme that only styles `entity.name.function` still gets a real, consistent
 /// colour for a method call too - not a jarring mix of "some tokens follow the theme, some
 /// silently don't".
-///
-/// A `None` parent means "this bucket has no ancestor to inherit from" - the same real roots
-/// `theme::syntax` itself uses (`KEYWORD`/`FUNCTION`/`TYPE`/`CONSTANT`/`STRING`/`COMMENT`/
-/// `ATTRIBUTE`/`STRONG`/`EMPHASIS` are independently authored hues, not defaults borrowed from
-/// another bucket).
 fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<HighlightKind>) {
     use HighlightKind::*;
     match kind {
@@ -1164,14 +1030,6 @@ fn syntax_scope_rule(kind: HighlightKind) -> (&'static [&'static str], Option<Hi
 /// `crate::theme::syntax` token key (`HighlightKind::name` and that token's key are the same
 /// snake_case string by construction - see [`tests::every_highlight_kind_maps_onto_a_real_syntax_token`],
 /// which proves it rather than assuming it).
-///
-/// Processed in [`HighlightKind::ALL`]'s own declaration order (parents before every child that
-/// can inherit from them - see [`syntax_scope_rule`]) so a child's fallback always reads an
-/// already-resolved parent, never one that hasn't been visited yet.
-///
-/// [`HighlightKind::Text`] is the one real special case: it comes from `colors["editor.foreground"]`
-/// (a real VSCode UI colour, not a `tokenColors` scope - there is no textmate scope for "plain
-/// text with no other rule matching") rather than a scope search.
 fn build_syntax_overrides(
     colors: &HashMap<String, String>,
     token_colors: &[VscodeTokenColorRule],
@@ -1309,9 +1167,6 @@ mod tests {
         );
     }
 
-    /// Every VSCode key this module claims to map must target a *real* registered token - a typo
-    /// here would silently drop that mapping, and `debug_assert!` alone wouldn't be checked in a
-    /// release build.
     #[test]
     fn every_mapped_token_key_is_a_real_registered_theme_token() {
         for (token_key, vscode_keys) in COLOR_KEY_MAP {
@@ -1326,8 +1181,6 @@ mod tests {
         }
     }
 
-    /// The `syntax.*` half depends on `HighlightKind::name()` and the matching token key being the
-    /// same string - proven here rather than assumed.
     #[test]
     fn every_highlight_kind_maps_onto_a_real_syntax_token() {
         for kind in HighlightKind::ALL {
@@ -1383,9 +1236,6 @@ mod tests {
         );
     }
 
-    /// The real breadth claim: a theme with a normal VSCode colour set moves genuinely many
-    /// distinct Jerry tokens to its *own literal* values, across unrelated modules - not just the
-    /// three or four the old five-swatch conversion could.
     #[test]
     fn a_realistic_theme_maps_many_real_keys_across_unrelated_modules() {
         let json = r##"{
@@ -1476,19 +1326,14 @@ mod tests {
             );
         }
 
-        // A translucent VSCode colour keeps its hue at full opacity.
         assert_eq!(entry(&file, "diff.add_bg").as_deref(), Some("#50fa7b"));
 
-        // And the whole thing is still a real, valid, selectable theme.
         let validated = file
             .validate()
             .expect("must pass the shared validate pipeline");
         assert_eq!(validated.name, "Broad");
     }
 
-    /// A former Rust-level alias pair really can diverge now: `variable.parameter` is styled by
-    /// this theme, `variable` isn't, and the two must land on genuinely different colours - the
-    /// concrete fidelity win the token rewrite bought for VSCode import.
     #[test]
     fn a_child_scope_the_theme_styles_diverges_from_the_parent_it_used_to_alias() {
         let json = r##"{
@@ -1636,8 +1481,6 @@ mod tests {
         assert_eq!(entry(&file, "syntax.text").as_deref(), Some("#f8f8f2"));
     }
 
-    /// A converted theme really round-trips through this app's own file format - the property
-    /// `import_vscode_theme_file`'s write-then-reload depends on.
     #[test]
     fn a_converted_theme_round_trips_through_the_real_toml_writer_and_parser() {
         let json = r##"{
@@ -1659,19 +1502,6 @@ mod tests {
 
 /// Real end-to-end import coverage against **actual, unmodified VSCode theme files** - not
 /// synthetic fixtures that might miss the paths a real file exercises.
-///
-/// `testdata/vscode/*.json` are the genuine files from Microsoft's own `theme-defaults` extension
-/// (MIT licensed, vendored verbatim), including their real JSONC comments, tabs, and `include`
-/// chains. Two real, user-reported bugs were found by pointing this at them rather than at a
-/// hand-written fixture:
-///
-/// - `Dark+` (`dark_plus.json`) failed to convert at all: it defines *no* `colors`, only
-///   `tokenColors` plus `"include": "./dark_vs.json"`, so ignoring `include` meant the converter
-///   genuinely could not see a background.
-/// - `Dark Modern` (`dark_modern.json`) converted but was then rejected by this crate's own
-///   readability check, because it sets `editor.background` `#1F1F1F` and
-///   `editorWidget.background` `#202020` - a deliberate flat-surface design that the old
-///   surface-against-surface check mistook for an unreadable theme.
 #[cfg(test)]
 mod real_vscode_default_theme_tests {
     use super::*;
@@ -1719,8 +1549,6 @@ mod real_vscode_default_theme_tests {
         dir
     }
 
-    /// The non-negotiable one: every real, shipped VSCode default theme imports end to end -
-    /// converted, validated, written to disk, and loadable back as a real selectable theme.
     #[test]
     fn every_real_vscode_default_theme_imports_end_to_end() {
         let source_dir = real_theme_dir();
@@ -1754,7 +1582,6 @@ mod real_vscode_default_theme_tests {
             assert!(path.exists(), "{file_name} must really land on disk");
         }
 
-        // And every one of them loads back cleanly from the directory it was written into.
         let (loaded, errors) = custom_theme::load_custom_themes_from_dir(dest_dir.path());
         assert!(
             errors.is_empty(),
@@ -1763,9 +1590,6 @@ mod real_vscode_default_theme_tests {
         assert_eq!(loaded.len(), 9, "every imported theme must load back");
     }
 
-    /// The `include` chain is really followed, not merely tolerated: `Dark+` carries no `colors`
-    /// of its own at all, so every chrome colour in the result has to have come from
-    /// `dark_vs.json`, while its *own* `tokenColors` still win for syntax.
     #[test]
     fn dark_plus_really_inherits_its_colours_through_the_include_chain() {
         let source_dir = real_theme_dir();
@@ -1795,11 +1619,9 @@ mod real_vscode_default_theme_tests {
             Some("#1e1e1e"),
             "the window background has to have come from dark_vs.json's editor.background"
         );
-        // Dark+'s own tokenColors style function declarations; that must still win.
         assert_eq!(entry("syntax.function").as_deref(), Some("#dcdcaa"));
     }
 
-    /// A circular `include` is a real, bounded error rather than a hang or a stack overflow.
     #[test]
     fn a_circular_include_chain_is_a_real_reported_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1823,8 +1645,6 @@ mod real_vscode_default_theme_tests {
         );
     }
 
-    /// A missing include target is reported honestly rather than silently importing a theme with
-    /// none of the colours the user expected.
     #[test]
     fn a_missing_include_target_is_a_real_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1839,9 +1659,6 @@ mod real_vscode_default_theme_tests {
         ));
     }
 
-    /// The light defaults really import as light themes, and the dark ones as dark - a real check
-    /// that the whole conversion preserved the source theme's own character rather than merely
-    /// producing *something* valid.
     #[test]
     fn the_real_light_defaults_import_as_light_themes_and_the_dark_ones_as_dark() {
         let source_dir = real_theme_dir();

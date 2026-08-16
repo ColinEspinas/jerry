@@ -1,33 +1,6 @@
 //! The Search panel's own state, and the pure decisions the panel's chrome reads off it: which
 //! of the three design states the body is in, what the count row says, and what each of the four
 //! real inputs holds.
-//!
-//! GPUI-free apart from the four [`gpui::FocusHandle`]s the fields need - which are plain data
-//! (`FocusHandle` is a cheap, cloneable id, not a window) - so every rule below is a real unit
-//! test rather than a claim checked only by looking at a screenshot.
-//!
-//! ## Three states, gated on one flag
-//!
-//! `REVISION-2026-08-14.md` §5's table **is** the spec, and [`BodyState`] is it as an enum:
-//!
-//! | | count row | body | fold-all · Replace all |
-//! |---|---|---|---|
-//! | no query | *(empty)* | `Search the files in <branch>.` | hidden |
-//! | no match | `no results` | `No matches for "<q>" in <branch>.` | hidden |
-//! | results | `14 results in 6 files` | the tree | shown |
-//!
-//! §4w's own account of why this is three and not two is the whole reason the flag exists:
-//! "making the query a real input created a state that could not previously exist - an empty
-//! field - and every derived value still branched on the match count alone, so *not searched yet*
-//! rendered as `no results` ... That asserts a fact about the worktree from a search nobody ran."
-//!
-//! Two further states the design table does not have, because a mock cannot have them: a search
-//! genuinely **in flight**, and a regex that does not **compile**. Both are real, and both are
-//! shown as themselves rather than folded into `no results` - which would be the same lie the
-//! table exists to stop, one layer down. In particular the results of a *previous* query are
-//! never left on screen under a newer one: [`SearchPanel::body_state`] compares the outcome's own
-//! query against what is typed now, so a stale tree reports itself as still searching instead of
-//! answering a question nobody asked.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,10 +12,6 @@ use crate::search::engine::{SearchOptions, SearchOutcome};
 use crate::text_history::TextField;
 
 /// Which of the four real inputs the panel is typing into.
-///
-/// A single enum rather than four booleans or four separate key handlers: the four fields share
-/// one keymap and one key-down handler, and "which one is focused" is exactly one fact. Four
-/// flags would be four facts that can disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchField {
     Query,
@@ -116,10 +85,6 @@ impl SearchModifier {
 }
 
 /// A completed search, kept beside the exact query and options that produced it.
-///
-/// The query is stored rather than assumed: it is what lets [`SearchPanel::body_state`] tell "these
-/// are the results for what is typed" from "these are the results for what *was* typed", which is
-/// the difference between a result tree and a stale one.
 #[derive(Debug, Clone)]
 pub struct CompletedSearch {
     pub query: String,
@@ -142,22 +107,6 @@ impl CompletedSearch {
 /// One flattened row in the Search panel's two-level result tree - the real fix for a live report
 /// (GitHub issue #162's own follow-up) that the panel became "very slow" and "lags" once a search
 /// returned a lot of results.
-///
-/// `crate::search::render::AdeApp::render_search_body` used to build every file row and every
-/// match row under it unconditionally, on every render - up to `crate::search::engine::
-/// MAX_MATCHES` (2,000) match rows plus one file row per matching file, regardless of how many of
-/// them the panel's own viewport could actually show. [`flatten_search_list_items`] turns a
-/// [`SearchOutcome`] plus the panel's own collapse state into the real flat sequence
-/// `render_search_body`'s `gpui::list` (GPUI's own variable-row-height virtualized list - a file
-/// row and a match row are different heights, and a file's own match-row count is not uniform
-/// across files either, both of which rule out `uniform_list`) renders only the items its
-/// viewport (plus a small overdraw margin) actually covers - mirroring `crate::rail::state::
-/// RailListItem`'s identical fix for the rail's own worktree list (GitHub issue #364).
-///
-/// Deliberately index-only rather than cloning row data into every item, for the same reason
-/// `RailListItem` is: cheap to rebuild fresh on every render, with exactly one place -
-/// `crate::search::render::AdeApp::render_search_list_item` - that ever resolves one back into
-/// real row data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchListItem {
     /// One matching file's own header row - its name, its chip, its match count.
@@ -474,9 +423,6 @@ impl SearchPanel {
 
     /// The count row's text - `""`, `no results`, `14 results in 6 files`, or the two states the
     /// design table does not have.
-    ///
-    /// Every count goes through `crate::root::plural` (`REVISION-2026-08-14.md` §7 rule 9), so
-    /// `1 result in 1 file` is never `1 results in 1 files`.
     pub fn count_label(&self) -> String {
         match self.body_state() {
             BodyState::NotSearched => String::new(),
@@ -519,9 +465,6 @@ impl SearchPanel {
     }
 
     /// The body's message in every state that is a message rather than a tree.
-    ///
-    /// `branch` is the active worktree's branch, exactly as the design's two sentences name it -
-    /// `Search the files in <branch>.` and `No matches for "<q>" in <branch>.`
     pub fn body_message(&self, branch: &str) -> Option<String> {
         match self.body_state() {
             BodyState::NotSearched => Some(format!("Search the files in {branch}.")),
@@ -536,10 +479,6 @@ impl SearchPanel {
     }
 
     /// `Replace all`'s tooltip, derived from live hits.
-    ///
-    /// The issue calls out the mock's own bug here by name: it "had `14` hardcoded and would have
-    /// lied on the first keystroke". Returns `None` in every state where there is nothing to
-    /// replace, which is the same gate the button itself is behind.
     pub fn replace_all_tooltip(&self) -> Option<String> {
         let outcome = self.results()?;
         Some(format!(
@@ -871,7 +810,6 @@ mod tests {
         for (index, field) in SearchField::ALL.into_iter().enumerate() {
             assert_eq!(panel.field(field).as_str(), format!("value{index}"));
         }
-        // Four distinct handles, not one shared one - see the field's own docs.
         let handles: Vec<gpui::FocusHandle> = SearchField::ALL
             .into_iter()
             .map(|field| panel.focus_handle(field).clone())

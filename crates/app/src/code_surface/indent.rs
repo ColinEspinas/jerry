@@ -6,25 +6,6 @@
 //! resolves the real absolute file path/worktree root and calls into this module's
 //! [`indent_settings_for_path`], then hands the resulting [`IndentSettings`] to
 //! `crate::code_surface::edit_buffer::EditBuffer::indent_lines`/`dedent_lines`).
-//!
-//! ## `.editorconfig` support is real but deliberately bounded
-//!
-//! This is a hand-rolled parser/matcher, not a vendored `editorconfig` crate (none of this
-//! workspace's existing dependencies - `vendor/zed`'s own pinned set included - carry one). Real,
-//! working support: `root = true`, `indent_style` (`tab`/`space`), `indent_size` (a number, or
-//! `tab` meaning "use `tab_width`"), `tab_width`, section patterns matched against just the
-//! file's own *basename* (`[*.rs]`, `[*]`, `[Makefile]`, brace-expanded `[*.{rs,toml}]`, `?`
-//! wildcards). Two real, documented gaps, chosen so an unsupported pattern degrades to "doesn't
-//! match" rather than a wrong match: directory-scoped patterns containing `/` (e.g.
-//! `[lib/**.js]`) never match anything here, and `**`/bracket character classes (`[0-9]`) are not
-//! specially interpreted (`[` is stripped as an ordinary section-header delimiter, so a pattern
-//! that tries to use one as a glob class is read as a literal string instead of a wrong match).
-//!
-//! Precedence follows the real EditorConfig spec: files closer to the target file win over files
-//! further away (per-property - a closer file that doesn't set `tab_width` at all still inherits
-//! it from a farther one), the walk upward stops at (and includes) the first `root = true` file,
-//! and within one file, a later matching `[section]` overrides an earlier matching one for
-//! whichever properties it sets.
 
 use std::ops::Range;
 use std::path::Path;
@@ -58,12 +39,6 @@ pub fn indent_unit(settings: IndentSettings) -> String {
 /// column" approximation that would misalign against the same file's own space-indented lines.
 /// Walks only the real leading run of `' '`/`'\t'` characters - the first non-whitespace character
 /// (or the end of the line) stops the walk, so trailing/inner whitespace never contributes.
-///
-/// `crate::code_surface::editing::render_editable_file_view_line`'s real, painted indent guides
-/// (gated by `crate::settings::store::AppearanceSettings::show_indent_guides`) are the only real
-/// consumer - see that function's own docs for how `tab_width` columns become real pixel guide
-/// positions via a real, measured monospace character width (never a hardcoded pixel constant
-/// unrelated to this count).
 pub fn leading_indent_levels(text: &str, tab_width: u8) -> usize {
     let tab_width = tab_width.max(1) as usize;
     let mut columns = 0usize;
@@ -777,7 +752,6 @@ mod tests {
         assert!(ends_with_opener("fn foo() {"));
         assert!(ends_with_opener("let xs = ["));
         assert!(ends_with_opener("foo("));
-        // Real trailing whitespace after the opener must not defeat the check.
         assert!(ends_with_opener("fn foo() {   "));
     }
 
@@ -796,7 +770,6 @@ mod tests {
         assert!(ends_with_block_opener("else:", Some("py")));
         assert!(ends_with_block_opener("for i in xs:", Some("py")));
         assert!(ends_with_block_opener("class Foo:", Some("py")));
-        // Real trailing whitespace after the colon must not defeat the check.
         assert!(ends_with_block_opener("if x:   ", Some("py")));
     }
 

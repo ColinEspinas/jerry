@@ -17,31 +17,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// How long after the last keystroke a note is written to disk.
-///
-/// Sized against the same question `crate::text_history::COALESCE_IDLE` (600ms) answers - long
-/// enough that an ordinary typing burst is one write, short enough that stepping away and closing
-/// the window cannot lose what is on screen.
 const REVIEW_NOTES_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// The one note currently open for typing, and its own text buffer.
-///
-/// **One at a time, and deliberately.** A per-note `TextField` + `FocusHandle` would have to be
-/// created and destroyed as a virtualized diff row scrolls in and out of existence, and a focus
-/// handle that disappears under the caret is the class of bug that is very hard to see and very
-/// easy to ship. One draft, named by the note it belongs to, is enough: a reviewer writes one note
-/// at a time, and the pinned cards around it are read-only text until they are clicked.
-///
-/// The buffer is a real [`TextField`], not a bare `String`, so a note gets the same per-widget
-/// undo history every other hand-rolled input in this app has (`crate::text_history`'s own module
-/// docs list the five; this is the sixth).
 pub(crate) struct NoteDraft {
     /// Which **checkout** this note belongs to.
-    ///
-    /// Carried on the draft rather than re-read from [`AdeApp::diff_root`] at each store call,
-    /// and that is a correctness point: `diff_root` is reassigned wholesale on every worktree
-    /// switch (`crate::code_surface::tabs::AdeApp::load_diff`), so a draft opened in worktree A
-    /// and still open after a switch to B would otherwise have every one of its writes land under
-    /// B's key - overwriting B's own note on the same path and line, and persisting it there.
     pub worktree: PathBuf,
     /// Which note this buffer belongs to.
     pub at: NoteRef,
@@ -107,20 +87,11 @@ impl NoteSendError {
 
 impl AdeApp {
     /// Which worktree the notes on screen belong to.
-    ///
-    /// [`Self::diff_root`] rather than the rail's selection: notes are keyed to the checkout the
-    /// diff was read out of, and that is the only place the lines they are anchored to exist.
     pub(crate) fn review_notes_worktree(&self) -> PathBuf {
         self.diff_root.clone()
     }
 
     /// The file the notes surface is currently about, if any.
-    ///
-    /// [`Self::open_change`] - the **Uncommitted** diff. Notes are scoped to that one surface on
-    /// purpose: `AUDIT-2026-08-13-competitive-v2.md` §3.2 puts a *second* `Send notes` on each
-    /// row of the `Runs` section, with its own per-run scope and its own target, and shipping a
-    /// notes bar on the Review tab too would quietly answer that question in a way §3.2 has
-    /// already answered differently. One surface, one scope, until the Runs one is really built.
     pub(crate) fn review_notes_file(&self) -> Option<PathBuf> {
         self.open_change.clone()
     }
@@ -154,26 +125,11 @@ impl AdeApp {
     }
 
     /// Writes the live store back out, off-thread, merging under the shared lock.
-    ///
-    /// Called at every point a note's content has genuinely settled - a card closing, a batch
-    /// being sent - where the write should not wait for anything.
     fn persist_review_notes(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         self.write_review_notes(worktree, None, cx);
     }
 
     /// The same write, debounced - what a keystroke schedules.
-    ///
-    /// A note has to survive the app closing, and "persist when the card closes" is not that: a
-    /// reviewer who types a note and then quits with the caret still in it would lose it, and
-    /// losing review text is the one failure this feature cannot have. Writing per character
-    /// instead would be a real `fsync`'d file write per character.
-    ///
-    /// So: one slot ([`AdeApp::_review_notes_persist_task`]), newest wins. Assigning a fresh task
-    /// drops - and therefore cancels - whatever earlier timer was still waiting, so only the last
-    /// keystroke's timer fires. Exactly the mechanism
-    /// `crate::code_surface::editing::AdeApp::schedule_rehighlight` already uses, and the state is
-    /// captured *inside* the task after the wait, so a coalesced write is a write of the newest
-    /// content rather than of whatever was there when the first keystroke landed.
     pub(in crate::review_notes) fn schedule_review_notes_persist(
         &mut self,
         worktree: &Path,
@@ -230,14 +186,6 @@ impl AdeApp {
 
     /// Clicking a diff line: pin a note beneath it, or - if the click landed on the line whose
     /// note is already open for typing - close that note again.
-    ///
-    /// `STAGE-A-CHANGELOG.md` §1 says the gesture *toggles*, and `Jerry.dc.html` implements that
-    /// against a fixed set of pre-authored notes, where "toggle" can only mean show/hide. Here the
-    /// note does not exist until you make one, so toggling has to mean create/remove - with one
-    /// deliberate asymmetry: a card you have **written into** is never destroyed by a click. It
-    /// closes, and stays pinned. Only a card that is still blank (i.e. the click was a mistake)
-    /// goes away again, which is exactly the case the toggle exists for. Emptying a note's text
-    /// is the way to remove one you meant to write.
     pub(crate) fn toggle_line_note(
         &mut self,
         anchor: NoteAnchor,
@@ -293,19 +241,6 @@ impl AdeApp {
 
     /// Closes whatever note is open for typing, discarding it if nothing was ever written into it,
     /// and hands keyboard focus back to the diff pane.
-    ///
-    /// The single removal point in the whole feature (besides emptying a note's text, which lands
-    /// here too). Nothing about sending calls it.
-    ///
-    /// The focus hand-off is load-bearing, not tidiness. The card only carries
-    /// [`Self::note_focus_handle`] while it is *being edited* (see
-    /// `crate::review_notes::render::AdeApp::render_review_note_card` for why exactly one element
-    /// may), so closing the draft removes that node from the dispatch tree - and a focus handle
-    /// whose node is no longer rendered is GPUI's **empty context stack**, where
-    /// `KeyBindingContextPredicate::eval_inner` short-circuits to `false` and every scoped binding
-    /// silently dies. That is a real, repeatedly-hit bug class in this codebase (see
-    /// `crate::keymap_overrides::real_context_stacks`' own docs, which include the empty stack for
-    /// exactly this reason), and it would take `mod+enter` and `c` with it.
     pub(crate) fn close_note_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = self.note_draft.take() else {
             return;
@@ -399,24 +334,6 @@ impl AdeApp {
     }
 
     /// **Which agent this file's notes belong to.**
-    ///
-    /// `STAGE-A-CHANGELOG.md` §1: *"`noteTarget` resolves to the file's first author, falling back
-    /// to the worktree's primary agent - so in a shared worktree the notes go to whoever wrote the
-    /// lines"*. Both halves are real here:
-    ///
-    /// 1. **The file's first author** is GitHub issue #287's own answer, read from the same place
-    ///    the `⚠` ring reads it (`crate::provenance::render::chip_authors`, whose order is the
-    ///    chip order on the row), filtered to authors that are agents and that are still open in
-    ///    this worktree. `you` is skipped rather than treated as a target: the human is who the
-    ///    notes are *from*.
-    /// 2. **The worktree's primary agent** is `crate::work_surface::agents::Agents::primary_for_cwd`
-    ///    - the same rule that decides which tab the centre pane shows for this worktree - further
-    ///      filtered to a real agent session. A shell shares the worktree but cannot revise
-    ///      anything, and typing a review prompt into somebody's `bash` would be both useless
-    ///      and, since it would arrive at a shell prompt, actively unpleasant.
-    ///
-    /// `None` when there is nobody at all - and then the bar says so and the button is not drawn,
-    /// rather than a button that names a target it does not have.
     pub(crate) fn review_note_target(&self, path: &Path) -> Option<NoteTarget> {
         let worktree = self.review_notes_worktree();
         if let Some(entry) = self.uncommitted_change_set.entry(path) {
@@ -468,11 +385,6 @@ impl AdeApp {
     }
 
     /// The one batched prompt this file's notes would compose into right now, in diff order.
-    ///
-    /// `order` is the anchors as the diff view really lays them out, top to bottom - see
-    /// [`Self::review_note_order`]. Falls back to plain anchor order for anything the diff no
-    /// longer shows, so a note pinned to a line that has since moved out of a hunk is still
-    /// delivered rather than silently dropped.
     pub(crate) fn batched_review_prompt(&self, path: &Path) -> Option<BatchedPrompt> {
         let worktree = self.review_notes_worktree();
         let mut notes = self.review_notes.deliverable(&worktree, path);
@@ -503,11 +415,6 @@ impl AdeApp {
     }
 
     /// **The send.** One batched prompt, into one agent's real pty, once.
-    ///
-    /// Everything this method does after a successful write is the issue's *"pinned after send"*
-    /// half: it flips each note's mark by recording the wording that was delivered, and it does
-    /// not remove anything. There is no clear-on-send path to review, because there is no code
-    /// here that could clear one.
     pub(crate) fn send_review_notes(
         &mut self,
         path: PathBuf,
@@ -586,12 +493,6 @@ impl AdeApp {
     }
 
     /// `C` over the diff - *"note on line"*, the footer hint's own wording.
-    ///
-    /// Acts on [`Self::note_cursor`]: the line whose note you last opened, which a click sets. A
-    /// keyboard-only "which line" would need a diff-line caret, and this read-only virtualized
-    /// list deliberately has none (see `crate::code_surface::diff_view`); inventing a hidden one
-    /// so a hint could be literal would be worse than this. With no cursor yet, `C` does nothing
-    /// rather than guessing a line.
     pub(crate) fn handle_toggle_line_note(
         &mut self,
         _action: &crate::root::ToggleLineNote,

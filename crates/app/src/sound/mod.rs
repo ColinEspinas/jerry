@@ -3,22 +3,6 @@
 //! own `Default` sets the master switch `enabled = false`, and nothing in this module ever opens
 //! an audio device until [`crate::sound::player::SoundPlayer`] is asked to play something for
 //! real.
-//!
-//! ## How the pieces fit
-//!
-//! - [`library`] - the sound library itself: built-in sounds embedded at compile time
-//!   ([`library::builtin_sounds`]), plus whatever the user has imported into
-//!   `~/.config/jerry/sounds/` ([`library::load_user_sounds_from_dir`]). Every
-//!   [`SoundEventKind`] resolves to one [`library::LibrarySound`] by id
-//!   ([`library::resolve`]).
-//! - [`player`] - the real playback side: a lazily-spawned dedicated audio thread
-//!   (`crate::sound::player::SoundPlayer`), never started at all if the module stays off.
-//! - `flow` (`pub(crate)`) - the `AdeApp`-side wiring: detecting real agent-status transitions on
-//!   the existing status-poll tick and deciding, given the live settings and window-focus state,
-//!   whether a sound should actually play right now.
-//!
-//! Three events, chosen because they're the three moments GitHub issue #226 asks for and each has
-//! a real, already-derived signal to trigger from - see [`SoundEventKind`].
 
 pub(crate) mod flow;
 pub mod library;

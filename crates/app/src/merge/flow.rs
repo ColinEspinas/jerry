@@ -8,21 +8,6 @@ impl AdeApp {
     /// moment (`Clean`/`Conflicted`, or an `Error` with `abortable_worktree`), this aborts it
     /// (`wt_core::merge::abort_merge`) rather than leaving the repository mid-merge with no UI
     /// left to finish or abort it.
-    ///
-    /// A `Running` attempt (the `git merge` child process itself) can't be cancelled from here -
-    /// there is no cancellation token threaded through it. Clearing `merge_flow` regardless is
-    /// still correct: [`Self::start_merge`]'s completion handler guards on `agent_id` still
-    /// matching, so a `Running` attempt that finishes after this point is a no-op there. If it
-    /// left a `MERGE_HEAD` behind, the next `Merge` click hits a git failure and
-    /// [`run_merge_attempt`]'s `find_in_progress_merge` fallback surfaces `Abort merge` for it
-    /// then - never a silent dead end.
-    ///
-    /// If [`Self::merge_op_in_flight`] is `true`, [`Self::complete_merge_flow`]/
-    /// [`Self::abort_merge_flow`] already own this flow's outcome on the background executor,
-    /// so this spawns nothing and only clears the UI-facing `merge_flow` field - reaching into
-    /// their shared [`Self::_merge_task`] slot here would drop (cancel) their in-flight
-    /// operation. See [`Self::_merge_cleanup_task`]'s docs for why this method's own
-    /// best-effort abort uses a separate field instead.
     pub(crate) fn clear_merge_flow_for_closed_agent(&mut self, cx: &mut Context<Self>) {
         let Some(flow) = self.merge_flow.take() else {
             return;
@@ -68,30 +53,6 @@ impl AdeApp {
     /// Merges `id`'s worktree branch into the repository's detected base branch, on the
     /// background executor (a `gix` open, a `git status` dirty-check, and a spawned `git merge`
     /// child process - see `wt_core::merge::attempt_merge`'s own docs).
-    ///
-    /// Only one merge flow is tracked at a time; a start while one is already in progress for
-    /// any agent is a no-op, since two concurrent `git merge` invocations would race over the
-    /// same base worktree.
-    ///
-    /// ## No UI entry point right now - deliberately, and tracked
-    ///
-    /// This used to be the agent context bar's `Merge` button. GitHub issue #295 deleted that
-    /// button outright (`STAGE-A-CHANGELOG.md` §4e: a **worktree** verb in an **agent** header,
-    /// offered twice for one two-agent worktree, offered while the agent was `Needs input`, and
-    /// "merge has preconditions - committed, base current, no live writers - and the header can
-    /// show none of them"), and §4e/#285 both name the git graph as where merging belongs.
-    ///
-    /// The graph has the *other* direction already ([`Self::start_merge_from_graph_branch`],
-    /// "Merge into current branch…"); **this** direction - a branch into its base - is the first
-    /// open bullet of GitHub issue #241, and inventing that surface was explicitly out of scope
-    /// for #295. So the flow, its `MergeOutcome` folding and its full regression suite below are
-    /// kept intact and unreachable rather than deleted and rebuilt later: the alternative is
-    /// throwing away tested behaviour a tracked issue is about to need. `#[allow(dead_code)]`
-    /// states that honestly instead of leaving a bare compiler warning for someone to silence.
-    ///
-    /// Nothing else about it is dormant: `wt_core::merge::attempt_merge` (the engine),
-    /// [`fold_merge_result`] (the shared `MergeOutcome` → UI-state mapping) and the whole
-    /// `crate::merge::render` conflict resolver are all live today via the graph direction.
     #[allow(dead_code)]
     pub(crate) fn start_merge(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.merge_flow.is_some() {
@@ -146,38 +107,6 @@ impl AdeApp {
     /// merges `source_branch` into whatever is checked out in the **focused worktree**
     /// (`wt_core::merge::attempt_merge_into_current`), the opposite direction from
     /// [`Self::start_merge`]'s own "this agent's branch into the base branch".
-    ///
-    /// **This is not a second merge flow.** It fills the same [`Self::merge_flow`] the context
-    /// bar's `Merge` button does, with the same [`merge::MergeFlowState`] shapes, so a conflict
-    /// lands in the *existing* conflict resolver (`crate::merge::render`) with its existing
-    /// `Take left`/`Take right`/`Take both`/hand-edit surface and its existing `Complete merge`/
-    /// `Abort merge` footer. There is deliberately no second conflict UI, and no second copy of
-    /// the `MergeOutcome` folding ([`run_merge_attempt_into_current`] shares it).
-    ///
-    /// That resolver renders inside an agent's work surface, so this activates the focused
-    /// worktree's agent tab ([`Self::select_agent`]) *before* the merge starts - otherwise a real
-    /// conflict would be resolved into a surface the user is not looking at. Which agent is
-    /// unimportant to the merge itself: unlike [`Self::start_merge`] (which derives the branch it
-    /// merges *from* the agent's own `cwd`), this merge's source is the branch that was clicked
-    /// and its target is the focused worktree, so the agent tab is purely the surface the result
-    /// is shown in - and every agent this picks between shares that one worktree by construction
-    /// (`Agents::iter_for_cwd`).
-    ///
-    /// Every precondition is [`crate::graph_view::graph_branch_merge_gate`]'s - the *same* pure
-    /// gate the row that was just clicked rendered itself from, so what the row said and what this
-    /// does can never disagree. Re-checked here rather than trusted from that render: the frame
-    /// that drew a live row and the click that lands on it are separate frames, and a background
-    /// `load_diff`, an agent waking up, or another merge starting in between can genuinely
-    /// invalidate it - the same "re-check rather than trust a UI-level belief" discipline
-    /// `wt_core::merge::complete_merge` already applies one layer down. A gate that refuses is
-    /// reported on the graph tab's own status line with the very string the row was showing, never
-    /// silently dropped.
-    ///
-    /// The gate is a pre-flight, not the authority: `wt_core::merge::attempt_merge_into_current`
-    /// re-checks the detached-`HEAD`, same-branch and dirty-worktree preconditions against git's
-    /// own ground truth, and a branch that doesn't exist is git's own refusal. Each surfaces as a
-    /// real [`merge::MergeFlowState::Error`] in the resolver with that module's (or git's) own real
-    /// message.
     pub(crate) fn start_merge_from_graph_branch(
         &mut self,
         source_branch: String,
@@ -258,10 +187,6 @@ impl AdeApp {
     /// the next unresolved hunk ([`crate::merge::state::first_unresolved`]). If that resolves the
     /// file's last conflict, the resolved content is written to disk and `git add`ed on the
     /// background executor (`wt_core::merge::write_resolved_file`).
-    ///
-    /// Only ever mutates a [`wt_core::merge::ConflictedPath::Text`] entry: `active_file`/
-    /// `active_hunk` are only ever set from `crate::merge::state::first_unresolved`, which never
-    /// points at an `Unmergeable` entry (see that function's docs).
     pub(in crate::merge) fn resolve_active_hunk(
         &mut self,
         choice: wt_core::merge::ConflictChoice,
@@ -365,18 +290,6 @@ impl AdeApp {
     /// (`wt_core::merge::complete_merge`), valid once a clean merge is staged or every
     /// conflicted file is resolved ([`crate::merge::state::all_resolved`]). On success, clears the flow
     /// and refreshes worktree/diff state to reflect the merge that just happened.
-    ///
-    /// Guarded by [`Self::merge_op_in_flight`] for the duration of the background commit: a
-    /// second click while the first is still in flight (e.g. a fast Abort-right-after-Complete)
-    /// would otherwise spawn a second git operation, overwriting [`Self::_merge_task`] and
-    /// dropping the first one's completion handler mid-commit.
-    /// [`Self::clear_merge_flow_for_closed_agent`] respects the same flag so closing the
-    /// agent mid-commit can't cancel this operation either.
-    ///
-    /// The success arm only clears [`Self::merge_flow`] when it still belongs to this
-    /// `agent_id`, matching the error arm below it: an agent close no longer blocks this
-    /// commit from running to completion, so a merge for a *different* agent could
-    /// legitimately be in `merge_flow` by the time this closure runs.
     pub(in crate::merge) fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -443,9 +356,6 @@ impl AdeApp {
     /// Surface D's `Abort merge` action - `git merge --abort` (`wt_core::merge::abort_merge`),
     /// restoring the base worktree to its pre-merge state. If the abort itself fails, the flow
     /// is left in an `Error` state describing that rather than pretending it succeeded.
-    ///
-    /// Guarded by [`Self::merge_op_in_flight`] - see [`Self::complete_merge_flow`]'s docs for
-    /// the Complete-vs-Abort race this (and the matching guard there) prevents.
     pub(in crate::merge) fn abort_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
@@ -585,10 +495,6 @@ impl AdeApp {
     /// would show stale markers here), never raw disk bytes. `extension: None` deliberately -
     /// see `crate::merge::editing`'s own top docs for why this surface never runs the real
     /// `tree-sitter` highlighter at all.
-    ///
-    /// A no-op if there's no active `Conflicted` text hunk to edit (nothing to seed from), or if
-    /// [`Self::merge_edit`] already matches the active file (re-clicking the toggle while already
-    /// editing it does nothing destructive).
     pub(in crate::merge) fn start_merge_hand_edit(
         &mut self,
         window: &mut Window,
@@ -669,11 +575,6 @@ impl AdeApp {
     /// matching `crate::merge::state::replace_conflicted_file` swap into `files[]`, a
     /// `crate::merge::state::first_unresolved` recompute, and [`Self::ensure_active_merge_highlight_cache`]
     /// - the same real hook the quick-pick path already uses.
-    ///
-    /// Mirrors [`Self::save_active_file`]/[`Self::spawn_file_save_loop`]'s serial-writer-loop
-    /// discipline (see [`Self::merge_edit_save_pending`]/[`Self::merge_edit_save_running`]'s own
-    /// docs) so two fast saves can't race each other's write, scoped to the single
-    /// [`Self::merge_edit`] slot rather than per-path.
     pub(crate) fn save_merge_edit(&mut self, cx: &mut Context<Self>) {
         let Some(edit) = self.merge_edit.as_ref() else {
             return;
@@ -972,10 +873,6 @@ enum MergeEditReparseOutcome {
 /// `abortable_worktree` via [`wt_core::merge::find_in_progress_merge`] rather than assuming a
 /// merge is or isn't in progress just because this call failed. If that lookup itself fails,
 /// `abortable_worktree` is `None`.
-///
-/// Reached only through [`run_merge_attempt`], so it shares that function's "no UI entry point
-/// until GitHub issue #241's graph merge-into-base lands" state - see
-/// [`AdeApp::start_merge`]'s own docs for why it is kept rather than deleted.
 #[allow(dead_code)]
 pub(in crate::merge) fn merge_error_state(
     repo_path: &std::path::Path,
@@ -997,10 +894,6 @@ pub(in crate::merge) fn merge_error_state(
 /// thread. For a [`wt_core::merge::MergeOutcome::Conflicted`], this also classifies every
 /// conflicted path (`wt_core::merge::classify_conflicted_file`) here, still off-thread, rather
 /// than leaving that as a second round-trip.
-///
-/// Its only caller is [`AdeApp::start_merge`], whose UI entry point GitHub issue #295 deleted and
-/// GitHub issue #241 will restore on the git graph - see that method's own docs. Its twin
-/// [`run_merge_attempt_into_current`] and their shared [`fold_merge_result`] are both live today.
 #[allow(dead_code)]
 pub(in crate::merge) fn run_merge_attempt(
     repo_path: &std::path::Path,
@@ -1017,12 +910,6 @@ pub(in crate::merge) fn run_merge_attempt(
 /// into the very same [`merge::MergeFlowState`] via the very same [`fold_merge_result`], so the
 /// existing conflict resolver cannot tell the two directions apart - which is the whole point of
 /// routing this through the existing flow rather than building a second one.
-///
-/// The one real difference is where an `Abort merge` offer comes from on failure: the base-branch
-/// direction has to *find* the worktree a merge might be in progress in
-/// (`find_in_progress_merge`), while here the worktree is already known, so this asks it directly
-/// (`merge_head_exists`) rather than re-deriving a repository-wide answer that could name a
-/// different worktree entirely.
 pub(in crate::merge) fn run_merge_attempt_into_current(
     target_worktree_path: &std::path::Path,
     source_branch: &str,
@@ -1045,10 +932,6 @@ pub(in crate::merge) fn run_merge_attempt_into_current(
 /// [`merge::MergeFlowState`] - shared by both directions ([`run_merge_attempt`] and
 /// [`run_merge_attempt_into_current`]) so the `MergeOutcome` → UI-state mapping, including the
 /// off-thread classification of every conflicted path, exists exactly once.
-///
-/// `error_state` builds the failure state, since the two directions genuinely differ in how they
-/// answer "is there a merge left in progress to offer an `Abort merge` for" - see
-/// [`run_merge_attempt_into_current`]'s own docs.
 fn fold_merge_result(
     result: Result<(wt_core::merge::MergeStart, wt_core::merge::MergeOutcome), wt_core::Error>,
     error_state: impl Fn(String) -> merge::MergeFlowState,
@@ -1187,9 +1070,6 @@ mod merge_regression_tests {
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
     }
 
-    /// Regression test: closing/archiving the agent mid-`Complete merge` must not cancel the
-    /// in-flight `git commit` or strand `merge_op_in_flight` at `true` - see
-    /// `AdeApp::clear_merge_flow_for_closed_agent`'s docs for the mechanism this guards.
     #[gpui::test]
     fn close_agent_during_in_flight_complete_merge_lets_the_commit_finish(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -1240,7 +1120,6 @@ mod merge_regression_tests {
             app.close_agent(feature_agent_id, window, cx)
         });
 
-        // Let the pending commit and its completion handler run.
         cx.run_until_parked();
 
         assert!(
@@ -1266,8 +1145,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Same setup, asserting the repository is left clean and usable: a brand-new merge started
-    /// right after the close-during-complete race must succeed, not hit a wedged repo.
     #[gpui::test]
     fn close_agent_during_in_flight_complete_merge_leaves_repo_usable_for_a_new_merge(
         cx: &mut TestAppContext,
@@ -1299,7 +1176,6 @@ mod merge_regression_tests {
         });
         cx.run_until_parked();
 
-        // A second, independent merge against the same base repo must work normally.
         let second_feature = add_worktree(repo.path(), "second-feature", "second-feature-wt");
         fs::write(second_feature.join("more.txt"), "more work\n").expect("write");
         git(&second_feature, &["add", "more.txt"]);
@@ -1337,9 +1213,6 @@ mod merge_regression_tests {
         assert!(repo.path().join("more.txt").is_file());
     }
 
-    /// Regression test: resolving two different conflicted files' last hunk back-to-back (e.g.
-    /// via Take-both) must not cancel the first file's background write - see
-    /// `AdeApp::resolve_active_hunk`'s docs for the mechanism this guards.
     #[gpui::test]
     fn resolving_two_files_back_to_back_writes_both_to_disk_without_cancelling_either(
         cx: &mut TestAppContext,
@@ -1415,7 +1288,6 @@ mod merge_regression_tests {
             );
         });
 
-        // Let both pending background writes run.
         cx.run_until_parked();
 
         let a_on_disk = fs::read_to_string(repo.path().join("a.txt")).expect("read a.txt");
@@ -1449,13 +1321,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Real merge-surface zoom: the active hunk's code rows must genuinely grow with
-    /// `Settings.appearance.editor_zoom_percent`, mirroring `code_surface::zoom::code_zoom_tests::
-    /// zoom_scales_text_but_not_the_gutter_width`'s real-bounds-measurement shape - see
-    /// `crate::merge::render::AdeApp::render_conflict_columns`'s `zoom_scoped` wrap. Reaches a real
-    /// `Conflicted` state through a real `git merge` (base and feature branches each edit line 2
-    /// of the same real `.rs` file differently), not a fabricated conflict string - the same
-    /// real-worktree harness this module's other regression tests use.
     #[gpui::test]
     fn merge_conflict_code_rows_genuinely_grow_with_zoom(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -1553,13 +1418,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Proves `AdeApp::merge_highlight_cache` is genuinely *reused*, not silently recomputed
-    /// every time `Self::ensure_active_merge_highlight_cache` runs - pointer identity of the
-    /// cached `ours` `Vec`, since a fresh recompute would allocate a new one (mirrors
-    /// `code_surface::diff_view::diff_render_tests`' identical technique for `diff_highlight_cache`, itself
-    /// mirroring `code_view_cache_tests`' original for `file_view_cache`). If the
-    /// `(relative_path, ConflictHunk)` freshness check were ever removed from
-    /// `ensure_merge_highlight_cache`, this would fail.
     #[gpui::test]
     fn repeated_cache_fills_of_the_same_active_hunk_reuse_the_cached_highlighting(
         cx: &mut TestAppContext,
@@ -1606,7 +1464,6 @@ mod merge_regression_tests {
                 .as_ptr()
         });
 
-        // The real hook this cache is recomputed from, called again with nothing changed.
         app.update(cx, |app, _cx| {
             app.ensure_active_merge_highlight_cache();
         });
@@ -1625,9 +1482,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// The other half of the same cache's correctness: advancing to a genuinely different active
-    /// hunk (a different conflicted file, real two-file conflict) must recompute - not a cache
-    /// that never refreshes, and not stale content from the file just resolved.
     #[gpui::test]
     fn resolving_a_hunk_and_advancing_recomputes_the_merge_highlight_cache_for_the_new_file(
         cx: &mut TestAppContext,
@@ -1708,14 +1562,6 @@ mod merge_regression_tests {
         }
     }
 
-    /// Required regression test (Revision R8.5c): hand-editing a real conflicted file's markers
-    /// away through the real `EntityInputHandler`/action-handler path - a real `secondary-a`
-    /// select-all keystroke, a real `replace_text_in_range` call (the same real trait method the
-    /// platform text-input layer itself calls - matching `crate::code_surface::editing::editing_tests`'
-    /// own established idiom for "type this text", not a private shortcut), and a real
-    /// `secondary-s` save keystroke - never by mutating `EditBuffer::content` directly. Confirms
-    /// the real on-disk content is marker-free, git's own unmerged-paths listing no longer
-    /// includes it, and the app's own `files[]` entry reports resolved.
     #[gpui::test]
     fn hand_editing_markers_away_and_saving_through_real_keystrokes_resolves_the_file(
         cx: &mut TestAppContext,
@@ -1827,10 +1673,6 @@ mod merge_regression_tests {
         });
     }
 
-    /// Required regression test: mixing a quick-pick Take-left on one hunk of a multi-hunk file
-    /// with a real hand-edit-and-save resolving a *different* hunk of the *same* file - confirms
-    /// both the final on-disk content and the app's own resolution state are correct for both
-    /// resolution paths applied to one file.
     #[gpui::test]
     fn mixing_take_left_on_one_hunk_with_a_hand_edit_save_on_another_hunk_of_the_same_file(
         cx: &mut TestAppContext,
@@ -1890,7 +1732,6 @@ mod merge_regression_tests {
             "the fixture must produce two real, separate conflict hunks"
         );
 
-        // Quick-pick resolve the first hunk via Take-left.
         app.update(cx, |app, cx| {
             app.resolve_active_hunk(wt_core::merge::ConflictChoice::Left, cx);
         });
@@ -1964,10 +1805,6 @@ mod merge_regression_tests {
         });
     }
 
-    /// Required end-to-end regression test: a real conflicting `git merge`, resolved through a
-    /// genuine mix of both resolution paths (one file via quick-pick Take-both, the other via a
-    /// real hand-edit save), then a real `Complete merge` producing a real merge commit with the
-    /// correct parent count and correct final content on disk.
     #[gpui::test]
     fn real_end_to_end_merge_resolved_through_a_mix_of_both_paths_produces_a_real_merge_commit(
         cx: &mut TestAppContext,
@@ -2015,13 +1852,11 @@ mod merge_regression_tests {
             assert_eq!(files.len(), 2, "both a.txt and b.txt should be conflicted");
         });
 
-        // a.txt resolved entirely through the quick-pick Take-both path.
         app.update(cx, |app, cx| {
             app.resolve_active_hunk(wt_core::merge::ConflictChoice::Both, cx);
         });
         cx.run_until_parked();
 
-        // b.txt resolved entirely by hand.
         app.update_in(cx, |app, window, cx| {
             app.start_merge_hand_edit(window, cx);
         });
@@ -2074,9 +1909,6 @@ mod merge_regression_tests {
         assert!(app.read_with(cx, |app, _| app.merge_edit.is_none()));
     }
 
-    /// GitHub issue #17 for Surface D's merge hand-edit buffer - the sixth and last real
-    /// text-typing surface. Driven through the real, bound `secondary-z` keystroke, so this also
-    /// proves the `"merge-editor text-input"` context really does route text undo here.
     #[gpui::test]
     fn secondary_z_in_the_merge_hand_edit_buffer_undoes_its_text(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -2164,12 +1996,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Required regression test: this exact bug class ("a shortcut steals a keystroke a text
-    /// field needed") has shipped six separate times in this codebase per BUILD-LOG (Revisions
-    /// R2, R4a, R4b, R8.5a, R8.5b) - proves the new `"merge-editor"` key context does not swallow
-    /// a keystroke while a *different* surface (here, the File view) is what's actually focused,
-    /// even while a merge hand-edit is genuinely still alive in the background for a different
-    /// agent.
     #[gpui::test]
     fn merge_editor_context_does_not_swallow_keystrokes_meant_for_a_different_focused_surface(
         cx: &mut TestAppContext,
@@ -2337,12 +2163,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Required identity/staleness regression test: starting a hand-edit, then ending the merge
-    /// flow (here, abort), must genuinely tear down [`AdeApp::merge_edit`] (not merely hide it),
-    /// and a fresh, unrelated merge started afterward must neither resurrect it nor be corruptible
-    /// by a stale result for the old attempt - even one carrying the old attempt's own real
-    /// `agent_id`/`generation` identity, directly proving `Self::apply_merge_edit_save_result`'s
-    /// own guard rather than relying on timing to reproduce the race.
     #[gpui::test]
     fn ending_a_merge_flow_tears_down_hand_edit_state_and_a_fresh_merge_cannot_be_polluted_by_it(
         cx: &mut TestAppContext,
@@ -2390,7 +2210,6 @@ mod merge_regression_tests {
                 (edit.agent_id, edit.generation, edit.relative_path.clone())
             });
 
-        // Abort the merge - a real exit point.
         app.update(cx, |app, cx| app.abort_merge_flow(cx));
         cx.run_until_parked();
         assert!(app.read_with(cx, |app, _| app.merge_flow.is_none()));
@@ -2487,27 +2306,6 @@ mod merge_regression_tests {
         });
     }
 
-    /// Regression test for a real, live-reproduced bug an audit caught: an earlier version of
-    /// `crate::code_surface::editing::AdeApp::active_edit_target` returned `None` whenever
-    /// `AdeApp::open_change` was `Some`, but `crate::work_surface::render::AdeApp::
-    /// render_center_pane`'s own real Surface-C-visibility predicate is stronger than that -
-    /// `open_change.is_some() && (open_diff_file_cache.is_some() || code_view ==
-    /// CodeView::File)`. A real, reachable state falls outside that predicate while `open_change`
-    /// is still `Some`: `crate::code_surface::tabs::AdeApp::refresh_open_diff_file_cache`
-    /// recomputes `open_diff_file_cache` from whatever `open_change` names against the *current*
-    /// diff - if that file's diff has since disappeared (e.g. reverted externally, then
-    /// `Self::load_diff` reruns) while `code_view` is still `Diff` (never switched to `File`),
-    /// `open_diff_file_cache` goes back to `None` with `open_change` untouched - exactly the state
-    /// `crate::code_surface::tabs::AdeApp::activate_file_tab`'s own doc comment describes ("the
-    /// tab can be active without being shown"). `render_center_pane` then genuinely falls through
-    /// to the agent/merge surface with `open_change` still `Some` the whole time. Set directly
-    /// here (the same established precedent `status_bar::render`'s own tests already use for this
-    /// exact field pair) rather than chasing the full multi-step live path, for a deterministic
-    /// reproduction of the *state* the routing bug actually depends on - what matters for this
-    /// test is that `open_change`/`code_view`/`open_diff_file_cache` hold exactly the real values
-    /// `refresh_open_diff_file_cache` can genuinely produce, not which sequence of clicks got
-    /// there. Confirms a real keystroke (`EntityInputHandler::replace_text_in_range`) still
-    /// reaches the genuinely on-screen merge hand-edit buffer in that state.
     #[gpui::test]
     fn merge_hand_edit_keystrokes_reach_the_buffer_even_while_open_change_is_some_but_surface_c_is_not_shown(
         cx: &mut TestAppContext,
@@ -2598,14 +2396,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Regression test for a real, live-reproduced bug an audit caught: saving a hand-edit whose
-    /// own markers are genuinely malformed (here: deleting only the real `=======` line, keeping
-    /// `<<<<<<<`/`>>>>>>>` - a real, easy mistake) must still record the real, successful
-    /// `std::fs::write` (clearing the buffer's own dirty flag, since the real bytes on disk now
-    /// genuinely match it) while leaving `files[]`/`Self::merge_edit` untouched - never silently
-    /// treating "the write succeeded but the re-parse failed" the same as "the write itself
-    /// failed" (which an earlier version of `Self::spawn_merge_edit_save_loop` did, leaving the
-    /// buffer wrongly dirty forever and `files[]` describing stale, pre-write content).
     #[gpui::test]
     fn saving_malformed_markers_still_records_the_real_write_without_corrupting_files(
         cx: &mut TestAppContext,
@@ -2711,18 +2501,6 @@ mod merge_regression_tests {
         );
     }
 
-    /// Regression test for the real, narrow race `merge::MergeEditState::buffer_id` exists to
-    /// close (found by reading, then genuinely reproduced here using the same real, established
-    /// test-only-delay seam `AdeApp::persist_settings`'s own tests already use for the analogous
-    /// settings-save race - `AdeApp::set_merge_edit_save_test_delay`): a save dispatched against
-    /// one hand-edit buffer, discarded and immediately replaced by a genuinely fresh buffer for
-    /// the *same* file (same agent/generation/relative_path) *before* the first save's real
-    /// background write lands, must not let that stale completion apply itself to the new
-    /// buffer/state at all - not `EditBuffer::mark_saved` (which would wrongly stamp the new,
-    /// untouched buffer as having saved the old buffer's content, corrupting its own dirty-state
-    /// bookkeeping) and not `AdeApp::apply_merge_edit_save_result` (which would even wrongly
-    /// resolve `files[]` and silently clear the new hand-edit out from under the user, since the
-    /// stale write's own content happens to have fully resolved the file).
     #[gpui::test]
     fn a_stale_save_completing_after_discard_and_a_fresh_reopen_does_not_corrupt_the_new_buffer(
         cx: &mut TestAppContext,
@@ -2819,7 +2597,6 @@ mod merge_regression_tests {
             "a freshly (re-)opened hand-edit buffer must start out genuinely clean"
         );
 
-        // Release buffer A's delayed save and let it run to completion.
         for _ in 0..60 {
             cx.background_executor
                 .advance_clock(std::time::Duration::from_millis(10));

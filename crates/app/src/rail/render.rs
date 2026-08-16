@@ -17,13 +17,6 @@ pub(crate) const RAIL_LIST_OVERDRAW: gpui::Pixels = px(48.0);
 /// design gives it a different word ("needs input / failed / running / finished / paused" - no
 /// "idle" appears in that list at all). Changing [`Status::label`] itself to match would have
 /// renamed it everywhere else in the app too.
-///
-/// [`Status::Review`]'s word is `"finished"` (the lowercase form of [`Status::label`]'s own
-/// `Finished`) as of revision 6 / GitHub issue #280 - never `"review ready"`, which stated a
-/// judgement the agent cannot make and collided with the user's own review progress. The
-/// trailing file count beside it ([`agent_trailing_text`]) carries what there is to look at,
-/// and an agent that finished with no measured files reads as a bare `finished` rather than
-/// being mislabelled as ready for review.
 fn agent_state_word(status: Status) -> &'static str {
     match status {
         Status::Ask => "needs input",
@@ -36,16 +29,6 @@ fn agent_state_word(status: Status) -> &'static str {
 
 /// How many agents in this window are waiting on a human - the Worktrees cell's state marker
 /// (GitHub issue #291).
-///
-/// `REVISION-2026-08-13.md` §1 names the unit outright ("worktrees shows agents needing a human")
-/// and `Jerry.dc.html` computes exactly it:
-/// `sessions.filter(s => s.status === 'ask' || s.status === 'fail').length`. Those are this app's
-/// [`Status::Ask`] and [`Status::Fail`].
-///
-/// A filter over [`rail::urgency_counts`]' one real pass, not a second classification - the same
-/// relationship `crate::title_bar::render::title_bar_agent_state_chips` already has to it, so the
-/// strip's marker and the title bar's own dots cannot report different numbers for the same
-/// window.
 fn agents_needing_you(rows: &[AgentRow]) -> usize {
     rail::urgency_counts(rows)
         .into_iter()
@@ -75,17 +58,6 @@ fn agent_trailing_text(agent: &AgentRow) -> String {
 }
 
 /// An agent row's title colour (`STAGE-A-CHANGELOG.md` §4n, `Jerry.dc.html`'s own `titleFg`).
-///
-/// Three states, in order: the globally active agent is [`theme::text::SELECTED`]; an
-/// [`Status::Idle`] one drops to [`theme::text::DIMMER`] (it is paused, and the rail's job is
-/// "who needs me"); everything else is [`theme::rail::AGENT_TITLE`], one clear step below the
-/// worktree branch above it rather than the same [`theme::text::BODY`] it used to share with it.
-///
-/// A near-miss §4n records is worth carrying: the colour change was first applied by a
-/// non-global regex on `titleFg:`, which matches three surfaces in the mock - the flat session
-/// list, the rail's agent rows, and History rows - and hit the wrong one. Pulling this out as a
-/// named function is that lesson as code: the rail's agent title has exactly one definition, and
-/// `AdeApp::render_past_agent_row`'s History title is deliberately *not* routed through it.
 fn agent_title_color(status: Status, is_selected: bool) -> theme::ColorToken {
     if is_selected {
         theme::text::SELECTED
@@ -97,30 +69,6 @@ fn agent_title_color(status: Status, is_selected: bool) -> theme::ColorToken {
 }
 
 /// A worktree row's 2px left edge: **selection or nothing**.
-///
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4m is the whole of this function,
-/// and the three parameters are its history. The rail used to paint each worktree row with its
-/// most urgent agent's status colour, with dedicated greys for the bare and prunable cases. All
-/// three are deleted:
-///
-/// 1. **A worktree has no status. Its agents do.** Colouring the worktree row states an agent's
-///    condition on the wrong object.
-/// 2. **It was a lossy `max()`** - one colour for N agents, while the row already carries the
-///    honest version at the right granularity (the per-agent dots when collapsed, the full agent
-///    rows when expanded).
-/// 3. **It made one property mean two things in one list**: selected file rows, history rows and
-///    the selected worktree all use a 2px left edge for *selection*.
-///
-/// A first cut kept a dim edge on unselected rows and a lighter one on prunable rows. Both were
-/// caught on the next pass and are gone too: "if the edge means selection, an edge on an
-/// unselected row means nothing, and `prunable` is already stated in words on the row (`merged ·
-/// prunable`). **A channel with one meaning has exactly two states - on and off.**"
-///
-/// `aggregate_status` and `is_prunable` are still taken, unused, on purpose: they are exactly the
-/// two inputs that used to move this value, and keeping them in the signature is what lets
-/// `rail_correction_tests` prove - across every status, prunable or not - that neither can move
-/// it again. `None` is the off state (a transparent border, so the 2px gutter still holds the
-/// row's text alignment, per §4m's "The 2px gutter stays for alignment").
 fn worktree_row_edge(
     _aggregate_status: Status,
     _is_prunable: bool,
@@ -132,11 +80,6 @@ fn worktree_row_edge(
 /// Which of the repo header's **two** urgency counts a dot+count pair is
 /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4: "`● 2` amber... needs input
 /// and `● 1` red... failed").
-///
-/// An enum rather than two near-identical render functions, so the pair really is one control
-/// drawn twice - the thing that goes wrong otherwise is §4l's own defect, two copies of a row
-/// that drift apart in size or spacing. The *counts* themselves are separate by design and are
-/// never summed (§7 rule 4); only their rendering is shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UrgencyCount {
     /// Worktrees needing input - amber.
@@ -186,15 +129,6 @@ impl UrgencyCount {
 impl AdeApp {
     /// One of the repo header's two urgency dot+count pairs, or **nothing at all** at zero
     /// (`REVISION-2026-08-14.md` §4: "Each hidden at zero").
-    ///
-    /// Returns `Option` rather than an empty element so the zero case really does draw nothing -
-    /// the same "hidden at zero" shape `crate::title_bar::render::title_bar_agent_state_chip_text`
-    /// already uses, and the reason the header's right side is empty rather than holding two blank
-    /// slots for a quiet repo.
-    ///
-    /// `flex:none` and `white-space:nowrap` on both the pair and its number: §4 makes the repo
-    /// *name* the only shrinkable thing in the row, so a long repo name ellipsises and the counts
-    /// - the one thing in the header you are meant to catch at a glance - never shrink or wrap.
     fn render_repo_urgency_count(
         &self,
         repo_id: repo::RepoId,
@@ -242,12 +176,6 @@ impl AdeApp {
     /// scope for a single filter row. Modified keystrokes (⌘, ⌃, ⌥) are left unhandled and
     /// keep propagating, so app-level shortcuts (e.g. ⌘N) still reach their bindings while
     /// this field has focus.
-    ///
-    /// Every key but `Esc` is `crate::text_history::TextField::handle_editing_key`'s, which is
-    /// where GitHub issue #162's real caret arrived: Left/Right/Home/End/Delete work here now,
-    /// not only in the search panel that motivated the upgrade. That is the issue's own "benefits
-    /// every other filter row", taken literally rather than left as a claim about a capability
-    /// nothing else calls.
     pub(in crate::rail) fn handle_filter_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -318,21 +246,6 @@ impl AdeApp {
     /// every currently open agent gets a row here regardless of which repo is focused right now,
     /// which is what lets [`Self::build_repo_groups`] show a background repo's own agents with
     /// genuinely live status rather than nothing at all.
-    ///
-    /// The branch lookup checks [`Self::worktrees`] (the focused repo's own live list) first,
-    /// then falls back to scanning every added repo's own [`crate::rail::repo::Repo::worktrees`].
-    /// An agent whose own repo isn't focused right now has no entry in [`Self::worktrees`] at
-    /// all - without this fallback its rail row would show a blank branch even though the repo's
-    /// own worktree list (kept live by `crate::root::AdeApp::load_repo_worktrees`/
-    /// `crate::root::AdeApp::start_repo_worktrees_polling`) knows it perfectly well.
-    ///
-    /// A plain [`crate::work_surface::agents::ProcessKind::Shell`] never gets a row here - the
-    /// rail answers "who needs me", and a shell has no turn to finish and nothing to ask. It
-    /// still shows up in the tab strip (`crate::work_surface::render`, which lists everything
-    /// open in the selected worktree, agents and shells alike) - this is specifically the rail's
-    /// own, narrower list. A worktree whose only open pane is a shell therefore renders as an
-    /// empty/idle row here, identically to a worktree with nothing open at all
-    /// (`rail::build_worktree_rows` already handles that case).
     pub(crate) fn build_agent_rows(&self, cx: &App) -> Vec<AgentRow> {
         self.agents
             .iter()
@@ -436,10 +349,6 @@ impl AdeApp {
     /// ones that failed to read - `crate::rail::worktrees::WorktreeItem`'s docs say a per-entry error
     /// is kept in the list rather than filtered out, and `Self::render_worktree_row` renders an
     /// errored entry as a visible, non-interactive row.
-    ///
-    /// Readable entries get their clean/merged note from [`Self::worktree_notes`] (refreshed
-    /// by the same periodic task as [`Self::diff_cache`]), defaulting to "unknown yet"
-    /// (`clean: None, merge: None`) for one the background snapshot hasn't reached yet.
     pub(in crate::rail) fn build_worktree_entries(&self) -> Vec<WorktreeEntry> {
         self.build_worktree_entries_from(&self.worktrees)
     }
@@ -447,17 +356,6 @@ impl AdeApp {
     /// [`Self::build_worktree_entries`]'s own logic, generalized to any [`WorktreeItem`] list -
     /// [`Self::build_repo_groups`]'s non-focused-repo rows reuse this against each repo's own
     /// [`crate::rail::repo::Repo::worktrees`] rather than [`Self::worktrees`].
-    ///
-    /// [`Self::worktree_notes`] is only ever populated for the *focused* repo's own paths
-    /// (`Self::start_status_polling` computes it from `Self::worktrees`, not
-    /// `Self::repos`) - a real, deliberate scope decision, not an oversight: a clean/merged note
-    /// costs a real `git status` walk plus a merge-base computation *per worktree*, and running
-    /// that for every worktree of every added repo on every status-poll tick (see
-    /// [`crate::root::STATUS_POLL_INTERVAL`]) would multiply this app's real background `git`
-    /// subprocess cost by however many repos are added, for status text that's only ever shown on
-    /// an agent-less row in the first place. A non-focused repo's rows fall through to the
-    /// identical "unknown yet" default this function already gives a *focused*-repo worktree the
-    /// status snapshot hasn't reached yet - never a fabricated clean/merged guess.
     pub(in crate::rail) fn build_worktree_entries_from(
         &self,
         items: &[WorktreeItem],
@@ -509,13 +407,6 @@ impl AdeApp {
     /// [`Self::diff_cache`]/[`Self::worktree_notes`]/[`Self::ahead_behind_cache`]/
     /// [`Self::process_stats`] on the foreground thread - the same "gather/compute/write back"
     /// shape [`Self::load_worktrees`]/[`Self::load_diff`] use.
-    ///
-    /// The status bar's real CPU%/memory sampling (`crate::status_bar::process_stats`) deliberately rides
-    /// this same existing timer rather than spawning a second, independent polling loop -
-    /// `prev_process_samples` is the one piece of state that must survive across ticks (a CPU%
-    /// needs a delta between two samples), threaded through the loop body itself rather than
-    /// stored on `Self`, since nothing outside this loop ever needs the raw, pre-percentage
-    /// reading.
     pub(crate) fn start_status_polling(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             let mut prev_process_samples: HashMap<u32, process_stats::RawCpuSample> =
@@ -640,17 +531,6 @@ impl AdeApp {
     /// [`Self::_worktree_watcher`] to keep it alive) plus the [`WORKTREE_WATCH_POLL_INTERVAL`]
     /// poll fallback the issue asks for, both driving the exact same
     /// [`Self::load_worktrees`] real re-parse - never a separate, divergent code path.
-    ///
-    /// The loop itself ticks every [`WORKTREE_WATCH_TICK`] (short - this is what gets a real
-    /// watcher event in front of [`Self::load_worktrees`] well under a second, not the 5s poll
-    /// interval) and, each tick, refreshes if either is true:
-    /// - the watcher's [`crate::rail::worktree_watch::DirtyFlag`] is set (a real filesystem
-    ///   change was observed) - after a [`WORKTREE_WATCH_SETTLE`] pause to coalesce a burst of
-    ///   events from one `git worktree` invocation into a single refresh, per the issue's own
-    ///   debounce requirement;
-    /// - [`WORKTREE_WATCH_POLL_INTERVAL`] has elapsed since the last refresh regardless - the
-    ///   backstop for changes with no filesystem-watchable signature at all (a worktree
-    ///   directory deleted by hand - see [`crate::rail::worktree_watch`]'s module docs).
     pub(crate) fn start_worktree_watch(&mut self, cx: &mut Context<Self>) {
         let repo_path = self.focused_repo_path();
         let dirty: worktree_watch::DirtyFlag = Arc::new(AtomicBool::new(false));
@@ -736,11 +616,6 @@ impl AdeApp {
     /// Removes `candidates` via `wt_core::remove_worktree`. Only called once
     /// [`Self::request_prune`]'s confirmation step is satisfied, with paths
     /// [`Self::prunable_worktree_paths`] itself produced.
-    ///
-    /// Guarded by [`Self::prune_in_flight`], mirroring `Self::complete_merge_flow`/
-    /// `Self::abort_merge_flow`'s `merge_op_in_flight` guard (see that field's docs for the
-    /// race this closes - a second confirming click spawning a second batch into the same
-    /// [`Self::_prune_task`] slot, dropping/cancelling the first).
     pub(in crate::rail) fn execute_prune(
         &mut self,
         candidates: Vec<PathBuf>,
@@ -800,19 +675,6 @@ impl AdeApp {
     /// the filter row, the real scrollable body of whichever view the strip has selected, and the
     /// footer - see the README's "Rail chrome" section for the exact band heights this composes
     /// (`theme::band::{CHROME_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
-    ///
-    /// GitHub issue #291 turned this from "the rail" into "the sidebar, which is showing the
-    /// rail": `crate::rail::strip_render::AdeApp::render_sidebar_strip` replaced the plain rail
-    /// header at the same [`theme::band::CHROME_HEADER`] height, and the scroller below now paints
-    /// whichever `crate::rail::strip::SidebarView` is selected.
-    ///
-    /// `crate::rail::state::RepoGroup`s are built **once**, here, and lent to both halves. The
-    /// strip's empty-day gate and the Worktrees body are two answers about the same data
-    /// (`REVISION-2026-08-13.md` §1: "Gate this at the source ... not in the template"), so
-    /// deriving them from one pass is what makes it impossible for the strip to offer a switcher
-    /// over rows the body does not have - as well as saving a second full rebuild per frame.
-    /// `&mut self` for GitHub issue #227's History body alone - see
-    /// [`Self::render_sidebar_body`]'s own docs.
     pub(crate) fn render_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // `Rc`, not a plain `Vec`: `Self::render_rail_list`'s own `gpui::list` render-item
         // closure captures this and is kept around by GPUI across frames, so it must be cheap to
@@ -931,12 +793,6 @@ impl AdeApp {
 
     /// Filter row 30: `/` plus the real typed query, or the placeholder text when empty -
     /// see [`Self::handle_filter_key_down`] for the (deliberately minimal) text input.
-    ///
-    /// Its placeholder follows the strip's selected view (GitHub issue #291) -
-    /// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1: "**Filter row** stays, and
-    /// its placeholder follows the view: `filter worktrees and agents` / `filter runs` / `filter
-    /// problems`." The query itself is one field across both views, and both really honour it, so
-    /// the placeholder never promises a filter that does nothing (§7 rule 1).
     pub(in crate::rail) fn render_rail_filter_row(
         &self,
         view: rail_strip::SidebarView,
@@ -1014,41 +870,6 @@ impl AdeApp {
     /// see [`Self::build_worktree_rows`]'s docs. The shared foundation for
     /// [`Self::render_rail_list`] and, since it returns plain data rather than GPUI elements,
     /// this module's own tests.
-    ///
-    /// Each [`RepoGroup`]'s `all_rows` (what the header's `N wt`/`N worktrees waiting` counters
-    /// read - [`rail::RepoGroup::waiting_count`]) is always this repo's real, complete worktree
-    /// list; only `rows` (what actually renders/expands below the header) is narrowed by
-    /// [`Self::filter_query`] - fixing the bug where typing into the filter box moved both
-    /// numbers, not just which rows were visible (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §2.0: "a repo you have scrolled past still reports that
-    /// something in it wants a human" - typing into the filter box is the same promise, just
-    /// scrolled-past-in-time rather than in-space).
-    ///
-    /// Every repo in [`Self::repos`] gets its own real `all_rows`/`rows` here, not just
-    /// [`Self::focused_repo`] - the focused repo's come from [`Self::build_worktree_rows`] (which
-    /// also folds in its GitHub issue #227 history, still genuinely scoped to the focused repo
-    /// only - persisted history has no meaning for a worktree this window has never selected),
-    /// while every other repo's worktree list comes straight from its own
-    /// [`crate::rail::repo::Repo::worktrees`] (kept live by `crate::root::AdeApp::
-    /// load_repo_worktrees`/`crate::root::AdeApp::start_repo_worktrees_polling`).
-    ///
-    /// Real open agents fold into **every** repo's rows, not just the focused one:
-    /// `crate::root::AdeApp::open_repo_in_current_window`/[`Self::checkout_repo_from_rail`] no
-    /// longer close an agent just because its own repo isn't the one currently focused (see
-    /// those methods' own "cross-repo agent persistence" docs), so [`Self::build_agent_rows`] -
-    /// which already has no repo filter of its own, since [`Self::agents`] never did - is
-    /// computed once below and matched against every repo's own worktree paths the same way
-    /// [`rail::build_worktree_rows`] already matches it against the focused repo's. This is the
-    /// real mechanism behind "the rail shows live status for agents in every repo at all times":
-    /// a background repo's agent row carries its own real [`Status`], diff totals, and
-    /// review-readiness exactly as it would if that repo were focused, because the same
-    /// status-poll tick ([`Self::start_status_polling`]) that refreshes the focused repo's data
-    /// already covers every open agent regardless of which repo it belongs to.
-    ///
-    /// [`rail::RepoWorktrees::rows_loaded`] mirrors [`crate::rail::repo::Repo::worktrees_loaded`]
-    /// for a non-focused repo (always `true` for the focused one - its own data path is
-    /// unchanged) so the render side can still tell "never fetched yet" apart from "fetched, and
-    /// really has zero worktrees".
     pub(crate) fn build_repo_groups(&self, cx: &mut Context<Self>) -> Vec<RepoGroup> {
         let rows = self.build_worktree_rows(cx);
         let filtered: Vec<WorktreeRow> =
@@ -1098,24 +919,6 @@ impl AdeApp {
     /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
     /// There is **no rail mode toggle**"). See [`Self::build_repo_groups`] for how the groups
     /// themselves are built.
-    ///
-    /// Takes the groups rather than rebuilding them (GitHub issue #291): the sidebar strip above
-    /// this list gates itself on the same data, and one pass is what guarantees the switcher and
-    /// the rows under it are talking about the same worktrees - see [`Self::render_rail`]. Held
-    /// as an `Rc` (not a borrowed slice) so [`Self::render_rail_list`]'s own render-item closure
-    /// can capture it for `O(1)`, without cloning every group's rows just to hand them to a
-    /// closure GPUI keeps around across frames.
-    ///
-    /// Real virtualization (GitHub issue #364), not a render cap: this used to build every repo
-    /// header, worktree row, agent row and history row
-    /// unconditionally, on every render, regardless of scroll position - the real reason hovering
-    /// any one row in a rail with many worktrees/agents open measurably slowed down, since GPUI's
-    /// own `.hover()` triggers a full `Window::refresh()` on every hover-region transition (see
-    /// [`rail::RailListItem`]'s own docs for exactly why that made per-row-scoped hover state a
-    /// dead end). [`rail::flatten_rail_list_items`] turns `groups` into the real flat sequence of
-    /// rows this renders, and `gpui::list` - the same variable-row-height virtualized list
-    /// `crate::sidebar::render::AdeApp::render_changes_sections` already uses - builds only the
-    /// ones its own viewport (plus a small overdraw margin) actually covers.
     pub(in crate::rail) fn render_rail_list(
         &self,
         groups: &std::rc::Rc<Vec<RepoGroup>>,
@@ -1322,45 +1125,6 @@ impl AdeApp {
     /// group - [`crate::root::AdeApp::select_worktree_by_path`]'s cross-repo fallback runs the
     /// entire real repo switch ([`Self::checkout_repo_from_rail`]) itself, so the header never
     /// needs a click handler for repo switching to work.
-    ///
-    /// The header's `N wt` and its two urgency counts ([`rail::RepoGroup::needs_input_count`],
-    /// [`rail::RepoGroup::failed_count`]) are read from `group.all_rows`, **not** `group.rows` -
-    /// see [`Self::build_repo_groups`]'s docs for why: this repo's real, complete worktree list,
-    /// unaffected by the rail's filter query or by which repo is currently focused. Only the rows
-    /// actually rendered below the header (`group.rows`) may be narrower - and only that narrower
-    /// list, never the header or the `+`, is affected by an empty vs. filtered-away distinction
-    /// (see the inline message below, which does distinguish the two for its own wording).
-    ///
-    /// `group.rows_loaded` gates the `N wt` count itself: `false` (a repo whose own first real
-    /// fetch hasn't resolved yet - see [`rail::RepoWorktrees::rows_loaded`]'s docs) renders an
-    /// honest em dash instead of `0 wt`, since this repo's real worktree count was never fetched
-    /// and may well be nonzero - a literal `0 wt` would be a false claim about state this app
-    /// hasn't actually loaded.
-    ///
-    /// ## Revision 6 (`REVISION-2026-08-14.md` §4, `STAGE-A-CHANGELOG.md` §4q/§4s/§4u)
-    ///
-    /// - **A rule, not a box.** The band is a bare `border-top` with **no fill**: "a filled band
-    ///   reads as a container, so it implied the worktrees below were *inside* something... A repo
-    ///   header is a rule between groups, not a box around one." The line sits **above** the
-    ///   label, where a separator belongs.
-    /// - **`index == 0` carries no rule at all** (§4u): the filter row's own bottom border already
-    ///   ends the chrome, and two hairlines a few px apart "read as one broken double line rather
-    ///   than two separators". Repo-to-repo separation is the 12px spacer above every *later*
-    ///   band instead.
-    /// - **26 high, content vertically centred** (§4s), 3px above its own first row while rows sit
-    ///   7px apart - "the header is visibly closer to its own rows than the rows are to each
-    ///   other, which is the whole job of a section header".
-    /// - **The name is the only shrinkable thing in the row** (§4): `flex:0 1 auto`,
-    ///   `min-width:0`, ellipsis. Every count is `flex:none` and must not wrap - §4l records the
-    ///   twin defect on the Changes panel's own labels, where `flex:none` *without* nowrap let
-    ///   `AGAINST MAIN` wrap to two lines and grow its header.
-    /// - **Two urgency counts, not one sentence.** See [`Self::render_repo_urgency_count`].
-    ///
-    /// `Self::render_rail_list`'s flattened [`rail::RailListItem::RepoHeader`] resolves here.
-    /// Split out of the old `render_repo_group` (GitHub issue #364) so it can be one standalone
-    /// virtualized list item rather
-    /// than a fixed piece of a div that also unconditionally built every one of this group's
-    /// rows.
     pub(in crate::rail) fn render_repo_group_header(
         &self,
         group: &RepoGroup,
@@ -1452,15 +1216,6 @@ impl AdeApp {
     /// `Self::render_rail_list`'s flattened [`rail::RailListItem::RepoEmptyMessage`] resolves
     /// here. Split out of the old `render_repo_group` for the same reason
     /// [`Self::render_repo_group_header`] was.
-    ///
-    /// GitHub issue #113: previously this repo's whole group (header included) was dropped from
-    /// the rail entirely whenever it had no rows to show. A real, worded inline message takes
-    /// that empty row-list's place instead, distinguishing three real cases: this repo's own
-    /// first real fetch hasn't resolved yet (`!group.rows_loaded` - normally just a brief window
-    /// right after `Self::add_repo`, not a standing limitation), it genuinely has no open
-    /// worktrees, or the filter box is hiding them - never claiming "no worktrees open yet" for a
-    /// repo whose data this app hasn't actually fetched, which may well have several worktrees on
-    /// disk.
     pub(in crate::rail) fn render_repo_group_empty_message(
         &self,
         group: &RepoGroup,
@@ -1490,19 +1245,6 @@ impl AdeApp {
     /// otherwise the real default (§2.2: "Worktrees whose most urgent agent is idle start
     /// collapsed"). An agent-less row has no caret at all, so this is only ever consulted
     /// (via [`Self::render_worktree_row`]) when `row.agents` is non-empty.
-    ///
-    /// GitHub issue #112 (live follow-up report): the worktree currently selected
-    /// ([`Self::current_worktree_path`] - the same real comparison [`Self::render_worktree_row`]'s own
-    /// `is_selected` uses) is exempt from the idle-collapse default, absent an explicit override.
-    /// Without this, a worktree the user is actively switching terminals within could silently
-    /// collapse out from under them the moment its most urgent agent's status crossed into
-    /// `Idle` (an ordinary, real occurrence - a shell sitting at its prompt between commands),
-    /// replacing both visible terminal rows with a single collapsed summary row and reading, from
-    /// the report, as the terminals having "merged into one" - no data was ever lost (the tab
-    /// strip stays untouched by this purely rail-side collapse), but the row the user was looking
-    /// at should never vanish out from under active use. An explicit caret click still always
-    /// wins over this, same as it already does over the plain idle default - a user who
-    /// deliberately collapses the active worktree gets to keep it collapsed.
     pub(in crate::rail) fn worktree_is_expanded(&self, row: &WorktreeRow) -> bool {
         match self.rail_collapse_overrides.get(&row.path) {
             Some(expanded) => *expanded,
@@ -1533,23 +1275,6 @@ impl AdeApp {
     /// expanded. `index` (unique within its repo group) disambiguates element ids for the real
     /// degenerate case `crate::rail::worktrees::WorktreeItem`'s docs call out: more than one
     /// unreadable worktree entry shares the same (empty) `path`, which alone would collide.
-    ///
-    /// `is_expanded` is passed in rather than recomputed from [`Self::worktree_is_expanded`] so
-    /// this always agrees with whatever [`rail::flatten_rail_list_items`] decided when it chose
-    /// whether to emit this row's agent/history items at all - recomputing it here from the same
-    /// mutable [`Self::rail_collapse_overrides`] a caret click can change mid-frame would risk the
-    /// caret glyph disagreeing with which children the list actually rendered.
-    ///
-    /// `trailing_pb` carries the 7px gap to the next worktree's own block
-    /// (`STAGE-A-CHANGELOG.md` §4n/§4s) - `true` exactly when this header is the last item in its
-    /// own worktree's block, i.e. when it has no expanded children for the flattened
-    /// [`rail::RailListItem::AgentRow`]/[`rail::RailListItem::EarlierRunsLink`] items to carry it
-    /// instead. See [`rail::RailListItem::is_last_in_worktree_block`].
-    ///
-    /// Clicking the row selects this worktree (`Self::select_worktree_by_path`), restoring
-    /// whatever tab it was left on (§2.3: "Clicking a worktree header restores whatever tab it
-    /// was left on") - switching tabs within it happens in the centre pane's own tab strip, or
-    /// by clicking one of the agent rows below directly (see [`Self::render_agent_row`]).
     pub(in crate::rail) fn render_worktree_row(
         &self,
         row: &WorktreeRow,
@@ -1879,28 +1604,6 @@ impl AdeApp {
     /// elapsed, then status dot/state word/trailing text/model. Clicking it selects this
     /// agent's tab *and* its worktree (`Self::select_agent` - already does both: it's the
     /// same real entry point the palette/tab-strip use to jump straight to one agent).
-    ///
-    /// **The status edge stays here.** §4m deleted the *worktree* row's status edge because a
-    /// worktree has no status of its own - "Agent rows keep their status edge; there the status
-    /// genuinely belongs to the row's object."
-    ///
-    /// **The child no longer outranks its parent** (`STAGE-A-CHANGELOG.md` §4n). The title was
-    /// `450 11.5px/16px` in [`theme::text::BODY`] (`#b8bfc6`) while the worktree branch above it
-    /// was `500 11px` mono in the brighter [`theme::text::STRONG`] - "Larger and equally bright,
-    /// one level down. The eye landed on agent titles first and had to work backwards to find
-    /// which worktree they belonged to." It is now 11px in [`theme::rail::AGENT_TITLE`], with
-    /// tighter vertical block padding, and the fix is deliberately all on this side: **"Fix
-    /// hierarchy by shrinking the child, never by growing the parent"** - a first cut that
-    /// strengthened the branch instead pushed real branch names into ellipsis, and the branch name
-    /// is what you scan the rail for.
-    ///
-    /// The elapsed time is [`theme::text::GHOST`] (`#4e545a`) for **every** status (§4k: "the time
-    /// does not need to have a color here"). Urgency lives in the dot and the state word; an
-    /// asking agent used to carry three amber elements, and the third of them stated *when*, which
-    /// is not a severity.
-    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter - `true`
-    /// exactly when [`rail::RailListItem::is_last_in_worktree_block`] says this is the flattened
-    /// item that now carries the 7px gap to the next worktree's own block.
     pub(in crate::rail) fn render_agent_row(
         &self,
         agent: &AgentRow,
@@ -2079,29 +1782,6 @@ impl AdeApp {
     }
 
     /// A worktree row's `\u{21ba} N earlier runs` line (GitHub issue #227).
-    ///
-    /// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §6, in full: "A 19-high
-    /// `\u{21ba} 2 earlier runs` line under a worktree row, switching the sidebar to History for
-    /// that worktree. **Only on worktrees with no live agent** - a first pass put it under every
-    /// worktree: eight identical rows, no information, and it pushed the rail past its height."
-    ///
-    /// This **replaced** the inline `HISTORY` section that used to render here - a small label
-    /// plus one two-line row per past run, each with its own `Resume`/`Reopen` button - which is
-    /// deleted rather than left beside it, per `REVISION-2026-08-14.md` §7 rule 5: "Replacing a
-    /// control means deleting its old keys in the same edit - a key defined twice is two
-    /// specifications of one thing, and the reader cannot tell which is real." Everything it did
-    /// is now done better one surface over: the runs are in [`crate::run_history::render`]'s
-    /// repo → worktree → run index, with their real titles, outcomes and drift, and `Resume` is
-    /// the run-transcript tab's own footer action, beside the sentence that says what resuming
-    /// will mean (`crate::run_history::tab::AdeApp::render_run_view`).
-    ///
-    /// The gate is `has_agents`, not "is this row expanded": this is a line *under* the worktree
-    /// row, not one of its children, so a folded worktree still offers it - which is also why
-    /// `crate::rail::state::flatten_rail_list_items` emits it outside the expansion gate.
-    ///
-    /// `trailing_pb`: see [`Self::render_worktree_row`]'s own docs on the same parameter. This
-    /// line is always the last item in its worktree's block when it is present at all (a
-    /// worktree with a live agent never gets one), so it is where the 7px inter-group gap lands.
     fn render_earlier_runs_link(
         &self,
         path: &std::path::Path,
@@ -2200,12 +1880,6 @@ impl AdeApp {
     /// The total real disk these prune candidates would free, or `None` while the background
     /// scan ([`Self::load_disk_usage`], whose per-worktree half is [`Self::worktree_disk_usage`])
     /// has not yet measured **every** one of them.
-    ///
-    /// All-or-nothing on purpose: a partial sum presented as "frees N" would be a number that is
-    /// wrong in the one direction that matters (too small), and the caller
-    /// ([`rail::prune_tooltip`]) drops the clause entirely rather than under-reporting. The
-    /// `truncated` flag is OR-ed across candidates, since one truncated walk makes the whole sum
-    /// a floor.
     pub(in crate::rail) fn prunable_disk_usage(&self, paths: &[PathBuf]) -> Option<(u64, bool)> {
         let mut total = 0u64;
         let mut truncated = false;
@@ -2218,22 +1892,6 @@ impl AdeApp {
     }
 
     /// Footer 28: real aggregate stats (`N worktrees · disk usage`) plus the real prune action.
-    ///
-    /// `prune` is a **bin icon at a 17px hit box** as of revision 6 (`REVISION-2026-08-14.md` §4):
-    /// "it was the only text action in a rail otherwise made of rows". The text-button path is
-    /// deleted in the same edit that added the icon, per §7 rule 5 - a control described twice is
-    /// two specifications of one thing. What the word could not carry moves into the tooltip
-    /// ([`rail::prune_tooltip`]), which now states what pruning means, how many candidates there
-    /// are, and how much disk it buys back.
-    ///
-    /// The two-click arm/confirm is unchanged, only restated: an armed control turns
-    /// [`theme::button::DANGER_FG`] and its tooltip becomes [`rail::prune_armed_tooltip`]. The
-    /// glyph is `crate::icons::Icon::Trash`, drawn through the shared `crate::icons::IconRow` at
-    /// `crate::icons::IconSize::Control` (12px) - §7 rule 7's shared optical box. That is
-    /// deliberately smaller than this control's own 17px hit box
-    /// ([`theme::band::ICON_BUTTON_HIT`]): the mock's hand-drawn bin glyph only ever painted a
-    /// 9x12 mark inset in the 17px square, and the first Phosphor migration wrongly stretched the
-    /// vendored SVG to fill the whole hit box (screenshot-reported "icons too big").
     pub(in crate::rail) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Includes error'd entries - the count should match what `wt_core::list_worktrees`
         // reported, problems included, not silently shrink.
@@ -2369,8 +2027,6 @@ mod agent_trailing_text_count_tests {
         assert_eq!(agent_trailing_text(&review_row(Some(12))), "12 files");
     }
 
-    /// No count at all is still an empty string, not `"0 files"` - the absence of a measurement
-    /// and a measured zero are different facts, and only the latter is a conjugation case.
     #[test]
     fn an_unmeasured_review_row_has_no_trailing_text() {
         assert_eq!(agent_trailing_text(&review_row(None)), "");
@@ -2468,12 +2124,6 @@ mod prune_regression_tests {
         );
     }
 
-    /// Deliberately discriminating, not just end-state-checking: arming/confirming twice
-    /// against the *same* candidate would pass whether or not `Self::prune_in_flight` exists
-    /// (a double-spawned batch removing one worktree twice just fails harmlessly the second
-    /// time). Instead this seeds a *second*, independent prunable worktree only after the
-    /// first batch is already in flight, so it can only be removed by a genuine second batch
-    /// spawning - if the guard is broken, `second` gets removed too.
     #[gpui::test]
     fn a_second_confirm_while_first_batch_is_in_flight_does_not_prune_a_worktree_seeded_after_it(
         cx: &mut TestAppContext,
@@ -2486,7 +2136,6 @@ mod prune_regression_tests {
             seed_one_prunable_worktree(app, first.clone(), "first-feature");
         });
 
-        // Click 1: arm.
         app.update(cx, |app, cx| app.request_prune(cx));
         assert!(app.read_with(cx, |app, _| app.prune_confirm_armed));
 
@@ -2514,7 +2163,6 @@ mod prune_regression_tests {
             seed_one_prunable_worktree(app, second.clone(), "second-feature");
         });
 
-        // Click 3: re-arm - `second` is now a real prune candidate too.
         app.update(cx, |app, cx| app.request_prune(cx));
         assert!(app.read_with(cx, |app, _| app.prune_confirm_armed));
 
@@ -2523,7 +2171,6 @@ mod prune_regression_tests {
         // second candidate list, `second` is never touched.
         app.update(cx, |app, cx| app.request_prune(cx));
 
-        // Now let whichever batch(es) actually got spawned run to completion.
         cx.run_until_parked();
 
         assert!(
@@ -2574,22 +2221,6 @@ mod rail_row_tests {
         }
     }
 
-    /// §2.2: "Worktrees whose most urgent agent is idle start collapsed" - proven here against
-    /// a running agent (never collapsed by default) and a real idle one (collapsed by default),
-    /// through `Self::worktree_is_expanded`, the single real place that default lives.
-    ///
-    /// The running case is a synthetic `AgentRow` rather than a real spawned agent: a plain
-    /// shell no longer produces any rail row at all (see `Self::build_agent_rows`'s own docs),
-    /// so it can't stand in for "a running agent" here any more, and reaching for a real
-    /// `claude`/`codex` spawn just to get one `Status::Run` row would trade a fast, deterministic
-    /// test for a slow one that also depends on those CLIs being installed - this test is about
-    /// `worktree_is_expanded`'s idle-rooted default, not about spawning.
-    ///
-    /// Selects a *second*, unrelated worktree rather than `wt` itself (GitHub issue #112 live
-    /// follow-up: the currently selected worktree is now exempt from this default - see
-    /// `Self::worktree_is_expanded`'s own docs) so this test keeps proving the plain idle-rooted
-    /// rule in isolation; `the_selected_worktree_never_idle_collapses_by_default` below covers
-    /// the exemption itself.
     #[gpui::test]
     fn worktree_is_expanded_defaults_to_the_real_idle_rooted_rule(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2659,11 +2290,6 @@ mod rail_row_tests {
         );
     }
 
-    /// **The regression test for this fix.** The rail answers "who needs me", and a plain shell
-    /// never needs anyone - so a worktree whose only open pane is a shell must produce zero rail
-    /// rows, the same as a worktree with nothing open at all. The tab strip
-    /// (`crate::work_surface::render`) is the real place a shell tab shows up; this test proves
-    /// the rail and the tab strip are allowed to disagree about that on purpose.
     #[gpui::test]
     fn a_worktree_with_only_a_shell_open_produces_no_agent_row(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2725,16 +2351,6 @@ mod rail_row_tests {
         );
     }
 
-    /// GitHub issue #112 (live follow-up report): a worktree the user is actively switching
-    /// terminals within - the one [`crate::root::AdeApp::current_worktree_path`] currently reports -
-    /// must never auto-collapse just because its most urgent agent's status happens to cross into
-    /// `Idle` (an ordinary occurrence - a shell sitting at its prompt between commands). Before
-    /// this exemption, that real, wall-clock-driven Idle transition would silently collapse the
-    /// row out from under active use, replacing both visible terminal rows with a single
-    /// collapsed summary line and reading, from the report, as the terminals having "merged into
-    /// one" - even though nothing was ever closed (the tab strip stayed untouched the whole
-    /// time). An explicit caret click still wins over the exemption, same as it already wins over
-    /// the plain idle default.
     #[gpui::test]
     fn the_selected_worktree_never_idle_collapses_by_default(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2770,7 +2386,6 @@ mod rail_row_tests {
             "premise: `wt` really is the currently selected worktree"
         );
 
-        // Same idle-forcing technique as the sibling test above.
         let idle_row = rail::WorktreeRow {
             agents: Vec::new(),
             ..running_row
@@ -2792,9 +2407,6 @@ mod rail_row_tests {
         );
     }
 
-    /// The caret's real click behaviour: flips whatever the current expanded state is into an
-    /// explicit, remembered override - and a second toggle flips it right back, proving this is
-    /// a real per-worktree memory, not a write-only flag.
     #[gpui::test]
     fn toggle_worktree_collapsed_flips_and_remembers_the_override(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2850,11 +2462,6 @@ mod rail_row_tests {
         );
     }
 
-    /// §2.3: "Clicking an agent selects its worktree **and** raises that agent's tab." -
-    /// `Self::render_agent_row`'s own click handler calls exactly `Self::select_agent`, so this
-    /// exercises that same real call: starting from worktree A selected/focused, selecting a
-    /// agent that lives in worktree B must move the rail's selection to B *and* make that
-    /// exact agent the active tab - not just one half of the pair.
     #[gpui::test]
     fn selecting_an_agent_selects_its_worktree_and_raises_its_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2914,11 +2521,6 @@ mod rail_row_tests {
         );
     }
 
-    /// A broader smoke test through the real repo-group → worktree-row → agent-row pipeline
-    /// (`Self::render_rail_list`) with a bare worktree (no caret/agents) alongside a busy one
-    /// with two agent rows - the same trees `AdeApp::render` composes every frame. Only asserts
-    /// it completes without panicking; the exact pixel spec is covered by the pure per-field
-    /// logic tests in `crate::rail::state` and this module's other tests.
     #[gpui::test]
     fn render_rail_list_does_not_panic_across_bare_and_multi_agent_worktrees(
         cx: &mut TestAppContext,
@@ -2962,14 +2564,6 @@ mod rail_row_tests {
         });
     }
 
-    /// The real bug the coordinator's audit found: typing into the rail's filter box must
-    /// change only which rows a repo group *renders*, never the header's `N wt` count
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1) - that number must
-    /// keep reporting the repo's real, complete worktree list, exactly like `RepoGroup::
-    /// waiting_count` (proven independently, against hand-built rows, by `crate::rail::state`'s
-    /// own `repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows`) does.
-    /// This test drives the same guarantee through the real, live `AdeApp`: two real worktrees,
-    /// a filter query that matches only one of them.
     #[gpui::test]
     fn build_repo_groups_header_wt_count_is_unaffected_by_the_filter_query(
         cx: &mut TestAppContext,
@@ -2998,7 +2592,6 @@ mod rail_row_tests {
             "sanity check: both rows are displayed with an empty filter query"
         );
 
-        // Type a filter query that matches only "alpha", not "beta".
         app.update(cx, |app, _cx| {
             app.filter_query
                 .insert_str("alpha", std::time::Instant::now());
@@ -3019,11 +2612,6 @@ mod rail_row_tests {
         );
     }
 
-    /// GitHub issue #227's read side, exercised through the real `AdeApp`/rail pipeline rather
-    /// than the pure `crate::rail::state` function directly: a worktree with no persisted history
-    /// shows none, a real closed agent's record shows up under `.history`, and a record that
-    /// *also* still has a live agent open (the same real key `record_agent_statuses` would
-    /// persist for a still-running one) is excluded rather than duplicated.
     #[gpui::test]
     fn build_worktree_rows_shows_real_persisted_history_and_excludes_a_currently_live_agent(
         cx: &mut TestAppContext,
@@ -3110,9 +2698,6 @@ mod rail_row_tests {
         );
     }
 
-    /// The literal resume path (GitHub issue #227): a real persisted record carrying a real
-    /// `session_id` must spawn a genuine `claude --resume <session_id>`, not just a fresh agent
-    /// in the same worktree.
     #[gpui::test]
     fn resume_past_agent_with_a_real_session_id_spawns_a_real_claude_resume(
         cx: &mut TestAppContext,
@@ -3170,10 +2755,6 @@ mod rail_row_tests {
         );
     }
 
-    /// The honest fallback (GitHub issue #227): a record with no real session id - a Codex
-    /// record, since Codex has no hooks and so never captures one, or a Claude record that
-    /// predates this field - must spawn a *fresh* agent of the recorded kind into the same
-    /// worktree, and must never fabricate a `--resume` flag with no real id behind it.
     #[gpui::test]
     fn resume_past_agent_without_a_session_id_reopens_a_fresh_agent_instead(
         cx: &mut TestAppContext,
@@ -3219,8 +2800,6 @@ mod rail_row_tests {
         );
     }
 
-    /// A stale/unknown key (the record was pruned, or never existed) must be a genuine no-op -
-    /// nothing is spawned, and nothing else about the app's state changes.
     #[gpui::test]
     fn resume_past_agent_is_a_no_op_for_an_unknown_key(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3288,18 +2867,6 @@ mod repo_checkout_tests {
         dir
     }
 
-    /// The repo header is **not a click target** - per explicit user direction, after two
-    /// subtler header-click behaviors were both rejected in review (auto-selecting the repo's
-    /// main worktree; then a "pure navigation" focus switch that still re-rooted the sidebar):
-    /// clicking a repo header must do *nothing at all*. Only worktree rows and agent rows are
-    /// clickable in the rail, and repo switching happens exclusively through a worktree row
-    /// (see `clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it` below).
-    ///
-    /// Driven through a real click on the header's own painted bounds - which must still paint
-    /// at all (GitHub issue #113's "the whole group vanished from the rail" half is unchanged) -
-    /// asserting the focused repo, file tree root, worktree selection, and the live agent set
-    /// are all exactly what they were before the click. That proves the header genuinely has no
-    /// `on_click`, not merely that it does something subtler than before.
     #[gpui::test]
     fn clicking_a_non_focused_repos_header_does_nothing_at_all(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir a");
@@ -3374,16 +2941,6 @@ mod repo_checkout_tests {
         });
     }
 
-    /// A checker audit of the original GitHub issue #113 fix found a real "no fake functionality"
-    /// violation: repo B's group used to render with empty `rows`/`all_rows` not because it
-    /// really had zero worktrees, but because *no repo but the focused one* had its worktree data
-    /// loaded at all - a real, then-standing data-model limitation. `RepoGroup::rows_loaded` was
-    /// added to tell that gap apart from a genuine zero-worktree repo. That data-model limitation
-    /// is exactly what this test now proves is gone: repo B (a real git repo, never focused)
-    /// still reads `rows_loaded: false` for the brief window before its own real background fetch
-    /// resolves (never a premature `true`, and never a fabricated non-empty count in that
-    /// window), then becomes `rows_loaded: true` with its real worktree count once that fetch
-    /// completes - proving the count is real data, not a race with "not loaded yet".
     #[gpui::test]
     fn build_repo_groups_marks_a_non_focused_repos_data_as_loaded_once_its_real_fetch_resolves(
         cx: &mut TestAppContext,
@@ -3454,14 +3011,6 @@ mod repo_checkout_tests {
         );
     }
 
-    /// Real cross-repo agent persistence (`crate::root::AdeApp::open_repo_in_current_window`'s
-    /// own "cross-repo agent persistence" docs): a real Claude agent spawned into repo B must
-    /// still show up in `Self::build_repo_groups`' output for repo B, with genuinely live status,
-    /// even after focus has moved away to repo A - the rail's own "see at a glance if a
-    /// background repo's agent needs me" promise. Also proves the inverse half of that same
-    /// promise: repo A's own tab strip (`crate::work_surface::render::AdeApp::
-    /// combined_tab_order`) must *not* show repo B's agent while B isn't the active worktree -
-    /// cross-repo visibility lives in the rail alone, never a new tab-strip affordance.
     #[gpui::test]
     fn build_repo_groups_folds_a_non_focused_repos_real_agent_into_its_own_row(
         cx: &mut TestAppContext,
@@ -3548,12 +3097,6 @@ mod repo_checkout_tests {
         });
     }
 
-    /// The focused-repo half of "the header is not a click target": a click on the
-    /// already-focused repo's own header must also be a genuine no-op - proven by arming some
-    /// real per-repo UI state and confirming it survives the click, the same "did this actually
-    /// reset anything" shape
-    /// `open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo`
-    /// (`crate::root::mod`) uses for the real switch case.
     #[gpui::test]
     fn clicking_the_already_focused_repos_header_does_not_reset_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3605,15 +3148,6 @@ mod repo_checkout_tests {
         path
     }
 
-    /// The reported "I can't switch from a worktree to another repo's worktree". Before the
-    /// multi-repo rail, a non-focused repo's worktrees had no clickable rows at all, so
-    /// `crate::root::AdeApp::select_worktree_by_path`'s focused-repo-only lookup was never asked
-    /// about one; now every added repo renders its own real rows, and clicking one belonging to a
-    /// different repo silently did nothing whatsoever - the path genuinely isn't in
-    /// `AdeApp::worktrees`, so the lookup simply missed and the handler returned.
-    ///
-    /// Driven through a real click on the real painted row, so this covers the whole path from
-    /// `render_worktree_row`'s own `on_click` inward, not just the handler.
     #[gpui::test]
     fn clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it(
         cx: &mut TestAppContext,
@@ -3696,13 +3230,6 @@ mod repo_checkout_tests {
         let _ = std::fs::remove_dir_all(&repo_b_feature);
     }
 
-    /// The other half of the cross-repo switch: the seeded worktree list must survive the real
-    /// background `git worktree list --porcelain` fetch that
-    /// `crate::root::AdeApp::checkout_repo_from_rail` kicks off, landing moments later. The
-    /// selection is recorded before that fetch resolves, so
-    /// `crate::rail::worktrees::recover_selection` has to re-anchor it by path rather than leave a
-    /// stale index - if it didn't, the worktree would visibly "unselect itself" a beat after the
-    /// click.
     #[gpui::test]
     fn a_cross_repo_worktree_selection_survives_the_repos_own_background_fetch(
         cx: &mut TestAppContext,
@@ -3758,8 +3285,6 @@ mod repo_checkout_tests {
         let _ = std::fs::remove_dir_all(&_first);
     }
 
-    /// The unchanged half of the contract: a path in no repo at all (a stale click racing a real
-    /// `git worktree remove`) must still do nothing - never a repo switch to something arbitrary.
     #[gpui::test]
     fn selecting_a_worktree_path_no_repo_knows_about_still_does_nothing(cx: &mut TestAppContext) {
         let repo_a = init_repo();
@@ -3788,26 +3313,6 @@ mod repo_checkout_tests {
         });
     }
 
-    /// The real, reproduced root cause behind "I spawned a Claude agent and it never showed up in
-    /// the rail": a repo path that isn't fully resolved. `git worktree list --porcelain` always
-    /// reports resolved paths, `crate::root::AdeApp::current_worktree_path` falls back to
-    /// `Self::focused_repo_path` whenever no worktree is selected (which is exactly the state a
-    /// fresh window - and every `Self::checkout_repo_from_rail` - leaves the app in), and
-    /// `crate::rail::state::build_worktree_rows_with_history` folds an agent into a worktree row
-    /// by exact path equality. So an agent spawned against an unresolved repo path matched *no*
-    /// row, and - because that function maps over worktrees and folds agents into them - was
-    /// dropped from the rail entirely, silently, with no row and no error.
-    ///
-    /// Driven through a symlinked repo path, which is precisely what `jerry ~/link-to-repo` (or
-    /// any `jerry .`/relative invocation) hands the app: the CLI argument used to be stored
-    /// verbatim as `Repo::path`. `crate::rail::repo::canonical_repo_path` normalizes it at the
-    /// boundary instead.
-    ///
-    /// `#[cfg(unix)]` because the *setup* is - `std::os::unix::fs::symlink` does not exist on
-    /// Windows, so without this gate the whole `app` test target fails to compile there, taking
-    /// every unrelated Windows test down with it (`crate::hooks::settings_file`'s Windows suite
-    /// among them). The behaviour under test is not Unix-specific; only the way this test
-    /// manufactures an unresolved path is.
     #[cfg(unix)]
     #[gpui::test]
     fn an_agent_spawned_in_a_repo_opened_through_a_symlink_still_appears_in_the_rail(
@@ -3826,7 +3331,6 @@ mod repo_checkout_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, link.clone());
         cx.run_until_parked();
 
-        // The real spawn chokepoint every "New agent" entry point funnels through.
         let agent_id = app.update_in(cx, |app, window, cx| {
             app.new_agent(ProcessKind::claude(), window, cx);
             app.agents
@@ -3863,12 +3367,6 @@ mod repo_checkout_tests {
         assert_eq!(row.agents[0].id, agent_id);
     }
 
-    /// The same normalization, applied to a repo opened *after* startup through
-    /// `Self::open_repo_in_current_window` (the "Open Folder…" path) rather than the CLI
-    /// argument - a second real entry point for a repo path, which must not be able to
-    /// reintroduce the unresolved-path bug on its own.
-    ///
-    /// `#[cfg(unix)]` for the same reason as the test above: `std::os::unix::fs::symlink`.
     #[cfg(unix)]
     #[gpui::test]
     fn opening_a_symlinked_folder_stores_the_resolved_repo_path(cx: &mut TestAppContext) {
@@ -3919,15 +3417,6 @@ mod repo_checkout_tests {
 /// The reported "at the start of the program you select something and a tab bar has a terminal;
 /// then I select a worktree and this is lost" - and the architectural invariant that replaced the
 /// family of bugs behind it:
-///
-/// **A tab is never shown, never spawnable, and never implicitly attributed to anything except a
-/// real, currently-selected worktree. There is no such thing as "a repo's own tab".**
-///
-/// Every test here drives real, painted rail rows through `cx.simulate_click` on real
-/// `debug_bounds`, against real `git init`-ed repositories and real PTY processes - the same
-/// technique `repo_checkout_tests` above uses - rather than calling selection methods directly,
-/// because the whole class of bugs being fixed was about what the *rendered* rail, tab strip, and
-/// centre pane each independently believed.
 #[cfg(test)]
 mod worktree_tab_attribution_tests {
     use crate::root::focus::palette_focus_tests;
@@ -4006,12 +3495,6 @@ mod worktree_tab_attribution_tests {
         cx.run_until_parked();
     }
 
-    /// The startup half of the reported bug. A fresh `jerry <repo>` launch spawns a real shell and
-    /// shows its tab - but it used to leave `AdeApp::selected` at `None`, so *the user never
-    /// selected the worktree that tab belongs to*. The tab rendered only because
-    /// `AdeApp::current_worktree_path`'s repo-root fallback happened to coincide with the main
-    /// worktree's own path. This asserts the real thing instead: the main worktree is genuinely
-    /// selected, and the startup shell genuinely lives in it.
     #[gpui::test]
     fn a_fresh_launch_genuinely_selects_the_repos_own_main_worktree(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -4051,13 +3534,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// The reported gesture end to end, through real clicks: the startup terminal must not be
-    /// *lost* when the user selects a different worktree - it must be a real, reversible switch
-    /// between two genuinely selected worktrees, with the same live process still there on the
-    /// way back.
-    ///
-    /// Before this revision, step 1 had no selection behind it at all, which is what made step 2
-    /// read as destruction rather than navigation.
     #[gpui::test]
     fn the_startup_terminal_is_a_real_worktrees_tab_and_survives_switching_away_and_back(
         cx: &mut TestAppContext,
@@ -4073,7 +3549,6 @@ mod worktree_tab_attribution_tests {
             agents[0]
         });
 
-        // Step 1: the main worktree really is the selected one, and really owns the tab.
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.current_worktree_path(),
@@ -4113,7 +3588,6 @@ mod worktree_tab_attribution_tests {
             );
         });
 
-        // Step 3: clicking back must restore the very same tab, not a respawned lookalike.
         click_worktree_row(&app, cx, repo.path());
         app.read_with(cx, |app, _| {
             assert_eq!(
@@ -4130,14 +3604,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// The real, permanent-loss half of the bug, live-reproduced before the fix: launching against
-    /// a *subdirectory* of a repo (`jerry ./crates` - an entirely ordinary invocation).
-    ///
-    /// `AdeApp::current_worktree_path` used to resolve to that bare subdirectory, which
-    /// `git worktree list --porcelain` reports as no worktree at all. The startup shell spawned
-    /// there rendered a real tab in the strip while *every* rail row read as unselected, and the
-    /// moment any worktree row was clicked the tab vanished for good - its `cwd` could never again
-    /// equal any row's path, so the live PTY was orphaned with no reachable way back.
     #[gpui::test]
     fn launching_against_a_subdirectory_still_attributes_its_shell_to_a_real_worktree(
         cx: &mut TestAppContext,
@@ -4187,8 +3653,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// Launching directly inside a linked worktree (`jerry ~/repo-wt/feature`) must land on *that*
-    /// worktree, not silently redirect to the repo's main one.
     #[gpui::test]
     fn launching_inside_a_linked_worktree_selects_that_worktree_not_main(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -4210,10 +3674,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// GitHub issue #90's "Open Folder…" is the other real opening gesture, and it duplicated the
-    /// constructor's spawn-into-the-bare-repo-path logic almost verbatim. Both now funnel through
-    /// the same `AdeApp::load_worktrees_for_opened_repo`, so they cannot drift apart on which
-    /// worktree the window lands in - this proves the "Open Folder…" half directly.
     #[gpui::test]
     fn opening_a_folder_lands_on_a_real_worktree_and_spawns_its_shell_there(
         cx: &mut TestAppContext,
@@ -4253,17 +3713,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// The real race the opening path has to survive, found reviewing this revision's own diff:
-    /// the worktree-list fetch is asynchronous, so a user can click a worktree row while it is
-    /// still in flight.
-    ///
-    /// That click sets `AdeApp::selected`, which makes `crate::rail::worktrees::recover_selection`
-    /// report `Unchanged` rather than `NoPriorSelection` when the fetch finally lands. An
-    /// `Opening` handler living *inside* that one match arm - which is how this was first written
-    /// - would therefore silently skip the window's guaranteed initial shell altogether, leaving a
-    /// freshly opened repo with no terminal at all. The handler is keyed off `AdeApp::selected`
-    /// after the match instead, so a raced click is simply respected: the worktree the user
-    /// actually chose stays selected, and the shell is spawned into *that*.
     #[gpui::test]
     fn a_worktree_click_racing_the_open_fetch_still_gets_its_guaranteed_shell(
         cx: &mut TestAppContext,
@@ -4310,20 +3759,6 @@ mod worktree_tab_attribution_tests {
         });
     }
 
-    /// The invariant's negative half, and the third live-reproduced inconsistency: while nothing
-    /// is genuinely selected, *nothing* may claim to be showing.
-    ///
-    /// Before this revision, `AdeApp::checkout_repo_from_rail` left `AdeApp::selected` at `None`
-    /// while `current_worktree_path` still resolved to the repo root, producing a real three-way
-    /// disagreement: the rail drew the main-worktree row as selected, the tab strip drew the root
-    /// shell's tab, and the centre pane rendered nothing at all (`Agents::clear_active` having
-    /// genuinely cleared it). All three now agree.
-    ///
-    /// `checkout_repo_from_rail` deliberately still selects nothing of its own - see its own docs,
-    /// and `repo_list_tests::checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own`
-    /// - it is an internal sub-step of a worktree-row click, never a resting state a user can
-    /// reach. This asserts that that transient state is now genuinely self-consistent rather than
-    /// merely looking plausible.
     #[gpui::test]
     fn nothing_selected_means_nothing_shown_anywhere(cx: &mut TestAppContext) {
         let repo_a = init_repo();
@@ -4469,16 +3904,6 @@ mod rail_filter_caret_tests {
         );
     }
 
-    /// GitHub issue #45's own title, taken literally: the caret must actually *blink* (not just
-    /// exist) once this field is focused - proving `filter_focus_handle`'s real wiring into
-    /// `crate::root::caret_blink`'s shared loop by advancing the real (simulated) clock past one
-    /// full interval and observing `caret_blink_visible` really flip, the same live-loop proof
-    /// `crate::code_surface::editing`'s own rehighlight-debounce tests use for their timers.
-    /// `cx.simulate_input` (not a bare `window.focus`) is what actually forces the window to
-    /// redraw and diff its own focus path in this test harness - the real trigger
-    /// `on_focus`/`on_blur` listeners fire from (see `gpui::Window::focus`'s own deferred-effect
-    /// doc comment) - matching how a real user always focuses a field by clicking or tabbing
-    /// into it and then typing, never focus with no further interaction.
     #[gpui::test]
     fn focusing_the_rail_filter_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4544,12 +3969,6 @@ mod agent_chip_icon_pack_tests {
     /// which defaults its worktree row to expanded (`AdeApp::worktree_is_expanded`'s own
     /// "idle-rooted" rule), so the agent row (and this chip) actually renders without needing a
     /// separate collapse-override hack.
-    ///
-    /// Real `AgentKind::Claude`, not `ProcessKind::Shell`: the rail never renders a row for a
-    /// plain shell at all (`AdeApp::build_agent_rows`'s own docs - a shell has nothing for the
-    /// rail to triage), so it can no longer stand in for "an agent row" here. The icon-chip
-    /// logic under test (`AdeApp::render_agent_chip_icon`) doesn't care which real kind it's
-    /// given - it's exercised identically either way.
     fn open_with_a_running_agent(
         cx: &mut TestAppContext,
     ) -> (
@@ -4623,21 +4042,6 @@ mod agent_chip_icon_pack_tests {
         );
     }
 
-    /// GitHub issue #309: `debug_bounds` (the two tests above) only proves the pack-icon element
-    /// exists in the render tree - `Interactivity::paint` records it *before* running the
-    /// element's own paint closure, so it stays `Some(..)` even for an element whose paint
-    /// closure draws nothing. That is exactly how the empty-box bug shipped past those two tests
-    /// in the first place: the old pack-icon branch built a `gpui::svg()` with no `.text_color()`
-    /// set, and GPUI's `Svg::paint` (`vendor/zed/crates/gpui/src/elements/svg.rs`) zips its path
-    /// with `style.text.color` and skips painting outright when that's `None` - a real, silent,
-    /// invisible empty box that both bounds-only tests above were blind to.
-    ///
-    /// This test instead inspects the real element `AdeApp::render_agent_chip_icon` hands back,
-    /// downcasting the type-erased `AnyElement` (`gpui::AnyElement::downcast_mut`) to check which
-    /// concrete GPUI element type is actually behind it. `gpui::Img::paint`
-    /// (`vendor/zed/crates/gpui/src/elements/img.rs`) never reads `style.text.color` at all - it
-    /// paints real decoded pixels unconditionally - so this is the real, structural guarantee
-    /// that the pack icon cannot regress back into the invisible-alpha-mask failure mode.
     #[gpui::test]
     fn the_pack_icon_element_is_a_real_image_not_a_colour_dependent_svg(cx: &mut TestAppContext) {
         let pack_dir = tempfile::tempdir().expect("tempdir");
@@ -4670,16 +4074,6 @@ mod agent_chip_icon_pack_tests {
 /// Revision 6's status rename (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4g,
 /// GitHub issue #280): [`Status::Review`] renders as `Finished`/`finished`, and the old
 /// `Review ready` wording must never come back to any rendered surface.
-///
-/// Pure, GPUI-window-free coverage over the real production functions every status-derived
-/// string in the window comes out of - the same "collect every rendered string, then assert one
-/// forbidden word is in none of them" idiom `crate::review::state`'s own
-/// `no_review_wording_anywhere_says_a_bare_diff` test already uses for the review surface's
-/// "diff" ban. Hand-built [`AgentRow`]s, the same idiom `crate::rail::state`'s `urgency_counts`
-/// tests use.
-///
-/// The title bar's own chip texts are swept by the twin test in `crate::title_bar::render`'s
-/// `agent_state_chip_text_tests`, since that formatter is private to that module.
 #[cfg(test)]
 mod status_wording_tests {
     use super::*;
@@ -4715,7 +4109,6 @@ mod status_wording_tests {
         for status in Status::ORDER {
             wording.push(status.label().to_string());
             wording.push(agent_state_word(status).to_string());
-            // `Self::render_past_agent_row`'s history line.
             wording.push(format!("was {}", agent_state_word(status)));
             for count in [None, Some(0), Some(1), Some(12)] {
                 wording.push(agent_trailing_text(&row(status, count)));
@@ -4763,9 +4156,6 @@ mod status_wording_tests {
         );
     }
 
-    /// §4g: "an agent that finished with **no** files reads `finished` with no count - legible
-    /// rather than mislabelled as ready for review", and a real count renders beside the word
-    /// as `finished · N files` (the row's two elements, dot-separated by layout).
     #[test]
     fn a_finished_agent_shows_its_file_count_beside_the_word_and_nothing_when_unmeasured() {
         assert_eq!(
@@ -4793,13 +4183,6 @@ mod status_wording_tests {
 mod rail_correction_tests {
     use super::*;
 
-    /// §4m, the whole rule: the worktree row's 2px left edge means **selection or nothing**.
-    ///
-    /// Swept across every real [`Status`] and both `prunable` values, because those are exactly
-    /// the two inputs that used to move this colour - the most urgent agent's status, and the
-    /// prunable/bare distinction. A regression that reintroduced either one would light up an
-    /// unselected row here, and the sweep is what makes "all three are deleted" a checkable claim
-    /// rather than a comment.
     #[test]
     fn the_worktree_edge_is_selection_or_nothing_whatever_the_row_holds() {
         for status in Status::ORDER {
@@ -4821,8 +4204,6 @@ mod rail_correction_tests {
         }
     }
 
-    /// §4n: the agent title is dimmer than the worktree branch above it, and dimmer still when
-    /// the agent is paused - "Fix hierarchy by shrinking the child, never by growing the parent."
     #[test]
     fn the_agent_title_sits_below_its_parent_branch_in_the_hierarchy() {
         assert_eq!(
@@ -4849,23 +4230,6 @@ mod rail_correction_tests {
         );
     }
 
-    /// The rail's amber question-preview card is gone (`REVISION-2026-07-31.md` §2.3: "No
-    /// question preview. The amber ask box is gone from the rail; the question belongs in the
-    /// agent pane where it can be answered"), and this is the guard that keeps it gone.
-    ///
-    /// Two independent facts, neither of which a comment could hold:
-    ///
-    /// 1. **The data is gone.** `AgentRow` carries no preview field, so there is nothing in the
-    ///    rail's own model for a card to render. That is a compile-time fact - the name appearing
-    ///    in this file's source at all would mean it came back.
-    /// 2. **The card's ink is gone.** `status.ask_card_*` were the three tokens that painted it,
-    ///    and they were the rail's only use of them. The tokens themselves stay in the palette
-    ///    (the card moves to the agent pane, it is not abolished), so the check that matters is
-    ///    that *this file* no longer reaches for them.
-    ///
-    /// Source-level, the same `include_str!`-your-own-file idiom `crate::theme`'s
-    /// `token_registry_tests` already uses, because the thing under test is the absence of code
-    /// rather than the behaviour of any.
     #[test]
     fn no_rail_render_code_reaches_for_the_removed_ask_card() {
         const SOURCE: &str = include_str!("render.rs");
@@ -4934,10 +4298,6 @@ mod rail_rev6_render_tests {
     /// row for it at all. `TerminalPane::spawn_error` is then really set, which
     /// `AdeApp::agent_status` reads as `ProcessSignal::Exited { success: false }` and
     /// `rail::status::derive_status` turns into a real [`Status::Fail`].
-    ///
-    /// Deliberately not a real `claude` spawn: that would pass or fail depending on whether the
-    /// machine running the suite has the binary installed, which is not something this test is
-    /// about.
     fn open_with_a_failed_agent(
         cx: &mut TestAppContext,
     ) -> (
@@ -4970,14 +4330,6 @@ mod rail_rev6_render_tests {
         (repo, wt, app, cx)
     }
 
-    /// §4/§4q and §9's checklist box 7, painted: a repo holding a failed agent shows the **red**
-    /// dot+count pair in its header, and shows **no amber one at all** - not an amber `0`, not an
-    /// amber pair that also counts it.
-    ///
-    /// This is the live counterpart to `crate::rail::state`'s pure
-    /// `a_worktree_holding_both_an_asking_and_a_failed_agent_counts_once_as_failed`: that one
-    /// proves the arithmetic, this one proves the header is really wired to it and that the
-    /// hidden-at-zero rule really removes the element rather than drawing an empty slot.
     #[gpui::test]
     fn a_failed_agent_paints_the_repo_headers_red_pair_and_no_amber_one(cx: &mut TestAppContext) {
         let (_repo, _wt, app, cx) = open_with_a_failed_agent(cx);
@@ -5005,9 +4357,6 @@ mod rail_rev6_render_tests {
         );
     }
 
-    /// §4q's "each hidden at zero", driven through the real render function for both pairs and
-    /// both sides of the boundary - the half of the rule a repo with a failed agent alone cannot
-    /// exercise.
     #[gpui::test]
     fn each_urgency_pair_is_an_element_only_when_its_own_count_is_nonzero(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5027,12 +4376,6 @@ mod rail_rev6_render_tests {
         });
     }
 
-    /// §4o: the caret is "10px `#8b9197` in a 13x27 box (the row's full height, so the whole left
-    /// column is clickable)" - it was 8px in an 11px box, "the smallest interactive target in the
-    /// window and the one you hit most while triaging".
-    ///
-    /// Measured, not asserted from the source: a real painted hit box, in a real window, on a
-    /// real worktree row that really has an agent under it.
     #[gpui::test]
     fn the_worktree_caret_is_a_full_row_height_hit_box(cx: &mut TestAppContext) {
         let (_repo, _wt, _app, cx) = open_with_a_failed_agent(cx);
@@ -5053,14 +4396,6 @@ mod rail_rev6_render_tests {
         );
     }
 
-    /// `Jerry.dc.html`'s own agent row indents under its worktree by a real 13px, holding the 1px
-    /// `#1e2225` connector the design's own §4n text calls out ("the connector... was already
-    /// there and does its job once the groups are separated") - so the agent's own status edge
-    /// sits *inset* under the worktree row, not flush with its left edge. A real, measured
-    /// regression: an earlier cut folded the 13px indent and the status-edge border onto the same
-    /// element, which (GPUI draws a border at a box's own outer edge, same as CSS) put the edge
-    /// at the worktree row's own x, not indented under it - the hierarchy the row is supposed to
-    /// show collapsed into the same left rail every other row in the tree already uses.
     #[gpui::test]
     fn the_agent_row_is_really_indented_under_its_worktree_not_flush_with_it(
         cx: &mut TestAppContext,
@@ -5098,22 +4433,6 @@ mod rail_rev6_render_tests {
         );
     }
 
-    /// Live report, screenshot-confirmed: "worktree pane is messed up, width issues" -
-    /// inconsistent row widths, and agent rows that don't share their parent worktree row's own
-    /// left/right extent. Root cause: `gpui::list` (GitHub issue #364's virtualization) lays each
-    /// item out via `Element::layout_as_root` with a real, *definite* available width - the
-    /// list's own painted `bounds.size.width` (verified directly against vendored
-    /// `gpui::elements::list`'s `layout_all_items`/`layout_items`, the same "read the real
-    /// upstream source" idiom this file's own scrollbar geometry notes already use) - but unlike
-    /// an ordinary `div().flex().flex_col()` parent, it does **not** stretch a root item to that
-    /// width by default. `render_change_row`/`render_section_header` (the pre-existing,
-    /// correct `gpui::list` user this rail work explicitly modeled itself on) already carry an
-    /// explicit `.w_full()` on their own root element for exactly this reason; every
-    /// `RailListItem` render function was missing it.
-    ///
-    /// Measured, not asserted from the source: every real painted row must span exactly the
-    /// rail's own real list width, the same real container `Self::render_rail_list` wraps
-    /// `gpui::list` in.
     #[gpui::test]
     fn every_rail_list_item_spans_the_full_rail_width(cx: &mut TestAppContext) {
         let (_repo, wt, app, cx) = open_with_a_failed_agent(cx);
@@ -5157,9 +4476,6 @@ mod rail_rev6_render_tests {
         );
     }
 
-    /// §4/§8: `prune` is a bin icon at a 17px hit box, and the text button it replaced is gone -
-    /// "it was the only text action in a rail otherwise made of rows", and §7 rule 5 requires the
-    /// old path to go in the same edit.
     #[gpui::test]
     fn the_prune_control_is_a_bin_icon_in_a_seventeen_pixel_box(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5191,7 +4507,6 @@ mod rail_rev6_render_tests {
         );
         assert_eq!(icon.size.height, px(12.0));
 
-        // And it must be centred in the hit box, not pinned to a corner.
         let left_gap = icon.origin.x - button.origin.x;
         let right_gap = (button.origin.x + button.size.width) - (icon.origin.x + icon.size.width);
         let top_gap = icon.origin.y - button.origin.y;
@@ -5207,10 +4522,6 @@ mod rail_rev6_render_tests {
         );
     }
 
-    /// §4s's spacing ratio, measured: "the header is visibly closer to its own rows than the rows
-    /// are to each other, which is the whole job of a section header" - 3px below the band, 7px
-    /// between worktrees (§4n raised the latter from 1px, where "ten groups ran together as one
-    /// stream").
     #[gpui::test]
     fn the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other(
         cx: &mut TestAppContext,
@@ -5365,11 +4676,6 @@ mod rail_virtualization_tests {
         Box::leak(format!("worktree-row-{index}-{}", worktree_path.display()).into_boxed_str())
     }
 
-    /// Before this fix, this row would have painted too: `Self::render_rail_list` built every
-    /// worktree row unconditionally, regardless of scroll position. `crate::sidebar::render::
-    /// virtualization_tests::a_file_tree_row_far_below_the_viewport_is_never_painted`'s own docs
-    /// record the same class of measurement for the file tree - "~145ms of a ~200ms `Window::
-    /// draw`" - before *that* surface's equivalent fix.
     #[gpui::test]
     fn a_worktree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5398,11 +4704,6 @@ mod rail_virtualization_tests {
         );
     }
 
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable by scrolling - mirrors `crate::sidebar::render::
-    /// virtualization_tests::scrolling_the_virtualized_file_tree_materializes_a_row_that_was_not_painted`
-    /// exactly, including its "a deliberately huge delta needs no row-height/viewport-size model
-    /// of its own" reasoning: `gpui::ListState` clamps to its own real maximum scroll offset.
     #[gpui::test]
     fn scrolling_the_virtualized_rail_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
@@ -5471,12 +4772,6 @@ mod rail_virtualization_tests {
         );
     }
 
-    /// The live report itself, made falsifiable: hovering a row that is really on screen must
-    /// never materialize one that is not, even though GPUI's own `.hover()` forces a full
-    /// `Window::refresh()` on the transition (`crate::rail::state::RailListItem`'s own docs on
-    /// exactly why that refresh alone doesn't bound the work without real virtualization
-    /// underneath it). Before this fix this assertion would have failed outright: every row,
-    /// including this one, was built on every render, hover-triggered refreshes included.
     #[gpui::test]
     fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
         cx: &mut TestAppContext,
@@ -5521,14 +4816,6 @@ mod rail_virtualization_tests {
 /// GitHub issue #336 ("Text inputs do not have selection and standard copy/paste/cut"), driven the
 /// way a user drives it: real simulated clicks, drags and keystrokes into a real focused field,
 /// with the real system clipboard on the other end of Ctrl/Cmd+C.
-///
-/// The rail filter is the surface under test because it is the plainest of the app's thirteen
-/// `"text-input"` nodes - one field, one focus handle, no modal, no debounce - so what these
-/// assert is the shared plumbing (`crate::root::widgets::AdeApp::render_simple_input_row`,
-/// `wire_text_input_actions`, `crate::text_history::TextField`) that every one of the other twelve
-/// goes through, not anything the rail owns. The per-surface half - that each field really passes
-/// its own `TextFieldHandle` - is what `crate::keymap_overrides::real_context_stacks`' own
-/// enumeration plus the scoping matrix in `crate::undo_scoping_matrix_tests` covers.
 #[cfg(test)]
 mod rail_filter_selection_tests {
     use super::*;
@@ -5566,15 +4853,6 @@ mod rail_filter_selection_tests {
     }
 
     /// A real window-space point over byte `offset` of the filter's own painted text.
-    ///
-    /// Built from `AdeApp::simple_input_layout` - the `(bounds, ShapedLine)` pair the row's own
-    /// overlay recorded when it last painted - rather than from the text element's `debug_bounds`.
-    /// That matters: `SimpleInput::text_selector` sits on the row's *leading* half (see
-    /// `AdeApp::render_simple_input_row`'s own docs), so once the caret is anywhere but the end,
-    /// that element is only as wide as the text before the caret. The recorded layout always
-    /// describes the whole line, which is also exactly what the click handler itself hit-tests
-    /// against - so a point built here and the offset the app resolves it to cannot disagree by
-    /// construction.
     fn point_at_offset(
         app: &gpui::Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
@@ -5635,7 +4913,6 @@ mod rail_filter_selection_tests {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
 
-        // A click at the field's own text origin: byte 0, whatever the glyph metrics are.
         let start = point_at_offset(&app, cx, 0);
         cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
@@ -5668,7 +4945,6 @@ mod rail_filter_selection_tests {
             gpui::Modifiers::default(),
         );
         cx.run_until_parked();
-        // With the button released, a bare pointer move must no longer touch the selection.
         cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
@@ -5682,7 +4958,6 @@ mod rail_filter_selection_tests {
     fn a_real_double_click_selects_the_word_under_the_pointer(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
-        // Over the `a` of `main`, so the pointer is genuinely inside the second word.
         let inside_second_word = point_inside_glyph(&app, cx, 8);
         cx.simulate_event(gpui::MouseDownEvent {
             position: inside_second_word,
@@ -5790,7 +5065,6 @@ mod rail_filter_selection_tests {
             "paste inserts the real clipboard content at the caret"
         );
 
-        // ...and the whole cut+paste pair is undoable, one real step at a time.
         cx.simulate_keystrokes(&secondary("z"));
         cx.run_until_parked();
         assert_eq!(
@@ -5846,12 +5120,6 @@ mod rail_filter_selection_tests {
         );
     }
 
-    /// The selected range really is painted behind the glyphs, not merely tracked in state.
-    ///
-    /// Asserted through `AdeApp::simple_input_layout` - the `(bounds, ShapedLine)` pair the row's
-    /// own overlay records every frame, which is the *same* pair the selection quad's own
-    /// `x_for_index` edges are computed from and the same one every click hit-test reads. If the
-    /// overlay never painted, this entry does not exist at all and there is no quad either.
     #[gpui::test]
     fn the_selection_is_really_measured_from_the_row_that_painted_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5882,7 +5150,6 @@ mod rail_filter_selection_tests {
             "...and ends at the shaped line's own real right edge - got {end_x:?} vs {width:?}"
         );
 
-        // The same shaped line is what a click hit-tests against, so the two can never disagree.
         let hit = app.read_with(cx, |app, _| {
             let (bounds, _) = app.simple_input_layout.get(&key).expect("still painted");
             app.simple_input_offset_at(&key, gpui::point(bounds.origin.x + end_x, bounds.origin.y))

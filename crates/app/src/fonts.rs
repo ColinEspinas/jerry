@@ -1,60 +1,5 @@
 //! Bundles the two font families the design requires (IBM Plex Sans, IBM Plex Mono; both OFL)
 //! and registers them with GPUI's text system.
-//!
-//! [`Assets`], this app's single `gpui::AssetSource`, also serves the shipped Phosphor icon files
-//! that `crate::icons` owns - see that module and [`Assets`]' own docs.
-//!
-//! ## Source
-//!
-//! The `.ttf` files under `assets/fonts/` are IBM's own unmodified static weights
-//! (`github.com/IBM/plex`, the same source Zed's own bundled `IBM Plex Sans` comes from - see
-//! `vendor/zed/assets/fonts/ibm-plex-sans/`): `@ibm/plex-sans@1.1.0` and `@ibm/plex-mono@2.5.0`'s
-//! `fonts/complete/ttf/` release assets.
-//!
-//! | Weight | Sans file | Mono file |
-//! |---|---|---|
-//! | 400 | `IBMPlexSans-Regular.ttf` | `IBMPlexMono-Regular.ttf` |
-//! | 450 | `IBMPlexSans-Text.ttf` | `IBMPlexMono-Text.ttf` |
-//! | 500 | `IBMPlexSans-Medium.ttf` | `IBMPlexMono-Medium.ttf` |
-//! | 600 | `IBMPlexSans-SemiBold.ttf` | `IBMPlexMono-SemiBold.ttf` (bundled for ANSI bold, below) |
-//!
-//! Each `assets/fonts/ibm-plex-{sans,mono}/LICENSE.txt` is IBM's unmodified OFL 1.1 text.
-//!
-//! ## `IBMPlexMono-SemiBold.ttf`: bundled for ANSI bold, not a design-token weight
-//!
-//! The design only calls for Mono 400/450/500, but `crate::terminal::pane::render_row` requests
-//! `FontWeight::BOLD` (700) for ANSI `SGR 1` cells. Without a bundled Mono weight above 500,
-//! GPUI's weight-matching would resolve "bold" to whichever bundled weight is numerically
-//! closest to 700 - which, before this file existed, was 500 (Medium): visibly not bold. 600
-//! (SemiBold) is the closest available weight.
-//!
-//! ## Unused-for-now, not dead code
-//!
-//! Nothing yet requests Sans 450/500/600 or Mono 450 - they're loaded and available for a later
-//! phase's UI to use per the design's type scale, not leftover code a cleanup pass should remove.
-//!
-//! ## Weight resolution
-//!
-//! A static `.ttf`'s legacy family name (name table ID 1) is unique per weight; only the
-//! typographic family (ID 16) is the shared `"IBM Plex Sans"`/`"IBM Plex Mono"`. `fontdb`
-//! (which backs GPUI's Linux text system, `vendor/zed/crates/gpui_wgpu/src/
-//! cosmic_text_system.rs`) prefers ID 16 over ID 1 (`fontdb-0.23.0/src/lib.rs`'s
-//! `parse_names`), so every bundled weight resolves as one family, distinguished by real
-//! `OS/2.usWeightClass` matching. The
-//! `bundled_font_weights_and_family_names_match_the_module_docs` test below checks this
-//! directly against the embedded bytes, so a future edit that swaps in the wrong weight file
-//! can't silently drift from this table.
-//!
-//! ## Registration
-//!
-//! [`Assets`] implements `gpui::AssetSource` (`vendor/zed/crates/gpui/src/assets.rs:13`);
-//! [`load_embedded_fonts`] mirrors Zed's own `load_embedded_fonts`
-//! (`vendor/zed/crates/zed/src/main.rs:1806`): list `"fonts"` via `cx.asset_source()`, load each
-//! entry's bytes, hand them to `cx.text_system().add_fonts(..)`
-//! (`vendor/zed/crates/gpui/src/text_system.rs:102`). `crate::run` wires `Assets` in via
-//! `Application::with_assets` (`vendor/zed/crates/gpui/src/app.rs:199`) before opening the
-//! window, calling [`load_embedded_fonts`] first inside the launch callback - see that
-//! function's docs for why a failure there is logged, not `.unwrap()`ed.
 
 use std::borrow::Cow;
 
@@ -102,12 +47,6 @@ const FONT_FILES: &[(&str, &[u8])] = &[
 /// This app's one [`gpui::AssetSource`], covering both bundled asset families: the fonts above
 /// (`fonts/...`) and the shipped Phosphor icons (`icons/...`, GitHub issue #282 -
 /// `crate::icons::ICON_FILES` owns that list, this only routes to it).
-///
-/// Icons load through here rather than through some second source because that is what GPUI
-/// itself reads: `gpui::svg().path(..)` ends up in `Window::paint_svg` ->
-/// `SvgRenderer::render_alpha_mask` -> `asset_source.load(&params.path)`
-/// (`vendor/zed/crates/gpui/src/svg_renderer.rs:223`), and `crate::run` registers exactly one
-/// source via `Application::with_assets`.
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -175,10 +114,6 @@ mod tests {
         assert!(listed.is_empty());
     }
 
-    /// The second bundled family this source serves - see [`Assets`]' own docs. The icon-side
-    /// assertions (every `Icon` reachable, real Phosphor bytes) live in `crate::icons`; this only
-    /// checks the routing here really happens, so a font-only implementation can't quietly come
-    /// back.
     #[test]
     fn also_serves_the_shipped_icons_alongside_the_fonts() {
         let assets = Assets;
@@ -236,10 +171,6 @@ mod tests {
             .is_none());
     }
 
-    /// Checks every bundled file's real name table (ID 16, falling back to ID 1 exactly the
-    /// way `fontdb::parse_names` does) and `OS/2.usWeightClass` directly against the embedded
-    /// bytes, via `ttf_parser` (the same crate `fontdb` is built on) - so the module docs'
-    /// weight table stays checkable by `cargo test` rather than only by a one-time inspection.
     #[test]
     fn bundled_font_weights_and_family_names_match_the_module_docs() {
         let expectations: &[(&str, &str, u16)] = &[

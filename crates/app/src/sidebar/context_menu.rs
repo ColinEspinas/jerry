@@ -1,19 +1,5 @@
 //! The file tree's right-click menu, as pure data (GitHub issue #19 §1): which actions a given
 //! target offers, and how they group.
-//!
-//! GPUI-free on purpose, exactly like [`crate::sidebar::file_tree`] beside it - "does a folder
-//! offer Collapse Subtree" is a decision that can be tested without a window, and
-//! [`crate::sidebar::render`] only *draws* what this module decides.
-//!
-//! ## What lives here, and what does not any more
-//!
-//! Everything *generic* about a menu - what a row is, how groups become separated rows, the
-//! popover's painted height, and the edge-aware geometry that keeps it on screen - moved to
-//! [`crate::menu::model`] when GitHub issue #290 promoted this component into the app's one
-//! shared menu (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t: "Both are 'a list
-//! of actions', so they are **one menu component** ... rather than two idioms that drift"). The
-//! file tree draws through that shared popover now; what stays here is only what is genuinely the
-//! file tree's own: its targets, its actions, and its row sets.
 
 use std::path::{Path, PathBuf};
 
@@ -151,9 +137,6 @@ impl MenuAction {
 /// ([`menu_items`], which is literally this flattened) and the rendered separators
 /// ([`menu_rows`]), so the two can never disagree about where a group ends: there is no second,
 /// hand-maintained list of "and the divider goes after row 3".
-///
-/// `clipboard_has_entry` gates every `Paste` row: with nothing cut or copied there is genuinely
-/// nothing to paste, and a row that silently does nothing is worse than a visibly disabled one.
 pub fn menu_groups(
     target: &ContextTarget,
     clipboard_has_entry: bool,
@@ -225,7 +208,6 @@ mod tests {
         items.iter().map(|item| item.action).collect()
     }
 
-    /// Issue #19 §1's three lists, exactly.
     #[test]
     fn each_target_offers_the_actions_the_issue_lists() {
         let file = ContextTarget::File(PathBuf::from("/repo/a.rs"));
@@ -273,8 +255,6 @@ mod tests {
         );
     }
 
-    /// Every row's label and keycap comes off the action itself, so the rendered row and the
-    /// handler it runs cannot describe two different commands.
     #[test]
     fn every_row_carries_its_actions_own_label_and_binding() {
         for item in menu_items(&ContextTarget::File(PathBuf::from("/repo/a.rs")), true) {
@@ -284,8 +264,6 @@ mod tests {
         }
     }
 
-    /// The real group boundaries, asserted by action rather than by index, so renaming or
-    /// reordering *within* a group doesn't churn this test but moving a row *across* one does.
     #[test]
     fn each_target_groups_its_actions_the_way_the_issue_describes() {
         let grouped = |target: &ContextTarget| -> Vec<Vec<MenuAction>> {
@@ -378,8 +356,6 @@ mod tests {
         assert_eq!(ContextTarget::Empty.destination_dir(root), root);
     }
 
-    /// Dividers go *between* groups and nowhere else - never leading, never trailing, never two
-    /// in a row - and the rows they separate stay in issue #19 §1's order.
     #[test]
     fn dividers_only_ever_sit_between_two_real_groups() {
         for target in [

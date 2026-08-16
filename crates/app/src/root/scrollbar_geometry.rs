@@ -2,14 +2,6 @@
 //! #30). Deliberately `gpui`-free (plain `f32`s, not `gpui::Pixels`), mirroring
 //! `crate::root::layout`'s own split between pure clamp math and the GPUI call sites that
 //! convert to/from `Pixels` - see that module's docs for the precedent this follows.
-//!
-//! The three functions below are the same real relationship
-//! `vendor/zed/crates/gpui/examples/list_example.rs` demonstrates against a live
-//! `gpui::ListState` (`max_offset_for_scrollbar`/`scroll_px_offset_for_scrollbar`/
-//! `viewport_bounds`), just factored out so it can be verified once, directly, without a live
-//! GPUI window - and reused identically for both axes (vertical/horizontal) and both of GPUI's
-//! real scroll-handle kinds (`gpui::ScrollHandle`, `gpui::UniformListScrollHandle`) rather than
-//! four hand-copied variants of the same three formulas.
 
 /// The smallest a thumb is ever allowed to shrink to, in pixels - without a floor, a very long
 /// document (thousands of lines) would shrink the thumb into an unclickable sliver.
@@ -23,11 +15,6 @@ pub const MIN_THUMB_LENGTH: f32 = 28.0;
 /// the viewport's own length (a document that fits without scrolling never reaches this function
 /// at all - see [`super::scrollbar`]'s "not scrollable" gate - but the cap keeps this function
 /// itself total for any input rather than relying on that caller-side guard).
-///
-/// `content = viewport + max_offset` - GPUI's own `ScrollHandle::max_offset()` is "how much
-/// further the view can scroll", not the content's total length, so the total is reconstructed
-/// from the two the same way `list_example.rs`'s own `total_height = viewport_height +
-/// max_offset` does.
 pub fn thumb_length(viewport: f32, max_offset: f32) -> f32 {
     let viewport = viewport.max(0.0);
     let max_offset = max_offset.max(0.0);
@@ -145,7 +132,6 @@ mod tests {
         let viewport = 400.0;
         let max_offset = 1200.0;
         let thumb = thumb_length(viewport, max_offset);
-        // Pointer at exactly `track_start + thumb/2` centers the thumb there, i.e. offset 0.
         assert_eq!(
             offset_for_pointer(viewport, max_offset, 0.0, thumb / 2.0),
             0.0

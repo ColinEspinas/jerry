@@ -1,37 +1,5 @@
 //! Real, on-disk persistence for what Jerry learned about each agent from its hooks (GitHub
 //! issue #239, phase 2 - groundwork for issue #227).
-//!
-//! ## What this is for, and what it deliberately is not
-//!
-//! Issue #227 ("Agent history and resume/recover") wants to show past and closed agents and let a
-//! user resume them. That needs real, structured data about agents that are no longer running -
-//! and until hooks existed, Jerry had none worth persisting: a status derived from pty silence is
-//! a guess, and a guess written to disk is still a guess an hour later.
-//!
-//! A hook fact is different. "This agent finished its turn at 14:32, its last tool call was
-//! `Edit: src/auth.rs`" is a real, dated, structured statement the agent itself made. That is
-//! worth keeping, so this module keeps it as it is learned.
-//!
-//! **Originally, no UI read this back** - browsing and resuming past agents was left as issue
-//! #227's job, deliberately out of this phase's scope, so the module existed purely so that work
-//! would have real data to build on rather than having to invent a capture mechanism first. Issue
-//! #227's read side is [`crate::hooks::history`] (the plain `AgentStatusState` -> UI-facing
-//! `PastAgent` list) and the rail's own history rows - this module remains the write/persistence
-//! half only, unchanged in shape by that later work.
-//!
-//! ## Everything about the file format mirrors `crate::review::baseline_state`
-//!
-//! Same directory (a sibling of the real `settings.toml`), same `BTreeMap` for a stable diffable
-//! file, same lossless `utf8:`/`bytes:` worktree encoding, same atomic write (temp sibling,
-//! `sync_all`, rename, directory sync), and the same merge-on-save under
-//! `crate::persisted_state_lock::with_locked_merge` so a second Jerry instance can't erase this
-//! one's records. The keys are even the same [`crate::review::state::baseline_key`] values, so
-//! [`crate::hooks::history`] can join a persisted status straight onto its review baseline without
-//! a translation table.
-//!
-//! Like `baseline_state` and unlike its other siblings, a key absent from memory is **not**
-//! deleted from disk on save: this is history, and an agent the user closed is exactly the agent
-//! issue #227 most wants to show.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -46,9 +14,6 @@ use crate::rail::status::Status;
 pub const AGENT_STATUS_FILE_NAME: &str = "agent-status.toml";
 
 /// How many agent records are kept - see [`AgentStatusState::prune_to_most_recent`].
-///
-/// Generous for a history UI (issue #227) while keeping the file small enough that rewriting it
-/// on every status change stays cheap.
 pub const MAX_RECORDED_AGENTS: usize = 500;
 
 /// The status file for a given real settings-file path - identical reasoning to
@@ -89,10 +54,6 @@ pub struct PersistedAgentStatus {
     pub session_id: Option<String>,
     /// The run's **title** - the first prompt its human typed, off a real `UserPromptSubmit`
     /// payload (GitHub issue #227, `crate::hooks::event::HookReport::prompt`).
-    ///
-    /// `None` for a run whose hooks never caught one, which History renders as the honest
-    /// fallback rather than inventing a task description - see
-    /// `crate::run_history::model::RunRecord::title_line`.
     pub title: Option<String>,
     /// How many turns this run really completed - one per `Stop`
     /// (`crate::hooks::server::HookRecord::turns`). `0` for a run that ended inside its first
@@ -103,35 +64,17 @@ pub struct PersistedAgentStatus {
     /// When this run really **ended**, as seconds since the Unix epoch - set once, by
     /// `crate::run_history::flow::AdeApp::finish_run_record`, at the moment the agent's pane was
     /// actually closed in this app.
-    ///
-    /// This is the field that distinguishes the two genuinely different endings a record can
-    /// have, and the whole reason `abandoned` is a real outcome rather than a guess: `Some` means
-    /// Jerry watched the run end and knows how it ended; `None` means the record simply stopped
-    /// being updated - the app quit, the machine slept, the hooks stopped firing - and nobody
-    /// ever saw it finish. See `crate::run_history::model::Outcome::of`.
     pub ended_at_unix: Option<i64>,
     /// The real review diffstat measured against this run's own baseline at the moment it ended
     /// (`wt_core::review::diff_against_tree` through
     /// `crate::run_history::flow::AdeApp::finish_run_record`) - what *this run* changed, not what
     /// the worktree currently contains.
-    ///
-    /// All three are `Some` together or `None` together: they come from one measurement, and a
-    /// header printing a file count beside a blank diffstat would be reporting half of one fact.
-    /// `None` whenever that measurement could not be made - no baseline was captured, or the
-    /// `git diff` failed - which the transcript header renders by omitting the diffstat rather
-    /// than by printing zeros.
     pub files_changed: Option<u32>,
     pub insertions: Option<u32>,
     pub deletions: Option<u32>,
 }
 
 /// One live agent's currently-known state, as [`AgentStatusState::set`] takes it.
-///
-/// A struct rather than nine positional parameters (which is what this was, complete with an
-/// `#[allow(clippy::too_many_arguments)]`): GitHub issue #227 added two more fields to it, and at
-/// eleven positional arguments - four of them `Option<String>` - a caller swapping `activity` and
-/// `question`, or `title` and `session_id`, would compile silently and write the wrong thing to
-/// disk forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveRun<'a> {
     pub worktree: &'a Path,
@@ -212,10 +155,6 @@ impl PersistedAgentStatus {
 }
 
 /// The stable on-disk spelling of a [`Status`].
-///
-/// A dedicated mapping rather than `#[derive(Serialize)]` on [`Status`] itself: the file is a
-/// compatibility surface a future issue #227 release must still be able to read, and deriving it
-/// would silently couple the file format to an enum this codebase renames freely.
 pub fn status_key(status: Status) -> &'static str {
     match status {
         Status::Ask => "ask",
@@ -308,9 +247,6 @@ impl AgentStatusState {
 
     /// The app's real write path: merges the entries this instance owns into whatever is on disk,
     /// then writes the result.
-    ///
-    /// Like `ReviewBaselineState::save_merged_at`, a key absent from `self` is left alone rather
-    /// than deleted - see the module docs on this being history.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = AgentStatusState::load_at(path);
@@ -326,11 +262,6 @@ impl AgentStatusState {
 
     /// Records one agent's real, current hook-derived state. Returns whether anything actually
     /// changed, so a caller can skip an otherwise pointless disk write on every render.
-    ///
-    /// The end-of-run half of the record ([`PersistedAgentStatus::ended_at_unix`] and the
-    /// diffstat) is deliberately carried over from whatever is already stored rather than reset:
-    /// this function only ever describes a *live* agent, and it must never be able to un-finish a
-    /// run that really finished.
     pub fn set(&mut self, key: String, run: LiveRun<'_>, now_unix: i64) -> bool {
         let existing = self.agents.get(&key);
         let record = PersistedAgentStatus {
@@ -371,13 +302,6 @@ impl AgentStatusState {
 
     /// Marks an already-recorded run as really **ended**, at `ended_at_unix`, with whatever was
     /// measured about it at that moment (GitHub issue #227). Returns whether anything changed.
-    ///
-    /// A no-op returning `false` for a key this state has never recorded, and that is the
-    /// contract, not a shortcut: [`crate::hooks::flow::AdeApp::record_agent_statuses`] only ever
-    /// records agents that produced a real hook fact (see its own docs on why a status inferred
-    /// from pty silence is not worth persisting), so an agent with no record here is one Jerry
-    /// never knew anything real about. Inventing an entry for it at close time would put a run in
-    /// History whose every field was a guess.
     pub fn finish(&mut self, key: &str, ended_at_unix: i64, run: FinishedRun) -> bool {
         let Some(record) = self.agents.get_mut(key) else {
             return false;
@@ -418,16 +342,6 @@ impl AgentStatusState {
     }
 
     /// Keeps only the `limit` most recently updated records, dropping the oldest.
-    ///
-    /// This file is history and never deletes a key on its own (see the module docs), which on its
-    /// own means unbounded growth: every agent ever run adds a permanent entry, and the whole file
-    /// is re-serialised and `fsync`ed - under the process-wide persistence lock - on every change.
-    /// A user who runs a few dozen agents a day would be rewriting an ever-larger file forever.
-    ///
-    /// Trimming by `updated_at_unix` keeps exactly what GitHub issue #227 would want to show
-    /// first - the most recent agents - and discards the tail no history UI would realistically
-    /// page back to. Applied at save time rather than on insert so a merge that pulls in another
-    /// instance's records is bounded too.
     pub fn prune_to_most_recent(&mut self, limit: usize) {
         if self.agents.len() <= limit {
             return;
@@ -504,7 +418,6 @@ mod tests {
 
     #[test]
     fn an_unchanged_status_reports_no_change_so_it_never_rewrites_the_file() {
-        // `set` is called from a render-frequency path; without this it would fsync constantly.
         let mut state = AgentStatusState::default();
         let key = key_for("/repo/wt-a", 10);
         let run = || {
@@ -520,7 +433,6 @@ mod tests {
             "only the timestamp differs - this must not count as a change"
         );
 
-        // A real status change does count.
         let key2 = key.clone();
         assert!(state.set(
             key2,
@@ -559,7 +471,6 @@ mod tests {
 
     #[test]
     fn saving_merges_rather_than_clobbering_another_instances_records() {
-        // The real hazard: two Jerry instances sharing one `~/.config/jerry`.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(AGENT_STATUS_FILE_NAME);
 
@@ -610,7 +521,6 @@ mod tests {
         let owned: BTreeSet<String> = std::iter::once(key.clone()).collect();
         state.save_merged_at(&path, &owned).expect("save");
 
-        // Now the agent is gone from memory, but still "owned" by this instance.
         let empty = AgentStatusState::default();
         empty.save_merged_at(&path, &owned).expect("save");
 
@@ -620,8 +530,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #227: the end-of-run half of a record survives a real file round trip, and
-    /// carries exactly what was measured - no fabricated zeros for what was not.
     #[test]
     fn a_finished_run_really_round_trips_with_its_ending_and_its_diffstat() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -683,8 +591,6 @@ mod tests {
         assert_eq!(record.deletions, Some(0));
     }
 
-    /// The contract that keeps History honest: an agent Jerry never learned anything real about
-    /// gets no record at close time either - `finish` refuses to invent one.
     #[test]
     fn finishing_a_run_that_was_never_recorded_invents_nothing() {
         let mut state = AgentStatusState::default();
@@ -702,8 +608,6 @@ mod tests {
         );
     }
 
-    /// A later live poll must never be able to un-finish a run that really finished, nor lose the
-    /// measurement taken when it did.
     #[test]
     fn a_later_live_record_cannot_erase_a_runs_real_ending() {
         let mut state = AgentStatusState::default();
@@ -737,8 +641,6 @@ mod tests {
         assert_eq!(record.deletions, Some(4));
     }
 
-    /// A file written before GitHub issue #227 added these fields must still load, with the new
-    /// fields reading as "not known" rather than as zeros that would render as real facts.
     #[test]
     fn a_file_written_before_the_run_fields_existed_still_loads() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -787,7 +689,6 @@ mod tests {
         state.prune_to_most_recent(MAX_RECORDED_AGENTS);
         assert_eq!(state.agents.len(), MAX_RECORDED_AGENTS);
 
-        // The most recent survive; the oldest are the ones dropped.
         let newest = key_for(
             &format!("/repo/wt-{}", MAX_RECORDED_AGENTS as i64 + 24),
             MAX_RECORDED_AGENTS as i64 + 24,

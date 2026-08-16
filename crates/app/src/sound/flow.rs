@@ -3,64 +3,6 @@
 //! existing status-poll tick, `crate::rail::render::AdeApp::start_status_polling`), but every
 //! decision that doesn't need a live `AdeApp`/`Context` lives here as plain functions so it's
 //! testable without GPUI or an audio device.
-//!
-//! ## Why not `crate::hooks::flow::AdeApp::record_agent_statuses`
-//!
-//! That function already computes a "did this agent's status really change" bool per agent on
-//! this same poll tick, which looks like a ready-made transition detector. It isn't a usable one
-//! here: it returns early whenever `agent_status_path` is `None`, and even when it runs, it only
-//! considers agents with a *fresh Claude Code hook fact* (`hooks/flow.rs`'s own `recordable`
-//! filter) - a Codex agent, or a Claude agent whose hooks haven't fired yet, is invisible to it by
-//! construction. A sound module that only ever notices half the agents would be worse than
-//! useless, so this reads every agent's live [`crate::rail::status::Status`] independently
-//! instead.
-//!
-//! ## What counts as a transition
-//!
-//! Three edges matter:
-//!
-//! - anything -> [`Status::Ask`] triggers [`SoundEventKind::AgentNeedsInput`]
-//! - the agent's own [`HookFact::TurnEnded`] fact newly becoming fresh triggers
-//!   [`SoundEventKind::AgentFinished`] - see "Why `AgentFinished` needs its own signal" below
-//! - anything -> [`Status::Review`] (reached some other way than the fact above, e.g. a plain
-//!   process exiting 0 with a real diff) also triggers [`SoundEventKind::AgentFinished`]
-//!
-//! Deliberately not anything -> [`Status::Idle`]: `Idle` is reached both by a real "turn ended,
-//! nothing to review" *and* by the pty-silence heuristic that also produces every other quiescent
-//! moment - `crate::hooks::flow`'s own docs already call a status derived from pty silence "a
-//! guess". A sound module playing on a guess is worse than one that stays quiet on a real (but
-//! diff-less) turn ending - see the issue's own "assumed trade-offs" for this call.
-//!
-//! An agent seen for the first time (present in the "current" snapshot but absent from
-//! "previous") never sounds - see [`crate::root::AdeApp::play_agent_status_sounds`]'s own
-//! "seeded" flag for why a *whole app launch* with agents already open must not replay every one
-//! of their statuses as a burst of transitions.
-//!
-//! ## Why `AgentFinished` needs its own signal, not just `-> Status::Review`
-//!
-//! `Status::Review` (`crate::rail::status::derive_status`) requires three things at once: a real
-//! `HookFact::TurnEnded` (or a clean process exit), a non-empty *unreviewed* diff against the
-//! agent's own baseline, and - via `crate::review::flow::AdeApp::agent_has_unreviewed_changes` -
-//! that this agent is currently the *only* one open in its worktree
-//! (`crate::work_surface::agents::Agents::is_sole_agent_in_worktree`). Every window starts with a
-//! shell already open in the repo, so spawning a Claude agent into that same worktree makes two
-//! agents there - the single-agent gate then never opens for it, and `AgentFinished` could never
-//! fire at all. `Status::Ask`, by contrast, is reachable by the plain quiescence heuristic alone,
-//! with none of those three conditions - which is why "needs input" sounded correctly while
-//! "finished" silently never did.
-//!
-//! The fix reads a stronger, earlier signal instead: `HookFact::TurnEnded` itself, the moment
-//! Claude Code's own `Stop` hook reports it, on its **rising edge** - a fact that stays fresh
-//! across several ticks (`crate::hooks::event::HOOK_SIGNAL_TTL`) never re-sounds. This is the
-//! agent stating outright "my turn just ended", independent of whether there happens to be a
-//! reviewable diff or a second agent sharing its worktree. It is also gated on
-//! [`crate::work_surface::agents::ProcessKind::is_agent_session`], the same guard
-//! `crate::rail::status::derive_status` applies to every hook-derived fact, so a plain shell
-//! (which never receives hooks) can never trigger it. A Codex agent has no hook channel at all,
-//! so for it `AgentFinished` still only ever arrives via the older `-> Status::Review` path.
-//!
-//! A falling edge (the fact expiring after 30 minutes with nothing else happening) is explicitly
-//! *not* a transition worth sounding for - see [`sound_for_transition`]'s own doc comment.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -352,10 +294,6 @@ mod tests {
         }
     }
 
-    /// The module docs' central fix: a fresh `TurnEnded` fact triggers `AgentFinished` on its own
-    /// rising edge, even while `status` itself stays put at `Idle` - the exact real-world case
-    /// (a Claude agent sharing its worktree with a shell, so `Status::Review`'s single-agent gate
-    /// never opens) that used to leave this event permanently silent.
     #[test]
     fn a_fresh_turn_ended_fact_triggers_agent_finished_even_with_no_status_change() {
         assert_eq!(
@@ -364,9 +302,6 @@ mod tests {
         );
     }
 
-    /// The same rising edge also outranks whatever `status` did on the same tick - even a
-    /// coincident move into `Ask` doesn't shadow it, since the fact is checked first and returns
-    /// unconditionally.
     #[test]
     fn a_fresh_turn_ended_fact_wins_even_alongside_a_move_into_ask() {
         assert_eq!(
@@ -386,10 +321,6 @@ mod tests {
         );
     }
 
-    /// The fact's falling edge (it merely expired, `HOOK_SIGNAL_TTL` elapsed with no new fact) is
-    /// not itself an event, even if `status` also moved into `Ask` on the same tick as the
-    /// quiescence heuristic resumes - see the module docs' "A falling edge ... is explicitly not
-    /// a transition" note.
     #[test]
     fn turn_ended_expiring_never_sounds_even_alongside_a_move_into_ask() {
         assert_eq!(
@@ -558,11 +489,6 @@ mod adeapp_tests {
         });
     }
 
-    /// The very first status-poll tick after a window opens must never play a sound, no matter
-    /// what state its one already-open agent (the real startup shell,
-    /// `AdeApp::new_with_settings`'s own "a fresh window starts with one shell" - see that
-    /// method's docs) happens to be in - see the module docs' "An agent seen for the first time"
-    /// section.
     #[gpui::test]
     fn the_first_tick_seeds_without_ever_setting_last_sound_at(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -589,9 +515,6 @@ mod adeapp_tests {
         });
     }
 
-    /// Two ticks in a row, with nothing about the real agent having changed in between, must
-    /// never produce a sound - there is no real transition to detect, only the same status
-    /// re-observed.
     #[gpui::test]
     fn two_ticks_with_no_real_change_never_set_last_sound_at(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

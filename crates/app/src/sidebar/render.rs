@@ -13,11 +13,6 @@ use gpui::SharedString;
 use std::time::Instant;
 
 /// How much extra the Changes panel's `gpui::list` measures above and below the viewport.
-///
-/// One run row's worth (`theme::band::RUN_ROW`, the tallest row the panel has), so the first row
-/// scrolling into view is already measured and the list does not pop. Deliberately small: overdraw
-/// is real work done for rows nobody is looking at, and the whole point of virtualizing this list
-/// is not doing that work.
 pub(crate) const CHANGES_LIST_OVERDRAW: gpui::Pixels = px(48.0);
 
 /// git's own conventional short form of a commit id, for a label that only has room for one.
@@ -52,15 +47,6 @@ impl AdeApp {
     /// always recomputes the diff (`Self::refresh_diff`, not just `cx.notify()`) rather than
     /// showing whatever was last loaded - a stale snapshot from when the worktree was first
     /// selected would silently hide changes an agent just made.
-    ///
-    /// `refresh_diff`, not `load_diff`: a live report ("when going to the changes pane it is
-    /// first empty and then fills up") traced to exactly this call unconditionally resetting
-    /// `Self::diff_state`/`Self::uncommitted_diff`/`Self::branch_commits` to `Loading` before
-    /// every single switch into Changes, even when the worktree hadn't changed and the panel's
-    /// last real answer was still perfectly good to keep showing while a fresh one loaded.
-    /// `refresh_diff` runs the identical real background reload without that synchronous blank -
-    /// see its own docs for why that is safe specifically because this call site never changes
-    /// `Self::diff_root`.
     pub(crate) fn set_right_sidebar_view(
         &mut self,
         view: RightSidebarView,
@@ -160,15 +146,6 @@ impl AdeApp {
     /// two hand-copied bodies, log string and all). Returns whether the persisted state changed,
     /// leaving the caller to decide when to write and when to notify: a reveal touches a whole
     /// ancestor chain and wants one write for all of it, not one per level.
-    ///
-    /// The tree still expands when the state is *refusable* (a non-UTF-8 path, which has no
-    /// honest TOML key - see `fold_state::worktree_key`): silently declining to open a folder
-    /// because of how its name is encoded would be a far worse outcome than not remembering that
-    /// it was opened. But it says so in the log rather than leaving the live tree and the file
-    /// quietly disagreeing.
-    ///
-    /// Uses the cached [`AdeApp::fold_state_root_key`], never `fold_state::worktree_key` - see
-    /// that field's docs for the blocking-syscall-per-click this avoids.
     pub(in crate::sidebar) fn record_dir_expanded(&mut self, path: &Path, expanded: bool) -> bool {
         if expanded {
             self.expanded_dirs.insert(path.to_path_buf());
@@ -240,9 +217,6 @@ impl AdeApp {
     /// (`Self::open_palette_file_result`) and a just-created file (`Self::create_new_file`),
     /// both of which would otherwise point at a row hidden inside a collapsed parent now that
     /// the tree starts collapsed.
-    ///
-    /// `path` itself is deliberately not expanded when it happens to be a directory: revealing
-    /// something means making it visible, not opening it.
     pub(crate) fn reveal_in_tree(&mut self, path: &Path, cx: &mut Context<Self>) {
         let root = self.file_tree_root.clone();
         let mut changed = false;
@@ -271,13 +245,6 @@ impl AdeApp {
     /// just finished loading (issue #18 §2 - "stale entries are silently ignored and pruned,
     /// never an error"). Called from `Self::load_file_tree`'s completion handler, which has
     /// already checked that the walk it is applying belongs to the current root.
-    ///
-    /// Only ever prunes against a walk that is genuinely *complete*
-    /// ([`file_tree::FileTreeListing::is_complete`]). A walk that stopped at its entry cap - or
-    /// that silently skipped a directory it couldn't read, which the walk does deliberately so
-    /// one unreadable folder can't blank the whole sidebar - is not evidence that the
-    /// directories it never reached are gone. Pruning against either would permanently delete
-    /// perfectly good state, since the prune is written straight back to disk.
     pub(crate) fn prune_stale_fold_state(&mut self, cx: &mut Context<Self>) {
         if !self.file_tree_complete {
             return;
@@ -302,25 +269,6 @@ impl AdeApp {
     /// Toggles a file's staged state (Revision R12 §5: the checkbox **is** staging) - the
     /// Changes row checkbox's click handler. `Self::render_change_row` stops propagation at the
     /// call site so checking a box never also opens that file's diff.
-    ///
-    /// Real, immediate git staging, not a UI-only intent recorded for later: checking the box
-    /// runs a real `git add -- <path>` (`wt_core::stage::stage_path`); unchecking it runs a real
-    /// `git reset -- <path>` (`wt_core::stage::unstage_path`) - the design's own "the checkbox
-    /// **is** staging" framing, taken literally. [`Self::staged_files`] flips optimistically,
-    /// synchronously, in the same click (so the checkbox visibly responds with no perceptible
-    /// delay) and the real git mutation runs on the background executor right after, matching
-    /// every other real git-mutating action in this app
-    /// (`crate::worktree_history::flow`'s own "never block the foreground thread" discipline).
-    ///
-    /// If the real git call fails, the optimistic flip is reverted (back to whatever
-    /// [`Self::staged_files`] would have read before this click) and the real error is recorded
-    /// in [`Self::changes_row_error`] - never left as a silent success that only *looked* like it
-    /// worked. A late-resolving revert can theoretically race a newer click on the *same* path
-    /// that started after this one failed (e.g. stage, fail, immediately re-stage by hand before
-    /// the failure's `this.update` runs) and clobber that newer click's own optimistic state;
-    /// this is accepted as a rare, honest tradeoff rather than added generation-counter machinery
-    /// for a failure mode (a `git add`/`git reset` on a path this app itself just resolved from a
-    /// real, loaded diff) that real-repo testing never actually produces.
     pub(in crate::sidebar) fn toggle_staged(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let should_stage = !self.staged_files.remove(&path);
         if should_stage {
@@ -427,10 +375,6 @@ impl AdeApp {
     /// showing up - correctly, since it is still an uncommitted-relative-to-`main` change worth
     /// reviewing, only now with its content latched into a real commit instead of sitting
     /// uncommitted.
-    ///
-    /// No `Undo`/`Redo` integration yet, unlike the other four `worktree_history_op_in_flight`
-    /// operations - a real, stated gap (see `wt_core::undo::commit_paths`'s own docs), not a
-    /// fake "undo" that would only look like it worked.
     pub(in crate::sidebar) fn commit_staged_files(&mut self, cx: &mut Context<Self>) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
@@ -487,9 +431,6 @@ impl AdeApp {
 
     /// The staged subset of the **uncommitted** scope, as real paths - `None` when nothing is
     /// staged, which is the one shape every commit-composer action's guard wants.
-    ///
-    /// The uncommitted scope, not the merge-base diff: staging acts on the working tree, and a
-    /// path whose only difference from `main` is already committed has nothing there to stage.
     pub(in crate::sidebar) fn staged_uncommitted_paths(&self) -> Option<Vec<PathBuf>> {
         let diff = self.uncommitted_diff.loaded()?;
         let staged = changes::staged_subset(&diff.files, &self.staged_files);
@@ -501,16 +442,6 @@ impl AdeApp {
 
     /// The message every commit path in this composer writes - the user's own typed text,
     /// verbatim, and nothing else.
-    ///
-    /// There used to be an auto-derived fallback here ("Update `<path>`"/"Update `N` files"),
-    /// live-recomputed from [`Self::staged_files`] whenever nothing had been typed yet. Removed
-    /// per explicit product decision: a focused, untouched box would silently repaint a
-    /// *different* string - and visibly move its caret between the before-empty-placeholder and
-    /// after-real-text positions - purely because staging state changed elsewhere, never because
-    /// the user touched this input at all ("why does the caret change once we stage a file? ...
-    /// just use a normal message input the user has to fill"). One stable input, exactly like
-    /// every other real text field in this app: it shows what was typed into it and nothing it
-    /// wasn't.
     pub(in crate::sidebar) fn staged_commit_message(&self) -> String {
         self.commit_message.as_str().to_string()
     }
@@ -580,12 +511,6 @@ impl AdeApp {
 
     /// Whether `action` can really run right now, and - when it cannot - the reason, stated on the
     /// row itself.
-    ///
-    /// `REVISION-2026-08-14.md` §7 rule 1: "Ship the affordance with the behaviour, or ship
-    /// neither." Every row in this menu is now backed by a real `wt_core` call, so what is left to
-    /// get right is that a row which *cannot* act says so instead of looking clickable - and says
-    /// *why*, in the same "the reason on the button itself" shape §1 rule 3 specifies for the
-    /// Merge gate.
     pub(in crate::sidebar) fn commit_menu_availability(
         &self,
         action: CommitMenuAction,
@@ -808,16 +733,6 @@ impl AdeApp {
     /// rect-composed folder/language-chip icons (see [`render_folder_icon`]/
     /// [`render_lang_chip`], never emoji or an SVG pipeline), collapse/expand (see
     /// [`Self::toggle_dir_expanded`]/`crate::sidebar::file_tree::visible_entries`).
-    ///
-    /// **Scrolling lives here, not in the caller.** This list is a `gpui::uniform_list`, which
-    /// sets its own `overflow.y = Scroll` and owns the scroll offset
-    /// (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`'s `uniform_list()`), so
-    /// `Self::render_right_sidebar` deliberately does *not* wrap it in a second
-    /// `overflow_y_scroll()` container any more. It used to, back when this was an eager
-    /// `flex_col` of every row: an outer scroller plus a naturally-grown child was the only way
-    /// to scroll then, and re-adding one now would let this list expand to its full virtual
-    /// height inside that outer scroller, silently undoing the virtualization while still
-    /// *looking* correct.
     pub(in crate::sidebar) fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Both early returns keep their own scroll box. `Self::render_right_sidebar`'s Files arm
         // can no longer be a scroller itself (the `uniform_list` below owns scrolling), but
@@ -1032,23 +947,6 @@ impl AdeApp {
     /// The tree's real *outer* element - the one node that carries keyboard focus, the
     /// `"file-tree"` key context every tree keybinding is scoped to, the empty-area right-click,
     /// and the `gpui::canvas` that records where the tree is painted (GitHub issue #19 §1).
-    ///
-    /// Wrapping every arm of [`Self::render_file_tree`] - including the "(empty directory)" and
-    /// unreadable-directory messages - rather than only the list arm is deliberate: an empty
-    /// directory is precisely when "right-click → New file" matters most, and a tree that lost
-    /// its focus target whenever a walk failed would silently disable every one of its
-    /// keybindings until the next successful walk.
-    ///
-    /// While an inline name editor is open the context string gains *two* more words,
-    /// `"tree-editing"` and `"text-input"`. The first is the real mechanism that stops
-    /// `Ctrl+C`/`Ctrl+X`/`Ctrl+V`/`F2`/`Shift+F10` from firing while the user is typing a name -
-    /// see `crate::sidebar::tree_ops`'s module docs and `crate::default_key_bindings`' own
-    /// entries for why an extra context word is used rather than conditionally omitting the
-    /// bindings. The second is what routes `Ctrl+Z` mid-filename to `TextUndo`.
-    ///
-    /// The literals themselves come from `crate::keymap_overrides::file_tree_key_context`, which
-    /// `real_context_stacks()` also calls, so the renderer and the enumeration every scoping
-    /// claim rests on cannot drift apart. That function's docs carry the reasoning.
     fn file_tree_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Space-separated context *words*, which is what `KeyBindingContextPredicate`'s
         // identifier terms match against - so `Some("file-tree && !tree-editing")` really does
@@ -1135,13 +1033,6 @@ impl AdeApp {
 
     /// The rows [`Self::render_file_tree`]'s `uniform_list` will build, and the indent depth the
     /// inline editor row (if any) should be drawn at.
-    ///
-    /// A rename *replaces* its target's row - the editor is that row, for as long as it's open.
-    /// A New File / New Folder editor is *inserted* immediately after its parent folder's row, at
-    /// one level deeper, which is where the created entry itself will appear. An editor whose
-    /// anchor isn't in the visible list (a new entry in the worktree root, which has no row of
-    /// its own; or an anchor a fresh walk no longer lists) goes to the top of the list rather
-    /// than being dropped - see [`Self::render_file_tree`]'s own docs.
     fn file_tree_rows(&self, visible_indices: &[usize]) -> (Vec<TreeRow>, usize) {
         let mut rows: Vec<TreeRow> = visible_indices
             .iter()
@@ -1187,12 +1078,6 @@ impl AdeApp {
     /// The inline name editor's row (issue #19 §2) - a real, append/backspace-only text field
     /// drawn at `depth`'s indentation, with the typed name, a caret, and the real rejection hint
     /// when one applies.
-    ///
-    /// It has no focus handle of its own: keystrokes reach it through
-    /// [`Self::file_tree_shell`]'s `on_key_down`, which the tree's own focus already delivers.
-    /// One focus target for the tree and its editor is what makes the
-    /// `"file-tree tree-editing"` context switch above a single, honest fact rather than two
-    /// handles that could disagree about which is focused.
     fn render_tree_inline_edit_row(
         &self,
         depth: usize,
@@ -1679,13 +1564,6 @@ impl AdeApp {
     /// the real `+n`/`−n` totals across the currently loaded diff, summed from the same real
     /// per-file stats (`crate::sidebar::changes::diff_file_stats`) the Changes rows themselves
     /// show.
-    ///
-    /// The three segments are **icons**, not text - `STAGE-A-CHANGELOG.md` §4w: "`Files` /
-    /// `Search` / `Changes` were the only text tabs left in a window whose left strip is already
-    /// iconographic. Now three 26x19 buttons in the same segmented shell, selected state
-    /// unchanged, each with a tooltip carrying the old label plus its old hint." The tooltip
-    /// strings below are `Jerry.dc.html`'s own `title` attributes on those three buttons,
-    /// transcribed rather than paraphrased.
     pub(in crate::sidebar) fn render_right_sidebar_toggle(
         &self,
         cx: &mut Context<Self>,
@@ -1864,12 +1742,6 @@ impl AdeApp {
     /// `design_handoff_jerry_ade/README.md`'s Changes spec ("Header 7/12 ... Footer 29"). Both
     /// list arms wrap their list in a plain `flex_1().min_h_0()` column, so a long list scrolls
     /// under its own pinned header/footer instead of pushing them off-screen.
-    ///
-    /// The scrolling itself belongs to the list, not to that wrapper - see
-    /// [`Self::render_file_tree`]'s docs for why re-adding an `overflow_y_scroll()` here would
-    /// silently undo the virtualization. Only the two *message-only* arms (no list at all) are
-    /// scrollers in their own right; [`scrollable_sidebar_message`] covers the equivalent cases
-    /// inside [`Self::render_file_tree`].
     pub(crate) fn render_right_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The git graph tab (GitHub issue #1, phase (a)) replaces this whole panel with Commit/
         // Branches while it's focused - design spec §5 ("Files/Changes is replaced by Commit |
@@ -1947,11 +1819,6 @@ impl AdeApp {
     /// The real base branch the panel's Commits and Against-main sections are scoped to, or `None`
     /// when git could not detect one (this worktree *is* the default branch, no default branch
     /// exists, or the histories are unrelated - see `wt_core::diff::DiffBase::NoBase`).
-    ///
-    /// Read from the loaded `Commits` scope rather than the merge-base diff's own `base_branch`:
-    /// `WorktreeDiff::base_branch` is a *label* that falls back to the worktree's own branch when
-    /// there is no real base (see `wt_core::diff::compute_diff`'s `label_branch`), so reading it
-    /// would let the Against-main header claim a base that does not exist.
     pub(in crate::sidebar) fn changes_base_branch(&self) -> Option<&str> {
         self.branch_commits
             .loaded()
@@ -1960,10 +1827,6 @@ impl AdeApp {
 
     /// The Runs section's rows: one per real agent session open in this worktree, with its
     /// diffstat read straight off the uncommitted change set's own per-author partition.
-    ///
-    /// A shell is not a run and is filtered out (`ProcessKind::is_agent_session`) - it has no
-    /// durable agent key, writes nothing the provenance store attributes, and would render a row
-    /// permanently reading `no files yet`.
     pub(in crate::sidebar) fn changes_run_rows(&self, cx: &gpui::App) -> Vec<sections::RunRow> {
         let sources: Vec<sections::RunSource> = self
             .current_worktree_agents()
@@ -2006,11 +1869,6 @@ impl AdeApp {
     /// [`sections::SectionRow::section`] into [`Self::render_changes_sections`]' shared scroller
     /// (Uncommitted, Commits, Against main) and [`Self::render_changes_runs_section`]'s own
     /// pinned-bottom well (Runs), rather than rendered as one flat list itself.
-    ///
-    /// Every section's body is built whether or not the section is open, so its header can state a
-    /// true count while collapsed; only an **open** section's body is actually pushed. That is
-    /// what makes `SectionHeader::count` and the number of rows the section renders the same
-    /// number by construction rather than by two counters agreeing - see that field's own docs.
     pub(in crate::sidebar) fn changes_section_rows(
         &self,
         cx: &gpui::App,
@@ -2205,10 +2063,6 @@ impl AdeApp {
     }
 
     /// One section's header diffstat.
-    ///
-    /// Runs is summed over the very rows it is about to render, so the header can never claim a
-    /// total its own rows do not add up to. The other three read the one stored total their scope
-    /// already has.
     fn changes_section_stat(
         &self,
         section: sections::ChangesSection,
@@ -2249,13 +2103,6 @@ impl AdeApp {
     /// is deliberately excluded - it renders in its own pinned-bottom well,
     /// [`Self::render_changes_runs_section`], matching `Jerry.dc.html` line 1433's own separate
     /// `max-height:170px;overflow-y:auto` wrapper rather than sharing this scroller.
-    ///
-    /// `gpui::list`, not the `uniform_list` this panel used to use, for one structural reason: even
-    /// with Runs split out, these three sections still put a 24px header and a 27px file row in the
-    /// same scroller, and `uniform_list` sizes **every** slot from item 0's measured height. `gpui::
-    /// list` is GPUI's own variable-height virtualized list and is still genuinely virtualized: it
-    /// builds only the items its viewport (plus [`Self::CHANGES_LIST_OVERDRAW`]) actually covers,
-    /// which `virtualization_tests` asserts against a live render exactly as it did before.
     pub(in crate::sidebar) fn render_changes_sections(
         &self,
         cx: &mut Context<Self>,
@@ -2320,11 +2167,6 @@ impl AdeApp {
     /// overflow-y:auto` wrapper, which sits *outside* the shared scroller the other three
     /// sections share rather than as a fourth entry inside it (the user: "run row should be
     /// pinned to the bottom and not to the top look at the design").
-    ///
-    /// Plain `.overflow_y_scroll()`, not `gpui::list`: Runs holds one row per agent open in this
-    /// worktree - genuinely few, unlike the shared scroller's many file rows across three
-    /// sections - so it needs no virtualization, the same reasoning the status bar's own
-    /// capped-and-scrollable resources tree already uses.
     pub(in crate::sidebar) fn render_changes_runs_section(
         &self,
         cx: &mut Context<Self>,
@@ -2397,12 +2239,6 @@ impl AdeApp {
     /// One section header: caret, uppercase label, count, and a right-aligned split diffstat, in
     /// the rev-6 `theme::changes` tokens (`REVISION-2026-08-14.md` §1). Clicking anywhere on it
     /// opens or closes the section.
-    ///
-    /// The diffstat is **split** into its own `+N` and `−N` colours rather than painted as one
-    /// green string, because `STAGE-A-CHANGELOG.md` §4o's rule is exactly that: "A value that is
-    /// coloured anywhere must be coloured everywhere" - every other diffstat in this app already
-    /// splits, so a one-colour one here would be the same number styled two ways depending on
-    /// which row it landed in.
     fn render_section_header(
         &self,
         header: &sections::SectionHeader,
@@ -2535,14 +2371,6 @@ impl AdeApp {
     /// the run's own agent tint, and there is **no checkbox, ever** - a run is not a stageable
     /// thing, and one agent's share of a file the other agent also wrote is not separately
     /// stageable at all (`REVISION-2026-08-14.md` §1's table and rule 1).
-    ///
-    /// Clicking focuses that agent's tab - a real, existing action
-    /// ([`Self::activate_agent_tab`]), not a new surface.
-    ///
-    /// No row tooltip, though `Jerry.dc.html`'s own markup carries one (`title="{{ r.tip }}"`,
-    /// stating the live/frozen consequence `STAGE-A-CHANGELOG.md` §4l moved off the row's visible
-    /// text) - a deliberate, requested deviation from both the mock and that citation, not an
-    /// oversight.
     fn render_run_row(&self, run: &sections::RunRow, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_id = run.agent_id;
         let selector = format!("changes-run-{}", run.agent_id);
@@ -2764,51 +2592,6 @@ impl AdeApp {
     /// `dir`/`name`, `+n`/`−n`, and the five-segment stat bar. Clicking anywhere on the row other
     /// than the checkbox itself (see [`Self::render_staging_checkbox`]'s `stop_propagation`) opens
     /// the file's diff and marks it seen.
-    ///
-    /// ## Three channels, three separate facts (GitHub issue #286)
-    ///
-    /// The row states three things about a file and gives each exactly one channel, which is the
-    /// whole of `STAGE-A-CHANGELOG.md` §4i/§4j and audit item I3:
-    ///
-    /// | Fact | Channel |
-    /// |---|---|
-    /// | what git did to it | the status letter, in a fixed 9px column ahead of `dir` (§4j) |
-    /// | whether you have seen it since the agent last wrote to it | the **filename's own** weight and colour (§4i) |
-    /// | whether it is staged | the checkbox, and only the checkbox (§4i, I3) |
-    ///
-    /// Two of those used to be crossed. `nameFg` encoded *staged* while the checkbox encoded
-    /// staged too, and "seen" was a cryptic glyph - "so one fact had two channels and the other
-    /// had a cryptic glyph". [`Self::seen_files`] and [`Self::staged_files`] are now separate maps
-    /// of separate types, and nothing here reads one to decide the other: opening a file marks it
-    /// seen and cannot stage it; checking the box stages it and cannot mark it seen.
-    ///
-    /// ## The status letter is on every row, not just the exceptions
-    ///
-    /// §4j replaced the `new`/`del` word pills this row used to carry. Those marked only the
-    /// exceptions - a *modified* file, the common case, got nothing - so the row could not answer
-    /// "what happened to this file". `crate::sidebar::changes::status_letter` is total, and the
-    /// column is a fixed width so every filename in the list starts on the same x.
-    ///
-    /// ## It renders a `ChangeSetEntry`, not a `DiffFile`
-    ///
-    /// The change set is keyed by path (`crate::provenance::change_set`), so *one path is one
-    /// row* (`REVISION-2026-08-14.md` §1's first "rule that is easy to get wrong") is a property
-    /// of the list this draws from rather than a rule the caller has to remember. The row's `+n`/`−n`
-    /// is that entry's own combined diffstat, which is **defined** as the sum of its per-author
-    /// shares, so the Runs section's numbers and this row's number cannot disagree: they are the
-    /// same partition read two ways. The `DiffFile` is still looked up alongside, for the one thing
-    /// the entry does not carry - the pre-rename path behind the `moved` tag.
-    ///
-    /// ## Checkboxes exist in exactly one section
-    ///
-    /// `REVISION-2026-08-14.md` §9, box 1. An Against-main row gets none at all, and this is now
-    /// structural rather than a per-file condition: the Uncommitted section is the working tree
-    /// against `HEAD`, so *everything* in it is genuinely stageable and nothing in it can be the
-    /// already-committed-clean row GitHub issue #220 was about. That row still exists - in the
-    /// Against-main section, which is the scope that legitimately lists committed work - where it
-    /// carries `crate::root::widgets::render_committed_tag`'s `committed` pill and no checkbox.
-    /// The old checkbox-slot marker is gone with the slot: there is no checkbox column in that
-    /// section for an inert `✓` to sit in.
     pub(in crate::sidebar) fn render_change_row(
         &self,
         entry: &crate::provenance::change_set::ChangeSetEntry,
@@ -3060,32 +2843,6 @@ impl AdeApp {
 
     /// §4i's floating hover bar: two icons, straddling the row's top edge, on the app's one
     /// popover chrome.
-    ///
-    /// > It is now a **floating bar straddling the row's top edge** (`top:-11px`, right-aligned,
-    /// > z-index 20), using the elevation convention every other popover in the file already uses
-    /// > […] so it plainly sits above the list rather than in it.
-    ///
-    /// That elevation convention is [`menu_popover_chrome`] here - the one function every
-    /// dropdown and context menu in this app builds on (GitHub issue #129), whose
-    /// `theme::surface::PALETTE`/`theme::border::POPOVER`/`theme::radius::CARD` are literally
-    /// §4i's own stated `#15181b` / `1px #2b3238` / radius 6. A hand-written copy of those five
-    /// style calls is exactly the drift issue #129 closed, so this reuses the function rather
-    /// than the values.
-    ///
-    /// **Exactly two icons.** §4i: "by the standard the last several passes have applied, a
-    /// copy-path or reveal-in-tree would be clutter." Both carry a tooltip, since both are
-    /// icon-only.
-    ///
-    /// **Discard takes two clicks**, and the first one only *arms* it: the icon is replaced by a
-    /// red `Discard?` pill and the second click on that pill is what runs
-    /// [`Self::discard_change_row`]. Leaving the row cancels
-    /// ([`Self::set_change_row_hover`] disarms whenever both hover halves go empty), so an armed
-    /// row can never be left sitting one stray click away from destroying an agent's work.
-    ///
-    /// `.occlude()` is what keeps the overhanging half honest: the bar is painted 11px above its
-    /// own row, so without it a click aimed at an icon would also reach whatever row is drawn
-    /// behind that strip (`gpui::InteractiveElement::occlude` sets `HitboxBehavior::BlockMouse` -
-    /// the same call `crate::menu::render`'s own popovers use for the same reason).
     fn render_change_row_actions(
         &self,
         path: &Path,
@@ -3240,14 +2997,6 @@ impl AdeApp {
     /// The one writer of both halves of §4i's hover state, and of the `Discard?` arming it
     /// governs. `from_bar` says which hitbox reported - see [`Self::change_row_hover`]'s docs for
     /// why there are two and why they must be independent.
-    ///
-    /// A `false` only clears the half that names *this* path: moving from one row straight onto
-    /// the next delivers the new row's `true` and the old row's `false` in an order GPUI does not
-    /// promise, and an unguarded clear would blank the state the new row had just set (the same
-    /// guard `crate::code_surface::file_view`'s own hover listener documents).
-    ///
-    /// **Leaving the row cancels the discard confirm** (§4i), and this is the single place that
-    /// is enforced: once neither half names the armed path, the arming is dropped.
     pub(in crate::sidebar) fn set_change_row_hover(
         &mut self,
         path: &Path,
@@ -3292,12 +3041,6 @@ impl AdeApp {
     /// The second click of §4i's `Discard?` confirm: a real, immediate
     /// `wt_core::stage::discard_path` for one file, on the background executor like every other
     /// real git mutation in this app.
-    ///
-    /// Nothing is flipped optimistically here, unlike [`Self::toggle_staged`]. There is no
-    /// cheap local prediction of what a discard leaves behind - the row may vanish entirely, or
-    /// stay with a different diffstat if the file was only partly this worktree's own - so the
-    /// panel re-reads the real diff once git has actually run, and shows the file exactly as git
-    /// now reports it. A failure lands in [`Self::changes_row_error`] rather than being swallowed.
     pub(in crate::sidebar) fn discard_change_row(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.change_row_discard_armed = None;
         self.changes_row_error = None;
@@ -3329,18 +3072,6 @@ impl AdeApp {
 
     /// `V`'s action handler ([`crate::root::ToggleChangeSeen`]) - `STAGE-A-CHANGELOG.md` §4i:
     /// "opening a file marks it seen […] and `V` unmarks".
-    ///
-    /// It **toggles** rather than only unmarking, and that is the design read literally rather
-    /// than half of it: §4i's prose says `V` unmarks, while the legend it specifies in the same
-    /// breath reads `V mark seen`. A toggle is the only behaviour that makes both true at once,
-    /// and it leaves each tooltip exactly as §4i writes it - the seen name's tooltip names `V` as
-    /// the way back, and the unseen name's names *opening* as the way forward, which is still the
-    /// primary path either way.
-    ///
-    /// Its subject is [`Self::open_change`] - the file whose diff is on screen - which is why the
-    /// binding is scoped to the `"diff"` surface rather than to the panel. A file with no live
-    /// uncommitted delta has no seen-state to toggle (the mark is keyed by the diffstat it had
-    /// when it was marked), so this no-ops for one rather than inventing an entry for it.
     pub(crate) fn handle_toggle_change_seen_action(
         &mut self,
         _action: &crate::root::ToggleChangeSeen,
@@ -3366,14 +3097,6 @@ impl AdeApp {
 
     /// The open file ([`Self::open_change`]) *as an Uncommitted-section row*, or `None` when
     /// nothing is open or what is open has no live uncommitted delta.
-    ///
-    /// The one condition behind both of the Changes footer's keyboard hints and both of the
-    /// actions they advertise ([`Self::handle_toggle_change_seen_action`],
-    /// [`Self::handle_toggle_change_staged_action`]), written once so a hint and its keystroke
-    /// cannot come to disagree about when they are live. Both states this row can carry - seen and
-    /// staged - belong to the Uncommitted scope: it is the only section with checkboxes
-    /// (`crate::sidebar::sections::ChangesSection`'s own table) and the only one whose files have a
-    /// working-tree delta for a seen mark to be keyed by.
     pub(in crate::sidebar) fn open_uncommitted_change(&self) -> Option<&PathBuf> {
         let path = self.open_change.as_ref()?;
         self.uncommitted_change_set
@@ -3392,25 +3115,6 @@ impl AdeApp {
 
     /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind
     /// `Jerry.dc.html`'s `changesHints` first hint, `space stage` (line 4548).
-    ///
-    /// Its subject is [`Self::open_change`], exactly like [`Self::handle_toggle_change_seen_action`]
-    /// beside it, and for the same reason: that path is *both* the file whose diff is on screen
-    /// (which is why the binding is scoped to the `"diff"` surface) *and* the row
-    /// [`Self::render_change_row`] paints as `selected`. The Changes list therefore already has one
-    /// real, visible, keyboard-reachable "current row", and both footer hints act on it. A second,
-    /// separate cursor for this list would mean two differently-highlighted current rows on screen
-    /// at once, with the two hints in one strip disagreeing about which one they mean.
-    ///
-    /// Delegates to the *same* [`Self::toggle_staged`] the row's checkbox click calls - the
-    /// optimistic flip, the real background `git add`/`git reset`, the revert-on-failure and the
-    /// [`Self::changes_row_error`] surfacing all come along, rather than a second, parallel
-    /// staging path that could drift from the checkbox's.
-    ///
-    /// Gated on [`Self::uncommitted_change_set`], not merely on something being open: staging is
-    /// the Uncommitted section's affordance and only its rows carry checkboxes
-    /// (`crate::sidebar::sections::ChangesSection`'s own table - "Checkboxes: never / yes / no /
-    /// no"), so with a Commits or Against-main file open this no-ops rather than `git add`-ing a
-    /// path the panel offers no way to unstage.
     pub(crate) fn handle_toggle_change_staged_action(
         &mut self,
         _action: &crate::root::ToggleChangeStaged,
@@ -3437,11 +3141,6 @@ impl AdeApp {
     /// Whether `alt`+click really has something to act on right now - the gate on
     /// [`render_changes_footer`]'s `⌥click filter by author` hint, and the exact same honesty rule
     /// [`Self::change_seen_toggle_live`] implements for `V`.
-    ///
-    /// The gesture acts on an **author chip**, so it is live exactly when a chip is on screen: a
-    /// multi-agent worktree (`REVISION-2026-07-31.md` §4's own gate, read through
-    /// `crate::provenance::render::AdeApp::worktree_has_multiple_agents` rather than re-derived)
-    /// with at least one row this app can really draw an author for.
     pub(in crate::sidebar) fn change_author_filter_live(&self) -> bool {
         self.worktree_has_multiple_agents()
             && self
@@ -3454,11 +3153,6 @@ impl AdeApp {
     /// §4i's own wording for a filename that **is** seen, verbatim, including the `V` it names as
     /// the way back. Kept as a constant so the row's tooltip and the test that pins it against
     /// the design read the same string.
-    ///
-    /// > The tooltip states the real rule […]: *Seen since the agent last changed it* / *Not seen
-    /// > since the agent last changed it*. That is stronger than "read" - a file you read and the
-    /// > agent then edits again **reverts to unseen**, which is the only version of this flag
-    /// > worth having when agents keep writing while you review.
     pub(in crate::sidebar) const SEEN_TOOLTIP: &'static str =
         "Seen since the agent last changed it \u{2014} V to unmark";
     /// The unseen half of [`Self::SEEN_TOOLTIP`], also verbatim.
@@ -3480,10 +3174,6 @@ impl AdeApp {
     /// not "reviewed") - toggled via [`Self::toggle_staged`]. Stops propagation on click so
     /// checking a box never also opens the row's diff, mirroring `Self::render_agent_tab`'s
     /// nested-clickable-child pattern (its tab-close `×`).
-    ///
-    /// Only rendered for a file with a real, live uncommitted delta - see
-    /// [`Self::render_change_row`] for why a committed-clean file gets
-    /// [`Self::render_committed_marker`] instead.
     pub(in crate::sidebar) fn render_staging_checkbox(
         &self,
         path: PathBuf,
@@ -3524,9 +3214,6 @@ impl AdeApp {
     /// commit action with its `▾` split-button menu. The staged set is derived once, early
     /// (`changes::staged_subset`), so the header count/diffstat/message/action-button all read
     /// from the exact same list, per the design's own "derive the staged set once" rule.
-    ///
-    /// Always rendered, even with nothing staged - the primary action just drops to a disabled-
-    /// looking ghost `Commit` in that case (never hidden outright).
     pub(in crate::sidebar) fn render_commit_composer(
         &self,
         cx: &mut Context<Self>,
@@ -3863,35 +3550,6 @@ impl AdeApp {
 
     /// The commit composer's `▾` split-button popover (Revision R12 §5): *Commit and push* /
     /// *Commit all files* / *Amend last commit* / *Stash staged files*.
-    ///
-    /// Opens **downward**, `top`-anchored. It used to open upward, because the composer used to
-    /// sit at the foot of the Changes panel; GitHub issue #285 pinned the composer *above* the
-    /// four sections instead (`REVISION-2026-08-14.md` §1), so an upward popover would now open
-    /// into the panel header and off the top of the window. Direction follows the anchor, and the
-    /// anchor moved.
-    ///
-    /// ## Why this is rendered from `AdeApp::render`, not from the composer (GitHub issue #176)
-    ///
-    /// This popover used to be a *child* of [`Self::render_commit_composer`], which made its
-    /// click-away scrim - `absolute()` with inset 0 - resolve against the composer's own
-    /// `.relative()` box (~135px tall, at the foot of the Changes panel) rather than the window.
-    /// Clicking the Changes list, the file tree, the rail, the tab strip, the editor or the title
-    /// bar therefore did *not* dismiss it, and none of its four rows is clickable either, so the
-    /// only gesture that reliably closed it was a second click on the `▾` toggle itself. That is
-    /// the issue's "the commit one is particularly bugged and hard to close".
-    ///
-    /// It is now a sibling of [`crate::work_surface::render::AdeApp::render_plus_menu`] and the
-    /// file tree's context menu in `AdeApp::render`, with the same genuinely full-window
-    /// `.occlude()`d scrim they use - the established shape in this app for a popover whose anchor
-    /// is a `gpui::canvas`-captured, window-space bounds ([`AdeApp::commit_composer_bounds`]).
-    /// `crate::graph_view::render::AdeApp::render_graph_view`'s own docs record the same move for
-    /// the graph's two menus, made for the same reason.
-    ///
-    /// **Every row is real** as of GitHub issue #285. They were placeholders - dimmed, visible,
-    /// un-clickable - which `REVISION-2026-08-14.md` §7 rule 1 rules out for good: *"Ship the
-    /// affordance with the behaviour, or ship neither."* Each is now backed by a real `wt_core`
-    /// call ([`CommitMenuAction`]), and a row that genuinely cannot act right now is dimmed with
-    /// the **reason** in place of its hint rather than looking clickable and doing nothing.
     pub(crate) fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The composer's own painted box, in window space. The popover keeps its R12 §5 side
         // geometry relative to that box - inset 12px on both sides - and hangs 1px below its
@@ -4047,12 +3705,6 @@ impl AdeApp {
     /// One row of [`AdeApp::render_commit_menu`]'s split-button popover - label + sub-label, no
     /// leading chip (unlike `crate::work_surface::render::render_dropdown_menu_row`, which this
     /// deliberately doesn't reuse: the design has no per-row glyph here).
-    ///
-    /// A row whose action can really run is a real click target with a real hover. A row whose
-    /// action cannot states the reason where its hint would be and keeps the
-    /// no-cursor/no-hover/no-handler treatment this codebase already uses for an action that is
-    /// visible but not available - never a clickable-looking no-op
-    /// (`crate::work_surface::render::AdeApp::render_footer_action`'s own rule).
     fn render_commit_menu_row(
         &self,
         action: CommitMenuAction,
@@ -4115,15 +3767,6 @@ impl AdeApp {
 /// `right_pane` state (`Files · Search · Changes`, `Files` default). The panel never shows diff
 /// *content* (see [`AdeApp::open_change`]'s docs) - `Changes` is the per-file review list,
 /// not a diff view.
-///
-/// `Search` is the middle tab (GitHub issue #162, `STAGE-A-CHANGELOG.md` §4u: "Search is now the
-/// middle tab of the right panel - `Files · Search · Changes`"). Middle rather than appended:
-/// these three are ordered by how far from the file they are - the tree, then finding a file's
-/// contents, then what has changed in them - and the order is what a user learns, not the label.
-///
-/// The variants' declaration order is also the segments' order in
-/// [`AdeApp::render_right_sidebar_toggle`], whose `on_select` dispatches by index. See
-/// `crate::settings::widgets::AdeApp::render_choice_control`'s own docs for why index, not label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RightSidebarView {
     Files,
@@ -4133,12 +3776,6 @@ pub(crate) enum RightSidebarView {
 
 /// The next tab in `Files -> Search -> Changes -> Files` order, behind the command palette's
 /// `Cycle Right Panel`.
-///
-/// A free function next to the enum rather than two separate `match`es inside
-/// `crate::palette::render`: that command both *names* the tab it is about to show and *switches*
-/// to it, and those were two independent matches over the same enum before this - a shape that
-/// only stayed correct while nobody added a third variant. Which is exactly what GitHub issue #162
-/// then did.
 pub(crate) fn next_right_sidebar_view(current: RightSidebarView) -> RightSidebarView {
     match current {
         RightSidebarView::Files => RightSidebarView::Search,
@@ -4149,10 +3786,6 @@ pub(crate) fn next_right_sidebar_view(current: RightSidebarView) -> RightSidebar
 
 /// One row of [`AdeApp::render_file_tree`]'s virtualized list: either a real walked entry (by
 /// index into [`AdeApp::file_tree`]) or the in-progress inline name editor.
-///
-/// An index rather than the entry itself, for the same reason
-/// `crate::sidebar::file_tree::visible_indices` returns indices: the `uniform_list` row-builder
-/// closure is `'static` and cannot hold a borrow of `self`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeRow {
     Entry(usize),
@@ -4162,15 +3795,6 @@ enum TreeRow {
 impl AdeApp {
     /// The file tree's right-click context menu popover (GitHub issue #19 §1) - the app's one
     /// shared menu ([`AdeApp::render_menu_overlay`]), given the file tree's own rows.
-    ///
-    /// Everything about *how* it paints, dismisses, occludes and flips lives there since GitHub
-    /// issue #290 promoted this menu into the component the rail's row menus and the `⋯` overflow
-    /// draw through too; what is left here is this surface's own three answers: which rows, where
-    /// they came from, and what a click runs.
-    ///
-    /// The panel's origin is [`AdeApp::tree_context_menu`]'s already-clamped one, resolved at
-    /// open time from the real click and the real `Window::bounds()` - so the menu near a window
-    /// edge is repositioned once, not re-solved (and possibly moved) on every frame it's open.
     pub(crate) fn render_tree_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let menu = self.tree_context_menu.clone();
         let rows = menu
@@ -4199,27 +3823,6 @@ impl AdeApp {
 /// `changesHints: this.mkHints([['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by
 /// author']])`, rendered through the same `diffHints` hint-row template (line 842) that is purely a
 /// loop over keycap+label pairs. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same strip.
-///
-/// This band used to open with the sentence `click a file to open its diff in the centre` as a
-/// shrinkable lead-in. That string comes from `README.md`'s Changes section - a *superseded*
-/// description of the pre-`#285`/`#286` panel (its "review checkbox", "tag pill" and `3 reviewed`
-/// header are all things those two issues replaced), and the mock has no prose slot in this footer
-/// at all. Revisions 1-4's own mocks did carry it, as a hint with an empty keycap list; revision 5
-/// dropped it deliberately in favour of `space stage`. The mock outranks `README.md` as a design
-/// source, so the sentence is gone rather than kept "for layout" - with every child now
-/// `flex:none`, there is nothing left in the row to shrink and nothing that can push a hint off
-/// the panel's right edge.
-///
-/// `text_size` is the caller's already-scaled [`AdeApp::ui_text_size`] value - this free
-/// function has no `&self` to call that method through, so the one caller
-/// ([`AdeApp::render_right_sidebar`]) computes and passes it in.
-///
-/// Each of the three `*_live` flags is the same honesty gate [`render_file_tree_footer`]'s `live`
-/// parameter implements: all three hints name something scoped to the open diff or to an on-screen
-/// author chip, so with nothing open a keycap would advertise a keystroke that genuinely does
-/// nothing. The hint disappears; the band does not, so the list above it never jumps. See
-/// [`AdeApp::change_stage_toggle_live`], [`AdeApp::change_seen_toggle_live`] and
-/// [`AdeApp::change_author_filter_live`] for what each really tests.
 pub(in crate::sidebar) fn render_changes_footer(
     text_size: Pixels,
     stage_toggle_live: bool,
@@ -4313,28 +3916,6 @@ pub(in crate::sidebar) const CHANGES_SEEN_SPEC: &str = "v";
 /// it, so switching between the two sidebar views with a diff loaded doesn't move the list under
 /// the cursor. (The Changes view's *no-diff* arm still has no footer; that arm renders a single
 /// message rather than a list, so there is nothing for a footer to sit under.)
-///
-/// The shape is the hint strip the design handoff already specifies for
-/// exactly this job - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `diffHints` strip:
-/// `height:28px ... padding:0 12px;background:#111316;border-top:1px solid #1c2023`, hints at
-/// `gap:11`, each hint `gap:5`, hint-size keycaps, label `400 10px 'IBM Plex Sans'` in `#4a5057`.
-/// Which is this app's
-/// `theme::band::SURFACE_FOOTER`/`surface::FOOTER`/`border::INNER`/`text::PATH` and the
-/// `KeycapSize::Hint` keycap it already had.
-///
-/// The keystroke is resolved through [`keymap::resolve_combo`], the same per-platform resolution
-/// the context menu's own row keycaps use - never a hard-coded keystroke string that could drift
-/// from the real binding, which is also why the tooltip below names no key at all and points at
-/// the keycap instead. It names a real, registered binding in `crate::default_key_bindings`,
-/// asserted by `crate::sidebar::tree_ops`'s own
-/// `the_file_tree_footer_only_advertises_real_registered_bindings`.
-///
-/// `live` is the other half of that honesty: the binding is scoped
-/// `"file-tree && !tree-editing && !tree-delete-confirm"`, so while an inline name editor or the
-/// delete confirmation is open it genuinely does not fire, and the strip drops its hint rather
-/// than advertising a dead shortcut. The band itself stays, so the tree doesn't jump 28px.
-///
-/// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled value.
 pub(in crate::sidebar) fn render_file_tree_footer(
     text_size: Pixels,
     macos: bool,
@@ -4413,9 +3994,6 @@ impl gpui::Render for TreeDragPayload {
 /// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
 /// distinct from the folder icon itself. Blank but still 8px wide for a file row, to keep
 /// every row's icon column aligned.
-///
-/// `text_size` - see [`render_changes_footer`]'s docs for why this takes an already-scaled
-/// value rather than computing it internally.
 pub(in crate::sidebar) fn render_tree_caret(
     is_dir: bool,
     open: bool,
@@ -4440,13 +4018,6 @@ pub(in crate::sidebar) fn render_tree_caret(
 /// The file tree's folder icon - two rects, a 5×3 tab and a 12×8 radius-2 body, composed
 /// entirely from `div()`s (never an emoji glyph, which is what caused the "tofu box" bug:
 /// no matching glyph installed on the reporting machine).
-///
-/// The two rects are *not* styled identically (verified against `design_handoff_jerry_ade/
-/// Jerry.dc.html`'s `n.folderBd`/`n.folderBg`): the body alternates between a filled `bg`
-/// (open) and transparent (collapsed), both with a `border` - but the tab is always
-/// solid-filled with the `border` colour and has no separate border of its own. An earlier
-/// version gave the tab the same hollow-when-collapsed treatment as the body; the mockup's
-/// collapsed-folder tab is solid, not outlined.
 pub(in crate::sidebar) fn render_folder_icon(open: bool) -> impl IntoElement {
     let (fill, border): (gpui::Rgba, gpui::Rgba) = if open {
         (
@@ -4507,13 +4078,6 @@ pub(in crate::sidebar) fn render_lang_chip(chip: LangChip) -> impl IntoElement {
 
 /// [`render_sidebar_message`] inside its own scroll box, for the right sidebar's message-only
 /// states (an unreadable directory, an empty tree, a diff that failed to compute).
-///
-/// These used to inherit scrolling from [`AdeApp::render_right_sidebar`]'s own
-/// `overflow_y_scroll()` container. That container had to go for the Files/Changes list arms -
-/// a `gpui::uniform_list` owns its own scrolling and would expand to its full virtual height
-/// inside an outer scroller - but these paths render no list at all, and the messages they show
-/// wrap a real, arbitrarily long `std::io::Error`/`git` error. Without this, a long error would
-/// be silently clipped at the panel's bottom edge with no way to read the rest of it.
 pub(in crate::sidebar) fn scrollable_sidebar_message(
     id: &'static str,
     text: String,
@@ -4565,13 +4129,6 @@ pub(in crate::sidebar) fn render_stat_bar(segments: [changes::StatSegment; 5]) -
 /// Real, live-rendered proof that the right sidebar's two long lists are genuinely virtualized -
 /// that is, that a row scrolled far below the viewport is not merely *invisible* but never
 /// becomes a painted element at all.
-///
-/// This is the property the whole fix rests on, and it is not observable from the pure logic:
-/// `crate::sidebar::file_tree::visible_entries` reports exactly the same rows either way. Only a real
-/// render can tell "built 500 elements and clipped 460 of them" apart from "built 40". Both
-/// tests therefore also assert the *positive* half - that the rows which should paint really do -
-/// so a future change that virtualizes by simply rendering nothing would fail here rather than
-/// pass.
 #[cfg(test)]
 mod virtualization_tests {
     use super::*;
@@ -4596,11 +4153,6 @@ mod virtualization_tests {
         );
     }
 
-    /// Before this revision's fix, every one of the first
-    /// 500 (the since-removed `MAX_RENDERED_FILE_ENTRIES` cap) visible rows was built, laid out and painted
-    /// on *every* frame - including all the ones below the fold - which measured, against real
-    /// `gpui::FrameTiming` data on this repository's own tree, as ~145ms of a ~200ms
-    /// `Window::draw`.
     #[gpui::test]
     fn a_file_tree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -4626,12 +4178,6 @@ mod virtualization_tests {
         );
     }
 
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable. This scrolls the real list with a real
-    /// `gpui::ScrollWheelEvent` and asserts the row that was previously absent genuinely
-    /// materializes - which simultaneously proves the list still scrolls at all after
-    /// `Self::render_right_sidebar` stopped wrapping it in its own `overflow_y_scroll()`
-    /// container, the one behaviour that change could plausibly have broken.
     #[gpui::test]
     fn scrolling_the_virtualized_file_tree_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
@@ -4670,18 +4216,6 @@ mod virtualization_tests {
         );
     }
 
-    /// The correctness half of the same change: virtualizing must not break the tree's real
-    /// content. A collapsed directory's children must be genuinely absent, and expanding it must
-    /// genuinely bring them in - the state `crate::sidebar::file_tree::visible_entries` owns, now
-    /// consulted from inside `uniform_list`'s row-builder rather than from an eager loop.
-    ///
-    /// Also the render-level proof of issue #18 §1's default: the very first assertion is that a
-    /// directory's child does *not* paint before anything has been expanded.
-    ///
-    /// Honest about its own reach: with only two entries this exercises no virtualization at
-    /// all, and it passes identically against the pre-fix eager loop. It is a guard on the
-    /// tree's *content* surviving the rewrite, not evidence that the rewrite virtualizes -
-    /// that is what the two "far below the viewport" tests and the scroll test are for.
     #[gpui::test]
     fn expanding_and_collapsing_a_directory_adds_and_removes_its_children(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -4720,19 +4254,6 @@ mod virtualization_tests {
         );
     }
 
-    /// The Changes panel gets the same treatment, and needs the same proof - and needs it *more*
-    /// since GitHub issue #285 moved it from `gpui::uniform_list` to `gpui::list` (four sections
-    /// of genuinely different row heights in one scroller, which `uniform_list` cannot represent).
-    /// A different virtualized element is still a virtualized element only if a real render says
-    /// so, which is what this asserts.
-    ///
-    /// The margin is real but worth stating: the test display is 1920x1080
-    /// (`vendor/zed/crates/gpui/src/platform/test/display.rs`), and 40 file rows at
-    /// `theme::band::CHANGE_ROW` (27px) is exactly 1080px - so what puts the last row off screen
-    /// is the real window chrome above and below it (title bar, panel header, commit composer,
-    /// four section headers, footer, status bar), which under the new layout is substantially
-    /// *more* than the ~159px it used to be. If that chrome ever shrinks drastically this test
-    /// fails loudly rather than silently passing for the wrong reason.
     #[gpui::test]
     fn a_changes_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -4781,18 +4302,6 @@ mod virtualization_tests {
         );
     }
 
-    /// GitHub issue #123 ("Add padding to the file tree right side icons/buttons"): before this
-    /// revision's fix, a directory row's own trailing "new file" `+` control sat at exactly
-    /// `SCROLLBAR_SIZE` from the row's right edge - precisely where the real overlay scrollbar's
-    /// track begins (`crate::root::scrollbar::render_vertical_scrollbar`'s own `right_0()`
-    /// `.w(px(SCROLLBAR_SIZE))`), i.e. touching it with zero real daylight between them whenever
-    /// the tree genuinely scrolled - the collision the issue's screenshot shows.
-    ///
-    /// This proves the fix with real painted geometry, not merely that a padding *number*
-    /// changed: `min_gap` is a real threshold on its own, independent of whatever
-    /// `crate::root::scrollbar::CONTENT_CLEARANCE` production code currently uses, so this test
-    /// keeps proving genuine daylight even if that constant's value ever changes, rather than
-    /// silently re-checking a value against itself.
     #[gpui::test]
     fn file_tree_row_and_header_actions_clear_the_real_scrollbar(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -4877,9 +4386,6 @@ mod change_row_selection_tests {
         );
     }
 
-    /// Same real-diff shape `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted`
-    /// already establishes (a real feature branch, so this hits `wt_core::diff::DiffBase::Diff`,
-    /// not `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback).
     #[gpui::test]
     fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
         cx: &mut TestAppContext,
@@ -4999,8 +4505,6 @@ mod fold_state_tests {
         names
     }
 
-    /// §1: nothing is expanded on the first visit to a worktree, and the tree really only shows
-    /// its root-level entries.
     #[gpui::test]
     fn a_worktree_opened_for_the_first_time_starts_fully_collapsed(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5030,9 +4534,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §2's headline requirement: expand three folders, "quit", "relaunch" - the same three are
-    /// open and nothing else. The reload reads the real file this app wrote, not an in-memory
-    /// cache handed between the two instances.
     #[gpui::test]
     fn expanded_folders_are_restored_exactly_after_a_simulated_reload(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5062,7 +4563,6 @@ mod fold_state_tests {
             2
         );
 
-        // The "relaunch": a brand-new `AdeApp` reading that same real file.
         let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
         cx.run_until_parked();
 
@@ -5082,8 +4582,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §2's identity requirement, at the app level: two worktrees with an identically-named
-    /// `src/` share one fold-state file, and one's expansion must never open the other's.
     #[gpui::test]
     fn fold_state_from_one_worktree_never_leaks_into_another(cx: &mut TestAppContext) {
         let worktree_a = TempDir::new().expect("tempdir");
@@ -5121,14 +4619,6 @@ mod fold_state_tests {
         );
     }
 
-    /// Two `jerry` processes (one per repository) share one fold-state file, and each holds a
-    /// whole-file copy read at its own startup. A plain whole-file write would therefore make
-    /// whichever instance saved last erase the other's worktree entirely.
-    ///
-    /// The ordering here is the whole point, and is what distinguishes this from
-    /// `fold_state_from_one_worktree_never_leaks_into_another`: B starts *before* A's second
-    /// write, so B's in-memory copy can never contain A's newer entry. Only a write that
-    /// genuinely re-reads the file and merges can preserve it.
     #[gpui::test]
     fn a_second_instances_saves_never_erase_the_first_instances_worktree(cx: &mut TestAppContext) {
         let repo_a = TempDir::new().expect("tempdir");
@@ -5143,7 +4633,6 @@ mod fold_state_tests {
             open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path.clone());
         cx.run_until_parked();
 
-        // Instance B starts here, snapshotting a file that knows nothing about A yet.
         let (app_b, cx) =
             open_app_with_state_dir(cx, repo_b.path().to_path_buf(), settings_path.clone());
         cx.run_until_parked();
@@ -5152,7 +4641,6 @@ mod fold_state_tests {
             app.toggle_dir_expanded(repo_a.path().join("src"), cx);
         });
         cx.run_until_parked();
-        // ...and now B writes, from its stale whole-file snapshot.
         app_b.update(cx, |app, cx| {
             app.toggle_dir_expanded(repo_b.path().join("src"), cx);
         });
@@ -5167,7 +4655,6 @@ mod fold_state_tests {
         );
         assert_eq!(on_disk.expanded_dirs(repo_b.path()).len(), 1);
 
-        // And a real relaunch of A sees its own state, which is what the user actually notices.
         let (reloaded_a, cx) =
             open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path);
         cx.run_until_parked();
@@ -5177,8 +4664,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §2: a folder that has since been deleted is dropped silently on the next load - no error
-    /// surfaces, and the surviving entries are untouched.
     #[gpui::test]
     fn a_stale_entry_for_a_deleted_folder_is_pruned_silently(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5197,7 +4682,6 @@ mod fold_state_tests {
         });
         cx.run_until_parked();
 
-        // An agent deletes one of them from underneath the running app.
         fs::remove_dir_all(repo.path().join("src/lib")).expect("remove");
 
         // The "relaunch" - which is also where the prune happens, against the freshly walked
@@ -5222,8 +4706,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §2: a mid-agent refresh of the same worktree (what an agent creating or deleting files
-    /// causes, via `create_new_file`'s own reload) must not reset fold state.
     #[gpui::test]
     fn reloading_the_same_worktrees_tree_keeps_the_fold_state(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5263,8 +4745,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §1: "collapse all" resets the tree *and* the saved state, in one step - so it survives a
-    /// reload rather than springing back open.
     #[gpui::test]
     fn collapse_all_clears_both_the_tree_and_the_saved_state(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5301,9 +4781,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §5: "reveal in tree", driven through the real command-palette open-file flow, expands
-    /// every ancestor of the revealed file - and records those expansions exactly like manual
-    /// ones, so they survive a reload.
     #[gpui::test]
     fn revealing_a_file_expands_its_ancestors_and_records_them(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5360,8 +4837,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §5 again, through the other real entry point: opening a file directly (what
-    /// go-to-definition does when it lands in a folder nobody has expanded) reveals it too.
     #[gpui::test]
     fn opening_a_file_directly_reveals_it_in_the_tree(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5390,8 +4865,6 @@ mod fold_state_tests {
         );
     }
 
-    /// §4: a directory with hundreds of entries renders *every* one of them - no truncation row,
-    /// no cap - while staying virtualized (the row far below the viewport is never built).
     #[gpui::test]
     fn a_large_directory_renders_completely_with_no_truncation_row(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5456,13 +4929,6 @@ mod fold_state_tests {
         );
     }
 
-    /// GitHub issue #160, end to end through the real app: a tree with more entries than the
-    /// removed 20,000-entry cap loads *completely* into the sidebar, and the "Stopped at N
-    /// entries - load more" row it used to grow instead is gone.
-    ///
-    /// This is the expensive fixture (21,200 real files and folders on disk) but it is the only
-    /// honest way to test the thing the issue asks for: a smaller tree would pass identically
-    /// before and after the change.
     #[gpui::test]
     fn a_tree_past_the_removed_cap_loads_every_entry_with_no_load_more_row(
         cx: &mut TestAppContext,
@@ -5528,23 +4994,6 @@ mod fold_state_tests {
         );
     }
 
-    /// CRITICAL 2: the canonicalized worktree key is resolved once per real root change and
-    /// cached, because `worktree_key` calls the blocking `std::fs::canonicalize` and the callers
-    /// are clicks and per-ancestor reveals. What's asserted here is the part that would actually
-    /// break if the cache were wrong: reaching a worktree through a symlink must record against
-    /// the *canonical* path, so opening it through the symlink and opening it directly share one
-    /// fold-state entry rather than silently keeping two.
-    ///
-    /// The reveal below goes through the **real** path, not the symlink, and that is the honest
-    /// shape of this now: `crate::rail::repo::canonical_repo_path` resolves the repo path where it
-    /// enters the app (the CLI argument, `AdeApp::add_repo`, `AdeApp::open_repo_in_current_
-    /// window`), so `AdeApp::file_tree_root` is already the real path here even though the app was
-    /// opened through the link - and every path the file tree/palette hands back to a reveal is
-    /// walked from that root, so no real UI path produces a symlinked one anymore. That
-    /// normalization exists for a separate, reproduced bug (an agent spawned against an unresolved
-    /// repo path matched no rail worktree row at all - see that function's docs); this test's own
-    /// property is unaffected by it, and the extra `file_tree_root` assertion below pins the new
-    /// behavior down rather than leaving it implied.
     #[cfg(unix)]
     #[gpui::test]
     fn the_cached_worktree_key_is_canonical_and_records_through_a_symlink(cx: &mut TestAppContext) {
@@ -5577,7 +5026,6 @@ mod fold_state_tests {
         });
         cx.run_until_parked();
 
-        // Reopening against the *real* path must see what was recorded through the symlink.
         let (reloaded, cx) = open_app_with_state_dir(
             cx,
             real.path().to_path_buf(),
@@ -5591,13 +5039,6 @@ mod fold_state_tests {
         );
     }
 
-    /// CRITICAL 4: a write that fails must not silently drop the change. The pending flag is
-    /// cleared *before* the write, so without an explicit re-queue on error the user's
-    /// expand/collapse is lost with only a log line - directly contradicting this feature's
-    /// "recorded immediately" claim.
-    ///
-    /// The failure is real, not injected: the settings path's parent is a regular *file*, so the
-    /// `create_dir_all` inside `FoldState::save_at` fails on every attempt.
     #[gpui::test]
     fn a_failed_fold_state_write_is_requeued_rather_than_dropped(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5635,14 +5076,6 @@ mod fold_state_tests {
         );
     }
 
-    /// An incomplete walk must never be used as evidence that the directories it never reached
-    /// are gone - pruning against it would silently, and permanently, destroy good state.
-    ///
-    /// GitHub issue #160 removed the entry cap this used to be driven through, so it is now
-    /// driven through the incompleteness that genuinely remains: a directory the walk cannot
-    /// read. The expanded folder lives *inside* that directory, so it really is absent from the
-    /// listing while the listing really is `partial` - the exact combination that would delete
-    /// its fold state if `prune_stale_fold_state` trusted an incomplete inventory.
     #[cfg(unix)]
     #[gpui::test]
     fn an_incomplete_walk_never_prunes_fold_state(cx: &mut TestAppContext) {
@@ -5686,7 +5119,6 @@ mod fold_state_tests {
         let saw_zzz = reloaded.read_with(cx, |app, _| {
             app.file_tree.iter().any(|entry| entry.name == "zzz")
         });
-        // Restore before any assertion can fail, or `TempDir`'s own cleanup fails too.
         fs::set_permissions(&outer, fs::Permissions::from_mode(0o755)).expect("chmod back");
 
         assert!(
@@ -5712,12 +5144,6 @@ mod fold_state_tests {
 /// GitHub issue #18 §3, verified where it actually matters: against real painted geometry in a
 /// real virtualized list, not against the pure `indent_guide_x` arithmetic alone (which
 /// `crate::sidebar::file_tree`'s own unit tests already cover).
-///
-/// The failure mode the issue names - "gaps or misaligned segments as rows recycle while
-/// scrolling" - is only observable this way: every assertion below reads
-/// `VisualTestContext::debug_bounds`, i.e. the bounds GPUI genuinely laid the guide out at, and
-/// the recycling test re-asserts them *after* a real scroll event has forced `uniform_list` to
-/// rebuild its rows from a different starting index.
 #[cfg(test)]
 mod indent_guide_tests {
     use super::*;
@@ -5751,19 +5177,6 @@ mod indent_guide_tests {
         (app, cx)
     }
 
-    /// GitHub issue #406 (regression): indent guides must render in the neutral resting colour
-    /// regardless of selection, focus, or which file is open - reported with a screenshot of an
-    /// expanded folder ("work_surface") whose children's connecting guide painted accent-blue
-    /// even though nothing in that subtree was selected or hovered. "don't color the lines in
-    /// the file explorer, let them neutral color like not selected."
-    ///
-    /// This used to be a real, deliberate feature: guides along the *open* file's own ancestor
-    /// chain painted `theme::tree::INDENT_GUIDE_ACTIVE` (GitHub issue #127), surviving even when
-    /// focus left the tree entirely (`Self::open_file_view` moves focus to the editor, not the
-    /// tree) - exactly the scenario this test reproduces, since that's precisely the state a real
-    /// user hits just by opening a file and starting to edit it. The fix removed that branch
-    /// outright rather than merely disabling it, so there is only ever one guide selector now -
-    /// no `-active-`/`-idle-` distinction to regress back into.
     #[gpui::test]
     fn indent_guides_stay_neutral_even_when_a_descendant_file_is_open_and_focus_leaves_the_tree(
         cx: &mut TestAppContext,
@@ -5816,8 +5229,6 @@ mod indent_guide_tests {
         );
     }
 
-    /// One guide per nesting level, each at exactly its level's chevron offset from the row's
-    /// own left edge, and none at all for a root-level row.
     #[gpui::test]
     fn each_row_draws_one_guide_per_level_aligned_with_that_levels_chevron(
         cx: &mut TestAppContext,
@@ -5833,7 +5244,6 @@ mod indent_guide_tests {
         let row = cx
             .debug_bounds("file-tree-row-deep.txt")
             .expect("the deepest row must paint");
-        // Literal selectors, not `format!`: `debug_bounds` takes a `&'static str`.
         for (level, selector) in [
             (0usize, "file-tree-guide-deep.txt-0"),
             (1, "file-tree-guide-deep.txt-1"),
@@ -5859,9 +5269,6 @@ mod indent_guide_tests {
         );
     }
 
-    /// The "no gaps" half: a guide spans its row's full height, and consecutive rows' segments
-    /// for the same level meet exactly - which is what makes them read as one continuous line
-    /// rather than a dashed one.
     #[gpui::test]
     fn guides_on_consecutive_rows_join_with_no_gap(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5907,9 +5314,6 @@ mod indent_guide_tests {
         }
     }
 
-    /// The real risk this whole approach was chosen to eliminate: after a scroll, `uniform_list`
-    /// rebuilds its rows from a different start index, reusing element slots. A guide drawn from
-    /// anything other than the row's own depth would land on the wrong row here.
     #[gpui::test]
     fn guides_stay_aligned_with_their_own_rows_after_the_list_recycles(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -5987,11 +5391,6 @@ mod indent_guide_tests {
         }
     }
 
-    /// GitHub issue #406 (regression): no row's guides ever pick up a distinct colour, whether or
-    /// not that row shares an ancestor with the currently open/selected/focused file. Before the
-    /// fix, `elsewhere.txt`'s shared `a` ancestor guide would have painted accent-coloured (it's
-    /// on the open file's chain) while its own `a/other` guide stayed neutral - exactly the kind
-    /// of partially-coloured subtree the original report showed a screenshot of.
     #[gpui::test]
     fn no_rows_guides_are_ever_recoloured_by_a_sibling_subtrees_open_file(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -6042,9 +5441,6 @@ mod indent_guide_tests {
         }
     }
 
-    /// Collapsing a folder removes its children's guides along with their rows - the guides are
-    /// pure functions of the rows that are actually showing, with no independently-tracked state
-    /// that could survive them.
     #[gpui::test]
     fn collapsing_removes_the_hidden_rows_guides_too(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -6157,7 +5553,6 @@ mod commit_composer_tests {
             repo.path(),
             &["commit", "-m", "a real commit on the feature branch"],
         );
-        // ...and only now a real, still-uncommitted edit to the other file.
         std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\nthree\n")
             .expect("modify dirty.txt");
         repo
@@ -6188,16 +5583,6 @@ mod commit_composer_tests {
         cx.run_until_parked();
     }
 
-    /// Live report ("The input is completly broken, carret is not centered verticaly, when
-    /// typing it goes to the right side of the input"): the message *text* div used to carry
-    /// `.flex_1().min_w_0()`, which stretched its own layout box across the whole field, so the
-    /// caret - the next `flex_none` sibling in the row once a message exists - painted pinned
-    /// at the field's right edge no matter how short the typed message was, and the row's
-    /// `.items_start()` top-aligned the 14px caret bar against the text line instead of
-    /// centering it. Same measured-bounds discipline as
-    /// `rail::render::rail_filter_caret_tests`: the caret must sit before the placeholder when
-    /// empty, hug the real typed text's right edge (not the field's) once typed, and sit
-    /// vertically centered in the field.
     #[gpui::test]
     fn message_caret_hugs_the_real_text_and_is_vertically_centered(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6373,9 +5758,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// The other half of the same "genuine no-op" rule: something staged but no message typed
-    /// must also refuse to commit - "a normal message input that the user has to fill", not an
-    /// optional one with a fallback.
     #[gpui::test]
     fn the_primary_button_is_a_genuine_no_op_with_nothing_typed(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6409,11 +5791,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// GitHub issue #285 follow-up (live report): the message box painted a real draft but had
-    /// no way to edit it at all - a click and a keystroke changed nothing. Driven through a real
-    /// click on the real painted field, then real simulated keystrokes, exactly the way
-    /// `rail::render::rail_filter_caret_tests::caret_sits_before_the_placeholder_when_empty_and_\
-    /// after_the_text_once_typed` proves the rail filter's own field is real.
     #[gpui::test]
     fn clicking_the_message_box_and_typing_really_edits_it(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6464,12 +5841,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Live report: "once a file is staged the commit message input breaks again... this should
-    /// be the same input." Typed first, before anything is staged (so the field seeds from the
-    /// empty draft, not a real file's), then a file gets staged out from under it - the field
-    /// must keep the user's own text, keep real keyboard focus, and keep accepting real
-    /// keystrokes, exactly the way [`clicking_the_message_box_and_typing_really_edits_it`] proves
-    /// for the reverse order (stage first, then type).
     #[gpui::test]
     fn typing_before_staging_survives_a_later_stage(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6546,18 +5917,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Live report: staging a file made the message box's caret "align right of the input, not
-    /// blinking" - GitHub issue #45's own failure mode, taken literally, the same live-loop proof
-    /// `rail::render::focusing_the_rail_filter_starts_the_real_shared_blink_loop` uses:
-    /// `commit_message_focus_handle` was built inside the `Self` literal in `root::state`, so it
-    /// could not join the constructor's first `AdeApp::wire_caret_blink` call (that one runs
-    /// before `this` exists) and needed to join the later, second call the way
-    /// `graph_state.branches_filter_focus_handle`/`new_file_focus_handle`/
-    /// `graph_state.branch_prompt_focus_handle` already do - it had been left out of both.
-    /// Left out, `caret_blink_visible` never toggles for this field: it stays frozen at whatever
-    /// it happened to be, which reads as "solid, not blinking" - and once a staged file's draft
-    /// makes the message non-empty, that frozen bar sits after the real text, i.e. "aligned right
-    /// of the input".
     #[gpui::test]
     fn focusing_the_commit_message_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6590,9 +5949,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// The edited message must be what a real commit actually writes, not just what the box
-    /// displays - the whole point of wiring the field into `staged_commit_message` rather than a
-    /// parallel piece of state the primary button never reads.
     #[gpui::test]
     fn a_real_commit_writes_the_users_own_edited_message(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6629,8 +5985,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Focusing the field alone (no real keystroke) must not itself become an undoable step -
-    /// the very first `Ctrl+Z` after clicking in must not blank a message the user never typed.
     #[gpui::test]
     fn focusing_the_message_field_is_not_itself_an_undoable_step(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6660,12 +6014,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Live report: "just check a file to be staged and the commit message becomes... visually
-    /// [broken]... why does the carret change once we stage a file?", followed by: "Just don't
-    /// draft messages from staged files anymore... use a normal message input that the user has
-    /// to fill." There is no more auto-drafted fallback at all (see
-    /// `Self::staged_commit_message`'s own docs) - staging, unstaging, or staging a second file
-    /// must never put any text in the box or take any away from what the user actually typed.
     #[gpui::test]
     fn staging_never_writes_anything_into_the_message_box(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -6799,10 +6147,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// `REVISION-2026-08-14.md` §7 rule 1: "Ship the affordance with the behaviour, or ship
-    /// neither." Every one of the four `▾` rows used to be a dimmed placeholder; each is now
-    /// backed by a real `wt_core` call, and this proves it against a real repository - a real
-    /// commit object, a real amend, a real stash - rather than trusting the row's own docs.
     #[gpui::test]
     fn commit_and_push_really_commits_and_reports_the_real_push_failure(cx: &mut TestAppContext) {
         // No `origin` in this fixture, deliberately: the commit half must really happen and the
@@ -6847,7 +6191,6 @@ mod commit_composer_tests {
         let repo = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
-        // Nothing staged at all: this is the row's whole point - it stages the rest first.
         assert!(
             app.read_with(cx, |app, _| app.staged_files.is_empty()),
             "premise: nothing is staged, so a plain `Commit` could not do this"
@@ -6951,8 +6294,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// A row that genuinely cannot act right now must say so rather than look clickable, and must
-    /// really do nothing if clicked at its painted position anyway.
     #[gpui::test]
     fn a_commit_menu_row_with_nothing_staged_is_disabled_and_does_nothing_when_clicked(
         cx: &mut TestAppContext,
@@ -7006,11 +6347,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// GitHub issue #176's "the commit one is particularly bugged and hard to close". Before this
-    /// fix the popover's dismiss scrim was a child of the composer, so it only covered the
-    /// composer's own ~130px box: a real click anywhere else in the window - the Changes list, the
-    /// file tree, the centre pane - went straight past it and the menu stayed open. This clicks a
-    /// point that is genuinely outside the composer and genuinely inside the window.
     #[gpui::test]
     fn a_real_click_far_outside_the_composer_closes_the_commit_menu(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -7058,11 +6394,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// The popover moved out of the composer and into `AdeApp::render` (GitHub issue #176), so its
-    /// position is now derived from a `gpui::canvas`-captured window-space anchor rather than from
-    /// its parent's own box. This pins the geometry that move had to preserve: Revision R12 §5's
-    /// 12px inset on both sides of the composer, and an upward-opening panel that clears the
-    /// primary commit button row.
     #[gpui::test]
     fn the_commit_menu_popover_really_paints_anchored_to_the_composer(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -7112,9 +6443,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Leaving the Changes view unrenders the composer. `commit_menu_open` used to stay latched
-    /// `true` through that, so coming back to Changes popped the popover open again with no click
-    /// (GitHub issue #176).
     #[gpui::test]
     fn leaving_the_changes_view_really_closes_the_commit_menu(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -7149,25 +6477,11 @@ mod commit_composer_tests {
         );
     }
 
-    /// Live report ("when going to the changes pane it is first empty and then fills up"), traced
-    /// to `set_right_sidebar_view` unconditionally resetting `Self::uncommitted_diff`/
-    /// `Self::branch_commits`/`Self::diff_state` to `Loading` on **every** switch into Changes -
-    /// even a second switch to a worktree that never changed, whose diff was already fully
-    /// loaded. GitHub issue #399's fix: `Self::refresh_diff` reruns the same real background
-    /// reload without that synchronous blank, so a re-entry into an already-loaded Changes view
-    /// keeps showing the real data it already had, undisturbed, for the whole real duration of
-    /// the (still genuinely unconditional) background refresh.
-    ///
-    /// This is a synchronous check, deliberately made *before* `cx.run_until_parked()` drains the
-    /// refresh - the exact window the live report is about. A test that only asserted the
-    /// post-`run_until_parked` state would pass whether or not the blank ever happened in
-    /// between, since the refresh always lands on the same real data either way.
     #[gpui::test]
     fn returning_to_an_already_loaded_changes_view_never_blanks_it(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
-        // Premise: the first load already landed, so every scope really is `Loaded`.
         app.read_with(cx, |app, _| {
             assert!(
                 matches!(
@@ -7186,7 +6500,6 @@ mod commit_composer_tests {
             );
         });
 
-        // Leave Changes, then switch back into it - the exact gesture the live report names.
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Files, window, cx);
         });
@@ -7234,11 +6547,6 @@ mod commit_composer_tests {
         });
     }
 
-    /// The mirror image of the test above: a real worktree switch (as opposed to a same-worktree
-    /// re-entry into the Changes view) is a genuinely different checkout, so `Self::load_diff`
-    /// must keep blanking every scope to `Loading` synchronously - showing the *previous*
-    /// worktree's already-loaded diff a frame longer would be the real cross-worktree data leak
-    /// `Self::reset_repo_scoped_state`'s own docs guard against, not a flash worth avoiding.
     #[gpui::test]
     fn switching_worktrees_still_blanks_the_changes_view_synchronously(cx: &mut TestAppContext) {
         let repo_a = changes_test_repo();
@@ -7270,16 +6578,6 @@ mod commit_composer_tests {
         cx.run_until_parked();
     }
 
-    /// The reported "2 context menus open at the same time", for this pair, end to end through a
-    /// real click on the real `▾` trigger.
-    ///
-    /// Honest about what it discriminates: the `+` menu's own scrim is full-window and
-    /// non-occluding, so that click would incidentally dismiss it even without
-    /// `close_menu_surfaces_except`. What this pins is the *outcome* - one menu open, never two -
-    /// through a real interaction; the sweep itself is what makes that outcome structural rather
-    /// than a coincidence of which scrim happens to be painted where, and
-    /// `crate::root::menus::menu_surface_tests::opening_any_one_surface_closes_all_the_others`
-    /// is the test that fails the moment the sweep stops covering a surface.
     #[gpui::test]
     fn opening_the_commit_menu_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
@@ -7417,22 +6715,12 @@ mod commit_composer_tests {
         );
     }
 
-    /// Real, immediate git staging (Revision R12 §5: "the checkbox **is** staging") -
-    /// `Self::toggle_staged` is the Changes row checkbox's real click handler
-    /// (`Self::render_staging_checkbox`'s `.on_click`), so calling it directly here exercises
-    /// exactly the same code path a real click reaches, matching this module's own established
-    /// `the_composer_reflects_real_staged_count_diffstat_branch_and_message` precedent for
-    /// driving the checkbox. Verified with real `git status --porcelain` reads, the same
-    /// real-index-verification discipline `wt_core::undo::tests::
-    /// commit_paths_never_commits_a_path_that_was_staged_by_something_else` already established
-    /// for this codebase's staging-adjacent tests.
     #[gpui::test]
     fn toggle_staged_really_stages_and_unstages_the_real_git_index(cx: &mut TestAppContext) {
         let repo = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         let a_path = PathBuf::from("a.txt");
 
-        // Sanity check the real starting state: a.txt is really modified but not staged.
         assert_eq!(
             git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
             "M a.txt",
@@ -7473,10 +6761,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Revision R12 §5's staging model has no "Jerry-only" staged state: the checkbox mirrors
-    /// the real git index, so a file already staged by something else - a user's own shell, an
-    /// agent CLI - before this worktree is ever loaded must read as staged from the very first
-    /// frame, not start at an honest-looking but wrong "0 staged".
     #[gpui::test]
     fn a_file_already_staged_in_real_git_before_the_worktree_is_ever_loaded_reads_as_staged(
         cx: &mut TestAppContext,
@@ -7502,9 +6786,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// Switching to a worktree that already has something staged in real git must show it as
-    /// staged too, not just the worktree the window happened to start on - the same real
-    /// re-derivation, exercised through `AdeApp::select_worktree` instead of the initial load.
     #[gpui::test]
     fn switching_to_a_worktree_with_something_already_staged_in_real_git_shows_it_as_staged(
         cx: &mut TestAppContext,
@@ -7522,7 +6803,6 @@ mod commit_composer_tests {
             ],
         );
         std::fs::write(second_wt.join("c.txt"), "real change\n").expect("write c.txt");
-        // Staged in the *second* worktree's own real index, before Jerry ever selects it.
         git(&second_wt, &["add", "c.txt"]);
 
         let (app, cx) = open_changes_view(cx, &repo);
@@ -7551,14 +6831,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// GitHub issue #220, "Changes are displayed as unstaged but are commited" - **now answered
-    /// structurally** by GitHub issue #285's four sections rather than by a per-row condition.
-    ///
-    /// The Uncommitted section is the working tree against `HEAD`, so a file whose difference from
-    /// `main` is already inside a real commit is not in it at all - there is no row for it to
-    /// render a misleading checkbox on. It is still counted in the Against-main section's header,
-    /// the scope that legitimately covers committed work - but not as a row of its own: that
-    /// section renders no row per file at all (see `SectionRow::AgainstMainContext`'s own docs).
     #[gpui::test]
     fn a_committed_file_is_in_the_against_main_section_not_the_uncommitted_one(
         cx: &mut TestAppContext,
@@ -7622,8 +6894,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// The composer's denominator is the **uncommitted** scope, so it counts what is genuinely
-    /// stageable without having to subtract already-committed files back out again.
     #[gpui::test]
     fn the_composer_counts_only_the_uncommitted_scope_in_its_denominator(cx: &mut TestAppContext) {
         let repo = repo_with_a_committed_and_a_dirty_file();
@@ -7660,9 +6930,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// After a real commit the just-committed file leaves the Uncommitted section entirely (the
-    /// working tree now matches `HEAD` for it) and is still counted in Against main, which is the
-    /// scope that lists what the branch would land - though never as a row of its own.
     #[gpui::test]
     fn committing_a_staged_file_moves_it_out_of_uncommitted_and_into_against_main(
         cx: &mut TestAppContext,
@@ -7731,14 +6998,6 @@ mod commit_composer_tests {
         );
     }
 
-    /// **The regression test for GitHub issue #243.** A deeply nested worktree path used to push
-    /// the filename, tag pill, and stat counts clean off the row's right edge - `dir` was
-    /// `.flex_none()` with no cap, and `name` had `.overflow_hidden()` without the paired
-    /// `.truncate()` every other truncated row in this codebase carries. A whole-row bounds
-    /// check can't prove this: `uniform_list` gives every row a fixed-width layout slot
-    /// regardless of whether an unclipped `flex_none` child spills out of it visually - so this
-    /// measures the directory-prefix element directly, real bounds against its real
-    /// `.max_w(px(120.0))` cap, not a hand-inspected snapshot.
     #[gpui::test]
     fn a_deeply_nested_path_does_not_overflow_the_change_row(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -7893,7 +7152,6 @@ mod changes_sections_tests {
         let repo = four_scope_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
-        // Two dirty paths, two commits of this branch's own, four paths against `main`.
         assert!(
             cx.debug_bounds("changes-section-uncommitted-2-open")
                 .is_some(),
@@ -7915,7 +7173,6 @@ mod changes_sections_tests {
             "Runs is open by default too, even with no agent having run here yet"
         );
 
-        // Only the open sections' rows are painted.
         assert!(
             cx.debug_bounds("change-row-dirty-a.txt").is_some(),
             "an open section paints its rows"
@@ -7930,14 +7187,6 @@ mod changes_sections_tests {
         );
     }
 
-    /// `REVISION-2026-08-14.md` §1's rule 4, and `STAGE-A-CHANGELOG.md` §4f: **the tab is called
-    /// `Changes`**, it holds all four sections, and `Uncommitted` is the name of one of them.
-    ///
-    /// §4f is about a real collision that had already happened once - §3.2's `Changes` ->
-    /// `Uncommitted` rename was meant for the *section* and got applied to the *panel tab* too,
-    /// naming a four-section panel after one of its four sections. So this pins both levels at
-    /// once rather than the tab alone: the tab says `Changes`, and the thing called `Uncommitted`
-    /// is a section inside it, alongside three others.
     #[gpui::test]
     fn the_tab_is_called_changes_and_uncommitted_is_one_of_its_four_sections(
         cx: &mut TestAppContext,
@@ -8037,7 +7286,6 @@ mod changes_sections_tests {
              not a tally of rows it never renders"
         );
 
-        // ...and the rows really paint, so the check above is about a list that reaches the screen.
         for selector in ["change-row-dirty-a.txt", "change-row-dirty-b.txt"] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -8048,7 +7296,6 @@ mod changes_sections_tests {
 
     #[gpui::test]
     fn checkboxes_exist_only_in_the_uncommitted_section(cx: &mut TestAppContext) {
-        // `REVISION-2026-08-14.md` §9, box 1.
         let repo = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
@@ -8191,7 +7438,6 @@ mod changes_sections_tests {
                 .set_kind_for_test(agent_id, ProcessKind::claude());
         });
 
-        // The very key `crate::provenance::flow` files a real hook edit under.
         let key = app.read_with(cx, |app, _| {
             let agent = app
                 .agents
@@ -8238,7 +7484,6 @@ mod changes_sections_tests {
              total exactly - by construction, since both are read off one partition"
         );
 
-        // ...and the two headers really paint that agreement.
         assert!(
             cx.debug_bounds("changes-section-runs-stat-+2-\u{2212}0")
                 .is_some(),
@@ -8316,7 +7561,6 @@ mod changes_sections_tests {
             rows.iter().map(|row| row.meta.clone()).collect::<Vec<_>>()
         );
 
-        // Switching which agent is focused must move neither count nor row set.
         app.update_in(cx, |app, window, cx| {
             app.select_agent(second, window, cx);
         });
@@ -8443,10 +7687,6 @@ mod changes_sections_tests {
 /// GitHub issue #286 - the change row's three rev-6 channels, each asserted against a real,
 /// painted row: git's own status letter (`STAGE-A-CHANGELOG.md` §4j), the filename's own
 /// seen-state (§4i), and the floating hover-action bar with its two-step discard (§4i).
-///
-/// Every one of these drives the real UI - `cx.debug_bounds` over a really-painted element,
-/// `cx.simulate_mouse_move`/`cx.simulate_click` through the real dispatch, and a real git
-/// repository underneath - rather than calling a pure helper and trusting the renderer used it.
 #[cfg(test)]
 mod change_row_tests {
     use super::*;
@@ -8500,8 +7740,6 @@ mod change_row_tests {
         (app, cx)
     }
 
-    /// §4j: "git's own letters […] one per row, on **every** row". The `new`/`del` word pills this
-    /// replaced left a modified file - the common case - with no mark at all.
     #[gpui::test]
     fn every_row_carries_gits_own_status_letter_including_the_modified_one(
         cx: &mut TestAppContext,
@@ -8524,10 +7762,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4j puts the letter "in a fixed 9px column ahead of the directory so every filename starts
-    /// on the same x". Asserted geometrically against real painted bounds, over rows whose
-    /// letters differ - the old pills could not do this, being absent on most rows and two
-    /// different widths on the rest.
     #[gpui::test]
     fn the_letter_column_is_fixed_width_and_ahead_of_the_name(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8560,9 +7794,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4j: "Applied in all three places that carried a badge: the Uncommitted rows, the file
-    /// header above the diff, and the commit file list." This covers the second - the diff
-    /// toolbar - through a real row click that really opens the file.
     #[gpui::test]
     fn the_file_header_above_the_diff_carries_the_same_letter(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8586,9 +7817,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i's two token pairs, and nothing else: an unseen name reads forward, a seen one recedes.
-    /// The state flips because the file was really **opened**, which is the only gesture §4i gives
-    /// for marking one.
     #[gpui::test]
     fn opening_a_file_moves_its_name_from_unseen_to_seen(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8618,16 +7846,11 @@ mod change_row_tests {
         );
     }
 
-    /// Audit I3, and `REVISION-2026-08-14.md` §9 box 3: `seen` and `staged` are two independent
-    /// maps and neither reads the other. Asserted in **both** directions, because the defect §4i
-    /// describes was exactly a crossed pair - `nameFg` encoding staged while the checkbox encoded
-    /// it too.
     #[gpui::test]
     fn seen_and_staged_are_two_independent_maps(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
-        // Opening marks seen and must not stage.
         let row = cx
             .debug_bounds("change-row-modified.txt")
             .expect("the modified row");
@@ -8641,7 +7864,6 @@ mod change_row_tests {
             "reviewing must never stage (REVISION-2026-08-14.md §1 rule 2)"
         );
 
-        // Staging must not mark seen.
         let checkbox = cx
             .debug_bounds("stage-checkbox-added.txt")
             .expect("the added row's checkbox");
@@ -8660,9 +7882,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i's `V`, through the real registered keybinding rather than by poking `seen_files`.
-    /// It toggles, which is the only reading that satisfies both halves of the design at once -
-    /// see `AdeApp::handle_toggle_change_seen_action`'s own docs.
     #[gpui::test]
     fn v_unmarks_a_seen_file_and_marks_an_unseen_one(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8702,9 +7921,6 @@ mod change_row_tests {
         );
     }
 
-    /// The binding the footer's `V` keycap advertises has to be a real, registered one - the same
-    /// honesty guard `the_file_tree_footer_only_advertises_real_registered_bindings` applies to
-    /// `F2`. A keycap for a shortcut nothing is bound to is worse than no keycap.
     #[test]
     fn the_changes_footer_only_advertises_a_really_registered_binding() {
         let bindings = crate::default_key_bindings();
@@ -8729,8 +7945,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i: the bar is "revealed by row state (`hov`), so nothing shifts and nothing is
-    /// permanently occluded" - so it must genuinely not exist at rest.
     #[gpui::test]
     fn the_hover_bar_is_absent_until_the_row_is_hovered(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8757,9 +7971,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i: "Exactly two icons […] a copy-path or reveal-in-tree would be clutter", and the bar
-    /// really **straddles the row's top edge** rather than sitting flush inside it - which is the
-    /// correction the design made after its own first cut.
     #[gpui::test]
     fn the_hover_bar_is_two_icons_floating_above_the_rows_top_edge(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8791,8 +8002,6 @@ mod change_row_tests {
         assert!(cx.debug_bounds("change-row-discard-modified.txt").is_some());
     }
 
-    /// §4i: "Discard takes two clicks. […] First click swaps the icon for a red `Discard?` pill,
-    /// second click commits." The first click must therefore leave the file completely untouched.
     #[gpui::test]
     fn the_first_discard_click_only_arms_the_confirm_and_changes_nothing(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8831,8 +8040,6 @@ mod change_row_tests {
         );
     }
 
-    /// The second click, and what it really does to the repository: `modified.txt` goes back to
-    /// exactly what `HEAD` has.
     #[gpui::test]
     fn the_second_discard_click_really_throws_the_files_changes_away(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8867,8 +8074,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i: "Leaving the row cancels." Enforced in `AdeApp::set_change_row_hover`, so an armed row
-    /// can never be left sitting one stray click away from destroying an agent's work.
     #[gpui::test]
     fn leaving_the_row_cancels_an_armed_discard(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8886,7 +8091,6 @@ mod change_row_tests {
         cx.run_until_parked();
         assert!(app.read_with(cx, |app, _| app.change_row_discard_armed.is_some()));
 
-        // Somewhere with no change row under it at all.
         cx.simulate_mouse_move(
             gpui::Point::new(px(4.0), px(4.0)),
             None,
@@ -8905,9 +8109,6 @@ mod change_row_tests {
         );
     }
 
-    /// The pointer moving from the row onto the bar's **overhanging** half must not dismiss the
-    /// bar - the exact failure a single hover field would produce, since that half is genuinely
-    /// outside the row's own hitbox (see `AdeApp::change_row_hover`'s docs).
     #[gpui::test]
     fn moving_onto_the_bars_overhang_keeps_it_open(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8922,7 +8123,6 @@ mod change_row_tests {
             .debug_bounds("change-row-actions-modified.txt")
             .expect("the floating bar");
 
-        // A point inside the bar but genuinely above the row it belongs to.
         let overhang =
             gpui::Point::new(bar.origin.x + bar.size.width / 2.0, bar.origin.y + px(2.0));
         assert!(
@@ -8938,9 +8138,6 @@ mod change_row_tests {
         );
     }
 
-    /// §4i: "The Uncommitted section header carries `N/M seen` and the progress bar derives from
-    /// the same map as the rows." Asserted by *moving* it - the counter has to answer to the same
-    /// `SeenFiles` map the rows read, not to a second tally of its own.
     #[gpui::test]
     fn the_section_header_counts_seen_off_the_same_map_the_rows_read(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8965,8 +8162,6 @@ mod change_row_tests {
         );
     }
 
-    /// The ride-along §4i's legend asks for: a real `V` keycap in the panel footer, and - the
-    /// honesty half - no keycap at all while the binding has nothing to act on.
     #[gpui::test]
     fn the_footer_shows_the_v_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -8989,7 +8184,6 @@ mod change_row_tests {
         );
     }
 
-    /// The same honesty half for `Jerry.dc.html`'s *first* `changesHints` entry, `space stage`.
     #[gpui::test]
     fn the_footer_shows_the_space_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -9012,15 +8206,6 @@ mod change_row_tests {
         );
     }
 
-    /// The live bug this fixes: the footer used to open with the sentence `click a file to open
-    /// its diff in the centre` - `README.md`'s wording for the *superseded* pre-`#285` panel -
-    /// ahead of the keycaps, so a user saw truncated prose where `Jerry.dc.html` line 4548's
-    /// `changesHints` specifies three chips and nothing else.
-    ///
-    /// Asserted geometrically rather than by hunting for a string, because that is what actually
-    /// pins the design: the mock's strip is `padding:0 12px` with the hints as its first child, so
-    /// the `space` keycap must begin exactly at the band's own left padding. Any prose lead-in
-    /// reintroduced ahead of it - shrinkable or not - pushes that origin right and fails here.
     #[gpui::test]
     fn the_footers_first_child_is_the_stage_keycap_at_the_bands_own_left_padding(
         cx: &mut TestAppContext,
@@ -9055,10 +8240,6 @@ mod change_row_tests {
         );
     }
 
-    /// `space` really stages and unstages the open change, through the real registered binding and
-    /// a real simulated keystroke - not by calling `toggle_staged` directly. Clicking the row is
-    /// what puts focus on the Diff surface, which is what makes the `"diff && !file-editor"`
-    /// binding reachable at all, exactly as `crate::root::focus`' own `]` test establishes.
     #[gpui::test]
     fn space_stages_and_unstages_the_open_change_through_the_real_key_binding(
         cx: &mut TestAppContext,
@@ -9110,13 +8291,6 @@ mod change_row_tests {
         );
     }
 
-    /// GitHub issue #220's fixture, reused for the other half of `space`'s honesty: a file whose
-    /// only difference from `main` is already inside a real commit has no Uncommitted row and no
-    /// checkbox (`ChangesSection`'s own table - checkboxes exist in exactly one section), so
-    /// opening its diff must leave `space` inert rather than `git add`-ing a path the panel offers
-    /// no way to unstage. The keystroke and the hint read the same
-    /// `AdeApp::open_uncommitted_change`, so a hidden hint and a dead keystroke are one condition
-    /// rather than two that can drift.
     #[gpui::test]
     fn space_does_nothing_for_a_file_with_no_uncommitted_row(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
@@ -9169,11 +8343,6 @@ mod change_row_tests {
         );
     }
 
-    /// The binding the footer's `space` keycap advertises has to be a real, registered one, with
-    /// the *same* scope `V` beside it carries - read off `V`'s own binding rather than restated,
-    /// so the two hints in one strip cannot come to mean different surfaces. The `!file-editor`
-    /// conjunct is load-bearing in a way it is not for `V`: in the editable File view a space is
-    /// a character to type.
     #[test]
     fn the_changes_footers_space_hint_only_advertises_a_really_registered_binding() {
         let bindings = crate::default_key_bindings();
@@ -9221,9 +8390,6 @@ mod change_row_tests {
         );
     }
 
-    /// The letter is a pure function of the status the row really carries, so the three renderers
-    /// cannot disagree about which letter a file gets - asserted against the same
-    /// `FileChangeStatus` the diff really produced for these three files.
     #[gpui::test]
     fn the_rows_letter_is_the_status_the_real_diff_reports(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();

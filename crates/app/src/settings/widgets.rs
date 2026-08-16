@@ -6,12 +6,6 @@
 //! visual "control shape" stays independent of any one page's field-mutation logic. (That
 //! section also defines a `path` control shape - `value` + `Change…` - but no page wires a
 //! click handler to a `Change…` action, so it isn't built here.)
-//!
-//! Every row-control text size in this module routes through `Self::ui_text_size`
-//! (`crate::theme::ui_scale`) - an earlier pass only scaled each row's own label/hint
-//! (`Self::render_settings_row`) and left every row's control fixed, visibly obvious on the
-//! Appearance page's own "Interface scale" row where the label grew but the segment labels next
-//! to it didn't.
 
 use super::*;
 use crate::settings::store::{CfgFormat, ConfigPage, SnippetLineKind};
@@ -23,27 +17,6 @@ use std::path::Path;
 /// pure decision is directly unit-testable without actually spawning a process, same "pure
 /// decision function + thin real-execution wrapper" shape as `crate::keymap`'s
 /// `detected_platform_is_macos`/`resolve_keystroke` and `crate::env_info`'s `is_wsl_from`.
-///
-/// `target` is deliberately an [`OsStr`], not a [`Path`] - the two real callers
-/// ([`AdeApp::open_settings_file`], a real local file path, and [`AdeApp::open_install_url`], a
-/// real `https://` URL) hand the OS default-open handler the same kind of "open this for me"
-/// string either way; a URL is not a filesystem path, so forcing it through `PathBuf` would be
-/// dishonest about what it is, and every platform's real handler below (`xdg-open`/`open`/
-/// `cmd /c start`) already accepts a URL exactly as it accepts a file path.
-///
-/// - macOS: real `open <target>` (`man 1 open`).
-/// - Windows: real `cmd /c start "" <target>`, not just `start <target>` - `start`'s first
-///   argument is a required (but empty is fine) window *title*, and skipping it makes `start`
-///   treat `target` itself as the title instead of the real target the moment `target` needs
-///   quoting (any path or URL containing a space) - a well-known real `cmd.exe` `start` gotcha,
-///   verified against Microsoft's own guidance, not assumed from memory. `start` is a `cmd.exe`
-///   built-in, not a standalone executable, hence the `cmd /c` wrapper. This is invoked via
-///   `std::process::Command`, one argument per `Vec` element - not through a shell that would
-///   need to re-parse quoting - so it does not matter that a user's actual default shell might
-///   be PowerShell, where `start` means something else entirely (`Start-Process`); this always
-///   runs `cmd.exe` explicitly and directly.
-/// - Linux (and anything else, as a reasonable fallback): real `xdg-open <target>`, unchanged
-///   from before this platform split existed.
 fn open_command_for(target_os: &str, target: &OsStr) -> (&'static str, Vec<OsString>) {
     match target_os {
         "macos" => ("open", vec![target.to_os_string()]),
@@ -105,10 +78,6 @@ impl AdeApp {
     /// Opens the settings file - the config banner's `Open file` button - via
     /// [`open_command_for`], real per-platform: `xdg-open` on Linux, `open` on macOS,
     /// `cmd /c start` on Windows (see that function's docs for why each is correct).
-    ///
-    /// Only the Linux path (`xdg-open`) has actually been run - this app has only ever
-    /// executed on Linux/WSL2. The macOS/Windows commands are real, verified-correct shell
-    /// commands (see [`open_command_for`]'s docs), not verified by running them.
     pub(in crate::settings) fn open_settings_file(&mut self, cx: &mut Context<Self>) {
         let Some(path) = settings_store::settings_toml_path() else {
             log::warn!(
@@ -143,12 +112,6 @@ impl AdeApp {
     /// that page's real key list (`crate::settings::store::config_keys_line`), the real
     /// `TOML | JSON` segment, and an `Open file` button. Only ever called for the three pages
     /// `page` can name - see `crate::settings::store::ConfigPage`'s own docs.
-    ///
-    /// The displayed path switches with the `TOML | JSON` segment, but there is no real
-    /// `settings.json` file to open - the JSON view is a read-only re-serialization of the same
-    /// loaded [`Settings`] value (see `crate::settings::store`'s "TOML is the real file" docs) -
-    /// so `Open file` is disabled whenever `JSON` is selected, rather than silently opening the
-    /// `.toml` path next to a displayed `.json` one it doesn't actually target.
     pub(in crate::settings) fn render_config_banner(
         &self,
         page: ConfigPage,
@@ -511,12 +474,6 @@ impl AdeApp {
     /// widget in this app (`Self::render_diff_file_toggle`, `Self::render_right_sidebar_toggle`,
     /// `Self::render_palette_scope_control`, and this page's TOML/JSON toggle). `selected` is
     /// compared by value (`==`) against each [`ChoiceOption::label`].
-    ///
-    /// `on_select` receives the clicked segment's **index** into `options`, not its display
-    /// `label`: every call site turns a click back into its own enum variant, and dispatching by
-    /// re-matching the display string is a silent correctness hazard - renaming a label with no
-    /// matching update to the `on_select` match arm would dispatch to the wrong variant with no
-    /// compile error. An index can't be broken by a label rename, only by reordering `options`.
     pub(crate) fn render_choice_control(
         &self,
         id_prefix: &'static str,
@@ -737,11 +694,6 @@ mod open_command_tests {
         assert_eq!(program, "xdg-open");
     }
 
-    /// [`open_command_for`] is genuinely reused for a URL target too (the Language servers
-    /// page's `Install` action, `AdeApp::open_install_url`), not just a local file path - proves
-    /// the same three real per-platform commands work unchanged for an `https://` target on
-    /// every platform R11 already verified, matching this test module's own established
-    /// pattern.
     #[test]
     fn every_platform_command_works_unchanged_for_a_real_url_target() {
         let url =

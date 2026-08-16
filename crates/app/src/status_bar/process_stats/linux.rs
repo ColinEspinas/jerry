@@ -1,30 +1,5 @@
 //! The Linux/WSL2 [`ProcessSampler`](super::ProcessSampler) backend: `/proc/<pid>/stat` for CPU
 //! ticks and `/proc/<pid>/status` for `VmRSS`.
-//!
-//! This is the original implementation this module started as, moved behind the shared trait
-//! unchanged in behaviour (GitHub issue #283). The one representational change is that
-//! [`Sampler::cpu_time`] converts the kernel's clock ticks into a real [`Duration`] here, inside
-//! the backend that owns that unit, rather than handing raw ticks up to shared code - see the
-//! parent module's docs for why every backend converts to a common unit. The conversion is exact
-//! (one tick is exactly 10ms at the pinned rate below), so a percentage computed from these
-//! durations is bit-for-bit the same number the tick-based version produced.
-//!
-//! ## The `100` clock-tick-rate constant
-//!
-//! Converting a tick count into CPU-seconds needs the kernel's `USER_HZ` (`sysconf(_SC_CLK_TCK)`
-//! in C). glibc/Linux hardcodes `USER_HZ` to 100 on every mainstream architecture (x86, x86_64,
-//! arm, aarch64) - verified on this project's own dev machine via `getconf CLK_TCK`.
-//! [`CLOCK_TICKS_PER_SECOND`] pins that well-known value.
-//!
-//! `libc` *is* a real dependency of this crate on Unix now (see `crates/app/Cargo.toml`), so
-//! `sysconf(libc::_SC_CLK_TCK)` is genuinely callable here and the original "no libc dependency"
-//! reason for the constant no longer holds. It is deliberately kept anyway: `_SC_CLK_TCK` is the
-//! *userspace* `USER_HZ`, which is fixed at 100 by the kernel ABI (`include/asm-generic/param.h`)
-//! independently of `CONFIG_HZ`, so a `sysconf` call would return a value this constant can
-//! already state, at the cost of an FFI call on a path that runs for every agent on every poll.
-//!
-//! See the parent module's docs for the per-process (not per-process-tree) limitation, which is
-//! documented once there for every platform rather than repeated per backend.
 
 use super::ProcessSampler;
 use std::path::PathBuf;
@@ -68,11 +43,6 @@ pub fn cpu_time_from_ticks(ticks: u64) -> Duration {
 /// Reads `/proc/<pid>/stat` and returns the sum of `utime` + `stime` (fields 14 and 15, in
 /// clock ticks) - the process's total CPU time consumed since it started. `None` if the process
 /// no longer exists or the file couldn't be parsed.
-///
-/// The `comm` field (field 2) is parenthesized and may itself contain spaces or parentheses, so
-/// this locates the *last* `)` and parses every field after it by position, rather than naively
-/// splitting the whole line on whitespace - the same class of care `wt_core::diff`'s own parser
-/// applies to unpredictable real-world content.
 pub fn read_cpu_ticks(pid: u32) -> Option<u64> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
     let content = std::fs::read_to_string(path).ok()?;
@@ -125,8 +95,6 @@ pub fn system_memory_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// A real read of this real machine's `/proc/meminfo` - a Linux box always has some physical
-    /// memory, and it is always at least as large as this process's own resident set.
     #[test]
     fn reads_this_real_machines_total_memory() {
         let total = read_total_memory_bytes().expect("/proc/meminfo MemTotal must be readable");
@@ -137,9 +105,6 @@ mod tests {
         );
     }
 
-    /// Real `/proc/self` reads: this test process's own pid always exists and always has a
-    /// readable `stat`/`status`, so both readers should return `Some` with a sane (non-zero for
-    /// RSS) value.
     #[test]
     fn reads_this_real_test_processs_own_proc_files() {
         let pid = std::process::id();
@@ -165,10 +130,6 @@ mod tests {
         assert_eq!(read_rss_bytes(u32::MAX), None);
     }
 
-    /// The tick -> [`Duration`] conversion is exact, which is what makes this backend's move
-    /// behind the shared trait a pure refactor: 100 ticks is one real CPU-second, exactly, so
-    /// every percentage this backend feeds the shared math is the number the previous,
-    /// tick-based implementation computed.
     #[test]
     fn cpu_time_from_ticks_is_the_exact_same_number_the_tick_math_produced() {
         assert_eq!(cpu_time_from_ticks(100), Duration::from_secs(1));
@@ -187,7 +148,6 @@ mod tests {
         assert_eq!(NANOS_PER_CLOCK_TICK * CLOCK_TICKS_PER_SECOND, 1_000_000_000);
     }
 
-    /// The trait implementation is really wired to the `/proc` readers above, not to a stub.
     #[test]
     fn the_sampler_reads_this_real_test_process_through_the_trait() {
         let pid = std::process::id();

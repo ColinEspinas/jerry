@@ -4,13 +4,6 @@
 //! (*New terminal* / *New agent* / *Git graph* / *Open file…* / *Next changed file*, none of them
 //! "New file"); the file tree's affordances were already a real, always-present second entry
 //! point to this same flow, so removing the menu row dropped no reachable functionality.
-//!
-//! Naming UI: a small, hand-rolled append/backspace-only inline text field
-//! (`Self::handle_new_file_key_down`), the same minimal shape `Self::handle_filter_key_down`
-//! already established for the rail's filter row - there is no existing "rename"/"create" text
-//! prompt anywhere else in this app to match instead (agents have no user-assigned names at
-//! all), and a single-line name prompt doesn't warrant pulling in the full `EntityInputHandler`
-//! machinery the File view's real text editing uses (`vendor/zed/crates/gpui/examples/input.rs`).
 
 use super::*;
 use std::path::Path;
@@ -333,15 +326,6 @@ impl AdeApp {
     /// the same real end state a Files-tree row click on an existing file reaches
     /// (`crate::code_surface::tabs::AdeApp::open_file_view`) - inlined here rather than reused
     /// as-is since there's no on-disk file yet for that method's own load path to read.
-    ///
-    /// Refuses - a real, visible error, with the prompt left open so the name can be corrected -
-    /// rather than silently overwriting an existing file or directory already at the same path.
-    /// The new [`edit_buffer::EditBuffer`] is seeded with `saved_mtime: None`/`saved_len: 0`:
-    /// genuinely nothing has been written to disk yet. The very next step calls
-    /// [`Self::save_active_file`] to perform that real first write, through the exact same
-    /// freshness-gated save pipeline every other save uses - see that method's own
-    /// `is_new_never_saved` docs for why a brand-new, never-loaded path doesn't trip its
-    /// external-change-conflict check the way it otherwise would.
     pub(super) fn create_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self.new_file_input.clone() else {
             return;
@@ -361,10 +345,6 @@ impl AdeApp {
     /// [`Self::create_new_file`]'s real body, callable without the modal prompt's own state - the
     /// file tree's inline "New file" editor (GitHub issue #19 §2) drives this directly, so both
     /// affordances create a file through one implementation rather than two.
-    ///
-    /// Returns the real rejection message on failure and leaves nothing changed, so each caller
-    /// can surface it next to *its own* field. Clears [`AdeApp::new_file_input`] on success (the
-    /// modal prompt's own dismissal) - a no-op for the tree's editor, which never opened it.
     pub(crate) fn create_file_named(
         &mut self,
         parent_dir: &Path,
@@ -468,11 +448,6 @@ mod tests {
     use gpui::TestAppContext;
     use std::time::Instant;
 
-    /// Real, live-reproduced regression coverage for the self-audit finding: cancelling the
-    /// "New file" prompt while a file tab is showing must not leave `Window::focus` dangling on
-    /// the now-hidden prompt field - proven the same way this project's other dangling-focus
-    /// fixes are (`root::focus::tab_strip_keybinding_tests`' own precedent): a real ⌘P keystroke
-    /// afterward must still reach `TogglePalette`.
     #[gpui::test]
     fn cancelling_new_file_while_a_file_tab_is_open_does_not_leave_focus_dangling(
         cx: &mut TestAppContext,
@@ -502,13 +477,6 @@ mod tests {
         );
     }
 
-    /// Real, live-reproduced coverage for the case [`super::AdeApp::cancel_new_file`] didn't
-    /// handle before this revision's own self-audit: no file tab open *and* no active agent at
-    /// all (every agent in the worktree already closed) - a real, reachable state under the
-    /// tabs rework (`crate::work_surface::agents::Agents::active_id`'s own docs, and
-    /// `crate::root::AdeApp::select_worktree`'s identical fallback for the same case). Before the
-    /// fix, `Agents::focus_active` was a genuine no-op here, leaving `Window::focus` dangling
-    /// on the just-closed prompt field.
     #[gpui::test]
     fn cancelling_new_file_with_no_file_tab_and_no_active_agent_does_not_leave_focus_dangling(
         cx: &mut TestAppContext,
@@ -548,9 +516,6 @@ mod tests {
         );
     }
 
-    /// End-to-end against a real temp directory: naming a file and pressing Enter must produce
-    /// a real, empty file on disk - not just an in-memory tab - and must not trip the
-    /// external-change-conflict path `Self::save_active_file`'s freshness gate exists for.
     #[gpui::test]
     fn creating_a_new_file_writes_a_real_empty_file_with_no_false_conflict(
         cx: &mut TestAppContext,
@@ -731,17 +696,6 @@ mod new_file_caret_tests {
         );
     }
 
-    /// GitHub issue #45's own title, taken literally: before this fix, `new_file_focus_handle`
-    /// was never wired into `AdeApp::wire_caret_blink` at all, so *blurring* it never called the
-    /// real [`crate::root::AdeApp::stop_caret_blink`] that pins the shared flag straight to
-    /// "dimmed" the instant focus leaves.
-    ///
-    /// Checks *blur*, not *focus* - see
-    /// `crate::graph_view::render::graph_focus_tests::blurring_the_branches_filter_stops_the_real_shared_blink_loop`'s
-    /// own docs for why a focus-then-type test can't actually distinguish "wired into
-    /// `wire_caret_blink`" from "`Self::handle_new_file_key_down`'s own real `reset_caret_blink`
-    /// call on every keystroke, regardless of that wiring" - only blur has an effect that's
-    /// unique to the real subscription this fix adds.
     #[gpui::test]
     fn blurring_the_new_file_prompt_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

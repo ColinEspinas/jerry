@@ -57,16 +57,6 @@ impl AdeApp {
     /// `ctrl-shift-T`'s own `handle_new_agent_action`/`handle_new_terminal_action`, the `+` menu's
     /// row, the title bar's Agent menu row (`crate::title_bar::menu::AdeApp::agent_menu_rows`),
     /// and the palette's `PaletteCommand::NewShell`.
-    ///
-    /// GitHub issue #90: a genuinely empty window (no [`Self::focused_repo`]) has no real repo
-    /// root to spawn into at all - a real, live-reproduced bug (independent audit) found that
-    /// without this guard, [`Self::current_worktree_path`] fell through to [`Self::focused_repo_path`],
-    /// which itself used to fall back to *some other, unopened* known repo's real path (`Self::
-    /// repos.first()`), silently spawning a real PTY - and, from there, reachable real destructive
-    /// git operations (`Keep All Changes`/`Discard Worktree`) - against a repo the user never
-    /// opened and can't even see (the empty-state view renders no tab strip at all, so the tab
-    /// this spawned would have been invisible). A no-op here is the honest fix: there is nothing
-    /// this app can offer to spawn an agent into until a real repo is opened.
     pub(crate) fn new_agent(
         &mut self,
         kind: ProcessKind,
@@ -160,15 +150,6 @@ impl AdeApp {
     /// spawning a replacement or closing the window - this app registers no window-close
     /// keybinding at all, on any platform, so there is no native "Ctrl+W closes the window"
     /// default here to accidentally fall back to in the first place).
-    ///
-    /// Scoped to `Some("!terminal")` in `crate::default_key_bindings` (not global) - plain
-    /// `Ctrl+W` is `crate::terminal::pane::keystroke_to_bytes`'s own real `unix-word-rerase`
-    /// control byte (`0x17`) a focused shell needs for its own word-backspace; see that list's
-    /// own docs (and its `secondary-z`/`"]"` entries) for this project's established precedent
-    /// for exactly this "app-level shortcut steals terminal input" conflict class (`secondary-p`
-    /// is the one deliberate exception to that precedent, not a further example of it - see that
-    /// binding's own docs) - a live terminal pane keeps `Ctrl+W`, and closing a *terminal* tab
-    /// this way stays reachable through the tab strip's own `×`/middle-click instead.
     pub(crate) fn handle_close_focused_tab_action(
         &mut self,
         _action: &CloseFocusedTab,
@@ -419,12 +400,6 @@ impl AdeApp {
 
     /// The `Archive` action - closes the tab via [`Self::close_agent`] (see that method's docs
     /// for why every close path must go through it rather than `Agents::close` directly).
-    ///
-    /// Its homes since GitHub issue #295 deleted the agent context bar's own copy
-    /// (`STAGE-A-CHANGELOG.md` §4e: "`Archive` is worktree lifecycle and belongs on the rail row
-    /// with prune and delete"): the rail's agent (`Archive run`) and worktree (`Archive N
-    /// agents`) context menus (`crate::rail::menu`, issue #290), and the title bar's
-    /// `Agent → Archive Agent`.
     pub(crate) fn archive_agent(
         &mut self,
         id: AgentId,
@@ -440,28 +415,6 @@ impl AdeApp {
     /// Closes agent `id`'s tab (`Agents::close` tears down its child process and moves focus
     /// onto whichever agent becomes active) and, if `id` is the agent [`Self::merge_flow`] is
     /// running under, cleans that up too (see [`Self::clear_merge_flow_for_closed_agent`]).
-    ///
-    /// Every close path - [`Self::archive_agent`], [`Self::respawn_agent`]'s
-    /// close-then-respawn, and the tab strip's own `×` - must go through this function rather
-    /// than `Agents::close` directly: previously only `archive_agent` cleared `merge_flow`, so
-    /// archiving (or retrying) a mid-merge agent left `merge_flow.agent_id` pointing at an agent
-    /// that no longer existed, permanently blocking every later merge (only one flow runs at a
-    /// time - `crate::merge::flow::AdeApp::start_merge_from_graph_branch`'s own single-flight
-    /// refusal).
-    ///
-    /// Tells `Agents::close` to skip its own focus move whenever the centre pane isn't
-    /// actually showing an agent's pane right now - a file tab is open, *or* Settings has
-    /// replaced the whole workspace body (`Self::settings_open`, see the title bar's Agent
-    /// menu docs - Archive Agent is reachable from there while Settings is showing, and
-    /// moving focus onto a pane `Self::render_settings` isn't drawing would dangle it exactly
-    /// like the file-tab case this guard already covered).
-    ///
-    /// If closing `id` leaves its worktree with no agent at all (and no file tab either), real
-    /// keyboard focus falls back onto [`Self::rail_focus_handle`] - the same fallback
-    /// [`Self::select_worktree`] uses for the identical "nothing left to focus" case - so
-    /// `Window::focus` never stays pointed at the just-`shutdown()`, no-longer-rendered pane. The
-    /// rail's *root*, not its filter field (which this used to target): see
-    /// [`Self::rail_focus_handle`]'s own docs for the real keystroke-swallowing bug that was.
     pub(crate) fn close_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         // A non-agent surface occupies the centre pane instead of an agent's own `TerminalPane`
         // while it is active, so `Agents::close`'s own focus-follows-close move onto the newly
@@ -507,25 +460,6 @@ impl AdeApp {
     }
 
     /// Whether some surface *other than an agent's own pane* currently occupies the centre column.
-    ///
-    /// The one shared predicate `REVISION-2026-08-13.md` §7 asks for, in this app's own terms.
-    /// The design states the rule as a deny-list on "is this tab a file"
-    /// (`isFileTab = !isAgent(tab) && tab !== 'terminal' && tab !== 'graph' && tab !== 'run'`) and
-    /// spells out exactly what it costs to forget one: "without the last clause the editor renders
-    /// *below* the new pane and the tab id is pushed into the worktree's open-file list as a
-    /// phantom file tab". Jerry's equivalent question is this one - every real site asked it as an
-    /// inline `open_change.is_some() || settings_open || graph_tab_active`, once per site, and one
-    /// of them had already drifted (the review tab was missing from `close_agent`'s own
-    /// `skip_focus_move`, so closing an agent while the Review tab was showing moved real keyboard
-    /// focus onto a pane nothing was drawing).
-    ///
-    /// **Extend this, and only this, when a centre surface is added.** Every caller is a place
-    /// that would otherwise focus, close or render an agent pane that is not on screen.
-    ///
-    /// Jerry's other half of §7 - "the tab id can't leak into the open-file list" - needs no
-    /// predicate at all: [`work_surface::TabRef`] is an enum, its file arm carries a `PathBuf`,
-    /// and the open-file list is `Vec<PathBuf>`, so a run tab is structurally incapable of landing
-    /// in it.
     pub(crate) fn centre_pane_is_not_an_agent(&self) -> bool {
         self.open_change.is_some()
             || self.settings_open
@@ -643,15 +577,6 @@ impl AdeApp {
     /// every render rather than caching a mutated copy) - [`Self::tab_order`] itself only records
     /// a user's real drag-chosen order, never which tabs exist; that's still `Agents`/
     /// [`Self::open_files`]'s job.
-    ///
-    /// GitHub issue #120: an earlier revision (R12 §3, "a bare worktree shows only the shell
-    /// tab") truncated this to the active file only (or nothing) whenever a worktree had no real
-    /// agent running - reconciling against an empty file list instead of the real
-    /// [`Self::open_files`]. That's gone: every open file tab stays visible regardless of whether
-    /// an agent, or even the default shell, is running - opening and working across files was
-    /// never meant to depend on a shell/agent existing. Bareness no longer affects tab *labels*
-    /// either (those are the pane's own live title now - `Self::agent_tab_label`); it survives
-    /// only in [`Self::render_agent_context_bar`]'s `Start an agent` swap.
     pub(crate) fn combined_tab_order(&self) -> Vec<work_surface::TabRef> {
         // No worktree genuinely selected means genuinely no tabs - an honestly empty strip, not
         // whatever happens to be open in the repo root. This used to fall through to
@@ -794,16 +719,6 @@ impl AdeApp {
     /// drop lands on a tab [`Self::update_tab_drag_insertion`] never actually recorded for - a
     /// drop can still fire on a tab the cursor technically never entered, e.g. a very fast
     /// release), then delegates to [`Self::reorder_tab`], and clears the now-stale caret state.
-    ///
-    /// Also records [`Self::tab_slide`] (task #65, GitHub issue #16's own remaining "neighbour
-    /// tabs teleport instead of sliding" gap) *before* [`Self::reorder_tab`] actually mutates the
-    /// order - `work_surface::state::tab_slide_offsets` needs the real pre-drop order to know
-    /// which tabs are about to shift, and the dragged tab's own real last-measured width
-    /// ([`Self::tab_bounds`]) to know by how much. `dragged_width` is `0px`
-    /// ([`Pixels::default`]) whenever that tab has never actually painted yet (e.g. a test that
-    /// never rendered a real window) - a real, honestly-measured `0` rather than an invented
-    /// placeholder width, so the recorded tabs are still correct even though nothing would
-    /// visibly move.
     pub(in crate::work_surface) fn drop_dragged_tab(
         &mut self,
         dragged: work_surface::TabRef,
@@ -873,10 +788,6 @@ impl AdeApp {
     /// across every worktree, per this revision's whole point (see `crate::root::mod`'s "One
     /// rail row per worktree" docs). The real per-worktree tab-strip order
     /// [`Self::render_tab_strip`] draws from, so the tabs shown and this list can never disagree.
-    ///
-    /// **Every** pane tab, shells included - this is "what does the strip show", and a
-    /// [`ProcessKind::Shell`] genuinely gets a tab. Anything that means "a real agent session"
-    /// rather than "a pane" wants [`Self::current_worktree_agent_sessions`] instead.
     pub(crate) fn current_worktree_agents(&self) -> impl Iterator<Item = &Agent> {
         let order = self.combined_tab_order();
         order.into_iter().filter_map(move |tab_ref| match tab_ref {
@@ -894,19 +805,6 @@ impl AdeApp {
     /// `secondary-8` bindings - no longer advertised by an on-screen keycap hint, removed per a
     /// direct product-owner request), [`Self::select_relative_agent`] (the title bar's `Next
     /// Agent`/`Previous Agent`), and that pair's own menu-enablement predicate.
-    ///
-    /// Same order as the strip, just with the shells dropped, so `secondary-2` still means "the
-    /// second agent you can see, reading left to right" - it simply stops counting the terminal
-    /// sitting between them. GitHub issue #381: `Jerry.dc.html` has never treated a terminal as
-    /// an agent (`isAgent = t => activeWt.agents.indexOf(t) >= 0`, with `'terminal'` a separate
-    /// tab id its `isFileTab` test excludes by name), and the design's own keybinding table calls
-    /// this `Jump to session by position`. Counting shells made the keycap row advertise more
-    /// positions than there were agents and pushed every real agent off its own number.
-    ///
-    /// A shell is not made unreachable by this: it still has a real tab to click, and - since
-    /// this same issue stopped the palette filing shells under a heading that reads `Agents` - it
-    /// now has its own `Terminals` group there, which is a full keyboard path to it
-    /// (`crate::palette::state::build_groups`).
     pub(crate) fn current_worktree_agent_sessions(&self) -> impl Iterator<Item = &Agent> {
         self.current_worktree_agents()
             .filter(|agent| agent.kind.is_agent_session())
@@ -945,20 +843,6 @@ impl AdeApp {
     /// `crate::rail::title_signal` classifies for the status pill), falling back to the resolved
     /// program name only while it has set no title at all
     /// (`work_surface::live_tab_label`'s own docs for both halves).
-    ///
-    /// Read fresh on every render, deliberately: the title is live, so a tab whose shell just
-    /// `cd`'d or whose agent just started a task must relabel itself without any further event
-    /// plumbing. GPUI makes that automatic - the `pane.read(cx)` below registers this window as a
-    /// reader of the pane entity, so the pane's own `cx.notify()` (which it fires whenever real
-    /// pty bytes arrive, and a title change *is* pty bytes) invalidates the window and redraws
-    /// this strip.
-    ///
-    /// Applies identically to a shell tab and an agent-CLI tab. Both are just a process in a pty,
-    /// both report through the same mechanism, and an agent's own title is the more informative
-    /// of the two (`\u{2733} Claude Code` while it works) - there is no per-kind naming authority
-    /// that would be regressed by preferring it. The one deliberate exception elsewhere is
-    /// `crate::review::render`'s review-tab label, which answers a different question (*which*
-    /// agent's diff this is) and so must stay a stable identity, not a live status.
     pub(crate) fn agent_tab_label(&self, agent: &Agent, cx: &App) -> String {
         let pane = agent.pane.read(cx);
         work_surface::live_tab_label(pane.title(), &pane.program_label())
@@ -969,68 +853,6 @@ impl AdeApp {
     /// `TabRef::File` - so an agent tab and a file tab can sit side by side in either order
     /// (GitHub issue #16), rather than always "every agent, then every file" - followed by the
     /// `+` menu button ([`Self::render_tab_strip_plus`]).
-    ///
-    /// This used to end in a right-aligned `secondary-1`..`secondary-8` agent-jump keycap hint
-    /// (mirrored by the status bar's own copy, `status_bar::render::AdeApp::
-    /// render_status_agent_hint`). GitHub issue #397, a direct product-owner report: at zero
-    /// real agent sessions in the current worktree the keycap row rendered empty and left the
-    /// bare word "agent" floating with nothing in front of it, which read as clutter rather than
-    /// a useful hint. The underlying `secondary-1`..`secondary-8` jump keybindings
-    /// ([`Self::jump_to_agent_at`]) are unaffected - only the advertising hint is gone.
-    ///
-    /// Each agent tab's label is read per tab, inside the loop below
-    /// (`Self::agent_tab_label`): a label is now purely a fact about that one pane's own live
-    /// title, so nothing here needs every label in hand up front. An earlier revision did need
-    /// that - it appended `#1`/`#2` ordinals to labels that repeated, which requires knowing
-    /// which ones repeat - but two tabs genuinely showing the same thing now honestly render the
-    /// same label, exactly as any real terminal emulator's tabs do.
-    ///
-    /// GitHub issue #354: the tabs themselves (plus the `+` button right after them) are wrapped
-    /// in their own `#tab-strip-scroll` child - `.flex_1().min_w_0().overflow_x_scroll()`,
-    /// tracked by [`Self::tab_strip_scroll_handle`] - rather than laid out directly in
-    /// `#tab-strip` itself.
-    /// Before this, the outer row carried no `overflow_x_scroll()`/clip of any kind, so once the
-    /// real tabs (each `flex_none`, i.e. sized to its own content) outgrew the strip's available
-    /// width, the excess simply painted past the pane's own right edge with no way to reach it -
-    /// no scroll-wheel handling (nothing was listening), no drag, and no overflow menu either.
-    /// `.overflow_x_scroll()` alone gives real, live scroll-wheel handling for free
-    /// (`vendor/zed/crates/gpui/src/elements/div.rs`'s own `paint_scroll_listener`, verified
-    /// directly: a plain vertical wheel delta is translated into horizontal `delta_x` whenever
-    /// `overflow.x == Scroll` and `overflow.y` is not also `Scroll`, exactly the "trackpad/wheel
-    /// scrolls a horizontal strip" behaviour every other tabbed app gives for free) - the same
-    /// `gpui::ScrollHandle` idiom `crate::root::scrollbar`'s own module docs describe for every
-    /// other scrollable region in this app, not a bespoke reimplementation. `min_w_0()` is
-    /// required for the same reason `Self::render_center_pane`'s own top docs give for its
-    /// `#work-surface` wrapper: without it, a flex item's automatic minimum size is its content's
-    /// own intrinsic size, so the scroll region would just grow to fit every tab instead of
-    /// staying clipped to the space actually available.
-    ///
-    /// The `+` button rides inside the same scrollable region, immediately after the last tab
-    /// (exactly where `Jerry.dc.html`'s own tab row puts it: `sc-for tabs`, then the `+` cell,
-    /// then a `flex:1` filler, then the trailing hint cluster), so reaching it when tabs overflow
-    /// is the same one scroll gesture that reaches the last tab - not a second, independently
-    /// reachable control pinned somewhere else.
-    ///
-    /// GitHub issue #405: there is deliberately **no** trailing chrome spacer after the scroller
-    /// any more. The mock's `flex:1` filler and the 12px of padding after it belong to the
-    /// trailing agent-jump keycap cluster - real content, flush against the strip's real right
-    /// edge. GitHub issue #397 (PR #398) deleted that cluster's content but kept a bare
-    /// `w(px(12))` bordered div in its place "for breathing room", which is exactly the live
-    /// report that followed: "the tab strip does not go all the way, there is a strange margin
-    /// right". Padding exists to keep real content off an edge; with the content gone it is just
-    /// 12px of dead chrome, and the tabs (which the scroller clips) stopped 12px short of the
-    /// pane's own right edge instead of running flush into it. The `flex_1()` scroller is what
-    /// owns the strip's leftover width now - filler and clip region in one - and it carries §4v's
-    /// bottom rule itself all the way to that real edge, exactly as the spacer used to.
-    ///
-    /// PR #403 (GitHub issue #402) tried to fix that same report by making the scroller
-    /// `.flex_initial()` and moving the `+` button out behind a new growing pusher, which pinned
-    /// the `+` to the far right of the strip. That mis-read a plain tab row (a `+` immediately
-    /// after the last tab, bare strip after it - what `Jerry.dc.html` itself draws, and what
-    /// every other tabbed editor draws) as a layout bug, and left the actual 12px spacer
-    /// untouched. The product owner's verdict on the result was immediate: "you fixed the plus
-    /// button on the right, why? And the padding is still here." Both halves of that change are
-    /// reverted here.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -1520,24 +1342,6 @@ impl AdeApp {
     /// full-window dimming for this smaller popover). The scrim's `on_click` closes the menu;
     /// the panel stops that click from bubbling up (`cx.stop_propagation()`). Positioned off
     /// [`Self::plus_button_bounds`].
-    ///
-    /// Five rows, in the exact order and wording Revision R12 §3 specifies: *New terminal*
-    /// ([`Self::new_agent`] with [`ProcessKind::Shell`]), *New agent* (`runs in <branch>` -
-    /// [`Self::new_agent_pane`]), *Git graph* ([`Self::open_git_graph`]), *Open file…*
-    /// ([`Self::open_palette`], scoped to [`palette::PaletteScope::Files`]), and *Next changed
-    /// file* ([`Self::next_changed_file`]). *New terminal*, *New agent*, *Git graph*, and *Next
-    /// changed file* each dispatch the same method their own global keybinding does
-    /// (`crate::default_key_bindings`) and show that binding's keycap; *Open file…* has no global
-    /// keybinding of its own (its own real `mod+P` spec is now claimed by `TogglePalette`
-    /// instead, see `crate::default_key_bindings`'s own docs for that tradeoff) and so shows no
-    /// keycap. Every row's click handler also closes the menu.
-    ///
-    /// There is no *New file* row - §3's item list names only these five. A worktree's file tree
-    /// (`crate::sidebar::render::render_file_tree_row`/`render_right_sidebar_toggle`) already
-    /// carries its own always-visible `+` affordances (per-directory and root-level), both wired
-    /// to the same real [`Self::start_new_file`] this row used to call, so removing it here drops
-    /// no reachable functionality - it was a second entry point to an action that already has one
-    /// the spec keeps.
     pub(crate) fn render_plus_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         // The tab strip's own `+` is the only control that opens this popover, so its painted
@@ -1683,10 +1487,6 @@ impl AdeApp {
     /// installed, or `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet).
     /// Display-only - [`Self::new_agent_pane`] runs its own detection independently, off the
     /// foreground thread, at the moment it actually spawns.
-    ///
-    /// Returns the narrow [`AgentKind`], not [`ProcessKind`]: the "New agent" row can only ever
-    /// resolve to a real agent CLI, so "could this be a shell?" isn't a question a caller has to
-    /// answer - the type says it can't be.
     pub(crate) fn resolved_new_agent_kind(&self) -> AgentKind {
         settings::AGENT_KINDS
             .into_iter()
@@ -1702,11 +1502,6 @@ impl AdeApp {
     /// [`settings::AGENT_KINDS`] entry a background `$PATH` search
     /// (`pty_core::resolve_on_path`, the same search [`Self::load_agent_rows`] runs) confirms is
     /// installed, rather than blocking the click on a filesystem walk.
-    ///
-    /// If no configured agent is installed, this spawns `AGENT_KINDS[0]` anyway, same as the
-    /// agent toolbar's `+ claude`/`+ codex` buttons when that binary isn't on `$PATH`: the
-    /// process fails to spawn and a non-panicking spawn error shows in the new tab
-    /// (`TerminalPane::spawn_error`).
     pub(crate) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
         // GitHub issue #90: the same real "nothing to spawn into yet" guard [`Self::new_agent`]'s
         // own docs explain - see those for the concrete bug this closes.
@@ -1796,12 +1591,6 @@ impl AdeApp {
     /// in the selected worktree. No longer advertised by any on-screen keycap hint (removed per
     /// a direct product-owner request), but the bindings themselves are still real and
     /// unaffected.
-    ///
-    /// GitHub issue #381: a plain [`ProcessKind::Shell`] does not take a number. It used to, and
-    /// the position it consumed was the user's own live report - the *worktree's startup shell*
-    /// occupies position 1 in essentially every worktree, so `secondary-1` selected a terminal
-    /// and every real agent sat one place further along than the keycap beside it claimed. See
-    /// [`Self::current_worktree_agent_sessions`] for why the design agrees.
     pub(crate) fn jump_to_agent_at(
         &mut self,
         position: usize,
@@ -1835,19 +1624,6 @@ impl AdeApp {
     /// over the existing per-worktree list. No-op with no agent session in the selected worktree
     /// at all, or with no active agent at all (both real, reachable states - the latter only
     /// while every agent has been closed).
-    ///
-    /// GitHub issue #381: a plain [`ProcessKind::Shell`] is not a stop on this cycle. A row that
-    /// says `Next Agent` and lands on a terminal is the same conflation the jump keycaps had, and
-    /// this one bit harder in practice - the startup shell sits in every worktree, so a two-tab
-    /// worktree of `[shell, claude]` made `Next Agent` a toggle that spent half its presses
-    /// leaving the only agent there was.
-    ///
-    /// **The active tab not being an agent session is a first-class case, not a no-op.** It is
-    /// the *normal* state (a focused terminal), and `Next Agent` from it must mean something:
-    /// there is no "current" position on the cycle to step from, so `delta > 0` enters at the
-    /// first agent session and `delta < 0` at the last. Falling out through the old
-    /// `position()?` here would have made the row silently dead in exactly the situation a user
-    /// reaches for it.
     pub(crate) fn select_relative_agent(
         &mut self,
         delta: isize,
@@ -2028,29 +1804,6 @@ impl AdeApp {
     /// bar never wraps when the centre narrows), and a status pill. **Identity and status only**
     /// (GitHub issue #295, `STAGE-A-CHANGELOG.md` §4e): the `Merge` and `Archive` buttons that
     /// used to close this bar are deleted, not hidden.
-    ///
-    /// Both were **worktree** verbs gated only on "there is an agent", sitting in an **agent**
-    /// header. §4e's three reasons, verbatim: a two-agent worktree "offered `Merge` **twice for
-    /// one worktree**"; it was offered "while the agent was `Needs input`, blocked mid-run on a
-    /// question about two conflicting migrations"; and "merge has preconditions - committed, base
-    /// current, no live writers - and the header can show none of them". Their homes now:
-    /// merging is the git graph's job (GitHub issue #241 - its "merge branch into base" half is
-    /// still open, so that direction is genuinely unavailable until it lands), and archiving is
-    /// the rail's agent/worktree context menus (`crate::rail::menu`, issue #290) plus the title
-    /// bar's Agent menu.
-    ///
-    /// The one button that stays is a bare worktree's (Revision R12 §3:
-    /// [`Self::current_worktree_is_bare`]) `Start an agent`, with the agent name greyed to
-    /// `no agent` - it is not one of the removed worktree verbs, and §4e's own rule ("an action
-    /// belongs in the scope of the object it acts on") puts starting an agent squarely in an
-    /// agent surface.
-    ///
-    /// **Not rendered over a `Shell` tab in a worktree that does have agents** - see
-    /// [`Self::render_center_pane`]'s `show_context_bar`, which reproduces `Jerry.dc.html`'s
-    /// `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0` and the mock's own reason:
-    /// "The whole row is agent identity, so it belongs to agent panes only… in a terminal pane
-    /// there is no agent to describe. Kept when the worktree has no agents at all, since it holds
-    /// that empty state's CTA."
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -2157,12 +1910,6 @@ impl AdeApp {
     /// The `Start an agent` button - a filled blue button with a `mod+shift+N` keycap hint. Real,
     /// not decorative: dispatches [`Self::new_agent_pane`], the same entry point the tab strip's
     /// `+` menu row and its own global `secondary-shift-n` keybinding already use.
-    ///
-    /// Rendered in exactly two places, both of which genuinely have no agent to act on: a bare
-    /// worktree's context bar (Revision R12 §3), where it replaced the deleted `Merge`/`Archive`
-    /// pair; and the no-agent empty state ([`Self::render_no_agents_empty_state`]), which §4t
-    /// keeps buttoned because "with no agent there is no keystroke to duplicate and no readout to
-    /// show". `element_id` distinguishes the two so GPUI never sees one id painted twice.
     pub(in crate::work_surface) fn render_start_agent_button(
         &self,
         element_id: &'static str,
@@ -2210,26 +1957,6 @@ impl AdeApp {
     /// cwd, and a `mod + click a path to open it` hint, rendered for every agent kind -
     /// `TerminalPane` behaves identically for shell and agents (see its module docs), so
     /// link-click is exactly as real for a `Claude`/`Codex` panic frame as for a shell prompt.
-    ///
-    /// A `Shell` label gets a ` · wsl` suffix when running inside WSL (`crate::env_info::is_wsl`).
-    /// The design's third hint, `split`, is deliberately not rendered - this app has no
-    /// pane-splitting feature, and this codebase omits hints for features that don't exist
-    /// rather than showing a decorative keycap for one (the same precedent
-    /// [`Self::render_plus_menu`]'s "Open file…" row sets).
-    ///
-    /// An agent pane's pid rides **this header**, and a shell's rides its info footer - which is
-    /// exactly where `Jerry.dc.html` puts each. The mock's two pane branches are mutually
-    /// exclusive (`isChat: isAgent(tab)` vs `isTerminal: tab === 'terminal'`) and only the
-    /// `isTerminal` one has a `pid`/`termSize` bottom bar; the `isChat` header reads
-    /// `{{ focus.cli }} · pid {{ focus.pid }} … {{ focus.ptyHint }}`. See
-    /// [`Self::render_pty_info_footer`] and [`Self::render_pty_footer`] for the bottom half of
-    /// that same split.
-    ///
-    /// GitHub issue #20 moved `clear` into the **terminal's** info footer, alongside
-    /// pid/grid-dims/env - see that method's own docs for the click entry point, and
-    /// [`Self::handle_terminal_clear_action`] for the real, rebindable keybinding, which is
-    /// scoped to a focused `TerminalPane` and so still works in an agent pane that no longer
-    /// paints the hint.
     pub(in crate::work_surface) fn render_pty_header(
         &self,
         agent: &Agent,
@@ -2324,22 +2051,6 @@ impl AdeApp {
     /// The **shell** pane's info footer: pid, grid dimensions, the environment chip, `clear`
     /// (GitHub issue #20 - moved here from the header, see [`Self::render_pty_header`]'s own
     /// docs), and a hint about file:line references.
-    ///
-    /// [`ProcessKind::Shell`] only, and mutually exclusive with [`Self::render_pty_footer`] - a
-    /// pane gets one bottom bar, never both. `Jerry.dc.html`'s two pane branches are `sc-if`
-    /// siblings on mutually exclusive conditions (`isTerminal: tab === 'terminal'` vs
-    /// `isChat: isAgent(tab)`), and only the `isTerminal` one carries this bar:
-    /// `pid {{ focus.pid }} │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
-    /// a tab`. Its `isChat` sibling's only bottom bar is the `hasBar` readout strip. Issue #20
-    /// named this bar "the **terminal** footer" too ("2. Terminal: move Clear into the footer"),
-    /// and §4b gates the environment chip "in both the window bar and **the terminal footer**".
-    ///
-    /// Rendering it under an agent as well was the double-bar bug the user reported live against
-    /// the shipped build ("both are displayed at the same time in both terminal and agents but
-    /// should not"): `TerminalPane` being one component behind both tab kinds is a fact about the
-    /// widget, not a licence for the chrome around it, and the mock draws the two kinds' chrome
-    /// differently on purpose. An agent's pid is not lost with this bar - it moved to the header,
-    /// which is where the `isChat` branch has always drawn it.
     pub(in crate::work_surface) fn render_pty_info_footer(
         &self,
         agent: &Agent,
@@ -2417,33 +2128,6 @@ impl AdeApp {
 
     /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue #295,
     /// `STAGE-A-CHANGELOG.md` §4t).
-    ///
-    /// [`ProcessKind::Agent`] only, and mutually exclusive with
-    /// [`Self::render_pty_info_footer`] - a pane gets one bottom bar, never both. §4t's "the bar
-    /// now renders **whenever there is an agent**" is a statement about *status*, not about pane
-    /// kind: it means the strip no longer waits for a status that offers a button. A `Shell` tab
-    /// is not "an agent" in that sentence's sense - `Jerry.dc.html` gates the whole strip on
-    /// `isChat: isAgent(tab)`, and §4u′ says so from the other direction when it accepts that the
-    /// budget popover is "reachable only from an agent pane. **On a terminal tab**, the graph or
-    /// Settings there is no way to open it… those surfaces have no agent spending anything."
-    /// Reading it as "whenever there is a pane" is what stacked this strip under the terminal's
-    /// own info footer in every tab.
-    ///
-    /// It renders whenever there is an agent, not only when that agent's status happens to
-    /// offer an action, which is what turns the now-buttonless `ask`/`run`/`finished` states from
-    /// absent strips into useful ones. Left to right: whatever run-scoped verbs the status really
-    /// earns ([`work_surface::footer_actions`] - none at all for three of the five statuses), a
-    /// spacer, then this one agent's own cost, right-aligned
-    /// ([`Self::render_agent_cost_readout`]).
-    ///
-    /// Then, past a 1px divider, the per-agent provider budget §4t puts to the right of the cost
-    /// (`5h ▓▓▓▓▓▓░ 92%   7d ▓▓▓▓░░░ 65%`, plus the popover §4u′ moved into this strip) -
-    /// GitHub issue #294, [`Self::render_agent_budget_readout`]. That readout is itself `None`
-    /// for a pane that spends no provider, which a `Shell` never can - a second, narrower reason
-    /// this whole strip is agent-only.
-    ///
-    /// No `JERRY` wordmark (deliberate deviation from the design mockup, per direct user request,
-    /// not a bug fix).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
         agent: &Agent,
@@ -2541,18 +2225,6 @@ impl AdeApp {
     /// §4t's per-agent cost readout: `6.2% cpu · 0.51 GB` for **this** agent's own pid, at the
     /// status bar's own recessive tier so the pane strip and the window footer speak in the same
     /// type sizes rather than inventing a second scale.
-    ///
-    /// `None` - genuinely nothing rendered, not a dimmed placeholder - in the two cases §4t and
-    /// `crate::status_bar::render::AdeApp::render_status_resources_readout` already agree on:
-    /// "blank for an agent that is not running" (an exited pane has no pid to sample and no cost
-    /// to report), and a build whose platform has no real sampling backend at all
-    /// (`process_stats::PLATFORM_SAMPLING_SUPPORTED`), where a permanent `...% cpu` could never
-    /// resolve.
-    ///
-    /// Reads the same `AdeApp::process_stats` sample map and the same
-    /// `crate::status_bar::resources` formatters the Resources popover and the status bar total
-    /// use - one sampling pipeline, three surfaces, never a second derivation that could disagree
-    /// with the total this agent is part of.
     pub(in crate::work_surface) fn render_agent_cost_readout(
         &self,
         is_running: bool,
@@ -2678,18 +2350,6 @@ impl AdeApp {
     /// renders first, above either the active file tab's Surface C
     /// (`Self::render_code_surface`) if [`Self::open_change`] names one, or the active agent's
     /// toolbar/context-bar/pty otherwise.
-    ///
-    /// A file opened via a Changes-row click (`Self::open_change_diff`) always has a `DiffFile`
-    /// to show; one opened via the Files tree (`Self::open_file_view`) may not, in which case
-    /// `diff_file` below is `None` and `Self::render_code_surface` shows the File view
-    /// unconditionally.
-    ///
-    /// The terminal-surface fallback's root div keeps `.min_w_0()`: GPUI's flexbox gives a flex
-    /// item's minimum width its content's intrinsic width by default, so an unbroken wide
-    /// terminal row could otherwise grow this pane past its `flex_1` share and push the
-    /// fixed-width right sidebar off screen (`.min_w_0()` zeroes that automatic minimum - see
-    /// `vendor/zed/crates/agent_ui/src/agent_panel.rs`'s own `.flex_1().min_w_0()` use for the
-    /// same overflow guard).
     pub(crate) fn render_center_pane(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let surface = div()
             .id("work-surface")
@@ -2809,39 +2469,6 @@ impl AdeApp {
     /// draws a "this is the selected one" edge from [`Agents::active_id`] - the rail's own agent
     /// row (`crate::rail::render::AdeApp::render_agent_row`) and this tab strip's own agent tab
     /// ([`Self::render_agent_tab`]) - can disagree with what the centre pane is actually showing.
-    ///
-    /// [`Agents::active_id`]'s own docs are explicit that it is "read directly by the centre pane
-    /// with no repo-scoping of its own": every *other* centre-pane occupant - the review tab, the
-    /// run tab, the graph tab - is a separate `bool` layered on top precisely because `Agents`
-    /// itself has no way to know about them ([`Self::review_tab_active`]/[`Self::run_tab_active`]/
-    /// [`Self::graph_tab_active`]), so any caller that wants "is the agent pane really what's on
-    /// screen" has to apply the same layering [`Self::render_center_pane`] does, rather than
-    /// reading [`Agents::active_id`] straight.
-    ///
-    /// Before this existed, both call sites above did exactly that - read [`Agents::active_id`]
-    /// straight - so opening a history run (GitHub issue #227) left whichever agent had been
-    /// active still drawn as the selected rail row *and* the active tab, alongside the run's own
-    /// now-correctly-selected row: two rows/tabs reading as selected at once, a live user report.
-    /// The review and graph tabs share the identical shape and were silently carrying the same
-    /// bug; this closes it for all three at the one root, rather than teaching each caller a
-    /// fourth flag to check.
-    ///
-    /// GitHub issue #382: the File/Diff surface (Surface C) shares the identical shape and was
-    /// still missing here, left out of the original #227 fix because that fix only chased the
-    /// three flag-gated occupants (review/run/graph) and never the fourth, structurally different
-    /// one - `Self::open_change`, a `PathBuf` rather than a `bool`. Opening a file tab while an
-    /// agent tab was active left the agent's rail row *and* tab strip entry still drawn as
-    /// selected, with the file tab now also selected: the exact "two selected at once" shape
-    /// #227 fixed, just for a fourth occupant nobody had chased down yet.
-    ///
-    /// `open_change.is_some()` alone is not enough to conclude Surface C is genuinely on screen -
-    /// see [`crate::code_surface::editing::AdeApp::active_edit_target`]'s own docs (which mirror
-    /// this exact predicate for the identical reason) for the real, reachable state that predicate
-    /// is guarding against: a tab can be "active" (its path still in `open_change`) without a diff
-    /// to show it (`open_diff_file_cache` is `None`) and `code_view` left on `Diff`, in which case
-    /// [`Self::render_center_pane`] falls through to the agent/merge surface with `open_change`
-    /// still `Some` the whole time - the weaker check would wrongly report the agent pane as not
-    /// showing while it genuinely is.
     pub(crate) fn active_agent_pane_id(&self) -> Option<AgentId> {
         let file_or_diff_surface_showing = self.open_change.is_some()
             && (self.open_diff_file_cache.is_some() || self.code_view == code_view::CodeView::File);
@@ -2856,18 +2483,6 @@ impl AdeApp {
     }
 
     /// The centre pane with no agent open in this worktree at all.
-    ///
-    /// The one surface GitHub issue #295 leaves buttoned, quoting §4t verbatim: "The empty-worktree
-    /// case keeps its buttons: with no agent there is no keystroke to duplicate and no readout to
-    /// show." `Start an agent` (the primary CTA, [`Self::new_agent_pane`]) and `Open terminal`
-    /// (§4e: "`Open terminal` survives only in the no-agents empty state, where it is the
-    /// legitimate secondary CTA", [`Self::open_companion_terminal`]) - the same two the design's
-    /// `noAgents` branch renders, and the only home either verb has left in this pane.
-    ///
-    /// `open_companion_terminal` is given the worktree that is genuinely selected right now
-    /// ([`Self::current_worktree_path`]), not a remembered agent cwd: with no agent open there is
-    /// no agent cwd to inherit, and spawning a shell anywhere but the selected worktree is what
-    /// that method's own docs already forbid.
     fn render_no_agents_empty_state(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let cwd = self.current_worktree_path();
         let colors = work_surface::action_button_colors(work_surface::ActionStyle::Outline);
@@ -2939,15 +2554,6 @@ impl AdeApp {
 /// (`crate::title_bar::menu::AdeApp::render_title_menu`) - shared here since both are the same
 /// "labeled trigger opens a small popover of real actions" pattern, first built for the `+`
 /// menu and reused as-is (not re-derived) for the title-bar menus.
-///
-/// `enabled` mirrors [`AdeApp::render_footer_action_button`]'s own enabled/disabled convention:
-/// `false` dims the chip/label/sub text and drops `cursor_pointer`/hover, so a row a click
-/// through it right now would have no real effect on (e.g. "Cut" with no active selection) reads
-/// as visibly inert rather than looking exactly as actionable as a working row. Callers must
-/// also skip attaching `.on_click` when `enabled` is `false` - this function only controls the
-/// row's *look*, never whether it's wired up, so a disabled row a caller forgot to gate would
-/// still silently do nothing on click, exactly the "looks actionable, does nothing" bug class
-/// this project's discipline forbids.
 pub(crate) fn render_dropdown_menu_row(
     chip_glyph: &'static str,
     chip_fg: gpui::Rgba,
@@ -3272,10 +2878,6 @@ mod tab_scoping_tests {
         app.worktrees = vec![worktree_item(wt_a, "wt-a"), worktree_item(wt_b, "wt-b")];
     }
 
-    /// The exact bug `crate::rail::state::build_worktree_rows` fixes at the pure-logic level
-    /// (`crate::rail::state::tests::build_worktree_rows_folds_every_agent_in_a_worktree_not_just_the_first`),
-    /// proven here end to end through the real `Agents`/`AdeApp` plumbing: two agents
-    /// spawned into the same worktree must both show up as that worktree's tabs.
     #[gpui::test]
     fn multiple_agents_in_one_worktree_all_show_as_tabs_under_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3318,14 +2920,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #227's resume flow: `Agents::spawn_resume` must really produce a
-    /// `claude --resume <session_id> --settings <path>` spawn - `--resume` prepended ahead of the
-    /// real hook injection's own `--settings`, not dropped in favour of it, and the hook
-    /// injection's `JERRY_*` environment still riding along so a resumed conversation keeps
-    /// reporting its status exactly like a fresh one. Uses a real [`crate::hooks::HookRuntime`]
-    /// (a real bound loopback listener, real generated files) rather than a hand-built
-    /// injection, so this exercises the exact object `crate::hooks::flow::AdeApp::
-    /// hook_injection_for` would hand a real spawn.
     #[gpui::test]
     fn spawn_resume_prepends_resume_ahead_of_the_real_hook_injection(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3378,13 +2972,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// The real gap this revision's own self-audit found: switching to a worktree with *no*
-    /// open agent leaves `Agents::focus_active` with nothing to focus (a genuine no-op), so
-    /// a previously-focused agent's pane - now unrendered once the tab strip's own
-    /// per-worktree filter applies - would otherwise leave `Window::focus` dangling, breaking
-    /// every global keybinding (including ⌘P itself) until the next click.
-    /// `Self::select_worktree`'s own fallback (redirecting focus to `Self::filter_focus_handle`
-    /// whenever the newly selected worktree has no agent to focus) closes this.
     #[gpui::test]
     fn ctrl_p_still_works_after_switching_to_a_worktree_with_no_open_agent(
         cx: &mut TestAppContext,
@@ -3421,10 +3008,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Switching the rail selection to a different worktree must show that worktree's own tabs,
-    /// not the previously selected worktree's - the centre-pane-follows-the-rail invariant, and
-    /// the exact behavior `crate::root::mod`'s "One rail row per worktree" docs describe: never
-    /// showing/pointing at the previously selected worktree's agent.
     #[gpui::test]
     fn switching_worktree_selection_shows_that_worktrees_own_tabs(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3460,7 +3043,6 @@ mod tab_scoping_tests {
             (id_a, id_b)
         });
 
-        // Still on wt-b (the last selection) - its tab strip must show only its own agent.
         let current: Vec<AgentId> = app.read_with(cx, |app, _| {
             app.current_worktree_agents().map(|s| s.id).collect()
         });
@@ -3470,7 +3052,6 @@ mod tab_scoping_tests {
             Some(id_b)
         );
 
-        // Switch back to wt-a - must show id_a, never id_b.
         app.update_in(cx, |app, window, cx| app.select_worktree(0, window, cx));
         let current: Vec<AgentId> = app.read_with(cx, |app, _| {
             app.current_worktree_agents().map(|s| s.id).collect()
@@ -3487,8 +3068,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Closing the active tab in a worktree that still has another open tab must fall back to
-    /// that sibling - the ordinary, non-degenerate case.
     #[gpui::test]
     fn closing_the_active_tab_falls_back_to_a_sibling_in_the_same_worktree(
         cx: &mut TestAppContext,
@@ -3540,18 +3119,6 @@ mod tab_scoping_tests {
         assert_eq!(current, vec![id1]);
     }
 
-    /// The degenerate case, and the real reason `Agents::close`'s fallback had to become
-    /// worktree-scoped rather than a same-`Vec` neighbor: closing the *last* tab in one worktree
-    /// must never fall back to a different worktree's own still-open agent, even though it
-    /// might sit right next to it in the flat underlying storage.
-    ///
-    /// Also real, live-reproduced coverage for another instance of this project's own "focus
-    /// left pointing at something unrendered" bug class (see `crate::root::focus`'s module doc):
-    /// before the fix, `Self::close_agent` left `Window::focus` dangling on the
-    /// just-`shutdown()` `TerminalPane` in this exact case (`self.agents.active = None`, and
-    /// `Agents::focus_active` is a real no-op with nothing active) - so a real ⌘P afterward,
-    /// not just checking `active_id() == None`, is what actually proves focus isn't dangling,
-    /// matching every other test for this bug class in this project.
     #[gpui::test]
     fn closing_the_last_tab_in_a_worktree_never_falls_back_to_a_different_worktrees_agent(
         cx: &mut TestAppContext,
@@ -3616,10 +3183,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Real drag-to-reorder, unified across agent and file tabs (GitHub issue #16): dropping
-    /// one agent tab onto another must actually change the *combined* tab order
-    /// (`Self::current_worktree_agents`, which now reads `Self::combined_tab_order` rather than
-    /// `Agents`' own raw creation order - see that method's own docs on why).
     #[gpui::test]
     fn drag_reordering_two_agent_tabs_changes_their_order(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3653,7 +3216,6 @@ mod tab_scoping_tests {
         });
         assert_eq!(before, vec![initial_id, id2, id3]);
 
-        // The real drop handler's own logic: drag id3, drop it before `initial_id`'s tab.
         app.update(cx, |app, cx| {
             app.reorder_tab(
                 work_surface::TabRef::Agent(id3),
@@ -3674,9 +3236,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::reorder_tab`/`work_surface::state::move_tab_order` must never corrupt the tab order
-    /// on a bad target - an unknown dragged id, an unknown drop target, or dropping a tab onto
-    /// itself must all be real no-ops.
     #[gpui::test]
     fn drag_reorder_is_a_no_op_for_an_unknown_or_identical_id(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3716,14 +3275,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Exactly the globally active agent's pane may poll at the frame-accurate foreground
-    /// cadence (`TerminalPane::is_foreground`); every other open pane must be demoted to the
-    /// background cadence - through every real mutator of "which agent is active": spawn,
-    /// tab click (`select_agent`), closing the active tab, and switching to an agent-less
-    /// worktree. A pane wrongly left foreground silently re-grows the measured multi-pane
-    /// foreground-drain regression this flag exists to bound (see
-    /// `crate::terminal::pane::BACKGROUND_POLL_INTERVAL`'s docs); one wrongly left background would lag
-    /// the very pane the user is watching.
     #[gpui::test]
     fn only_the_active_agents_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3755,14 +3306,12 @@ mod tab_scoping_tests {
             (first_id, second_id)
         });
 
-        // Spawning made the new agent active - it alone must be foreground.
         assert_eq!(
             foreground_ids(&app, cx),
             vec![second_id],
             "after spawn, only the newly active agent's pane may be foreground"
         );
 
-        // A real tab click: the clicked agent's pane is promoted, the old one demoted.
         app.update_in(cx, |app, window, cx| {
             app.select_agent(first_id, window, cx);
         });
@@ -3772,7 +3321,6 @@ mod tab_scoping_tests {
             "selecting a tab must promote exactly that pane and demote the previous one"
         );
 
-        // Closing the active tab promotes the surviving sibling.
         app.update_in(cx, |app, window, cx| {
             app.agents.close(first_id, false, window, cx);
         });
@@ -3797,19 +3345,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// The real cross-kind capability GitHub issue #16 exists to unlock: a file tab dragged so it
-    /// lands between two agent tabs must actually interleave them in the combined tab order,
-    /// not just reorder within its own kind - the exact case the old, kind-locked
-    /// `DraggedAgentTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
-    /// dispatches purely on the dragged value's concrete type, so a `DraggedFileTab` could never
-    /// be dropped onto an agent tab's `on_drop::<DraggedAgentTab>` handler or vice versa).
-    ///
-    /// The second tab spawned here is a real `Claude` agent, not a second `Shell` - Revision
-    /// R12 §3's bare-worktree suppression (`Self::current_worktree_is_bare`) treats "every open
-    /// agent is a `Shell`" as bare and hides file tabs from `Self::combined_tab_order` entirely
-    /// (`a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state`
-    /// covers that directly), which would make this drag-interleaving assertion moot for reasons
-    /// that have nothing to do with what this test actually exercises.
     #[gpui::test]
     fn dragging_a_file_tab_between_two_agent_tabs_interleaves_them(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3844,7 +3379,6 @@ mod tab_scoping_tests {
              two-block layout"
         );
 
-        // The real cross-kind drop: drag the file tab so it lands between the two agent tabs.
         app.update(cx, |app, cx| {
             app.reorder_tab(
                 work_surface::TabRef::File(PathBuf::from("a.txt")),
@@ -3867,11 +3401,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #93: the git graph tab must be a full, kind-agnostic member of the same
-    /// drag-to-reorder system as agent/file tabs, not a fixed trailing entry - dragging it so it
-    /// lands between two agent tabs must actually interleave it into `Self::combined_tab_order`,
-    /// mirroring `dragging_a_file_tab_between_two_agent_tabs_interleaves_them`'s own file-tab
-    /// case exactly.
     #[gpui::test]
     fn dragging_the_graph_tab_between_two_agent_tabs_interleaves_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3926,10 +3455,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::start_dragging_tab`/`Self::drop_dragged_tab` must treat `TabRef::Graph` exactly
-    /// like any other tab kind - recording it while dragged, then clearing that record once
-    /// dropped - mirroring `start_dragging_tab_records_exactly_the_tab_that_started_the_drag`'s
-    /// own agent-tab case.
     #[gpui::test]
     fn dragging_the_graph_tab_dims_its_own_slot_then_clears_on_drop(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3972,11 +3497,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::drop_dragged_tab` must actually honor whichever half of the target tab the cursor
-    /// was last recorded over (`Self::tab_drag_insertion`, set by
-    /// `Self::update_tab_drag_insertion`'s own real per-tab `on_drag_move` tracking) - "after"
-    /// must land the dragged tab on the far side of the target from a plain "before" drop - and
-    /// must clear that state once handled, so a later drop on a different tab can't inherit it.
     #[gpui::test]
     fn drop_dragged_tab_honors_the_recorded_insertion_side_then_clears_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4027,10 +3547,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::start_dragging_tab` (the real `on_drag` constructor callback's body, GitHub issue
-    /// #16's "the original slot renders dimmed" ask) must record exactly the tab that started
-    /// the drag, so `Self::render_file_tab`/`Self::render_agent_tab`'s own `is_dragging` check
-    /// dims the right slot and no other.
     #[gpui::test]
     fn start_dragging_tab_records_exactly_the_tab_that_started_the_drag(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4054,8 +3570,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// A real drop must clear `Self::dragging_tab` alongside `Self::tab_drag_insertion` - a
-    /// dropped tab's slot must never stay dimmed once the drag it was dimmed for is over.
     #[gpui::test]
     fn dropping_a_tab_clears_dragging_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4093,10 +3607,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::cancel_any_tab_drag` (the workspace body's real cancelled-drag cleanup - GPUI gives
-    /// no dedicated callback for Esc/release-outside-any-target, see `AdeApp::dragging_tab`'s own
-    /// docs) must clear both drag-tracking fields together and report whether it actually did
-    /// anything, so a click that was never a drag doesn't force an unnecessary re-render.
     #[gpui::test]
     fn cancel_any_tab_drag_clears_both_fields_and_reports_whether_anything_changed(
         cx: &mut TestAppContext,
@@ -4127,10 +3637,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `tab_settle_animation_id` (the pure logic behind the settle-in fade, GitHub issue #16's
-    /// "dropping animates the tab settling into its slot") must return `Some` only for the tab
-    /// that was actually dropped, and `None` for every other tab, including one dropped in a
-    /// previous, no-longer-current drop.
     #[test]
     fn tab_settle_animation_id_matches_only_the_settled_tab() {
         let dropped = work_surface::TabRef::File(PathBuf::from("a.txt"));
@@ -4145,9 +3651,6 @@ mod tab_scoping_tests {
         assert_eq!(tab_settle_animation_id(&None, &dropped), None);
     }
 
-    /// Two separate drops of the very same tab must get two different animation ids - reusing
-    /// one would resume GPUI's own already-finished animation state for that id instead of
-    /// starting a fresh fade (`tab_settle_animation_id`'s own docs on why).
     #[test]
     fn tab_settle_animation_id_is_fresh_across_two_drops_of_the_same_tab() {
         let tab = work_surface::TabRef::File(PathBuf::from("a.txt"));
@@ -4157,9 +3660,6 @@ mod tab_scoping_tests {
         assert_ne!(first_drop, second_drop);
     }
 
-    /// A real drop (`Self::drop_dragged_tab`) must record `Self::dropped_tab_settle` for exactly
-    /// the tab that was dropped, and a second, later drop of a different tab must overwrite it
-    /// with a fresh id rather than leaving the first tab's own id behind.
     #[gpui::test]
     fn drop_dragged_tab_records_a_fresh_settle_id_for_the_dropped_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4208,14 +3708,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// The remaining GitHub issue #16 gap this closes (task #65): a drop must not just
-    /// settle-fade the tab that was dragged - every *other* tab whose slot it passed over must
-    /// slide too. Proven end to end against `Self::tab_bounds`'s own real, `gpui::canvas`-painted
-    /// width (`cx.run_until_parked()` lets that canvas actually paint, exactly like the plus
-    /// button's own bounds tests do) - not a fabricated placeholder offset. Three real agent tabs
-    /// dragging tab 1 to land after tab 3 must shift both 2 and 3 (each by tab 1's own real
-    /// width), and must never record tab 1 itself - it already has its own settle-fade
-    /// (`drop_dragged_tab_records_a_fresh_settle_id_for_the_dropped_tab`, just above).
     #[gpui::test]
     fn drop_dragged_tab_records_real_slide_offsets_for_every_shifted_neighbour(
         cx: &mut TestAppContext,
@@ -4301,10 +3793,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// A no-op drop (dragging a tab onto its own current slot) must record no slide state at all
-    /// - nothing actually changed position, so nothing may animate
-    /// (`drag_reorder_is_a_no_op_for_an_unknown_or_identical_id`'s own proof for the underlying
-    /// reorder itself; this is that same guarantee for the slide it now also kicks off).
     #[gpui::test]
     fn drop_dragged_tab_records_no_slide_state_for_a_no_op_drop(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4388,17 +3876,6 @@ mod tab_scoping_tests {
         .expect("the tab must have really painted at least once before it can be measured")
     }
 
-    /// The complaint this whole design answers: "when testing I don't see any changes in the
-    /// title of terminal or agents, they just say `terminal #1/#2`". A tab is now labelled with
-    /// whatever the process inside it says it is *right now* - its live OSC 0/2 title - and that
-    /// label really moves when the title does.
-    ///
-    /// Both halves are asserted: the label itself (`Self::agent_tab_label`, the one method the
-    /// strip calls per tab), and that the strip genuinely *repaints* with it. The repaint half
-    /// is measured against the tab's own real painted width (`Self::tab_bounds`): nothing here
-    /// touches `AdeApp` at all between the two frames - only the pane's own `cx.notify()` off
-    /// the injected bytes - so a wider painted tab can only mean that notify really re-drove
-    /// `Self::render_tab_strip` with the new title.
     #[gpui::test]
     fn a_tabs_label_is_its_panes_live_title_and_the_strip_repaints_when_that_title_changes(
         cx: &mut TestAppContext,
@@ -4453,10 +3930,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// "Why the name at all? Just name the tab what it is and stop, no need to add names or
-    /// numbers." Two panes really showing the same thing get the same label - no `#1`/`#2`, no
-    /// branch suffix, nothing synthesised to tell them apart, exactly like every real terminal
-    /// emulator's tabs. The human tells them apart by position, which is the truth about them.
     #[gpui::test]
     fn two_tabs_with_the_same_live_title_render_the_same_label_with_nothing_added(
         cx: &mut TestAppContext,
@@ -4512,16 +3985,11 @@ mod tab_scoping_tests {
             "no ordinal and no branch suffix may be bolted onto a live title: {first}"
         );
 
-        // The real production strip must build fine with two identically labelled tabs in it.
         app.update(cx, |app, cx| {
             let _ = app.render_tab_strip(cx);
         });
     }
 
-    /// The honest fallback, and the only one: a pane whose process has set no title yet (many
-    /// shells only set one from their prompt hook, and plenty of setups never set one at all)
-    /// shows its real resolved program name - never a blank tab, and never the old generic
-    /// `"terminal"` literal that started this whole complaint.
     #[gpui::test]
     fn a_pane_that_has_reported_no_title_shows_its_real_program_name_not_an_empty_tab(
         cx: &mut TestAppContext,
@@ -4583,11 +4051,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Uniformity across both tab kinds (`work_surface::TabChipKind::Cli` and `::Term`): an
-    /// agent CLI's tab is titled by the same live mechanism a plain shell's is. An agent's own
-    /// title is the *more* informative of the two - it's what `crate::rail::title_signal`
-    /// already reads to tell whether that agent is working - so there is no per-kind naming
-    /// authority that preferring it would regress.
     #[gpui::test]
     fn an_agent_clis_tab_takes_its_live_title_exactly_like_a_shells_does(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4637,13 +4100,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Revision R12 §3's exact `+` menu item list: "*New terminal* · *New agent*
-    /// (`runs in <branch>`) · *Git graph* · *Open file…* · *Next changed file*." Proven against
-    /// the real painted popover (`Self::render_dropdown_menu_row`'s own `debug_selector`, one per
-    /// row, keyed by its label), not just the source order - and confirms there is genuinely no
-    /// "New file" row any more (removed: the file tree already carries a real, always-visible
-    /// replacement, `crate::sidebar::render::render_file_tree_row`/
-    /// `render_right_sidebar_toggle`'s own per-directory and root-level "+" affordances).
     #[gpui::test]
     fn the_plus_menus_five_rows_match_revision_r12_3_in_order_with_no_new_file_row(
         cx: &mut TestAppContext,
@@ -4694,9 +4150,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Revision R12 §3's `+` menu Git graph row, clicked for real (`cx.simulate_click` against
-    /// the row's own painted bounds, not a direct `open_git_graph` call) - must actually open the
-    /// graph tab, and close the menu behind it the same way every other row's click does.
     #[gpui::test]
     fn a_real_click_on_the_plus_menus_git_graph_row_opens_the_graph_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4732,11 +4185,6 @@ mod tab_scoping_tests {
         });
     }
 
-    /// Revision R12 §3's `+` menu "New agent" row secondary text (`runs in <branch>`) must come
-    /// from the real selected worktree's own recorded branch - the exact composition
-    /// `Self::render_plus_menu` performs (`Self::current_worktree_branch` piped into
-    /// `work_surface::new_agent_menu_secondary_text`) - not a hardcoded model/kind label the row
-    /// used to show (`agent.kind.label()`, e.g. `"Claude"`).
     #[gpui::test]
     fn the_new_agent_rows_secondary_text_uses_the_real_selected_worktrees_branch(
         cx: &mut TestAppContext,
@@ -4776,13 +4224,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #120: an earlier revision (R12 §3, "a bare worktree shows only the shell
-    /// tab") suppressed every open file tab in `Self::combined_tab_order` the moment a worktree
-    /// went bare (no real agent, only its default `Shell` tab left). That's gone - a file tab
-    /// opened before the worktree went bare must keep rendering, unchanged, exactly as it does
-    /// with a real agent running. Bareness no longer affects tab *labels* either - a tab is
-    /// named by its own pane's live title (`Self::agent_tab_label`) whatever else is open in
-    /// the worktree - so this is now the only thing bareness could have touched here.
     #[gpui::test]
     fn a_bare_worktrees_tab_strip_still_shows_every_open_file_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4861,15 +4302,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #112: switching between two terminals open in the *same* worktree - the
-    /// common case for a rail/tab-strip click - must move real keyboard focus onto the newly
-    /// selected terminal's own pane. Before the fix, `select_agent`'s same-worktree/no-file-tab
-    /// branch never called `Window::focus` at all: `Window::focus` stayed on the previously
-    /// active terminal's now-unmounted `TerminalPane` handle, so GPUI's dispatch fell back to
-    /// the window root - outside the `"terminal"` key context - and typed input into the
-    /// terminal that visibly looked selected silently went nowhere (or fell through to
-    /// normally-suppressed global bindings instead), which reads to a user as the two terminals
-    /// having "merged" into one.
     #[gpui::test]
     fn window_focus_follows_a_same_worktree_terminal_switch(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4927,12 +4359,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #100: opening a file via the real `Self::open_file_view` entry point (the
-    /// Files tree row click handler - it never checks bareness, so a bare worktree's tree stays
-    /// fully clickable) while the worktree was *already* bare, with no prior real agent, must
-    /// still produce a real tab for it. GitHub issue #120 later made this the *only* real
-    /// behavior left to test here - once bareness stopped suppressing file tabs at all, this
-    /// stopped being a carved-out exception to anything.
     #[gpui::test]
     fn opening_a_file_in_an_already_bare_worktree_still_gets_a_real_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4980,11 +4406,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #116 (real dragging-while-bare tab-order corruption, fixed against an earlier
-    /// revision where bareness truncated `combined_tab_order` to a single visible file tab) plus
-    /// #120 (that truncation is gone entirely - see `a_bare_worktrees_tab_strip_still_shows_every_open_file_tab`).
-    /// With no truncation left, dragging while bare is now just an ordinary drag - this keeps
-    /// direct coverage that it still persists every open file's position correctly.
     #[gpui::test]
     fn dragging_a_tab_while_bare_persists_every_open_files_position(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5064,20 +4485,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #382: [`AdeApp::active_agent_pane_id`]'s own cascade - the fix for GitHub
-    /// issue #227 - only ever zeroed out for the review/run/graph tabs, because those three are
-    /// plain `bool` flags. The File/Diff surface is a fourth centre-pane occupant with the
-    /// identical shape, but tracked through `Self::open_change` (a `PathBuf`, not a `bool`), and
-    /// was left out of the original fix. Opening a file tab while an agent was the active centre-
-    /// pane content left that agent's own tab strip entry (and rail row, which reads the same
-    /// method) still drawn as selected, alongside the file tab that had genuinely taken over the
-    /// centre pane - the exact "two selected at once" shape #227 fixed, just for a fourth occupant
-    /// nobody had chased down yet. Mirrors
-    /// `crate::run_history::render::tab_scoping_tests::switching_between_an_agent_and_a_history_run_leaves_exactly_one_selected`'s
-    /// own "exactly one selected" idiom, but for a file tab, and checks the real painted surfaces
-    /// (`"pty-surface"`/`"file-view-code-list"`) rather than only the logical predicate, so this
-    /// fails if the fix is real but `render_center_pane` itself ever drifts from
-    /// `active_agent_pane_id`'s cascade.
     #[gpui::test]
     fn switching_from_an_agent_to_a_file_tab_leaves_exactly_one_selected(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5404,9 +4811,6 @@ mod tab_order_persistence_tests {
 /// the real OS clipboard (checked the same way `crate::sidebar::tree_ops`' own
 /// `copy_relative_path_writes_the_worktree_relative_path` checks "Copy Path", since this app has
 /// exactly one clipboard mechanism and both go through it).
-///
-/// These fail against the pre-fix tree twice over: the actions didn't exist, and neither did any
-/// selection for copy to read.
 #[cfg(test)]
 mod terminal_clipboard_action_tests {
     use super::*;
@@ -5445,7 +4849,6 @@ mod terminal_clipboard_action_tests {
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell agent");
         pane.update(cx, |pane, cx| {
-            // `ESC[10;1H` - row 10, column 1 (1-indexed), i.e. grid row 9, column 0.
             pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
             pane.select_cells_for_test(9, 0..text.chars().count());
         });
@@ -5475,8 +4878,6 @@ mod terminal_clipboard_action_tests {
         );
     }
 
-    /// Only the *active* agent's selection is copied - the same "which pane does this act on"
-    /// contract `terminal_clear_action_tests` pins for `TerminalClear`.
     #[gpui::test]
     fn dispatching_terminal_copy_uses_only_the_active_agents_selection(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5506,16 +4907,6 @@ mod terminal_clipboard_action_tests {
         assert_eq!(text.as_deref(), Some("active-agent-text"));
     }
 
-    /// The whole point of GitHub issue #158, driven by a **real keystroke** rather than
-    /// `dispatch_action`: with a terminal genuinely focused, the copy shortcut must reach
-    /// `TerminalCopy` and not `TerminalPane::handle_key_down`.
-    ///
-    /// This is the assertion that pins the fix's most load-bearing detail. Without the binding,
-    /// `crate::terminal::pane::keystroke_to_bytes`'s control-byte branch ignores `shift`
-    /// entirely, so `Ctrl+Shift+C` over a focused terminal produced `0x03` - it *interrupted the
-    /// running process* instead of copying. GPUI dispatches matching `KeyBinding`s before any
-    /// `on_key_down` listener and an action handler stops propagation by default in the bubble
-    /// phase, which is what makes a bound action win here.
     #[gpui::test]
     fn the_real_copy_keystroke_over_a_focused_terminal_copies_instead_of_typing(
         cx: &mut TestAppContext,
@@ -5553,7 +4944,6 @@ mod terminal_clipboard_action_tests {
         );
     }
 
-    /// The paste counterpart of the keystroke test above, proven by the real pty echo.
     #[gpui::test]
     fn the_real_paste_keystroke_over_a_focused_terminal_reaches_the_pty(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5598,8 +4988,6 @@ mod terminal_clipboard_action_tests {
         );
     }
 
-    /// The paste half, proven by the pty's own echo rather than by asserting `write_input` was
-    /// called - mirroring `terminal_clear_action_tests`' discipline for `TerminalClear`.
     #[gpui::test]
     fn dispatching_terminal_paste_reaches_the_active_agents_real_pty(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5743,12 +5131,6 @@ mod select_agent_cross_repo_tests {
 /// GitHub issue #295: the agent pane's context bar is identity-only, and its bottom strip is a
 /// readout rather than an action bar (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`
 /// §4e/§4r/§4t).
-///
-/// These drive the real painted surface - real spawned child processes, real
-/// `VisualTestContext::debug_bounds` measurements of what actually reached the screen, and real
-/// simulated clicks - rather than re-asserting `footer_actions`'s pure output, which
-/// `crate::work_surface::state`'s own tests already pin. The point of measuring is that a removed
-/// button must be absent from the *paint*, not merely absent from a list.
 #[cfg(test)]
 mod agent_pane_readout_tests {
     use super::*;
@@ -5843,15 +5225,6 @@ mod agent_pane_readout_tests {
         }
     }
 
-    /// §4e: the context bar "now carries identity and status only" - `Merge` and `Archive` are
-    /// **deleted**, not hidden or disabled. Both were worktree verbs sitting in an agent header:
-    /// offered twice for one two-agent worktree, offered while the agent was `Needs input`, and
-    /// gated on preconditions the header cannot show.
-    ///
-    /// Measured rather than read off the source: the status pill is now the bar's **last** child,
-    /// so its painted right edge must sit within the bar's own 12px right padding. Any re-added
-    /// trailing button pushes the pill left by that button's full width. Mutation-verified - a
-    /// re-added `Archive` button leaves the pill 83px short and fails this assertion.
     #[gpui::test]
     fn the_context_bar_ends_at_the_status_pill_with_no_merge_or_archive(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -5897,18 +5270,6 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// §4t: "The bar now renders whenever there is an agent, not only when there are actions - so
-    /// the finished and asking states, which §4r emptied, are useful strips again rather than
-    /// absent ones."
-    ///
-    /// A freshly spawned pane has just written its prompt, so it is `Status::Run` - the status
-    /// §4t emptied of buttons entirely (`⌃C` in the focused pty is the interrupt). The strip must
-    /// still paint, and must carry this agent's own cost readout.
-    ///
-    /// Relabelled to a real agent kind first: §4t's "whenever there is an agent" is about
-    /// *status*, not pane kind, and a `Shell` tab gets the terminal pane's own info footer
-    /// instead ([`AdeApp::render_pty_info_footer`]). This test asserted the strip painted for a
-    /// plain shell before that was fixed - which is exactly the duplication the user reported.
     #[gpui::test]
     fn a_running_agents_strip_still_paints_and_carries_its_own_cost(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -5956,15 +5317,6 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// One bottom bar per pane, picked by pane kind - reported live against the shipped build as
-    /// "the footer of the terminals and agents… right now both are displayed at the same time in
-    /// both terminal and agents but should not".
-    ///
-    /// `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if` siblings
-    /// (`isTerminal: tab === 'terminal'` and `isChat: isAgent(tab)`). The `isTerminal` one is the
-    /// only one with a `pid │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
-    /// a tab` bar; the `isChat` one's only bottom bar is the `hasBar` readout strip. So a `Shell`
-    /// tab paints the info footer and **not** the readout strip.
     #[gpui::test]
     fn a_shell_tab_paints_the_info_footer_and_not_the_agent_readout_strip(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -6002,9 +5354,6 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// The other half of the same split: a real `Claude`/`Codex` tab paints the readout strip and
-    /// **not** the terminal's info footer - and its `pid` is not lost with that bar, because the
-    /// mock's `isChat` header carries it (`{{ focus.cli }}  pid {{ focus.pid }}`).
     #[gpui::test]
     fn an_agent_tab_paints_only_the_readout_strip_and_keeps_its_pid_in_the_header(
         cx: &mut TestAppContext,
@@ -6048,18 +5397,6 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// **Live report: "the height of the agent terminal is not good... it get a scrollbar" against
-    /// a genuinely long real Claude agent transcript** - investigated for both of this project's
-    /// two prior sizing-bug classes (#368's fresh-pane grid/pty measurement race, #356's stacked
-    /// header/footer chrome) and a third (a font-fallback-driven row-height blowup); none
-    /// reproduced under real, repeated measurement. This is the real, direct check of the
-    /// remaining candidate root cause `debug_bounds` can answer: does this pane's own real,
-    /// painted geometry - header band + the terminal's own content band + its bottom bar - ever
-    /// stop summing to the pane's real total height, on a pane that has had genuinely long real
-    /// output (well past #356's chrome rebuild and #368's fresh-pane latch, both scoped to a
-    /// pane's very first frames)? A gap here would mean the grid is sized against a region
-    /// different from what is really on screen - exactly the shape "the height is not good" would
-    /// take, independent of whether a scrollbar is also, separately, correct.
     #[gpui::test]
     fn header_content_and_footer_bands_sum_to_the_real_pane_height_on_a_long_transcript(
         cx: &mut TestAppContext,
@@ -6196,13 +5533,6 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0`, and the mock's own comment:
-    /// "The whole row is agent identity, so it belongs to agent panes only… **in a terminal pane
-    /// there is no agent to describe.** Kept when the worktree has no agents at all, since it
-    /// holds that empty state's CTA."
-    ///
-    /// #295 listed "the bar stays scoped to agent panes" as an acceptance criterion. It was not
-    /// true: a shell tab in a worktree that *does* have agents wore the whole identity row.
     #[gpui::test]
     fn a_shell_tab_beside_a_real_agent_gets_no_identity_bar(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -6245,8 +5575,6 @@ mod agent_pane_readout_tests {
         let _ = shell_id;
     }
 
-    /// §4t: the cost is "blank for an agent that is not running". Not a dimmed `...`, not a
-    /// fabricated `0% cpu` - nothing at all, which is what the `Option` return states.
     #[gpui::test]
     fn the_cost_readout_is_blank_for_an_agent_that_is_not_running(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -6265,12 +5593,6 @@ mod agent_pane_readout_tests {
         });
     }
 
-    /// §4e/§4r's one surviving pair, and its two-click safety: `failed` keeps `Retry` and
-    /// `Discard worktree`, and the discard really arms before it destroys.
-    ///
-    /// Driven through the genuinely painted button (`debug_bounds` + `simulate_click`), not
-    /// through `request_discard_worktree` directly - the point is that this strip still offers
-    /// those two, and that `Open terminal` (which used to sit between them) does not paint.
     #[gpui::test]
     fn a_failed_run_keeps_retry_and_a_two_click_discard_and_nothing_else(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -6335,16 +5657,12 @@ mod agent_pane_readout_tests {
         );
     }
 
-    /// §4t, verbatim: "The empty-worktree case keeps its buttons: with no agent there is no
-    /// keystroke to duplicate and no readout to show." `Open terminal` survives here and nowhere
-    /// else in this pane (§4e: "the legitimate secondary CTA"), and it really spawns a shell.
     #[gpui::test]
     fn the_no_agent_empty_state_really_starts_a_terminal(cx: &mut TestAppContext) {
         let repo = init_repo();
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
-        // Close whatever the app opened on startup, so the centre pane really is the empty state.
         let startup: Vec<AgentId> = app.read_with(cx, |app, _| {
             app.agents.iter().map(|agent| agent.id).collect()
         });
@@ -6386,9 +5704,6 @@ mod agent_pane_readout_tests {
         });
     }
 
-    /// Revision R12 §3's one context-bar button that #295 does *not* remove: a bare worktree has
-    /// no agent, so it has no agent verbs to offer and no worktree verbs to misplace - just the
-    /// primary CTA that gives it one.
     #[gpui::test]
     fn a_bare_worktree_keeps_its_start_an_agent_button(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -6437,17 +5752,6 @@ mod tab_strip_overflow_scroll_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
-    /// Twenty real shell agent tabs (each a genuine `Agent`, no simulated output) reliably
-    /// overflow the narrow test window's centre pane. Proves, against the real painted geometry:
-    /// - the overflow is real (`AdeApp::tab_strip_scroll_handle`'s own `max_offset().x > 0`);
-    /// - the last tab genuinely starts outside `#tab-strip-scroll`'s own visible bounds (the
-    ///   literal "not accessible" the issue title names, not just an assumption);
-    /// - a real scroll to that max offset - the same offset a real scroll-wheel tick would
-    ///   eventually reach (`vendor/zed/crates/gpui/src/elements/div.rs`'s own
-    ///   `paint_scroll_listener`, which this fix relies on for the wheel-to-`delta_x`
-    ///   translation itself) - brings that same tab back inside the visible bounds; and
-    /// - a real `cx.simulate_click` on it, now that it is on screen, genuinely activates it -
-    ///   the concrete, user-facing "tabs are not accessible" this issue reports.
     #[gpui::test]
     fn scrolling_the_tab_strip_reaches_a_tab_that_overflowed_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6605,24 +5909,6 @@ mod tab_strip_trailing_margin_tests {
         (app, cx)
     }
 
-    /// GitHub issue #405, a live product-owner report, screenshotted twice: "the tab strip does
-    /// not go all the way, there is a strange margin right."
-    ///
-    /// The real, measured cause: `#tab-strip` ended in a bare `w(px(12))` bordered spacer left
-    /// behind by PR #398 (GitHub issue #397) when it deleted the trailing agent-jump keycap
-    /// cluster's *content* but kept its padding. `Jerry.dc.html`'s own tab row has no such thing:
-    /// the 12px there is that cluster's own `padding:0 12px`, and padding with no content in it
-    /// is not breathing room, it is 12px of dead chrome. With the scroller sitting behind it, the
-    /// tabs it clips stopped 12px short of the pane's real right edge instead of running flush
-    /// into it - which is exactly the margin both screenshots show, and exactly what survived
-    /// PR #403 ("the padding is still here").
-    ///
-    /// Asserted against real painted bounds, in the real reported state: enough real file tabs to
-    /// genuinely overflow the strip, with the shell tab active so the bare worktree's context bar
-    /// (`#agent-context-bar`, the `Idle` / `Start an agent` row) is on screen below it. The
-    /// context bar is measured alongside deliberately - it is `#work-surface`'s own sibling of
-    /// the tab strip and carries the design's real `px(12)` padding, so it pins down that the two
-    /// rows genuinely share one pane width and that the discrepancy was the tab strip's alone.
     #[gpui::test]
     fn the_tab_strips_tabs_run_flush_into_the_panes_real_right_edge(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6684,14 +5970,6 @@ mod tab_strip_trailing_margin_tests {
         );
     }
 
-    /// The other half of the same report: "you fixed the plus button on the right, why?"
-    ///
-    /// PR #403 moved the `+` out of the scroller and put a growing `#tab-strip-pusher` in front of
-    /// it, which pinned it to the far right of the strip whether the tabs filled it or not. That
-    /// is not what `Jerry.dc.html` draws - its tab row is `sc-for tabs`, then the `+` cell, then a
-    /// `flex:1` filler - nor what any other tabbed editor draws, and it was rejected on sight by
-    /// the product owner. The `+` belongs immediately after the last tab; the bare strip after it
-    /// is the design, not a gap in need of filling.
     #[gpui::test]
     fn the_plus_button_sits_immediately_after_the_last_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

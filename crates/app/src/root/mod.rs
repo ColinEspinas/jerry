@@ -1,80 +1,5 @@
 //! The top-level three-pane window: a left worktree sidebar, a tabbed center pane of
 //! terminal agents, and a right file tree, composed as GPUI entities.
-//!
-//! ## What lives here, and what doesn't
-//!
-//! This module is the *app shell*, not a grab-bag of rendering code. It owns [`AdeApp`]
-//! itself (the one state struct every subsystem reads and mutates) and its construction
-//! ([`state`]), the crate's GPUI actions, the `Render` impl that composes the zones, and
-//! the genuinely cross-zone mechanics: focus/overlay discipline ([`focus`], [`OverlayFocus`]), pane resizing
-//! ([`resize`] plus its pure width-clamp half, [`layout`]), the scoped rem-size override
-//! Surface C's zoom paints through ([`rem_scope`]), the shared keycap/chip/message widgets
-//! ([`widgets`]), the app-wide pluralisation helper every counter in the window conjugates
-//! through ([`plural`] - see its module docs for the rule, which is binding on new code), the
-//! background-task slot type ([`task_pool`]), and the "New file" prompt
-//! ([`new_file`]), which is an overlay reachable from two different zones and so belongs to
-//! neither.
-//!
-//! Everything *about one subsystem* lives in that subsystem's own folder instead - both its
-//! pure, window-free logic and the `impl AdeApp` blocks that draw it: `crate::rail`,
-//! `crate::work_surface`, `crate::sidebar`, `crate::code_surface`, `crate::merge`,
-//! `crate::palette`, `crate::settings`, `crate::status_bar`, `crate::title_bar`,
-//! `crate::terminal`, `crate::lsp`, `crate::worktree_history`. So "everything about
-//! feature X" is one directory, not two unrelated ones.
-//!
-//! ## Offloading `wt-core`'s blocking calls
-//!
-//! `wt_core::list_worktrees` performs blocking I/O (`gix` object-database reads, and
-//! sometimes spawning `git`). It's never called directly from `render` or an event handler;
-//! [`AdeApp::load_worktrees`] hands it to `cx.background_executor().spawn(..)` and only
-//! touches `self` again inside a `this.update(cx, ..)` callback once the background task
-//! resolves. `crate::sidebar::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
-//! pattern.
-//!
-//! ## One rail row per worktree; agents are tabs scoped to it
-//!
-//! [`crate::work_surface::agents::Agents`] holds any number of independent, simultaneously-running
-//! terminal agents (a plain shell, or an agent CLI), each pinned to the worktree it was
-//! started in. The agent rail shows exactly one row per worktree
-//! (`crate::rail::state::WorktreeRow`, aggregating every agent open in it), and the centre pane's tab
-//! strip (`AdeApp::render_tab_strip`) only ever shows the *currently selected* worktree's own
-//! agents - never a flat, unscoped list of every agent across every worktree.
-//!
-//! Selecting a worktree in the sidebar still never spawns or kills anything - but, unlike
-//! before this revision, it *does* change which agent is "active"
-//! (`crate::work_surface::agents::Agents::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
-//! the active agent must always belong to the selected worktree, or the centre pane would show
-//! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
-//! drives the file tree, and which worktree `current_worktree_path` resolves to for the *next* "New
-//! terminal"/"New agent pane" click - that part is unchanged. Spawning an agent is still always
-//! its own explicit action, never an implicit side effect of browsing.
-//!
-//! ### A tab always belongs to a real, selected worktree - never to a repo
-//!
-//! The invariant that ties all of the above together, and the one a family of reported bugs all
-//! turned out to be violations of:
-//!
-//! > **A tab is never shown, never spawnable, and never implicitly attributed to anything except a
-//! > real, currently-selected worktree. There is no such thing as "a repo's own tab".**
-//!
-//! [`AdeApp::current_worktree_path`] is the single chokepoint that enforces it, and it returns
-//! `Option<PathBuf>` precisely so that "nothing is selected" is a state the app can *say* rather
-//! than paper over. It used to fall back to [`AdeApp::focused_repo_path`] whenever
-//! [`AdeApp::selected`] was `None`, which quietly made a repo root behave like a worktree it is
-//! not - see that method's own docs for the three live-reproduced failures that produced
-//! (a real tab no rail row claimed and that a single click orphaned forever; the rail, tab strip,
-//! and centre pane disagreeing three ways; and the reported "I select a worktree and the startup
-//! terminal is lost").
-//!
-//! The other half is that the `None` state is kept genuinely rare rather than merely handled: the
-//! two real "open a repo" gestures - a CLI launch ([`AdeApp::new_with_settings`]) and "Open
-//! Folder…" ([`AdeApp::open_repo_in_current_window`]) - both funnel through
-//! [`AdeApp::load_worktrees_for_opened_repo`], which resolves the repo's real worktree list,
-//! genuinely selects the right worktree of it
-//! ([`crate::rail::worktrees::selection_for_opened_repo`]), and only then spawns that window's
-//! guaranteed initial shell, into that concretely-selected worktree. So a focused repo at rest
-//! always has a real worktree selected; `None` is confined to the brief in-flight window before
-//! that first fetch lands, and to genuine error states.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -537,18 +462,6 @@ pub struct AdeApp {
     /// Every open agent's own **review** state (GitHub issue #225) - its captured baseline, the
     /// diff loaded against that baseline, and which file it has open. Keyed by
     /// [`crate::work_surface::agents::AgentId`].
-    ///
-    /// This is deliberately *not* the same thing as [`Self::diff_state`], and the difference is
-    /// the whole point of issue #225: `diff_state` holds the one **git** diff for the selected
-    /// worktree (against the merge-base with the default branch), while this holds a per-agent
-    /// **review** (against a snapshot taken when that agent started, or when the user last marked
-    /// it reviewed). One worktree with one agent has both, they answer different questions, and
-    /// they frequently disagree - correctly. See `crate::review`'s own module docs.
-    ///
-    /// An entry appears when a baseline is really captured
-    /// (`crate::review::flow::AdeApp::capture_review_baseline`, a background task, so slightly
-    /// after the agent itself appears) and is removed when the agent closes. An agent with no
-    /// entry has no review surface at all, which is honest: there is nothing to measure against.
     pub(crate) agent_reviews: HashMap<AgentId, review::state::AgentReview>,
     /// The on-disk mirror of [`Self::agent_reviews`]' baselines - see
     /// `crate::review::baseline_state`'s module docs, including the honest note that nothing can
@@ -602,28 +515,13 @@ pub struct AdeApp {
     pub(crate) line_provenance_owned: std::collections::BTreeSet<String>,
     /// [`Self::diff_state`]'s file list joined with [`Self::line_provenance`] - one row per path,
     /// each carrying its authors and the per-author `split` (GitHub issue #284).
-    ///
-    /// Cached rather than derived per frame because the Changes rows are virtualized and would
-    /// otherwise rebuild it on every scroll tick. It is rebuilt through exactly one function
-    /// (`crate::provenance::flow::AdeApp::rebuild_change_set`), called from the two writes that
-    /// can invalidate it - `Self::load_diff` finishing, and provenance changing.
     pub(crate) change_set: crate::provenance::change_set::ChangeSet,
     /// The **Uncommitted** scope (GitHub issue #285): the working tree against its own `HEAD`,
     /// loaded by the same background task [`Self::diff_state`] is, so the panel's four sections
     /// never describe two different moments in git's history.
-    ///
-    /// Deliberately *not* derivable from [`Self::diff_state`]: that is the merge-base diff, whose
-    /// file list mixes committed and uncommitted work with no signal to tell them apart (GitHub
-    /// issue #220). See `wt_core::diff::diff_against_head`'s own docs.
     pub(crate) uncommitted_diff: sections::ScopeLoad<wt_core::diff::WorktreeDiff>,
     /// [`Self::uncommitted_diff`]'s file list joined with [`Self::line_provenance`] - one row per
     /// path, each carrying its authors and the per-author `split`.
-    ///
-    /// This is what the Runs section's per-run diffstats are read off, which is what makes them
-    /// sum to the Uncommitted section's own total by construction rather than by agreement
-    /// (`STAGE-A-CHANGELOG.md` §5). [`Self::change_set`] is the same join over the *merge-base*
-    /// diff and serves the Against-main section; the two are separate because their scopes are,
-    /// and rebuilt together through one function so neither can go stale on its own.
     pub(crate) uncommitted_change_set: crate::provenance::change_set::ChangeSet,
     /// Every diff-line review note this window holds (GitHub issue #288), keyed worktree -> path
     /// -> line anchor. See `crate::review_notes` for the model and the three rules it enforces.
@@ -643,10 +541,6 @@ pub struct AdeApp {
     pub(crate) note_cursor: Option<crate::review_notes::NoteRef>,
     /// Why the last send failed, if it did. Shown in the notes bar rather than swallowed: a review
     /// note that silently reached nobody is the worst outcome this feature has.
-    ///
-    /// The error itself, not its rendered sentence, so the bar can tell whether it is still
-    /// *true*: a `NoTarget` recorded before an agent was started must stop being shown the moment
-    /// one is, and a `String` has no way to know which failure it came from.
     pub(crate) note_send_error: Option<crate::review_notes::flow::NoteSendError>,
     /// Focus for the open note card's own hand-rolled single-line input.
     pub(crate) note_focus_handle: FocusHandle,
@@ -655,12 +549,6 @@ pub struct AdeApp {
     pub(crate) diff_notes_focus_handle: FocusHandle,
     /// The per-author diff filter (GitHub issue #287), if one is in force: which file it was
     /// entered from, and whose lines it keeps at full opacity.
-    ///
-    /// Pinned to a path rather than left global - see
-    /// [`crate::provenance::render::AuthorFilter`]'s own docs for why that is a correctness
-    /// choice, not tidiness. Read through
-    /// [`crate::provenance::render::AdeApp::active_author_filter`], never directly, so a stale
-    /// filter for a file that is no longer open can never dim anything.
     pub(crate) author_filter: Option<crate::provenance::render::AuthorFilter>,
     /// The **Commits** scope (GitHub issue #285): what is already written down on this branch.
     pub(crate) branch_commits: sections::ScopeLoad<wt_core::diff::BranchCommits>,
@@ -676,21 +564,11 @@ pub struct AdeApp {
     /// shared overlay scrollbar still draws against it.
     pub(crate) changes_sections_list: gpui::ListState,
     /// Which changed files have been **seen since the agent last changed them**.
-    ///
-    /// `REVISION-2026-08-14.md` §1's rule 2: "`reviewed` and `staged` are separate fields.
-    /// Reviewing must never stage." This is the `reviewed` half, and it is a separate field of a
-    /// separate type from [`Self::staged_files`] precisely so nothing can read one for the other.
-    /// It drives the Uncommitted header's `N/M seen` counter and meter; it drives no index.
     pub(crate) seen_files: sections::SeenFiles,
     /// Real expand/collapse state for the file tree - a directory's absolute path is in this set
     /// iff it is expanded (see `crate::sidebar::file_tree::visible_entries`, which this set feeds
     /// directly). **Absence means collapsed**, so a worktree opened for the first time shows only
     /// its root-level entries (GitHub issue #18 §1).
-    ///
-    /// This is the live, in-memory mirror of one worktree's entry in [`Self::fold_state`]; every
-    /// mutation goes through `AdeApp::set_dir_expanded`/`collapse_all_dirs`/`reveal_in_tree`,
-    /// which keep the two in step and write the change to disk immediately. Re-derived from
-    /// `fold_state` on every worktree switch (`Self::select_worktree`), never carried across one.
     pub(crate) expanded_dirs: HashSet<PathBuf>,
     /// Every worktree's persisted fold state, loaded once at startup from
     /// `~/.config/jerry/file-tree-state.toml` - see `crate::sidebar::fold_state`'s module docs
@@ -729,25 +607,9 @@ pub struct AdeApp {
     /// directories (`file_tree::FileTreeListing::is_complete`) - false when it silently skipped
     /// an unreadable or too-deep subdirectory. The only condition under which
     /// `AdeApp::prune_stale_fold_state` may read "not in this listing" as "deleted".
-    ///
-    /// There is no `file_tree_truncated` companion any more: GitHub issue #160 removed the walk's
-    /// entry cap, so "the walk stopped early because it ran out of budget" is no longer a state
-    /// this app can be in.
     pub(crate) file_tree_complete: bool,
     /// Which view the left column's sidebar strip has selected (GitHub issue #291) - see
     /// `crate::rail::strip::SidebarView`.
-    ///
-    /// The window's first rail-level view state: before the strip, the left column was hard-wired
-    /// to one thing (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1: "The left
-    /// panel was hard-wired to one thing. It is now a switchable surface"). Deliberately **not**
-    /// persisted: it is a per-window navigation position like the right panel's own
-    /// [`Self::right_sidebar_view`], not a preference, and a window restored onto Problems for a
-    /// checkout whose diagnostics have not been recomputed yet would open on an empty panel with
-    /// no explanation.
-    ///
-    /// Read through `crate::rail::strip_render::AdeApp::effective_sidebar_view`, never directly by
-    /// a renderer: on a day with no worktrees there is no switcher, so this field's value is not
-    /// necessarily the view being shown.
     pub(crate) sidebar_view: crate::rail::strip::SidebarView,
     /// The rail's open worktree/agent row menu (GitHub issue #290), `None` when closed - see
     /// `crate::rail::menu::RailRowMenu`. Its origin is window-space and already clamped, and it
@@ -861,23 +723,6 @@ pub struct AdeApp {
     /// Every path in the currently-loaded worktree with a *live* uncommitted delta - staged,
     /// unstaged, or untracked (`wt_core::stage::dirty_paths`, a real `git status --porcelain`
     /// read), or `None` while that answer isn't known yet.
-    ///
-    /// GitHub issue #220 ("Changes are displayed as unstaged but are commited"): the Changes list
-    /// is `wt_core::diff::diff_against_base`'s diff against the **merge-base with the default
-    /// branch**, so it deliberately lists files whose difference from that base is already latched
-    /// into a real commit on this branch alongside files with genuinely uncommitted edits, and
-    /// `wt_core::diff::DiffFile` carries nothing to tell the two apart. Without this set, every
-    /// file not in [`Self::staged_files`] rendered an actionable, unchecked "stage me" checkbox -
-    /// including already-committed files, for which `git add` would be a no-op, so the row falsely
-    /// implied the work wasn't committed yet. `crate::sidebar::changes::is_committed_clean` is the
-    /// read side.
-    ///
-    /// `None` means **unknown**, never "nothing is dirty": it is set synchronously at the top of
-    /// [`Self::load_diff`] (so it can never outlive the diff it describes, which is also why -
-    /// unlike [`Self::staged_files`] - nothing in `crate::sidebar::tree_ops` has to remap or prune
-    /// it across a rename or delete) and only filled in once the real query lands. Every consumer
-    /// falls back to the ordinary stageable presentation while it is `None`, rather than claiming
-    /// files are committed on the strength of an answer that hasn't arrived.
     pub(crate) dirty_files: Option<HashSet<PathBuf>>,
     /// The most recent real git failure from one Changes row's own controls - `(path, message)`.
     /// Two writers today: [`Self::toggle_staged`]'s `git add`/`git reset`, and
@@ -885,12 +730,6 @@ pub struct AdeApp {
     /// hover bar). One channel rather than one per action, because it is one place on screen: the
     /// row acted, the row's action failed, and the panel says so once, immediately under the
     /// composer.
-    ///
-    /// Surfaced by `Self::render_changes_row_error` the same honest way [`Self::tree_op_error`]
-    /// surfaces a failed tree operation, rather than silently swallowing a real failure behind an
-    /// optimistic UI update that quietly reverts. Cleared on dismiss, on the next successful
-    /// action on the same path, and (implicitly, since it names a worktree-relative path)
-    /// whenever a worktree switch clears [`Self::staged_files`] out from under it.
     pub(crate) changes_row_error: Option<(PathBuf, String)>,
     /// Every in-flight [`Self::toggle_staged`] background `git add`/`git reset` - a [`TaskPool`],
     /// not a single slot, for the same "independent operations" reason as
@@ -901,30 +740,12 @@ pub struct AdeApp {
     pub(crate) _stage_tasks: TaskPool,
     /// Which Uncommitted row's own 27px band the pointer is inside, if any - one half of what
     /// reveals `STAGE-A-CHANGELOG.md` §4i's floating hover bar.
-    ///
-    /// Two fields rather than one because the bar deliberately **straddles the row's top edge**
-    /// (§4i: "a floating bar straddling the row's top edge … so it plainly sits above the list
-    /// rather than in it"), which means part of it is genuinely outside the row's own hitbox.
-    /// In the HTML mock that costs nothing - the bar is a DOM descendant, so `mouseleave` never
-    /// fires for it - but GPUI's `on_hover` is purely bounds-based, so a single field would see
-    /// the row report `false` the instant the pointer crossed onto the overhanging part and the
-    /// bar would vanish out from under the click it was reaching for.
-    ///
-    /// The pair is also *order-independent*, which a single field could not be: moving between
-    /// the two hitboxes delivers one `false` and one `true` in an order GPUI does not promise
-    /// (the same fact `crate::code_surface::file_view`'s own hover listener guards against), and
-    /// two separate fields OR'd together give the same answer whichever arrives first.
     pub(crate) change_row_hover: Option<PathBuf>,
     /// The other half of [`Self::change_row_hover`] - the floating bar's own hitbox, including
     /// the part of it that hangs above the row. See that field's docs.
     pub(crate) change_row_actions_hover: Option<PathBuf>,
     /// The row whose `Discard` button is **armed**: its icon has been clicked once and swapped
     /// for the red `Discard?` pill, and a second click really discards.
-    ///
-    /// §4i: "Discard takes two clicks. It destroys an agent's work with no git object behind it
-    /// to recover from - the one irreversible action in the panel. […] Leaving the row cancels."
-    /// The cancel is enforced in [`Self::set_change_row_hover`], the one writer of both hover
-    /// fields, so there is no path that can leave a row armed once the pointer is gone.
     pub(crate) change_row_discard_armed: Option<PathBuf>,
     /// Every in-flight [`Self::discard_change_row`] background `git checkout`/`git rm` - a
     /// [`TaskPool`] for the same reason [`Self::_stage_tasks`] is one.
@@ -939,14 +760,6 @@ pub struct AdeApp {
     /// The commit composer's own painted bounds, captured every render by a `gpui::canvas` child
     /// (the same pattern [`Self::plus_button_bounds`] uses). `Bounds::default()` until the
     /// composer has really painted once.
-    ///
-    /// GitHub issue #176: the popover used to be a *child* of the composer, which made its
-    /// "click-away dismisses" scrim - `absolute()` with inset 0 - resolve against the composer's
-    /// own ~135px box instead of the window, so clicking the Changes list, the file tree, the
-    /// rail, the tab strip or the editor did not close it ("the commit one is particularly bugged
-    /// and hard to close"). It is now a sibling of `Self::render_plus_menu` in [`Render::render`]
-    /// with a genuinely full-window scrim, which means it has to carry its anchor in window space
-    /// like every other popover here does.
     pub(crate) commit_composer_bounds: gpui::Bounds<Pixels>,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
     /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
@@ -1097,9 +910,6 @@ pub struct AdeApp {
     pub(crate) review_focus: OverlayFocus,
     /// Which runs the sidebar's History view is showing - `all` or `this worktree`
     /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §6, GitHub issue #227).
-    ///
-    /// Deliberately not persisted, for exactly [`Self::sidebar_view`]'s own reason: it is a
-    /// per-window navigation position, not a preference.
     pub(crate) history_scope: crate::run_history::model::HistoryScope,
     /// Which History worktree groups the user has explicitly folded or unfolded, keyed by
     /// worktree path (`true` = folded). A worktree with no entry takes the default
@@ -1110,20 +920,11 @@ pub struct AdeApp {
     /// Real drift counts, `worktree -> run key -> commits since that run ended` (GitHub issue
     /// #227). Filled in by `crate::run_history::flow::AdeApp::load_run_drift`, which runs a real
     /// `wt_core::run_drift::commits_since_each` per worktree on the background executor.
-    ///
-    /// A run with no entry paints **no** drift dot and no drift text - see
-    /// `crate::run_history::model::RunEntry::drift`. There is deliberately no "assume zero"
-    /// fallback: `at the tip` is a real claim about the branch, and a claim made before the
-    /// traversal answered would be a guess dressed as the most reassuring of the three bands.
     pub(crate) run_drift: HashMap<PathBuf, HashMap<String, usize>>,
     /// Whether a drift load is already running, so a re-render mid-flight cannot start a second
     /// one - the same single-flight shape [`Self::prune_in_flight`] uses.
     pub(crate) run_drift_in_flight: bool,
     /// Which run's transcript is open as a centre tab in each worktree, keyed by worktree path.
-    ///
-    /// **One run tab per worktree, replaced on the next open** (`REVISION-2026-08-13.md` §3), so
-    /// this is a map rather than [`Self::review_tab_open`]'s single window-wide slot: opening a
-    /// run in another checkout must not close the one you were reading here.
     pub(crate) run_tab_by_worktree: HashMap<PathBuf, String>,
     /// Whether the run-transcript tab is the tab strip's currently *active* entry - exactly
     /// mirrors [`Self::review_tab_active`], including that switching to another tab clears this
@@ -1160,11 +961,6 @@ pub struct AdeApp {
     /// [`Self::diff_view_scroll_handle`]: the two surfaces are separate places in the app, and
     /// sharing one handle would carry the git Diff view's scroll position into the review (and
     /// back) every time the user switched between them.
-    ///
-    /// A `gpui::UniformListScrollHandle`, matching [`Self::diff_view_scroll_handle`]'s own type -
-    /// both surfaces are driven by the same `render_diff_file_detail` `uniform_list` (GitHub
-    /// issue #224), which owns its scroll offset through this handle type rather than a plain
-    /// `gpui::ScrollHandle`.
     pub(crate) review_scroll_handle: UniformListScrollHandle,
     /// [`Self::diff_highlight_cache`]'s counterpart for the review tab's own open file - a
     /// separate cache for the same reason the scroll handle is separate: the review tab and the
@@ -1174,17 +970,6 @@ pub struct AdeApp {
     pub(crate) review_highlight_cache: Option<DiffHighlightCache>,
     /// The in-flight `wt_core::review::snapshot_worktree_tree` behind each fresh agent's
     /// baseline capture, keyed by agent.
-    ///
-    /// Deliberately **not** the single `Option<Task<()>>` slot [`Self::_load_graph_task`] uses:
-    /// GPUI cancels a `Task` when it is dropped, so one shared slot meant spawning agent B while
-    /// agent A's snapshot was still running silently cancelled A's capture - permanently, since
-    /// nothing retries it, leaving A with no review for its entire lifetime and an orphaned
-    /// baseline ref that `release_review_baseline` would never clean up (it early-returns when
-    /// there is no entry). A single slot is right for a *replaceable* load like the graph's; a
-    /// baseline capture is per-agent and must not be superseded by an unrelated agent's.
-    ///
-    /// Entries are removed when their capture completes, so this never grows past the number of
-    /// captures genuinely in flight.
     pub(crate) _review_baseline_tasks: HashMap<AgentId, Task<()>>,
     /// The in-flight `wt_core::review::diff_against_tree` load behind the review tab.
     pub(crate) _review_load_task: Option<Task<()>>,
@@ -1359,29 +1144,9 @@ pub struct AdeApp {
         HashMap<gpui::SharedString, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
     /// Which single-line input a real click-drag selection is currently in progress in - the
     /// `caret_selector` key of [`Self::simple_input_layout`], or `None` when no button is down.
-    ///
-    /// Needed because the drag has to keep extending the selection while the pointer is *outside*
-    /// the field (dragging past its right edge is how a user selects to the end of a query that
-    /// overflows its box), which a hover-filtered `on_mouse_move` listener cannot see - so the
-    /// move/up listeners are registered window-wide (`gpui::Window::on_mouse_event`, the same
-    /// mechanism Zed's own editor element uses for this) and this is what tells them the drag is
-    /// really theirs.
     pub(crate) simple_input_drag: Option<gpui::SharedString>,
     /// GitHub issue #202: which code blocks the user has currently collapsed, keyed by absolute
     /// path, each value a set of 0-based [`code_surface::fold::FoldRange::start_line`]s.
-    ///
-    /// **Deliberately ephemeral** - in memory only, never written to disk. This app does persist
-    /// comparable per-worktree view state elsewhere (`crate::sidebar::fold_state` for the *file
-    /// tree*'s expanded directories, `crate::work_surface::tab_order_state` for tab order), but
-    /// neither of those precedents applies cleanly here: both key off a stable identity (a
-    /// directory path, a tab), while a code fold is a plain line index that a single edit made
-    /// outside the app invalidates. Restoring one across a restart would just as often collapse
-    /// the wrong block as the right one. Not even scroll position is persisted per file (see
-    /// `crate::code_surface::tabs`' own note), so this matches the surrounding discipline.
-    ///
-    /// Keyed by *absolute* path rather than by the `(worktree cwd, relative path)` pair
-    /// [`Self::edit_buffers`] uses, since an absolute path is already unambiguous across
-    /// worktrees - so unlike `edit_buffers` this needs no worktree-switch reset to stay honest.
     pub(crate) file_view_folds: HashMap<PathBuf, std::collections::HashSet<usize>>,
     /// The real shaped line, bounds, and 0-indexed buffer line that painted the *caret's own* row
     /// most recently - `crate::code_surface::editing`'s `EntityInputHandler::bounds_for_range`/
@@ -1526,14 +1291,6 @@ pub struct AdeApp {
     /// The rail's *root container*'s focus handle - the app's real "nowhere else to put focus"
     /// fallback target (`Self::select_worktree`, `Self::close_agent`, `Self::cancel_new_file`),
     /// deliberately **not** [`Self::filter_focus_handle`].
-    ///
-    /// Those three sites used to fall back onto the filter field itself, which an adversarial
-    /// audit found had become a real, reachable bug once GitHub issue #17 tagged that field
-    /// `"text-input"`: closing the last agent focused a text input the user never asked to type
-    /// in, and `Ctrl+Z` there resolved to `TextUndo` against an empty field - a silently swallowed
-    /// keystroke with no feedback. The rail's root div carries no key context of its own, so
-    /// focusing *it* keeps the focused `FocusId` genuinely findable in the next rendered frame -
-    /// the actual invariant the fallback exists to protect - without claiming to be a text widget.
     pub(crate) rail_focus_handle: FocusHandle,
     /// GitHub issue #90's empty-state view's own focus target (`Self::render_empty_state`) - the
     /// same "focus something real rather than leave `Window::focus == None`" discipline
@@ -1564,10 +1321,6 @@ pub struct AdeApp {
     /// Resources popover's `Updated Ns ago` line (GitHub issue #293). `None` until the very first
     /// sample lands, which that line renders as an honest `not sampled yet` rather than as
     /// "0s ago".
-    ///
-    /// A stored instant rather than a render-time `Instant::now()`: the whole point of the line
-    /// is to say how stale the numbers above it are, and a value computed while drawing them
-    /// would always read "just now".
     pub(crate) process_stats_sampled_at: Option<std::time::Instant>,
     /// Whether the status bar's Resources popover is open (GitHub issue #293) - one of the
     /// [`menus::MenuSurface`]s, so it obeys the app's one-menu-at-a-time invariant.
@@ -1578,13 +1331,6 @@ pub struct AdeApp {
     pub(crate) resources_readout_bounds: gpui::Bounds<Pixels>,
     /// Every provider's real rate-limit budget (GitHub issue #294) - what the agent pane strip's
     /// cluster and the budget popover both read.
-    ///
-    /// **This window's copy of a process-wide fact**, not the fact itself: the budget one poll
-    /// fetched belongs to every window, and so do the rate-limit rules that decide when the next
-    /// poll may run, so the truth lives in `crate::budget::state::shared_budget` and this is
-    /// refreshed from it by `crate::budget::flow::AdeApp::sync_budget_from_shared`. Written only
-    /// from there, and only from real poll results - see that module for why a per-window budget
-    /// meant N windows read every provider N times as often.
     pub(crate) budget: crate::budget::state::BudgetState,
     /// Whether the agent pane's rate-limit budget popover is open (GitHub issue #294) - one of
     /// the [`menus::MenuSurface`]s, so it obeys the app's one-menu-at-a-time invariant.
@@ -1864,24 +1610,6 @@ pub struct AdeApp {
     /// the shared *binary*, not a per-extension language id. Spawned lazily (see
     /// [`Self::ensure_lsp_client`]) and reused for every subsequent file of that language under
     /// that root. See [`LspClientState`]'s own docs for the states a client can be in.
-    ///
-    /// [`Self::evict_stale_lsp_clients`] (called on every worktree switch) tears down every
-    /// entry whose root isn't the newly active one - a deliberate "kill the non-active one"
-    /// choice over a small bounded LRU, since each language server instance costs real GB
-    /// against this repo's own workspace and worktree switches are infrequent enough that
-    /// keeping more than one warm isn't worth the memory. This still applies per-root, not
-    /// per-(root, binary): switching worktrees evicts *every* language's client for the old
-    /// root, not just one - see `lsp::lsp_client_eviction_tests` for the regression test.
-    ///
-    /// A language whose primary needs a coordinated companion process (see
-    /// `crate::language::CompanionServer` - Vue is the one real case) gets a **second,
-    /// independent entry** here, keyed by that companion's own distinct
-    /// `CompanionServer::client_key` rather than its bare binary name. That's deliberate: the
-    /// companion then goes through 100% of the same already-proven spawn/poll/evict machinery as
-    /// any other client, and its distinct key means a Vue-flavored `typescript-language-server`
-    /// (carrying an extra real plugin) can never collide with, or be silently reused as, the
-    /// plain one a `.ts` file in the same repo spawns. `crate::lsp::client::LspConnection` is what
-    /// presents a matched pair as one thing to callers.
     pub(crate) lsp_clients: HashMap<(PathBuf, &'static str), LspClientState>,
     /// Absolute paths that have already had `textDocument/didOpen` sent for their owning
     /// [`Self::lsp_clients`] entry - checked by [`Self::render_file_view`] so a re-render never
@@ -1969,14 +1697,6 @@ pub struct AdeApp {
     pub(crate) _completions_resolve_task: Option<Task<()>>,
     /// Which `(path, completions_generation, item index)` triple [`Self::_completions_resolve_task`]
     /// is currently out asking about, if any - cleared when that request's response lands.
-    ///
-    /// Exists because "superseded" and "answered" are genuinely different states, and conflating
-    /// them cost real data: superseding a resolve *cancels* it (dropping a `Task` cancels it), so
-    /// an item the user arrowed past never gets an answer. Recording it in
-    /// [`Self::completions_resolved`] at dispatch time therefore marked an item answered that
-    /// never was, and coming back to it produced no second request - its row and detail pane
-    /// stayed pinned to the unresolved item's own fields for as long as the popup lived. Only a
-    /// request that is genuinely still on its way is skipped here; a cancelled one is retried.
     pub(crate) completions_resolve_in_flight: Option<(PathBuf, u64, usize)>,
     /// Which `(path, completions_generation, item index into `CompletionsStatus::Ready::items`)`
     /// triples this app has already *had a real answer* for from `completionItem/resolve` -
@@ -1991,18 +1711,6 @@ pub struct AdeApp {
     /// [`Self::completions_generation`], keyed by its index into
     /// `crate::lsp::completion_popup::CompletionsStatus::Ready::items` and already merged over the
     /// item that response describes. Read by the detail pane and by accept; **never** by a row.
-    ///
-    /// It lives beside the server's response rather than being merged into it, and that is the
-    /// whole point. Merging into `items` was what made a completion row visibly fill in - and, for
-    /// a `typescript-language-server` auto-import whose inline `detail` is a bare module specifier
-    /// and whose resolved `detail` is a signature, visibly *change* - the moment the user arrowed
-    /// onto it. Live-reported: "it should not be like this, all data should be here without
-    /// needing to select the suggestion." A row now reads only the untouched response, so it is
-    /// complete when the popup opens and frozen from then on, by construction rather than by
-    /// convention; the detail pane is the one thing a resolve is allowed to fill in.
-    ///
-    /// Cleared wherever [`Self::completions_generation`] stops describing the same response - the
-    /// same points that clear [`Self::completions_resolved`].
     pub(crate) completions_resolved_items:
         std::collections::HashMap<usize, lsp_core::lsp_types::CompletionItem>,
     /// Surface C's real Completions popup state (Revision R8.5b) - `None` when no popup is
@@ -2116,13 +1824,6 @@ pub struct AdeApp {
     /// put on the real system clipboard, for as long as that card should still be showing its
     /// momentary `copied` confirmation (see
     /// [`crate::code_surface::lsp_ui::DIAGNOSTIC_COPY_CONFIRM_DURATION`]).
-    ///
-    /// The *text* rather than a bare `bool` on purpose, and it is what the button compares
-    /// itself against: the card is re-anchored to whatever diagnostic is under the caret or the
-    /// pointer right now, so a bare flag would keep reading as "copied" if the caret moved to a
-    /// different broken line inside the confirmation window - a confirmation for a copy that
-    /// never happened on *that* diagnostic. Comparing the payload means only the card whose own
-    /// content genuinely is on the clipboard says so.
     pub(crate) diagnostic_copy_confirmed: Option<String>,
     /// The single in-flight timer that clears [`Self::diagnostic_copy_confirmed`], a single slot
     /// for the same reason [`Self::_hover_hide_task`] is one: assigning a fresh task drops
@@ -2237,11 +1938,6 @@ pub struct AdeApp {
     /// Every shell this machine genuinely has, offered as clickable suggestions under the Shell
     /// field (GitHub issue #213's follow-up - "a select + auto-detect installed shells", built as
     /// a hybrid so the field itself stays unrestricted free text).
-    ///
-    /// Detected by real I/O - `/etc/shells` plus a real `PATH` search, `%COMSPEC%` plus a real
-    /// `PATH` search on Windows (`crate::settings::state::detect_installed_shells`) - so like
-    /// [`Self::shell_status`] it is refreshed on a real user gesture (opening Settings, opening
-    /// the dropdown) and held here, never recomputed from `render`.
     pub(crate) shell_suggestions: Vec<settings::ShellSuggestion>,
     /// Whether that suggestion dropdown is currently painted. A real
     /// [`crate::root::menus::MenuSurface`] like every other floating dropdown in the app, so the
@@ -2279,13 +1975,6 @@ pub struct AdeApp {
     /// dropdown loses focus it should be closed"). Held for the entity's whole lifetime, like
     /// [`Self::_window_appearance_subscription`] beside it - a dropped `Subscription` stops
     /// firing.
-    ///
-    /// A menu is a transient, click-away surface anchored to a control in *this* window; leaving
-    /// one painted while the user is working in another window means coming back to a stale
-    /// popover positioned off bounds that may since have moved. Only the six
-    /// [`menus::MenuSurface`]s are swept - the palette/Settings/"New file" overlays own real
-    /// keyboard focus and half-typed input, and closing those out from under an alt-tab would
-    /// destroy real work.
     pub(crate) _window_activation_subscription: Subscription,
     /// Whether the tab strip's `+` menu popover is open - see [`Self::render_plus_menu`].
     /// Closed by its own scrim click, by picking a row, by opening any other
@@ -2297,13 +1986,6 @@ pub struct AdeApp {
     /// pattern as [`Self::body_bounds`]). [`Self::render_plus_menu`] positions the popover
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
-    ///
-    /// The *only* anchor this popover has. A per-repo `plus_menu_repo_anchor`/
-    /// `rail_plus_button_bounds` pair used to exist alongside it, for the rail repo header's own
-    /// `+` opening this same popover; that button is inert now (see
-    /// `crate::rail::render::AdeApp::render_repo_group_new_button`'s own docs for why), so
-    /// nothing outside the tab strip can open the plus menu and both fields went with it rather
-    /// than being left capturing bounds for an anchor no click can ever select.
     pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
     /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
     /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
@@ -2359,41 +2041,16 @@ pub struct AdeApp {
     pub(crate) _tab_order_save_task: Option<Task<()>>,
     /// Every worktree whose persisted tab session this window has already dealt with - see
     /// `crate::work_surface::session::AdeApp::restore_worktree_session`, which is the only writer.
-    ///
-    /// Two jobs, both load-bearing:
-    ///
-    /// 1. **Restore exactly once per worktree per window.** Restoring reopens file tabs and spawns
-    ///    real processes; running it again on the next rail click back into the same worktree would
-    ///    stack a second shell (and a second resumed agent) on top of the first every time.
-    /// 2. **Gate recording on restore having happened.** A worktree whose session hasn't been
-    ///    restored yet still looks empty, and
-    ///    [`crate::work_surface::session::AdeApp::record_worktree_session`] writing that emptiness
-    ///    to disk would erase the very session the next selection was about to reopen. Membership
-    ///    here is what makes "the live tab strip is now the truth for this worktree" a real,
-    ///    checkable fact rather than an assumption.
     pub(crate) session_restored: HashSet<PathBuf>,
     /// Every real reason a persisted tab could not be reopened this session - "`src/gone.rs` no
     /// longer exists", "a Codex agent has no resumable session id". One degraded tab never fails
     /// the rest of a restore (see
     /// [`crate::work_surface::session::AdeApp::restore_worktree_session`]), but it must not
     /// silently vanish either: each entry is logged as it happens and kept here.
-    ///
-    /// Nothing renders these yet - deliberately, and stated plainly rather than implied: this
-    /// carries the same "real data captured, no UI reads it back" contract
-    /// `crate::hooks::store`'s own module docs already established for its first phase. Bounded by
-    /// [`crate::work_surface::session::MAX_SESSION_RESTORE_NOTICES`] so a user who visits many
-    /// worktrees in one long-running window can't grow it without limit.
     pub(crate) session_restore_notices: Vec<String>,
     /// Which worktree of each repo (keyed by `crate::rail::repo::repo_key`) was last genuinely
     /// selected - the live mirror of `crate::rail::repo::RepoRecord::selected_worktree`, seeded
     /// from `repos.toml` at startup and updated by [`Self::select_worktree`].
-    ///
-    /// A map rather than a single value because [`Self::selected`] only ever describes the
-    /// *focused* repo: [`Self::repo_state_snapshot`] has to write a real remembered worktree for
-    /// every repo it persists, including the ones this window has not looked at since launch, and
-    /// without this it would blank theirs out on the next save (`RepoState::save_merged_at`
-    /// replaces a whole record for every key in [`Self::repo_state_owned`], and startup's own
-    /// `add_repo` puts every restored repo in that set).
     pub(crate) selected_worktree_by_repo: HashMap<String, PathBuf>,
     /// The unified tab strip's real, precise drop-target indicator (GitHub issue #16's "better
     /// visual feedback" ask): `Some((target, insert_after))` while a tab is being dragged over
@@ -2618,13 +2275,6 @@ impl AdeApp {
     /// this app runs under - the one place a user's own syntax-highlighting preferences are turned
     /// into the value the pipeline consumes, so no call site reads
     /// `self.settings.appearance.*` for this and risks disagreeing with another.
-    ///
-    /// Read on the foreground thread and passed **by value** into whatever background work needs
-    /// it (`spawn_file_load`, `schedule_rehighlight`). It deliberately isn't ambient state: a
-    /// `thread_local!` (the `theme::CURRENT_THEME` pattern) would be invisible to the background
-    /// executor these highlights actually run on, and a process-global was already tried and
-    /// reverted in this codebase for the parallel-test flakes it caused - see `CURRENT_THEME`'s
-    /// own docs.
     pub(crate) fn highlight_options(&self) -> crate::code_surface::code_view::HighlightOptions {
         crate::code_surface::code_view::HighlightOptions {
             bracket_pair_colorization: self.settings.appearance.bracket_pair_colorization,
@@ -2634,21 +2284,6 @@ impl AdeApp {
     /// Drops every cached syntax-highlighting result and re-derives it, so a settings change that
     /// alters *span production* rather than paint-time colour really takes effect on already-open
     /// content instead of only on the next file opened.
-    ///
-    /// Needed because [`Self::highlight_options`] feeds
-    /// `crate::code_surface::code_view::HighlightOptions`, whose output is baked into
-    /// `RenderedLine` runs and then cached in four independent places - none of which key their
-    /// freshness on settings (the File view's on `(path, mtime, len)`, the Diff view's on whole-
-    /// `DiffFile` equality, the Merge view's on `(path, hunk)`, and each `EditBuffer`'s on its own
-    /// `highlight_dirty` flag). Nulling a cache is not enough on its own for the Diff and Merge
-    /// ones: their `ensure_*` methods early-return on an equality check, so each has to be cleared
-    /// *and* re-driven. The Markdown preview needs nothing here - it re-renders from source every
-    /// frame and so picks the change up for free.
-    ///
-    /// Every open [`edit_buffer::EditBuffer`] is marked dirty and re-highlighted through the same
-    /// debounced background path typing already uses, rather than a synchronous foreground parse
-    /// of every open file - see `crate::code_surface::code_view`'s own "Re-highlighting cost"
-    /// notes for why a foreground parse of a large file is the thing to avoid.
     pub(crate) fn invalidate_syntax_highlighting(&mut self, cx: &mut Context<Self>) {
         self.file_view_cache = None;
         self.file_view_last_freshness_check = None;
@@ -2704,10 +2339,6 @@ impl AdeApp {
     /// Queues a background-executor save of the current [`Self::settings`] to
     /// [`Self::settings_path`] (`Settings::save_at`), called from every settings mutation. A
     /// `None` path (every GPUI test) makes this a no-op; a save failure is logged, not surfaced.
-    ///
-    /// Marks [`Self::settings_save_pending`] and starts the serial writer loop
-    /// ([`Self::_settings_save_task`]) if it isn't already running - see that field's docs for
-    /// why writes are serialized rather than raced.
     pub(crate) fn persist_settings(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.settings_path.clone() else {
             return;
@@ -2777,16 +2408,6 @@ impl AdeApp {
     /// §2 asks for fold changes to be "recorded immediately (crash-safe), not only on clean
     /// exit"), and `FoldState::save_at`'s write-temp-then-rename is what makes an interrupted
     /// write a no-op rather than a corrupted file.
-    ///
-    /// Structurally identical to [`Self::persist_settings`], including the "clear the running
-    /// flag in the same synchronous step that decides to stop" trick that keeps a change landing
-    /// at exactly the wrong moment from being silently dropped - see that method's own docs for
-    /// the full reasoning. It is a genuine no-op with a `None` path (every GPUI test that hasn't
-    /// asked for a real one).
-    ///
-    /// Unlike settings, the write is a *merge* (`FoldState::save_merged_at` against
-    /// [`Self::fold_state_owned`]): a second `jerry` process browsing a different repository is
-    /// writing the same file, and a whole-file write would erase its state.
     pub(crate) fn persist_fold_state(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.fold_state_path.clone() else {
             return;
@@ -2877,17 +2498,6 @@ impl AdeApp {
     /// [`Self::focused_repo`]'s path, or an empty [`PathBuf`] when nothing is focused at all
     /// (GitHub issue #90's genuinely empty window, or a stale [`Self::focused_repo`] id no longer
     /// in [`Self::repos`] - defensive, not reachable through any real mutator today).
-    ///
-    /// Deliberately **not** `self.repos.first()` - an independent audit found this exact fallback
-    /// was a real, reachable bug: [`Self::repos`] is populated from the *whole* persisted
-    /// `repos.toml` (every repo this user has ever opened, in any window), not just the one this
-    /// window has focused, so falling back to its first entry could silently resolve to a
-    /// completely different, unopened repo's real path - and every real repo-scoped operation
-    /// this app has (spawning an agent, committing, discarding a worktree) reads its target
-    /// through this method or [`Self::current_worktree_path`]. Every call site that can run with no
-    /// repo focused must check [`Self::focused_repo`]/[`Self::focused_repo_path`]'s emptiness
-    /// itself instead - see [`crate::work_surface::render::AdeApp::new_agent`]'s own docs for the
-    /// concrete exploit this was found through and the real guard that closes it.
     pub(crate) fn focused_repo_path(&self) -> PathBuf {
         self.focused_repo()
             .map(|repo| repo.path.clone())
@@ -2901,13 +2511,6 @@ impl AdeApp {
     /// see [`Self::focus_repo`] for that half, kept as a separate call so a caller that only
     /// wants "make sure this repo is known" (startup, before deciding what's focused) doesn't get
     /// an unwanted focus side effect.
-    ///
-    /// Calls [`repo::repo_key`] synchronously (a single `std::fs::canonicalize`, not offloaded to
-    /// the background executor) - safe here the same way [`Settings::load_or_init`]'s own
-    /// single-file-read constructor exception is safe (see [`Self::new`]'s docs): this only ever
-    /// runs from a real, infrequent user action or once at startup, never a render or per-
-    /// keystroke path, unlike [`repo::repo_key`]'s hot-path sibling
-    /// `crate::sidebar::fold_state::worktree_key`.
     pub(crate) fn add_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) -> RepoId {
         // The single point a repo path enters [`Self::repos`], and so the single place it gets
         // normalized - see [`repo::canonical_repo_path`]'s own docs for the real, reproduced bug
@@ -2952,13 +2555,6 @@ impl AdeApp {
     /// which *repo* is focused doesn't yet reload anything (the file tree/diff/agents are still
     /// single-repo-scoped fields this phase doesn't rewire - see [`Self::worktrees`]'s own docs),
     /// so there is nothing to kick off here beyond the assignment itself.
-    ///
-    /// GitHub issue #90: also persists this as [`repo::RepoState::last_focused`] (via
-    /// [`Self::persist_repo_state`], the same real writer [`Self::add_repo`] already calls) - "the
-    /// app remembers the last-opened folder and reopens it automatically next launch" needs every
-    /// real focus change recorded, not just the one a fresh repo's own `add_repo` call happens to
-    /// trigger. A no-op call (unknown `id`) persists nothing new, since [`Self::focused_repo`]
-    /// never actually changed.
     pub(crate) fn focus_repo(&mut self, id: RepoId, cx: &mut Context<Self>) {
         if self.repos.iter().any(|repo| repo.id == id) {
             self.focused_repo = Some(id);
@@ -2976,49 +2572,6 @@ impl AdeApp {
     /// [`Self::add_repo`] + [`Self::focus_repo`] alone, which (per their own docs) don't reload
     /// anything, since until now the only place that combination ran was startup, where the
     /// caller went on to do the reload itself right afterwards ([`Self::new_with_settings`]).
-    ///
-    /// An independent audit of this method's first version found (and this now fixes) two real
-    /// gaps beyond the incomplete state reset above:
-    /// - it never (re)started [`Self::start_worktree_watch`]/[`Self::start_status_polling`] - a
-    ///   window that starts empty and only later opens a folder never got rail status polling at
-    ///   all, and a window switching from repo A to repo B kept its watcher bound to A's path.
-    ///   Both are safe to call unconditionally here: assigning a fresh `Task`/watcher to their own
-    ///   field drops (and so cancels) whatever was previously running there, so this can never
-    ///   leave two loops running at once.
-    /// - a genuinely empty window's Settings/palette overlay may have captured
-    ///   [`Self::empty_state_focus_handle`] as its own "return focus to" target
-    ///   ([`OverlayFocus::capture`]) - once a real repo is focused, [`Self::render_empty_state`]
-    ///   stops being part of the rendered tree at all, so restoring focus to it later would
-    ///   silently dangle every global keybinding. [`OverlayFocus::forget_target`] is this
-    ///   project's own established fix for exactly this class of bug (see its own docs).
-    ///
-    /// ## Cross-repo agent persistence
-    ///
-    /// Every agent open before this call, in *every* repo, stays exactly as it was: a real PTY
-    /// process left running in the background, never paused and never closed just because
-    /// `path` is about to become the focused repo instead. This used to shut down every other
-    /// repo's agents right here (the same real teardown [`Self::close_agent`] always uses) on the
-    /// reasoning that nothing yet let a user reach them again - the tab strip
-    /// ([`crate::work_surface::render::AdeApp::combined_tab_order`]) is still genuinely scoped to
-    /// the *active worktree* (`Agents::iter_for_cwd`), so a repo other than `path` shows none of
-    /// its own tabs the moment focus moves away. That reasoning no longer holds: the rail's own
-    /// per-repo groups ([`crate::rail::render::AdeApp::build_repo_groups`]) now fold every repo's
-    /// real open agents into their own rows regardless of focus, with genuinely live status, so a
-    /// background repo's agent is still fully reachable - just through the rail instead of the
-    /// tab strip - and closing it out from under the user the instant they looked away would be a
-    /// real, silent kill of work they never asked to stop. Switching back to that repo later
-    /// (another call here, or [`Self::checkout_repo_from_rail`]) finds the exact same
-    /// [`AgentId`]s mid-work, never a fresh respawn.
-    ///
-    /// Idempotent against a repo already known to this window (re-opening an already-added repo
-    /// just re-focuses and reloads it, rather than duplicating anything) - the same
-    /// [`Self::add_repo`] guarantee this builds on. A repo with no agent open yet in its own root
-    /// (a genuinely new repo, or one whose root worktree was closed by hand) gets one spawned
-    /// here, the same "a fresh window starts with one shell in the repo root" default
-    /// [`Self::new_with_settings`] gives a CLI-launched repo - a repo revisited after being
-    /// unfocused keeps whatever real agent(s) it already had running, per the cross-repo
-    /// persistence above, so this never spawns a redundant second shell into a worktree that
-    /// already has one.
     pub(crate) fn open_repo_in_current_window(
         &mut self,
         path: PathBuf,
@@ -3066,36 +2619,6 @@ impl AdeApp {
     /// rows and agent rows are click targets). So today this has exactly one real caller:
     /// [`Self::select_worktree_by_path`]'s cross-repo fallback, reached by clicking a worktree
     /// row under a non-focused repo's group.
-    ///
-    /// Shares `open_repo_in_current_window`'s real repo-switch reload
-    /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
-    /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target, and real
-    /// cross-repo agent persistence - see that method's own "Cross-repo agent persistence" docs,
-    /// which apply here unchanged) but deliberately does **not** call [`Self::add_repo`] or spawn
-    /// an initial shell: `id` must already be a known [`Self::repos`] entry (every row the rail
-    /// renders came from there), and unlike "Open Folder…" - which always guarantees *some* real
-    /// terminal is running so a freshly opened folder is never inert - this focuses the repo
-    /// with nothing selected and nothing spawned, leaving the follow-up worktree selection to
-    /// its caller.
-    ///
-    /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
-    /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
-    /// already [`Self::focused_repo`] (a repeat call for the repo already showing must not
-    /// reset any of its live state).
-    ///
-    /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
-    /// that `id` has never had a real agent open in comes up genuinely empty, a real "focused,
-    /// nothing open yet" state - the user opens something next via the tab strip's own `+` (the
-    /// rail repo header's own `+` is inert until a real "add worktree" design lands - see
-    /// [`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
-    /// *before*, though, may already have real agents left running from that earlier visit (see
-    /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
-    /// closed or respawned here, and none are *reactivated* either: `Agents::clear_active` below
-    /// leaves the centre pane showing nothing until a worktree row is genuinely selected (see
-    /// the inline comment below and `Agents::clear_active`'s own docs for why clearing, not
-    /// skipping, is the correct half-measure-free behavior). There is no cross-restart
-    /// persistence of *which tabs were open* for a repo yet - a real, disclosed gap, not a
-    /// silently stubbed one.
     pub(crate) fn checkout_repo_from_rail(
         &mut self,
         id: RepoId,
@@ -3686,19 +3209,6 @@ impl AdeApp {
     /// [`Self::render_workspace_body`] whenever [`Self::focused_repo`] is `None`: a fresh launch
     /// with no CLI argument and nothing ever persisted (or a remembered folder that no longer
     /// exists), or a brand-new window opened via `crate::title_bar::menu`'s "New Window" row.
-    ///
-    /// Deliberately minimal - a centered message plus one real, working affordance - rather than
-    /// an inert placeholder: the "Open Folder…" button below calls the exact same
-    /// [`Self::start_choose_repo_folder`] real native-picker flow the File menu's own "Open
-    /// Folder…" row does (`crate::title_bar::menu::AdeApp::file_menu_rows`), so a user landing
-    /// here has a genuine way out of the empty state without needing to already know about the
-    /// title bar. The title bar and status bar stay real, unconditional siblings around this (see
-    /// [`Render::render`]'s own docs), so Settings/File-menu/Quit are all still reachable from
-    /// here exactly as they are from the normal workspace view.
-    ///
-    /// `track_focus`es [`Self::empty_state_focus_handle`] - the same "never leave `Window::focus`
-    /// dangling" reasoning [`Self::rail_focus_handle`]'s own docs give, applied to a window whose
-    /// rendered tree has no rail/tab-strip/file-tree at all to fall back onto instead.
     fn render_empty_state(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("empty-state")
@@ -3748,20 +3258,6 @@ impl AdeApp {
 /// target is still safe to use" state each of this app's three focus-capturing overlays needs:
 /// the code/file Surface C ([`AdeApp::code_focus`]), the command palette
 /// ([`AdeApp::palette_focus`]), and Settings ([`AdeApp::settings_focus`]).
-///
-/// ## The dangling-focus invariant
-///
-/// Every one of these overlays replaces or covers whatever was rendered before it, and GPUI
-/// resolves a dispatched action against whichever node the focused `FocusId` maps to in the
-/// *last rendered frame* (`vendor/zed/crates/gpui/src/window.rs`'s
-/// `focus_node_id_in_rendered_frame`), falling back to the dispatch tree's root node - above
-/// every `on_action` handler - when that `FocusId` isn't found there. So: an overlay's `open_*`
-/// must always end by moving `Window::focus` onto the overlay's own handle, and its `close_*`
-/// must always end by calling [`restore_focus`] to move focus back onto something still
-/// rendered, never leave it pointing at the now-unrendered overlay handle. This project has hit
-/// the "close_* forgot to restore" version of this bug repeatedly; this type
-/// and [`restore_focus`] are the single consolidated fix - every overlay's open/close pair
-/// should route through them rather than hand-rolling capture/restore again.
 #[derive(Default)]
 pub(crate) struct OverlayFocus {
     /// The focus target in place immediately before this overlay opened (`window.focused(cx)`,
@@ -3795,15 +3291,6 @@ impl OverlayFocus {
     /// Forgets a captured target that is about to stop being rendered, leaving [`restore_focus`]
     /// to fall back to the active agent's pane instead of focusing a node GPUI can no longer
     /// find in the frame.
-    ///
-    /// This exists for a real, reproduced case (found by the `tree-focus-bugfixes` branch's own
-    /// adversarial audit): with the file tree focused, opening the palette captures
-    /// `tree_focus_handle`; running the palette's own "Cycle Right Panel" then unrenders the
-    /// whole tree, and closing the palette restored focus straight onto it.
-    /// `crate::sidebar::render::AdeApp::set_right_sidebar_view` already had a
-    /// `tree_focus_handle.is_focused(window)` guard for the *direct* version of this, but the
-    /// palette is what holds focus at that moment, so the guard could not see it. Every overlay
-    /// that could be holding the tree's handle is swept there instead.
     pub(crate) fn forget_target(&mut self, handle: &FocusHandle) {
         if self.return_focus.as_ref() == Some(handle) {
             self.return_focus = None;
@@ -3813,39 +3300,6 @@ impl OverlayFocus {
 
 /// The shared focus-restore-on-close step for every overlay that captured a pre-open target via
 /// [`OverlayFocus::capture`] - see this type's own docs for the invariant this closes.
-///
-/// If the active agent changed while the surface was open, the captured handle is skipped in
-/// favor of the *current* active agent's terminal pane (a handle from a no-longer-active
-/// agent would be just as dangling as the overlay's own). Otherwise the captured handle is
-/// restored, falling back to the active agent's pane if nothing was focused before, and finally
-/// to `fallback` if there is no agent either. A free function, not an `AdeApp` method, since
-/// every caller already holds `&mut self` and needs to pass `&mut self.some_field` alongside it.
-/// Deliberately doesn't call `cx.notify()` - every caller has its own surface-specific state
-/// change around this call and issues its own single `cx.notify()` once everything, this restore
-/// included, is done.
-///
-/// `fallback` ([`AdeApp::focus_fallback_handle`], which every caller passes) is GitHub issue
-/// #255's fix, and it closes a real, reproduced hole rather than padding an unreachable one: this
-/// function used to end its chain at the active agent's pane and simply *not move focus at all*
-/// when there wasn't one, which is the whole bug. A window with no agents left is an ordinary,
-/// fully-supported state (`crate::work_surface::render::AdeApp::render_center_pane`'s own "no
-/// agents open in this worktree" arm), and closing any focus-owning surface in it - a file tab,
-/// the git graph tab, the review tab, Settings, the palette - left `Window::focus` pointing at
-/// the handle that had just stopped being rendered. From there GPUI resolves every subsequent
-/// keystroke against the dispatch tree's *root* node (see this module's [`OverlayFocus`] docs and
-/// `focus_node_id_in_rendered_frame`), which sits above every `on_action` handler `AdeApp` has -
-/// so ⌘P, ⌘,, and every other global binding silently did nothing until the user happened to
-/// click something focusable. Three real reproductions, each now a test in
-/// `crate::root::focus::tabless_window_keybinding_tests`:
-///
-/// 1. Open a file, close the last agent tab, close the file tab.
-/// 2. Open Settings, archive the last agent from the title bar's Agent menu, close Settings.
-/// 3. Open the git graph tab, close the last agent tab, close the graph tab.
-///
-/// Each ends with zero tabs open, which is exactly the state the issue names. The `agent_changed`
-/// branch above is what all three route through: the pre-open target *was* the agent that has
-/// since been closed, so it is (correctly) discarded, and before this parameter existed there was
-/// then nothing left to fall back to.
 pub(crate) fn restore_focus(
     agents: &Agents,
     overlay_focus: &mut OverlayFocus,
@@ -3871,23 +3325,6 @@ pub(crate) fn restore_focus(
 /// superseding `Option<Task<()>>` slot could let an older edit's `std::fs::write` complete
 /// *after* a newer edit's, since dropping a `Task` cannot stop a write that already started.
 /// [`AdeApp::persist_settings`]'s serial writer loop closes this structurally.
-///
-/// ## What these tests can and can't actually prove
-///
-/// Under GPUI's deterministic test executor, a background closure with no internal `.await`
-/// points (like `Settings::save_at`) either hasn't been polled yet or runs to completion in one
-/// synchronous step (`vendor/zed/crates/scheduler/src/test_scheduler.rs`'s `step_filtered`) -
-/// there's no wall-clock thread pool making independent progress between test statements. So
-/// "prove two writes were interleaved mid-write" isn't an achievable test goal here, and a test
-/// that only checks the final on-disk value after two edits with the *same* injected delay would
-/// pass identically whether or not writes are actually serialized (same-delay timers drain in
-/// queuing order regardless).
-///
-/// What *is* testable is *ordering*: give an earlier edit a *longer* delay than a later edit
-/// queued behind it. A non-serialized implementation would let the later, shorter-delayed write
-/// land first and the earlier, now-stale write land after it, corrupting the file. Against the
-/// real serial writer loop, no second write can begin until the first's delay-then-write fully
-/// completes, so this inversion is structurally impossible.
 #[cfg(test)]
 mod settings_persist_tests {
     use super::*;
@@ -3911,10 +3348,6 @@ mod settings_persist_tests {
         })
     }
 
-    /// Edit 1 gets a long delay and is still pending when edit 2 is queued behind it with a
-    /// shorter delay. A per-edit-independent-task implementation would let edit 2's write finish
-    /// first and edit 1's stale write land on top afterward; the serial writer loop can't start
-    /// edit 2's delay until edit 1's delay-then-write has fully completed.
     #[gpui::test]
     fn a_later_edit_queued_while_an_earlier_one_is_delayed_is_never_overwritten_by_it(
         cx: &mut TestAppContext,
@@ -3956,7 +3389,6 @@ mod settings_persist_tests {
             "the second edit should be recorded as pending, not dropped"
         );
 
-        // Drain both delays, in whatever order the implementation actually resolves them.
         let mut settled = false;
         for _ in 0..40 {
             cx.background_executor
@@ -3979,13 +3411,6 @@ mod settings_persist_tests {
         );
     }
 
-    /// A rapid burst of edits (far more than two), each given a *shorter* delay than the one
-    /// before it and all queued before the loop has been driven forward even once, must still
-    /// converge on exactly the final edit's value - not, as a non-serialized implementation
-    /// would produce, whichever edit happened to carry the longest delay (here, deliberately the
-    /// first) winning by finishing last. See
-    /// [`a_later_edit_queued_while_an_earlier_one_is_delayed_is_never_overwritten_by_it`] for the
-    /// two-edit version.
     #[gpui::test]
     fn a_burst_of_edits_with_decreasing_delays_converges_on_the_final_value(
         cx: &mut TestAppContext,
@@ -4088,9 +3513,6 @@ mod repo_list_tests {
         })
     }
 
-    /// A fresh window's own startup path already exercises the common single-repo case: exactly
-    /// one repo, focused, matching the CLI-given path - "a user launching `app <path>` today must
-    /// keep working exactly as before" is this test.
     #[gpui::test]
     fn a_fresh_window_starts_with_exactly_one_focused_repo(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4126,8 +3548,6 @@ mod repo_list_tests {
         });
     }
 
-    /// Adding the same real path twice (e.g. a repeat `app <path>` launch sharing one
-    /// `~/.config/jerry`) must not produce a second rail group for the same repo.
     #[gpui::test]
     fn add_repo_is_idempotent_for_the_same_path(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4166,9 +3586,6 @@ mod repo_list_tests {
         });
     }
 
-    /// A stale/unknown id must not blank out focus - the same "refuse rather than corrupt state"
-    /// shape `crate::sidebar::fold_state::FoldState::set_expanded` uses for an out-of-worktree
-    /// path.
     #[gpui::test]
     fn focus_repo_with_an_unknown_id_is_a_no_op(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4182,9 +3599,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The persistence half: adding a repo with a real settings path must, once the background
-    /// writer loop settles, leave a real `repos.toml` on disk that a fresh load recovers - "which
-    /// repos are currently added should survive an app restart".
     #[gpui::test]
     fn adding_a_repo_persists_to_a_real_repos_toml(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir");
@@ -4213,14 +3627,6 @@ mod repo_list_tests {
         assert!(on_disk.repos.contains_key(&canonical_b));
     }
 
-    /// A window opened against `repo_a`, sharing a real `~/.config/jerry` that *another* running
-    /// `jerry` instance already recorded `repo_b` into, must not erase `repo_b` the moment it
-    /// saves anything of its own - the identical multi-instance guarantee
-    /// `crate::sidebar::fold_state` already provides for the file-tree fold state, proven here
-    /// through one real `AdeApp` entity's startup-and-save cycle against a `repos.toml` seeded as
-    /// if a second instance had already written to it (`crate::rail::repo`'s own tests already
-    /// cover the pure `RepoState::save_merged_at` half; this proves the real `AdeApp` wiring
-    /// reaches it correctly end to end).
     #[gpui::test]
     fn opening_against_one_repo_does_not_erase_another_instances_already_persisted_repo(
         cx: &mut TestAppContext,
@@ -4230,7 +3636,6 @@ mod repo_list_tests {
         let settings_dir = tempfile::tempdir().expect("tempdir");
         let settings_path = settings_dir.path().join("settings.toml");
 
-        // Simulate a second `jerry` instance that already added `repo_b` and saved it.
         let repo_state_path = repo::repo_state_path_for(&settings_path);
         let mut seed = RepoState::default();
         let canonical_b = repo::repo_key(repo_b.path()).expect("repo b key");
@@ -4243,7 +3648,6 @@ mod repo_list_tests {
         );
         seed.save_at(&repo_state_path).expect("seed save");
 
-        // This instance opens against a different repo, sharing the same `repos.toml`.
         let (app, cx) = open_test_app_with_real_settings_path(
             cx,
             repo_a.path().to_path_buf(),
@@ -4265,11 +3669,6 @@ mod repo_list_tests {
         );
     }
 
-    /// GitHub issue #90: a window with no CLI argument (`repo_path: None`) that is allowed to
-    /// consult persisted state (`use_remembered_repo: true` - the real process-launch case) and
-    /// a fresh settings directory - nothing has ever been persisted - opens in a genuinely empty
-    /// state: no repo focused, and none of the single-repo-scoped startup work
-    /// (`Self::new_with_settings`'s own docs) ran at all.
     #[gpui::test]
     fn no_cli_arg_and_nothing_persisted_is_a_genuinely_empty_window(cx: &mut TestAppContext) {
         let settings_dir = tempfile::tempdir().expect("tempdir");
@@ -4297,12 +3696,6 @@ mod repo_list_tests {
         });
     }
 
-    /// GitHub issue #90's own headline behaviour: focusing a repo (via [`AdeApp::focus_repo`])
-    /// persists it as [`RepoState::last_focused`], and a *second*, independently-constructed
-    /// `AdeApp` sharing the same real settings path, given `repo_path: None,
-    /// use_remembered_repo: true` (the real process-launch path with no CLI argument), reopens
-    /// that exact repo automatically - "the app remembers the last-opened folder and reopens it
-    /// automatically next launch".
     #[gpui::test]
     fn a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo(
         cx: &mut TestAppContext,
@@ -4349,9 +3742,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The other half of "remembers the last-opened folder": a remembered repo whose directory
-    /// has since been deleted or moved must fall back to a genuinely empty window, not a broken
-    /// or crashing one.
     #[gpui::test]
     fn a_remembered_repo_that_no_longer_exists_falls_back_to_a_genuinely_empty_window(
         cx: &mut TestAppContext,
@@ -4365,7 +3755,6 @@ mod repo_list_tests {
             open_test_app_with_real_settings_path(cx, repo_path.clone(), settings_path.clone());
         cx.run_until_parked();
 
-        // The remembered repo's own directory is now gone.
         drop(repo);
         assert!(!repo_path.exists());
 
@@ -4391,12 +3780,6 @@ mod repo_list_tests {
         });
     }
 
-    /// GitHub issue #90's "New Window" semantics: `use_remembered_repo: false` (what
-    /// `crate::title_bar::menu`'s "New Window" row passes) must open a genuinely empty window
-    /// even when a real, still-existing last-focused repo *is* on record - unlike the real
-    /// process-launch path (`use_remembered_repo: true`, proven by
-    /// [`a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo`] above), which
-    /// would reopen this exact repo.
     #[gpui::test]
     fn use_remembered_repo_false_stays_empty_even_with_a_real_remembered_repo(
         cx: &mut TestAppContext,
@@ -4434,10 +3817,6 @@ mod repo_list_tests {
         });
     }
 
-    /// [`AdeApp::open_repo_in_current_window`] - the shared real flow behind both the File menu's
-    /// "Open Folder…" row and the empty-state view's own button - genuinely focuses the chosen
-    /// repo in an already-running, previously-empty window and reloads its worktrees/file tree/
-    /// diff/initial agent, mirroring what a real CLI-argument launch does.
     #[gpui::test]
     fn open_repo_in_current_window_focuses_and_reloads_a_real_repo_from_empty(
         cx: &mut TestAppContext,
@@ -4479,13 +3858,6 @@ mod repo_list_tests {
         });
     }
 
-    /// Critical fix (independent audit): `Self::open_repo_in_current_window` used to only reset
-    /// four fields (`staged_files`/`open_change`/`expanded_dirs`/`selected_tree_path`), leaving
-    /// every other per-repo UI control - a tree error banner, the commit composer popover, an
-    /// armed prune confirmation, and more - still armed against the *old* repo after switching to
-    /// a new one. `Self::reset_repo_scoped_state` (shared with `Self::select_worktree`) now
-    /// covers all of it; this proves a representative sample of the fields the original version
-    /// missed are really cleared by a real Open Folder switch, not just the original four.
     #[gpui::test]
     fn open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo(
         cx: &mut TestAppContext,
@@ -4529,13 +3901,6 @@ mod repo_list_tests {
         });
     }
 
-    /// Real user report: a repo with zero linked worktrees (just the main checkout on its
-    /// current branch) correctly shows one worktree row right after opening it, but switching
-    /// away to a different repo and back makes that row disappear. Uses two real git repos
-    /// (`git init`, no linked worktrees on either) and `Self::open_repo_in_current_window` for
-    /// both switches, `cx.run_until_parked()` after each so [`AdeApp::load_worktrees`]'s real
-    /// background task has actually resolved before the next switch - this is a same-thread,
-    /// strictly-sequential repro, not a race between overlapping loads.
     #[gpui::test]
     fn switching_away_from_a_zero_linked_worktree_repo_and_back_keeps_its_worktree_row(
         cx: &mut TestAppContext,
@@ -4622,14 +3987,6 @@ mod repo_list_tests {
         );
     }
 
-    /// Critical fix (independent audit): the original `open_repo_in_current_window` never
-    /// (re)started the real status-polling loop or the worktree filesystem watcher - a window
-    /// that starts empty and only later opens a folder never got either at all. `repo` is a real
-    /// `git init`-ed directory, not a bare `tempfile::tempdir()`: `spawn_worktree_watcher` returns
-    /// `None` for a path that isn't inside a real git repository at all
-    /// (`wt_core::git_common_dir` failing), so a bare tempdir would make this test pass "by
-    /// accident" - `_worktree_watcher` would read `None` regardless of whether the real fix ever
-    /// ran, proving nothing about the watcher half of the fix.
     #[gpui::test]
     fn open_repo_in_current_window_starts_status_polling_and_worktree_watch(
         cx: &mut TestAppContext,
@@ -4683,15 +4040,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The other real half of Critical fix 2: a window switching from one real repo to another
-    /// must *rebind* the watcher to the new path, not leave it silently still watching the old
-    /// one. Proven by making the second repo a bare, non-git directory:
-    /// `spawn_worktree_watcher` can only ever return `None` for it
-    /// (`wt_core::git_common_dir` fails for a non-repository path) - so `_worktree_watcher`
-    /// reading `None` after the switch is genuine proof `Self::start_worktree_watch` really ran
-    /// again with repo B's own path, not proof of nothing (a stale watcher still pointed at repo
-    /// A - a real git repo - would have kept this field `Some`, silently masking the bug this
-    /// test exists to catch).
     #[gpui::test]
     fn open_repo_in_current_window_rebinds_the_worktree_watcher_to_the_new_repo(
         cx: &mut TestAppContext,
@@ -4725,13 +4073,6 @@ mod repo_list_tests {
         });
     }
 
-    /// Real cross-repo agent persistence (this feature's own whole point, GitHub issue #1 phase
-    /// e): switching folders away from repo A must leave its real agent process running in the
-    /// background - not paused, not closed, exactly the process the user was looking at a moment
-    /// before - and switching back must find that exact same agent, mid-work, never a fresh
-    /// respawn. This used to close every one of repo A's agents right here (the same real PTY
-    /// teardown `Self::close_agent` always uses) - see `Self::open_repo_in_current_window`'s own
-    /// "Cross-repo agent persistence" docs for why that's gone.
     #[gpui::test]
     fn open_repo_in_current_window_leaves_the_previous_repos_agents_running(
         cx: &mut TestAppContext,
@@ -4819,16 +4160,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The rail-native mirror of
-    /// [`open_repo_in_current_window_leaves_the_previous_repos_agents_running`] just above:
-    /// [`AdeApp::checkout_repo_from_rail`] shares the identical real cross-repo agent persistence
-    /// contract, not a partial or weaker version of it. Proves two real agents belonging to repo
-    /// A (its initial shell plus a spawned Claude session) are both still genuinely running -
-    /// still present in [`crate::work_surface::agents::Agents`]'s own list, real PTY processes
-    /// and all - after checking out repo B from the rail, the same "really alive, not leaked or
-    /// killed" guarantee the `open_repo_in_current_window` mirror test proves via the identical
-    /// technique (asserting against the live agent list and each one's own `TerminalPane::
-    /// is_running`).
     #[gpui::test]
     fn checkout_repo_from_rail_leaves_the_previous_repos_agents_running(cx: &mut TestAppContext) {
         let repo_a = tempfile::tempdir().expect("tempdir");
@@ -4909,15 +4240,6 @@ mod repo_list_tests {
         });
     }
 
-    /// "Repo headers should not be associated to tabs at all" - the user's own words, after two
-    /// earlier attempts at this same bug (auto-selecting the main worktree; blocking every spawn
-    /// while nothing is selected) both turned out wrong for different reasons. The centre pane
-    /// has no repo-scoping of its own (`crate::work_surface::render::AdeApp::render_center_pane`
-    /// reads `Agents::active` directly), so simply *not* reactivating anything on checkout was
-    /// tried and rejected too: repo A's agent stayed the globally active one, and its terminal
-    /// kept rendering right alongside repo B's own, unrelated rail rows. `Agents::clear_active`
-    /// is what actually closes this - checked here directly, not inferred from `Agents::active_id`
-    /// alone, since that alone wouldn't prove the *previous* repo's agent was the thing cleared.
     #[gpui::test]
     fn checking_out_a_repo_from_the_rail_clears_the_centre_pane_instead_of_reactivating(
         cx: &mut TestAppContext,
@@ -5001,31 +4323,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The reported "we can add a tab to the repo itself". [`AdeApp::checkout_repo_from_rail`] is
-    /// pure navigation - which repo's worktree rows the rail shows - and must never select a
-    /// worktree on the user's behalf; only a real click on a worktree row does that. An earlier
-    /// attempt at this bug auto-selected the main worktree here and was rejected in review: back
-    /// when the repo header was still a click target, that just moved "the repo itself is
-    /// actionable" one level deeper.
-    ///
-    /// (The doc comment here previously described that *rejected* behavior rather than what the
-    /// body actually asserts - corrected in the same revision that fixed the underlying flaw.)
-    ///
-    /// The premise is unchanged, but the reason it is now *safe* is different, and worth stating
-    /// because it is this revision's whole point. `AdeApp::selected` staying `None` used to be a
-    /// limbo state that still rendered a plausible-looking tab, because
-    /// `AdeApp::current_worktree_path` fell back to the bare repo path for exactly that `None` - so the
-    /// rail lit up the main-worktree row, the tab strip drew the repo root's shell, and the centre
-    /// pane showed nothing, all at the same time. That fallback is gone (see `current_worktree_path`'s
-    /// own docs), so "nothing selected" is now genuinely inert *everywhere* rather than merely
-    /// inert here - proven directly by `crate::rail::render::worktree_tab_attribution_tests::
-    /// nothing_selected_means_nothing_shown_anywhere`.
-    ///
-    /// This is not a resting state a user can reach: the repo header is not a click target at all,
-    /// so `checkout_repo_from_rail`'s only caller is [`AdeApp::select_worktree_by_path`]'s
-    /// cross-repo case, which selects the clicked worktree synchronously right afterwards.
-    /// Asserted both before and after `cx.run_until_parked()`, so neither the synchronous half nor
-    /// `AdeApp::load_worktrees`'s own background fetch may introduce a selection.
     #[gpui::test]
     fn checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own(
         cx: &mut TestAppContext,
@@ -5054,7 +4351,6 @@ mod repo_list_tests {
             );
         });
 
-        // And the real background fetch landing moments later must not introduce one either.
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(
@@ -5065,14 +4361,6 @@ mod repo_list_tests {
         });
     }
 
-    /// The reported "weird flicker on the worktrees" when clicking a repo: before the
-    /// synchronous seed above existed, `AdeApp::worktrees` was left completely untouched by
-    /// `checkout_repo_from_rail` - still repo A's own rows - for the entire synchronous portion
-    /// of the click (and so for the very next render), with repo B's header now showing above
-    /// them. Repo A's rows visibly flashed under repo B's name until `load_worktrees`'s
-    /// background fetch replaced them a moment later. Checked *before* `run_until_parked()`, so
-    /// this proves the synchronous seed, not the eventual correct state everything converges to
-    /// anyway.
     #[gpui::test]
     fn checking_out_a_repo_from_the_rail_never_shows_the_previous_repos_worktrees_even_briefly(
         cx: &mut TestAppContext,
@@ -5090,7 +4378,6 @@ mod repo_list_tests {
             app.checkout_repo_from_rail(repo_b_id, window, cx);
         });
 
-        // No `run_until_parked()`: this is exactly the state the very next render would use.
         app.read_with(cx, |app, _| {
             assert!(
                 app.worktrees.iter().all(|item| item.path != repo_a.path()),
@@ -5107,12 +4394,6 @@ mod repo_list_tests {
         });
     }
 
-    /// Critical fix (independent audit): a genuinely empty window's Settings overlay can capture
-    /// [`AdeApp::empty_state_focus_handle`] as its own "return focus to" target
-    /// ([`OverlayFocus::capture`]) - once a real repo is focused, `Self::render_empty_state` stops
-    /// being part of the rendered tree at all, so restoring focus there later would silently
-    /// dangle every global keybinding. `Self::open_repo_in_current_window` must forget that target
-    /// ([`OverlayFocus::forget_target`]) before Settings closes.
     #[gpui::test]
     fn open_repo_in_current_window_forgets_a_dangling_empty_state_focus_target(
         cx: &mut TestAppContext,
@@ -5158,12 +4439,6 @@ mod repo_list_tests {
         );
     }
 
-    /// Critical fix (independent audit): a genuinely empty window has no real repo root to spawn
-    /// a new agent into - `Self::focused_repo_path`'s own `Self::repos.first()` fallback (removed)
-    /// used to let `Self::current_worktree_path` silently resolve to some *other*, unopened repo's real
-    /// path, so `secondary-n`/`ctrl-shift-T`'s own handlers could spawn a real, invisible PTY
-    /// there. `Self::new_agent`/`Self::new_agent_pane` now refuse outright with no focused repo -
-    /// this proves both real entry points genuinely spawn nothing.
     #[gpui::test]
     fn new_agent_and_new_agent_pane_are_no_ops_with_no_focused_repo(cx: &mut TestAppContext) {
         let other_repo = tempfile::tempdir().expect("tempdir");

@@ -4,11 +4,6 @@
 //! `crate::root` gathers the real signals (`TerminalPane`, `wt_core::list_worktrees`,
 //! `wt_core::diff::diff_against_base`) into the plain types this module operates on, and renders
 //! the result as GPUI elements.
-//!
-//! Two levels, always (§2.1): **repo group → worktree → agents** - no rail mode toggle. There
-//! used to be a second, `RailMode`-switched "by project" structure; the revision that redesigned
-//! the rail around repo grouping removed it (§7: "`groupSessions`, `railMode` and `railSort` are
-//! all gone").
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -41,24 +36,6 @@ pub struct AgentRow {
     /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row -
     /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "the live tool call -
     /// `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`".
-    ///
-    /// A sibling field here rather than a payload on [`Status::Run`] itself (status-conditional,
-    /// but a row-level fact rather than part of the status enum) - keeping [`Status`] itself a plain
-    /// `Copy` value users of `Status::ORDER`/`urgency_rank`/`color` etc. can keep relying on,
-    /// rather than every one of those call sites suddenly needing to supply or ignore an
-    /// `activity` payload for a `Run` variant they don't care about.
-    ///
-    /// Real as of GitHub issue #239 phase 2, and only ever from a real source: this is a Claude
-    /// Code hook payload's own `tool_name` plus the relevant `tool_input` field (`Bash: cargo
-    /// test`, `Edit: src/auth.rs`), parsed by `crate::hooks::event`. It was deliberately left
-    /// `None` before that, rather than filled from a PTY-output heuristic, because guessing "the
-    /// live tool call" from rendered terminal text is exactly the kind of plausible-but-wrong
-    /// string this field would be worst as.
-    ///
-    /// Still `None` whenever there is no real answer: a Codex agent or a shell (neither has
-    /// hooks), a Claude agent whose hooks haven't fired yet or have gone stale
-    /// (`crate::hooks::event::HOOK_SIGNAL_TTL`), and any row that isn't [`Status::Run`] - a
-    /// finished agent's last tool call describes the past, not what it is doing.
     pub activity: Option<String>,
     /// Wall-clock time since `crate::work_surface::agents::Agent::spawned_at` - the agent
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
@@ -68,24 +45,6 @@ pub struct AgentRow {
     /// [`Status::Review`] row only - §2.3's trailing text for that state (`12 files`, rendered
     /// beside the `finished` state word). `None` for every other status (§2.3: "Do not put a
     /// per-agent file count here" - this one state is the documented exception).
-    ///
-    /// GitHub issue #225 made this a genuinely per-agent number: it comes from
-    /// `crate::review::flow::AdeApp::agent_review_file_count`, a real
-    /// `wt_core::review::diff_against_tree` against the snapshot taken when this agent started
-    /// (or when the user last marked it reviewed). It used to be the *worktree's* whole git diff
-    /// against the merge-base with the default branch, which is a different question entirely -
-    /// an agent that changed nothing in a worktree whose branch had already diverged reported
-    /// every one of the branch's files as its own.
-    ///
-    /// Still `None` whenever the count would be a guess rather than a fact:
-    /// - No baseline has been captured yet (capture is a background task, so there is a real
-    ///   moment after spawn where there is genuinely nothing to measure against).
-    /// - The review hasn't loaded yet, or failed to load.
-    /// - **More than one agent is open in this worktree.** This is a deliberate design gate, not
-    ///   a missing feature: real per-agent attribution doesn't exist yet, so with two agents
-    ///   sharing a worktree this agent's review would honestly include the other's changes. The
-    ///   whole review surface is held back for such worktrees until they're back down to one
-    ///   agent - see `crate::work_surface::agents::Agents::count_for_cwd`.
     pub review_file_count: Option<usize>,
 }
 
@@ -184,9 +143,6 @@ impl WorktreeNote {
     /// A prune candidate: not the main checkout, not locked, clean (mirroring
     /// `wt_core::remove_worktree`'s own dirty-tree refusal up front), and merged into its
     /// detected base.
-    ///
-    /// Not sufficient on its own to remove a worktree - says nothing about a live agent
-    /// running inside it. See [`prunable_worktree_paths`] for that additional exclusion.
     pub fn is_prunable(&self) -> bool {
         !self.is_main
             && !self.is_locked
@@ -234,9 +190,6 @@ impl WorktreeNote {
 /// deliberate: `std` has no timezone database, and pulling one in (`chrono-tz`, or the
 /// `time` crate's `local-offset` feature, unsound-by-default on unix) wasn't worth it for a
 /// single label.
-///
-/// `pub(crate)` so `crate::review::state`'s own "captured at HH:MM" header reuses this exact
-/// formatting (and its exact UTC caveat) rather than growing a second, subtly different copy.
 pub(crate) fn format_utc_hhmm(unix_seconds: i64) -> String {
     let seconds_in_day = unix_seconds.rem_euclid(86_400);
     let hours = seconds_in_day / 3600;
@@ -318,17 +271,6 @@ impl WorktreeRow {
     /// groups themselves) - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1's
     /// full seven-step order: `input → failed → review → running → idle → bare → prunable`.
     /// Lower sorts first (more urgent).
-    ///
-    /// The first five steps are exactly [`Status::urgency_rank`] (§2.3's own agent state words -
-    /// `needs input`/`failed`/`finished`/`running`/`paused` - map one-to-one onto
-    /// [`Status::Ask`]/[`Status::Fail`]/[`Status::Review`]/[`Status::Run`]/[`Status::Idle`], see
-    /// that enum's own docs), reused rather than re-derived. The last two only apply to a
-    /// agent-less row, which [`Self::aggregate_status`] alone can't distinguish from a row
-    /// whose one open agent is genuinely [`Status::Idle`] - both would otherwise rank 4. A
-    /// worktree with no agents at all is never the "same kind of quiet" as one with an idle
-    /// agent still attached, so this splits that case using [`WorktreeNote::is_prunable`], the
-    /// same real merged/clean/locked facts §2.2's "Bare worktrees `#22262a`, prunable
-    /// `#2f353a`" left-edge colours already key off.
     pub fn urgency_rank(&self) -> u8 {
         if self.agents.is_empty() {
             if self.note.is_prunable() {
@@ -394,10 +336,6 @@ impl WorktreeRow {
 /// the old `ProjectChild`-based `build_project_children` had: `agents.iter().find(...)` only
 /// ever surfaced one agent per worktree, silently hiding any additional ones). Every worktree
 /// appears here, including ones with no agent (e.g. `main`, or a merged/prunable leftover).
-///
-/// Thin wrapper over [`build_worktree_rows_with_history`] with an empty history list, for the
-/// many existing call sites (including most of this module's own tests) that predate GitHub issue
-/// #227 and have no persisted history to fold in.
 pub fn build_worktree_rows(worktrees: &[WorktreeEntry], agents: &[AgentRow]) -> Vec<WorktreeRow> {
     build_worktree_rows_with_history(worktrees, agents, &[])
 }
@@ -507,22 +445,6 @@ pub struct RepoGroup {
 impl RepoGroup {
     /// The group header's **red** urgency count: worktrees in this repo holding at least one
     /// failed agent, hidden at zero.
-    ///
-    /// Revision 6 (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4,
-    /// `STAGE-A-CHANGELOG.md` §4q) split the header's single amber `N worktrees waiting` into two
-    /// counts, because merging them "said 'three worktrees want you' when one of the three had
-    /// actually died, and amber is the wrong colour for that". §7 rule 4, verbatim: **"Two states
-    /// distinguished anywhere in the app are never summed anywhere in it."** The title bar has
-    /// always shown `ask`/`fail`/`running` apart; the rail header now does too.
-    ///
-    /// Deliberately worktree-level, not agent-level: a worktree with two failed agents still
-    /// counts once, since the header answers "how many rows in this group want me", not "how many
-    /// agents".
-    ///
-    /// Reads [`Self::all_rows`], **not** [`Self::rows`]: this count must survive a filter query
-    /// that hides the very row it's counting, and must survive the group's rows being collapsed
-    /// away for a non-focused repo, per §2.0's "a repo you have scrolled past still reports that
-    /// something in it wants a human".
     pub fn failed_count(&self) -> usize {
         self.all_rows
             .iter()
@@ -532,17 +454,6 @@ impl RepoGroup {
 
     /// The group header's **amber** urgency count: worktrees holding at least one asking agent
     /// **and no failed one**, hidden at zero.
-    ///
-    /// The `and no failed one` half is the whole point of §9's checklist box 7 ("a both-states
-    /// worktree counts once as failed") and of §4q's own rule: "A worktree holding both an asking
-    /// and a failed agent counts **once, as failed** - the worse state wins, so the two counts sum
-    /// to the number of worktrees needing you rather than double-counting." Written against
-    /// [`WorktreeRow::has_agent_with`] rather than [`WorktreeRow::aggregate_status`] on purpose:
-    /// `aggregate_status` ranks `Ask` *above* `Fail` ([`Status::urgency_rank`]), so a both-states
-    /// worktree aggregates to `Ask` and would have landed in the amber count - the exact
-    /// mis-colouring §4q rejected.
-    ///
-    /// Reads [`Self::all_rows`] for the same reason [`Self::failed_count`] does.
     pub fn needs_input_count(&self) -> usize {
         self.all_rows
             .iter()
@@ -568,30 +479,6 @@ impl RepoGroup {
 
 /// One flattened row in the rail's Worktrees body - the real fix for the rail becoming
 /// unresponsive to hover with many worktrees/agents open (live user report, GitHub issue #364).
-///
-/// `crate::rail::render::AdeApp::render_rail_list` used to build every repo header, every
-/// worktree row, every agent row and every history row unconditionally, on every single render -
-/// including rows nowhere near the visible viewport. That render ran on every hover-driven
-/// `Window::refresh()` (GPUI's own `.hover()`/`.group_hover()` call `window.refresh()` on every
-/// hover-region transition - see `vendor/zed/crates/gpui/src/elements/div.rs`), and a refresh
-/// forces *every* view in the window to skip its own per-entity prepaint cache for that frame
-/// (`vendor/zed/crates/gpui/src/view.rs`'s `!window.refreshing` check) - so no amount of scoping
-/// which `Entity` owns the hover flag could have bounded the work: the only real lever is
-/// building fewer elements in the first place.
-///
-/// This is the item `crate::rail::render::AdeApp::render_rail_list`'s real `gpui::list` (GPUI's
-/// own variable-row-height virtualized list - `crate::sidebar::render::AdeApp::
-/// render_changes_sections` already uses it for the identical "a 26px header and a 40-ish px
-/// agent row in one scroller" reason, since `uniform_list` sizes every slot from item 0's
-/// measured height alone) renders one of per row actually on screen, plus a small overdraw
-/// margin - so per-hover-event (indeed per-frame) work is bounded by the number of rows visible,
-/// never the total number of rows across every repo.
-///
-/// Deliberately index-only (into the `&[RepoGroup]` the render side already built this frame,
-/// via [`flatten_rail_list_items`]) rather than cloning row data into every item: cheap to build
-/// fresh on every render (as `Self::render_rail_list` already did for its old eager `Vec` of
-/// elements), and there is exactly one place - the render side's own dispatch - that ever needs
-/// to resolve one back into real row data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailListItem {
     /// One repo group's header band (name, `N wt`, urgency counts).
@@ -615,16 +502,6 @@ pub enum RailListItem {
     },
     /// The `\u{21ba} N earlier runs` line under a worktree row (GitHub issue #227,
     /// `REVISION-2026-08-13.md` \u{a7}6).
-    ///
-    /// Emitted **outside** the expansion gate, and **only for a worktree with no live agent** -
-    /// both halves are \u{a7}6's own spec: it is a line *under* the row rather than one of its
-    /// children, so a folded worktree still offers it, and "a first pass put it under every
-    /// worktree: eight identical rows, no information".
-    ///
-    /// This replaced the `HistoryHeader`/`PastAgentRow` pair that used to flatten the rail's own
-    /// inline `HISTORY` section here. Both are deleted rather than left beside it
-    /// (`REVISION-2026-08-14.md` \u{a7}7 rule 5) - the runs themselves live in the sidebar's
-    /// History view now (`crate::run_history::render`).
     EarlierRunsLink {
         group_index: usize,
         row_index: usize,
@@ -640,10 +517,6 @@ impl RailListItem {
     /// [`Self::WorktreeRow`] itself when collapsed or childless, otherwise the last
     /// [`Self::AgentRow`] or, on a worktree with no live agent but real history, its own
     /// [`Self::EarlierRunsLink`].
-    ///
-    /// Always `false` for an errored worktree row, matching
-    /// `crate::rail::render::AdeApp::render_worktree_row`'s own pre-flatten behaviour exactly: its
-    /// early-return error branch never carried the gap at all, whatever came after it.
     pub fn is_last_in_worktree_block(&self, groups: &[RepoGroup], expanded: bool) -> bool {
         let row = match self {
             RailListItem::RepoHeader { .. } | RailListItem::RepoEmptyMessage { .. } => {
@@ -699,10 +572,6 @@ impl RailListItem {
 
 /// Flattens `groups` into the real sequence [`crate::rail::render::AdeApp::render_rail_list`]'s
 /// `gpui::list` renders - see [`RailListItem`]'s own docs for why this exists at all.
-///
-/// `expanded` mirrors `crate::rail::render::AdeApp::worktree_is_expanded`, injected as a closure
-/// rather than called directly so this stays what every other function in this module is: pure
-/// row-model logic with no `gpui::Window`/`Context` of its own, testable without a real window.
 pub fn flatten_rail_list_items(
     groups: &[RepoGroup],
     mut expanded: impl FnMut(&WorktreeRow) -> bool,
@@ -750,20 +619,6 @@ pub fn flatten_rail_list_items(
 }
 
 /// The tooltip on the repo header's **amber** dot+count pair: `"2 worktrees here need input"`.
-///
-/// Revision 6 replaced the header's one prose run (`3 worktrees waiting`) with two bare
-/// dot+count pairs, and put the sentence in a tooltip instead - `STAGE-A-CHANGELOG.md` §4q's own
-/// rule: **"a count belongs in the header, a sentence belongs in a tooltip. If a header needs a
-/// sentence to be understood, the signal is wrong, not the copy."** The old
-/// `waiting_count_label` text path was deleted in the same edit that added these two, per §7
-/// rule 5 ("Replacing a control means deleting its old keys in the same edit - a key defined
-/// twice is two specifications of one thing, and the reader cannot tell which is real").
-///
-/// Both the noun and the verb agree through [`crate::root::plural`] rather than a hand-written
-/// ternary (§7 rule 9) - `Jerry.dc.html`'s own `askTip` conjugates `needs`/`need` too, and a
-/// tooltip reading "1 worktrees here need input" would be exactly the defect that rule exists for.
-/// Hiding at zero is the *caller's* decision (a content choice, made at the render site by not
-/// drawing the pair at all), so this function is total and always returns a real sentence.
 pub fn needs_input_tooltip(count: usize) -> String {
     format!(
         "{} here {} input",
@@ -786,18 +641,6 @@ pub fn failed_tooltip(count: usize) -> String {
 
 /// A rail worktree row's diffstat, as the two parts it is **coloured** in - `("+152",
 /// Some("−11"))` - or `None` when there is no real diff to show.
-///
-/// `STAGE-A-CHANGELOG.md` §4o, verbatim: **"A value that is coloured anywhere must be coloured
-/// everywhere, which means the logic returns its parts, not a pre-joined string."** The rail used
-/// to compose `+152 −11` into one neutral `#5e646a` string here, which is precisely why it could
-/// not be coloured, while run rows, uncommitted rows, commit rows and section headers all split
-/// theirs into `diff::STAT_ADD`/`diff::STAT_DEL`. Same number, read the same way, styled two
-/// different ways depending on which panel it was in.
-///
-/// The deletion half is `Option` rather than a `−0`: `Jerry.dc.html`'s own `wtStats` returns
-/// `del: d ? '−' + d : ''`, so a pure-addition diff shows one part, not a second one that says
-/// nothing. Both zero is `None` outright - the row's prose fallback (`checkout · clean`, `merged ·
-/// prunable`), which stays neutral, is what occupies that slot instead.
 pub fn diff_stat_parts(add: usize, del: usize) -> Option<(String, Option<String>)> {
     if add == 0 && del == 0 {
         return None;
@@ -809,10 +652,6 @@ pub fn diff_stat_parts(add: usize, del: usize) -> Option<(String, Option<String>
 }
 
 /// The rail footer's and Settings → Disk's shared idle line: `"3 worktrees · 1.2 GB"`.
-///
-/// One function rather than the two independently-formatted copies these two surfaces used to
-/// carry (both of which read `1 worktrees` for a fresh single-checkout repo, which is the very
-/// first thing a new user sees).
 pub fn worktree_disk_label(worktree_count: usize, disk_label: &str) -> String {
     format!(
         "{} \u{b7} {disk_label}",
@@ -822,23 +661,6 @@ pub fn worktree_disk_label(worktree_count: usize, disk_label: &str) -> String {
 
 /// The rail footer's prune control's tooltip - `"Prune merged worktrees \u{2014} 1 prunable,
 /// frees 214 MB"`.
-///
-/// `REVISION-2026-08-14.md` §4 turned `prune` from the rail's one text button into a bin icon at a
-/// 17px hit box, "the only text action in a rail otherwise made of rows" - and the tooltip is
-/// where the words went. It deliberately carries **more** than the button's old `prune (1)` label
-/// could: what pruning means (merged worktrees), how many are candidates, and what it buys back.
-///
-/// `freed_bytes` is `Some((bytes, truncated))` only once the real background disk scan
-/// (`crate::root::AdeApp::load_disk_usage`, whose per-worktree half lives in
-/// `crate::root::AdeApp::worktree_disk_usage`) has reported a size for **every** prune candidate.
-/// While any candidate is unmeasured it is `None` and the `, frees N` clause is simply absent
-/// rather than under-reported - the same honesty rule `crate::rail::render::AdeApp::
-/// disk_usage_label`'s `...` and the repo header's em-dash `\u{2014} wt` already follow. The
-/// `truncated` flag (a scan that hit its own walk limit) renders `frees 214 MB+`, exactly as
-/// [`format_bytes`]' caller in `disk_usage_label` does.
-///
-/// At zero candidates the sentence changes shape rather than reading `0 prunable`: nothing is
-/// offered, so the tooltip says so.
 pub fn prune_tooltip(prunable_count: usize, freed_bytes: Option<(u64, bool)>) -> String {
     if prunable_count == 0 {
         return "Prune merged worktrees \u{2014} nothing prunable".to_string();
@@ -892,14 +714,6 @@ pub fn pruned_label(removed_count: usize) -> String {
 /// most urgent worktree") - **never** alphabetically or by insertion order, per that section's
 /// explicit warning. Both sorts are stable (`slice::sort_by_key`), so two rows/groups tied on
 /// rank keep their caller-supplied relative order rather than reshuffling on every render.
-///
-/// Every repo supplies real `rows`/`all_rows` here, not just the focused one -
-/// `crate::rail::repo::Repo::worktrees` is kept live for every added repo by
-/// `crate::root::AdeApp::load_repo_worktrees`/`crate::root::AdeApp::
-/// start_repo_worktrees_polling` (see [`RepoWorktrees::rows_loaded`]'s own docs for exactly when
-/// a given repo's data has actually arrived). This function itself stays a plain, repo-count-
-/// agnostic reduction either way - it only ever sorts and re-shapes whatever [`RepoWorktrees`]
-/// list it's handed, never reads [`crate::root::AdeApp`] fields directly.
 pub fn group_worktrees_by_repo(repos: Vec<RepoWorktrees>) -> Vec<RepoGroup> {
     let mut groups: Vec<RepoGroup> = repos
         .into_iter()
@@ -1047,12 +861,6 @@ pub fn is_prunable(worktree_notes: &HashMap<PathBuf, WorktreeNote>, path: &Path)
 /// The final list of worktree paths `crate::root::AdeApp::prune_worktrees` is allowed to
 /// remove: every path that is a prune candidate per [`is_prunable`] **and** has no live
 /// agent running with its cwd inside it.
-///
-/// The live-agent check isn't implied by `is_prunable`'s dirty check: a running process
-/// with no uncommitted changes still leaves a clean tree, but removing its worktree directory
-/// out from under it is real data loss - `wt_core::remove_worktree`'s own safety check has no
-/// way to catch that. This exclusion happens once here, before `remove_worktree` is called
-/// for any candidate.
 pub fn prunable_worktree_paths(
     worktree_paths: &[PathBuf],
     worktree_notes: &HashMap<PathBuf, WorktreeNote>,
@@ -1077,8 +885,6 @@ pub const DISK_USAGE_WALK_FILE_CAP: usize = 50_000;
 /// incomplete lower bound. Symlinks are not followed (`DirEntry::metadata` on unix is
 /// `lstat`-based), so a cyclic symlink can't loop this walk. Unreadable entries are skipped
 /// rather than aborting the whole walk.
-///
-/// Performs blocking filesystem I/O; callers must offload this to a background executor.
 pub fn disk_usage_bytes(root: &Path) -> (u64, bool) {
     let mut total = 0u64;
     let mut visited_files = 0usize;
@@ -1148,8 +954,6 @@ mod tests {
         }
     }
 
-    /// [`AgentRow::activity`] is a plain, independent field - carrying a value must not change
-    /// filtering (it isn't title/branch/kind text) or anything else about the row's identity.
     #[test]
     fn activity_is_independent_of_filtering_and_defaults_to_none() {
         let idle_row = row(1, Status::Run, "agent-a", "/a");
@@ -1249,7 +1053,6 @@ mod tests {
 
     #[test]
     fn worktree_note_merged_and_clean_linked_worktree_is_prunable() {
-        // 11:04 UTC == 11 * 3600 + 4 * 60 seconds into the day.
         let seconds_since_midnight = 11 * 3600 + 4 * 60;
         let note = WorktreeNote {
             is_main: false,
@@ -1409,14 +1212,6 @@ mod tests {
         assert_eq!(rows[1].agents[1].id, 2);
     }
 
-    /// GitHub issue #227 / §6, as the flattened list really emits it: the `↺ N earlier runs`
-    /// line appears **only** on a worktree with no live agent, appears whether or not that row is
-    /// expanded (it sits *under* the row, not inside it), and is the last item in its block - so
-    /// it, not the worktree row, carries the 7px inter-group gap.
-    ///
-    /// Also the deletion, stated as an assertion: history no longer flattens into a `HISTORY`
-    /// header plus one row per run. Those items are gone, and a worktree's runs live in the
-    /// sidebar's History view (`crate::run_history::render`).
     #[test]
     fn the_earlier_runs_line_is_emitted_only_for_a_worktree_with_no_live_agent() {
         let past = |worktree: &str| crate::hooks::history::PastAgent {
@@ -1439,7 +1234,6 @@ mod tests {
             worktree_entry("/repo-wt/quiet", clean_note(false)),
             worktree_entry("/repo-wt/fresh", clean_note(false)),
         ];
-        // `busy` has both a live agent and history; `quiet` has only history; `fresh` has neither.
         let agents = vec![row(1, Status::Run, "agent-a", "/repo-wt/busy")];
         let rows = build_worktree_rows_with_history(
             &worktrees,
@@ -1747,8 +1541,6 @@ mod tests {
         );
     }
 
-    /// §4q's split: the header's one amber count became an amber `needs input` count and a red
-    /// `failed` count, each counting worktrees (not agents), each zero when nothing qualifies.
     #[test]
     fn repo_group_urgency_counts_report_asking_and_failed_worktrees_separately() {
         let worktrees = vec![
@@ -1790,15 +1582,6 @@ mod tests {
         );
     }
 
-    /// `REVISION-2026-08-14.md` §9's checklist box 7, verbatim: "Repo header shows ask and fail
-    /// separately; **a both-states worktree counts once as failed**."
-    ///
-    /// The trap this guards is real and specific: [`WorktreeRow::aggregate_status`] ranks `Ask`
-    /// *above* `Fail` ([`Status::urgency_rank`]), so a worktree holding one of each aggregates to
-    /// `Ask`. A count written against the aggregate would put this worktree in the **amber**
-    /// column - which is exactly §4q's "amber is the wrong colour for that" defect, and would also
-    /// make the two counts sum to more, or to the wrong colour, rather than to "the number of
-    /// worktrees needing you".
     #[test]
     fn a_worktree_holding_both_an_asking_and_a_failed_agent_counts_once_as_failed() {
         let worktrees = vec![worktree_entry("/repo-wt/both", clean_note(false))];
@@ -1827,15 +1610,6 @@ mod tests {
         );
     }
 
-    /// The bug the coordinator's audit found: the header's urgency counts and the header's
-    /// `N wt` count (`group.all_rows.len()` at the render site) must come from the repo's real,
-    /// complete worktree list, never from whatever narrower set happens to be rendered below the
-    /// header. Builds a repo whose `rows` (the "currently displayed" set - what a filter query
-    /// or a non-focused repo's rendering would legitimately narrow) is a completely different,
-    /// unrelated list from `all_rows` (the repo's real state, including an asking worktree) -
-    /// so a passing assertion proves the header counters read `all_rows`, not `rows`, and would
-    /// keep reporting real state even for "a repo you have scrolled past" (§2.0) or one whose
-    /// rows a filter query has hidden.
     #[test]
     fn repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows() {
         let real_worktrees = vec![
@@ -1887,10 +1661,6 @@ mod tests {
         );
     }
 
-    /// Group *order* must be just as stable as the per-group counters
-    /// (`repo_group_header_counts_read_the_real_worktree_list_not_the_displayed_rows`): a repo
-    /// whose real state (`all_rows`) holds an asking worktree must still sort first even when
-    /// its currently-displayed `rows` (e.g. filtered down) look quiet.
     #[test]
     fn group_worktrees_by_repo_orders_groups_by_all_rows_not_displayed_rows() {
         let urgent_worktrees = vec![worktree_entry("/urgent-repo/wt", clean_note(false))];
@@ -1917,7 +1687,6 @@ mod tests {
         );
     }
 
-    /// §4q's "each with its own tooltip", conjugated in both the noun and the verb (§7 rule 9).
     #[test]
     fn the_two_urgency_tooltips_agree_with_their_own_counts_in_noun_and_verb() {
         assert_eq!(needs_input_tooltip(1), "1 worktree here needs input");
@@ -1926,8 +1695,6 @@ mod tests {
         assert_eq!(failed_tooltip(3), "3 worktrees here have failed agents");
     }
 
-    /// §4o: the rail's diffstat is returned as its two coloured parts, never as one pre-joined
-    /// string - and a diff with no deletions renders one part, not a `\u{2212}0` that says nothing.
     #[test]
     fn diff_stat_parts_splits_the_rail_diffstat_and_drops_an_empty_deletion() {
         assert_eq!(
@@ -1950,8 +1717,6 @@ mod tests {
         );
     }
 
-    /// §4's prune tooltip: "Prune merged worktrees \u{2014} 1 prunable, frees 214 MB" - the words
-    /// the icon itself cannot carry, including the size only when it is really known.
     #[test]
     fn the_prune_tooltip_states_the_count_and_only_a_measured_size() {
         assert_eq!(
@@ -1977,15 +1742,12 @@ mod tests {
         );
     }
 
-    /// The armed half of the two-click prune, kept from the text button it replaced.
     #[test]
     fn the_armed_prune_tooltip_conjugates_its_own_count() {
         assert_eq!(prune_armed_tooltip(1), "Click again to remove 1 worktree");
         assert_eq!(prune_armed_tooltip(2), "Click again to remove 2 worktrees");
     }
 
-    /// The rail footer and Settings → Disk share this one line, and it used to read
-    /// `"1 worktrees · 4.2 GB"` in both places for a fresh single-checkout repo.
     #[test]
     fn worktree_disk_label_conjugates_at_zero_one_and_two() {
         assert_eq!(worktree_disk_label(0, "0 B"), "0 worktrees \u{b7} 0 B");
@@ -2020,8 +1782,6 @@ mod tests {
         assert_eq!(pruned_label(2), "pruned 2 worktrees");
     }
 
-    /// None of the prune/disk labels may fall back to the `worktree(s)` escape hatch these
-    /// three replaced - that spelling dodges the conjugation instead of doing it.
     #[test]
     fn no_prune_label_uses_the_parenthesised_plural_escape_hatch() {
         for n in 0..4 {
@@ -2136,7 +1896,6 @@ mod tests {
              the prune candidate list, even though it is otherwise prunable"
         );
 
-        // Same worktree, no live agent anywhere near it - now it's really a candidate.
         let candidates_without_agent =
             prunable_worktree_paths(&worktree_paths, &notes, &HashSet::new());
         assert_eq!(candidates_without_agent, vec![merged_clean_path]);
@@ -2244,9 +2003,6 @@ mod tests {
         dir
     }
 
-    /// End-to-end, against a real tempdir git repo: [`compute_status_snapshot`] reports a
-    /// prunable, clean, merged worktree correctly, and a dirty one as not prunable, in one
-    /// snapshot covering both the diff side and the worktree-note side.
     #[test]
     fn compute_status_snapshot_reports_real_diff_and_merge_state() {
         let repo = init_repo();

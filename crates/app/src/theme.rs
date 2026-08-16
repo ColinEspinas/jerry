@@ -1,75 +1,5 @@
 //! Jerry's design tokens, ported from `design_handoff_jerry_ade/tokens.rs` (colour/size
 //! constants transcribed from the reviewed mockup `Jerry.dc.html`).
-//!
-//! ## Runtime-swappable colour tokens ([`ColorToken`])
-//!
-//! Every colour constant below (`surface::WINDOW`, `text::BODY`, `syntax::KEYWORD`, ...) is a
-//! [`ColorToken`], not a plain [`Rgba`] - a real, compile-time `const` (so it can still appear
-//! inside another `const`, e.g. `crate::language::EXTENSIONS`'s `chip_colors` field - see that
-//! module's own docs) carrying two things: a real, stable **key** (`"surface.window"`,
-//! `"syntax.keyword"`, ...) and Jerry Dark's own literal [`Rgba`] **default**. At the point
-//! something actually asks for a real colour ([`ColorToken::resolve`], or the `Into<Hsla>`/
-//! `Into<Rgba>`/`Into<gpui::Fill>`/`Into<gpui::Background>` impls every GPUI builder method
-//! already accepts), the token looks its own key up in whichever theme palette is live right now
-//! ([`CURRENT_THEME`]) and falls back to its compiled default when that palette doesn't name it.
-//!
-//! Jerry Dark itself is the identity case - no palette is installed at all, so `resolve()` returns
-//! the token's own `default` completely unchanged, not even a lossy `Rgba -> Hsla -> Rgba` round
-//! trip, and every existing exact-hex test (`lang_token_tests`, etc.) keeps passing bit-for-bit.
-//!
-//! ## The key is the whole contract with a theme file
-//!
-//! A theme file (`assets/themes/*.toml`, or a user's own `~/.config/jerry/themes/*.toml` - see
-//! `crate::settings::custom_theme`'s own module docs for the real format) names tokens by exactly
-//! these keys, grouped into `[module]` tables:
-//!
-//! ```toml
-//! [surface]
-//! window = "#0e0f11"
-//!
-//! [syntax]
-//! keyword = "#b477cf"
-//! ```
-//!
-//! `"{module}.{const name lowercased}"` is the whole naming rule - `surface::WINDOW` is
-//! `surface.window`, `syntax::FUNCTION_METHOD` is `syntax.function_method`. A `(fg, bg)` pair
-//! token gets two keys (`agent.sonnet.fg`/`agent.sonnet.bg`), an array token one per element
-//! (`graph.lanes.0` .. `graph.lanes.5`). Nothing derives one token's colour from another's any
-//! more: **every** token here has its own independent key and its own literal default, including
-//! the ~37 that used to be plain Rust-level aliases of some other const (`syntax::FUNCTION_METHOD`
-//! was `= FUNCTION`, `editor::CARET` was `= syntax::CARET`, ...). Those defaults are unchanged
-//! literal values, so Jerry Dark looks exactly as it always did, but a theme file can now move any
-//! one of them without dragging its former alias-partner along.
-//!
-//! [`TOKEN_GROUPS`] is the real, complete registry every one of those tokens is reachable through.
-//! See its own docs for what walks it (theme-file key validation, the built-in theme generator,
-//! the "generate a theme from one colour" utility) and for the source-parsing test that keeps it
-//! honestly total.
-//!
-//! ## The HSL derivation is still here, just not in the live path any more
-//!
-//! [`derive_shift`]/[`apply_shift`] - the real, systematic hue/saturation/lightness transform that
-//! used to compute *every* non-Jerry-Dark colour on the fly at resolve time - are now an offline
-//! *authoring* utility: they generate a full, literal palette (see [`derived_palette`]) that gets
-//! written into a real theme file. The five built-in non-Jerry-Dark themes were migrated onto
-//! literal files that way (`crate::settings::builtin_themes`), and the Themes page's "Generate
-//! from colour" action uses the same code for a user's own seed colour. Live resolution is a plain
-//! hash lookup - no HSL maths, no per-token derivation, no `Rgba -> Hsla -> Rgba` round trip.
-//!
-//! [`token`] reimplements `gpui::rgb`'s byte-extraction formula as a real `const fn` (GPUI's own
-//! `rgb()`/`Into<Hsla>` conversions aren't `const fn` - `vendor/zed/crates/gpui/src/color.rs:14,677`
-//! - so a literal `const Hsla`/`const Rgba` token wouldn't compile).
-//!
-//! Module names (`surface`, `border`, `text`, `status`, `diff`, `syntax`, `term`, `agent`,
-//! `lang`, `button`, `toggle`, `tag`, `radius`, `band`, `zone`, `shadow`, ...) match `tokens.rs`
-//! so call sites can reference e.g. `theme::status::ASK` unchanged. `radius`/`band`/`zone` are
-//! [`gpui::Pixels`] (via `gpui::px`, `vendor/zed/crates/gpui/src/geometry.rs:3736`) since GPUI's
-//! sizing methods consume `Pixels` directly; `shadow` is `(Pixels, Pixels, Pixels)` for
-//! `(x-offset, y-offset, blur-radius)`. None of those are colours, so none of them is a
-//! [`ColorToken`] and none is themeable.
-//!
-//! `font` (not present in `tokens.rs`) carries the two bundled font family names - see
-//! `crate::fonts`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -105,11 +35,6 @@ pub const fn token(key: &'static str, value: u32) -> ColorToken {
 /// A design token: a stable [`key`](Self::key) a theme file can name it by, plus Jerry Dark's own
 /// literal [`default`](Self::default) colour - resolved against whichever theme is really live
 /// only at the point something actually renders it (see the module docs).
-///
-/// `Copy`/`const`-constructible so it's a drop-in for the plain `Rgba` these tokens used to be: a
-/// bare `theme::surface::WINDOW` still works unchanged at every GPUI builder call site
-/// (`.bg(...)`, `.text_color(...)`, ...) via the [`From`] impls below, and still works inside
-/// another `const` definition (it's itself real `const`-evaluable, unlike a function call).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorToken {
     /// This token's real, stable theme-file key - `"{module}.{const name lowercased}"`, e.g.
@@ -197,37 +122,6 @@ thread_local! {
     /// entries layered on top of everything up its `base` chain - once, at selection time. Live
     /// resolution is then a plain hash lookup per token, not a per-token HSL derivation the way
     /// this module's pre-rewrite mechanism worked.
-    ///
-    /// A [`std::thread_local`], not a value threaded through every render call's parameters, by
-    /// deliberate design: every one of this module's ~270 colour tokens is a bare, freestanding
-    /// `const` read from dozens of files across the whole app (`theme::surface::WINDOW`,
-    /// `theme::text::BODY`, ...), the overwhelming majority several layers deep inside plain,
-    /// `gpui`-context-free helper functions (`crate::sidebar::changes::stat_segment_color`,
-    /// `crate::rail::status::Status::color`, ...) that have no `AdeApp`/`Context`/theme parameter
-    /// to receive a selection through, and adding one to every such signature across the codebase
-    /// (the exact churn `crate::root::AdeApp::ui_text_size`'s own narrower, opt-in scaling
-    /// mechanism was deliberately kept away from, per that function's own docs) would be a
-    /// materially larger, riskier change than this app's actual, real architecture needs.
-    ///
-    /// The `thread_local!`-not-process-global part carries over verbatim from the mechanism this
-    /// replaced, and for a reason a real audit found the hard way. This started as a plain global
-    /// (reasoning: "nothing in this app ever wants a different selected theme on a different
-    /// thread", true for the real, single-foreground-thread production app per `vendor/zed/
-    /// CLAUDE.md`'s own "All use of entities and UI rendering occurs on a single foreground
-    /// thread" note) - the flaw: `cargo test`'s default (parallel) mode runs each `#[gpui::test]`
-    /// on its *own* OS thread, and since essentially every test in this crate constructs at least
-    /// one `AdeApp` (whose constructor always calls `Self::apply_theme_selection`, writing this
-    /// value), a single shared global meant any test asserting a non-default resolved colour could
-    /// be corrupted mid-assertion by a completely unrelated, concurrently-running test's own
-    /// `AdeApp` construction resetting it - a real, reproduced flake specific to default (not
-    /// `--test-threads=1`) parallelism. A `thread_local!` fixes this for free: each test thread
-    /// gets its own independent copy, so tests can never interfere with each other's theme
-    /// selection regardless of scheduling, while production is unaffected (there is still only the
-    /// one real foreground thread that ever reads or writes this).
-    ///
-    /// `RefCell<Option<Rc<Palette>>>`, not `Cell`: a compiled palette is a `HashMap`, not `Copy`.
-    /// The `Rc` means installing a palette (and cloning one out for a caller that wants to keep
-    /// it) is a refcount bump, never a rehash of ~270 entries.
     static CURRENT_THEME: std::cell::RefCell<Option<Rc<Palette>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -250,16 +144,6 @@ pub fn current_theme_palette() -> Option<Rc<Palette>> {
 /// registry, and the single source of truth for "which keys are real" that
 /// `crate::settings::custom_theme`'s key validation, `crate::settings::builtin_themes`' theme-file
 /// generator, and the "generate a theme from one colour" action all read.
-///
-/// Each entry is `(module name, that module's own `TOKENS` slice)`, and each `TOKENS` entry is
-/// `(Rust const name, the token itself)`. The const name is carried purely so
-/// [`token_registry_tests`] can check it against the token's own key; nothing at runtime needs it.
-///
-/// Kept honestly total by [`token_registry_tests::every_real_color_token_in_this_file_is_registered`],
-/// which parses this file's own source (`include_str!`) and fails if a `pub const ...: ColorToken`
-/// declaration exists that no `TOKENS` slice lists, or if a module declaring tokens is missing from
-/// this list - so adding a token without registering it is a test failure, not a colour that
-/// silently can't be themed.
 pub const TOKEN_GROUPS: &[(&str, &[(&str, ColorToken)])] = &[
     ("surface", surface::TOKENS),
     ("border", border::TOKENS),
@@ -304,9 +188,6 @@ pub fn all_tokens() -> impl Iterator<Item = ColorToken> {
 /// [`TOKEN_GROUPS`] declares that key - the one lookup that turns a user-authored (or
 /// VSCode-converted) string into a real, `&'static str`-keyed [`Palette`] entry, and the check
 /// behind `crate::settings::custom_theme::ThemeFileError::UnknownKey`.
-///
-/// Linear over ~270 entries, called once per key while *compiling* a theme (never on the live
-/// resolve path) - a real, deliberate "simple beats clever at this size" call, not an oversight.
 pub fn token_for_key(key: &str) -> Option<ColorToken> {
     all_tokens().find(|token| token.key == key)
 }
@@ -323,24 +204,6 @@ pub fn theme_is_light(window_background: Rgba) -> bool {
 }
 
 /// Real OKLCH colour maths - the perceptual space this palette is authored and derived in.
-///
-/// ## Why not HSL
-///
-/// This module used to do every colour transform in HSL, and the theme redesign's audit measured
-/// what that cost. HSL's `l` is not lightness: a hue rotation at constant HSL saturation swings
-/// real perceived chroma wildly, and its "lightness" of a saturated blue and a saturated yellow are
-/// the same number while one is obviously darker. Derived through it, Jerry Dark's own palette lost
-/// most of its contrast - `Ember` ended with **24 of 39** syntax tokens below the 4.5:1 body-text
-/// floor and `Slate` with 22, some as low as 2.15:1, and `Paper` collapsed three distinguishable
-/// text levels into pure black (the bug [`apply_shift`] used to disclose in its own docs).
-///
-/// OKLCH fixes that by construction: `L` is perceptual lightness, `C` is perceptual chroma, and
-/// rotating `H` at fixed `L`/`C` genuinely preserves how light and how saturated a colour looks.
-///
-/// The conversion constants are Björn Ottosson's published OKLab matrices. `oklch_of` and
-/// [`rgba_from_oklch`] round-trip to within a rounding step, which
-/// [`oklch_tests::every_registered_token_round_trips_through_oklch`] pins over every real token in
-/// the registry rather than a sample.
 mod oklch {
     use super::Rgba;
 
@@ -398,13 +261,6 @@ mod oklch {
     }
 
     /// A real sRGB colour for an OKLCH triple, **gamut-mapped by reducing chroma only**.
-    ///
-    /// This is the one genuinely important choice in this module. A naive conversion clamps each
-    /// RGB component independently, which silently changes both the hue and the lightness of any
-    /// out-of-gamut colour - and since a derived theme is exactly a palette pushed to new
-    /// lightnesses, out-of-gamut is the common case, not the exception. Binary-searching chroma
-    /// down instead keeps `L` and `H` exactly as asked for and gives up only saturation, which is
-    /// what "the most saturated version of this colour that sRGB can actually show" means.
     pub(super) fn to_rgba(lightness: f32, chroma: f32, hue: f32, alpha: f32) -> Rgba {
         let lightness = lightness.clamp(0.0, 1.0);
         let chroma = chroma.max(0.0);
@@ -453,19 +309,6 @@ pub fn hue_distance(a: f32, b: f32) -> f32 {
 /// A real, systematic OKLCH transform - see [`derive_shift`]'s own docs for how one is computed,
 /// [`apply_shift`] for how it's applied to a single colour, and [`derived_palette`] for the real
 /// whole-palette generation both of this module's remaining callers use.
-///
-/// **Not part of live theme resolution.** Before this module's rewrite, every non-Jerry-Dark
-/// colour in the app was computed by running one of these over a token's own default on every
-/// single `resolve()` call; now it is strictly an *authoring-time* tool that produces literal
-/// colours to be written into a real, hand-editable theme file.
-///
-/// ## This used to be HSL, and that was measurably wrong
-///
-/// The theme redesign moved it to OKLCH after measuring what HSL cost. See the [`oklch`] module's
-/// own docs for the full numbers; the short version is that deriving a palette through HSL lost
-/// most of its contrast (`Ember` ended with 24 of 39 syntax tokens below the 4.5:1 body-text
-/// floor, some as low as 2.15:1) and collapsed three of `Paper`'s text levels into pure black.
-/// Neither was a tuning mistake - both fall straight out of HSL's `l` not being lightness.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OklchShift {
     /// Added to hue, in **degrees** (wraps via `rem_euclid(360.0)`).
@@ -492,19 +335,6 @@ pub const IDENTITY_SHIFT: OklchShift = OklchShift {
 
 /// Applies `shift` to `base` in OKLCH: rotate hue, scale chroma, remap lightness, then gamut-map
 /// back into sRGB by reducing chroma only ([`oklch::to_rgba`]).
-///
-/// Alpha is carried through untouched - several real tokens are deliberately translucent, and a
-/// derived theme must not silently make them opaque.
-///
-/// **The `Paper` black-text collapse this fixes.** With the old HSL transform, `Paper`'s
-/// negative-slope lightness fit mapped Jerry Dark's already-light `text::SELECTED`/`PRIMARY`/
-/// `HEADING` *below* zero lightness, where a `clamp(0.0, 1.0)` turned all three into pure black -
-/// three distinguishable interface text levels collapsing into one. The fit is still allowed to
-/// have a negative slope here (inverting dark to light is exactly what it is for), but it is now
-/// solved and applied in a space where lightness means lightness, so the same three tokens land on
-/// three genuinely different values;
-/// [`derivation_tests::paper_keeps_its_interface_text_levels_distinct`] pins that specific
-/// regression rather than trusting the side effect.
 pub fn apply_shift(base: Rgba, shift: OklchShift) -> Rgba {
     let (lightness, chroma, hue) = oklch::of(base);
     oklch::to_rgba(
@@ -520,26 +350,6 @@ pub fn apply_shift(base: Rgba, shift: OklchShift) -> Rgba {
 /// files are generated with (`crate::settings::builtin_themes`, which pins each theme's own
 /// original swatches) and the one an imported VSCode theme's whole-app chrome still goes through
 /// (`crate::settings::vscode_theme`) for the many tokens no VSCode colour key maps onto:
-///
-/// - **Lightness** is a linear fit (`scale`/`offset`, not a plain additive shift) solved exactly
-///   from the two background-ish swatches (index 0, the window background; index 1, the panel
-///   background) - two points exactly determine a line. This is what lets a light theme (real
-///   example: `Paper`, whose swatches are genuinely light hex values) be derived correctly from
-///   Jerry Dark's own near-black tokens: fitting on *background* lightness specifically, rather
-///   than averaging across all five swatches, keeps the fit meaningful for a theme that inverts
-///   light and dark entirely.
-/// - **Hue** is the circular mean (via `atan2` over the swatches' real `(cos, sin)` hue vectors,
-///   not a plain arithmetic average, which breaks across the 0/360 wraparound a hue near red sits
-///   on) of the *chromatic* swatches only (index 2/3/4). The two background swatches are excluded
-///   because a near-neutral colour's hue is numerically unstable and not representative of what an
-///   accent hue rotation should be.
-/// - **Chroma** is the mean ratio (`target.C / base.C`) across the same three chromatic swatches,
-///   clamped so an unusually low-chroma swatch pair can't produce a negative or wildly inflated
-///   scale.
-///
-/// Structurally identical to the HSL version this replaced - same three fits, same swatch roles.
-/// Only the space changed, which is the whole point: the same arithmetic in OKLCH preserves
-/// perceived lightness and saturation where in HSL it did not.
 pub fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> OklchShift {
     fn oklch_of_hex(hex_value: u32) -> (f32, f32, f32) {
         oklch::of(hex_rgba(hex_value))
@@ -594,33 +404,10 @@ pub fn derive_shift(base_swatches: [u32; 5], target_swatches: [u32; 5]) -> Oklch
 /// Jerry Dark's own real accent blue ([`syntax::FUNCTION`]/`#74ade8`) - the reference hue
 /// [`shift_from_seed`] rotates a user's seed colour against. Pinned here as the one place that
 /// choice is made, rather than repeated at each caller.
-///
-/// It moved to `syntax::FUNCTION_DEFINITION`'s `#88b4ed` for one revision, because the restraint
-/// palette had rendered a function *call* at plain foreground - leaving `FUNCTION` a near-neutral
-/// grey whose hue was numerically meaningless, so rotating a whole palette against it would have
-/// produced garbage from a constant that still looked plausible. That revision is walked back and
-/// `FUNCTION` is a genuinely chromatic blue again, so this points back at it.
-/// [`derivation_tests::the_seed_reference_accent_is_a_genuinely_chromatic_colour`] exists to stop
-/// that class of silent breakage from recurring either way.
 const SEED_REFERENCE_ACCENT: u32 = 0x74ade8;
 
 /// Derives an [`OklchShift`] from a single seed colour - the real maths behind the Themes page's
 /// "Generate from colour" action (GitHub issue #141).
-///
-/// One colour cannot honestly determine all four degrees of freedom [`derive_shift`] solves from
-/// five swatches, so this makes a real, documented, deliberately narrow choice: **hue and chroma
-/// only**. The whole Jerry Dark palette is rotated so that its own accent blue
-/// ([`SEED_REFERENCE_ACCENT`]) lands exactly on the seed's hue, and every token's chroma is scaled
-/// by the same ratio the seed has against that accent; lightness is left completely alone
-/// (`scale 1.0`, `offset 0.0`).
-///
-/// That is the honest reading of "generate a theme from a colour": you pick the app's accent, and
-/// everything else follows it while keeping Jerry Dark's own carefully-tuned light/dark structure
-/// intact. It deliberately does *not* try to guess whether you wanted a light theme from a light
-/// seed - inverting lightness needs a real second reference point (which is exactly what
-/// [`derive_shift`]'s two background swatches are), and guessing at one would produce a
-/// precise-looking answer that is really a vibe match. The generated file is a full, literal,
-/// hand-editable palette, so retuning lightness afterwards is a real, supported next step.
 pub fn shift_from_seed(seed: Rgba) -> OklchShift {
     let (_, seed_chroma, seed_hue) = oklch::of(seed);
     let (_, reference_chroma, reference_hue) = oklch::of(hex_rgba(SEED_REFERENCE_ACCENT));
@@ -638,10 +425,6 @@ pub fn shift_from_seed(seed: Rgba) -> OklchShift {
 }
 
 /// The WCAG 2.x contrast ratio between two real colours - order-independent.
-///
-/// The same formula every standard contrast checker uses, and the same one
-/// [`syntax_contrast_tests`] measures with; it lives here (not only in tests) because
-/// [`enforce_syntax_contrast_floors`] has to *act* on it at authoring time, not merely assert it.
 pub fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
     fn relative_luminance(color: Rgba) -> f32 {
         fn channel(component: f32) -> f32 {
@@ -659,11 +442,6 @@ pub fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
 
 /// The real WCAG floor a given syntax token has to clear against its own theme's editor
 /// background, or `None` for a token this guard deliberately leaves alone.
-///
-/// Two tiers, exactly the ones `theme::syntax`' own design docs describe: ordinary syntax
-/// foregrounds are body text and get **4.5:1**; the deliberately de-emphasized family (operators,
-/// punctuation, and the bracket-pair ring) gets **3:1**, because being quieter than the code is
-/// their whole job and holding them to body-text contrast would defeat it.
 fn syntax_contrast_floor(key: &str) -> Option<f32> {
     let scope = key.strip_prefix("syntax.")?;
     match scope {
@@ -687,23 +465,6 @@ pub fn syntax_contrast_floor_for_test(key: &str) -> Option<f32> {
 /// Pushes any syntax colour that lands below its [`syntax_contrast_floor`] away from `background`
 /// in OKLCH lightness until it clears - holding hue and chroma, so the colour keeps its identity
 /// and only its lightness moves.
-///
-/// ## Why a derived palette needs this at all
-///
-/// [`derive_shift`] solves its lightness fit from a theme's own two *background* swatches. That is
-/// the right thing for making a theme feel like itself, but it carries no guarantee whatsoever
-/// about foreground contrast: a theme whose window and panel backgrounds sit close together
-/// produces a fit that compresses Jerry Dark's whole lightness range, and everything lands nearer
-/// the background than it started. Measured, that is exactly what happened - `Slate` and `Ember`
-/// derived a third of their syntax palette below the 3:1 floor even after the move to OKLCH,
-/// because the problem is the *fit*, not the colour space.
-///
-/// The alternative would be hand-retuning five generated files, which the whole point of
-/// generating them is to avoid, and which nothing would then stop from silently rotting.
-///
-/// Deliberately one-directional: it only ever *increases* contrast, never reduces it, so a theme
-/// that already reads well is returned completely untouched (pinned by
-/// [`derivation_tests::the_contrast_guard_leaves_an_already_readable_palette_alone`]).
 fn enforce_syntax_contrast_floors(palette: &mut [(&'static str, Rgba)]) {
     let Some(background) = palette
         .iter()
@@ -729,11 +490,6 @@ fn enforce_syntax_contrast_floors(palette: &mut [(&'static str, Rgba)]) {
 /// The one real "move this colour away from that background until it clears `floor`" step both
 /// contrast guards share - [`enforce_syntax_contrast_floors`] and
 /// [`enforce_terminal_foreground_contrast`].
-///
-/// Holds hue and chroma and moves lightness only, so the colour keeps its identity; `lighten` is
-/// the direction its own guard already decided from the background (up on a dark theme, down on a
-/// light one). Returns `color` completely unchanged when it already clears, so this is strictly
-/// one-directional - it can only ever increase contrast.
 fn pushed_to_clear_floor(color: Rgba, background: Rgba, floor: f32, lighten: bool) -> Rgba {
     // Measured on the **quantized** colour, not the float one. A theme file stores `#rrggbb`, so an
     // 8-bit rounding step is applied to whatever this produces; searching in float space and
@@ -783,17 +539,6 @@ fn pushed_to_clear_floor(color: Rgba, background: Rgba, floor: f32, lighten: boo
 /// The same guard [`enforce_syntax_contrast_floors`] applies to code, applied to unstyled terminal
 /// output - `terminal.foreground` against `terminal.background` rather than against
 /// `surface.center`, because that is the surface it is actually painted on.
-///
-/// Needed for the same reason and measured the same way: [`derive_shift`]'s lightness fit is solved
-/// from a theme's two *background* swatches and carries no foreground-contrast guarantee at all. On
-/// this app's own bundled themes it lands `Slate`'s terminal foreground at a measured 4.27:1 -
-/// readable-ish, but under WCAG's 4.5:1 body-text bar for what is, by volume, most of what a
-/// terminal ever paints.
-///
-/// Deliberately only the foreground. The ANSI sixteen are pinned rather than derived (see
-/// [`pin_terminal_ansi_palette`]), and pinned values are authored to be legible; forcing a floor on
-/// them would also be wrong on its own terms, since ANSI black on a dark background is *supposed*
-/// to be near-invisible - that is what a program asking for colour 0 is asking for.
 fn enforce_terminal_foreground_contrast(palette: &mut [(&'static str, Rgba)]) {
     let Some(background) = palette
         .iter()
@@ -816,10 +561,6 @@ fn enforce_terminal_foreground_contrast(palette: &mut [(&'static str, Rgba)]) {
 /// resulting palette as real, literal `(key, colour)` pairs in registry order - the one shared
 /// generator behind both the built-in theme migration (`crate::settings::builtin_themes`) and the
 /// "generate a theme from one colour" action, so those two can never derive palettes differently.
-///
-/// This is exactly what the pre-rewrite mechanism computed lazily, per token, on every single
-/// `resolve()` call; computing it once up front instead is what let those palettes become real
-/// files.
 pub fn derived_palette(shift: OklchShift) -> Vec<(&'static str, Rgba)> {
     let mut palette: Vec<(&'static str, Rgba)> = all_tokens()
         .map(|token| (token.key, apply_shift(token.default, shift)))
@@ -833,17 +574,6 @@ pub fn derived_palette(shift: OklchShift) -> Vec<(&'static str, Rgba)> {
 /// Replaces the sixteen derived `terminal.ansi.*` entries with a real, *authored* ANSI palette -
 /// [`terminal::ANSI`]'s own defaults for a dark derived theme, [`terminal::LIGHT_ANSI`] for a light
 /// one, decided from the palette's own derived `surface.window` via [`theme_is_light`].
-///
-/// See [`terminal::LIGHT_ANSI`]'s docs for the whole reasoning. The short version: every other
-/// colour in this app is a free design choice, so shifting it is right; the ANSI sixteen carry
-/// fixed conventional meanings that a systematic hue/lightness shift destroys - most sharply on
-/// `Paper`, whose genuinely negative lightness slope would derive ANSI *black* to near-white, i.e.
-/// invisible on Paper's own light terminal background.
-///
-/// Deliberately shaped like [`enforce_syntax_contrast_floors`] - a narrow, documented pass over the
-/// already-derived palette rather than a special case threaded through [`apply_shift`] - so
-/// everything that consumes a derived palette (the bundled theme generator, "generate from colour",
-/// and the VSCode importer's base layer) gets it identically and for free.
 fn pin_terminal_ansi_palette(palette: &mut [(&'static str, Rgba)]) {
     let Some(window) = palette
         .iter()
@@ -885,11 +615,6 @@ pub mod surface {
     /// `#101113`, exactly the rail's own background". `Jerry.dc.html`'s own final markup then
     /// settled one step lower again (`background:#0a0b0d`, matching §4v's closing verification
     /// line "selected `rgb(16,17,19)` over strip `rgb(10,11,13)`"), which is the value here.
-    ///
-    /// A theme that lifted this to or above [`RAIL`] would not merely recolour the strip - it
-    /// would destroy the selected cell's "cut the column rule and join the panel below" reading,
-    /// which is the strip's entire selection idiom. `theme::tests::the_sidebar_strip_stays_
-    /// recessed_below_the_rail_in_every_bundled_theme` holds that invariant.
     pub const SIDEBAR_STRIP: ColorToken = token("surface.sidebar_strip", 0x0a0b0d);
     pub const CENTER: ColorToken = token("surface.center", 0x131518); // work surface
     pub const PTY: ColorToken = token("surface.pty", 0x0d0f11); // agent CLI + terminal
@@ -938,10 +663,6 @@ pub mod surface {
     /// carried on the hover fill too, not on the resting label alone. Without it, `Delete` and
     /// `Copy Path` are visually identical the moment the pointer is on either of them, which is
     /// exactly when the click is about to happen.
-    ///
-    /// Deliberately its own token rather than a reuse of `theme::changes::DISCARD_BG` (the same
-    /// literal): that one names the Changes panel's armed `Discard?` pill, and a menu row hover
-    /// re-tinted with it would silently follow a theme's edit to a different control.
     pub const MENU_ROW_HOVER_DESTRUCTIVE: ColorToken =
         token("surface.menu_row_hover_destructive", 0x2a1719);
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
@@ -956,9 +677,6 @@ pub mod surface {
     /// silently painted the wrong one of the two.
     pub const LSP_POPOVER_FOOTER: ColorToken = token("surface.lsp_popover_footer", 0x141719);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("WINDOW", WINDOW),
         ("WINDOW_BORDER", WINDOW_BORDER),
@@ -1031,9 +749,6 @@ pub mod border {
     /// `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
     pub const DIAGNOSTIC_CARD_FOOTER: ColorToken = token("border.diagnostic_card_footer", 0x2b2224);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("ZONE", ZONE),
         ("INNER", INNER),
@@ -1079,9 +794,6 @@ pub mod tree {
     /// remaining effect on anything painted.
     pub const INDENT_GUIDE_ACTIVE: ColorToken = token("tree.indent_guide_active", 0x3f5b74);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("INDENT_GUIDE", INDENT_GUIDE),
         ("INDENT_GUIDE_ACTIVE", INDENT_GUIDE_ACTIVE),
@@ -1117,25 +829,8 @@ pub mod text {
     pub const TREE_CARET: ColorToken = token("text.tree_caret", 0x4a5057);
     /// The colour a hovered glyph lifts to in a surface whose *background* already encodes
     /// selection - today the sidebar strip's cells (GitHub issue #291).
-    ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v derives it from a real
-    /// defect and states the rule verbatim: **"two states must not compete on one property. If
-    /// background says 'selected', hover says it somewhere else."** Making the selected cell match
-    /// the rail (which the cut-out requires) dropped selected to luminance 16.9 while a background
-    /// hover sat at 25.4, so hovering an *inactive* view out-read the active one. "Hover moved off
-    /// background entirely: the cell sets `color`, every glyph part draws with `currentColor`, and
-    /// hover lifts `color` to `#c8ced4`."
-    ///
-    /// Its own token rather than a reuse of [`HEADING`] (`#c8cdd2`, two units away and
-    /// indistinguishable today) because the two answer different questions: `HEADING` is a resting
-    /// *text* step on the ramp, this is the top of a two-state glyph pair whose floor is
-    /// [`FAINTER`]. A theme retuning its heading weight must not silently flatten a hover that is
-    /// the only feedback an inactive strip cell has.
     pub const GLYPH_HOVER: ColorToken = token("text.glyph_hover", 0xc8ced4);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("SELECTED", SELECTED),
         ("PRIMARY", PRIMARY),
@@ -1181,9 +876,6 @@ pub mod status {
     pub const BANNER_BG: ColorToken = token("status.banner_bg", 0x1b1610);
     pub const BANNER_BORDER: ColorToken = token("status.banner_border", 0x33291a);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("ASK", ASK),
         ("ASK_BG", ASK_BG),
@@ -1212,18 +904,6 @@ pub mod rail {
     use super::{token, ColorToken};
 
     /// Repo group header's uppercase name.
-    ///
-    /// Revision 6 (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4s) retargeted this
-    /// from the rail-only `#787f86` to the app-wide section-label value: "It was `#787f86` at
-    /// `.08em` while every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
-    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`. It now uses that token."
-    /// `Jerry.dc.html`'s rail band and all four Changes-panel section labels really do paint the
-    /// same `#9aa1a8`, which is why [`super::changes::SECTION_LABEL`] carries the identical value:
-    /// a repo band is a section header, not a rail-specific ornament.
-    ///
-    /// Kept under its own `rail.` key rather than folded into one shared constant because the key
-    /// is a *themable* name a user's `.toml` may already set - renaming it would silently drop
-    /// their override. The two constants are the same colour by intent, and both cite §4s.
     pub const REPO_HEADER_NAME: ColorToken = token("rail.repo_header_name", 0x9aa1a8);
     /// Active worktree row header background (§2.2: "Active worktree header background
     /// `#181c1f`").
@@ -1240,27 +920,12 @@ pub mod rail {
     /// The repo header's amber urgency **count** - the number beside the [`super::status::ASK`]
     /// dot (`REVISION-2026-08-14.md` §4: "`● 2` amber (`#e2a336` dot, `#c99b4e` text, needs
     /// input)").
-    ///
-    /// Its own key rather than a reach into `status.ask_card_fg`, which happens to hold the same
-    /// hex: a header count and an ask card's text are unrelated concepts that would drift the
-    /// moment a theme moved one of them. Same reasoning, and same shape, as
-    /// [`super::changes::EDGE_UNCOMMITTED`] carrying its own key beside
-    /// [`super::border::SELECTED_EDGE`].
     pub const REPO_ASK_COUNT: ColorToken = token("rail.repo_ask_count", 0xc99b4e);
     /// The repo header's red urgency **count** - the number beside the [`super::status::FAIL`]
     /// dot (§4: "`● 1` red (`#e0625c` dot, `#c4726d` text, failed)"). Its own key, for the reason
     /// [`Self::REPO_ASK_COUNT`]'s docs give.
     pub const REPO_FAIL_COUNT: ColorToken = token("rail.repo_fail_count", 0xc4726d);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
-    ///
-    /// `rail.prunable_edge` (`#2f353a`) was removed here in revision 6: §4m deleted the whole
-    /// status/prunable/bare left-edge channel from worktree rows ("A channel with one meaning has
-    /// exactly two states - on and off"), leaving that token with nothing to colour. It went in
-    /// the same edit as the edge itself, and out of the bundled theme files with it, rather than
-    /// being left as a themable name for a thing this app no longer draws.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("REPO_HEADER_NAME", REPO_HEADER_NAME),
         ("WORKTREE_ACTIVE_BG", WORKTREE_ACTIVE_BG),
@@ -1292,9 +957,6 @@ pub mod diff {
     pub const STAT_EMPTY: ColorToken = token("diff.stat_empty", 0x22262a); // unused segment of the 5-bar
     pub const GIT_GUTTER: ColorToken = token("diff.git_gutter", 0x2c6244); // 3px agent-touched marker
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("ADD_BG", ADD_BG),
         ("ADD_FG", ADD_FG),
@@ -1320,156 +982,6 @@ pub mod diff {
 /// (`tree-sitter-rust`/`-python`/`-javascript`/`-typescript`'s own bundled `queries/highlights.scm`
 /// files, read directly off the fetched crates under `~/.cargo/registry/src/`, not guessed) each
 /// bucket exists to cover.
-///
-/// ## What earns a colour
-///
-/// **Ten accent hues, all at one OKLCH lightness (0.732) and one chroma (0.105), differing only in
-/// hue.** Every semantic category a reader actually distinguishes gets one; the only things left
-/// at plain foreground are the neutrals ([`TEXT`], [`EMBEDDED`]) and the deliberately de-emphasized
-/// punctuation family.
-///
-/// | hue | OKLCH H | what it means |
-/// |---|---|---|
-/// | red-rose `#e28c93` | 15 | [`VARIABLE_PARAMETER`] |
-/// | orange `#de946b` | 50 | [`CONSTANT`] / [`CONSTANT_BUILTIN`] / [`NUMBER`] / [`VARIABLE_BUILTIN`] |
-/// | gold `#c7a356` | 85 | [`TYPE`] / [`TYPE_BUILTIN`] / [`TAG`] / [`HEADING`] |
-/// | green `#98b46a` | 126 | [`STRING`] (and [`STRING_ESCAPE`], the same hue lifted in lightness) |
-/// | teal `#4bbeb1` | 185 | [`ATTRIBUTE`] |
-/// | cyan-blue `#51b7d8` | 222 | [`PROPERTY`] |
-/// | blue `#74ade8` | 250 | [`FUNCTION`] / [`FUNCTION_METHOD`] / [`LINK`] / [`CARET`] |
-/// | violet-blue `#a19fe8` | 285 | [`FUNCTION_DEFINITION`] |
-/// | purple `#c194d6` | 315 | [`KEYWORD`] (and [`EMPHASIS`]) |
-/// | rose `#da8db2` | 350 | [`VARIABLE`] |
-///
-/// And a neutral ramp: [`STRONG`] `L 0.885` > [`TEXT`] `L 0.762` > [`COMMENT_DOC`] `L 0.660` >
-/// [`COMMENT`] `L 0.600` > punctuation `L 0.560`.
-///
-/// ## Where the tier comes from, and why this walked an earlier revision back
-///
-/// The `L 0.732 / C 0.105` tier is not a fresh invention: it is **the OKLCH of this app's own
-/// original `syntax.function` blue `#74ade8`**, the palette the maintainer says they preferred.
-/// Every accent above is that colour rotated in hue only, so `FUNCTION` reproduces the original
-/// value bit-exactly and `STRING` lands ΔE 2 (below a just-noticeable difference) from the
-/// original `#9dbb6f`. The rest keep their original hue and move only onto the shared tier - the
-/// largest drift is ΔE 16 on [`KEYWORD`], which stays unmistakably the same purple.
-///
-/// The revision this replaces held [`KEYWORD`], [`FUNCTION`] and [`FUNCTION_METHOD`] at *exactly*
-/// [`TEXT`]'s grey, on tonsky's "I don't highlight variables or function calls" argument. The
-/// maintainer looked at the built app and rejected it: *"I don't like the new colors at all. I
-/// preferred the old colors but I think they were not used correctly."* That is the verdict of the
-/// person who reads this screen all day, and it is not a lone opinion - Asenov, Hilliges and
-/// Muller's CHI'16 controlled study, *The Effect of Richer Visualizations on Code Comprehension*,
-/// measured 33 participants across three levels of visual richness and found richer colour cut
-/// time-to-answer on structural comprehension questions by 21-75% **with no loss of correctness**,
-/// and recommended in as many words that tool designers *"use a wider variety of colors by default"*
-/// and *"enable the highlighting of more constructs."* Its one real caution is about non-colour
-/// noise (icons replacing keywords, background tinting everywhere), not about hue count.
-///
-/// So the restraint pass is walked back deliberately. What is **kept** from it is the construction
-/// method, which was never the problem: one perceptual tier for every accent, contrast floors
-/// enforced rather than assumed, and the definition-site query work in
-/// [`crate::code_surface::code_view`] - which now buys a real distinction between a declaration and
-/// a call rather than between "coloured" and "not coloured".
-///
-/// ## Solarized's actual discipline, in OKLCH
-///
-/// Solarized's real method is symmetric CIELAB lightness relationships, so light and dark modes
-/// keep an identical perceived contrast structure instead of being naive inversions of each other.
-/// The equivalent here is stronger, because OKLCH's lightness is more perceptually uniform than
-/// CIELAB's: every accent shares one `L` and one `C` and differs *only* in hue, so no accent can
-/// shout louder than another, and [`enforce_syntax_contrast_floors`] re-establishes the same
-/// relationship against each derived theme's own background rather than trusting the transform.
-/// [`syntax_palette_tests::every_accent_shares_one_lightness_and_one_chroma`] pins the tier and
-/// [`syntax_palette_tests::every_accent_hue_family_stays_a_real_hue_apart`] pins the spacing.
-///
-/// ## Contrast, measured
-///
-/// Every accent lands 7.32-8.10:1 against [`super::surface::CENTER`], and the closest any accent
-/// comes to plain [`TEXT`] is ΔE 27.8 - roughly 12x the ~2.3 just-noticeable difference, which is
-/// the number that actually answers "is this visibly coloured or just a different hex".
-/// [`COMMENT`] is 4.88:1 - it used to be **3.03:1**, a real ghost-grey failure of the 4.5:1
-/// body-text floor, and the single clearest legibility bug the redesign's audit found. Punctuation
-/// is 4.13:1: below plain text on purpose, above the 3:1 floor on purpose. [`syntax_palette_tests`]
-/// pins all of it, and [`enforce_syntax_contrast_floors`] is what makes it hold in the five
-/// *derived* themes too.
-///
-/// ## The bracket-pair depth ring (GitHub issue #168)
-///
-/// A bracket that is half of a real matched pair paints one of six ring colours ([`BRACKET_1`] ..
-/// [`BRACKET_6`]), chosen by `nesting depth % 6`, both halves alike. A bracket with no matching
-/// partner keeps [`PUNCTUATION_BRACKET`] instead, which is what makes malformed or mid-edit code
-/// degrade visibly-but-quietly rather than lying about structure.
-///
-/// The ring is built the same way the accents are - six hues at **one** OKLCH lightness and
-/// **one** chroma - but it is placed on a different tier entirely: **`L 0.560 / C 0.090`, which is
-/// exactly [`PUNCTUATION_BRACKET`]'s own lightness.** A bracket *is* punctuation; colouring it
-/// should tell you the nesting depth without promoting it above the code it encloses, so the ring
-/// keeps the punctuation weight and spends only hue. It sits under the accents on both axes
-/// (L 0.560 vs 0.732, C 0.090 vs 0.105), and
-/// [`syntax_bracket_ring_tests::the_ring_stays_inside_the_palettes_own_chroma_register`] pins the
-/// chroma half.
-///
-/// Its six hues are the canonical even split - **0, 60, 120, 180, 240, 300** - because with ten
-/// semantic hue families on the wheel there is no longer a set of six *gaps* wide enough to hide
-/// in. That is the real change here and it is worth stating plainly: the ring stopped buying its
-/// separation from hue and started buying it from lightness, which turns out to be a much better
-/// trade. Measured against the semantic accents in Jerry Dark it went from ΔE 11.3 (the previous
-/// ring's worst case, against a palette of *eight* families) to **20.8** against a palette of ten.
-/// The check that measures it exists because an earlier ring had `BRACKET_1` at hue 23 against
-/// [`ERROR_UNDERLINE`]'s 25 - two degrees apart, i.e. a matched depth-0 bracket essentially
-/// wearing the error colour.
-///
-/// Measured, across **every** bundled theme rather than only Jerry Dark:
-///
-/// - **Cyclically adjacent depths** (`n` against `n + 1`, the only comparison a reader actually
-///   makes): worst ΔE 20.7, ~9x the ~2.3 just-noticeable difference.
-/// - **Against plain text**, so a matched bracket never reads as unmatched: worst ΔE 16.7.
-/// - **Against the de-emphasized punctuation tone**, the other thing an uncoloured bracket can be:
-///   worst ΔE 26.5.
-/// - **Readable**: every ring colour clears 3:1 against the editor background in every bundled
-///   theme, guaranteed by [`enforce_syntax_contrast_floors`] rather than by luck.
-///
-/// These floors are lower than the ring this replaced was held to, and that is the point rather
-/// than a regression: ΔE is bought with chroma, and six hues at one low chroma have a hard ceiling
-/// on how far apart they can be. The previous ring reached its numbers by being the most saturated
-/// thing in the palette - a maintainer looking at the real thing called it out, and none of the
-/// ΔE-only checks could see it.
-///
-/// **`<` and `>` deliberately do not participate**, which is a decision rather than an omission.
-/// They really do arrive as `punctuation.bracket` (Rust and TypeScript capture type-argument
-/// brackets that way, and `tree-sitter-html` captures a tag's own). Tracking them would make HTML
-/// actively wrong - `<div>` and `</div>` are two same-level pairs, not one open/close pair, so a
-/// stack matcher paints a whole document flat depth-0 while implying structure that is not there.
-/// See `crate::code_surface::code_view::colorize_bracket_pairs`' own docs.
-///
-/// ## The default fallback chain (GitHub issue #31)
-///
-/// Several scopes here still have no independently *authored* colour of their own: their compiled
-/// default is the same literal value as their nearest covered ancestor scope, so a scope this
-/// app's palette never designed a hue for reads like its *parent* rather than like plain
-/// foreground text:
-///
-/// - [`FUNCTION_METHOD`] defaults to [`FUNCTION`]'s blue (a method call is still a call - both are
-///   use sites, and both are coloured alike)
-/// - [`TYPE_BUILTIN`] to [`TYPE`]'s gold (`i32`/`number`/`void` are still types)
-/// - [`CONSTANT_BUILTIN`] to [`CONSTANT`]'s orange (`true`/`None`/`undefined` are still constants)
-/// - [`TAG`] to [`TYPE`]'s (preserves this module's pre-existing, deliberate "a JSX element name
-///   is coloured like the type it names" choice - see the historical note on
-///   [`crate::code_surface::code_view::HighlightKind::Tag`])
-/// - [`OPERATOR`], [`PUNCTUATION_BRACKET`] and [`PUNCTUATION_DELIMITER`] share the one
-///   de-emphasized punctuation tone; [`EMBEDDED`] is plain [`TEXT`]
-///
-/// Each of those is a real, live-classified bucket (a genuine `tree-sitter-highlight` capture this
-/// module's `HIGHLIGHT_NAMES` actually recognizes - see
-/// `code_view_tests::every_real_grammar_config_compiles` and its siblings), simply designed to
-/// render identically to its parent rather than compete with it.
-///
-/// Before this module's rewrite each of those was a literal Rust-level `const` alias, so the two
-/// could never be told apart by a theme at all. They are now independently keyed tokens that
-/// merely *start* at the same value: a theme file (very much including an imported VSCode one) can
-/// set one without touching the other. The chain above is still what an importer walks when a
-/// theme names the parent scope but not the child - see
-/// `crate::settings::vscode_theme::syntax_scope_rule`.
 pub mod syntax {
     use super::{token, ColorToken};
 
@@ -1483,11 +995,6 @@ pub mod syntax {
     /// place the reader learns where a name comes from. See
     /// `crate::code_surface::code_view`'s own `RUST_DEFINITION_SUPPLEMENT` for the real query
     /// rules that separate this from a call site (no bundled grammar query does).
-    ///
-    /// A violet-blue: [`FUNCTION`]'s own blue rotated 35 degrees on the shared accent tier, so a
-    /// declaration reads as a *distinguished call* rather than as an unrelated concept. Measured
-    /// ΔE 19.6 from [`FUNCTION`] - well clear of the ~2.3 just-noticeable difference, and pinned by
-    /// [`syntax_palette_tests::a_definition_site_is_clearly_distinguishable_from_a_call_site`].
     pub const FUNCTION_DEFINITION: ColorToken = token("syntax.function_definition", 0xa19fe8);
     pub const TYPE: ColorToken = token("syntax.type", 0xc7a356);
     /// `type.builtin` (`tree-sitter-rust`'s `(primitive_type) @type.builtin`, `-typescript`'s
@@ -1541,11 +1048,6 @@ pub mod syntax {
     /// `variable` - a real, live-classified bucket (`-python`'s own blanket `(identifier)
     /// @variable`, `-javascript`'s identical blanket rule). A dusty rose on the shared accent
     /// tier, warm against [`PROPERTY`]'s cool cyan-blue so an `a.b.c` chain reads at a glance.
-    ///
-    /// This used to default to [`TEXT`]'s near-white `#acb2be`, which meant every identifier in a
-    /// file rendered as plain grey - the single biggest reason code here read as undifferentiated
-    /// white. Rust needed `RUST_VARIABLE_PREFIX` in `crate::code_surface::code_view` before this
-    /// token was reachable at all in this app's own primary language.
     pub const VARIABLE: ColorToken = token("syntax.variable", 0xda8db2);
     /// `variable.parameter` (`tree-sitter-rust`'s `(parameter (identifier) @variable.parameter)`,
     /// `-typescript`'s `required_parameter`/`optional_parameter` rules) - [`VARIABLE`]'s own rose
@@ -1646,10 +1148,6 @@ pub mod syntax {
     /// own docs for each variant's real capture/grammar evidence), so this is purely a
     /// classification fix: a future theme (or a future palette revision) now has a real,
     /// independent token to differentiate any of them without this module changing again.
-    ///
-    /// `punctuation.special` (Markdown's ATX `#`/list bullets, JS/TS's `${`/`}` interpolation
-    /// delimiters, YAML's `---`/`&`/`*`) - defaults to [`OPERATOR`]'s own colour, its pre-issue
-    /// bucket.
     pub const PUNCTUATION_SPECIAL: ColorToken = token("syntax.punctuation_special", 0x6f757e);
     /// `label` (a Rust lifetime, a C goto target, a YAML anchor/alias) - defaults to
     /// [`VARIABLE`]'s own colour, its pre-issue bucket. See `HighlightKind::Label`'s own docs for
@@ -1700,9 +1198,6 @@ pub mod syntax {
     pub const DIAGNOSTIC_CARD_MESSAGE: ColorToken =
         token("syntax.diagnostic_card_message", 0xe3908b);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("TEXT", TEXT),
         ("KEYWORD", KEYWORD),
@@ -1763,14 +1258,6 @@ pub mod syntax {
 /// minimap, blame text, and a removed-line gutter marker). Each such token's own doc comment says
 /// so explicitly; none is wired into a fabricated render call - see this crate's own
 /// `CONTRIBUTING.md` "no fake functionality" rule.
-///
-/// Most tokens here *default to* the same literal value an existing token elsewhere in this module
-/// carries (the same "start from what's already designed" idiom [`syntax`]'s own fallback chain
-/// uses) rather than being independently-authored hex literals - consolidated here, under one
-/// discoverable name, even where the underlying value already existed under another module's name.
-/// Each is nonetheless its own independently-keyed token: before this module's rewrite they were
-/// literal Rust-level `const` aliases, so e.g. a theme could not give the code surface's caret a
-/// different colour from `syntax::CARET`; now it can.
 pub mod editor {
     use super::{token, ColorToken};
 
@@ -1856,9 +1343,6 @@ pub mod editor {
     /// would read as the same red the standalone Diff view already uses for a removal.
     pub const DIFF_REMOVED: ColorToken = token("editor.diff_removed", 0xa35f5b);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("SELECTION", SELECTION),
         ("SELECTION_INACTIVE", SELECTION_INACTIVE),
@@ -1904,9 +1388,6 @@ pub mod term {
     pub const LINK_HOVER: ColorToken = token("term.link_hover", 0xa5cdf0);
     pub const LINK_UNDERLINE_HOVER: ColorToken = token("term.link_underline_hover", 0x78a8d0);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("PROMPT", PROMPT),
         ("TEXT", TEXT),
@@ -1928,32 +1409,6 @@ pub mod term {
 
 /// The integrated terminal's own rendered-content palette - the colours a program running inside a
 /// terminal pane actually paints its characters with.
-///
-/// GitHub issue #208, "the integrated terminal theme should follow the editor theme".
-///
-/// ## Why this is not `term`, despite the name
-///
-/// `theme::term` is chrome *around and over* terminal output - the caret this app paints in its
-/// own text fields (`term::CURSOR`), the command palette's prompt tint (`term::PROMPT`), the
-/// diagnostic warning tone (`term::WARN`), and the clickable `path:line` link styling the terminal
-/// pane overlays on rows it has scanned (`term::LINK` and friends). None of it is what a pty's own
-/// bytes resolve to. This module is: `crate::terminal::grid`'s `TerminalPalette` is built from
-/// exactly these tokens, and every character cell `crate::terminal::pane` paints takes its
-/// foreground, background and selection fill from it.
-///
-/// Before this existed the whole set was hardcoded in `crate::terminal::grid` - VS Code's own
-/// default terminal colours, identical in every one of this app's six themes, so the terminal
-/// stayed a `#1e1e1e` rectangle inside a `#0d0f11` app no matter which theme was selected.
-///
-/// ## What "follow the editor theme" means for each of these
-///
-/// [`BACKGROUND`], [`FOREGROUND`], [`CURSOR`] and [`SELECTION`] are ordinary chrome: they default
-/// to the values this palette already had for exactly these jobs (`surface::PTY` is literally
-/// documented as "agent CLI + terminal", `term::TEXT` as terminal output text), and they go
-/// through `super::derived_palette`'s real OKLCH shift like every other token, so switching themes
-/// visibly moves them.
-///
-/// [`ANSI`] is deliberately different - see [`LIGHT_ANSI`]'s docs for the whole reasoning.
 pub mod terminal {
     use super::{token, ColorToken};
 
@@ -1970,30 +1425,11 @@ pub mod terminal {
     /// What `NamedColor::Cursor` resolves to - the colour a program gets when it explicitly asks
     /// for "the cursor colour" rather than a concrete one. Defaults to [`super::term::CURSOR`]'s
     /// value, the caret colour this app already paints elsewhere.
-    ///
-    /// The block cursor itself is *not* painted from this: `crate::terminal::grid` renders it the
-    /// way a real terminal does, by swapping the cursor cell's own foreground and background, so
-    /// it tracks [`BACKGROUND`]/[`FOREGROUND`] (or whatever colours that cell already had) for
-    /// free.
     pub const CURSOR: ColorToken = token("terminal.cursor", 0x5a9ad4);
     /// The fill painted behind a selected cell - GitHub issue #158's real mouse selection.
-    ///
-    /// Its default is exactly what the *editor's* own selection composites to:
-    /// [`super::editor::SELECTION`] at [`super::editor::SELECTION_OPACITY`] over
-    /// [`super::surface::CENTER`], flattened to an opaque value because the terminal paints a span
-    /// background rather than a translucent overlay quad. Pinned by
-    /// `super::terminal_palette_tests::the_terminal_selection_default_is_the_editor_selection_flattened`,
-    /// so the two can't drift into looking like unrelated features.
     pub const SELECTION: ColorToken = token("terminal.selection", 0x273a4d);
 
     /// `failed to start process: ...`, the line the pane paints when a spawn never happened.
-    ///
-    /// This and [`PROCESS_EXITED`] are here because until rev 6 they were the app's only two
-    /// genuinely hard-coded colours - `rgb(0xff6b6b)` and `rgb(0xffcc66)`, inline in
-    /// `crate::terminal::pane`'s render, unthemeable and invisible to every theme file. Now that
-    /// `super::stray_hex_tests` makes an inline colour a build failure they had to become real
-    /// tokens, and their defaults are the exact values they were already painting, so no theme
-    /// and no pixel changes - only the ability to retint them at all.
     pub const SPAWN_ERROR: ColorToken = token("terminal.spawn_error", 0xff6b6b);
     /// The `[process exited]` label, once the child is gone.
     pub const PROCESS_EXITED: ColorToken = token("terminal.process_exited", 0xffcc66);
@@ -2001,9 +1437,6 @@ pub mod terminal {
     /// The standard ANSI 16-colour palette, indexed `0..=15` by `NamedColor`'s own discriminants
     /// and by `Color::Indexed(0..=15)`, in the conventional order: black, red, green, yellow, blue,
     /// magenta, cyan, white, then the eight bright variants in the same order.
-    ///
-    /// These values are VS Code's own default *dark* terminal palette, which is where
-    /// `crate::terminal::grid`'s hardcoded array took them from before they became real tokens.
     pub const ANSI: [ColorToken; 16] = [
         token("terminal.ansi.0", 0x000000),
         token("terminal.ansi.1", 0xcd3131),
@@ -2025,35 +1458,11 @@ pub mod terminal {
 
     /// [`ANSI`]'s light-theme counterpart - VS Code's own default *light* terminal palette, same
     /// provenance and same `0..=15` ordering.
-    ///
-    /// ## Why the ANSI sixteen are not run through the OKLCH derivation
-    ///
-    /// Every other colour in this app is a free design choice, so [`super::derived_palette`]'s
-    /// systematic hue/chroma/lightness shift is exactly the right way to carry it into another
-    /// theme. The ANSI sixteen are not free: their *meaning* is fixed by forty years of convention
-    /// (index 1 is red because programs print errors in it; index 0 is the darkest colour a
-    /// program can ask for), and a shifted palette stops answering to that name. Measured on this
-    /// app's own themes, the derivation would have rotated every one of them off-hue on `Ember`
-    /// and `Moss`, and - far worse - inverted them wholesale on `Paper`, whose fit has a genuinely
-    /// negative lightness slope: ANSI *black* would have come out near-white, i.e. invisible on
-    /// Paper's own light terminal background, for every program that prints black-on-default.
-    ///
-    /// So the sixteen are pinned rather than derived, and pinned in the two variants a real
-    /// terminal palette needs. [`super::derived_palette`] picks between them from the derived
-    /// theme's own [`super::theme_is_light`] verdict, which is exactly what VS Code itself does
-    /// (its Dark+ and Light+ themes ship two separately authored `terminal.ansi*` blocks; these
-    /// are those two blocks). Every one of them is still a real, registered, independently
-    /// themeable token, so a hand-written theme file or an imported VSCode theme that *does* author
-    /// its own sixteen gets them honoured verbatim - the pinning is only the default a theme that
-    /// says nothing inherits.
     pub const LIGHT_ANSI: [u32; 16] = [
         0x000000, 0xcd3131, 0x00bc00, 0x949800, 0x0451a5, 0xbc05bc, 0x0598bc, 0x555555, 0x666666,
         0xcd3131, 0x14ce14, 0xb5ba00, 0x0451a5, 0xbc05bc, 0x0598bc, 0xa5a5a5,
     ];
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("BACKGROUND", BACKGROUND),
         ("FOREGROUND", FOREGROUND),
@@ -2095,9 +1504,6 @@ pub mod env {
     /// Defaults to [`super::border::DIVIDER`]'s own value.
     pub const LOCAL_BORDER: ColorToken = token("env.local_border", 0x22262a);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("WSL_FG", WSL_FG),
         ("WSL_BG", WSL_BG),
@@ -2110,53 +1516,6 @@ pub mod env {
 /// One tint per agent - the **agent tint pool**. Used on the rail badge, the CLI tab chip, the
 /// Changes panel's per-run left edge and the conflict side headers, so a colour always means the
 /// same agent.
-///
-/// # The reserved-hue allocation rule
-///
-/// Quoted verbatim from the rev-6 design bundle, `design_handoff_jerry_ade/revision 5/
-/// STAGE-A-CHANGELOG.md` §4a ("Colour allocation rule", added after review):
-///
-/// > **Five hue families are structural and reserved. Agent identity is allocated only outside
-/// > them.**
-/// >
-/// > | Family | Reserved for |
-/// > |---|---|
-/// > | amber `#e2a336` / `#d8a94a` | attention - needs input, warnings, planned pauses |
-/// > | violet `#c98fbf` | branch and graph scope (the graph pane, rebase, `Against main`) |
-/// > | green `#5cb87f` / `#7fc79a` | additions and staged state |
-/// > | red `#e0625c` / `#d1706a` | failure and deletions |
-/// > | blue `#3f5b74` / `#5a9ad4` | selection and focus |
-/// >
-/// > Adding an agent to `sessions` / `agentDefs` means picking a tint outside all five. The
-/// > current pool: copper `#cf8a5c`, teal `#4fb3a5`, periwinkle `#9d8fd4`, steel blue `#7f9ad4`.
-///
-/// **This is not a style note, it is a correctness rule**, and it is enforced by a real test
-/// ([`agent_tint_allocation_tests`]) rather than left to review. Review caught the failure it
-/// exists to prevent: `haiku-4.5`'s tint *was* `#c98fbf`, byte-identical to the violet §3.2
-/// assigns to branch scope, so inside one panel that colour meant both "haiku-4.5" and "branch" -
-/// and the two met on the same property (a 2px left edge) on the very worktree built to
-/// demonstrate per-agent attribution. Violet lines in the gutter read as "branch", not "haiku".
-///
-/// # Adding an agent
-///
-/// Pick a tint whose hue sits outside all five families, add it here as a `(fg, bg)` pair, list it
-/// in [`TOKENS`] **and** in [`TINT_POOL`], and map the agent to it in
-/// `crate::work_surface::agent_tint`. [`agent_tint_allocation_tests`] walks [`TINT_POOL`], so a
-/// tint that reintroduces the collision fails the build rather than shipping.
-///
-/// The reallocation §4a's own table specifies, applied here in full:
-///
-/// | Agent | Was | Now | Why |
-/// |---|---|---|---|
-/// | `sonnet-4.5` | `#d8a94a` / `#33280f` | copper `#cf8a5c` / `#31210f` | amber was one step from the needs-input amber it sits beside in the rail |
-/// | `haiku-4.5` | `#c98fbf` / `#332030` | periwinkle `#9d8fd4` / `#241f33` | the reported collision with branch violet |
-/// | `gpt-5-codex` | `#6ab97f` / `#1e3327` | teal `#4fb3a5` / `#12302c` | green is the additions colour and would have collided in the same gutter |
-/// | `qwen-local` | `#7f9ad4` / `#1f2941` | steel blue, unchanged | already outside all five families |
-///
-/// The token **keys** deliberately stay per-agent (`agent.sonnet.fg`, ...) rather than becoming
-/// hue names: a theme author retints "the agent that is Sonnet", and an existing hand-written
-/// theme file keeps naming the same keys. The hue names above are what the pool member *is*, and
-/// are carried as real labels in [`TINT_POOL`] so the rule's own table can be checked against it.
 pub mod agent {
     use super::{token, ColorToken};
 
@@ -2186,13 +1545,6 @@ pub mod agent {
 
     /// The real, enumerable agent tint pool - `(hue name, (fg, bg))` - and the list
     /// [`super::agent_tint_allocation_tests`] walks to enforce the module docs' reserved-hue rule.
-    ///
-    /// Every tint an agent can wear must appear here. This is deliberately a separate listing
-    /// rather than a `[ColorToken; N]`: the registry's own source parser reads
-    /// `[ColorToken; N]` declarations as N *new* keys to register (see [`super::TOKEN_GROUPS`]),
-    /// so a pool built out of the already-registered tokens above has to wear a shape the parser
-    /// does not treat as a declaration. It carries no colours of its own - only references to the
-    /// four pairs above - so it cannot drift from what a theme actually resolves.
     pub const TINT_POOL: &[(&str, (ColorToken, ColorToken))] = &[
         ("copper", SONNET),
         ("teal", CODEX),
@@ -2200,9 +1552,6 @@ pub mod agent {
         ("steel blue", LOCAL),
     ];
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("SONNET.fg", SONNET.0),
         ("SONNET.bg", SONNET.1),
@@ -2277,9 +1626,6 @@ pub mod lang {
     );
     // "."
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("RS.fg", RS.0),
         ("RS.bg", RS.1),
@@ -2337,9 +1683,6 @@ pub mod button {
     pub const DANGER_FG: ColorToken = token("button.danger_fg", 0xc4726d);
     pub const DANGER_FG_HOVER: ColorToken = token("button.danger_fg_hover", 0xe3908b);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("GREEN_BG", GREEN_BG),
         ("GREEN_BG_HOVER", GREEN_BG_HOVER),
@@ -2371,9 +1714,6 @@ pub mod toggle {
     /// added here directly.
     pub const CHECKBOX_HOVER: ColorToken = token("toggle.checkbox_hover", 0x3f7a55);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("TRACK_ON", TRACK_ON),
         ("TRACK_OFF", TRACK_OFF),
@@ -2384,35 +1724,6 @@ pub mod toggle {
 }
 
 /// Git's own `A`/`M`/`D` status letters on a file row, and the file tree's own A/M change marks.
-///
-/// # The letters replaced the word badges (`STAGE-A-CHANGELOG.md` §4j)
-///
-/// This module used to hold a `NEW`/`DELETED`/`CONFLICT` fg/bg pair each, painting a filled
-/// `new`/`del` word pill. §4j deleted all three for three stated faults:
-///
-/// 1. **Only the exceptions were marked.** `new` and `del` got a badge; a *modified* file - the
-///    common case - got nothing, so the row could not answer "what happened to this file".
-/// 2. **`conflict` is not a git status.** It was an overlay meaning "two agents touched this",
-///    which the row's pair of author chips already states.
-/// 3. **A filled word badge outweighs the filename**, in a row whose subject is the path.
-///
-/// What replaces them is git's own letter, one per row, in a fixed 9px column:
-///
-/// | | Meaning | Colour |
-/// |---|---|---|
-/// | `A` | Added | `#5f9c78` |
-/// | `M` | Modified | `#767d84` - "the common case does not shout" |
-/// | `D` | Deleted | `#b06a66` |
-///
-/// [`STATUS_MODIFIED`] deliberately shares its hex with [`super::changes::FILENAME_SEEN`] and
-/// still carries its own key, the same convention [`super::changes::RUN_META_ENDED`]'s own docs
-/// record: a distinct element gets a distinct token even when two of them currently resolve to
-/// the same grey.
-///
-/// [`TREE_MODIFIED`] is **not** this `M` and is deliberately left alone: the Files tree paints
-/// its own change marks amber (`#a3873f`) in `Jerry.dc.html`'s own tree rows, where the mark is
-/// the only thing saying a file is dirty at all and genuinely is the exception. On a Changes row
-/// every line is a change, which is exactly why §4j's `M` recedes.
 pub mod tag {
     use super::{token, ColorToken};
 
@@ -2426,9 +1737,6 @@ pub mod tag {
     pub const TREE_ADDED: ColorToken = token("tag.tree_added", 0x5f9c78); // "A" mark
     pub const TREE_MODIFIED: ColorToken = token("tag.tree_modified", 0xa3873f); // "M" mark
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("STATUS_ADDED", STATUS_ADDED),
         ("STATUS_MODIFIED", STATUS_MODIFIED),
@@ -2476,9 +1784,6 @@ pub mod completions_popup {
         token("completions_popup.kind_type.bg", 0x33203e),
     );
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("ITEM_SELECTED_BG", ITEM_SELECTED_BG),
         ("ITEM_SELECTED_FG", ITEM_SELECTED_FG),
@@ -2530,9 +1835,6 @@ pub mod settings {
     /// `#c294e0`).
     pub const SNIPPET_SECTION: ColorToken = token("settings.snippet_section", 0xc294e0);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("NAV_ROW_HOVER", NAV_ROW_HOVER),
         ("SUBTITLE", SUBTITLE),
@@ -2548,33 +1850,6 @@ pub mod settings {
 }
 
 /// The overlay scrollbar (GitHub issue #30).
-///
-/// Rev 5 of the mockup had no scrollbar spec at all - every scrollable region there relied on raw
-/// browser/OS scrolling - so these values used to be a judgment-call derivation from neighbouring
-/// neutral tokens. **Rev 6 supersedes that with a real spec**, `design_handoff_jerry_ade/
-/// revision 5/STAGE-A-CHANGELOG.md` §4p, whose own note is explicit that it governs this build:
-///
-/// > | Part | Value |
-/// > |---|---|
-/// > | width / height | 10px |
-/// > | track | transparent |
-/// > | thumb | `#2b3137`, radius 5, with a 2px transparent border and `background-clip:content-box` so it floats 2px clear of the edge |
-/// > | thumb hover | `#3d444b` |
-/// > | stepper buttons, corner | removed |
-/// >
-/// > **For the Rust build this is a spec, not CSS** - GPUI draws its own scrollbars, so the
-/// > numbers above are what to draw.
-///
-/// So the numbers are transcribed here rather than derived, and `crate::root::scrollbar` draws
-/// them directly. Two consequences worth stating, because both replace an older convention:
-///
-/// - **The track has no token, deliberately.** "Transparent" is not a colour a theme should be
-///   able to fill in - a scroll affordance that paints a rail is the loud platform default §4p
-///   removed. The track is simply not painted, the same honesty
-///   [`ColorToken::literal`]'s docs describe for `crate::work_surface::TRANSPARENT`.
-/// - **The thumb is painted at full strength**, not at the reduced opacity the derived values
-///   needed. `#2b3137` is already quieter than the greys it replaced; compositing it further would
-///   land somewhere the spec did not ask for.
 pub mod scrollbar {
     use super::{px, token, ColorToken, Pixels};
 
@@ -2592,35 +1867,11 @@ pub mod scrollbar {
     /// an inset.
     pub const THUMB_INSET: Pixels = px(2.0);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[("THUMB", THUMB), ("THUMB_HOVER", THUMB_HOVER)];
 }
 
 /// Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
 /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §2).
-///
-/// Rev 6 moved budget from a single global footer readout to **one meter per agent**, because a
-/// budget is per-provider and a provider belongs to an agent. There is then **one bar per window**
-/// (`5h` / `7d`), each hued on its own value - §4u′, and GitHub issue #294's Phase 0 spike, which
-/// found that both supported providers really do report two independent windows with their own
-/// utilisations and their own reset instants. (§2's older "the meter fills to the tighter of the
-/// two windows" is the superseded shape: a single bar hides *which* limit is tight, and on the
-/// live account the spike measured, a healthy 5-hour window sat next to a 7-day one on the amber
-/// boundary.) The fill hue is the one place in the readout where colour carries meaning:
-///
-/// > Hue `#7fc79a` above 40%, `#c99b4e` 15-40%, `#c4726d` below.
-///
-/// The three hues are thresholds on *remaining* budget, not on consumption - [`OK`] is the
-/// healthy end. They sit inside the reserved green/amber/red families on purpose: this is
-/// attention and failure signalling, exactly what those families are reserved *for*
-/// ([`agent`]'s own docs), and deliberately not agent identity.
-///
-/// §2's other rule is a negative one worth carrying next to these: **no aggregate `⚠ N` anywhere**.
-/// A provider you do not use failing to poll is telemetry about telemetry. A connected provider
-/// that goes stale shows `last read <age>` in [`STALE`] in place of its own numbers, so the signal
-/// attaches to the thing that is actually broken.
 pub mod budget {
     use super::{token, ColorToken};
 
@@ -2636,17 +1887,8 @@ pub mod budget {
     pub const TRACK: ColorToken = token("budget.track", 0x22262a);
     /// A provider that is connected but whose last poll is stale (`last read 3m ago`), and the
     /// `not connected` row.
-    ///
-    /// **A derivation, not a transcription** - §2 specifies this state's *behaviour* (it replaces
-    /// that provider's own numbers) but names no colour for it, so this takes [`text::FAINT`]'s
-    /// value: recessive, because §2 is explicit that a provider failing to poll must not read as
-    /// an alert when nothing about it is actionable from the bar. The three hues above are the
-    /// real transcribed ones.
     pub const STALE: ColorToken = token("budget.stale", 0x6b7178);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("OK", OK),
         ("WARN", WARN),
@@ -2659,42 +1901,6 @@ pub mod budget {
 /// The Changes panel - four stacked, collapsible sections in one scroller
 /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1), plus the file row's own
 /// seen/unseen and discard states (`STAGE-A-CHANGELOG.md` §4i).
-///
-/// # The four sections and their left edges
-///
-/// §1's table, for the column this module owns:
-///
-/// | | **Runs** | **Uncommitted** | **Commits** | **Against main** |
-/// |---|---|---|---|---|
-/// | Answers | what *this agent* did in *this run* | what is dirty in the checkout | what is written down | what would land |
-/// | Left edge | agent tint | `#3f5b74` | neutral | `#c98fbf` |
-///
-/// The **Runs** edge has no token here on purpose: it is the agent's own tint, resolved per row
-/// from [`agent`]'s pool, which is the entire point of per-agent attribution. The other three are
-/// [`EDGE_UNCOMMITTED`], [`EDGE_NEUTRAL`] and [`EDGE_AGAINST_MAIN`].
-///
-/// `EDGE_AGAINST_MAIN` is the branch-scope violet, and this is one of its **structural**
-/// positions - see [`agent`]'s reserved-hue rule. Against-main is branch scope (what would land on
-/// `main`), so it wears the same violet the graph pane and rebase do. That is the rule working as
-/// intended, not a violation of it: the rule forbids that violet as *agent identity*, and requires
-/// it here.
-///
-/// # Seen and unseen
-///
-/// §4i moved "seen" off a separate mark and onto the filename itself, after two rounds:
-///
-/// | State | Filename |
-/// |---|---|
-/// | not seen | `#dde2e7` / 500 - reads forward |
-/// | seen | `#767d84` / 450 - recedes |
-///
-/// > when a row already contains the thing a state is *about*, style that thing. A separate
-/// > indicator is a second element to place, decode and keep from colliding with its neighbours.
-///
-/// The state these encode is **"seen since the agent last changed it"**, not "opened once": a file
-/// you read and the agent then edits again reverts to unseen. Note also that the checkbox owns
-/// *staged* and the name owns *seen* - one fact per channel. Do not reintroduce a colour for
-/// staged on the filename.
 pub mod changes {
     use super::{token, ColorToken};
 
@@ -2702,44 +1908,19 @@ pub mod changes {
     /// [`border::SELECTED_EDGE`] (this palette's "structural blue") but carries its own key.
     pub const EDGE_UNCOMMITTED: ColorToken = token("changes.edge_uncommitted", 0x3f5b74);
     /// `COMMITS`' 2px left edge.
-    ///
-    /// **A derivation, not a transcription** - §1's table says only "neutral" here, naming no
-    /// colour, so this takes [`border::DIVIDER`]'s value: what is already written down carries no
-    /// scope, so its edge is the same grey every other plain 1px rule in the app uses.
     pub const EDGE_NEUTRAL: ColorToken = token("changes.edge_neutral", 0x22262a);
     /// `AGAINST MAIN`'s 2px left edge - the branch-scope violet, in one of its reserved structural
     /// positions (see this module's own docs).
     pub const EDGE_AGAINST_MAIN: ColorToken = token("changes.edge_against_main", 0xc98fbf);
 
     /// Section header label - 9.5px/600 uppercase, `.09em` tracking.
-    ///
-    /// `#9aa1a8`, not §1's transcribed `#787f86`: `STAGE-A-CHANGELOG.md` §4s is the later word on
-    /// the same value ("every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
-    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`") and `Jerry.dc.html` - which
-    /// outranks both prose files - really does paint all four of these labels `#9aa1a8`. Same
-    /// value, same citation, as [`super::rail::REPO_HEADER_NAME`]: a repo band and a Changes
-    /// section are the same kind of header.
     pub const SECTION_LABEL: ColorToken = token("changes.section_label", 0x9aa1a8);
     /// Section header count - 9.5px mono, immediately after the label.
     pub const SECTION_COUNT: ColorToken = token("changes.section_count", 0x4a5057);
     /// The section header's own disclosure caret (`▾`/`▸`).
-    ///
-    /// `#8b9197`, not §1's own `#5e646a`: `STAGE-A-CHANGELOG.md` §4p supersedes it, and the
-    /// shipped mock confirms the later value. §4p's rule is that a **disclosure caret** - the
-    /// control that expands or collapses a list, wherever it appears - is *one* control at one
-    /// size, so the four Changes-panel section headers wear the same 10px `#8b9197` glyph the
-    /// rail's own worktree caret does. (A *dropdown chevron* bound to a button or chip is a
-    /// different control and deliberately stays smaller - see
-    /// `crate::sidebar::render::AdeApp::render_commit_composer`'s `▾`.)
     pub const SECTION_CARET: ColorToken = token("changes.section_caret", 0x8b9197);
 
     /// A run row's meta line while the run is **still moving** (`STAGE-A-CHANGELOG.md` §4l).
-    ///
-    /// §4l removed the row's separate `live`/`frozen` badge - "it restated `running`/`ended` one
-    /// line below" - and moved the state onto the meta line's own colour instead: warm while the
-    /// run is live, neutral once it has ended. This warm is deliberately *not*
-    /// [`super::status::ASK`]'s amber: it is a fact about how final a diffstat is, not an urgency,
-    /// and the two must not read as the same signal one row apart.
     pub const RUN_META_LIVE: ColorToken = token("changes.run_meta_live", 0x8a7548);
     /// A run row's meta line once the run has ended - the neutral half of [`RUN_META_LIVE`]'s
     /// pair. Same hex as [`super::text::FAINTER`], a distinct token for a distinct element (the
@@ -2767,31 +1948,11 @@ pub mod changes {
     /// The `⚠` ring around a file row's author chips - *this path has lines from more than one
     /// agent* (`REVISION-2026-08-14.md` §1), and the control that filters the open diff by author
     /// (GitHub issue #287).
-    ///
-    /// **Amber, deliberately.** `STAGE-A-CHANGELOG.md` §4g left this one open - it removed the
-    /// rail's aggregate `⚠ N` for devaluing amber and then flagged the ring itself:
-    ///
-    /// > **Left in place, flagged for a later call:** that ring is also amber (`#8a6420`). By the
-    /// > same argument it is stating a fact, not a warning […] A neutral ring would keep the click
-    /// > target and drop the false alarm.
-    ///
-    /// The product decision of 2026-08-14 (GitHub issue #287) **overrides that note**: a shared
-    /// file genuinely does need attention, so amber here is the app's own amber-means-attention
-    /// language used correctly rather than spent on a fact. The two halves of §4g are not in
-    /// tension once the count is gone - amber was devalued by an aggregate that named no file and
-    /// did nothing when clicked, and this ring names exactly one file and filters its diff.
-    ///
-    /// Same hex as [`super::status::ASK_CARD_EDGE`], its own key: both are the attention amber at
-    /// border weight, on two unrelated elements.
     pub const SHARED_RING: ColorToken = token("changes.shared_ring", 0x8a6420);
 
     /// The `you` gutter bar in the diff view - Orca's second rule, kept: *"your own hand edit
     /// flips that line back to you"* (`REVISION-2026-08-14.md` §1), and `you` is deliberately
     /// **not** an agent, so it is deliberately not an agent tint either.
-    ///
-    /// `#4e545a`, `Jerry.dc.html`'s own `attrOf('you').bg` - a neutral, outside
-    /// [`super::agent`]'s whole pool by construction, so a hand edit can never be mistaken for
-    /// whichever agent happens to hold the nearest hue.
     pub const HAND_EDIT_GUTTER: ColorToken = token("changes.hand_edit_gutter", 0x4e545a);
     /// The `you` author chip's glyph, the neutral counterpart to an agent chip's own tint.
     pub const HAND_EDIT_CHIP_FG: ColorToken = token("changes.hand_edit_chip_fg", 0x8b9197);
@@ -2818,9 +1979,6 @@ pub mod changes {
     /// last moment before the two-click confirm starts.
     pub const DISCARD_HOVER_BG: ColorToken = token("changes.discard_hover_bg", 0x33191b);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("EDGE_UNCOMMITTED", EDGE_UNCOMMITTED),
         ("EDGE_NEUTRAL", EDGE_NEUTRAL),
@@ -2850,24 +2008,6 @@ pub mod changes {
 
 /// The status bar's three type tiers
 /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3).
-///
-/// > Three tiers instead of one flat 10px smear - the problem was never density, it was that five
-/// > readouts at `#4a5057` all read at once, so you had to read all of it to find any of it.
-///
-/// | Tier | Content | Type |
-/// |---|---|---|
-/// | Primary | `main ↑2 ↓0`, `4 agents running` | 10.5px/450 `#a9b0b7` |
-/// | Secondary | provider budgets | 10.5px mono, hue per state |
-/// | Recessive | `41% cpu · 3.4 GB` | 10px `#4a5057` |
-///
-/// **The secondary tier has no colour token of its own, and that is the spec, not a gap**: its
-/// hue *is* the budget state, so it resolves to [`budget::OK`] / [`budget::WARN`] /
-/// [`budget::CRITICAL`] (or [`budget::STALE`]) per provider. Giving it a fourth flat grey here
-/// would recreate exactly the "five readouts that all read at once" §3 removed. A tier is a
-/// weight, and only two of the three are a fixed colour.
-///
-/// §3 also fixes what must *not* go here: no worktree or agent counts, because the rail footer
-/// already carries them 30px away.
 pub mod status_bar {
     use super::{token, ColorToken};
 
@@ -2902,9 +2042,6 @@ pub mod status_bar {
     /// load > 85%.
     pub const LOAD_CRITICAL: ColorToken = token("status_bar.load_critical", 0xc4726d);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("PRIMARY", PRIMARY),
         ("SECONDARY", SECONDARY),
@@ -2920,16 +2057,6 @@ pub mod status_bar {
 
 /// Diff-line review notes (GitHub issue #288, `STAGE-A-CHANGELOG.md` §1's two `§6.2` rows and
 /// the audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
-///
-/// Every value here is transcribed directly from `Jerry.dc.html`'s own inline styles for that
-/// surface (the `hasNotes` bar and the `l.isNote` branch of the diff row loop), not derived.
-///
-/// The one colour worth naming twice is [`EDGE`]: `#5a9ad4` is this palette's *selection* blue -
-/// the same value [`super::editor::SELECTION`] carries - and §6.2 asks for "the selection-blue
-/// left edge" on the card by name. It gets its own key rather than reusing the editor's because
-/// the two are different facts (a text selection vs. "this is your annotation"), and a re-theme
-/// that moved one has no business silently moving the other - the same reasoning
-/// [`super::status_bar::LOAD_ELEVATED`] already records for its amber.
 pub mod notes {
     use super::{token, ColorToken};
 
@@ -2964,10 +2091,6 @@ pub mod notes {
     /// revision*), deliberately recessive against [`BAR_LABEL`].
     pub const BAR_META: ColorToken = token("notes.bar_meta", 0x5e646a);
     /// A delivery that really failed, said out loud in the bar rather than swallowed.
-    ///
-    /// **A derivation, not a transcription** - the mock has no failure state for this surface
-    /// (audit item I12 is a whole Stage B item). It takes [`super::status::FAIL`]'s value, which
-    /// is what every other real failure in this app is already painted.
     pub const BAR_ERROR: ColorToken = token("notes.bar_error", 0xc4726d);
 
     /// The `Send notes to <agent>` button's fill, border, hover fill and label.
@@ -2981,7 +2104,6 @@ pub mod notes {
     /// Its `⌘⏎` keycaps' glyphs.
     pub const SEND_CAP_FG: ColorToken = token("notes.send_cap_fg", 0x7fa9cf);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("EDGE", EDGE),
@@ -3009,46 +2131,6 @@ pub mod notes {
 /// Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227,
 /// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §4/§5, transcribed from that
 /// revision's own tables and from `revision 5/tokens.rs`'s `history` module).
-///
-/// # Two independent axes
-///
-/// §5, verbatim: "**Outcome and drift are independent axes**: an abandoned run at the tip is the
-/// most resumable thing in the list." That is why they are two separate families here and why no
-/// token is shared between them - a row saying `abandoned` in grey next to a green `at the tip`
-/// dot is the design working, not a contradiction to be tidied away.
-///
-/// # Outcome: four values, and deliberately no `merged`
-///
-/// §5's table, in full:
-///
-/// | Outcome | fg / bg |
-/// |---|---|
-/// | `done` | `#7fc79a` / `#16261e` |
-/// | `interrupted` | `#c99b4e` / `#2b2413` |
-/// | `failed` | `#c4726d` / `#2a1719` |
-/// | `abandoned` | `#8b9197` / `#1e2225` |
-///
-/// There is no `OUT_MERGED` and there must never be one: "**merging happens to a branch, not to a
-/// run.** A run whose code later merged simply finished; whether the branch merged is already on
-/// the worktree row in the rail (`merged · prunable`)."
-///
-/// These four reuse the app's reserved green/amber/red/neutral families rather than introducing
-/// new hues, which is exactly what those families are reserved for (see [`agent`]'s own docs):
-/// this is outcome signalling, not identity.
-///
-/// # Drift: three bands
-///
-/// §4's table:
-///
-/// | Commits since | Shown | Dot |
-/// |---|---|---|
-/// | 0 | `at the tip` | `#5cb87f` |
-/// | 1-2 | `N commits since` | `#8fbde6` |
-/// | 3+ | `N commits since` in `#a3873f` | `#c99b4e` |
-///
-/// Only the far band tints its *text* ([`DRIFT_FAR_TEXT`]); the other two leave it in the row's
-/// own dim foreground ([`DRIFT_TEXT`]), so colour on the label means "this one has moved a long
-/// way" rather than merely restating the dot.
 pub mod history {
     use super::{token, ColorToken};
 
@@ -3101,11 +2183,6 @@ pub mod history {
     /// (`p` / `c` / `d` / `w`) - the leading `❯ claude --resume …` command line, ordinary body
     /// text, the indented `⎿ …` detail lines, and the `● …` lead line that opens and closes a
     /// synthesised transcript.
-    ///
-    /// A **captured** transcript is plain text with no styling of its own (the terminal grid's
-    /// colours are not stored - see `crate::run_history::transcript_store`), so every one of its
-    /// lines takes [`TRANSCRIPT_BODY`]. The other three are used by the synthesised transcript and
-    /// by the closing line, which this app builds itself and therefore does know the shape of.
     pub const TRANSCRIPT_PROMPT: ColorToken = token("history.transcript_prompt", 0x8fbde6);
     pub const TRANSCRIPT_BODY: ColorToken = token("history.transcript_body", 0xa7adb4);
     pub const TRANSCRIPT_DETAIL: ColorToken = token("history.transcript_detail", 0x6b7178);
@@ -3114,19 +2191,10 @@ pub mod history {
     /// The transcript body's opacity - `revision 5/tokens.rs`'s own
     /// `TRANSCRIPT_OPACITY = 0.70`, and §3's "the transcript at **70% opacity** - the one signal
     /// that this is a recording, not a live pane".
-    ///
-    /// Not a [`ColorToken`] because it is not a colour: it multiplies whatever the transcript's
-    /// own lines are already coloured, so it stays correct in a theme that recolours them.
     pub const TRANSCRIPT_OPACITY: f32 = 0.70;
 
     /// The run-transcript footer's `Resume here` button - §3's own triple, verbatim: "**Resume
     /// here** (`enter`, green `#1c3a2a` / `#376b4d` / `#9fdcb6`)", i.e. fill / border / label.
-    ///
-    /// [`RESUME_BORDER`] and [`RESUME_FG`] share [`button::GREEN_KEYCAP`]'s and
-    /// [`button::GREEN_FG`]'s values, and [`RESUME_BG_HOVER`] is [`button::GREEN_BG`] exactly -
-    /// this is the app's one green affirmative family, not a second one. They carry their own
-    /// keys for [`DRIFT_TEXT`]'s reason: a theme should be able to move the one button that
-    /// restarts a finished conversation without moving every green button in the window.
     pub const RESUME_BG: ColorToken = token("history.resume_bg", 0x1c3a2a);
     pub const RESUME_BG_HOVER: ColorToken = token("history.resume_bg_hover", 0x24503a);
     pub const RESUME_BORDER: ColorToken = token("history.resume_border", 0x376b4d);
@@ -3169,15 +2237,6 @@ pub mod history {
 /// The right panel's Search tab (GitHub issue #162, `REVISION-2026-08-14.md` §5 /
 /// `STAGE-A-CHANGELOG.md` §4v) - real hex values transcribed directly from those sections, not
 /// paraphrased.
-///
-/// Only the values this surface is the **first** to need get keys here. Its greys are already in
-/// the ramp and are reused rather than re-declared: the idle note's `#41464b` is
-/// [`super::text::HINT`], the empty note's and the placeholders' `#4e545a` is
-/// [`super::text::GHOST`], the count row's `#5e646a` is [`super::text::FAINTER`], a modifier
-/// button's off-state is [`super::text::FAINTER`] too, the line number's `#3d4248` is
-/// [`super::text::DISABLED`] and the file row's dimmed directory `#454b51` is
-/// [`super::text::GHOSTER`]. A second key holding a value the ramp already states would be
-/// exactly the "two specifications of one thing" defect §4w names.
 pub mod search {
     use super::{token, ColorToken};
 
@@ -3198,7 +2257,6 @@ pub mod search {
     /// against [`MATCH_FG`], since the line is there to place the hit, not to be read in full.
     pub const LINE: ColorToken = token("search.line", 0x767d84);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
     /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("MODIFIER_ON_BG", MODIFIER_ON_BG),
@@ -3228,35 +2286,6 @@ pub mod graph {
     /// Stroke width of every line the commit graph draws: the lane verticals, the elbow bridge,
     /// and both elbow curves' borders (plus the rebase surface's fold elbow, which deliberately
     /// shares the graph's visual vocabulary).
-    ///
-    /// 2px rather than the spec's original 1px, and that is a correctness decision, not only a
-    /// visual one (GitHub issue #346). GPUI snaps every painted quad to integer *device* pixels
-    /// independently per primitive: box edges via `Window::snap_bounds` (round-half-toward-zero
-    /// per edge) and border widths via `Window::snap_stroke` (rounded as a length, minimum one
-    /// device pixel). At an integer scale factor every integer logical coordinate lands exactly
-    /// on the device grid and all of those roundings agree. At a **fractional** scale factor
-    /// (1.25x, 1.5x - issue #216's `GPUI_X11_SCALE_FACTOR` override, or any fractional-DPI
-    /// monitor) logically coincident edges land on half-device-pixel boundaries where two
-    /// *different* primitives can legally round one device pixel apart - measured for real at
-    /// scale 1.5: a lane vertical snapped to device column `[469, 470)` while the elbow curve
-    /// continuing it snapped its border stroke to `[470, 471)`. With 1-logical-px strokes that
-    /// disagreement is a 100% visual break exactly at the elbow (the twice-reported "lines are
-    /// jagged when coming to an elbow ... on some screens it is fine and on other it breaks").
-    /// At 2 logical px every snapped stroke is at least 2 device pixels at every scale >= 1.0,
-    /// so the worst-case one-device-pixel disagreement still leaves the strokes overlapping and
-    /// the line reads continuous.
-    ///
-    /// Round 2 of the same issue: overlap alone still allowed a one-device-pixel *step* at each
-    /// junction (a curve's waist stroke on rows `[n, n+3)` against a `[n, n+2)` bridge -
-    /// connected, but visibly jagged at 1.25x on a real fractional-scale run). The lane canvas
-    /// therefore now authors its whole geometry pre-snapped to the device-pixel grid
-    /// (`crate::graph_view::render`'s `SnapGrid` - see its docs for the full pipeline argument),
-    /// which makes every junction's two painted intervals *identical*, not merely overlapping -
-    /// pinned by `elbow_fractional_scale_tests`' exact-equality sweeps, which emulate GPUI's own
-    /// snapping arithmetic over a fine scale grid plus a seeded random sample. The 2px width
-    /// stays: it is the graph's established visual weight, and it keeps the stroke robust even
-    /// under coordinate sources this crate does not control (e.g. a fractionally-scrolled
-    /// ancestor).
     pub const LINE_WIDTH: Pixels = px(2.0);
     /// Each S-curve piece's own box width, and its base height (`crate::graph_view::render`'s
     /// `CurveBox::height` adds exactly one stroke to the bottom-edged curve's own height, so that
@@ -3450,18 +2479,6 @@ pub mod graph {
     /// flush with the edge), so this has been left as a known imprecision rather than a blocker.
     pub const ROW_MENU_HEIGHT: Pixels = px(425.0);
     /// The Branches panel's own branch right-click context menu width (GitHub issue #241).
-    ///
-    /// Deliberately **wider** than [`ROW_MENU_WIDTH`]'s design-specified 330 (§4's "a 330-wide
-    /// context menu" is that menu's own number, for its own short verbs), because this menu's rows
-    /// genuinely need more room and were measurably losing text at 330 in a real running build:
-    /// its labels are whole sentences (`Rebase current branch on Branch…`) and its sub-labels carry
-    /// real explanations rather than a sha - `Delete Branch…`'s own "refused if it has unmerged
-    /// commits" was already truncating to "…unmerged co…" before anything was added to this menu,
-    /// and `Merge into current branch…`'s blocked reason (`graph_branch_merge_gate`) has to be
-    /// *readable* to do its job at all: a reason clipped to "2 files still uncom…" is a rule
-    /// (REVISION-2026-08-14.md §1 rule 3, "the reason on the button itself") only half kept.
-    /// Measured against the longest real label+reason pair this menu can produce, in a real X11
-    /// build, not calculated from font metrics.
     pub const BRANCH_MENU_WIDTH: Pixels = px(400.0);
     /// The branch context menu's painted height under the test suite's `gpui::TestAppContext` -
     /// pinned by `crate::graph_view::render::graph_branch_menu_tests::
@@ -3479,9 +2496,6 @@ pub mod graph {
     /// A branch with no lane in the visible graph gets a neutral dot (§5).
     pub const BRANCH_NO_LANE_DOT: ColorToken = token("graph.branch_no_lane_dot", 0x3d4248);
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("TAB_CHIP_BG", TAB_CHIP_BG),
         ("TAB_CHIP_FG", TAB_CHIP_FG),
@@ -3564,15 +2578,6 @@ pub mod band {
     /// same height), and the files/changes panel header - the three sit side by side under the
     /// title bar and must line up pixel-perfect, so they read off one constant instead of three
     /// values that could drift independently.
-    ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v is the reason this is one
-    /// constant and not three, and it is worth reading before changing it - the design really did
-    /// raise one of the three to 38 and produced "a visible staircase at every column boundary".
-    /// Its rule, verbatim: **"column headers that share a y are one rule, not three. Changing any
-    /// of their heights changes a line that spans the whole window - check the other two in the
-    /// same edit."** The same section also fixes the *colour* of that rule at
-    /// [`super::border::RAIL_INNER`] for all three, "which once the rules lined up would have read
-    /// as one rule changing shade mid-span" otherwise.
     pub const CHROME_HEADER: Pixels = px(36.0);
     pub const CONTEXT_BAR: Pixels = px(32.0);
     pub const DIFF_TOOLBAR: Pixels = px(31.0);
@@ -3680,24 +2685,6 @@ pub mod shadow {
 /// every literal `Pixels` constant in this module to scale is out of scope). See
 /// `crate::root::AdeApp::ui_text_size` for the render-side application, which chooses whether to
 /// call [`scaled_px`] at each call site.
-///
-/// ## Which real surfaces read this
-///
-/// Scaled: the agent rail (`crate::rail::render`); the title bar/status bar
-/// (`crate::status_bar::render`); the command palette's row labels/hints
-/// (`crate::palette::render`); the Files/Changes sidebar's row labels, footer hint, and
-/// tree caret (`crate::sidebar::render`); the file/agent tab strip's tab labels
-/// (`crate::work_surface::render`); and every Settings row's label/hint *and* control
-/// (stepper value, choice-segment labels, config banner text, snippet block text - all in
-/// `crate::settings::widgets`).
-///
-/// Deliberately not scaled, each for its own reason: the code surface and terminal panes have
-/// their own dedicated font-size mechanisms (`AdeApp::effective_code_rem_px`,
-/// `Settings.appearance.terminal_font_size`) that a second multiplier would compound with;
-/// chips/badges/keycaps/close-tab glyphs app-wide are small, fixed-size shapes the design treats
-/// as part of a component rather than running text; and the rest of `crate::work_surface::render`'s own
-/// chrome (agent context bar, toolbar buttons, `+` menu, footer action buttons) is real,
-/// currently out of scope.
 pub mod ui_scale {
     use super::px;
     use gpui::Pixels;
@@ -3742,9 +2729,6 @@ pub mod palette {
         token("palette.command_chip.bg", 0x1d2532),
     );
 
-    /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
-    /// the module's slice of [`super::TOKEN_GROUPS`]'s whole-app registry. See that constant's
-    /// own docs for what walks this and why every token has to appear here.
     pub const TOKENS: &[(&str, ColorToken)] = &[
         ("PREFIX", PREFIX),
         ("GROUP_HEADER", GROUP_HEADER),
@@ -3883,10 +2867,6 @@ mod ui_scale_tests {
 /// (`crate::settings::builtin_themes`) and the "generate from colour" action all walk, so a token
 /// that exists in this file but not in the registry would be a colour no theme could ever change
 /// *and* one no generated file would ever mention - silently, with nothing else failing.
-///
-/// Reflection can't see `const` declarations, so these tests read this module's own real source
-/// (`include_str!("theme.rs")` - the literal file being compiled, not a copy) and compare what it
-/// declares against what the registry lists.
 #[cfg(test)]
 mod token_registry_tests {
     use super::*;
@@ -4021,8 +3001,6 @@ mod token_registry_tests {
         );
     }
 
-    /// The registry has to be big enough to be believable as "the whole app's palette" - a real
-    /// floor, not an exact pin (adding a token shouldn't break a test).
     #[test]
     fn the_registry_covers_the_whole_palette_not_a_sample_of_it() {
         assert!(
@@ -4036,35 +3014,12 @@ mod token_registry_tests {
 /// Enforces the reserved-hue allocation rule from `design_handoff_jerry_ade/revision 5/
 /// STAGE-A-CHANGELOG.md` §4a - quoted in full in [`agent`]'s own docs, which is the rule these
 /// tests exist to make unbreakable.
-///
-/// # Why this is a test and not a review note
-///
-/// The rule was *written* because review caught a shipped collision: `haiku-4.5`'s tint was
-/// `#c98fbf`, byte-identical to the branch-scope violet, so one colour meant two things on the
-/// same property in the same panel. A convention in a changelog would not have caught it and did
-/// not - a second agent added months later, by someone who never read §4a, reintroduces it just as
-/// easily. So the rule is checked against **real perceptual colour maths** over the real,
-/// enumerable [`agent::TINT_POOL`], and adding a colliding tint fails the build.
-///
-/// # Why OKLCH hue, and not "is this hex in a list"
-///
-/// A hardcoded list of forbidden hexes would pass vacuously for any collision that is not
-/// byte-identical - `#c88fbe` would sail through while looking exactly like branch violet. Hue is
-/// the property the rule is actually about ("five hue *families*"), so hue is what gets measured,
-/// in the same OKLCH space this module already authors palettes in (see the [`oklch`] module for
-/// why not HSL) and through the same [`hue_distance`] the rest of the file uses.
 #[cfg(test)]
 mod agent_tint_allocation_tests {
     use super::*;
 
     /// The five structural hue families, exactly as §4a's table names them - family label and
     /// every hex the table lists for it.
-    ///
-    /// These are deliberately spelled as literal hexes rather than read out of the token registry.
-    /// The rule is about the *design's* five families; wiring it to whatever `status::ASK`
-    /// currently happens to be would mean a theme or a retune silently moving the boundary the
-    /// rule is supposed to hold still. If one of these ever genuinely changes, §4a changed, and
-    /// editing this table should be a deliberate act with the changelog open.
     const RESERVED_FAMILIES: &[(&str, &[u32])] = &[
         (
             "amber (attention, warnings, planned pauses)",
@@ -4078,13 +3033,6 @@ mod agent_tint_allocation_tests {
 
     /// How far, in degrees of OKLCH hue, an agent tint has to sit from every reserved family
     /// before it reads as its own colour rather than as a shade of that family's meaning.
-    ///
-    /// Not an arbitrary round number. The tightest real clearance in the pool §4a specifies is
-    /// steel blue at **17.4°** from the blue family - §4a's own judgment that `#7f9ad4` is
-    /// "already outside all five families" is what sets the floor, and 15° sits just under it.
-    /// The three tints §4a *reallocated* measure 0.0°, 0.0° and 3.4°, so the gap between "what the
-    /// design accepts" and "what the design rejected" is wide and this threshold is inside it -
-    /// which is the property [`the_rule_actually_rejects_the_collision_review_caught`] pins.
     const MIN_SEPARATION_DEGREES: f32 = 15.0;
 
     /// The smallest OKLCH hue distance from `color` to any hex in any reserved family, with the
@@ -4108,7 +3056,6 @@ mod agent_tint_allocation_tests {
             })
     }
 
-    /// The rule itself: no agent may wear a hue that belongs to a structural family.
     #[test]
     fn every_agent_tint_sits_outside_all_five_reserved_hue_families() {
         for (name, (foreground, _)) in agent::TINT_POOL {
@@ -4126,13 +3073,8 @@ mod agent_tint_allocation_tests {
         }
     }
 
-    /// **The discrimination check**: the rule is only worth having if it genuinely rejects the
-    /// colours the design rejected. Each of these three is a real tint that really shipped and
-    /// that §4a really reallocated, so if the maths above ever degrades into something that
-    /// accepts everything, this fails first and says so.
     #[test]
     fn the_rule_actually_rejects_the_collision_review_caught() {
-        // (what it was, which agent wore it, the family it collided with)
         let reallocated = [
             (0xc98fbf, "haiku-4.5", "violet"),
             (0xd8a94a, "sonnet-4.5", "amber"),
@@ -4155,9 +3097,6 @@ mod agent_tint_allocation_tests {
         }
     }
 
-    /// Guards the pool listing itself. [`the rule`](every_agent_tint_sits_outside_all_five_reserved_hue_families)
-    /// walks [`agent::TINT_POOL`], so a tint that exists as a token but never made it into the
-    /// pool would be unchecked - exactly the silent gap that let the original collision through.
     #[test]
     fn every_registered_agent_tint_is_listed_in_the_pool() {
         for (name, token) in agent::TOKENS {
@@ -4181,11 +3120,6 @@ mod agent_tint_allocation_tests {
         );
     }
 
-    /// A guard on the *maths*, not the palette: if `oklch_of`/`hue_distance` ever degenerated
-    /// (returning a constant, say), every assertion above would pass or fail for the wrong reason.
-    /// The five families are five genuinely different hues, so they must measure far apart from
-    /// each other - and each family's own members must measure close together, which is what makes
-    /// them a family at all.
     #[test]
     fn the_reserved_families_are_themselves_distinct_and_internally_coherent() {
         for (family, hexes) in RESERVED_FAMILIES {
@@ -4224,21 +3158,9 @@ mod agent_tint_allocation_tests {
 
 /// Proves the claim the whole rev-6 campaign is built on: **this file is the only place a colour
 /// literal lives**.
-///
-/// Every rev-6 issue after the token one references tokens by name, so a hex value inlined at a
-/// render call site is not a style problem - it is a colour no theme file can reach, invisible to
-/// [`TOKEN_GROUPS`], absent from every generated theme, and silently wrong in five of the six
-/// bundled themes. That is precisely the failure mode that had already happened twice here before
-/// this test existed (`crate::terminal::pane`'s spawn-error and process-exited lines, now
-/// [`terminal::SPAWN_ERROR`] and [`terminal::PROCESS_EXITED`]).
 #[cfg(test)]
 mod stray_hex_tests {
     /// The real theme layer - the only files allowed to name a colour literally.
-    ///
-    /// `theme.rs` declares the tokens. `settings/builtin_themes.rs` carries each bundled theme's
-    /// five preview swatches, which are that theme's own identity rather than any surface's
-    /// colour, and which it writes into the `preview` key of the file it generates. Nothing else
-    /// in the app has any business spelling a colour.
     const THEME_LAYER: &[&str] = &["app/src/theme.rs", "app/src/settings/builtin_themes.rs"];
 
     /// Every `.rs` file under `crates/`, as `(path relative to crates/, contents)`.
@@ -4288,7 +3210,6 @@ mod stray_hex_tests {
                 .iter()
                 .take_while(|byte| byte.is_ascii_hexdigit())
                 .count();
-            // Exactly six, and not the leading six of a longer literal.
             digits == 6
         })
     }
@@ -4342,16 +3263,10 @@ mod stray_hex_tests {
 
 /// GitHub issue #208's own coverage inside this module: the shape of the new [`terminal`] group,
 /// and the one real special case it adds to [`derived_palette`].
-///
-/// The end-to-end half - a real painted pane whose colours genuinely change with the selected
-/// theme - lives in `crate::terminal::pane::terminal_theme_tests`.
 #[cfg(test)]
 mod terminal_palette_tests {
     use super::*;
 
-    /// [`terminal`] must be a genuinely separate group from [`term`], not a rename of it: the two
-    /// name completely different things (see [`terminal`]'s own docs) and a theme has to be able to
-    /// move one without touching the other.
     #[test]
     fn the_terminal_group_is_distinct_from_term_and_fully_registered() {
         let terminal_keys: Vec<&str> = terminal::TOKENS.iter().map(|(_, t)| t.key).collect();
@@ -4380,11 +3295,6 @@ mod terminal_palette_tests {
         assert_ne!(term::CURSOR.key, terminal::CURSOR.key);
     }
 
-    /// [`terminal::SELECTION`]'s default is not a hand-picked blue: it is exactly what the
-    /// *editor's* own selection composites to over the code surface, flattened. Recomputed here
-    /// rather than restated, so retuning [`editor::SELECTION`] or [`editor::SELECTION_OPACITY`]
-    /// without retuning this fails loudly instead of quietly leaving two selections that no longer
-    /// look like the same feature.
     #[test]
     fn the_terminal_selection_default_is_the_editor_selection_flattened() {
         let over = surface::CENTER.default;
@@ -4409,9 +3319,6 @@ mod terminal_palette_tests {
         );
     }
 
-    /// The ANSI sixteen are pinned, not derived - see [`terminal::LIGHT_ANSI`]'s docs. A *dark*
-    /// derived theme gets [`terminal::ANSI`]'s own defaults back verbatim, no matter how far the
-    /// shift moves everything else.
     #[test]
     fn a_dark_derived_theme_keeps_the_standard_ansi_sixteen_exactly() {
         let shift = derive_shift(
@@ -4437,9 +3344,6 @@ mod terminal_palette_tests {
         );
     }
 
-    /// A *light* derived theme gets [`terminal::LIGHT_ANSI`] instead. The value that matters most:
-    /// ANSI black must still be black. Derived, it would have come out near-white - i.e. invisible
-    /// on a light terminal - for every program that prints black-on-default.
     #[test]
     fn a_light_derived_theme_gets_the_light_ansi_palette_with_black_still_black() {
         let shift = derive_shift(
@@ -4473,8 +3377,6 @@ mod terminal_palette_tests {
         );
     }
 
-    /// The two pinned palettes are really two palettes - a guard against one of them being an
-    /// accidental copy of the other, which would make the light case above vacuous.
     #[test]
     fn the_dark_and_light_ansi_palettes_are_genuinely_different() {
         let differing = (0..16)
@@ -4520,9 +3422,6 @@ mod theme_runtime_tests {
         a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
     }
 
-    /// The real identity case: with no palette installed, `resolve()` returns the token's own
-    /// compiled default completely unchanged - not even a lossy `Rgba -> Hsla -> Rgba` round trip
-    /// (see the module docs for why this matters for every other exact-hex test in this crate).
     #[test]
     fn jerry_dark_resolve_is_bit_exact_with_no_lookup_at_all() {
         assert!(
@@ -4533,7 +3432,6 @@ mod theme_runtime_tests {
         assert!(same(syntax::KEYWORD.resolve(), hex_rgba(0xc194d6)));
     }
 
-    /// The real, load-bearing proof a palette actually changes what gets rendered.
     #[test]
     fn an_installed_palette_really_changes_what_a_token_resolves_to() {
         let jerry_dark = surface::WINDOW.resolve();
@@ -4542,9 +3440,6 @@ mod theme_runtime_tests {
         assert!(same(surface::WINDOW.resolve(), hex_rgba(0xf4f1ea)));
     }
 
-    /// A *partial* palette - the whole point of the "override only what you want" file format:
-    /// keys it doesn't name keep resolving to their own compiled defaults, in the same breath as
-    /// the ones it does name resolve to its values.
     #[test]
     fn a_partial_palette_leaves_every_key_it_does_not_name_on_its_own_default() {
         let _guard = with_palette(&[("syntax.keyword", 0xff79c6)]);
@@ -4556,16 +3451,6 @@ mod theme_runtime_tests {
         assert!(same(text::BODY.resolve(), text::BODY.default));
     }
 
-    /// Every former Rust-level alias is now independently overridable - the concrete thing this
-    /// rewrite bought. Moving `syntax.operator` must not drag `syntax.text` (its old alias
-    /// target) along with it, and vice versa.
-    ///
-    /// Uses `FUNCTION_METHOD`/`FUNCTION` specifically because those two genuinely still *share* a
-    /// default, which is what makes the test meaningful: if the two started from different values,
-    /// an assertion that they resolve differently would pass trivially without proving anything
-    /// about the override mechanism. (`VARIABLE_PARAMETER`/`VARIABLE` served this role first, then
-    /// `FUNCTION`/`TEXT`; both pairs stopped sharing a default as the palette gave more buckets
-    /// real colours of their own - see `syntax`'s own module docs.)
     #[test]
     fn a_former_alias_can_now_be_moved_without_moving_what_it_used_to_alias() {
         assert!(
@@ -4581,8 +3466,6 @@ mod theme_runtime_tests {
         );
     }
 
-    /// Clearing the palette restores the exact original values, not some residue - the real
-    /// round-trip safety mutable global state needs.
     #[test]
     fn clearing_the_palette_restores_the_exact_original_values() {
         let original = surface::WINDOW.default;
@@ -4594,8 +3477,6 @@ mod theme_runtime_tests {
         assert!(same(surface::WINDOW.resolve(), original));
     }
 
-    /// [`ColorToken::literal`]'s deliberately unthemeable colours ignore any installed palette -
-    /// including one that (impossibly) tried to name the empty key.
     #[test]
     fn a_literal_token_is_never_themed() {
         let transparent = Rgba {
@@ -4630,8 +3511,6 @@ mod theme_runtime_tests {
 mod derivation_tests {
     use super::*;
 
-    /// [`derive_shift`]'s lightness fit is solved from the two background-ish swatches
-    /// specifically (index 0 and 1) - a real, direct unit test of the pure function.
     #[test]
     fn derive_shift_solves_an_exact_linear_fit_through_the_two_background_swatches() {
         // A synthetic "base" theme (window bg lightness ~10%, panel ~20%) and "target" theme
@@ -4652,9 +3531,6 @@ mod derivation_tests {
         assert!((remap(0x333333) - target_panel).abs() < 0.01);
     }
 
-    /// A degenerate `base` (identical window/panel lightness - a real divide-by-near-zero case in
-    /// the lightness fit) must fall back to an identity scale rather than producing `NaN`/`inf`
-    /// and corrupting every generated colour.
     #[test]
     fn derive_shift_never_produces_nan_when_the_base_swatches_have_equal_lightness() {
         let base = [0x404040, 0x404040, 0x808080, 0x808080, 0x808080];
@@ -4666,7 +3542,6 @@ mod derivation_tests {
         assert!(shift.chroma_scale.is_finite());
     }
 
-    /// [`shift_from_seed`]'s documented contract: hue and chroma only, lightness untouched.
     #[test]
     fn shift_from_seed_rotates_hue_and_scales_chroma_but_never_lightness() {
         let seed = hex_rgba(0xe07a5f); // a warm coral, far from Jerry Dark's accent blue
@@ -4686,7 +3561,6 @@ mod derivation_tests {
         assert!((rotated_chroma - seed_chroma).abs() < 0.01);
     }
 
-    /// A seed identical to the reference accent is a real no-op, not a near-miss.
     #[test]
     fn a_seed_equal_to_the_reference_accent_derives_the_identity_palette() {
         let shift = shift_from_seed(hex_rgba(SEED_REFERENCE_ACCENT));
@@ -4710,8 +3584,6 @@ mod derivation_tests {
         }
     }
 
-    /// [`derived_palette`] really covers the *whole* registry - the property that makes a
-    /// generated theme file a complete palette rather than a partial one.
     #[test]
     fn derived_palette_names_every_registered_token_exactly_once() {
         let shift = shift_from_seed(hex_rgba(0x8fae6b));
@@ -4732,29 +3604,6 @@ mod derivation_tests {
 /// a real, computed WCAG 2.x contrast-ratio check (not eyeballed), for every one of [`syntax`]'s
 /// real foreground tokens against the work-surface background ([`surface::CENTER`]) they actually
 /// render on, across every one of the six real bundled themes.
-///
-/// Now measured through the *real* mechanism this rewrite installed: each theme's own checked-in
-/// file, compiled into a real [`Palette`] and installed exactly as selecting it in the app would,
-/// rather than through a live HSL derivation. The numbers are unchanged, which is the point - the
-/// migration was required to preserve every colour.
-///
-/// ## Why the threshold is 2.5:1, not WCAG's own 4.5:1
-///
-/// A real, honest finding from computing this rather than assuming it: [`syntax::COMMENT`]
-/// (`#5d636f` in Jerry Dark) was **already** the dimmest token in this palette, at a measured
-/// 3.03:1 against [`surface::CENTER`] in Jerry Dark itself - deliberately dim, a real,
-/// pre-existing design choice (a comment should recede), not a regression. WCAG's own 4.5:1
-/// "normal text" minimum would fail that pre-existing token outright, in the one theme this whole
-/// palette was hand-authored against. 2.5:1 is chosen instead as a real, still-meaningful floor -
-/// well above "invisible" (a ratio near 1.0) while not rejecting a token this codebase already
-/// ships and that this issue was never asked to re-tune.
-///
-/// The stricter sweep covers Jerry Dark and Paper (the one bundled light theme) specifically -
-/// what the issue asks for by name. A second, wider sweep covers all six at a deliberately looser
-/// 1.5:1 floor: `Slate`'s and `Ember`'s own derived `COMMENT` measures as low as ~2.15:1, a real,
-/// honestly-disclosed pre-existing gap in the derivation those files were generated from, not
-/// something this change caused - wide enough to pass every real measured value while still
-/// catching a genuine near-invisible pairing should a future edit introduce one.
 #[cfg(test)]
 mod syntax_contrast_tests {
     use super::*;
@@ -4838,20 +3687,6 @@ mod syntax_contrast_tests {
         }
     }
 
-    /// The sidebar strip's one structural invariant, in every bundled theme (GitHub issue #291).
-    ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "a tab only reads as
-    /// connected if the strip behind it is **darker than the panel**, and here strip and rail were
-    /// both `#101113`, so the slab floated." The selected cell fills with [`surface::RAIL`] and
-    /// paints its own rule in the same colour, so a theme that let [`surface::SIDEBAR_STRIP`]
-    /// collapse onto `RAIL` would take the strip's entire selection idiom with it - a failure no
-    /// contrast floor catches, because both colours would still be perfectly legible.
-    ///
-    /// Stated as *recession*, not as "darker", because `Paper` is a real bundled light theme whose
-    /// derivation legitimately inverts the ramp: there, every surface Jerry Dark makes darker is
-    /// made lighter. So the invariant is measured against [`surface::WINDOW`] - the palette's own
-    /// "one step back from a panel" - and asks only that the strip sits on that same side of the
-    /// rail, by at least as much.
     #[test]
     fn the_sidebar_strip_stays_recessed_below_the_rail_in_every_bundled_theme() {
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -4900,9 +3735,6 @@ mod syntax_contrast_tests {
         }
     }
 
-    /// A real, disclosed self-check on the contrast machinery itself: the same colour against
-    /// itself must measure exactly `1.0`, and pure black against pure white must measure the real,
-    /// well-known WCAG maximum of `21.0`.
     #[test]
     fn contrast_ratio_matches_known_reference_values() {
         let white = Rgba {
@@ -4925,23 +3757,6 @@ mod syntax_contrast_tests {
 /// The identifier family's own regression coverage - [`syntax::VARIABLE`],
 /// [`syntax::VARIABLE_PARAMETER`] and [`syntax::PROPERTY`] must really read as their own colours,
 /// in **every** bundled theme, not just in Jerry Dark.
-///
-/// That "every bundled theme" part is the load-bearing half. Those three tokens used to default to
-/// [`syntax::TEXT`]'s near-white grey, which made most of a source file render as one
-/// undifferentiated tone. Giving them real hues fixes Jerry Dark on its own, but the other five
-/// bundled themes are *generated files* (`crate::settings::builtin_themes`) holding literal
-/// per-token colours - so a change to these defaults that forgets to regenerate them would leave
-/// those five silently serving the old near-white value, which would be worse than not fixing this
-/// at all. Every check below runs against each theme's own real compiled palette, so a stale
-/// generated file fails here rather than shipping.
-/// GitHub issue #168's bracket-pair depth ring, pinned the same way the identifier family below
-/// is: the three properties the six colours were actually selected against, measured in **every**
-/// bundled theme rather than only in Jerry Dark. The five non-Jerry-Dark themes are generated by
-/// running [`derive_shift`] over these defaults, so a change to a default that looks fine in Jerry
-/// Dark can still collapse under the derivation - which is not hypothetical: an earlier draft's
-/// `#9b8cff` derived to `#020109` under `Paper`'s inverting lightness fit, ΔE 8.8 from that
-/// theme's own plain text, i.e. a coloured bracket indistinguishable from an uncoloured one. Every
-/// floor here would have caught it.
 #[cfg(test)]
 mod syntax_bracket_ring_tests {
     use super::syntax_color_math::delta_e;
@@ -4973,9 +3788,6 @@ mod syntax_bracket_ring_tests {
             .collect()
     }
 
-    /// The whole point of the feature: two nesting levels a reader is comparing must not look
-    /// alike. Cyclically adjacent (depth `n` against `n + 1`) is the pair that matters most, since
-    /// those two nest directly inside one another.
     #[test]
     fn cyclically_adjacent_ring_colours_stay_far_apart_in_every_bundled_theme() {
         // Lower again than the ring this replaced, and for the same *kind* of reason it was
@@ -5003,8 +3815,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// Non-adjacent depths matter too, just less: six levels of nesting has to stay legible, not
-    /// merely three.
     #[test]
     fn no_two_ring_colours_collide_in_any_bundled_theme() {
         // With six hues evenly spaced at one lightness and one chroma, the nearest pair *is* an
@@ -5027,11 +3837,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// No ring colour may be confusable with a semantic accent - the spec's own words. This is a
-    /// new check, and it exists because of a real defect in the ring this replaced: its
-    /// `BRACKET_1` sat at OKLCH hue 23 against `ERROR_UNDERLINE`'s 25, two degrees apart, so a
-    /// matched depth-0 bracket wore essentially the error colour. Every ΔE check of the day passed,
-    /// because they only ever compared ring colours to *plain text* and to each other.
     #[test]
     fn no_ring_colour_is_confusable_with_a_syntax_accent() {
         // This floor was **raised** from 8.0 when the ring moved off the accent lightness band
@@ -5076,10 +3881,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// The other thing an uncoloured bracket can be. Since the redesign,
-    /// `syntax::PUNCTUATION_BRACKET` is no longer plain text but its own dimmer tone, so a ring
-    /// colour has to stay clear of *both* - this covers the half
-    /// `every_ring_colour_is_perceptibly_different_from_plain_text` does not.
     #[test]
     fn every_ring_colour_stays_clear_of_the_de_emphasized_bracket_tone() {
         const MIN_DELTA_E: f32 = 14.0;
@@ -5098,10 +3899,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// A *matched* bracket reading identically to an *unmatched* one would erase the whole
-    /// matched/unmatched distinction this feature's honest-degradation design rests on - and
-    /// `syntax::PUNCTUATION_BRACKET` is exactly `syntax::TEXT` by deliberate design, so this one
-    /// check covers both.
     #[test]
     fn every_ring_colour_is_perceptibly_different_from_plain_text() {
         // Real measured worst case: 16.7, in Jerry Dark. Note this check got *harder* in the
@@ -5126,8 +3923,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// A bracket is one thin glyph, so the ring is held to a stricter contrast floor than the
-    /// 1.5:1 `syntax_contrast_tests` applies to the four non-Jerry-Dark, non-`Paper` themes.
     #[test]
     fn every_ring_colour_clears_a_stricter_contrast_floor_than_the_palette_at_large() {
         const MIN_RATIO: f32 = 2.5;
@@ -5146,19 +3941,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// The regression test for the real bug this ring was rewritten to fix, and the one thing
-    /// every other check here missed.
-    ///
-    /// The first version of this ring was produced by maximising pairwise ΔE in open colour space.
-    /// Maximising ΔE rewards chroma, so it bought its separation with saturation: two of its six
-    /// colours reached C* 88.7 and 93.3 against a palette whose most saturated token
-    /// ([`syntax::KEYWORD`]) is C* 53.4 and whose mean is 33.7. Every distinctness test above
-    /// passed. It still looked wrong, because a colour set can be perfectly distinguishable and
-    /// still not belong to the palette it sits in.
-    ///
-    /// So: no ring colour may be more saturated than this palette's own most saturated token, and
-    /// the ring's mean chroma must stay near the palette's. That is what "derived from the theme's
-    /// own hues" actually has to mean numerically.
     #[test]
     fn the_ring_stays_inside_the_palettes_own_chroma_register() {
         /// The real, semantic (non-neutral, non-ring) tokens the ring has to live alongside.
@@ -5218,7 +4000,6 @@ mod syntax_bracket_ring_tests {
             );
         }
 
-        // Every bundled theme: a loose bound that still catches a gross blowout.
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
             let palette = palette_chromas();
@@ -5237,14 +4018,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// A ring colour sits between two semantic hues and must never be mistakable for either.
-    ///
-    /// The strict, Jerry-Dark-only counterpart to
-    /// `no_ring_colour_is_confusable_with_a_syntax_accent`. Its floor was raised from 11 to 18 when
-    /// the ring moved onto the punctuation lightness band: measured worst case here is now ΔE 20.8,
-    /// against 11.3 for the ring this replaced. A palette that grew from eight semantic hue
-    /// families to ten therefore ended up with a *more* clearly separated bracket ring, not a less
-    /// one - which is the whole argument for spending lightness rather than hue on it.
     #[test]
     fn no_ring_colour_impersonates_the_semantic_token_it_borrows_its_hue_from() {
         const MIN_DELTA_E: f32 = 18.0;
@@ -5273,9 +4046,6 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// The ring is six *independently keyed* tokens a theme file can move one at a time, not six
-    /// aliases of one colour - the mistake that would quietly turn this feature back into the flat
-    /// single-bracket-colour non-solution GitHub issue #168 explicitly rejected.
     #[test]
     fn the_six_ring_tokens_are_six_real_independently_keyed_colours() {
         let keys: std::collections::HashSet<&str> =
@@ -5346,19 +4116,6 @@ mod syntax_palette_tests {
     use super::*;
 
     /// The only tokens still held at *exactly* plain foreground, and the reason each one is.
-    ///
-    /// [`syntax::EMBEDDED`] covers the leftover bytes of a template-string/f-string interpolation
-    /// that no more specific capture claims - the interpolated expression's own identifiers, calls
-    /// and numbers all win over it by nesting, so it is essentially never the visible colour of a
-    /// real token and giving it an eleventh hue would spend one on nothing.
-    ///
-    /// Note what is *not* in this list any more: `KEYWORD`, `FUNCTION` and `FUNCTION_METHOD`. An
-    /// earlier revision of this palette held all three at exactly `TEXT`, following tonsky's
-    /// use-site/binding-site line. The maintainer looked at the built app and rejected it - "I
-    /// preferred the old colors but I think they were not used correctly" - and the CHI'16 study
-    /// cited in `syntax`' own module docs measured the same thing objectively. See
-    /// `keywords_calls_and_identifiers_all_carry_real_colour_in_every_bundled_theme`, which is the
-    /// test that replaced the one asserting the opposite.
     fn plain_foreground_tokens() -> Vec<(&'static str, ColorToken)> {
         vec![("EMBEDDED", syntax::EMBEDDED)]
     }
@@ -5390,7 +4147,6 @@ mod syntax_palette_tests {
         ]
     }
 
-    /// Only [`syntax::EMBEDDED`] resolves to exactly plain text, in every bundled theme.
     #[test]
     fn only_the_deliberately_neutral_tokens_render_at_plain_foreground() {
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -5408,20 +4164,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// **The test that replaced `calls_and_keywords_render_at_plain_foreground_in_every_bundled_theme`.**
-    ///
-    /// Every accent - very much including `KEYWORD`, `FUNCTION` and `FUNCTION_METHOD`, which an
-    /// earlier revision pinned to *exactly* plain text - must be visibly coloured against the plain
-    /// foreground it sits next to, in every bundled theme.
-    ///
-    /// The floor is stated in CIE-Lab ΔE against plain text rather than in contrast ratio,
-    /// deliberately. A colour can sit at a perfectly good contrast ratio against the *background*
-    /// and still be indistinguishable from the plain foreground beside it - which is exactly the
-    /// failure the maintainer caught by looking at a screenshot while every contrast assertion in
-    /// this file was green.
-    ///
-    /// 18 is ~8x the ~2.3 just-noticeable difference. Jerry Dark itself measures 27.8 at its worst
-    /// (`PROPERTY`); the floor is set by the derived themes, whose transform compresses chroma.
     #[test]
     fn keywords_calls_and_identifiers_all_carry_real_colour_in_every_bundled_theme() {
         const MIN_DELTA_E: f32 = 18.0;
@@ -5443,8 +4185,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// A local, a parameter and a member access have to be tellable apart from each other too -
-    /// otherwise the previous test is satisfiable by painting all three the same tint.
     #[test]
     fn the_three_identifier_tokens_are_distinguishable_from_each_other() {
         const MIN_DELTA_E: f32 = 10.0;
@@ -5468,9 +4208,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// The other half of the same idea: a *definition* site really is distinguishable from the
-    /// call sites around it. Now that both are coloured, this is the only thing keeping the
-    /// definition-site query work in `code_view` visible at all.
     #[test]
     fn a_definition_site_is_clearly_distinguishable_from_a_call_site() {
         for def in crate::settings::state::THEME_DEFS.iter() {
@@ -5486,8 +4223,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// Punctuation sits *below* base text: present, traceable, never competing with the code.
-    /// The floor keeps it from becoming the ghost-grey this palette is trying to avoid.
     #[test]
     fn punctuation_is_dimmer_than_plain_text_but_still_clears_three_to_one() {
         let background = surface::CENTER.default;
@@ -5505,9 +4240,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// Comments stay genuinely readable. The palette this replaced had `COMMENT` at 3.03:1, below
-    /// the 4.5:1 body-text floor - real "ghost grey", and the single clearest legibility failure
-    /// the audit found in Jerry Dark.
     #[test]
     fn comments_clear_the_full_body_text_contrast_floor_not_a_relaxed_one() {
         let background = surface::CENTER.default;
@@ -5523,19 +4255,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// **The test that replaced `the_palette_spends_at_most_six_accent_hues_plus_two_identifier_tints`.**
-    ///
-    /// That one enforced a *restraint budget* - at most six accent hues - and the budget is exactly
-    /// what the maintainer rejected on sight and what the CHI'16 study contradicts. Deleting it
-    /// without replacement would leave nothing pinning the palette's structure, so what replaces it
-    /// pins the property that actually matters once "more colour" is the goal: **every hue family
-    /// is a real hue apart from every other one.** A wider palette is only an improvement if its
-    /// members are still individually identifiable.
-    ///
-    /// The bound on the *count* is kept, just moved up: ten semantic families is a deliberate
-    /// ceiling, not an invitation to keep adding. Past roughly that many, the wheel cannot hold
-    /// them 25 degrees apart at one lightness and one chroma - which is precisely how the bracket
-    /// ring lost its room and had to drop a tier (see `syntax`' own bracket-ring docs).
     #[test]
     fn every_accent_hue_family_stays_a_real_hue_apart() {
         const MIN_SEPARATION: f32 = 25.0;
@@ -5559,10 +4278,6 @@ mod syntax_palette_tests {
         );
     }
 
-    /// The accents are the whole palette's chromatic surface: no *other* syntax token may invent an
-    /// eleventh hue family behind the accent tier's back. Diagnostics are exempt - they are a
-    /// different channel (an underline and a row tint, never a token foreground) and deliberately
-    /// own the pure red the accent wheel leaves free.
     #[test]
     fn no_syntax_token_invents_a_hue_outside_the_accent_wheel() {
         let accent_hues: Vec<f32> = accent_tokens()
@@ -5591,9 +4306,6 @@ mod syntax_palette_tests {
         }
     }
 
-    /// Perceptual construction: the accents differ from each other by *hue*, not by lightness or
-    /// saturation. That is what makes them read as one family and what keeps any one of them from
-    /// shouting louder than the rest.
     #[test]
     fn every_accent_shares_one_lightness_and_one_chroma() {
         let measured: Vec<(f32, f32)> = accent_tokens()
@@ -5621,8 +4333,6 @@ mod syntax_palette_tests {
         );
     }
 
-    /// Every accent still has to be readable, in every bundled theme - the point of moving the
-    /// derivation to OKLCH.
     #[test]
     fn every_accent_clears_the_body_text_floor_in_every_bundled_theme() {
         for def in crate::settings::state::THEME_DEFS.iter() {

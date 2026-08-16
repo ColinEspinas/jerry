@@ -2,19 +2,6 @@
 //! worktree it's running in, and tracks which agents are open and which one is active for
 //! the tabbed center pane. `TerminalPane` itself has no notion of tabs or of "which
 //! worktree" - see its module docs - this is that one layer up.
-//!
-//! ## Per-worktree tab scoping
-//!
-//! Every agent belongs to exactly one worktree (its [`Agent::cwd`]), and the centre pane's
-//! tab strip (`crate::root::AdeApp::render_tab_strip`) only ever shows the agents belonging to
-//! whichever worktree is currently selected - so [`Self::active`] doubles as "which agent is
-//! shown in the centre pane" *and* must always name an agent in the currently selected
-//! worktree (or be `None`, if that worktree has no open agent at all). [`Self::active_by_cwd`]
-//! is the second half of that invariant: a per-worktree "last active tab" memory, so switching
-//! back and forth between two worktrees each restores whichever tab you were last looking at in
-//! each, rather than always landing on the first one. [`Self::activate_for_worktree`] is the one
-//! place that invariant gets re-established - see `crate::root::AdeApp::select_worktree`'s own
-//! docs for why it must also move real keyboard focus in the same step.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -26,14 +13,6 @@ use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
 
 /// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
 /// also covers a plain interactive terminal.
-///
-/// This type existing *without* a `Shell` variant is the point: anything that only makes sense
-/// for a real agent (the Settings › Agents "installed on `$PATH`?" card, the `$PATH` name to
-/// search for, which tint/initial an agent badge wears) can take an `AgentKind` and be
-/// structurally impossible to call with a shell, rather than having to remember a runtime
-/// "is this Shell?" check it could silently forget - which is exactly the bug class this shape
-/// replaced (`crate::rail::status::derive_status`'s [`crate::rail::status::Status::Review`] arm
-/// genuinely forgot it, back when one flat enum held all three cases as equal peers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     /// The `claude` CLI (Claude Code), spawned with no arguments in the chosen worktree.
@@ -67,10 +46,6 @@ impl AgentKind {
     /// "this kind has no fixed binary" case to model, precisely because an `AgentKind` is never
     /// a shell (before the shell/agent split this was an `Option<&'static str>` every caller had
     /// to unwrap or `filter_map` away).
-    ///
-    /// Public so `crate::settings::state`'s Agents page can look up the same `$PATH` name this
-    /// eventually hands `TerminalSpec::command` at spawn time (see [`ProcessKind::spec`]),
-    /// instead of a second hardcoded list that could drift from what's actually spawned.
     pub fn binary_name(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -83,13 +58,6 @@ impl AgentKind {
 /// session. Purely descriptive - drives the tab label and which "New ..." button created it;
 /// `TerminalPane` itself has no branching for "shell" vs. "agent CLI", and the PTY/tab/spawn/
 /// close/focus machinery below is deliberately identical for both.
-///
-/// The shell/agent split is a *type-level* distinction, not a convention: a [`Self::Shell`] is a
-/// bare terminal with no turns and nothing to review, so every `match` on this enum is forced by
-/// the compiler to say what it does about that case. Cases that only ever cared about "is this a
-/// shell or not" collapse to two arms (`Shell` / `Agent(_)`); the rarer cases that genuinely
-/// differ per CLI destructure the inner [`AgentKind`]. And code that can only ever mean a real
-/// agent doesn't take this type at all - it takes [`AgentKind`], which has no shell to handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessKind {
     Shell,
@@ -121,19 +89,6 @@ impl ProcessKind {
     /// (`crate::settings::store::TerminalSettings::shell_override`, GitHub issue #213) and only
     /// reaches [`ProcessKind::Shell`]: an agent CLI spawns its own fixed binary directly, never
     /// through a shell, so which shell the user prefers genuinely cannot affect it.
-    ///
-    /// `extras` is `(args, env)` to append for a real agent CLI - in practice
-    /// `crate::hooks::HookRuntime::spawn_extras`'s `--settings <path>` plus the `JERRY_*`
-    /// environment that lets that agent's hooks find their way home (GitHub issue #239 phase 2).
-    /// It is deliberately handed in by the caller rather than derived here: whether hooks are
-    /// available at all is a live, per-launch fact owned by `crate::root::AdeApp`, and this
-    /// function is a pure `ProcessKind` -> `TerminalSpec` mapping that must stay testable without
-    /// one.
-    ///
-    /// A [`ProcessKind::Shell`] discards `extras` outright. That is a real gate, not an
-    /// oversight: a shell must never be handed the hook token or an agent id, because a shell is
-    /// an interactive terminal running whatever the user types, and anything it ran would inherit
-    /// the credentials for reporting status as some other pane.
     fn spec(
         self,
         cwd: PathBuf,
@@ -190,17 +145,6 @@ pub struct Agent {
     pub spawned_at: Instant,
     /// The same spawn moment as [`Self::spawned_at`], but as real wall-clock seconds since the
     /// Unix epoch - set from the identical call site, at the identical instant.
-    ///
-    /// Both exist because they answer genuinely different questions and neither can answer the
-    /// other's. [`Instant`] is monotonic, which is exactly right for "how long has this been
-    /// running" (the rail's elapsed text) and exactly wrong for identity: it has no meaning
-    /// outside this process, and cannot be converted to a wall-clock time at all. This field is
-    /// the durable half - part of the key a persisted review baseline is filed under
-    /// (`crate::review::state::baseline_key`), since [`AgentId`] is a per-window counter that
-    /// restarts at zero on every launch and so cannot key anything expected to outlive one.
-    ///
-    /// See `crate::review::baseline_state`'s own module docs for what that persistence can and
-    /// cannot do today.
     pub spawned_at_unix: i64,
     /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
     /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
@@ -249,36 +193,6 @@ impl Agents {
 
     /// How many **real agent sessions** are currently open in `cwd` - the real signal behind
     /// GitHub issue #225's **single-agent gate**.
-    ///
-    /// The whole review surface (the Review tab, the footer's `Review diff` door, and the rail's
-    /// review-ready status) is held back for any worktree with more than one open agent, because
-    /// real per-agent attribution does not exist yet: with two agents sharing a worktree, an
-    /// agent's review diff would honestly include changes the *other* one made, and this app
-    /// would have no way to tell them apart. Presenting that as "this agent's review" would be a
-    /// fabrication, so it shows nothing at all until the worktree is back down to one agent.
-    ///
-    /// A plain [`ProcessKind::Shell`] is **not** counted (GitHub issue #381). The gate is about
-    /// *which agent gets credited with a diff*, and a shell is never a candidate for that credit:
-    /// no baseline is ever captured for one ([`crate::review::flow::AdeApp::
-    /// capture_review_baseline`] refuses outright), it has no turns to end, and it can never
-    /// itself open a review surface. Counting one was not a conservative choice, it was a
-    /// silently fatal one: `crate::root::AdeApp::select_worktree` spawns a startup shell into
-    /// every worktree that has no tab yet, so the *first* agent started in any worktree already
-    /// shared it with that shell and the gate never opened for it - the review surface was
-    /// effectively dead in the default configuration. `crate::sound::flow`'s module docs had
-    /// already written that consequence down ("Every window starts with a shell already open in
-    /// the repo, so spawning a Claude agent into that same worktree makes two agents there - the
-    /// single-agent gate then never opens for it") and routed around it rather than fixing it
-    /// here.
-    ///
-    /// Deliberately a **decision-time** check, not a capture-time one: a baseline is still
-    /// captured for every agent regardless of how many share its worktree (it's cheap, and it
-    /// means the surface simply starts working - correctly, against a real baseline taken at the
-    /// right moment - the instant the others close). Only *display* is gated.
-    ///
-    /// Reads through [`Self::iter_for_cwd`] rather than open-coding the per-worktree filter, so
-    /// the tab strip's own per-worktree scoping and this gate can never disagree about which
-    /// agents belong to a worktree.
     pub fn count_for_cwd(&self, cwd: &Path) -> usize {
         self.iter_for_cwd(cwd.to_path_buf())
             .filter(|agent| agent.kind.is_agent_session())
@@ -292,9 +206,6 @@ impl Agents {
     /// [`ProcessKind::Shell`], which is not a session this gate can ever open *for* (it has no
     /// baseline and nothing to review); without that check a lone shell would satisfy a gate
     /// whose whole subject is "which agent's changes are these".
-    ///
-    /// See [`Self::count_for_cwd`] for why this gate exists at all, and why the count it reads
-    /// leaves shells out.
     pub fn is_sole_agent_in_worktree(&self, id: AgentId) -> bool {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return false;
@@ -305,18 +216,6 @@ impl Agents {
     /// **The worktree's primary agent**: its own last-active tab (see [`Self::active_by_cwd`]),
     /// or - for a worktree that has never had one recorded - its first open agent in creation
     /// order. `None` if the worktree has no open agents at all.
-    ///
-    /// This is the rule [`Self::activate_for_worktree`] has always applied when the rail moves to
-    /// a worktree; it is factored out here because GitHub issue #288 needs the same answer to a
-    /// different question - *"which agent do this file's review notes go to, when the file itself
-    /// names nobody"* - and two copies of "which agent does this worktree mean" is exactly how the
-    /// centre pane and a send target would come to disagree on screen.
-    ///
-    /// Deliberately **not** filtered to agent sessions here: this answers "which tab is this
-    /// worktree's", and a worktree whose only tab is a shell really does have that shell as its
-    /// primary. Callers that need a party capable of *revising code* filter on
-    /// `ProcessKind::is_agent_session` themselves - `crate::review_notes::flow` does, and says
-    /// why.
     pub fn primary_for_cwd(&self, cwd: &Path) -> Option<&Agent> {
         let remembered = self
             .active_by_cwd
@@ -339,29 +238,6 @@ impl Agents {
     /// `crate::root::AdeApp::current_worktree_path`), appends it as a new tab, and makes it
     /// active (both globally, [`Self::active`], and as `cwd`'s own remembered tab,
     /// [`Self::active_by_cwd`]). Returns the new agent's id.
-    ///
-    /// Deliberately does not move keyboard focus itself: only the caller
-    /// (`crate::root::AdeApp`) knows whether a file tab is currently occupying the centre
-    /// pane, and focusing an agent's pane while a file tab is showing points
-    /// `Window::focus` at a node nothing in the rendered tree tracks. Every real call site
-    /// guards this via `crate::root::AdeApp::focus_newly_spawned_agent`, whose own docs
-    /// cover the bug this avoids.
-    ///
-    /// Subscribes to the new pane's [`TerminalPaneEvent`]s so a click on a detected
-    /// path/`path:line` link in this agent's terminal output opens it as a file tab
-    /// (`crate::root::AdeApp::open_terminal_link`). `terminal_font_size_px` and
-    /// `shell_override` are both read fresh from live settings by every call site (the same
-    /// threading pattern, for the same reason): a freshly spawned pane never starts out
-    /// mismatched from what Settings shows. `shell_override` is GitHub issue #213's configured
-    /// shell (`crate::settings::store::TerminalSettings::shell_override`) - `None` means "the
-    /// real OS default", and it only affects [`ProcessKind::Shell`] tabs (see
-    /// [`ProcessKind::spec`]).
-    ///
-    /// `hooks` is this launch's hook injection (GitHub issue #239 phase 2), or `None` when hook
-    /// support isn't running - see [`crate::hooks::HookRuntime::start`] for every real reason it
-    /// may not be. It is consumed *only* for [`AgentKind::Claude`]: hooks are a Claude Code
-    /// feature, so a Codex agent and a shell are spawned byte-for-byte as they were before this
-    /// phase, and both fall back to the terminal-title and quiescence signals.
     // Eight parameters, one past clippy's threshold. Every one is a distinct, live value read
     // fresh from settings or app state at each of this method's ~40 call sites (see the docs
     // above for why each is threaded rather than read here), so bundling them into a struct would
@@ -396,12 +272,6 @@ impl Agents {
     /// to genuinely pick the named conversation back up, not merely start a new one in the same
     /// directory (`crate::hooks::event::HookReport::session_id`'s own docs cover how that was
     /// checked).
-    ///
-    /// Still receives `hooks`, and still gets the same `--settings`/environment injection a fresh
-    /// [`AgentKind::Claude`] spawn would: a resumed conversation is exactly as real an agent as a
-    /// new one, and Jerry's rail should keep tracking it the same way (also verified against the
-    /// real binary - `--settings` and `--resume` coexist without conflict, and the resumed
-    /// session's hooks report the same `session_id` it resumed).
     // Nine parameters, matching `Self::spawn`'s own already-`#[allow]`'d count plus the one real
     // addition (`session_id`) - see that method's docs for why bundling the rest into a struct
     // wouldn't reduce anything.
@@ -501,11 +371,6 @@ impl Agents {
 
     /// Test-only sibling of [`Self::set_kind_for_test`]: overrides an already-spawned agent's
     /// recorded spawn second without touching its real process.
-    ///
-    /// The spawn second is half of `crate::review::state::baseline_key`, i.e. half of the durable
-    /// identity `crate::provenance` files a line's author under. A test that seeds provenance for
-    /// a specific agent has to be able to make a live tab carry that same key, and the alternative
-    /// - waiting for the wall clock to land on the right second - is not a test.
     #[cfg(test)]
     pub(crate) fn set_spawned_at_unix_for_test(&mut self, id: AgentId, spawned_at_unix: i64) {
         if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
@@ -598,14 +463,6 @@ impl Agents {
     /// agent - or, if `cwd` has never had one recorded (a worktree just visited for the
     /// first time this window), its first open agent in creation order. `None` if `cwd`
     /// currently has no open agents at all.
-    ///
-    /// This is the real fix for the bug this revision exists to close: before it,
-    /// [`Self::active`] was a single value entirely independent of which worktree was
-    /// selected in the rail, so switching worktrees could leave the centre pane showing a
-    /// completely different worktree's terminal. `crate::root::AdeApp::select_worktree` calls
-    /// this on every switch - see that method's own docs for why it must also move real
-    /// keyboard focus in the same step (the previously-active agent's pane may no longer be
-    /// rendered at all once the tab strip's own per-worktree filter applies).
     pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
         let id = self.primary_for_cwd(cwd).map(|agent| agent.id);
         self.active = id;
@@ -645,26 +502,6 @@ impl Agents {
     /// Closes a tab: tears down its `PtySession` via `TerminalPane::shutdown` before dropping
     /// the `Entity<TerminalPane>`, so closing a tab never just hides it while its process
     /// leaks.
-    ///
-    /// The fallback for what becomes active next is scoped to the closed agent's *own
-    /// worktree*, never a same-`Vec`-neighbor from a different one (pre-redesign, every
-    /// agent shared one flat tab strip, so any neighbor was a reasonable fallback; now that
-    /// the tab strip is per-worktree, falling back across worktrees would silently switch the
-    /// centre pane to an unrelated worktree's terminal): the sibling that was immediately to
-    /// the closed tab's right (in creation order, within the same `cwd`), falling back to its
-    /// left, falling back to `None` if this was the worktree's last open tab - in which case
-    /// its rail row simply reverts to the same "no active agent" state a worktree the user
-    /// hasn't started anything in already shows (see `crate::rail::state::WorktreeRow`'s own docs);
-    /// deliberately not auto-respawning a fresh shell, since an agent-less worktree is already
-    /// a normal, existing state this app models everywhere else.
-    ///
-    /// Only moves focus (via [`Self::focus_active`]) when the closed agent was the *globally*
-    /// active one - closing a background tab in a worktree that isn't currently selected must
-    /// never steal focus - unless `skip_focus_move` says the centre pane isn't showing an
-    /// agent's pane right now anyway (a file tab occupies it, or the whole workspace body is
-    /// currently swapped out for Settings) - the caller, `crate::root::AdeApp::close_agent`,
-    /// computes that from `AdeApp::open_change`/`AdeApp::settings_open` - see [`Self::spawn`]'s
-    /// docs for why this can't be decided here.
     pub fn close(
         &mut self,
         id: AgentId,
@@ -736,14 +573,6 @@ impl Default for Agents {
 mod tests {
     use super::*;
 
-    /// `close`/`activate_for_worktree` both need a real `Agent` (a real `Entity<TerminalPane>`,
-    /// only buildable via `Agents::spawn` inside a real GPUI window) to exercise meaningfully,
-    /// so that coverage lives in `work_surface::render`'s GPUI-test module (`tab_scoping_tests`)
-    /// instead, alongside the rest of this revision's worktree/tab scoping coverage (and the
-    /// combined tab-order drag-to-reorder coverage - see `work_surface::state`'s own
-    /// `reconcile_tab_order`/`move_tab_order` for the tab strip's real ordering layer, which
-    /// tracks position on top of `Agents` rather than inside it). This module only holds the
-    /// plain, GPUI-free checks that don't need a real pane at all.
     #[test]
     fn a_fresh_agents_collection_has_no_active_agent() {
         let agents = Agents::new();
@@ -847,10 +676,6 @@ mod tests {
         );
     }
 
-    /// `spec` is private, but the fact it reads through `AgentKind::binary_name` (rather than a
-    /// second hardcoded list) is what keeps the Settings › Agents `$PATH` search honest: the name
-    /// that card searches for must be the name actually spawned. This asserts the shared source,
-    /// which is the part that could drift.
     #[test]
     fn the_settings_path_search_and_the_real_spawn_read_the_same_binary_name() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {

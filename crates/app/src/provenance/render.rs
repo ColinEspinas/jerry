@@ -1,59 +1,6 @@
 //! The visible half of per-agent attribution (GitHub issue #287): the diff view's per-line
 //! gutter bar, the file row's author chips and their `⚠` ring, and the per-author filter the
 //! ring opens.
-//!
-//! [`super`] is the backend (GitHub issue #284) - who wrote which line. This module is the only
-//! place that turns one of those answers into a colour, a glyph and a sentence, so a given author
-//! reads the same on every surface that shows one: the change row, the graph's working-tree row,
-//! the diff gutter and the filter indicator.
-//!
-//! ## The three channels, and what each is allowed to say
-//!
-//! `REVISION-2026-08-14.md` §1 calls per-agent attribution "the differentiator", and states the
-//! model it extends:
-//!
-//! > Orca ships gutter provenance but binary - AI or human. Extend it to N agents using the tint
-//! > chips already in the palette, with Orca's two hard-won rules: your own hand edit flips that
-//! > line back to you, and attribution is local, never committed. The `⚠` ring on a file row
-//! > means *this path has lines from more than one agent*.
-//!
-//! | Channel | Says | Where |
-//! |---|---|---|
-//! | gutter bar | who wrote **this line** | [`AdeApp::diff_line_authors`], painted by `crate::code_surface::diff_view::render_diff_line` |
-//! | author chips | who wrote **this file** | [`AdeApp::render_author_chips`], on the change row and the graph's working-tree row |
-//! | `⚠` ring | this file has lines from **more than one agent** | [`AdeApp::render_author_chips`], and it is a control |
-//!
-//! ## Four rules this module keeps
-//!
-//! 1. **Never guess an attribution.** [`author_style`] returns `None` for
-//!    [`super::Author::Unattributed`] and for an agent key this build cannot resolve to a real
-//!    [`crate::work_surface::agents::AgentKind`], and every caller renders *nothing* for a
-//!    `None` - no bar, no chip. An unattributed line is the absence of an answer, and the honest
-//!    rendering of an absent answer is an empty gutter.
-//! 2. **`you` is not an agent.** It gets [`crate::theme::changes::HAND_EDIT_GUTTER`], a neutral
-//!    outside [`crate::theme::agent`]'s whole pool, and the tooltip says *you — hand edit*.
-//! 3. **Chips only in a multi-agent worktree** (`REVISION-2026-07-31.md` §4): *"Attribution chips
-//!    render only when the worktree has more than one agent - with one agent every chip is
-//!    identical and carries no information."* [`AdeApp::worktree_has_multiple_agents`] is that
-//!    gate, and because the ring lives on the chip group, the ring is gated with it.
-//! 4. **A filter names itself, or it does not exist** (`STAGE-A-CHANGELOG.md` §4b). The
-//!    `<agent> only ✕` indicator renders only while a filter is genuinely active, so a filtered
-//!    diff can never read as the whole diff - and there is no inert, dead-looking control sitting
-//!    in the toolbar the rest of the time.
-//!
-//! ## Where the `⚠ N` count went
-//!
-//! Nowhere - it was never built here, and must not be. `STAGE-A-CHANGELOG.md` §4g removed the
-//! rail worktree row's aggregate `⚠ N` outright:
-//!
-//! > **It is not actionable there.** A bare count names no file and clicking it does nothing. The
-//! > signal only becomes useful attached to the object, which is exactly where it already lives -
-//! > the ring around the author chips on the file row in Changes, where clicking filters the diff
-//! > by author.
-//!
-//! `crate::rail::state::WorktreeRow` carries no shared-file count and
-//! [`super::change_set::ChangeSet::shared_paths`] is read only by the file row, which is where
-//! this stays.
 
 use std::path::{Path, PathBuf};
 
@@ -70,9 +17,6 @@ use crate::work_surface::agents::ProcessKind;
 /// How far a line that is **not** the filtered author's is dimmed while a per-author filter is
 /// active - `Jerry.dc.html`'s own `opacity: .32`, quoted as an acceptance criterion by GitHub
 /// issue #287 ("other authors' lines dim (the mock uses 0.32 opacity)").
-///
-/// Dimmed, never hidden: the lines around a filtered author's work are what make it legible as a
-/// change, and removing them would turn a filter into a different, much less honest diff.
 pub const FILTER_DIM_OPACITY: f32 = 0.32;
 
 /// One author, as this app draws it: the tint its gutter bar and chip wear, the single glyph the
@@ -91,14 +35,6 @@ pub struct AuthorStyle {
 }
 
 /// How `author` is drawn, or `None` when it must not be drawn at all.
-///
-/// `None` has exactly two causes, and both are "no answer", never "some answer we could not be
-/// bothered to render":
-///
-/// - [`Author::Unattributed`] - nobody is on record for this line. Rule 1 of this module.
-/// - [`Author::Agent`] whose [`AgentKey::kind`] this build cannot read (a record written by a
-///   future version, or a hand-edited state file). There is a real author here, but naming or
-///   colouring it would mean inventing which agent it was.
 pub fn author_style(author: &Author) -> Option<AuthorStyle> {
     match author {
         Author::Agent(key) => agent_style(key),
@@ -134,11 +70,6 @@ fn agent_tint_of(key: &AgentKey) -> Option<(Rgba, Rgba)> {
 }
 
 /// The colour of `author`'s gutter bar, or `None` for a line that carries no bar at all.
-///
-/// `you` deliberately does **not** take [`AuthorStyle::fg`] here: the chip's glyph has to read
-/// against its own fill, while the bar is a 2px stripe against the diff's background, and
-/// `Jerry.dc.html` gives the two different values (`#8b9197` and `#4e545a`). An agent's bar and
-/// chip glyph are one value, because its own tint already is.
 pub fn author_gutter_color(author: &Author) -> Option<Rgba> {
     match author {
         Author::You => Some(theme::changes::HAND_EDIT_GUTTER.into()),
@@ -149,9 +80,6 @@ pub fn author_gutter_color(author: &Author) -> Option<Rgba> {
 
 /// The sentence a gutter bar's, or a chip's, tooltip states - `None` for an author that is not
 /// drawn at all, which therefore has no tooltip either.
-///
-/// `STAGE-A-CHANGELOG.md` §1 gives `you`'s wording outright; an agent's is its own name, which is
-/// what `Jerry.dc.html`'s `attrOf` puts in the same slot.
 pub fn author_tooltip(author: &Author) -> Option<String> {
     match author {
         Author::You => Some("you \u{2014} hand edit".to_string()),
@@ -160,16 +88,6 @@ pub fn author_tooltip(author: &Author) -> Option<String> {
 }
 
 /// Whether one diff line is dimmed to [`FILTER_DIM_OPACITY`] by an active per-author filter.
-///
-/// `Jerry.dc.html`'s own predicate, kept exactly: `muted = attr && who && who !== attr`. Three
-/// things follow from it, and all three are load-bearing rather than incidental:
-///
-/// - **No filter, nothing dims.** A diff at rest is one flat, honest surface.
-/// - **A line with no author never dims.** Context lines, and lines nobody is on record for, are
-///   not "somebody else's" - they are the shape the filtered author's work sits inside, and
-///   fading them would make a filter into a much less readable diff rather than a focused one.
-/// - **Only a *different* known author dims.** Which is what makes the remaining full-opacity
-///   lines exactly the set the toolbar's `<agent> only` indicator claims they are.
 pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool {
     match (author, filter) {
         // `is_drawable(author)` rather than `author.is_some()`: a context or unattributed line
@@ -181,8 +99,6 @@ pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool 
 }
 
 /// The `⚠` ring's tooltip, verbatim from `STAGE-A-CHANGELOG.md` §1's own `title=` attribute:
-///
-/// > `title="Two agents edited this file — click to filter the diff by author"`
 pub const SHARED_RING_TOOLTIP: &str =
     "Two agents edited this file \u{2014} click to filter the diff by author";
 
@@ -192,21 +108,9 @@ pub const FILTER_INDICATOR_TOOLTIP: &str =
 
 /// The `crate::keymap::resolve_combo` spec for the chip's own filter gesture, and the one the
 /// Changes footer renders as keycaps (`STAGE-A-CHANGELOG.md` §2's `⌥click filter by author`).
-///
-/// Resolved through [`crate::keymap`] like every other keycap in this app rather than written as
-/// a literal glyph, so the hint reads `⌥ click` on macOS and `Alt click` everywhere else - and
-/// `alt` is a real modifier this app really reads off the click event
-/// (`AdeApp::render_author_chips`), not a string that merely looks like a shortcut.
 pub const AUTHOR_FILTER_SPEC: &str = "alt+click";
 
 /// Which path a per-author filter is pinned to, and to whom.
-///
-/// Pinned to a **path**, not left global, and that is a correctness choice rather than tidiness.
-/// `STAGE-A-CHANGELOG.md` §4b's rule for this feature is that "a filtered diff would read as the
-/// whole diff" if nothing said otherwise; the mirror-image failure is a filter surviving onto a
-/// file its author never touched, where every single line dims and the diff reads as *empty*.
-/// Keying the filter to the file it was entered from makes both impossible: opening another file
-/// is opening an unfiltered diff, and the indicator disappears with it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthorFilter {
     pub path: PathBuf,
@@ -215,9 +119,6 @@ pub struct AuthorFilter {
 
 impl AdeApp {
     /// The per-author filter that is genuinely in force for the diff on screen right now, if any.
-    ///
-    /// Reads through [`Self::open_change`] rather than trusting the stored filter on its own -
-    /// see [`AuthorFilter`] for why a filter is a fact about one file.
     pub(crate) fn active_author_filter(&self) -> Option<&Author> {
         let filter = self.author_filter.as_ref()?;
         (self.open_change.as_deref() == Some(filter.path.as_path())).then_some(&filter.author)
@@ -225,10 +126,6 @@ impl AdeApp {
 
     /// Opens `path`'s diff filtered to `author` - the `⚠` ring's whole behaviour, and
     /// `alt+click`'s.
-    ///
-    /// Opening is part of it, not a precondition: `STAGE-A-CHANGELOG.md` §1 describes the ring as
-    /// "clicking opens the file and filters to one author", so the gesture works from a row whose
-    /// diff is not on screen yet.
     pub(crate) fn filter_diff_by_author(
         &mut self,
         path: PathBuf,
@@ -250,10 +147,6 @@ impl AdeApp {
 
     /// Whether the current worktree really has more than one agent open in it - rule 3 of this
     /// module's docs, and the gate on every author chip in the app.
-    ///
-    /// Counts **agent sessions**, not tabs: a shell shares the worktree but authors nothing, so a
-    /// worktree holding one agent and one terminal is a one-agent worktree, where "every chip is
-    /// identical and carries no information" is exactly as true as it is with no terminal at all.
     pub(crate) fn worktree_has_multiple_agents(&self) -> bool {
         self.agents
             .iter_for_cwd(self.diff_root.clone())
@@ -265,10 +158,6 @@ impl AdeApp {
     /// Every diff line's author for the file on screen, hunk by hunk and index-aligned with
     /// `file.hunks[h].lines`, or an empty `Vec` when this worktree has no provenance record for
     /// this path at all.
-    ///
-    /// An empty result is the "renders no bars" case, and it is reached for a real reason rather
-    /// than by accident: the store simply has nothing on record for the path (nothing has been
-    /// attributed here since Jerry started watching, or an agent with no hook layer wrote it).
     pub(crate) fn diff_line_authors(&self, file: &wt_core::diff::DiffFile) -> Vec<Vec<Author>> {
         let Some(records) = self.line_provenance.worktree(&self.diff_root) else {
             return Vec::new();
@@ -281,22 +170,6 @@ impl AdeApp {
 
     /// One file row's author chips, with the `⚠` ring around them when the file has more than one
     /// agent in it - `REVISION-2026-08-14.md` §1 and `REVISION-2026-07-31.md` §4.
-    ///
-    /// Returns `None`, and so renders nothing at all, in a single-agent worktree (rule 3) and for
-    /// a path nobody is on record for. `id` distinguishes the two surfaces that draw this - the
-    /// Changes row and the graph's working-tree row - so their `debug_selector`s stay separable.
-    ///
-    /// ## Two gestures, one destination
-    ///
-    /// | Gesture | Filters to |
-    /// |---|---|
-    /// | click the ring (or the group's own padding) | the file's first author |
-    /// | `alt`+click one chip | **that** chip's author |
-    ///
-    /// The plain click is the ring's promise in its own tooltip; the modified click is
-    /// `STAGE-A-CHANGELOG.md` §2's `⌥click filter by author`, which the Changes footer advertises
-    /// as real keycaps only while chips are genuinely on screen. A chip stops propagation so the
-    /// group's own handler cannot then overwrite the author the user actually pointed at.
     pub(crate) fn render_author_chips(
         &self,
         id: &'static str,
@@ -393,16 +266,6 @@ impl AdeApp {
 
     /// A read-only strip of author chips - the same marks [`Self::render_author_chips`] draws,
     /// with no ring and no click behind them.
-    ///
-    /// This is the graph's working-tree row (GitHub issue #287, audit items I4/I5): that row
-    /// states *who has written into this checkout*, which is a fact about the whole worktree
-    /// rather than about one path, so there is no file for a filter to open and no second author
-    /// for a ring to warn about. Shipping the ring here anyway would be a control that cannot do
-    /// what the same mark does one panel over - `REVISION-2026-08-14.md` §7's rule 1, "ship the
-    /// affordance with the behaviour, or ship neither".
-    ///
-    /// Gated on a multi-agent worktree for exactly the reason a file row's chips are
-    /// (`REVISION-2026-07-31.md` §4): a union of one agent is that agent, on every row, forever.
     pub(crate) fn render_author_chip_strip(
         &self,
         id: &'static str,
@@ -441,11 +304,6 @@ impl AdeApp {
     }
 
     /// One author chip, at the mock's own 13px box.
-    ///
-    /// An agent's chip is [`Self::render_agent_chip_icon`] - the same component the rail badge and
-    /// the CLI tab chip already use, so a user's own icon pack (GitHub issue #5) applies here too
-    /// and an agent is one recognisable mark everywhere it appears. `you` is not an agent and has
-    /// no icon-pack entry, so it draws the neutral chip directly.
     pub(crate) fn render_author_chip(
         &self,
         author: &Author,
@@ -475,13 +333,6 @@ impl AdeApp {
 
     /// The `<agent> only ✕` indicator, in the file toolbar, **only while a filter is active** -
     /// `STAGE-A-CHANGELOG.md` §4b:
-    ///
-    /// > the per-author filter chips are gone from the toolbar; a single dismissible
-    /// > **`<agent> only ✕`** indicator appears *only while a filter is active*. The filter is
-    /// > still entered from the `⚠` ring on the file row, which is what its tooltip already
-    /// > promised. Without this a filtered diff would read as the whole diff.
-    ///
-    /// Clicking anywhere on it clears the filter, which is what its own tooltip says it does.
     pub(crate) fn render_author_filter_indicator(
         &self,
         cx: &mut Context<Self>,
@@ -550,10 +401,6 @@ pub fn chip_authors(entry: &ChangeSetEntry) -> Vec<Author> {
 }
 
 /// The same, for a whole worktree - the graph's working-tree row `by` union.
-///
-/// Includes [`Author::You`] when the human really did hand-edit something dirty, because `you` is
-/// a first-class author here (rule 2 of this module's docs), and a working tree the human has
-/// written into is a working tree the human contributed to.
 pub fn chip_authors_for(change_set: &super::change_set::ChangeSet) -> Vec<Author> {
     drawable(change_set.authors())
 }
@@ -565,9 +412,6 @@ fn drawable(authors: Vec<Author>) -> Vec<Author> {
 /// Whether `author` is one this app can draw at all - [`author_style`]'s own `Some`/`None`
 /// question, answered without building the [`AuthorStyle`] (and its owned label) that a caller
 /// asking only "is there anything here?" would immediately throw away.
-///
-/// Kept next to [`author_style`] and deliberately phrased as the same `match`, so the two cannot
-/// disagree about which authors are drawable; the render tests exercise both.
 pub fn is_drawable(author: &Author) -> bool {
     match author {
         Author::Agent(key) => key.kind().is_some(),
@@ -616,10 +460,6 @@ mod tests {
         )))
     }
 
-    /// The mock's own acceptance criterion for `src/api/users.rs`, at the level colour is decided:
-    /// *"the open diff shows three distinct gutter tints, one of which is the neutral hand-edit
-    /// tint"*. Two agents that shared a tint would collapse the whole feature into "an agent wrote
-    /// this", which is what Orca already ships.
     #[test]
     fn two_agents_and_a_hand_edit_are_three_distinct_gutter_tints() {
         let claude = author_gutter_color(&agent(AgentKind::Claude)).expect("claude has a tint");
@@ -636,8 +476,6 @@ mod tests {
         );
     }
 
-    /// Rule 1: never guess. An unattributed line has no bar at all, rather than a neutral one -
-    /// the neutral is spoken for, and it means `you`.
     #[test]
     fn an_unattributed_line_gets_no_bar_no_chip_and_no_tooltip() {
         assert_eq!(author_style(&Author::Unattributed), None);
@@ -645,8 +483,6 @@ mod tests {
         assert_eq!(author_tooltip(&Author::Unattributed), None);
     }
 
-    /// The same rule for a real author this build cannot name: a record naming an agent kind that
-    /// does not exist here is honestly undrawable, and drawing it would mean picking one.
     #[test]
     fn an_agent_key_this_build_cannot_read_is_drawn_as_nothing_rather_than_as_a_guess() {
         let future = Author::Agent(AgentKey::new("utf8:/repo/wt-a|Opus|1700000000"));
@@ -659,9 +495,6 @@ mod tests {
         );
     }
 
-    /// The durable key is `<encoded worktree>|<kind>|<spawn second>` and a real worktree path may
-    /// contain a `|`, so this is split from the right - a path that broke it would silently
-    /// mis-colour every line that agent wrote.
     #[test]
     fn an_agent_key_whose_worktree_path_contains_a_pipe_still_resolves_its_kind() {
         let key = AgentKey::new(crate::review::state::baseline_key(
@@ -672,7 +505,6 @@ mod tests {
         assert_eq!(key.kind(), Some(AgentKind::Codex));
     }
 
-    /// `you — hand edit`, verbatim from `STAGE-A-CHANGELOG.md` §1.
     #[test]
     fn the_hand_edit_tooltip_is_the_designs_own_wording() {
         assert_eq!(
@@ -681,7 +513,6 @@ mod tests {
         );
     }
 
-    /// `Jerry.dc.html`'s `muted = attr && who && who !== attr`, all four arms.
     #[test]
     fn a_filter_dims_other_authors_lines_and_nothing_else() {
         let claude = agent(AgentKind::Claude);
@@ -713,9 +544,6 @@ mod tests {
         );
     }
 
-    /// The cheap predicate and the full style must answer the same question - it exists only to
-    /// skip building a label the caller throws away, and a divergence would mean a chip group
-    /// that reserves space for a chip it then cannot draw.
     #[test]
     fn the_cheap_drawable_check_agrees_with_the_full_style_for_every_author() {
         for author in [
@@ -734,8 +562,6 @@ mod tests {
         }
     }
 
-    /// The product decision of 2026-08-14, which `STAGE-A-CHANGELOG.md` §4g had left open: the
-    /// ring stays amber, and it is *the app's own* attention amber rather than a one-off.
     #[test]
     fn the_shared_file_ring_is_the_apps_own_attention_amber() {
         assert_eq!(
@@ -747,14 +573,6 @@ mod tests {
 }
 
 /// The mock's shared-file sad path, rendered for real (GitHub issue #287's acceptance criteria).
-///
-/// > `Jerry.dc.html`'s `Review · uncommitted` state, `src/api/users.rs`: the row shows the `⚠`
-/// > ring and **three author chips** […]; the open diff shows **three distinct gutter tints, one
-/// > of which is the neutral hand-edit tint**.
-///
-/// Everything below is built from real parts: a real git repo, real agent sessions in it, real
-/// provenance recorded through the store's own `PreToolUse`/write/`PostToolUse` sequence, and a
-/// real hand edit on top - then measured against real painted bounds.
 #[cfg(test)]
 mod attribution_render_tests {
     use super::*;
@@ -873,7 +691,6 @@ impl UserApi {
             std::fs::write(&file, after).expect("the agent's own write");
             store.record_agent_edit(repo, &file, &key);
         }
-        // The human's own edit, through the same door `AdeApp::record_hand_edit` uses.
         std::fs::write(&file, AFTER_HAND_EDIT).expect("hand edit");
         store.record_hand_edit(repo, &file);
         (dir, store)
@@ -905,7 +722,6 @@ impl UserApi {
         (app, cx)
     }
 
-    /// Both agents, the hand edit, and the ring - the issue's own first acceptance criterion.
     #[gpui::test]
     fn the_shared_file_row_carries_three_author_chips_inside_the_ring(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -943,9 +759,6 @@ impl UserApi {
         }
     }
 
-    /// `REVISION-2026-08-14.md` §1: the ring means *this path has lines from more than one agent*.
-    /// A file one agent wrote (and the human then touched) is not that, and lighting the ring for
-    /// it would make it mean "someone touched this twice", which is every file.
     #[gpui::test]
     fn a_file_only_one_agent_wrote_gets_chips_but_no_ring(cx: &mut TestAppContext) {
         let dir = TempDir::new().expect("tempdir");
@@ -990,8 +803,6 @@ impl UserApi {
         );
     }
 
-    /// `REVISION-2026-07-31.md` §4: *"Attribution chips render only when the worktree has more
-    /// than one agent - with one agent every chip is identical and carries no information."*
     #[gpui::test]
     fn a_single_agent_worktree_shows_no_chips_no_ring_and_no_footer_hint(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1021,7 +832,6 @@ impl UserApi {
         );
     }
 
-    /// The other half of the same rule: with two agents the gesture is real, so its keycaps show.
     #[gpui::test]
     fn the_footer_advertises_alt_click_exactly_when_there_is_a_chip_to_click(
         cx: &mut TestAppContext,
@@ -1051,9 +861,6 @@ impl UserApi {
         );
     }
 
-    /// The gutter, measured on real painted bounds: an *additional* channel beside the diff-kind
-    /// accent, never a replacement for it, and present only on lines a real author is on record
-    /// for.
     #[gpui::test]
     fn the_diff_gutter_paints_an_author_bar_beside_the_kind_accent(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1163,8 +970,6 @@ impl UserApi {
         );
     }
 
-    /// A worktree with no provenance at all renders exactly the diff it always did - which is what
-    /// makes "attribution renders only where provenance exists" safe rather than a special case.
     #[gpui::test]
     fn a_file_with_no_recorded_provenance_gets_no_gutter_bars_at_all(cx: &mut TestAppContext) {
         let (repo, _store) = shared_file_repo();
@@ -1196,8 +1001,6 @@ impl UserApi {
         );
     }
 
-    /// Clicking the ring is the whole entry point: it opens the file and filters it, and the
-    /// toolbar then says so.
     #[gpui::test]
     fn clicking_the_ring_opens_the_file_filtered_and_names_the_filter(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1242,8 +1045,6 @@ impl UserApi {
         );
     }
 
-    /// `alt`+click picks *that* chip's author, which is the whole reason the modified click
-    /// exists - the ring alone can only ever open the first one.
     #[gpui::test]
     fn alt_clicking_a_chip_filters_to_that_chips_own_author(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1273,7 +1074,6 @@ impl UserApi {
         });
     }
 
-    /// The `✕` really clears it, and the indicator goes with it.
     #[gpui::test]
     fn dismissing_the_indicator_clears_the_filter(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1307,8 +1107,6 @@ impl UserApi {
         );
     }
 
-    /// A filter is a fact about one file. Opening another one is opening an unfiltered diff -
-    /// otherwise a file its author never touched would render entirely dimmed and read as empty.
     #[gpui::test]
     fn opening_another_file_is_not_still_filtered(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
@@ -1345,8 +1143,6 @@ impl UserApi {
         assert!(cx.debug_bounds("diff-author-filter").is_none());
     }
 
-    /// Audit items I4/I5, on the graph's synthetic first row: it is called `Working tree`, it
-    /// pins no single agent, and it carries the real `by` union with the real union figure.
     #[gpui::test]
     fn the_graph_working_tree_row_carries_the_union_not_one_agent(cx: &mut TestAppContext) {
         let (repo, store) = shared_file_repo();
