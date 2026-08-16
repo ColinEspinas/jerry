@@ -1283,6 +1283,18 @@ mod title_menu_tests {
                 cx,
             );
         });
+        // Retagged to a real agent kind: `select_relative_agent` only ever stops on a real agent
+        // session (GitHub issue #381 - a row that says "Next Agent" must not land on a terminal),
+        // so a cycle built out of plain shells would have nothing to cycle through at all. The
+        // second worktree's agent is retagged too, so it stays a genuine candidate for the
+        // cross-worktree leak this test's own docs are about - filtering by kind must not be what
+        // keeps cycling inside worktree A.
+        app.update(cx, |app, _cx| {
+            let ids: Vec<AgentId> = app.agents.iter().map(|agent| agent.id).collect();
+            for id in ids {
+                app.agents.set_kind_for_test(id, ProcessKind::claude());
+            }
+        });
         // Spawning into the second worktree above made its own agent globally active - re-
         // select the first worktree to restore it as the one under test (its own last-active tab
         // via `Agents::activate_for_worktree`).
@@ -1359,5 +1371,102 @@ mod title_menu_tests {
                  find nothing"
             );
         });
+    }
+
+    /// GitHub issue #381: `Next Agent`/`Previous Agent` skip plain terminals, and - because the
+    /// active tab being a terminal is the *normal* state, not an edge case - stepping from one
+    /// enters the agent cycle at its near end rather than doing nothing.
+    ///
+    /// The strip here is `[shell, claude, codex]`, which is what a worktree looks like the moment
+    /// a user starts two agents in it: the startup shell `select_worktree` opened, then their
+    /// agents. Before this fix the cycle had three stops and half of every user's presses landed
+    /// them back on the terminal they were trying to leave.
+    #[gpui::test]
+    fn next_agent_skips_shells_and_enters_the_cycle_from_one(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        for _ in 0..2 {
+            app.update_in(cx, |app, window, cx| {
+                app.new_agent(ProcessKind::Shell, window, cx);
+            });
+        }
+        cx.run_until_parked();
+        let ids: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        assert_eq!(ids.len(), 3, "the startup shell plus two more tabs");
+        app.update(cx, |app, _cx| {
+            app.agents.set_kind_for_test(ids[1], ProcessKind::claude());
+            app.agents.set_kind_for_test(ids[2], ProcessKind::codex());
+        });
+
+        // Sitting on the shell: `Next Agent` must be offered, and must go somewhere.
+        app.update_in(cx, |app, window, cx| app.select_agent(ids[0], window, cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.menu_command_enabled(MenuCommand::NextAgent),
+                "with real agents open, `Next Agent` from a terminal is a real action"
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_relative_agent(1, window, cx)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(ids[1]),
+            "stepping forward off a terminal must enter the agent cycle at its first agent, \
+             never be a silent no-op"
+        );
+
+        // Forward again wraps across the two agents - the shell is not a stop.
+        app.update_in(cx, |app, window, cx| {
+            app.select_relative_agent(1, window, cx)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(ids[2])
+        );
+        app.update_in(cx, |app, window, cx| {
+            app.select_relative_agent(1, window, cx)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(ids[1]),
+            "the cycle wraps between the two real agents and never lands on the shell"
+        );
+
+        // Backwards off a terminal enters at the far end instead.
+        app.update_in(cx, |app, window, cx| app.select_agent(ids[0], window, cx));
+        app.update_in(cx, |app, window, cx| {
+            app.select_relative_agent(-1, window, cx)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(ids[2]),
+            "stepping backward off a terminal must enter at the last agent"
+        );
+
+        // And with no agent session at all there is genuinely nothing to offer.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.set_kind_for_test(ids[1], ProcessKind::Shell);
+            app.agents.set_kind_for_test(ids[2], ProcessKind::Shell);
+            app.select_agent(ids[0], window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.menu_command_enabled(MenuCommand::NextAgent),
+                "a worktree of nothing but terminals has no agent to cycle to"
+            );
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.select_relative_agent(1, window, cx)
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(ids[0]),
+            "and the action itself is a real no-op there, not a jump to a terminal"
+        );
     }
 }

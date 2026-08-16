@@ -247,8 +247,8 @@ impl Agents {
         self.agents.iter().filter(move |agent| agent.cwd == cwd)
     }
 
-    /// How many agents are currently open in `cwd` - the real signal behind GitHub issue #225's
-    /// **single-agent gate**.
+    /// How many **real agent sessions** are currently open in `cwd` - the real signal behind
+    /// GitHub issue #225's **single-agent gate**.
     ///
     /// The whole review surface (the Review tab, the footer's `Review diff` door, and the rail's
     /// review-ready status) is held back for any worktree with more than one open agent, because
@@ -257,30 +257,49 @@ impl Agents {
     /// would have no way to tell them apart. Presenting that as "this agent's review" would be a
     /// fabrication, so it shows nothing at all until the worktree is back down to one agent.
     ///
+    /// A plain [`ProcessKind::Shell`] is **not** counted (GitHub issue #381). The gate is about
+    /// *which agent gets credited with a diff*, and a shell is never a candidate for that credit:
+    /// no baseline is ever captured for one ([`crate::review::flow::AdeApp::
+    /// capture_review_baseline`] refuses outright), it has no turns to end, and it can never
+    /// itself open a review surface. Counting one was not a conservative choice, it was a
+    /// silently fatal one: `crate::root::AdeApp::select_worktree` spawns a startup shell into
+    /// every worktree that has no tab yet, so the *first* agent started in any worktree already
+    /// shared it with that shell and the gate never opened for it - the review surface was
+    /// effectively dead in the default configuration. `crate::sound::flow`'s module docs had
+    /// already written that consequence down ("Every window starts with a shell already open in
+    /// the repo, so spawning a Claude agent into that same worktree makes two agents there - the
+    /// single-agent gate then never opens for it") and routed around it rather than fixing it
+    /// here.
+    ///
     /// Deliberately a **decision-time** check, not a capture-time one: a baseline is still
     /// captured for every agent regardless of how many share its worktree (it's cheap, and it
     /// means the surface simply starts working - correctly, against a real baseline taken at the
     /// right moment - the instant the others close). Only *display* is gated.
     ///
-    /// Reads through [`Self::iter_for_cwd`] rather than open-coding the filter, so the tab
-    /// strip's own per-worktree scoping and this gate can never disagree about which agents
-    /// belong to a worktree.
+    /// Reads through [`Self::iter_for_cwd`] rather than open-coding the per-worktree filter, so
+    /// the tab strip's own per-worktree scoping and this gate can never disagree about which
+    /// agents belong to a worktree.
     pub fn count_for_cwd(&self, cwd: &Path) -> usize {
-        self.iter_for_cwd(cwd.to_path_buf()).count()
+        self.iter_for_cwd(cwd.to_path_buf())
+            .filter(|agent| agent.kind.is_agent_session())
+            .count()
     }
 
-    /// `true` if `id` names an agent that is the **only** one currently open in its own
-    /// worktree: the review surface's real gate, in the one form every call site wants. `false`
-    /// for an
-    /// unknown id (e.g. a just-closed agent), so a stale click handler can never re-open a review
-    /// surface for an agent that no longer exists.
+    /// `true` if `id` names a **real agent session** that is the only one currently open in its
+    /// own worktree: the review surface's real gate, in the one form every call site wants.
+    /// `false` for an unknown id (e.g. a just-closed agent), so a stale click handler can never
+    /// re-open a review surface for an agent that no longer exists - and `false` for a plain
+    /// [`ProcessKind::Shell`], which is not a session this gate can ever open *for* (it has no
+    /// baseline and nothing to review); without that check a lone shell would satisfy a gate
+    /// whose whole subject is "which agent's changes are these".
     ///
-    /// See [`Self::count_for_cwd`] for why this gate exists at all.
+    /// See [`Self::count_for_cwd`] for why this gate exists at all, and why the count it reads
+    /// leaves shells out.
     pub fn is_sole_agent_in_worktree(&self, id: AgentId) -> bool {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return false;
         };
-        self.count_for_cwd(&agent.cwd) == 1
+        agent.kind.is_agent_session() && self.count_for_cwd(&agent.cwd) == 1
     }
 
     /// **The worktree's primary agent**: its own last-active tab (see [`Self::active_by_cwd`]),

@@ -1101,6 +1101,165 @@ mod review_flow_tests {
         });
     }
 
+    /// **A plain terminal sharing the worktree does not gate anything** (GitHub issue #381).
+    ///
+    /// The single-agent gate exists so one agent's review can't claim another agent's changes;
+    /// a [`ProcessKind::Shell`] is not a party it can ever be confused with - no baseline is
+    /// captured for one, it has no turns, and it can never open a review surface of its own. It
+    /// used to be counted anyway, and the consequence was not a corner case: `select_worktree`
+    /// opens a startup shell in every worktree that has no tab yet, so the *first* agent started
+    /// anywhere already shared its worktree with that shell and the gate never opened for it. The
+    /// review surface was effectively dead in the default configuration - `crate::sound::flow`'s
+    /// module docs describe exactly this and route around it.
+    ///
+    /// Deliberately does **not** use [`sole_agent`], whose whole job is to close the startup
+    /// shell first: keeping that shell open is the entire point of this test.
+    #[gpui::test]
+    fn a_plain_shell_in_the_same_worktree_does_not_gate_the_review_surface(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = diverged_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        let shell = app.read_with(cx, |app, _| {
+            let ids: Vec<AgentId> = app.agents.iter().map(|agent| agent.id).collect();
+            assert_eq!(ids.len(), 1, "the window's own startup shell");
+            ids[0]
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == shell)
+                    .map(|agent| agent.kind),
+                Some(ProcessKind::Shell),
+                "sanity check: the startup tab really is a shell, not an agent session"
+            );
+        });
+
+        // A real agent alongside it - the shell stays open, exactly as it does in the app.
+        app.update_in(cx, |app, window, cx| {
+            app.new_agent(ProcessKind::claude(), window, cx);
+        });
+        cx.run_until_parked();
+        let agent = app.read_with(cx, |app, _| {
+            app.agents.active_id().expect("the agent just spawned")
+        });
+        std::fs::write(repo.path().join("agent_work.rs"), "fn main() {}\n").expect("write");
+        app.update(cx, |app, cx| app.load_agent_review(agent, cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.iter().count(),
+                2,
+                "sanity check: the shell and the agent really are both open in this worktree"
+            );
+            assert!(
+                app.agents.is_sole_agent_in_worktree(agent),
+                "a terminal is not an agent - the agent is still the only *agent session* here"
+            );
+            assert!(
+                app.review_available_for(agent),
+                "an open terminal must not hold back the whole review surface"
+            );
+            assert_eq!(app.agent_review_file_count(agent), Some(1));
+            assert!(
+                !app.agents.is_sole_agent_in_worktree(shell),
+                "and the shell itself is never the subject of this gate - it has no baseline and \
+                 nothing to review"
+            );
+            assert!(
+                !app.review_available_for(shell),
+                "a shell must never get a review surface of its own"
+            );
+        });
+
+        // The tab really opens, not just the predicate.
+        app.update_in(cx, |app, window, cx| app.open_review_tab(agent, window, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.review_tab_open, Some(agent));
+            assert!(app
+                .combined_tab_order()
+                .contains(&work_surface::TabRef::Review(agent)));
+        });
+    }
+
+    /// **Every real spawn door captures a baseline**, not just `new_agent`.
+    ///
+    /// Found by driving the running app while verifying GitHub issue #381: `new_agent_pane`
+    /// (`ctrl-shift-N`, the title bar's `New Agent Pane` row, and the empty pane's own
+    /// `Start an agent` CTA) and `respawn_agent` (`Retry`/`Resume`) both spawned a real agent and
+    /// never captured one, so no agent started through them could ever open a review surface -
+    /// and `new_agent_pane` is how most agents in this app are actually started. `respawn_agent`
+    /// is the worse of the two: its own `close_agent` has already *released* the previous
+    /// agent's ref, so a retried agent was left with neither.
+    ///
+    /// Asserted through `AdeApp::agent_reviews` (a real captured baseline with a real
+    /// `refs/jerry/review/*` ref behind it), not merely through `review_available_for`, so this
+    /// can't pass on the single-agent gate alone.
+    #[gpui::test]
+    fn every_spawn_door_captures_a_review_baseline(cx: &mut TestAppContext) {
+        let repo = diverged_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // `new_agent_pane` resolves the first agent CLI really installed on `$PATH` in the
+        // background before it spawns, so this needs a real parked run to land.
+        app.update(cx, |app, cx| app.new_agent_pane(cx));
+        cx.run_until_parked();
+        let from_pane_door = app.read_with(cx, |app, _| {
+            app.agents
+                .active_id()
+                .expect("new_agent_pane spawned a tab")
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == from_pane_door)
+                    .is_some_and(|agent| agent.kind.is_agent_session()),
+                "sanity check: this door spawns a real agent session, not a shell"
+            );
+            let review = app
+                .agent_reviews
+                .get(&from_pane_door)
+                .expect("`New Agent Pane` must capture a review baseline like every other door");
+            assert!(
+                !review.baseline.tree_id.is_empty(),
+                "and a real snapshot behind it, not an empty placeholder"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                review.baseline.tree_id,
+                "the real ref must point at that snapshot"
+            );
+        });
+
+        // `Retry`/`Resume`: closes the tab (releasing its ref) and spawns a fresh agent.
+        app.update_in(cx, |app, window, cx| {
+            app.respawn_agent(from_pane_door, window, cx)
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let respawned = app.agents.active_id().expect("respawn_agent spawned a tab");
+            assert_ne!(
+                respawned, from_pane_door,
+                "sanity check: a respawn is a genuinely new agent, not the old one revived"
+            );
+            let review = app.agent_reviews.get(&respawned).expect(
+                "a retried agent must get its own baseline - its predecessor's ref was just \
+                 released, so without one it has nothing at all to review against",
+            );
+            assert_eq!(
+                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                review.baseline.tree_id
+            );
+        });
+    }
+
     /// Closing an agent releases its baseline ref (so `git gc` can reclaim the objects) but
     /// deliberately keeps the persisted metadata entry - the groundwork GitHub issue #227 needs.
     #[gpui::test]
