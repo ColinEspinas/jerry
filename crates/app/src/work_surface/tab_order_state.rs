@@ -479,6 +479,12 @@ mod tests {
             state.worktrees.is_empty(),
             "closing every file tab must not leave an empty entry behind forever"
         );
+
+        // A session whose every entry is unrecordable (outside the root) encodes to nothing, and
+        // must be forgotten the same way an explicitly empty one is.
+        state.set_session_tabs(root, &file_session(&[root.join("a.rs")]));
+        state.set_session_tabs(root, &file_session(&[PathBuf::from("/etc/passwd")]));
+        assert!(state.worktrees.is_empty());
     }
 
     #[test]
@@ -560,37 +566,19 @@ mod tests {
         assert_eq!(on_disk.file_order(b), vec![b.join("b.rs")]);
     }
 
+    /// Neither a file that is not there nor one that is not valid TOML may fail the load - a
+    /// hand-edited or half-written `tab-order.toml` degrades to the empty state.
     #[test]
-    fn a_missing_file_loads_as_empty_state_rather_than_failing() {
+    fn a_missing_or_corrupted_file_loads_as_empty_state_rather_than_failing() {
         let dir = crate::test_support::temp_root();
-        let state = TabOrderState::load_at(&dir.path().join("does-not-exist.toml"));
-        assert_eq!(state, TabOrderState::default());
-    }
+        assert_eq!(
+            TabOrderState::load_at(&dir.path().join("does-not-exist.toml")),
+            TabOrderState::default()
+        );
 
-    #[test]
-    fn a_corrupted_file_loads_as_empty_state_rather_than_failing() {
-        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(TabOrderState::load_at(&path), TabOrderState::default());
-    }
-
-    #[test]
-    fn a_traversal_entry_in_a_hand_edited_file_is_ignored() {
-        let dir = crate::test_support::temp_root();
-        let path = dir.path().join("tab-order.toml");
-        std::fs::write(
-            &path,
-            "[worktrees.\"/repo/worktree-a\"]\nfiles = [\"../worktree-b/secret.rs\", \"src/main.rs\"]\n",
-        )
-        .expect("write");
-
-        let state = TabOrderState::load_at(&path);
-        assert_eq!(
-            state.file_order(Path::new("/repo/worktree-a")),
-            vec![PathBuf::from("/repo/worktree-a/src/main.rs")],
-            "the `..` entry must be silently dropped, and the good one kept"
-        );
     }
 
     #[test]
@@ -750,8 +738,9 @@ mod tests {
         );
     }
 
-    /// The same traversal guard `files` has always had, applied to a hand-edited `tabs` entry: a
-    /// `..` path must never decode into a file outside the worktree it is filed under.
+    /// The traversal guard, on both record shapes: a `..` path in a hand-edited file - in the
+    /// legacy `files` list or in a `tabs` entry - must never decode into a file outside the
+    /// worktree it is filed under, and must be dropped without taking the good entries with it.
     #[test]
     fn a_traversal_session_entry_in_a_hand_edited_file_is_ignored() {
         let dir = crate::test_support::temp_root();
@@ -775,17 +764,16 @@ mod tests {
                 "/repo/worktree-a/src/main.rs"
             ))],
         );
-    }
 
-    /// A worktree whose whole session is a single unrecordable file (outside the root) must be
-    /// forgotten entirely rather than left with an empty entry - the same contract an explicitly
-    /// empty session already has.
-    #[test]
-    fn a_session_that_encodes_to_nothing_forgets_the_worktree() {
-        let root = Path::new("/repo/worktree-a");
-        let mut state = TabOrderState::default();
-        state.set_session_tabs(root, &file_session(&[root.join("a.rs")]));
-        state.set_session_tabs(root, &file_session(&[PathBuf::from("/etc/passwd")]));
-        assert!(state.worktrees.is_empty());
+        std::fs::write(
+            &path,
+            "[worktrees.\"/repo/worktree-a\"]\nfiles = [\"../worktree-b/secret.rs\", \"src/main.rs\"]\n",
+        )
+        .expect("write");
+        assert_eq!(
+            TabOrderState::load_at(&path).file_order(Path::new("/repo/worktree-a")),
+            vec![PathBuf::from("/repo/worktree-a/src/main.rs")],
+            "the legacy `files` list drops its `..` entry and keeps the good one too"
+        );
     }
 }

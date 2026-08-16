@@ -92,22 +92,18 @@ pub fn spawn_worktree_watcher(repo_path: &Path, dirty: DirtyFlag) -> Option<Reco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// Real-time bounded wait for the watcher's async, OS-thread-delivered callback to fire -
     /// there is no deterministic/simulated clock to advance here (unlike `gpui`'s test
-    /// executor), since `notify`'s events come from the real kernel on a real background
-    /// thread. A generous 3s ceiling, polled every 10ms; real inotify delivery is normally
-    /// sub-millisecond, so this only ever times out on a genuine failure to detect the change.
+    /// executor), since `notify`'s events come from the real kernel on a real background thread.
+    /// `test_support::wait_until` is the workspace's one sanctioned wall-clock wait
+    /// (`docs/testing.md`); real inotify delivery is normally sub-millisecond, so the generous
+    /// ceiling only ever elapses on a genuine failure to detect the change.
     fn wait_until_dirty(dirty: &DirtyFlag) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if dirty.swap(false, Ordering::SeqCst) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        false
+        test_support::wait_until(Duration::from_secs(3), || {
+            dirty.swap(false, Ordering::SeqCst)
+        })
     }
 
     #[test]

@@ -358,14 +358,6 @@ mod session_restore_tests {
     use crate::settings::store as settings_store;
     use gpui::TestAppContext;
 
-    /// A real repo with a real initial commit, so `git worktree list --porcelain` reports a real
-    /// main-worktree row for the app to select - and so `git worktree add` below works at all.
-    fn init_repo() -> (crate::test_support::TempRoot, PathBuf) {
-        let dir = crate::test_support::temp_repo();
-        let root = dir.to_path_buf();
-        (dir, root)
-    }
-
     /// A real linked worktree of `repo`, created under `container` (worktrees live outside the
     /// repo - `crate::rail::repo::Repo::path`'s own docs).
     fn add_worktree(repo: &Path, container: &Path, branch: &str) -> PathBuf {
@@ -462,7 +454,8 @@ mod session_restore_tests {
     fn a_relaunch_reopens_every_file_and_terminal_tab_in_its_real_drag_order(
         cx: &mut TestAppContext,
     ) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
         let settings_dir = crate::test_support::temp_root();
@@ -559,7 +552,8 @@ mod session_restore_tests {
     fn an_unvisited_worktrees_session_costs_nothing_until_it_is_really_selected(
         cx: &mut TestAppContext,
     ) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
         let settings_dir = crate::test_support::temp_root();
@@ -627,7 +621,8 @@ mod session_restore_tests {
     /// reason - never a panic, and never a phantom tab for a path that no longer resolves.
     #[gpui::test]
     fn a_file_deleted_between_sessions_is_skipped_with_a_real_reason(cx: &mut TestAppContext) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");
@@ -677,7 +672,8 @@ mod session_restore_tests {
     fn a_claude_agent_is_restored_by_a_real_resume_carrying_its_own_session_id(
         cx: &mut TestAppContext,
     ) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         let session_id = "5af4c210-34fa-4ab2-9c35-f6ceab76551c";
@@ -765,7 +761,8 @@ mod session_restore_tests {
     /// fail the whole restore" half.
     #[gpui::test]
     fn an_agent_with_no_resumable_session_is_refused_honestly_and_alone(cx: &mut TestAppContext) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");
@@ -839,7 +836,8 @@ mod session_restore_tests {
     fn relaunching_with_no_cli_argument_lands_back_in_the_last_worktree_with_its_tabs(
         cx: &mut TestAppContext,
     ) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
         let settings_dir = crate::test_support::temp_root();
@@ -883,7 +881,8 @@ mod session_restore_tests {
     /// overriding the user, not helping them.
     #[gpui::test]
     fn an_explicitly_named_path_still_wins_over_the_remembered_worktree(cx: &mut TestAppContext) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
         let settings_dir = crate::test_support::temp_root();
@@ -914,8 +913,10 @@ mod session_restore_tests {
     /// moment the user goes to it.
     #[gpui::test]
     fn both_repos_tab_sessions_survive_a_relaunch(cx: &mut TestAppContext) {
-        let (_repo_a, repo_a) = init_repo();
-        let (_repo_b, repo_b) = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_a = repo_a.to_path_buf();
+        let repo_b = crate::test_support::temp_repo();
+        let repo_b = repo_b.to_path_buf();
         let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_a.join("in-a.txt"), "a\n").expect("write");
@@ -979,7 +980,8 @@ mod session_restore_tests {
     /// tabs would quietly resurrect them forever.
     #[gpui::test]
     fn a_deliberately_closed_tab_stays_closed_across_a_relaunch(cx: &mut TestAppContext) {
-        let (_repo, repo_path) = init_repo();
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
         let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");

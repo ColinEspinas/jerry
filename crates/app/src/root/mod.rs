@@ -1,80 +1,15 @@
-//! The top-level three-pane window: a left worktree sidebar, a tabbed center pane of
-//! terminal agents, and a right file tree, composed as GPUI entities.
+//! The top-level three-pane window: a left worktree rail, a tabbed centre pane of terminal
+//! agents, and a right file tree, composed as GPUI entities.
 //!
-//! ## What lives here, and what doesn't
+//! Owns [`AdeApp`] itself - the one state struct every subsystem reads and mutates - its
+//! construction ([`state`]), the crate's GPUI actions, the `Render` impl that composes the
+//! zones, and the genuinely cross-zone mechanics: focus and overlay discipline ([`focus`]),
+//! pane resizing ([`resize`], [`layout`]), the scoped rem-size override ([`rem_scope`]), the
+//! shared widgets ([`widgets`]), pluralisation ([`plural`]), the background-task slot type
+//! ([`task_pool`]) and the "New file" prompt ([`new_file`]).
 //!
-//! This module is the *app shell*, not a grab-bag of rendering code. It owns [`AdeApp`]
-//! itself (the one state struct every subsystem reads and mutates) and its construction
-//! ([`state`]), the crate's GPUI actions, the `Render` impl that composes the zones, and
-//! the genuinely cross-zone mechanics: focus/overlay discipline ([`focus`], [`OverlayFocus`]), pane resizing
-//! ([`resize`] plus its pure width-clamp half, [`layout`]), the scoped rem-size override
-//! Surface C's zoom paints through ([`rem_scope`]), the shared keycap/chip/message widgets
-//! ([`widgets`]), the app-wide pluralisation helper every counter in the window conjugates
-//! through ([`plural`] - see its module docs for the rule, which is binding on new code), the
-//! background-task slot type ([`task_pool`]), and the "New file" prompt
-//! ([`new_file`]), which is an overlay reachable from two different zones and so belongs to
-//! neither.
-//!
-//! Everything *about one subsystem* lives in that subsystem's own folder instead - both its
-//! pure, window-free logic and the `impl AdeApp` blocks that draw it: `crate::rail`,
-//! `crate::work_surface`, `crate::sidebar`, `crate::code_surface`, `crate::merge`,
-//! `crate::palette`, `crate::settings`, `crate::status_bar`, `crate::title_bar`,
-//! `crate::terminal`, `crate::lsp`, `crate::worktree_history`. So "everything about
-//! feature X" is one directory, not two unrelated ones.
-//!
-//! ## Offloading `wt-core`'s blocking calls
-//!
-//! `wt_core::list_worktrees` performs blocking I/O (`gix` object-database reads, and
-//! sometimes spawning `git`). It's never called directly from `render` or an event handler;
-//! [`AdeApp::load_worktrees`] hands it to `cx.background_executor().spawn(..)` and only
-//! touches `self` again inside a `this.update(cx, ..)` callback once the background task
-//! resolves. `crate::sidebar::file_tree::build_file_tree`'s `std::fs::read_dir` walk follows the same
-//! pattern.
-//!
-//! ## One rail row per worktree; agents are tabs scoped to it
-//!
-//! [`crate::work_surface::agents::Agents`] holds any number of independent, simultaneously-running
-//! terminal agents (a plain shell, or an agent CLI), each pinned to the worktree it was
-//! started in. The agent rail shows exactly one row per worktree
-//! (`crate::rail::state::WorktreeRow`, aggregating every agent open in it), and the centre pane's tab
-//! strip (`AdeApp::render_tab_strip`) only ever shows the *currently selected* worktree's own
-//! agents - never a flat, unscoped list of every agent across every worktree.
-//!
-//! Selecting a worktree in the sidebar still never spawns or kills anything - but, unlike
-//! before this revision, it *does* change which agent is "active"
-//! (`crate::work_surface::agents::Agents::activate_for_worktree`, called from [`AdeApp::select_worktree`]):
-//! the active agent must always belong to the selected worktree, or the centre pane would show
-//! one worktree's terminal while the rail highlights another. [`AdeApp::selected`] itself still
-//! drives the file tree, and which worktree `current_worktree_path` resolves to for the *next* "New
-//! terminal"/"New agent pane" click - that part is unchanged. Spawning an agent is still always
-//! its own explicit action, never an implicit side effect of browsing.
-//!
-//! ### A tab always belongs to a real, selected worktree - never to a repo
-//!
-//! The invariant that ties all of the above together, and the one a family of reported bugs all
-//! turned out to be violations of:
-//!
-//! > **A tab is never shown, never spawnable, and never implicitly attributed to anything except a
-//! > real, currently-selected worktree. There is no such thing as "a repo's own tab".**
-//!
-//! [`AdeApp::current_worktree_path`] is the single chokepoint that enforces it, and it returns
-//! `Option<PathBuf>` precisely so that "nothing is selected" is a state the app can *say* rather
-//! than paper over. It used to fall back to [`AdeApp::focused_repo_path`] whenever
-//! [`AdeApp::selected`] was `None`, which quietly made a repo root behave like a worktree it is
-//! not - see that method's own docs for the three live-reproduced failures that produced
-//! (a real tab no rail row claimed and that a single click orphaned forever; the rail, tab strip,
-//! and centre pane disagreeing three ways; and the reported "I select a worktree and the startup
-//! terminal is lost").
-//!
-//! The other half is that the `None` state is kept genuinely rare rather than merely handled: the
-//! two real "open a repo" gestures - a CLI launch ([`AdeApp::new_with_settings`]) and "Open
-//! Folder…" ([`AdeApp::open_repo_in_current_window`]) - both funnel through
-//! [`AdeApp::load_worktrees_for_opened_repo`], which resolves the repo's real worktree list,
-//! genuinely selects the right worktree of it
-//! ([`crate::rail::worktrees::selection_for_opened_repo`]), and only then spawns that window's
-//! guaranteed initial shell, into that concretely-selected worktree. So a focused repo at rest
-//! always has a real worktree selected; `None` is confined to the brief in-flight window before
-//! that first fetch lands, and to genuine error states.
+//! Everything *about one subsystem* lives in that subsystem's own folder instead, pure logic
+//! and `impl AdeApp` blocks alike - so "everything about feature X" is one directory, not two.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2966,59 +2901,21 @@ impl AdeApp {
         }
     }
 
-    /// GitHub issue #90's "Open Folder…" (`crate::title_bar::menu`'s File-menu row) and the
-    /// empty-state view's own "Open Folder" button (`Self::render_empty_state`) both funnel
-    /// through here: `path` becomes a real, focused repo in the *current* window, and every
-    /// single-repo-scoped piece of state this app still has is reset/reloaded against it via
-    /// [`Self::reset_repo_scoped_state`] (the exact same reset [`Self::select_worktree`] applies
-    /// on every worktree switch, extracted so this real "switch to an entirely different repo"
-    /// gesture can share it rather than reimplementing a partial copy) - unlike plain
-    /// [`Self::add_repo`] + [`Self::focus_repo`] alone, which (per their own docs) don't reload
-    /// anything, since until now the only place that combination ran was startup, where the
-    /// caller went on to do the reload itself right afterwards ([`Self::new_with_settings`]).
+    /// Makes `path` a real, focused repo in the *current* window: the File menu's "Open Folder…"
+    /// row and the empty state's own button both funnel through here.
     ///
-    /// An independent audit of this method's first version found (and this now fixes) two real
-    /// gaps beyond the incomplete state reset above:
-    /// - it never (re)started [`Self::start_worktree_watch`]/[`Self::start_status_polling`] - a
-    ///   window that starts empty and only later opens a folder never got rail status polling at
-    ///   all, and a window switching from repo A to repo B kept its watcher bound to A's path.
-    ///   Both are safe to call unconditionally here: assigning a fresh `Task`/watcher to their own
-    ///   field drops (and so cancels) whatever was previously running there, so this can never
-    ///   leave two loops running at once.
-    /// - a genuinely empty window's Settings/palette overlay may have captured
-    ///   [`Self::empty_state_focus_handle`] as its own "return focus to" target
-    ///   ([`OverlayFocus::capture`]) - once a real repo is focused, [`Self::render_empty_state`]
-    ///   stops being part of the rendered tree at all, so restoring focus to it later would
-    ///   silently dangle every global keybinding. [`OverlayFocus::forget_target`] is this
-    ///   project's own established fix for exactly this class of bug (see its own docs).
+    /// Every single-repo-scoped piece of state is reset against it via
+    /// [`Self::reset_repo_scoped_state`], the worktree watcher and status polling are rebound to
+    /// it (both are safe to call unconditionally - assigning a fresh `Task`/watcher to its own
+    /// field cancels whatever was running there), and a Settings/palette overlay still holding
+    /// [`Self::empty_state_focus_handle`] as its return target forgets it, since
+    /// [`Self::render_empty_state`] leaves the rendered tree the moment a repo is focused.
     ///
-    /// ## Cross-repo agent persistence
-    ///
-    /// Every agent open before this call, in *every* repo, stays exactly as it was: a real PTY
-    /// process left running in the background, never paused and never closed just because
-    /// `path` is about to become the focused repo instead. This used to shut down every other
-    /// repo's agents right here (the same real teardown [`Self::close_agent`] always uses) on the
-    /// reasoning that nothing yet let a user reach them again - the tab strip
-    /// ([`crate::work_surface::render::AdeApp::combined_tab_order`]) is still genuinely scoped to
-    /// the *active worktree* (`Agents::iter_for_cwd`), so a repo other than `path` shows none of
-    /// its own tabs the moment focus moves away. That reasoning no longer holds: the rail's own
-    /// per-repo groups ([`crate::rail::render::AdeApp::build_repo_groups`]) now fold every repo's
-    /// real open agents into their own rows regardless of focus, with genuinely live status, so a
-    /// background repo's agent is still fully reachable - just through the rail instead of the
-    /// tab strip - and closing it out from under the user the instant they looked away would be a
-    /// real, silent kill of work they never asked to stop. Switching back to that repo later
-    /// (another call here, or [`Self::checkout_repo_from_rail`]) finds the exact same
-    /// [`AgentId`]s mid-work, never a fresh respawn.
-    ///
-    /// Idempotent against a repo already known to this window (re-opening an already-added repo
-    /// just re-focuses and reloads it, rather than duplicating anything) - the same
-    /// [`Self::add_repo`] guarantee this builds on. A repo with no agent open yet in its own root
-    /// (a genuinely new repo, or one whose root worktree was closed by hand) gets one spawned
-    /// here, the same "a fresh window starts with one shell in the repo root" default
-    /// [`Self::new_with_settings`] gives a CLI-launched repo - a repo revisited after being
-    /// unfocused keeps whatever real agent(s) it already had running, per the cross-repo
-    /// persistence above, so this never spawns a redundant second shell into a worktree that
-    /// already has one.
+    /// Agents open in *other* repos stay running: the rail's per-repo groups fold every repo's
+    /// agents into their own rows regardless of focus, so a background repo's agent is still
+    /// reachable, and switching back finds the same [`AgentId`]s mid-work rather than a respawn.
+    /// Idempotent for an already-known repo, and a repo that already has an agent in its own root
+    /// gets no redundant second shell.
     pub(crate) fn open_repo_in_current_window(
         &mut self,
         path: PathBuf,
@@ -3057,45 +2954,17 @@ impl AdeApp {
         self.start_status_polling(cx);
     }
 
-    /// The rail's real repo-switch engine - the rail-native sibling of
-    /// [`Self::open_repo_in_current_window`]. It began as GitHub issue #113's "click a repo
-    /// header in the rail and it checks out", but the repo header is deliberately **not
-    /// clickable at all anymore** (explicit user direction, after two subtler header-click
-    /// behaviors were both rejected in review - see
-    /// [`crate::rail::render::AdeApp::render_repo_group`]'s own docs: in the rail, only worktree
-    /// rows and agent rows are click targets). So today this has exactly one real caller:
-    /// [`Self::select_worktree_by_path`]'s cross-repo fallback, reached by clicking a worktree
-    /// row under a non-focused repo's group.
+    /// The rail's repo-switch engine, reached from [`Self::select_worktree_by_path`]'s cross-repo
+    /// fallback when a worktree row under a non-focused repo's group is clicked. (The repo header
+    /// itself is inert - in the rail, only worktree rows and agent rows are click targets.)
     ///
-    /// Shares `open_repo_in_current_window`'s real repo-switch reload
-    /// (`Self::reset_repo_scoped_state`, `Self::start_worktree_watch`/`Self::start_status_polling`,
-    /// forgetting a dangling [`Self::empty_state_focus_handle`] overlay target, and real
-    /// cross-repo agent persistence - see that method's own "Cross-repo agent persistence" docs,
-    /// which apply here unchanged) but deliberately does **not** call [`Self::add_repo`] or spawn
-    /// an initial shell: `id` must already be a known [`Self::repos`] entry (every row the rail
-    /// renders came from there), and unlike "Open Folder…" - which always guarantees *some* real
-    /// terminal is running so a freshly opened folder is never inert - this focuses the repo
-    /// with nothing selected and nothing spawned, leaving the follow-up worktree selection to
-    /// its caller.
+    /// Shares [`Self::open_repo_in_current_window`]'s repo-switch reload and its cross-repo agent
+    /// persistence, but never calls [`Self::add_repo`] and never spawns a shell: `id` must
+    /// already be a known [`Self::repos`] entry, and the repo comes up focused with nothing
+    /// selected and nothing reactivated, leaving the follow-up worktree selection to its caller.
     ///
-    /// A no-op if `id` isn't (or is no longer) a known repo - the same defensive guard
-    /// [`Self::focus_repo`] already has, reused here rather than duplicated - or if `id` is
-    /// already [`Self::focused_repo`] (a repeat call for the repo already showing must not
-    /// reset any of its live state).
-    ///
-    /// Unlike [`Self::open_repo_in_current_window`], this never spawns a fallback shell: a repo
-    /// that `id` has never had a real agent open in comes up genuinely empty, a real "focused,
-    /// nothing open yet" state - the user opens something next via the tab strip's own `+` (the
-    /// rail repo header's own `+` is inert until a real "add worktree" design lands - see
-    /// [`crate::rail::render::AdeApp::render_repo_group_new_button`]). A repo `id` has visited
-    /// *before*, though, may already have real agents left running from that earlier visit (see
-    /// [`Self::open_repo_in_current_window`]'s cross-repo persistence docs) - none of them are
-    /// closed or respawned here, and none are *reactivated* either: `Agents::clear_active` below
-    /// leaves the centre pane showing nothing until a worktree row is genuinely selected (see
-    /// the inline comment below and `Agents::clear_active`'s own docs for why clearing, not
-    /// skipping, is the correct half-measure-free behavior). There is no cross-restart
-    /// persistence of *which tabs were open* for a repo yet - a real, disclosed gap, not a
-    /// silently stubbed one.
+    /// A no-op for an unknown `id`, or for one already in [`Self::focused_repo`] - a repeat call
+    /// for the repo already showing must not reset any of its live state.
     pub(crate) fn checkout_repo_from_rail(
         &mut self,
         id: RepoId,
