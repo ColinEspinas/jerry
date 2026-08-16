@@ -833,8 +833,10 @@ impl AdeApp {
                         else {
                             return;
                         };
+                        // No `TextFieldHandle::changed` here either - see
+                        // `AdeApp::wire_simple_input_mouse`'s own docs: a drag moves the
+                        // selection, it never edits the text.
                         if move_field.with(this, |field| field.select_to(offset)) == Some(true) {
-                            move_field.changed(this, cx);
                             cx.notify();
                         }
                     });
@@ -858,8 +860,14 @@ impl AdeApp {
     }
 
     /// The row's own `mouse down`: focus the field, then place/extend/word-select at the real
-    /// hit-tested byte offset, and arm the drag [`Self::simple_input_overlay`]'s window-wide
-    /// listeners extend.
+    /// hit-tested byte offset, and arm the drag that [`Self::simple_input_overlay`]'s window-wide
+    /// listeners go on to extend.
+    ///
+    /// Deliberately does **not** run [`TextFieldHandle::changed`]: a click moves the selection, it
+    /// never edits the text, and that hook is the owning surface's "the text changed" work (the
+    /// Search panel restarting its debounced worktree walk, a note card scheduling a persist).
+    /// Running it here would restart a real filesystem search every time the user clicked into the
+    /// query box.
     ///
     /// Deliberately does **not** `cx.stop_propagation()`: several of these rows sit inside a
     /// larger clickable container whose own handler is what focuses the surface, opens the row for
@@ -889,7 +897,7 @@ impl AdeApp {
                 // `== 2` so a third rapid click keeps re-selecting the word (a single-line field
                 // has no "select the line" step above it - `Ctrl/Cmd+A` is that) instead of
                 // dropping back to a plain caret.
-                let changed = field.with(this, |field| {
+                field.with(this, |field| {
                     if event.click_count >= 2 {
                         field.select_word_at(offset)
                     } else if event.modifiers.shift {
@@ -900,9 +908,6 @@ impl AdeApp {
                 });
                 this.simple_input_drag = Some(layout_key.clone());
                 this.reset_caret_blink(cx);
-                if changed == Some(true) {
-                    field.changed(this, cx);
-                }
                 cx.notify();
             }),
         )
@@ -1112,6 +1117,15 @@ pub(crate) fn text_editing_modifiers(
 /// forever, which is exactly how it ended up the one field whose caret ignored
 /// `crate::text_history::TextField::caret` entirely and sat at the end of the text whatever the
 /// user had arrowed back to.
+///
+/// One honest consequence, stated rather than hidden: a nonzero [`Self::gap_after_text`] is a real
+/// margin on the caret's own (zero-width) anchor, so it displaces whatever text follows the caret
+/// by that many pixels, while the `gpui::ShapedLine` the row hit-tests against describes an
+/// unbroken line. In the palette that is a ≤2px click inaccuracy, and only while the caret is
+/// genuinely *mid-string* (with the caret at the end - where it is for every field until the user
+/// presses Left or Home - there is no following text to displace). Every other field in this app
+/// leaves both gaps at zero and is exact. The alternative was dropping the design's own
+/// `paletteTyped` spacing, which is not this change's call to make.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SimpleInputCaret {
     pub height: Pixels,
