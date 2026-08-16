@@ -738,6 +738,7 @@ impl AdeApp {
             next_tab_settle_id: 0,
             tab_bounds: HashMap::new(),
             tab_slide: HashMap::new(),
+            tab_strip_scroll_handle: gpui::ScrollHandle::new(),
             custom_themes,
             custom_theme_load_errors,
             custom_theme_status: None,

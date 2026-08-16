@@ -976,6 +976,32 @@ impl AdeApp {
     /// that - it appended `#1`/`#2` ordinals to labels that repeated, which requires knowing
     /// which ones repeat - but two tabs genuinely showing the same thing now honestly render the
     /// same label, exactly as any real terminal emulator's tabs do.
+    ///
+    /// GitHub issue #354: the tabs themselves (plus the `+` button right after them) are wrapped
+    /// in their own `#tab-strip-scroll` child - `.flex_1().min_w_0().overflow_x_scroll()`,
+    /// tracked by [`Self::tab_strip_scroll_handle`] - rather than laid out directly in `#tab-strip`
+    /// itself. Before this, the outer row carried no `overflow_x_scroll()`/clip of any kind, so
+    /// once the real tabs (each `flex_none`, i.e. sized to its own content) outgrew the strip's
+    /// available width, the excess simply painted past the pane's own right edge with no way to
+    /// reach it - no scroll-wheel handling (nothing was listening), no drag, and no overflow
+    /// menu either. `.overflow_x_scroll()` alone gives real, live scroll-wheel handling for free
+    /// (`vendor/zed/crates/gpui/src/elements/div.rs`'s own `paint_scroll_listener`, verified
+    /// directly: a plain vertical wheel delta is translated into horizontal `delta_x` whenever
+    /// `overflow.x == Scroll` and `overflow.y` is not also `Scroll`, exactly the "trackpad/wheel
+    /// scrolls a horizontal strip" behaviour every other tabbed app gives for free) - the same
+    /// `gpui::ScrollHandle` idiom `crate::root::scrollbar`'s own module docs describe for every
+    /// other scrollable region in this app, not a bespoke reimplementation. `min_w_0()` is
+    /// required for the same reason `Self::render_center_pane`'s own top docs give for its
+    /// `#work-surface` wrapper: without it, a flex item's automatic minimum size is its content's
+    /// own intrinsic size, so the scroll region would just grow to fit every tab instead of
+    /// staying clipped to the space actually available.
+    ///
+    /// The `+` button rides inside the same scrollable region, immediately after the last tab
+    /// (exactly where it already sits when nothing overflows), so reaching it when tabs overflow
+    /// is the same one scroll gesture that reaches the last tab - not a second, independently
+    /// reachable control. The trailing spacer and the right-aligned agent-jump keycap cluster stay
+    /// **outside** the scrollable region, as `#tab-strip`'s own direct children: they are chrome
+    /// that should always stay visible/pinned, not part of what can be scrolled through.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -991,7 +1017,7 @@ impl AdeApp {
         // **The tabs own it.**" Every child below therefore carries the rule itself, the `+`, the
         // spacer and the counter cluster included, "without which the rule stopped at the last tab
         // and 398px of the window's top edge was simply missing".
-        let mut bar = div()
+        let bar = div()
             .id("tab-strip")
             // Lets a real test measure this column header's own painted box - §4v's
             // "column headers that share a y are one rule, not three" is only checkable against
@@ -1005,16 +1031,33 @@ impl AdeApp {
 
         let order = self.combined_tab_order();
 
+        // GitHub issue #354: the real scrollable region - see this method's own top docs. It is
+        // `flex_1().min_w_0()` (bounded to whatever width the strip actually has left, never
+        // grown past it by its children's own content) and carries the column rule itself
+        // (`.border_b_1()`) so that rule still reaches this region's own right edge when the
+        // tabs don't fill it, exactly like the plain spacer this replaces used to.
+        let mut scroller = div()
+            .id("tab-strip-scroll")
+            .debug_selector(|| "tab-strip-scroll".to_string())
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_stretch()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_strip_scroll_handle)
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER);
+
         for tab_ref in order {
             match tab_ref {
                 work_surface::TabRef::Agent(id) => {
                     if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
                         let label = self.agent_tab_label(agent, cx);
-                        bar = bar.child(self.render_agent_tab(agent, label, cx));
+                        scroller = scroller.child(self.render_agent_tab(agent, label, cx));
                     }
                 }
                 work_surface::TabRef::File(path) => {
-                    bar = bar.child(self.render_file_tab(&path, cx));
+                    scroller = scroller.child(self.render_file_tab(&path, cx));
                 }
                 // GitHub issue #93: the git graph tab is now a real member of the same combined
                 // order every agent/file tab already goes through - draggable, and its own
@@ -1022,33 +1065,28 @@ impl AdeApp {
                 // slot always rendered after every other tab. See `crate::graph_view::render::
                 // render_graph_tab`'s own docs for the drag wiring this required.
                 work_surface::TabRef::Graph => {
-                    bar = bar.child(crate::graph_view::render::render_graph_tab(self, cx));
+                    scroller =
+                        scroller.child(crate::graph_view::render::render_graph_tab(self, cx));
                 }
                 // GitHub issue #225: the agent review tab, a full member of the same combined,
                 // draggable order every other kind already goes through.
                 work_surface::TabRef::Review(id) => {
-                    bar = bar.child(crate::review::render::render_review_tab(self, id, cx));
+                    scroller =
+                        scroller.child(crate::review::render::render_review_tab(self, id, cx));
                 }
                 // GitHub issue #227: the run-transcript tab, a full member of the same combined,
                 // draggable order - one per worktree, replaced rather than stacked.
                 work_surface::TabRef::Run => {
-                    bar = bar.child(crate::run_history::tab::render_run_tab(self, cx));
+                    scroller = scroller.child(crate::run_history::tab::render_run_tab(self, cx));
                 }
             }
         }
 
-        bar = bar.child(self.render_tab_strip_plus(cx));
+        scroller = scroller.child(self.render_tab_strip_plus(cx));
 
         let jump_keys = self.agent_jump_keys();
 
-        bar.child(
-            // The spacer carries the column rule too - see the container's own comment above.
-            div()
-                .flex_1()
-                .border_b_1()
-                .border_color(theme::border::RAIL_INNER),
-        )
-        .child(
+        bar.child(scroller).child(
             div()
                 .flex_none()
                 .flex()
@@ -6378,6 +6416,149 @@ mod agent_pane_readout_tests {
             cx.debug_bounds("context-bar-start-agent").is_some(),
             "a bare worktree's context bar keeps `Start an agent` - it is not one of the \
              worktree verbs §4e removed"
+        );
+    }
+}
+
+/// GitHub issue #354 ("Can't scroll in tab menu so tabs are not accessible once overflowing").
+/// Real end-to-end coverage against `Self::render_tab_strip`'s own `#tab-strip-scroll` region
+/// (this module's own docs): before it existed, the strip carried no `overflow_x_scroll()` of
+/// any kind, so a tab pushed past the strip's own right edge by enough earlier tabs was genuinely
+/// unreachable - no scroll-wheel listener was ever registered for it to receive, no drag, no
+/// overflow menu.
+#[cfg(test)]
+mod tab_strip_overflow_scroll_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    /// Twenty real shell agent tabs (each a genuine `Agent`, no simulated output) reliably
+    /// overflow the narrow test window's centre pane. Proves, against the real painted geometry:
+    /// - the overflow is real (`AdeApp::tab_strip_scroll_handle`'s own `max_offset().x > 0`);
+    /// - the last tab genuinely starts outside `#tab-strip-scroll`'s own visible bounds (the
+    ///   literal "not accessible" the issue title names, not just an assumption);
+    /// - a real scroll to that max offset - the same offset a real scroll-wheel tick would
+    ///   eventually reach (`vendor/zed/crates/gpui/src/elements/div.rs`'s own
+    ///   `paint_scroll_listener`, which this fix relies on for the wheel-to-`delta_x`
+    ///   translation itself) - brings that same tab back inside the visible bounds; and
+    /// - a real `cx.simulate_click` on it, now that it is on screen, genuinely activates it -
+    ///   the concrete, user-facing "tabs are not accessible" this issue reports.
+    #[gpui::test]
+    fn scrolling_the_tab_strip_reaches_a_tab_that_overflowed_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        // Deliberately narrow (`VisualTestContext::simulate_resize`'s own docs) rather than the
+        // default maximized 1920×1080 `TestDisplay`: twenty real tabs overflow a maximized test
+        // window too, but only past several dozen, which would mean this test paying for several
+        // dozen real spawned shell processes just to prove a layout fact. 900px reliably overflows
+        // with the same ~20 tabs the issue itself was filed against.
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+
+        let mut agent_ids: Vec<AgentId> = Vec::new();
+        app.update_in(cx, |app, window, cx| {
+            for _ in 0..20 {
+                let id = app.agents.spawn(
+                    ProcessKind::Shell,
+                    repo.path().to_path_buf(),
+                    12.0,
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
+                agent_ids.push(id);
+            }
+            // `work_surface::Agents::spawn` does not itself call `cx.notify()` - it leaves that to
+            // the caller, once its own batch of setup is done. Without an explicit `cx.notify()`
+            // here, the window never actually redraws off these twenty new agents, and every
+            // `debug_bounds`/`tab_bounds` read below would just be replaying whatever was already
+            // painted from the very first, single-tab frame.
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let last_agent = *agent_ids.last().expect("spawned at least one agent");
+        let last_tab_ref = work_surface::TabRef::Agent(last_agent);
+
+        // `Agents::spawn` selects the agent it just created (matching a real "open a new tab and
+        // land on it"), so without this the last tab would already be active before its own
+        // click, defeating the point of proving the *click* is what activates it. Re-selecting
+        // the first of the twenty spawned agents - itself just as real, and also part of the same
+        // overflowing strip - restores the "not already active" premise the click below depends
+        // on.
+        let first_spawned_agent = agent_ids[0];
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(first_spawned_agent, window, cx);
+        });
+        cx.run_until_parked();
+
+        let strip_bounds = cx
+            .debug_bounds("tab-strip-scroll")
+            .expect("the scrollable tab region must have painted");
+
+        let max_offset = app.read_with(cx, |app, _| app.tab_strip_scroll_handle.max_offset());
+        assert!(
+            max_offset.x > px(0.0),
+            "twenty real tabs must genuinely overflow the strip's own width - premise of this \
+             test; got max_offset.x = {:?}",
+            max_offset.x
+        );
+
+        let bounds_before = app
+            .read_with(cx, |app, _| app.tab_bounds.get(&last_tab_ref).copied())
+            .expect("the last tab must have painted at least once, off-screen or not");
+        assert!(
+            bounds_before.origin.x + bounds_before.size.width
+                > strip_bounds.origin.x + strip_bounds.size.width,
+            "premise: before scrolling, the last of twenty tabs must genuinely sit past the \
+             scrollable region's own visible right edge - last tab right edge {:?}, region right \
+             edge {:?}",
+            bounds_before.origin.x + bounds_before.size.width,
+            strip_bounds.origin.x + strip_bounds.size.width,
+        );
+
+        // The same scroll a real wheel tick (or a drag on a future thumb) would eventually reach -
+        // `gpui::ScrollHandle::set_offset`, the exact setter
+        // `crate::root::scrollbar::ScrollableHandle` wraps for every other scrollable region in
+        // this app.
+        app.update(cx, |app, cx| {
+            app.tab_strip_scroll_handle
+                .set_offset(gpui::point(-max_offset.x, px(0.0)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let strip_bounds_after = cx
+            .debug_bounds("tab-strip-scroll")
+            .expect("the scrollable tab region must still be painted after scrolling");
+        let bounds_after = app
+            .read_with(cx, |app, _| app.tab_bounds.get(&last_tab_ref).copied())
+            .expect("the last tab must still be painted after scrolling");
+        assert!(
+            bounds_after.origin.x >= strip_bounds_after.origin.x
+                && bounds_after.origin.x + bounds_after.size.width
+                    <= strip_bounds_after.origin.x + strip_bounds_after.size.width + px(1.0),
+            "after scrolling to the real max offset, the last tab must be genuinely inside the \
+             scrollable region's own visible bounds - it was {bounds_after:?}, region is \
+             {strip_bounds_after:?}"
+        );
+
+        assert_ne!(
+            app.read_with(cx, |app, _| app.active_agent_pane_id()),
+            Some(last_agent),
+            "premise: the last tab must not already be the active one before its own click is \
+             what activates it"
+        );
+
+        cx.simulate_click(bounds_after.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active_agent_pane_id()),
+            Some(last_agent),
+            "a real click on the previously-overflowing tab, now scrolled into view, must \
+             genuinely activate it - the concrete case GitHub issue #354 reports: \"tabs are not \
+             accessible once overflowing\""
         );
     }
 }

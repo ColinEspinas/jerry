@@ -2428,6 +2428,19 @@ pub struct AdeApp {
     /// "left set, never explicitly cleared" precedent), and a fresh drop's own set of shifted
     /// tabs is never a superset of the previous drop's anyway.
     pub(crate) tab_slide: std::collections::HashMap<work_surface::TabRef, (Pixels, u64)>,
+    /// GitHub issue #354: the unified tab strip's own scroll state, so once the real tab row
+    /// (agent/file/graph/review/run tabs, `work_surface::render::AdeApp::render_tab_strip`)
+    /// overflows the strip's available width, every tab past the visible edge stays real,
+    /// reachable content - scroll-wheel and drag-to-scroll through
+    /// `crate::root::scrollbar::ScrollableHandle`, the same live `gpui::ScrollHandle` idiom
+    /// every other scrollable region in this app already uses (`crate::root::scrollbar`'s own
+    /// module docs) - never silently clipped/unreachable past the strip's own edge, which is
+    /// exactly what shipped with no `.overflow_x_scroll()`/`.track_scroll()` at all before this
+    /// fix. Deliberately scoped to just the tab row itself (not the `+` button, the trailing
+    /// spacer, or the right-aligned agent-jump keycap cluster) - see
+    /// `work_surface::render::AdeApp::render_tab_strip`'s own docs for why only that inner
+    /// wrapper is the real scroll region.
+    pub(crate) tab_strip_scroll_handle: gpui::ScrollHandle,
     /// User-authored themes loaded from `~/.config/jerry/themes/*.toml` at construction time
     /// (GitHub issue #5) - real, additional `crate::settings::custom_theme::CustomTheme` entries
     /// layered on top of the six built-in `settings::THEME_DEFS`, not a replacement for them. See
