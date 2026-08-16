@@ -6,8 +6,8 @@ it that way as more people touch it.
 ## Before you start
 
 `gpui`/`gpui_platform` are plain git dependencies pinned to a specific `zed-industries/zed` commit
-— see the [README](README.md#gpui-version-pin) for the pinned revision. Cargo fetches them
-automatically; no manual checkout is needed.
+— the revision lives in the root [`Cargo.toml`](Cargo.toml), which is its only home; don't restate
+it elsewhere. Cargo fetches them automatically; no manual checkout is needed.
 
 Coding standards (what "no fake functionality" means, the exact hard rules on `unwrap`/`unsafe`/
 paths/git argv, comment style, GPUI patterns) live in [`CLAUDE.md`](CLAUDE.md) — read that, not this
