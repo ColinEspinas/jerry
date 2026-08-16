@@ -121,9 +121,11 @@ use settings::store as settings_store;
 ///   actively being edited, reproduced live by typing `]` into real content. `!`/`&&` are real,
 ///   supported `KeyBindingContextPredicate` syntax (`vendor/zed/crates/gpui/src/keymap/
 ///   context.rs:172-420`'s own `Not`/`And` variants and parser), not invented here.
-/// - `"secondary-1"` through `"secondary-8"` back the tab strip's agent-jump keycaps
+/// - `"secondary-1"` through `"secondary-8"` back agent-jumping
 ///   (`root::AdeApp::jump_to_agent_at`), expanding the design's `mod+1…8` spec into eight
-///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component.
+///   individually bound keystrokes since GPUI has no "N" wildcard keystroke component. No longer
+///   advertised by an on-screen keycap hint (removed per a direct product-owner request), but the
+///   bindings themselves are still real.
 /// - The `Editor*` entries (Revision R8.5a's real File view text editing) are scoped to
 ///   `Some("file-editor")`, a real *additional* context alongside `"diff"` above - both live on
 ///   the *same* focused "code-surface" container (`code_surface::render::AdeApp::

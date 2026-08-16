@@ -873,10 +873,10 @@ mod tab_strip_keybinding_tests {
         let third_tab_id = tab_ids[2];
 
         assert_eq!(
-            app.read_with(cx, |app, _| app.agent_jump_keys()),
-            vec!["1".to_string(), "2".to_string(), "3".to_string()],
-            "the keycap row must advertise one number per real agent session (three), not one \
-             per tab (five)"
+            app.read_with(cx, |app, _| app.current_worktree_agent_sessions().count()),
+            3,
+            "premise: exactly three real agent sessions exist (not five tabs) for \
+             secondary-1..secondary-3 to have anything to number"
         );
 
         // Start from a tab that is neither answer, so the assertion below can't pass by accident.
