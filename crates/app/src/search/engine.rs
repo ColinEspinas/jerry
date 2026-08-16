@@ -21,11 +21,15 @@
 //!
 //! ## Bounded, because a worktree is not bounded
 //!
-//! `target/` alone can hold hundreds of thousands of files, and this walk runs against whatever
-//! the active worktree really contains. Four real limits, each reported honestly rather than
-//! silently applied: [`MAX_MATCHES`], [`MAX_SCANNED_FILES`], [`MAX_FILE_BYTES`] and a binary-file
-//! check. [`SearchOutcome::truncated`] is what the panel's count row turns into a real truncation
-//! notice - the issue's own "results cap with an honest truncation notice".
+//! A `target/`- or `node_modules`-style build/dependency directory can hold hundreds of thousands
+//! of files, and (see "Scoped to real content" below) this walk no longer even opens one -
+//! but the caps here are kept regardless, as real defense in depth against whatever the active
+//! worktree really contains once it *is* real, trackable content: an enormous monorepo, a
+//! generated-and-committed directory, or the fallback walk's own non-git path. Four real limits,
+//! each reported honestly rather than silently applied: [`MAX_MATCHES`], [`MAX_SCANNED_FILES`],
+//! [`MAX_FILE_BYTES`] and a binary-file check. [`SearchOutcome::truncated`] is what the panel's
+//! count row turns into a real truncation notice - the issue's own "results cap with an honest
+//! truncation notice".
 //!
 //! ## Parallel, because a directory walk is not one file
 //!
@@ -58,6 +62,37 @@
 //! outcome (its own generation guard already discards it), so this is a pure CPU-saving early
 //! exit, not a correctness-affecting one. [`search_worktree`] is the non-cancellable convenience
 //! wrapper every existing (and every non-panel) caller keeps using.
+//!
+//! ## Scoped to real content, not to every byte on disk
+//!
+//! A second live report, against a real repository rather than a fixture: "it is very slow still
+//! ... it can take 10 seconds", plus its own corroborating clue - "the perf of the search seems
+//! faster after the first query". Both are explained by the same real defect, and neither the
+//! rayon batching above nor the cancellation below touch it, because it sits one step earlier:
+//! candidate *discovery*. The walk that fed both of those fixes candidates
+//! ([`collect_files_by_walking`], now the fallback path below) skipped only `.git` - every other
+//! directory, including a `.gitignore`d build or dependency directory, was opened and `stat`-ed
+//! like any other. Measured directly against this application's *own* checkout: 125,242 files on
+//! disk, of which 99,250 (79%) sit under its own `target/` - 31 GB of `.gitignore`d Rust build
+//! output. [`MAX_SCANNED_FILES`] (20,000) is smaller than `target/` alone, so the old walk hit
+//! that cap, and reported itself truncated, entirely inside `target/` - before a single real
+//! source file was ever read. That is a real, on-disk directory walk (`read_dir` plus a `stat`
+//! per entry across however much of `target/`'s tree it reached before the cap), which costs real
+//! wall-clock time proportional to how much of that metadata the OS has to fetch from storage
+//! rather than serve from its own dentry/page cache - explaining both reports at once: slow
+//! (real, uncached I/O across tens of thousands of build-output entries) the first time, and
+//! faster on every query after (the same metadata, now warm in the OS cache).
+//!
+//! The real fix is [`wt_core::worktree_files::list_worktree_files`]: `git ls-files --cached
+//! --others --exclude-standard`, the same "what does this worktree really contain" question
+//! `wt_core::review::measure_untracked` already answers for the git-snapshot side of this
+//! codebase (see that module's own docs for the near-identical 19 GB untracked-directory incident
+//! this project has already hit once). Unlike a raw walk, `ls-files` never opens a directory once
+//! its own exclude rule matches it - so a build/dependency directory costs one `stat` on the
+//! directory itself, not one per file inside it. Measured directly against this repository: all
+//! 25,992 real files, in 73ms. [`collect_files_by_walking`] stays as the fallback for the one
+//! case `git` cannot answer - `worktree_path` is not (or is no longer) a real git worktree - so
+//! search still functions there; it is no longer the common path.
 
 use std::collections::HashSet;
 use std::fs;
@@ -68,6 +103,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::search::glob::GlobList;
+use wt_core::worktree_files::list_worktree_files;
 
 /// The largest file this search will read. The same ceiling
 /// `crate::code_surface::code_view::MAX_FILE_BYTES` puts on opening a file in the editor, for the
@@ -350,10 +386,10 @@ pub fn search_worktree_cancellable(
     is_stale: &dyn Fn() -> bool,
 ) -> SearchOutcome {
     let mut outcome = SearchOutcome::default();
-    let mut candidates = Vec::new();
-    collect_files(&request.root, &mut candidates, &mut outcome);
+    let mut candidates = collect_candidate_files(&request.root, &mut outcome);
     // A stable, predictable order: the tree is read top to bottom and a search re-run after a
-    // keystroke must not shuffle rows the user was reading. `read_dir` order is not defined.
+    // keystroke must not shuffle rows the user was reading. Neither `git ls-files`' own order nor
+    // `read_dir`'s is defined to be that.
     candidates.sort();
 
     // The include/exclude filter is real path-string work, not file IO, so it stays sequential -
@@ -361,10 +397,7 @@ pub fn search_worktree_cancellable(
     // batch below holding only real candidates to read.
     let filtered: Vec<(PathBuf, String)> = candidates
         .into_iter()
-        .filter_map(|path| {
-            let relative = relative_slash_path(&request.root, &path)?;
-            request.filter.allows(&relative).then_some((path, relative))
-        })
+        .filter(|(_path, relative)| request.filter.allows(relative))
         .collect();
 
     for batch in filtered.chunks(SEARCH_SCAN_BATCH) {
@@ -443,7 +476,49 @@ fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
     )
 }
 
-/// Every regular file under `dir`, recursively.
+/// Every real candidate file under `request.root`, as an absolute path paired with its
+/// worktree-relative, `/`-separated form - see this module's own "Scoped to real content" docs
+/// for why this asks `git`, not the filesystem, and what that actually fixed.
+///
+/// `git ls-files --cached --others --exclude-standard` (via
+/// [`wt_core::worktree_files::list_worktree_files`]) is tried first: it is both the correct
+/// definition of "this worktree's real content" (tracked files, plus untracked files `git` itself
+/// would offer to stage - the same [`wt_core::review::measure_untracked`] already trusts) and,
+/// because it never opens a directory once its own exclude rule matches it, dramatically cheaper
+/// against a real repository with a `target/`- or `node_modules`-style build/dependency directory
+/// than any walk that has to visit one to find out it should be skipped.
+///
+/// [`collect_files_by_walking`] is the fallback for the one case `git` cannot answer -
+/// `request.root` is not (or is no longer) a real git worktree, or `git` itself could not be run
+/// at all - so search still functions there, exactly as it always has.
+fn collect_candidate_files(root: &Path, outcome: &mut SearchOutcome) -> Vec<(PathBuf, String)> {
+    match list_worktree_files(root) {
+        Ok(listing) => {
+            if listing.truncated {
+                outcome.truncated = true;
+            }
+            listing
+                .files
+                .into_iter()
+                .map(|relative| (root.join(&relative), relative))
+                .collect()
+        }
+        Err(_) => {
+            let mut paths = Vec::new();
+            collect_files_by_walking(root, &mut paths, outcome);
+            paths
+                .into_iter()
+                .filter_map(|path| {
+                    let relative = relative_slash_path(root, &path)?;
+                    Some((path, relative))
+                })
+                .collect()
+        }
+    }
+}
+
+/// Every regular file under `dir`, recursively - the fallback walk [`collect_candidate_files`]
+/// uses when `dir` is not a real git worktree `git ls-files` can answer for.
 ///
 /// `.git` is the one thing skipped unconditionally, and it is skipped for a reason no filter
 /// should have to restate: it is this app's own bookkeeping, it is mostly binary, and a search of
@@ -453,9 +528,13 @@ fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
 /// silently cannot find text in it is the "an index, not a result" failure `STAGE-A-CHANGELOG.md`
 /// §4v names, one level up.
 ///
+/// Unlike the `git`-backed primary path above, this walk has no way to know which directories a
+/// `.gitignore` would exclude - it is only ever reached outside a real git worktree, where there
+/// is no `.gitignore` to ask in the first place. [`MAX_SCANNED_FILES`] is what keeps it bounded.
+///
 /// Symlinks are not followed (`DirEntry::file_type` does not follow them), so a worktree
 /// containing a link to `/` cannot make this walk unbounded.
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, outcome: &mut SearchOutcome) {
+fn collect_files_by_walking(dir: &Path, out: &mut Vec<PathBuf>, outcome: &mut SearchOutcome) {
     if out.len() >= MAX_SCANNED_FILES {
         outcome.truncated = true;
         return;
@@ -475,7 +554,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, outcome: &mut SearchOutcome
             if path.file_name().is_some_and(|name| name == ".git") {
                 continue;
             }
-            collect_files(&path, out, outcome);
+            collect_files_by_walking(&path, out, outcome);
             if outcome.truncated {
                 return;
             }
@@ -1460,5 +1539,134 @@ mod worktree_tests {
             );
             assert!(!outcome.truncated);
         }
+    }
+}
+
+/// Real coverage for the live "search is very slow on my real repo" regression: every test above
+/// this module runs against a plain, non-git [`tempfile::tempdir`], which only ever exercises
+/// [`collect_files_by_walking`] (the fallback). None of it proves the *primary*,
+/// `git`-ls-files-backed path actually excludes a `.gitignore`d build directory the way this
+/// module's own "Scoped to real content" docs claim - that only happens inside a real git
+/// worktree, which is what every test here sets up.
+#[cfg(test)]
+mod git_backed_worktree_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A real git worktree with real tracked source, a real `.gitignore`d build directory sized
+    /// enough that including it would matter, and a real untracked-but-not-ignored file - so a
+    /// single search proves all three: gitignored content is never scanned, tracked content is,
+    /// and untracked-non-ignored content is too.
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "t@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            fs::write(&path, content).expect("write");
+        };
+        write(".gitignore", "target/\n");
+        write(
+            "src/auth/session.rs",
+            "let refresh_token = store.issue(&sid)?;\n",
+        );
+        git(root, &["add", ".gitignore", "src/auth/session.rs"]);
+        // A real `target/`-shaped build directory: several hundred files, every one of them
+        // mentioning the query, so a walk that fails to exclude it would not just be slow - it
+        // would visibly change the result set this test asserts on.
+        for i in 0..300 {
+            write(
+                &format!("target/debug/deps/refresh_token-{i}.d"),
+                "refresh_token\n",
+            );
+        }
+        write("src/new_untracked.rs", "refresh_token again\n");
+        dir
+    }
+
+    fn run(root: &Path, query: &str) -> SearchOutcome {
+        let matcher = Matcher::compile(query, SearchOptions::default())
+            .expect("compiles")
+            .expect("a non-empty query");
+        search_worktree(&SearchRequest {
+            root: root.to_path_buf(),
+            matcher,
+            filter: PathFilter::new("", ""),
+        })
+    }
+
+    #[test]
+    fn a_gitignored_build_directory_is_never_scanned_in_a_real_git_worktree() {
+        let dir = fixture();
+        let outcome = run(dir.path(), "refresh_token");
+
+        assert!(
+            !outcome
+                .files
+                .iter()
+                .any(|file| file.relative.starts_with("target/")),
+            "a real .gitignore'd build directory must never appear in results: {:?}",
+            outcome
+                .files
+                .iter()
+                .map(|f| f.relative.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .files
+                .iter()
+                .any(|file| file.relative == "src/auth/session.rs"),
+            "a real tracked file must still be found"
+        );
+        assert!(
+            outcome
+                .files
+                .iter()
+                .any(|file| file.relative == "src/new_untracked.rs"),
+            "a real untracked-but-not-ignored file must still be found"
+        );
+        assert!(
+            !outcome.truncated,
+            "300 gitignored files must not consume any of MAX_SCANNED_FILES's budget - a walk \
+             that has to burn its cap on a build directory before ever reaching real content is \
+             exactly the regression this proves fixed"
+        );
+        assert_eq!(
+            outcome.scanned_files, 3,
+            "only the three real files (.gitignore, session.rs, new_untracked.rs) should ever \
+             have been opened and read - not the 300 gitignored ones"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_tracked_file_under_a_later_gitignore_rule_is_still_searched() {
+        let dir = fixture();
+        let root = dir.path();
+        // `session.rs` is already tracked (see `fixture`); now ignore its own directory too.
+        fs::write(root.join(".gitignore"), "target/\nsrc/auth/\n").expect("write");
+
+        let outcome = run(root, "refresh_token");
+        assert!(
+            outcome
+                .files
+                .iter()
+                .any(|file| file.relative == "src/auth/session.rs"),
+            "git status does not hide an explicitly tracked file just because a later ignore \
+             rule would otherwise cover it, and neither should search"
+        );
     }
 }
