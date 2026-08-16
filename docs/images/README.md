@@ -1,9 +1,12 @@
 # README images
 
-Every file in this directory is currently a **generated placeholder**, not a real capture — a flat
-three-zone wireframe in Jerry Dark's palette, captioned "screenshot pending". They exist so the
-product README renders cleanly instead of showing broken image slots while the real assets are
-being produced.
+`dot-full.png`, `dot-partial.png` and `dot-planned.png` are permanent: the support-level dots on the
+README's agent chips, in Jerry Dark's own swatch colours (`#5cb87f`, `#e2a336`, and a muted grey).
+Leave them alone.
+
+**Every other file here is a generated placeholder**, not a real capture — a flat wireframe in the
+same palette, captioned "screenshot pending". They exist so the product README renders cleanly
+instead of showing broken image slots while the real assets are being produced.
 
 Replacing them is tracked in [issue #431](https://github.com/ColinEspinas/jerry/issues/431).
 

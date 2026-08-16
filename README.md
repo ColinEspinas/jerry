@@ -163,22 +163,18 @@ actually done. Rebase interactively when you want to tidy up before merging.
 ## Supported agents
 
 <p>
-  <img src="https://img.shields.io/badge/full-3f9c5f?style=flat-square" alt="Full support" valign="middle" /> &nbsp;
-  <a href="https://claude.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="" width="16" valign="middle" /> Claude Code</kbd></a>
+  <a href="https://claude.com/claude-code"><kbd><img src="docs/images/dot-full.png" alt="Full support" width="9" valign="middle" /> <img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="docs/images/dot-partial.png" alt="Partial support" width="9" valign="middle" /> <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
+  <a href="https://cursor.com/cli"><kbd><img src="docs/images/dot-planned.png" alt="Planned" width="9" valign="middle" /> <img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=64" alt="" width="16" valign="middle" /> Cursor</kbd></a>
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/partial-b5811f?style=flat-square" alt="Partial support" valign="middle" /> &nbsp;
-  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="" width="16" valign="middle" /> Codex</kbd></a>
+  <sub>
+    <img src="docs/images/dot-full.png" alt="" width="9" valign="middle" /> <strong>full</strong> — runs, and reports its own state back, so status is never a guess &nbsp;·&nbsp;
+    <img src="docs/images/dot-partial.png" alt="" width="9" valign="middle" /> <strong>partial</strong> — runs, but status is inferred from its terminal &nbsp;·&nbsp;
+    <img src="docs/images/dot-planned.png" alt="" width="9" valign="middle" /> <strong>planned</strong> — not built yet
+  </sub>
 </p>
-
-<p>
-  <img src="https://img.shields.io/badge/planned-5b6570?style=flat-square" alt="Planned" valign="middle" /> &nbsp;
-  <a href="https://cursor.com/cli"><kbd><img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=64" alt="" width="16" valign="middle" /> Cursor</kbd></a> &nbsp;
-  <a href="../../issues/new"><kbd>+ yours?</kbd></a>
-</p>
-
-<sub><strong>full</strong> — runs, and reports its own state back, so status is never a guess &nbsp;·&nbsp; <strong>partial</strong> — runs, but status is inferred from its terminal &nbsp;·&nbsp; <strong>planned</strong> — not built yet</sub>
 
 Jerry runs the CLI **you** installed, in the session's worktree — your auth, your config, your
 version. It doesn't bundle, wrap or proxy anything, and **Settings › Agents** tells you whether each
