@@ -1852,7 +1852,7 @@ mod tests {
     /// `handle_editing_key`'s character arm receives it.
     fn type_into(field: &mut TextField, text: &str, now: Instant) {
         for ch in text.chars() {
-            field.handle_editing_key("", Some(&ch.to_string()), now);
+            field.handle_editing_key("", Some(&ch.to_string()), EditingModifiers::none(), now);
         }
     }
 
@@ -1870,7 +1870,7 @@ mod tests {
         let now = t0();
         type_into(&mut field, "refresh_token", now);
         for _ in 0.."_token".len() {
-            assert!(field.handle_editing_key("left", None, now));
+            assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         }
         assert_eq!(field.split_at_caret(), ("refresh", "_token"));
         type_into(&mut field, "ed", now);
@@ -1888,15 +1888,15 @@ mod tests {
         let mut field = TextField::new();
         let now = t0();
         type_into(&mut field, "abcd", now);
-        field.handle_editing_key("left", None, now);
-        field.handle_editing_key("left", None, now);
+        field.handle_editing_key("left", None, EditingModifiers::none(), now);
+        field.handle_editing_key("left", None, EditingModifiers::none(), now);
         assert_eq!(field.split_at_caret(), ("ab", "cd"));
 
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), "acd");
         assert_eq!(field.caret(), 1);
 
-        assert!(field.handle_editing_key("delete", None, now));
+        assert!(field.handle_editing_key("delete", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), "ad");
         assert_eq!(field.caret(), 1, "Delete never moves the caret");
     }
@@ -1906,14 +1906,14 @@ mod tests {
         let mut field = TextField::new();
         let now = t0();
         type_into(&mut field, "abc", now);
-        assert!(field.handle_editing_key("home", None, now));
+        assert!(field.handle_editing_key("home", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), 0);
         assert!(
-            !field.handle_editing_key("home", None, now),
+            !field.handle_editing_key("home", None, EditingModifiers::none(), now),
             "a key that moves nothing must report so, or the caller stops propagating a \
              keystroke it did not use"
         );
-        assert!(field.handle_editing_key("end", None, now));
+        assert!(field.handle_editing_key("end", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), 3);
     }
 
@@ -1925,9 +1925,9 @@ mod tests {
         let cluster = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
         field.insert_str(cluster, now);
         field.insert_str("x", now);
-        assert!(field.handle_editing_key("left", None, now));
+        assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), cluster.len());
-        assert!(field.handle_editing_key("left", None, now));
+        assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         assert_eq!(
             field.caret(),
             0,
@@ -1935,9 +1935,9 @@ mod tests {
         );
 
         field.move_to_end();
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), cluster);
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(
             field.as_str(),
             "",
@@ -1952,7 +1952,7 @@ mod tests {
         let now = t0();
         type_into(&mut field, "abc", now);
         assert_eq!(field.history_len(), 1);
-        field.handle_editing_key("home", None, now);
+        field.handle_editing_key("home", None, EditingModifiers::none(), now);
         type_into(&mut field, "X", now);
         assert_eq!(
             field.history_len(),
@@ -2024,7 +2024,7 @@ mod tests {
         let now = t0();
         for key in ["escape", "enter", "tab", "up", "down"] {
             assert!(
-                !field.handle_editing_key(key, None, now),
+                !field.handle_editing_key(key, None, EditingModifiers::none(), now),
                 "`{key}` means something different on every surface - a shared default would \
                  silently take it away from the handler that owns it"
             );

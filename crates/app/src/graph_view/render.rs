@@ -1464,10 +1464,11 @@ fn branches_filter_handle() -> TextFieldHandle {
 /// as much right to clear "that name already exists" as a typed one.
 fn branch_prompt_name_handle() -> TextFieldHandle {
     TextFieldHandle::new(|app: &mut AdeApp| {
-        app.graph_state
-            .branch_prompt
-            .is_some()
-            .then(|| &mut app.graph_state.branch_prompt_name)
+        if app.graph_state.branch_prompt.is_some() {
+            Some(&mut app.graph_state.branch_prompt_name)
+        } else {
+            None
+        }
     })
     .on_changed(|app: &mut AdeApp, _cx| {
         if let Some(open) = app.graph_state.branch_prompt.as_mut() {

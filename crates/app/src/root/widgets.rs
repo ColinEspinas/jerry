@@ -1002,9 +1002,17 @@ impl AdeApp {
 /// box showing stale results.
 #[derive(Clone)]
 pub(crate) struct TextFieldHandle {
-    access: Rc<dyn for<'a> Fn(&'a mut AdeApp) -> Option<&'a mut text_history::TextField>>,
-    on_changed: Option<Rc<dyn Fn(&mut AdeApp, &mut Context<AdeApp>)>>,
+    access: TextFieldAccess,
+    on_changed: Option<TextFieldChanged>,
 }
+
+/// How a [`TextFieldHandle`] reaches its field - see that type's own docs for why this is a
+/// closure rather than an enum of every field in the app.
+type TextFieldAccess =
+    Rc<dyn for<'a> Fn(&'a mut AdeApp) -> Option<&'a mut text_history::TextField>>;
+
+/// The follow-up work a [`TextFieldHandle`]'s own surface runs whenever its field really changes.
+type TextFieldChanged = Rc<dyn Fn(&mut AdeApp, &mut Context<AdeApp>)>;
 
 impl TextFieldHandle {
     pub(crate) fn new(
@@ -1100,8 +1108,8 @@ pub(crate) fn text_editing_modifiers(
 /// field's: `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `paletteEmpty`/`paletteTyped`
 /// fixture draws it 16px tall with a 3px gap before the placeholder and a 2px gap after the typed
 /// text, while every other input in the app is the plain flush 14px bar this type defaults to. The
-/// alternative to modelling that here was leaving the palette hand-assembling its own row forever
-/// - which is exactly how it ended up the one field whose caret ignored
+/// alternative to modelling that here was leaving the palette hand-assembling its own row
+/// forever, which is exactly how it ended up the one field whose caret ignored
 /// `crate::text_history::TextField::caret` entirely and sat at the end of the text whatever the
 /// user had arrowed back to.
 #[derive(Debug, Clone, Copy)]
