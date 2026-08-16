@@ -230,105 +230,82 @@ mod tests {
         }
     }
 
+    /// A row's label, in the three-way order the function itself resolves it: the branch name
+    /// when there is one, else the short sha of the commit it is detached at, else the directory
+    /// name (an unborn worktree with no commit at all).
     #[test]
-    fn labels_use_branch_name_when_available() {
-        let items = build_worktree_items(vec![status("/repo", Some("main"), true)]);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "main");
-        assert_eq!(items[0].path, PathBuf::from("/repo"));
-        assert!(items[0].is_main);
-        assert!(items[0].error.is_none());
-    }
+    fn a_label_is_the_branch_then_the_short_sha_then_the_directory_name() {
+        let on_branch = build_worktree_items(vec![status("/repo", Some("main"), true)]);
+        assert_eq!(on_branch[0].label, "main");
+        assert_eq!(on_branch[0].path, PathBuf::from("/repo"));
+        assert!(on_branch[0].is_main);
 
-    #[test]
-    fn detached_head_labels_with_the_short_sha_not_the_directory_name() {
-        let items = build_worktree_items(vec![status("/repos/feature-x", None, false)]);
-        assert_eq!(items[0].label, "deadbee");
-        assert_eq!(items[0].short_sha.as_deref(), Some("deadbee"));
-        assert_eq!(items[0].branch, None);
-        assert!(items[0].is_detached);
-        assert!(!items[0].is_main);
-    }
+        let detached = build_worktree_items(vec![status("/repos/feature-x", None, false)]);
+        assert_eq!(detached[0].label, "deadbee");
+        assert_eq!(detached[0].short_sha.as_deref(), Some("deadbee"));
+        assert_eq!(detached[0].branch, None);
+        assert!(detached[0].is_detached && !detached[0].is_main);
 
-    #[test]
-    fn falls_back_to_directory_name_when_there_is_no_commit_at_all() {
         let mut unborn = status("/repos/fresh", None, false);
         unborn.head_commit = None;
-        let items = build_worktree_items(vec![unborn]);
-        assert_eq!(items[0].label, "fresh");
-        assert_eq!(items[0].short_sha, None);
+        let unborn = build_worktree_items(vec![unborn]);
+        assert_eq!(unborn[0].label, "fresh");
+        assert_eq!(unborn[0].short_sha, None);
     }
 
+    /// The lock and bare flags git reports carry through to the row unchanged, and an empty
+    /// listing maps to no rows rather than a synthesised one.
     #[test]
-    fn empty_list_maps_to_empty_items() {
-        assert_eq!(build_worktree_items(Vec::new()), Vec::new());
-    }
-
-    #[test]
-    fn locked_state_and_reason_are_preserved() {
+    fn lock_and_bare_state_carry_through_and_an_empty_listing_makes_no_rows() {
         let mut locked = status("/repo-wt/locked", Some("locked-branch"), false);
         locked.is_locked = true;
         locked.lock_reason = Some("external disk".to_string());
-        let items = build_worktree_items(vec![locked]);
-        assert!(items[0].is_locked);
-        assert_eq!(items[0].lock_reason.as_deref(), Some("external disk"));
-    }
+        let locked = build_worktree_items(vec![locked]);
+        assert!(locked[0].is_locked);
+        assert_eq!(locked[0].lock_reason.as_deref(), Some("external disk"));
 
-    #[test]
-    fn unlocked_state_is_preserved() {
-        let items = build_worktree_items(vec![status("/repo-wt/unlocked", Some("x"), false)]);
-        assert!(!items[0].is_locked);
-        assert_eq!(items[0].lock_reason, None);
-    }
-
-    #[test]
-    fn bare_entry_is_flagged_bare_and_never_main() {
         let mut bare = status("/bare-repo", None, false);
         bare.is_bare = true;
         bare.head_commit = None;
         bare.is_detached = false;
-        let items = build_worktree_items(vec![bare]);
-        assert!(items[0].is_bare);
-        assert!(!items[0].is_main);
+        let bare = build_worktree_items(vec![bare]);
+        assert!(bare[0].is_bare && !bare[0].is_main);
+
+        assert_eq!(build_worktree_items(Vec::new()), Vec::new());
     }
 
-    /// The central "don't silently list a broken worktree as healthy" guarantee (issue #12):
-    /// a prunable entry must be both flagged via `is_broken`/`broken_reason` *and* rejected by
-    /// the plain `error.is_none()` gate every existing selection/agent-spawn/diff call site
-    /// already uses, with no changes needed at those call sites.
+    /// The central "don't silently list a broken worktree as healthy" guarantee (issue #12): a
+    /// prunable entry must be both flagged via `is_broken`/`broken_reason` *and* rejected by the
+    /// plain `error.is_none()` gate every existing selection/agent-spawn/diff call site already
+    /// uses, with no changes needed at those call sites - reason or no reason - while a healthy
+    /// entry stays usable.
     #[test]
-    fn a_prunable_entry_is_marked_broken_and_unusable() {
+    fn a_prunable_entry_is_marked_broken_and_unusable_with_or_without_a_reason() {
         let mut gone = status("/repo-wt/gone", Some("gone-branch"), false);
         gone.is_prunable = true;
         gone.prunable_reason = Some("gitdir file points to non-existent location".to_string());
-        let items = build_worktree_items(vec![gone]);
-        assert!(items[0].is_broken);
+        let gone = build_worktree_items(vec![gone]);
+        assert!(gone[0].is_broken);
         assert_eq!(
-            items[0].broken_reason.as_deref(),
+            gone[0].broken_reason.as_deref(),
             Some("gitdir file points to non-existent location")
         );
         assert!(
-            items[0].error.is_some(),
+            gone[0].error.is_some(),
             "a broken worktree must also fail the existing error.is_none() usability gate"
         );
-    }
 
-    #[test]
-    fn a_prunable_entry_with_no_reason_still_reports_a_real_error() {
-        let mut gone = status("/repo-wt/gone-no-reason", Some("gone"), false);
-        gone.is_prunable = true;
-        let items = build_worktree_items(vec![gone]);
-        assert!(items[0].is_broken);
-        assert_eq!(items[0].broken_reason, None);
-        assert!(items[0].error.is_some());
-    }
+        let mut unexplained = status("/repo-wt/gone-no-reason", Some("gone"), false);
+        unexplained.is_prunable = true;
+        let unexplained = build_worktree_items(vec![unexplained]);
+        assert!(unexplained[0].is_broken);
+        assert_eq!(unexplained[0].broken_reason, None);
+        assert!(unexplained[0].error.is_some());
 
-    #[test]
-    fn a_healthy_entry_is_not_broken() {
-        let items = build_worktree_items(vec![status("/repo", Some("main"), true)]);
-        assert!(!items[0].is_broken);
-        assert_eq!(items[0].broken_reason, None);
-        assert!(items[0].error.is_none());
+        let healthy = build_worktree_items(vec![status("/repo", Some("main"), true)]);
+        assert!(!healthy[0].is_broken);
+        assert_eq!(healthy[0].broken_reason, None);
+        assert!(healthy[0].error.is_none());
     }
 
     // --- `recover_selection` ------------------------------------------------------------
@@ -350,34 +327,33 @@ mod tests {
         }
     }
 
+    /// Nothing to recover: no prior selection at all, or one that is still there and usable.
     #[test]
-    fn no_prior_selection_needs_no_recovery() {
-        let new_items = vec![item("/repo", true, None)];
-        assert_eq!(
-            recover_selection(None, &new_items),
-            SelectionRecovery::NoPriorSelection
-        );
-    }
-
-    #[test]
-    fn a_selection_that_is_still_present_is_unchanged() {
-        let previous = item("/repo-wt/feature", false, None);
+    fn a_still_usable_or_absent_selection_needs_no_recovery() {
         let new_items = vec![
             item("/repo", true, None),
             item("/repo-wt/feature", false, None),
         ];
+        assert_eq!(
+            recover_selection(None, &new_items),
+            SelectionRecovery::NoPriorSelection
+        );
+
+        let previous = item("/repo-wt/feature", false, None);
         assert_eq!(
             recover_selection(Some(&previous), &new_items),
             SelectionRecovery::Unchanged(1)
         );
     }
 
+    /// A selection that vanished - or that is still listed but has since gone broken - falls back
+    /// to the main worktree with a real notice naming what was lost, and reports `None` honestly
+    /// when there is no usable main to fall back to either.
     #[test]
-    fn a_vanished_selection_falls_back_to_main_with_a_notice() {
+    fn a_vanished_or_broken_selection_falls_back_to_a_usable_main_or_to_nothing() {
         let previous = item("/repo-wt/feature", false, None);
-        let new_items = vec![item("/repo", true, None)];
-        let recovery = recover_selection(Some(&previous), &new_items);
-        match recovery {
+
+        match recover_selection(Some(&previous), &[item("/repo", true, None)]) {
             SelectionRecovery::FellBackToMain { new_index, notice } => {
                 assert_eq!(new_index, Some(0));
                 assert!(notice.contains("/repo-wt/feature"));
@@ -385,32 +361,21 @@ mod tests {
             }
             other => panic!("expected FellBackToMain, got {other:?}"),
         }
-    }
 
-    #[test]
-    fn a_selection_that_became_broken_also_falls_back_to_main() {
-        let previous = item("/repo-wt/feature", false, None);
-        let new_items = vec![
+        let now_broken = vec![
             item("/repo", true, None),
             item("/repo-wt/feature", false, Some("worktree is prunable")),
         ];
-        let recovery = recover_selection(Some(&previous), &new_items);
         assert!(matches!(
-            recovery,
+            recover_selection(Some(&previous), &now_broken),
             SelectionRecovery::FellBackToMain {
                 new_index: Some(0),
                 ..
             }
         ));
-    }
 
-    #[test]
-    fn falling_back_with_no_usable_main_at_all_reports_none() {
-        let previous = item("/repo-wt/feature", false, None);
-        let new_items: Vec<WorktreeItem> = Vec::new();
-        let recovery = recover_selection(Some(&previous), &new_items);
         assert!(matches!(
-            recovery,
+            recover_selection(Some(&previous), &[]),
             SelectionRecovery::FellBackToMain {
                 new_index: None,
                 ..
@@ -420,82 +385,61 @@ mod tests {
 
     // --- `selection_for_opened_repo` -----------------------------------------------------
 
-    /// The overwhelmingly common `jerry .` case: the opened path *is* the main worktree, so
-    /// both of this function's rules agree and it lands on the one obvious row.
+    /// The three real launch shapes: `jerry .` at the repo root (both of this function's rules
+    /// agree on the one obvious row), `jerry ~/repo-wt/feature` directly inside a linked worktree
+    /// (which must win over main, never be silently redirected), and the live-reproduced
+    /// subdirectory launch `jerry ./crates`. Before that last rule existed,
+    /// `AdeApp::current_worktree_path` fell back to the bare subdirectory path and the startup
+    /// shell it spawned there belonged to no rail row at all - a real, live tab that no worktree
+    /// claimed, permanently unreachable the moment any worktree row was clicked.
     #[test]
-    fn opening_a_repo_root_selects_its_own_main_worktree() {
+    fn an_opened_path_selects_its_own_worktree_or_the_main_one_it_sits_under() {
         let items = vec![
             item("/repo", true, None),
             item("/repo-wt/feature", false, None),
         ];
-        assert_eq!(
-            selection_for_opened_repo(Path::new("/repo"), &items),
-            Some(0)
-        );
+        for (opened, expected, why) in [
+            ("/repo", Some(0), "the repo root is its own main worktree"),
+            (
+                "/repo-wt/feature",
+                Some(1),
+                "the worktree the user actually pointed at must win over the main worktree",
+            ),
+            (
+                "/repo/crates",
+                Some(0),
+                "a subdirectory is not a worktree, so this must land on the real main worktree",
+            ),
+        ] {
+            assert_eq!(
+                selection_for_opened_repo(Path::new(opened), &items),
+                expected,
+                "{why}"
+            );
+        }
     }
 
-    /// `jerry ~/repo-wt/feature` - launching directly inside a linked worktree must land on
-    /// *that* worktree, never silently redirect to main.
+    /// A row that isn't usable is never selected, however exactly the opened path matches it -
+    /// selecting one would hand every downstream consumer a path that isn't on disk. With no
+    /// usable row left at all, "nothing" is the honest answer rather than an index that doesn't
+    /// resolve.
     #[test]
-    fn opening_a_linked_worktree_directly_selects_that_worktree_not_main() {
-        let items = vec![
-            item("/repo", true, None),
-            item("/repo-wt/feature", false, None),
-        ];
-        assert_eq!(
-            selection_for_opened_repo(Path::new("/repo-wt/feature"), &items),
-            Some(1),
-            "the worktree the user actually pointed at must win over the main worktree"
-        );
-    }
-
-    /// The real, live-reproduced subdirectory launch (`jerry ./crates`): the opened path is a
-    /// genuine directory but not any worktree, so nothing can match it exactly. Before this
-    /// rule existed, `AdeApp::current_worktree_path` fell back to that bare subdirectory path, and
-    /// the startup shell it spawned there belonged to no rail row at all - a real, live tab
-    /// that no worktree claimed, and which became permanently unreachable the moment any
-    /// worktree row was clicked.
-    #[test]
-    fn opening_a_subdirectory_of_a_repo_falls_back_to_the_main_worktree() {
-        let items = vec![
-            item("/repo", true, None),
-            item("/repo-wt/feature", false, None),
-        ];
-        assert_eq!(
-            selection_for_opened_repo(Path::new("/repo/crates"), &items),
-            Some(0),
-            "a subdirectory is not a worktree, so this must land on the real main worktree \
-             rather than on the subdirectory itself"
-        );
-    }
-
-    /// A repo with genuinely nothing usable to select is a real, honest state - reported as
-    /// such rather than papered over with an index that doesn't resolve to a usable row.
-    #[test]
-    fn opening_a_repo_with_no_usable_worktree_at_all_selects_nothing() {
-        assert_eq!(selection_for_opened_repo(Path::new("/repo"), &[]), None);
-    }
-
-    /// An exact path match that is nonetheless *broken* must not be selected - it would hand
-    /// every downstream consumer a path that isn't on disk. Falls through to main instead.
-    #[test]
-    fn a_broken_exact_match_is_skipped_in_favour_of_a_usable_main() {
-        let items = vec![
+    fn an_unusable_row_is_never_selected_even_on_an_exact_path_match() {
+        let broken_match = vec![
             item("/repo", true, None),
             item("/repo-wt/gone", false, Some("worktree is prunable")),
         ];
         assert_eq!(
-            selection_for_opened_repo(Path::new("/repo-wt/gone"), &items),
+            selection_for_opened_repo(Path::new("/repo-wt/gone"), &broken_match),
             Some(0),
             "a prunable exact match is not usable, so this must fall back to main"
         );
-    }
 
-    /// And a broken *main* is skipped too, leaving the honest "nothing usable" answer rather
-    /// than an index pointing at an unusable row.
-    #[test]
-    fn a_broken_main_worktree_is_not_selected_either() {
-        let items = vec![item("/repo", true, Some("worktree is prunable"))];
-        assert_eq!(selection_for_opened_repo(Path::new("/repo"), &items), None);
+        let broken_main = vec![item("/repo", true, Some("worktree is prunable"))];
+        assert_eq!(
+            selection_for_opened_repo(Path::new("/repo"), &broken_main),
+            None
+        );
+        assert_eq!(selection_for_opened_repo(Path::new("/repo"), &[]), None);
     }
 }

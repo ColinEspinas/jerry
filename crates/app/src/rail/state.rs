@@ -1165,6 +1165,8 @@ mod tests {
         assert!(!running_row.matches_filter("writing auth.rs"));
     }
 
+    /// Unlike `group_by_urgency`, every status must appear in the tally even when its count is
+    /// zero - including the all-zero case, which must still be five rows rather than none.
     #[test]
     fn urgency_counts_covers_every_status_in_order_including_zero_counts() {
         let rows = vec![
@@ -1180,16 +1182,12 @@ mod tests {
                 (Status::Review, 1),
                 (Status::Run, 0),
                 (Status::Idle, 0),
-            ],
-            "unlike group_by_urgency, every status must appear even when its count is zero"
+            ]
         );
-    }
 
-    #[test]
-    fn urgency_counts_with_no_agents_is_all_zero_not_omitted() {
-        let counts = urgency_counts(&[]);
-        assert_eq!(counts.len(), 5);
-        assert!(counts.iter().all(|(_, count)| *count == 0));
+        let empty = urgency_counts(&[]);
+        assert_eq!(empty.len(), 5);
+        assert!(empty.iter().all(|(_, count)| *count == 0));
     }
 
     #[test]
@@ -1220,121 +1218,62 @@ mod tests {
         assert_eq!(filter_agents(&rows, "").len(), 2);
     }
 
-    #[test]
-    fn worktree_note_main_checkout_is_never_prunable_even_if_merged() {
-        let note = WorktreeNote {
-            is_main: true,
-            clean: Some(true),
-            merge: Some(WorktreeMergeStatus {
+    fn note(
+        is_main: bool,
+        clean: Option<bool>,
+        merged: Option<bool>,
+        is_locked: bool,
+    ) -> WorktreeNote {
+        WorktreeNote {
+            is_main,
+            clean,
+            merge: merged.map(|merged| WorktreeMergeStatus {
                 base_branch: "main".to_string(),
-                merged: true,
-                head_committer_unix_seconds: Some(0),
+                merged,
+                // 11:04 UTC == 11 * 3600 + 4 * 60 seconds into the day.
+                head_committer_unix_seconds: Some(if merged { 11 * 3600 + 4 * 60 } else { 0 }),
             }),
-            is_locked: false,
-        };
-        assert!(!note.is_prunable());
-        assert_eq!(note.label(), "checkout · clean");
+            is_locked,
+        }
     }
 
+    /// Every real combination of the four inputs a worktree note is built from, and the two
+    /// answers it owes for each: what the row says, and whether the worktree may be offered for
+    /// pruning at all. Only one combination is prunable - a linked worktree that is merged,
+    /// clean and unlocked. A dirty one would be refused by `wt_core::remove_worktree` anyway; a
+    /// locked one must never be offered regardless of merge state, though the merged fact still
+    /// shows; and the main checkout is never prunable however merged and clean it is.
     #[test]
-    fn worktree_note_dirty_main_checkout_label() {
-        let note = WorktreeNote {
-            is_main: true,
-            clean: Some(false),
-            merge: None,
-            is_locked: false,
-        };
-        assert_eq!(note.label(), "checkout · dirty");
-    }
-
-    #[test]
-    fn worktree_note_merged_and_clean_linked_worktree_is_prunable() {
-        // 11:04 UTC == 11 * 3600 + 4 * 60 seconds into the day.
-        let seconds_since_midnight = 11 * 3600 + 4 * 60;
-        let note = WorktreeNote {
-            is_main: false,
-            clean: Some(true),
-            merge: Some(WorktreeMergeStatus {
-                base_branch: "main".to_string(),
-                merged: true,
-                head_committer_unix_seconds: Some(seconds_since_midnight),
-            }),
-            is_locked: false,
-        };
-        assert!(note.is_prunable());
-        assert_eq!(note.label(), "merged 11:04 · prunable");
-    }
-
-    #[test]
-    fn worktree_note_merged_but_dirty_linked_worktree_is_not_prunable() {
-        let note = WorktreeNote {
-            is_main: false,
-            clean: Some(false),
-            merge: Some(WorktreeMergeStatus {
-                base_branch: "main".to_string(),
-                merged: true,
-                head_committer_unix_seconds: Some(0),
-            }),
-            is_locked: false,
-        };
-        assert!(
-            !note.is_prunable(),
-            "a dirty worktree must never be offered as prunable, even if its branch is merged \
-             - wt_core::remove_worktree would refuse it anyway"
-        );
-        assert_eq!(note.label(), "dirty");
-    }
-
-    #[test]
-    fn worktree_note_unmerged_linked_worktree_is_not_prunable() {
-        let note = WorktreeNote {
-            is_main: false,
-            clean: Some(true),
-            merge: Some(WorktreeMergeStatus {
-                base_branch: "main".to_string(),
-                merged: false,
-                head_committer_unix_seconds: Some(0),
-            }),
-            is_locked: false,
-        };
-        assert!(!note.is_prunable());
-        assert_eq!(note.label(), "clean");
-    }
-
-    #[test]
-    fn worktree_note_with_no_detectable_base_is_never_prunable() {
-        let note = WorktreeNote {
-            is_main: false,
-            clean: Some(true),
-            merge: None,
-            is_locked: false,
-        };
-        assert!(!note.is_prunable());
-    }
-
-    #[test]
-    fn worktree_note_locked_merged_clean_worktree_is_never_prunable_but_label_says_locked() {
-        // A locked worktree can be genuinely merged and clean - lock state is independent of
-        // merge/dirty state.
-        let note = WorktreeNote {
-            is_main: false,
-            clean: Some(true),
-            merge: Some(WorktreeMergeStatus {
-                base_branch: "main".to_string(),
-                merged: true,
-                head_committer_unix_seconds: Some(0),
-            }),
-            is_locked: true,
-        };
-        assert!(
-            !note.is_prunable(),
-            "a locked worktree must never be offered as prunable regardless of merge/clean state"
-        );
-        assert_eq!(
-            note.label(),
-            "merged 00:00 · locked",
-            "the merged fact should still be visible, just not offered as prunable"
-        );
+    fn only_a_merged_clean_unlocked_linked_worktree_is_prunable() {
+        let cases: &[(WorktreeNote, bool, &str)] = &[
+            (
+                note(true, Some(true), Some(true), false),
+                false,
+                "checkout \u{b7} clean",
+            ),
+            (
+                note(true, Some(false), None, false),
+                false,
+                "checkout \u{b7} dirty",
+            ),
+            (
+                note(false, Some(true), Some(true), false),
+                true,
+                "merged 11:04 \u{b7} prunable",
+            ),
+            (note(false, Some(false), Some(true), false), false, "dirty"),
+            (note(false, Some(true), Some(false), false), false, "clean"),
+            (note(false, Some(true), None, false), false, "clean"),
+            (
+                note(false, Some(true), Some(true), true),
+                false,
+                "merged 11:04 \u{b7} locked",
+            ),
+        ];
+        for (note, prunable, label) in cases {
+            assert_eq!(note.is_prunable(), *prunable, "{note:?}");
+            assert_eq!(note.label(), *label, "{note:?}");
+        }
     }
 
     fn worktree_entry(path: &str, note: WorktreeNote) -> WorktreeEntry {
@@ -1918,16 +1857,74 @@ mod tests {
     }
 
     /// §4q's "each with its own tooltip", conjugated in both the noun and the verb (§7 rule 9).
+    /// Every count-bearing label the rail renders agrees with its own number in both noun and
+    /// verb, at zero, one and two - and none of them dodges into the parenthesised `(s)` escape
+    /// hatch. The conjugation helper itself is pinned by `crate::root::plural`'s own tests; what
+    /// this pins is that each of these call sites really goes through it.
     #[test]
-    fn the_two_urgency_tooltips_agree_with_their_own_counts_in_noun_and_verb() {
+    fn every_count_bearing_rail_label_conjugates_rather_than_dodging() {
         assert_eq!(needs_input_tooltip(1), "1 worktree here needs input");
         assert_eq!(needs_input_tooltip(2), "2 worktrees here need input");
         assert_eq!(failed_tooltip(1), "1 worktree here has a failed agent");
         assert_eq!(failed_tooltip(3), "3 worktrees here have failed agents");
+
+        assert_eq!(prune_armed_tooltip(1), "Click again to remove 1 worktree");
+        assert_eq!(prune_armed_tooltip(2), "Click again to remove 2 worktrees");
+
+        assert_eq!(worktree_disk_label(0, "0 B"), "0 worktrees \u{b7} 0 B");
+        assert_eq!(worktree_disk_label(1, "4.2 GB"), "1 worktree \u{b7} 4.2 GB");
+        assert_eq!(
+            worktree_disk_label(2, "4.2 GB"),
+            "2 worktrees \u{b7} 4.2 GB"
+        );
+
+        for (n, confirm, pruning, pruned) in [
+            (0, "0 worktrees", "0 worktrees", "0 worktrees"),
+            (1, "1 worktree", "1 worktree", "1 worktree"),
+            (2, "2 worktrees", "2 worktrees", "2 worktrees"),
+        ] {
+            assert_eq!(
+                prune_confirm_label(n),
+                format!("click prune again to remove {confirm}")
+            );
+            assert_eq!(pruning_label(n), format!("pruning {pruning}\u{2026}"));
+            assert_eq!(pruned_label(n), format!("pruned {pruned}"));
+        }
+
+        for n in 0..4 {
+            for label in [prune_confirm_label(n), pruning_label(n), pruned_label(n)] {
+                assert!(
+                    !label.contains("(s)"),
+                    "prune label must conjugate, not dodge: {label}"
+                );
+            }
+        }
     }
 
-    /// §4o: the rail's diffstat is returned as its two coloured parts, never as one pre-joined
-    /// string - and a diff with no deletions renders one part, not a `\u{2212}0` that says nothing.
+    /// The prune tooltip's own sentence *shapes*, which are more than conjugation: an unmeasured
+    /// candidate drops the whole size clause rather than reporting a size that leaves it out, a
+    /// truncated scan keeps `disk_usage_label`'s `+` suffix so the number stays a floor rather
+    /// than a claim, and zero candidates changes the sentence rather than reading `0 prunable`.
+    #[test]
+    fn the_prune_tooltip_states_the_count_and_only_a_measured_size() {
+        assert_eq!(
+            prune_tooltip(1, Some((214 * 1024 * 1024, false))),
+            "Prune merged worktrees \u{2014} 1 prunable, frees 214.0 MB"
+        );
+        assert_eq!(
+            prune_tooltip(3, Some((2 * 1024 * 1024 * 1024, true))),
+            "Prune merged worktrees \u{2014} 3 prunable, frees 2.0 GB+"
+        );
+        assert_eq!(
+            prune_tooltip(1, None),
+            "Prune merged worktrees \u{2014} 1 prunable"
+        );
+        assert_eq!(
+            prune_tooltip(0, Some((0, false))),
+            "Prune merged worktrees \u{2014} nothing prunable"
+        );
+    }
+
     #[test]
     fn diff_stat_parts_splits_the_rail_diffstat_and_drops_an_empty_deletion() {
         assert_eq!(
@@ -1952,88 +1949,6 @@ mod tests {
 
     /// §4's prune tooltip: "Prune merged worktrees \u{2014} 1 prunable, frees 214 MB" - the words
     /// the icon itself cannot carry, including the size only when it is really known.
-    #[test]
-    fn the_prune_tooltip_states_the_count_and_only_a_measured_size() {
-        assert_eq!(
-            prune_tooltip(1, Some((214 * 1024 * 1024, false))),
-            "Prune merged worktrees \u{2014} 1 prunable, frees 214.0 MB"
-        );
-        assert_eq!(
-            prune_tooltip(3, Some((2 * 1024 * 1024 * 1024, true))),
-            "Prune merged worktrees \u{2014} 3 prunable, frees 2.0 GB+",
-            "a truncated scan keeps the `+` suffix `disk_usage_label` already uses - the number \
-             is a floor, and the tooltip must not round it into a claim"
-        );
-        assert_eq!(
-            prune_tooltip(1, None),
-            "Prune merged worktrees \u{2014} 1 prunable",
-            "an unmeasured candidate drops the whole clause rather than reporting a size that \
-             leaves it out"
-        );
-        assert_eq!(
-            prune_tooltip(0, Some((0, false))),
-            "Prune merged worktrees \u{2014} nothing prunable",
-            "zero candidates changes the sentence's shape rather than reading `0 prunable`"
-        );
-    }
-
-    /// The armed half of the two-click prune, kept from the text button it replaced.
-    #[test]
-    fn the_armed_prune_tooltip_conjugates_its_own_count() {
-        assert_eq!(prune_armed_tooltip(1), "Click again to remove 1 worktree");
-        assert_eq!(prune_armed_tooltip(2), "Click again to remove 2 worktrees");
-    }
-
-    /// The rail footer and Settings → Disk share this one line, and it used to read
-    /// `"1 worktrees · 4.2 GB"` in both places for a fresh single-checkout repo.
-    #[test]
-    fn worktree_disk_label_conjugates_at_zero_one_and_two() {
-        assert_eq!(worktree_disk_label(0, "0 B"), "0 worktrees \u{b7} 0 B");
-        assert_eq!(worktree_disk_label(1, "4.2 GB"), "1 worktree \u{b7} 4.2 GB");
-        assert_eq!(
-            worktree_disk_label(2, "4.2 GB"),
-            "2 worktrees \u{b7} 4.2 GB"
-        );
-    }
-
-    #[test]
-    fn prune_labels_conjugate_at_zero_one_and_two() {
-        assert_eq!(
-            prune_confirm_label(0),
-            "click prune again to remove 0 worktrees"
-        );
-        assert_eq!(
-            prune_confirm_label(1),
-            "click prune again to remove 1 worktree"
-        );
-        assert_eq!(
-            prune_confirm_label(2),
-            "click prune again to remove 2 worktrees"
-        );
-
-        assert_eq!(pruning_label(0), "pruning 0 worktrees\u{2026}");
-        assert_eq!(pruning_label(1), "pruning 1 worktree\u{2026}");
-        assert_eq!(pruning_label(2), "pruning 2 worktrees\u{2026}");
-
-        assert_eq!(pruned_label(0), "pruned 0 worktrees");
-        assert_eq!(pruned_label(1), "pruned 1 worktree");
-        assert_eq!(pruned_label(2), "pruned 2 worktrees");
-    }
-
-    /// None of the prune/disk labels may fall back to the `worktree(s)` escape hatch these
-    /// three replaced - that spelling dodges the conjugation instead of doing it.
-    #[test]
-    fn no_prune_label_uses_the_parenthesised_plural_escape_hatch() {
-        for n in 0..4 {
-            for label in [prune_confirm_label(n), pruning_label(n), pruned_label(n)] {
-                assert!(
-                    !label.contains("(s)"),
-                    "prune label must conjugate, not dodge: {label}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn format_elapsed_picks_the_largest_whole_unit() {
         assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
@@ -2081,26 +1996,6 @@ mod tests {
             "matches only the agent-less row, via its real path - the label alone never \
              contains a directory component like this"
         );
-    }
-
-    #[test]
-    fn is_prunable_helper_looks_up_by_path() {
-        let mut notes = HashMap::new();
-        notes.insert(
-            PathBuf::from("/repo-wt/merged"),
-            WorktreeNote {
-                is_main: false,
-                clean: Some(true),
-                merge: Some(WorktreeMergeStatus {
-                    base_branch: "main".to_string(),
-                    merged: true,
-                    head_committer_unix_seconds: Some(0),
-                }),
-                is_locked: false,
-            },
-        );
-        assert!(is_prunable(&notes, Path::new("/repo-wt/merged")));
-        assert!(!is_prunable(&notes, Path::new("/repo-wt/unknown")));
     }
 
     #[test]
@@ -2329,24 +2224,21 @@ mod tests {
         assert_eq!(merged_ahead_behind.behind, 0);
     }
 
+    /// A real directory tree's sizes are summed recursively; a path that isn't there at all is
+    /// zero rather than an error the caller has to handle.
     #[test]
-    fn disk_usage_bytes_sums_real_file_sizes_recursively() {
+    fn disk_usage_bytes_sums_a_real_tree_and_reports_zero_for_a_missing_one() {
         let dir = crate::test_support::temp_root();
         std::fs::write(dir.path().join("a.txt"), vec![b'x'; 100]).expect("write");
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).expect("mkdir");
         std::fs::write(sub.join("b.txt"), vec![b'y'; 250]).expect("write");
 
-        let (total, truncated) = disk_usage_bytes(dir.path());
-        assert_eq!(total, 350);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn disk_usage_bytes_on_a_nonexistent_path_is_zero_not_an_error() {
-        let (total, truncated) = disk_usage_bytes(Path::new("/definitely/not/a/real/path/xyz"));
-        assert_eq!(total, 0);
-        assert!(!truncated);
+        assert_eq!(disk_usage_bytes(dir.path()), (350, false));
+        assert_eq!(
+            disk_usage_bytes(Path::new("/definitely/not/a/real/path/xyz")),
+            (0, false)
+        );
     }
 
     #[test]
