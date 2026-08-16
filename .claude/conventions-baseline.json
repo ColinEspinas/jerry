@@ -1,5 +1,5 @@
 {
   "_comment": "Ratchet baseline for .claude/hooks/check-conventions.sh - these numbers may only go down, never up. Recount with the exact commands in that script's comments after fixing a batch of violations, and lower the number in the same commit.",
   "glob_imports_app_src": 301,
-  "render_adapter_calls": 221
+  "render_adapter_calls": 201
 }
