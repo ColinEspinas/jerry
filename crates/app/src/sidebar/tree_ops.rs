@@ -633,10 +633,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
-            return;
-        }
         if self.tree_inline_edit.is_none() {
+            if keystroke.modifiers.platform
+                || keystroke.modifiers.control
+                || keystroke.modifiers.alt
+            {
+                return;
+            }
             if keystroke.key == "escape" && self.tree_context_menu.is_some() {
                 self.close_tree_context_menu(cx);
                 cx.stop_propagation();
@@ -651,33 +654,36 @@ impl AdeApp {
             "escape" => {
                 self.cancel_tree_inline_edit(window, cx);
                 cx.stop_propagation();
+                return;
             }
             "enter" => {
                 self.commit_tree_inline_edit(window, cx);
                 cx.stop_propagation();
+                return;
             }
-            "backspace" => {
-                if let Some(edit) = self.tree_inline_edit.as_mut() {
-                    edit.name.backspace(Instant::now());
-                    edit.error = None;
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-            }
-            _ => {
-                if let Some(text) = keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    if let Some(edit) = self.tree_inline_edit.as_mut() {
-                        edit.name.insert_str(text, Instant::now());
-                        edit.error = None;
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }
-            }
+            _ => {}
+        }
+        // GitHub issue #336: `widgets::text_editing_modifiers` plus the whole `TextField`
+        // vocabulary through one entry point, rather than the backspace/insert pair this editor
+        // used to hand-roll - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own
+        // note on the modifier translation.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
+            return;
+        };
+        let Some(edit) = self.tree_inline_edit.as_mut() else {
+            return;
+        };
+        if edit.name.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        ) {
+            edit.error = None;
+            cx.notify();
+            cx.stop_propagation();
         }
     }
 

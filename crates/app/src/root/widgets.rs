@@ -457,7 +457,8 @@ impl AdeApp {
         &self,
         selector: impl Into<gpui::SharedString>,
         focus_handle: &FocusHandle,
-    ) -> impl IntoElement {
+        height: Pixels,
+    ) -> gpui::Div {
         let caret_blink_visible = self.caret_blink_visible;
         let focus_handle = focus_handle.clone();
         // `impl Into<SharedString>` rather than `&'static str`: a caret that belongs to a *row of
@@ -466,41 +467,36 @@ impl AdeApp {
         // which is exactly the ambiguity `only_the_card_being_typed_into_paints_a_caret` has to be
         // able to see through.
         let selector = selector.into();
-        div()
-            .flex_none()
-            .w(px(0.0))
-            .h(px(14.0))
-            .relative()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(px(1.5))
-                    .h(px(14.0))
-                    .debug_selector(move || selector.to_string())
-                    .child(
-                        gpui::canvas(
-                            move |bounds, window, _cx| {
-                                let is_focused = focus_handle.is_focused(window);
-                                simple_input_caret_opacity(is_focused, caret_blink_visible).map(
-                                    |opacity| {
-                                        gpui::fill(
-                                            bounds,
-                                            theme::term::CURSOR.resolve().opacity(opacity),
-                                        )
-                                    },
-                                )
-                            },
-                            |_bounds, quad, window, _cx| {
-                                if let Some(quad) = quad {
-                                    window.paint_quad(quad);
-                                }
-                            },
-                        )
-                        .size_full(),
-                    ),
-            )
+        div().flex_none().w(px(0.0)).h(height).relative().child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(1.5))
+                .h(height)
+                .debug_selector(move || selector.to_string())
+                .child(
+                    gpui::canvas(
+                        move |bounds, window, _cx| {
+                            let is_focused = focus_handle.is_focused(window);
+                            simple_input_caret_opacity(is_focused, caret_blink_visible).map(
+                                |opacity| {
+                                    gpui::fill(
+                                        bounds,
+                                        theme::term::CURSOR.resolve().opacity(opacity),
+                                    )
+                                },
+                            )
+                        },
+                        |_bounds, quad, window, _cx| {
+                            if let Some(quad) = quad {
+                                window.paint_quad(quad);
+                            }
+                        },
+                    )
+                    .size_full(),
+                ),
+        )
     }
 
     /// **The** caret+text row every hand-rolled single-line input in this app should be built
@@ -596,6 +592,7 @@ impl AdeApp {
             text_size,
             text_color,
             placeholder_color,
+            caret: caret_style,
             field,
         } = input;
         // "Blank" by the same rule every caller used: nothing typed at all. A field holding only
@@ -625,9 +622,22 @@ impl AdeApp {
         // draft is ever open), and a caret keyed on that shared handle would paint in every one
         // of them the moment any of them was focused.
         let caret = |el: gpui::Div| match focus_handle {
-            Some(handle) => {
-                el.child(self.render_simple_input_caret(caret_selector.clone(), handle))
-            }
+            Some(handle) => el.child(
+                self.render_simple_input_caret(caret_selector.clone(), handle, caret_style.height)
+                    // The gaps are margins on the *zero-width* anchor, so they really are gaps
+                    // between the bar and its neighbour rather than extra caret width - see
+                    // [`SimpleInputCaret`] for the one field in this app that needs them.
+                    .mr(if is_blank {
+                        caret_style.gap_before_placeholder
+                    } else {
+                        px(0.0)
+                    })
+                    .ml(if is_blank {
+                        px(0.0)
+                    } else {
+                        caret_style.gap_after_text
+                    }),
+            ),
             None => el,
         };
         // One shared shape for both halves: intrinsically sized, and allowed to shrink and clip
@@ -656,13 +666,10 @@ impl AdeApp {
         if has_selection {
             // One span, so the shaped line the overlay measures the selection quad from really
             // does describe the glyphs on screen - see this method's own docs.
-            row = row.child(
-                span(text.to_string(), text_color)
-                    .debug_selector({
-                        let selector = text_selector.clone();
-                        move || selector.to_string()
-                    }),
-            );
+            row = row.child(span(text.to_string(), text_color).debug_selector({
+                let selector = text_selector.clone();
+                move || selector.to_string()
+            }));
         } else {
             let leading = if is_blank {
                 placeholder.to_string()
@@ -812,28 +819,26 @@ impl AdeApp {
                 let move_entity = entity.clone();
                 let move_key = paint_key.clone();
                 let move_field = field.clone();
-                window.on_mouse_event(
-                    move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
-                        if phase != gpui::DispatchPhase::Bubble
-                            || event.pressed_button != Some(MouseButton::Left)
-                        {
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble
+                        || event.pressed_button != Some(MouseButton::Left)
+                    {
+                        return;
+                    }
+                    move_entity.update(cx, |this, cx| {
+                        if this.simple_input_drag.as_ref() != Some(&move_key) {
                             return;
                         }
-                        move_entity.update(cx, |this, cx| {
-                            if this.simple_input_drag.as_ref() != Some(&move_key) {
-                                return;
-                            }
-                            let Some(offset) = this.simple_input_offset_at(&move_key, event.position)
-                            else {
-                                return;
-                            };
-                            if move_field.with(this, |field| field.select_to(offset)) == Some(true) {
-                                move_field.changed(this, cx);
-                                cx.notify();
-                            }
-                        });
-                    },
-                );
+                        let Some(offset) = this.simple_input_offset_at(&move_key, event.position)
+                        else {
+                            return;
+                        };
+                        if move_field.with(this, |field| field.select_to(offset)) == Some(true) {
+                            move_field.changed(this, cx);
+                            cx.notify();
+                        }
+                    });
+                });
                 let up_entity = entity.clone();
                 let up_key = paint_key.clone();
                 window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _window, cx| {
@@ -1089,6 +1094,35 @@ pub(crate) fn text_editing_modifiers(
     })
 }
 
+/// One [`SimpleInput`]'s caret metrics.
+///
+/// Exists because the command palette's caret is genuinely a different control from every other
+/// field's: `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `paletteEmpty`/`paletteTyped`
+/// fixture draws it 16px tall with a 3px gap before the placeholder and a 2px gap after the typed
+/// text, while every other input in the app is the plain flush 14px bar this type defaults to. The
+/// alternative to modelling that here was leaving the palette hand-assembling its own row forever
+/// - which is exactly how it ended up the one field whose caret ignored
+/// `crate::text_history::TextField::caret` entirely and sat at the end of the text whatever the
+/// user had arrowed back to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SimpleInputCaret {
+    pub height: Pixels,
+    /// Gap between the caret and the placeholder it sits *before*, while the field is blank.
+    pub gap_before_placeholder: Pixels,
+    /// Gap between the real text and the caret that sits *after* it.
+    pub gap_after_text: Pixels,
+}
+
+impl Default for SimpleInputCaret {
+    fn default() -> Self {
+        Self {
+            height: px(14.0),
+            gap_before_placeholder: px(0.0),
+            gap_after_text: px(0.0),
+        }
+    }
+}
+
 /// One [`AdeApp::render_simple_input_row`] field: what it holds, what it says while empty, and
 /// how it is painted.
 ///
@@ -1129,6 +1163,9 @@ pub(crate) struct SimpleInput<'a> {
     pub text_color: theme::ColorToken,
     /// The (usually dimmer) colour of the placeholder.
     pub placeholder_color: theme::ColorToken,
+    /// The caret bar's own metrics. `SimpleInputCaret::default()` for every field but the command
+    /// palette - see that type's own docs.
+    pub caret: SimpleInputCaret,
     /// How to reach the real field behind this row, for click/drag/double-click selection. `None`
     /// is a genuinely read-only row - see [`AdeApp::render_simple_input_row`]'s own docs.
     pub field: Option<TextFieldHandle>,

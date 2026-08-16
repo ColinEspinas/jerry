@@ -246,85 +246,86 @@ impl AdeApp {
                     Self::new_file_name_handle(),
                     cx,
                 )
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .w(px(320.0))
-                    .p(px(12.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .child(
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .w(px(320.0))
+                .p(px(12.0))
+                .bg(theme::surface::PALETTE)
+                .border_1()
+                .border_color(theme::border::POPOVER)
+                .rounded(theme::radius::CARD)
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(11.5))
+                        .text_color(theme::text::HEADING)
+                        .child("New file"),
+                )
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::FAINTER)
+                        .child(parent_label),
+                )
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .bg(theme::surface::SEGMENT_TRACK)
+                        .flex()
+                        .items_center()
+                        // GitHub issue #45 / live report: this prompt had no caret element
+                        // at all before this - just the typed name or its placeholder, no
+                        // insertion-point indicator, and `new_file_focus_handle` was never
+                        // wired into `crate::root::caret_blink` either (see
+                        // `Self::new_with_settings`'s own comment on the fix). The caret and
+                        // the text around it now come from the one helper that owns that
+                        // structure - see `AdeApp::render_simple_input_row`.
+                        .child(self.render_simple_input_row(
+                            widgets::SimpleInput {
+                                caret_selector: "new-file-caret".into(),
+                                text_selector: "new-file-name-text".into(),
+                                focus_handle: Some(&self.new_file_focus_handle),
+                                text: &name,
+                                caret_offset: name_caret,
+                                selection: name_selection.clone(),
+                                placeholder: "file-name.ext",
+                                font: theme::font::MONO,
+                                text_size: px(11.5),
+                                // One colour for both: this prompt has never dimmed its
+                                // placeholder, and the migration is not the place to change
+                                // that.
+                                text_color: theme::text::BODY,
+                                placeholder_color: theme::text::BODY,
+                                caret: widgets::SimpleInputCaret::default(),
+                                field: Some(Self::new_file_name_handle()),
+                            },
+                            cx,
+                        )),
+                )
+                .when_some(self.new_file_error.clone(), |el, error| {
+                    el.child(
                         div()
                             .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.5))
-                            .text_color(theme::text::HEADING)
-                            .child("New file"),
+                            .text_size(px(10.5))
+                            .text_color(theme::status::FAIL)
+                            .child(error),
                     )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::FAINTER)
-                            .child(parent_label),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(theme::radius::CHIP)
-                            .bg(theme::surface::SEGMENT_TRACK)
-                            .flex()
-                            .items_center()
-                            // GitHub issue #45 / live report: this prompt had no caret element
-                            // at all before this - just the typed name or its placeholder, no
-                            // insertion-point indicator, and `new_file_focus_handle` was never
-                            // wired into `crate::root::caret_blink` either (see
-                            // `Self::new_with_settings`'s own comment on the fix). The caret and
-                            // the text around it now come from the one helper that owns that
-                            // structure - see `AdeApp::render_simple_input_row`.
-                            .child(self.render_simple_input_row(
-                                widgets::SimpleInput {
-                                    caret_selector: "new-file-caret".into(),
-                                    text_selector: "new-file-name-text".into(),
-                                    focus_handle: Some(&self.new_file_focus_handle),
-                                    text: &name,
-                                    caret_offset: name_caret,
-                                    selection: name_selection.clone(),
-                                    placeholder: "file-name.ext",
-                                    font: theme::font::MONO,
-                                    text_size: px(11.5),
-                                    // One colour for both: this prompt has never dimmed its
-                                    // placeholder, and the migration is not the place to change
-                                    // that.
-                                    text_color: theme::text::BODY,
-                                    placeholder_color: theme::text::BODY,
-                                    field: Some(Self::new_file_name_handle()),
-                                },
-                                cx,
-                            )),
-                    )
-                    .when_some(self.new_file_error.clone(), |el, error| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(10.5))
-                                .text_color(theme::status::FAIL)
-                                .child(error),
-                        )
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(px(10.0))
-                            .text_color(theme::text::GHOST)
-                            .child("enter to create \u{b7} esc to cancel"),
-                    ),
+                })
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::GHOST)
+                        .child("enter to create \u{b7} esc to cancel"),
+                ),
             )
     }
 

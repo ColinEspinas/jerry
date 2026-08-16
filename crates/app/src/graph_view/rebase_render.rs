@@ -10,7 +10,22 @@ use super::rebase::{
 };
 use super::*;
 use crate::root::plural;
-use gpui::{DragMoveEvent, KeyDownEvent};
+use crate::root::widgets::{SimpleInput, SimpleInputCaret, TextFieldHandle};
+use gpui::{DragMoveEvent, KeyDownEvent, SharedString};
+
+/// One interactive-rebase plan row's `reword` message field handle - what click/drag selection
+/// and GitHub issue #336's four clipboard/select-all actions act on. `None` whenever the plan no
+/// longer has a row at `index`, which is exactly the case [`TextFieldHandle`]'s own `Option`
+/// exists for.
+fn rebase_reword_handle(index: usize) -> TextFieldHandle {
+    TextFieldHandle::new(move |app: &mut AdeApp| {
+        app.graph_state
+            .rebase
+            .as_mut()
+            .and_then(|state| state.plan.get_mut(index))
+            .map(|row| &mut row.reword_message)
+    })
+}
 use wt_core::rebase::RebaseOutcome;
 
 /// The dragged payload for a plan row's own drag handle (design spec §1.4) - mirrors
@@ -933,7 +948,8 @@ impl AdeApp {
         let text = row.reword_message.as_str().to_string();
         let focus_handle = row.reword_focus_handle.clone();
         let supplied = row.has_supplied_reword_message();
-        div()
+        let field = rebase_reword_handle(index);
+        let row_node = div()
             .id(("rebase-reword-field", index))
             .flex_1()
             .min_w_0()
@@ -942,7 +958,10 @@ impl AdeApp {
             .key_context("text-input")
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.handle_rebase_reword_key_down(index, event, window, cx);
-            }))
+            }));
+        // GitHub issue #336's four clipboard/select-all actions, on the same node that carries
+        // this row's `"text-input"` word.
+        self.wire_text_input_actions(row_node, field.clone(), cx)
             // §1.4: "Its click must stop propagating, so placing the caret does not fight row
             // selection" - but the row still becomes the selected one, since that is visibly the
             // row being worked on and is what §1.4's keyboard actions then act upon.
@@ -966,12 +985,28 @@ impl AdeApp {
             })
             .flex()
             .items_center()
-            .gap(px(1.0))
-            .font(font(theme::font::SANS))
-            .text_size(px(11.5))
-            .text_color(theme::text::SELECTED)
-            .child(text)
-            .child(self.render_simple_input_caret("rebase-reword-caret", &focus_handle))
+            // GitHub issue #336: through the one helper that owns this structure, like every
+            // other simple input in the app. Before this, the caret was pinned after the text
+            // whatever the row's own `TextField::caret` said, and there was no selection
+            // highlight or click hit-testing at all.
+            .child(self.render_simple_input_row(
+                SimpleInput {
+                    caret_selector: SharedString::from(format!("rebase-reword-caret-{index}")),
+                    text_selector: SharedString::from(format!("rebase-reword-text-{index}")),
+                    focus_handle: Some(&focus_handle),
+                    text: &text,
+                    caret_offset: row.reword_message.caret(),
+                    selection: row.reword_message.selection(),
+                    placeholder: "",
+                    font: theme::font::SANS,
+                    text_size: px(11.5),
+                    text_color: theme::text::SELECTED,
+                    placeholder_color: theme::text::GHOST,
+                    caret: SimpleInputCaret::default(),
+                    field: Some(field),
+                },
+                cx,
+            ))
             .into_any_element()
     }
 

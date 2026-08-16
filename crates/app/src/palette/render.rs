@@ -1,7 +1,9 @@
 use super::*;
 use crate::root::plural;
 use crate::root::scrollbar;
-use crate::root::widgets::{render_hint_pair, render_hint_row, render_keycap_row, KeycapSize};
+use crate::root::widgets::{
+    render_hint_pair, render_hint_row, render_keycap_row, KeycapSize, SimpleInput, SimpleInputCaret,
+};
 use crate::settings::widgets::ChoiceOption;
 use crate::sidebar::render::{next_right_sidebar_view, RightSidebarView};
 
@@ -628,9 +630,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         // GitHub issue #27's "solid mid-keystroke" applies to every real caret-bearing input,
         // not only the code editor - reset unconditionally here, before dispatching on which key
         // this actually was, since every branch below is a real, live keystroke this input is
@@ -644,12 +650,6 @@ impl AdeApp {
                 if !self.leave_palette_step(cx) {
                     self.close_palette(window, cx);
                 }
-                cx.stop_propagation();
-            }
-            "backspace" => {
-                self.palette_query.backspace(Instant::now());
-                self.palette_selected = 0;
-                cx.notify();
                 cx.stop_propagation();
             }
             "enter" => {
@@ -674,17 +674,20 @@ impl AdeApp {
                 }
                 cx.stop_propagation();
             }
-            _ => {
-                let Some(text) = keystroke.key_char.as_deref() else {
-                    return;
-                };
-                if text.is_empty() {
-                    return;
-                }
-                if self.palette_query.is_empty() && self.palette_step == palette::PaletteStep::Root
+            key => {
+                // A scope prefix character typed into an *empty* root query switches scope
+                // instead of being inserted - checked before any editing, exactly as before.
+                if let Some(text) = keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
                 {
-                    if let Some(first_char) = text.chars().next() {
-                        if let Some(scope) = palette::typed_scope_prefix(first_char) {
+                    if self.palette_query.is_empty()
+                        && self.palette_step == palette::PaletteStep::Root
+                    {
+                        if let Some(scope) =
+                            text.chars().next().and_then(palette::typed_scope_prefix)
+                        {
                             self.palette_scope = scope;
                             self.palette_selected = 0;
                             cx.notify();
@@ -693,12 +696,31 @@ impl AdeApp {
                         }
                     }
                 }
-                self.palette_query.insert_str(text, Instant::now());
-                self.palette_selected = 0;
-                cx.notify();
-                cx.stop_propagation();
+                // GitHub issue #336: the whole `TextField` vocabulary through one entry point,
+                // rather than the backspace/insert pair this palette used to hand-roll - which is
+                // why its caret could never move off the end of the query.
+                if self.palette_query.handle_editing_key(
+                    key,
+                    keystroke.key_char.as_deref(),
+                    modifiers,
+                    Instant::now(),
+                ) {
+                    self.palette_selected = 0;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
             }
         }
+    }
+
+    /// The palette query's own field handle - what click/drag selection and GitHub issue #336's
+    /// four clipboard/select-all actions act on. Its `on_changed` resets the highlighted row to
+    /// the top exactly as a keystroke into the field does: a pasted query describes a different
+    /// result list, and leaving the old index selected would run whatever now happens to sit
+    /// there.
+    fn palette_query_handle() -> crate::root::widgets::TextFieldHandle {
+        crate::root::widgets::TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.palette_query))
+            .on_changed(|app: &mut AdeApp, _cx| app.palette_selected = 0)
     }
 
     /// The command palette overlay: an absolutely-positioned scrim + panel painted as the last
@@ -728,43 +750,47 @@ impl AdeApp {
                 this.close_palette(window, cx);
             }))
             .child(
-                div()
-                    .id("palette-panel")
-                    .track_focus(&self.palette_focus_handle)
-                    // The one shared context tag every real text-typing surface in this app
-                    // carries (GitHub issue #17): it routes `secondary-z` to `TextUndo` here.
-                    // Registering the listener on *this* node - the one `palette_focus_handle` is
-                    // tracked on - is what makes the routing structural: GPUI only dispatches an
-                    // action along the focused node's own ancestor path, so a palette query typed
-                    // over an open file editor undoes the query, not the file. See
-                    // `crate::default_key_bindings`' own docs.
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_palette_text_undo))
-                    .on_action(cx.listener(Self::handle_palette_text_redo))
-                    .on_key_down(cx.listener(Self::handle_palette_key_down))
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        // Stops the click from bubbling to the scrim's own `on_click`, which
-                        // would otherwise close the palette on every click inside it.
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .w(theme::zone::PALETTE_WIDTH)
-                    .max_h(px(480.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::PANEL)
-                    .overflow_hidden()
-                    .shadow(vec![BoxShadow::new(
-                        shadow_x,
-                        shadow_y,
-                        gpui::black().opacity(0.55),
-                    )
-                    .blur_radius(shadow_blur)])
-                    .child(self.render_palette_input_row(cx))
-                    .child(self.render_palette_groups(&groups, cx))
-                    .child(self.render_palette_footer(total)),
+                self.wire_text_input_actions(
+                    div()
+                        .id("palette-panel")
+                        .track_focus(&self.palette_focus_handle)
+                        // The one shared context tag every real text-typing surface in this app
+                        // carries (GitHub issue #17): it routes `secondary-z` to `TextUndo` here.
+                        // Registering the listener on *this* node - the one
+                        // `palette_focus_handle` is tracked on - is what makes the routing
+                        // structural: GPUI only dispatches an action along the focused node's own
+                        // ancestor path, so a palette query typed over an open file editor undoes
+                        // the query, not the file. See `crate::default_key_bindings`' own docs.
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_palette_text_undo))
+                        .on_action(cx.listener(Self::handle_palette_text_redo))
+                        .on_key_down(cx.listener(Self::handle_palette_key_down)),
+                    Self::palette_query_handle(),
+                    cx,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    // Stops the click from bubbling to the scrim's own `on_click`, which
+                    // would otherwise close the palette on every click inside it.
+                    cx.stop_propagation();
+                }))
+                .flex()
+                .flex_col()
+                .w(theme::zone::PALETTE_WIDTH)
+                .max_h(px(480.0))
+                .bg(theme::surface::PALETTE)
+                .border_1()
+                .border_color(theme::border::POPOVER)
+                .rounded(theme::radius::PANEL)
+                .overflow_hidden()
+                .shadow(vec![BoxShadow::new(
+                    shadow_x,
+                    shadow_y,
+                    gpui::black().opacity(0.55),
+                )
+                .blur_radius(shadow_blur)])
+                .child(self.render_palette_input_row(cx))
+                .child(self.render_palette_groups(&groups, cx))
+                .child(self.render_palette_footer(total)),
             )
     }
 
@@ -773,35 +799,6 @@ impl AdeApp {
     /// which renders the identical two-position caret rather than a fixed one, so this isn't a
     /// new invention. `margin_right`/`margin_left` place it on whichever side of the text it sits
     /// on: before the placeholder (empty query) or after the real typed text (non-empty).
-    fn render_palette_caret(
-        &self,
-        margin_right: gpui::Pixels,
-        margin_left: gpui::Pixels,
-    ) -> impl IntoElement {
-        // GitHub issue #27's caret blink, applied here too: `Self::palette_focus_handle` is
-        // wired into the same shared blink loop `crate::root::caret_blink` drives for the code
-        // editor (`AdeApp::wire_caret_blink`), and stays genuinely focused for this input's
-        // entire real lifetime - the palette panel's only other interactive children
-        // (`Self::render_palette_scope_control`'s segments) are plain `.on_click()` divs with no
-        // `.track_focus()` of their own, so they never steal keyboard focus away from it. That
-        // means this caret is never actually rendered while unfocused (closing the palette stops
-        // rendering it at all), so unlike the code editor's own caret there's no separate
-        // "hidden while unfocused" case to paint here - `caret_blink_visible` alone is the real,
-        // whole answer for whether to paint it this frame.
-        let visible = self.caret_blink_visible;
-        div()
-            .flex_none()
-            .mr(margin_right)
-            .ml(margin_left)
-            .w(px(1.5))
-            .h(px(16.0))
-            .when(visible, |el| el.bg(theme::term::CURSOR))
-            // `debug_selector` is a no-op outside test builds; lets
-            // `palette_caret_tests::*` measure the caret's real painted x position in both
-            // states and assert it actually moved.
-            .debug_selector(|| "palette-caret".to_string())
-    }
-
     /// The palette's input row: scope-prefix glyph, typed query (or its placeholder), a caret at
     /// the real insertion point, and the clickable segmented scope control.
     ///
@@ -819,7 +816,6 @@ impl AdeApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = !self.palette_query.is_empty();
         let placeholder = match self.palette_step {
             palette::PaletteStep::Root => "Type a command, file or agent\u{2026}",
             palette::PaletteStep::PickLanguageServer => "Which language server?",
@@ -844,35 +840,35 @@ impl AdeApp {
                     .text_color(theme::palette::PREFIX)
                     .child(self.palette_scope.prefix_glyph()),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .when(!has_query, |el| {
-                        el.child(self.render_palette_caret(px(3.0), px(0.0)))
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(self.ui_text_size(13.0))
-                            .text_color(if has_query {
-                                theme::text::SELECTED
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_query {
-                                self.palette_query.as_str().to_string()
-                            } else {
-                                placeholder.to_string()
-                            })
-                            .debug_selector(|| "palette-query-text".to_string()),
-                    )
-                    .when(has_query, |el| {
-                        el.child(self.render_palette_caret(px(0.0), px(2.0)))
-                    }),
-            )
+            // GitHub issue #336: through the one helper that owns this structure, like every
+            // other simple input in the app. The palette keeps its own caret *metrics* (16px
+            // tall, 3px before the placeholder, 2px after the typed text -
+            // `Jerry.dc.html`'s own `paletteEmpty`/`paletteTyped` fixture) through
+            // `SimpleInputCaret`, which is exactly why that type exists. What it gains is a caret
+            // that follows `TextField::caret` instead of sitting at the end of the query
+            // regardless, a real selection highlight, and real click/drag/double-click selection.
+            .child(self.render_simple_input_row(
+                SimpleInput {
+                    caret_selector: "palette-caret".into(),
+                    text_selector: "palette-query-text".into(),
+                    focus_handle: Some(&self.palette_focus_handle),
+                    text: self.palette_query.as_str(),
+                    caret_offset: self.palette_query.caret(),
+                    selection: self.palette_query.selection(),
+                    placeholder,
+                    font: theme::font::SANS,
+                    text_size: self.ui_text_size(13.0),
+                    text_color: theme::text::SELECTED,
+                    placeholder_color: theme::text::GHOST,
+                    caret: SimpleInputCaret {
+                        height: px(16.0),
+                        gap_before_placeholder: px(3.0),
+                        gap_after_text: px(2.0),
+                    },
+                    field: Some(Self::palette_query_handle()),
+                },
+                cx,
+            ))
             .when(self.palette_step == palette::PaletteStep::Root, |el| {
                 el.child(self.render_palette_scope_control(cx))
             })

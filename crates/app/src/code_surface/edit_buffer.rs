@@ -186,7 +186,9 @@ use crate::code_surface::fold;
 use crate::code_surface::indent;
 use crate::code_surface::symbols;
 use crate::language::HighlighterFn;
-use crate::text_history::{self, word_class, EditKind, SelectionSnapshot, TextEdit, TextHistory, WordClass};
+use crate::text_history::{
+    self, word_class, EditKind, SelectionSnapshot, TextEdit, TextHistory, WordClass,
+};
 
 /// Longest common byte prefix of `a`/`b`, clamped to a real UTF-8 char boundary in both -
 /// `EditBuffer::stale_spans_for_region`'s own real "which text didn't change" test (GitHub issue

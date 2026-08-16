@@ -335,10 +335,9 @@ impl AdeApp {
         // rather than being typed into it - through `widgets::text_editing_modifiers` since
         // GitHub issue #336, so word-wise Ctrl+Left/Right is real editing here rather than a
         // refused keystroke (see `crate::rail::render::AdeApp::handle_filter_key_down`'s note).
-        let Some(modifiers) = crate::root::widgets::text_editing_modifiers(
-            &keystroke.key,
-            &keystroke.modifiers,
-        ) else {
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
         };
         let changed = draft.field.handle_editing_key(

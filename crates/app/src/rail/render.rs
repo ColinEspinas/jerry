@@ -990,6 +990,7 @@ impl AdeApp {
                     text_size: self.ui_text_size(10.5),
                     text_color: theme::text::DIM,
                     placeholder_color: theme::text::GHOST,
+                    caret: widgets::SimpleInputCaret::default(),
                     field: Some(Self::filter_query_handle()),
                 },
                 cx,

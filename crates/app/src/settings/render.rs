@@ -1089,67 +1089,68 @@ impl AdeApp {
                     shell_input_handle(),
                     cx,
                 )
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        window.focus(&this.shell_focus_handle, cx);
-                        this.open_shell_suggestions(cx);
-                    }))
-                    // The field's real, window-space painted bounds, for positioning the
-                    // suggestion dropdown - the same `gpui::canvas` idiom
-                    // `Self::plus_button_bounds` uses, and for the same reason: the dropdown is a
-                    // top-level sibling in `AdeApp::render`, so it needs the field's position in
-                    // window space, not in this row's own coordinate system.
-                    .child({
-                        let this = cx.entity();
-                        gpui::canvas(
-                            move |bounds, _window, cx| {
-                                this.update(cx, |this, _cx| {
-                                    this.shell_field_bounds = bounds;
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full()
-                    })
-                    .cursor_pointer()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    .h(px(20.0))
-                    .w(px(168.0))
-                    .px(px(7.0))
-                    .rounded(theme::radius::BUTTON)
-                    .border_1()
-                    .border_color(theme::border::CARD_FIELD)
-                    .bg(theme::surface::CARD_SUNK)
-                    // Caret placement and text sizing both through
-                    // `AdeApp::render_simple_input_row`, which owns that structure for every
-                    // simple input in this app. This field was the *second* live instance of the
-                    // bug that helper exists to make unrepeatable: `.flex_1().min_w_0()` sat on
-                    // the text element, so inside this fixed 168px box the text's layout box
-                    // filled the whole field whatever the shell path said, and the caret after it
-                    // sat pinned to the right-hand border instead of against the last character.
-                    .child(self.render_simple_input_row(
-                        SimpleInput {
-                            caret_selector: "settings-shell-caret".into(),
-                            text_selector: "settings-shell-text".into(),
-                            focus_handle: Some(&self.shell_focus_handle),
-                            text: if has_shell { &shell } else { "" },
-                            caret_offset: self.shell_input.caret(),
-                            selection: self.shell_input.selection(),
-                            placeholder: &placeholder,
-                            font: theme::font::MONO,
-                            text_size: self.ui_text_size(10.5),
-                            text_color: theme::text::BODY,
-                            placeholder_color: theme::text::GHOST,
-                            field: Some(shell_input_handle()),
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    window.focus(&this.shell_focus_handle, cx);
+                    this.open_shell_suggestions(cx);
+                }))
+                // The field's real, window-space painted bounds, for positioning the
+                // suggestion dropdown - the same `gpui::canvas` idiom
+                // `Self::plus_button_bounds` uses, and for the same reason: the dropdown is a
+                // top-level sibling in `AdeApp::render`, so it needs the field's position in
+                // window space, not in this row's own coordinate system.
+                .child({
+                    let this = cx.entity();
+                    gpui::canvas(
+                        move |bounds, _window, cx| {
+                            this.update(cx, |this, _cx| {
+                                this.shell_field_bounds = bounds;
+                            });
                         },
-                        cx,
-                    )),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full()
+                })
+                .cursor_pointer()
+                .flex_none()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                .h(px(20.0))
+                .w(px(168.0))
+                .px(px(7.0))
+                .rounded(theme::radius::BUTTON)
+                .border_1()
+                .border_color(theme::border::CARD_FIELD)
+                .bg(theme::surface::CARD_SUNK)
+                // Caret placement and text sizing both through
+                // `AdeApp::render_simple_input_row`, which owns that structure for every
+                // simple input in this app. This field was the *second* live instance of the
+                // bug that helper exists to make unrepeatable: `.flex_1().min_w_0()` sat on
+                // the text element, so inside this fixed 168px box the text's layout box
+                // filled the whole field whatever the shell path said, and the caret after it
+                // sat pinned to the right-hand border instead of against the last character.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "settings-shell-caret".into(),
+                        text_selector: "settings-shell-text".into(),
+                        focus_handle: Some(&self.shell_focus_handle),
+                        text: if has_shell { &shell } else { "" },
+                        caret_offset: self.shell_input.caret(),
+                        selection: self.shell_input.selection(),
+                        placeholder: &placeholder,
+                        font: theme::font::MONO,
+                        text_size: self.ui_text_size(10.5),
+                        text_color: theme::text::BODY,
+                        placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(shell_input_handle()),
+                    },
+                    cx,
+                )),
             )
     }
 
@@ -1190,10 +1191,12 @@ impl AdeApp {
             // backspace/insert half this used to hand-roll - caret movement, selection extension,
             // word-wise movement and Delete all arrive here at once, for this field and the two
             // below it.
-            key => {
-                self.shell_input
-                    .handle_editing_key(key, keystroke.key_char.as_deref(), modifiers, Instant::now())
-            }
+            key => self.shell_input.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
         };
         if changed {
             self.apply_shell_input(cx);
@@ -2071,45 +2074,46 @@ impl AdeApp {
                     theme_seed_input_handle(),
                     cx,
                 )
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        window.focus(&this.theme_seed_focus_handle, cx);
-                    }))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    .h(px(20.0))
-                    .w(px(96.0))
-                    .px(px(7.0))
-                    .rounded(theme::radius::BUTTON)
-                    .border_1()
-                    .border_color(theme::border::CARD_FIELD)
-                    .bg(theme::surface::CARD_SUNK)
-                    // GitHub issue #336: through the one helper that owns this structure, like
-                    // every other simple input in the app, rather than the hand-assembled
-                    // caret-before-placeholder / text / caret-after-text trio this row used to
-                    // carry - which is exactly the duplication `render_simple_input_row` exists to
-                    // end, and which had no selection highlight or hit-testing of its own.
-                    .child(self.render_simple_input_row(
-                        SimpleInput {
-                            caret_selector: "settings-theme-seed-caret".into(),
-                            text_selector: "settings-theme-seed-text".into(),
-                            focus_handle: Some(&self.theme_seed_focus_handle),
-                            text: if has_seed { seed.as_str() } else { "" },
-                            caret_offset: self.theme_seed_input.caret(),
-                            selection: self.theme_seed_input.selection(),
-                            placeholder: "#rrggbb",
-                            font: theme::font::MONO,
-                            text_size: px(10.5),
-                            text_color: theme::text::BODY,
-                            placeholder_color: theme::text::GHOST,
-                            field: Some(theme_seed_input_handle()),
-                        },
-                        cx,
-                    )),
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    window.focus(&this.theme_seed_focus_handle, cx);
+                }))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                .h(px(20.0))
+                .w(px(96.0))
+                .px(px(7.0))
+                .rounded(theme::radius::BUTTON)
+                .border_1()
+                .border_color(theme::border::CARD_FIELD)
+                .bg(theme::surface::CARD_SUNK)
+                // GitHub issue #336: through the one helper that owns this structure, like
+                // every other simple input in the app, rather than the hand-assembled
+                // caret-before-placeholder / text / caret-after-text trio this row used to
+                // carry - which is exactly the duplication `render_simple_input_row` exists to
+                // end, and which had no selection highlight or hit-testing of its own.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "settings-theme-seed-caret".into(),
+                        text_selector: "settings-theme-seed-text".into(),
+                        focus_handle: Some(&self.theme_seed_focus_handle),
+                        text: if has_seed { seed.as_str() } else { "" },
+                        caret_offset: self.theme_seed_input.caret(),
+                        selection: self.theme_seed_input.selection(),
+                        placeholder: "#rrggbb",
+                        font: theme::font::MONO,
+                        text_size: px(10.5),
+                        text_color: theme::text::BODY,
+                        placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(theme_seed_input_handle()),
+                    },
+                    cx,
+                )),
             )
             // A real, live preview of the seed itself, so a typo is visible before clicking.
             .when(parse_seed_hex(&seed).is_some(), |el| {
@@ -2627,66 +2631,64 @@ impl AdeApp {
             settings_keymap_filter_handle(),
             cx,
         )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                window.focus(&this.settings_keymap_filter_focus_handle, cx);
-            }))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .px(px(11.0))
-            .py(px(7.0))
-            .bg(theme::surface::CARD_SUNK)
-            .border_b_1()
-            .border_color(theme::border::CARD)
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
-                    .text_color(theme::text::GHOSTER)
-                    .child("/"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    // GitHub issue #45 / live report: same fix as
-                    // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
-                    // before the placeholder (real cursor position 0) while the filter is empty,
-                    // never appended after it.
-                    .child(self.render_simple_input_row(
-                        SimpleInput {
-                            caret_selector: "settings-keymap-filter-caret".into(),
-                            text_selector: "settings-keymap-filter-text".into(),
-                            focus_handle: Some(&self.settings_keymap_filter_focus_handle),
-                            text: self.settings_keymap_filter.as_str(),
-                            caret_offset: self.settings_keymap_filter.caret(),
-                            selection: self.settings_keymap_filter.selection(),
-                            placeholder: &format!(
-                                "filter {}",
-                                plural::count(total, "binding", None)
-                            ),
-                            font: theme::font::SANS,
-                            text_size: px(11.0),
-                            text_color: theme::text::DIM,
-                            placeholder_color: theme::text::GHOST,
-                            field: Some(settings_keymap_filter_handle()),
-                        },
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!("{shown} shown")),
-            )
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            window.focus(&this.settings_keymap_filter_focus_handle, cx);
+        }))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .px(px(11.0))
+        .py(px(7.0))
+        .bg(theme::surface::CARD_SUNK)
+        .border_b_1()
+        .border_color(theme::border::CARD)
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::GHOSTER)
+                .child("/"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                // GitHub issue #45 / live report: same fix as
+                // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
+                // before the placeholder (real cursor position 0) while the filter is empty,
+                // never appended after it.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "settings-keymap-filter-caret".into(),
+                        text_selector: "settings-keymap-filter-text".into(),
+                        focus_handle: Some(&self.settings_keymap_filter_focus_handle),
+                        text: self.settings_keymap_filter.as_str(),
+                        caret_offset: self.settings_keymap_filter.caret(),
+                        selection: self.settings_keymap_filter.selection(),
+                        placeholder: &format!("filter {}", plural::count(total, "binding", None)),
+                        font: theme::font::SANS,
+                        text_size: px(11.0),
+                        text_color: theme::text::DIM,
+                        placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(settings_keymap_filter_handle()),
+                    },
+                    cx,
+                )),
+        )
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(format!("{shown} shown")),
+        )
     }
 
     /// Same minimal append/backspace/escape-clears shape as [`Self::handle_filter_key_down`] -

@@ -10,7 +10,7 @@ use super::{flow, NoteAnchor, NoteMark};
 use crate::provenance::render::author_style;
 use crate::provenance::Author;
 use crate::root::widgets::{
-    render_keycap_row, text_tooltip, KeycapSize, SimpleInput, TextFieldHandle,
+    render_keycap_row, text_tooltip, KeycapSize, SimpleInput, SimpleInputCaret, TextFieldHandle,
 };
 use crate::root::{plural, AdeApp};
 use crate::theme;
@@ -554,6 +554,7 @@ impl AdeApp {
                             text_size: px(11.5),
                             text_color: theme::notes::CARD_FG,
                             placeholder_color: theme::notes::CARD_PLACEHOLDER,
+                            caret: SimpleInputCaret::default(),
                             // Only the card really being edited is pointer-editable; the pinned
                             // ones around it are read-only text, exactly as their suppressed
                             // caret already says.

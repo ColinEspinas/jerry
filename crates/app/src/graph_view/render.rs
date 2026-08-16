@@ -7,7 +7,7 @@ use super::*;
 use crate::root::scrollbar;
 use crate::root::widgets::{
     menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter, SimpleInput,
-    TextFieldHandle,
+    SimpleInputCaret, TextFieldHandle,
 };
 use crate::settings::widgets;
 use crate::sidebar::changes;
@@ -1367,82 +1367,81 @@ impl AdeApp {
                     branch_prompt_name_handle(),
                     cx,
                 )
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .w(px(320.0))
-                    .p(px(12.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .child(
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .w(px(320.0))
+                .p(px(12.0))
+                .bg(theme::surface::PALETTE)
+                .border_1()
+                .border_color(theme::border::POPOVER)
+                .rounded(theme::radius::CARD)
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(11.5))
+                        .text_color(theme::text::HEADING)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "graph-branch-prompt-subtitle".to_string())
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::FAINTER)
+                        .child(subtitle),
+                )
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .bg(theme::surface::SEGMENT_TRACK)
+                        .flex()
+                        .items_center()
+                        // GitHub issue #336: through the one helper that owns this structure,
+                        // like every other simple input in the app - which is also what gives
+                        // this prompt a selection highlight and real click-to-position for the
+                        // first time.
+                        .child(self.render_simple_input_row(
+                            SimpleInput {
+                                caret_selector: "graph-branch-prompt-caret".into(),
+                                text_selector: "graph-branch-prompt-text".into(),
+                                focus_handle: Some(&self.graph_state.branch_prompt_focus_handle),
+                                text: if has_name { name.as_str() } else { "" },
+                                caret_offset: self.graph_state.branch_prompt_name.caret(),
+                                selection: self.graph_state.branch_prompt_name.selection(),
+                                placeholder: "branch-name",
+                                font: theme::font::MONO,
+                                text_size: px(11.5),
+                                text_color: theme::text::BODY,
+                                placeholder_color: theme::text::GHOST,
+                                caret: SimpleInputCaret::default(),
+                                field: Some(branch_prompt_name_handle()),
+                            },
+                            cx,
+                        )),
+                )
+                .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
+                    el.child(
                         div()
                             .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.5))
-                            .text_color(theme::text::HEADING)
-                            .child(title),
+                            .text_size(px(10.5))
+                            .text_color(theme::status::FAIL)
+                            .child(error),
                     )
-                    .child(
-                        div()
-                            .debug_selector(|| "graph-branch-prompt-subtitle".to_string())
-                            .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::FAINTER)
-                            .child(subtitle),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(theme::radius::CHIP)
-                            .bg(theme::surface::SEGMENT_TRACK)
-                            .flex()
-                            .items_center()
-                            // GitHub issue #336: through the one helper that owns this structure,
-                            // like every other simple input in the app - which is also what gives
-                            // this prompt a selection highlight and real click-to-position for the
-                            // first time.
-                            .child(self.render_simple_input_row(
-                                SimpleInput {
-                                    caret_selector: "graph-branch-prompt-caret".into(),
-                                    text_selector: "graph-branch-prompt-text".into(),
-                                    focus_handle: Some(
-                                        &self.graph_state.branch_prompt_focus_handle,
-                                    ),
-                                    text: if has_name { name.as_str() } else { "" },
-                                    caret_offset: self.graph_state.branch_prompt_name.caret(),
-                                    selection: self.graph_state.branch_prompt_name.selection(),
-                                    placeholder: "branch-name",
-                                    font: theme::font::MONO,
-                                    text_size: px(11.5),
-                                    text_color: theme::text::BODY,
-                                    placeholder_color: theme::text::GHOST,
-                                    field: Some(branch_prompt_name_handle()),
-                                },
-                                cx,
-                            )),
-                    )
-                    .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(10.5))
-                                .text_color(theme::status::FAIL)
-                                .child(error),
-                        )
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(px(10.0))
-                            .text_color(theme::text::GHOST)
-                            .child(footer),
-                    ),
+                })
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::GHOST)
+                        .child(footer),
+                ),
             )
     }
 }
@@ -3098,51 +3097,52 @@ impl AdeApp {
             branches_filter_handle(),
             cx,
         )
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                window.focus(&this.graph_state.branches_filter_focus_handle, cx);
-            }))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .h(theme::graph::BRANCHES_FILTER_ROW)
-            .border_b_1()
-            .border_color(theme::border::RAIL_INNER)
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::text::GHOST)
-                    .child("/"),
-            )
-            // Caret placement, the empty/typed ordering and the flex structure around them all
-            // through the one helper that owns them - see
-            // `AdeApp::render_simple_input_row`'s own docs.
-            .child(self.render_simple_input_row(
-                SimpleInput {
-                    caret_selector: "graph-branches-filter-caret".into(),
-                    text_selector: "graph-branches-filter-text".into(),
-                    focus_handle: Some(&self.graph_state.branches_filter_focus_handle),
-                    text: self.graph_state.branches_filter.as_str(),
-                    caret_offset: self.graph_state.branches_filter.caret(),
-                    selection: self.graph_state.branches_filter.selection(),
-                    placeholder: "filter branches",
-                    font: theme::font::MONO,
-                    text_size: px(10.5),
-                    text_color: theme::text::DIM,
-                    placeholder_color: theme::text::GHOST,
-                    field: Some(branches_filter_handle()),
-                },
-                cx,
-            ))
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!("{count}")),
-            )
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            window.focus(&this.graph_state.branches_filter_focus_handle, cx);
+        }))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .h(theme::graph::BRANCHES_FILTER_ROW)
+        .border_b_1()
+        .border_color(theme::border::RAIL_INNER)
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.5))
+                .text_color(theme::text::GHOST)
+                .child("/"),
+        )
+        // Caret placement, the empty/typed ordering and the flex structure around them all
+        // through the one helper that owns them - see
+        // `AdeApp::render_simple_input_row`'s own docs.
+        .child(self.render_simple_input_row(
+            SimpleInput {
+                caret_selector: "graph-branches-filter-caret".into(),
+                text_selector: "graph-branches-filter-text".into(),
+                focus_handle: Some(&self.graph_state.branches_filter_focus_handle),
+                text: self.graph_state.branches_filter.as_str(),
+                caret_offset: self.graph_state.branches_filter.caret(),
+                selection: self.graph_state.branches_filter.selection(),
+                placeholder: "filter branches",
+                font: theme::font::MONO,
+                text_size: px(10.5),
+                text_color: theme::text::DIM,
+                placeholder_color: theme::text::GHOST,
+                caret: SimpleInputCaret::default(),
+                field: Some(branches_filter_handle()),
+            },
+            cx,
+        ))
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(format!("{count}")),
+        )
     }
 
     fn current_graph(&self) -> Option<&Graph> {

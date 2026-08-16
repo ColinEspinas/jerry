@@ -124,9 +124,11 @@ impl AdeApp {
                         .border_t_1()
                         .border_color(theme::border::ROW)
                         .child(render_search_row_mark("\u{21c4}", self.ui_text_size(10.0)))
-                        .child(
-                            self.render_search_field(SearchField::Replace, "replace with\u{2026}", cx),
-                        )
+                        .child(self.render_search_field(
+                            SearchField::Replace,
+                            "replace with\u{2026}",
+                            cx,
+                        ))
                         // `REVISION-2026-08-14.md` §7 rule 2: a control that acts on results does
                         // not exist when there are none.
                         .children(
@@ -251,6 +253,7 @@ impl AdeApp {
                 // either dim-text token and absent from the palette". This is the design's own
                 // `#4e545a`, through the theme layer.
                 placeholder_color: theme::text::GHOST,
+                caret: widgets::SimpleInputCaret::default(),
                 field: Some(search_field_handle(field)),
             },
             cx,
@@ -2340,6 +2343,7 @@ impl AdeApp {
                         text_size: self.ui_text_size(11.0),
                         text_color: theme::text::SELECTED,
                         placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
                         field: Some(find_bar_query_handle()),
                     },
                     cx,
