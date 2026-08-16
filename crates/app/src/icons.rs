@@ -253,9 +253,23 @@ pub enum IconSize {
     /// 15px - the sidebar strip's buttons (`Jerry.dc.html`: each strip glyph sits in a
     /// `position:relative;width:15px;height:15px` wrapper inside a 38px-wide cell).
     Strip,
-    /// 17px - the icon buttons: the search panel's count row (replace / filter / fold-all) and
-    /// the rail footer's prune button, all `width:17px;height:17px` in `Jerry.dc.html`.
-    /// §4w records fold-all being lifted 15 -> 17 for exactly the reason rule 7 states.
+    /// 12px - the icon buttons: the search panel's count row (replace / filter) and the rail
+    /// footer's prune button. `Jerry.dc.html`'s `width:17px;height:17px` on these controls is the
+    /// **hit box** (`theme::band::ICON_BUTTON_HIT`), not the glyph's own optical size - a
+    /// distinction this size got wrong the first time round (GitHub issue filed 2026-08-16,
+    /// screenshot-reported: "icons in buttons are too big"). The hand-drawn stand-ins actually
+    /// painted well inside that box:
+    ///
+    /// - funnel (`onClick="{{ onFindGlob }}"`): three bars at `left:3/5/7 width:11/7/3`, `top:5/8/11
+    ///   height:1` each - bounding box x 3-14 (11 wide), y 5-12 (7 tall).
+    /// - trash (rail prune): lid + nub + body at `left:4/7/5 top:4.5/2.5/6.5` - bounding box x
+    ///   4-13 (9 wide), y 2.5-14.5 (12 tall).
+    /// - `⇄` (replace) and the fold-all caret were plain text at `font-size:11px`.
+    ///
+    /// 12 is the largest real dimension in that set (the trash glyph's height) - the same
+    /// "the square box is the larger dimension" reading [`IconSize::PanelTab`]'s own doc comment
+    /// uses, so nothing here clips. Fold-all stays a text caret (`crate::search::render_search_caret`),
+    /// not an `Icon`, so it is unaffected by this box.
     Control,
 }
 
@@ -276,7 +290,7 @@ impl IconSize {
             IconSize::MenuRow => px(13.0),
             IconSize::TabChip => px(14.0),
             IconSize::Strip => px(15.0),
-            IconSize::Control => px(17.0),
+            IconSize::Control => px(12.0),
         }
     }
 }
@@ -619,7 +633,10 @@ mod tests {
         assert_eq!(IconSize::PanelTab.box_size(), px(11.0));
         assert_eq!(IconSize::TabChip.box_size(), px(14.0));
         assert_eq!(IconSize::Strip.box_size(), px(15.0));
-        assert_eq!(IconSize::Control.box_size(), px(17.0));
+        // 12, not 17 - `Jerry.dc.html`'s 17px on these controls is the surrounding hit box
+        // (`theme::band::ICON_BUTTON_HIT`); the funnel/trash hand-drawn glyphs inside it only
+        // really occupy up to 11x7 and 9x12 respectively. See `IconSize::Control`'s doc comment.
+        assert_eq!(IconSize::Control.box_size(), px(12.0));
     }
 
     /// §8's weight rule, checked against what `assets/icons/` really holds. This is the guard
