@@ -25,8 +25,8 @@
 
 > [!NOTE]
 > **Jerry is a working prototype, not a released product.** It does real work — real branches, real
-> agent processes, real `git` — but expect rough edges. [What's rough](#whats-rough) is the honest
-> list.
+> agent processes, real `git` — but expect rough edges. [Open issues](../../issues) is the honest
+> list of what's in progress.
 
 ## How it works
 
@@ -43,8 +43,7 @@ Everything Jerry touches is ordinary `git`. Nothing reaches your main checkout u
 any branch it works with is inspectable — or undoable — from a plain terminal, with or without Jerry
 running.
 
-> Worktrees themselves are still created with `git worktree add`; Jerry picks them up from there. See
-> [what's rough](#whats-rough).
+> Worktrees themselves are still created with `git worktree add` — Jerry picks them up from there.
 
 ---
 
@@ -163,14 +162,24 @@ actually done. Rebase interactively when you want to tidy up before merging.
 
 ## Supported agents
 
-| Agent | CLI | How Jerry tracks it |
-| --- | --- | --- |
-| **Claude Code** | `claude` | Directly — Claude Code reports its own state, so running/waiting/finished isn't guesswork. Past conversations can be resumed. |
-| **Codex** | `codex` | Inferred from what its terminal is doing. |
+<p align="center">
+  <img alt="Claude Code: full support" src="https://img.shields.io/badge/Claude%20Code-full-3f9c5f?style=for-the-badge&labelColor=1a1e21" />
+  <img alt="Codex: partial support" src="https://img.shields.io/badge/Codex-partial-b5811f?style=for-the-badge&labelColor=1a1e21" />
+  <img alt="Cursor: planned" src="https://img.shields.io/badge/Cursor-planned-5b6570?style=for-the-badge&labelColor=1a1e21" />
+</p>
+
+<p align="center">
+  <sub>
+    <strong>full</strong> — runs, and reports its own state back, so status is never a guess &nbsp;·&nbsp;
+    <strong>partial</strong> — runs, but status is inferred from its terminal &nbsp;·&nbsp;
+    <strong>planned</strong> — not built yet
+  </sub>
+</p>
 
 Jerry runs the CLI **you** installed, in the session's worktree — your auth, your config, your
 version. It doesn't bundle, wrap or proxy anything, and **Settings › Agents** tells you whether each
-one is on your `PATH`.
+one is on your `PATH`. Claude Code goes further than the rest: it reports its own state, and past
+conversations can be resumed from where they stopped.
 
 **More are coming.** Any coding agent that runs in a terminal fits this model, and the goal is to
 work with all of them. Today that's Claude Code and Codex; [Cursor](../../issues/353) is next. If
@@ -242,42 +251,17 @@ you.
 
 ---
 
-## What Jerry won't do
-
-Three rules this project holds itself to, because they're the difference between a tool you can trust
-with your repo and one you can't.
-
-- **No sandboxes, no copies.** Jerry uses real `git worktree`. Every branch it makes is inspectable,
-  mergeable and undoable from any terminal, with or without Jerry installed.
-- **No wrapping your agent.** Jerry spawns the CLI you already installed and stays out of the
-  conversation — it never sits between you and the model, and never rewrites your prompts. The one
-  addition is a settings file passed to Claude Code so it can report its own status back.
-- **Nothing fake in the UI.** No button that looks wired up but isn't, no sample data standing in for
-  a real source. Where something isn't built yet, it says so.
-
-## What's rough
-
-An honest read of a prototype, rather than a status badge:
-
-- **You can't create a worktree from Jerry yet** — it attaches agents to worktrees that already
-  exist, so `git worktree add` still happens in a terminal. Related:
-  [#199](../../issues/199), [#198](../../issues/198).
-- The Git changes pane doesn't always reflect real status ([#415](../../issues/415)).
-- Interactive rebase has real bugs in its plan editing and its confirmations
-  ([#343](../../issues/343), [#344](../../issues/344)).
-- Review notes can't pick a target when a worktree has several agents ([#330](../../issues/330)).
-- Killing a process tree doesn't work on macOS ([#422](../../issues/422)).
-- The test suite isn't back in CI yet ([#426](../../issues/426)).
-
-[All open issues →](../../issues)
-
 ## Built with
 
-[GPUI](https://www.gpui.rs/) (Zed's UI framework) &nbsp;·&nbsp;
-[`alacritty_terminal`](https://github.com/zed-industries/alacritty) + `portable-pty` for terminal and
-PTY &nbsp;·&nbsp; [`gix`](https://crates.io/crates/gix) plus the real `git` CLI for version control
-&nbsp;·&nbsp; [`lsp-types`](https://crates.io/crates/lsp-types) with a hand-written client
-&nbsp;·&nbsp; `tree-sitter` for highlighting.
+A native Rust application — no Electron, no web view.
+
+| | |
+| --- | --- |
+| [**GPUI**](https://www.gpui.rs/) | The UI framework, from the Zed editor |
+| [**`alacritty_terminal`**](https://github.com/zed-industries/alacritty) + **`portable-pty`** | Terminal emulation and process handling |
+| [**`gix`**](https://crates.io/crates/gix) + the real `git` CLI | Reading and writing your repository |
+| [**`lsp-types`**](https://crates.io/crates/lsp-types) | Language server support, with a hand-written client |
+| [**`tree-sitter`**](https://tree-sitter.github.io/tree-sitter/) | Syntax highlighting |
 
 ## Contributing
 
@@ -293,5 +277,5 @@ a change moves from issue to merged PR is in
 
 ## License
 
-**[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — your choice.** Contributions are covered by
-both unless you say otherwise.
+**[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — take whichever suits you.** Open a PR and your
+code goes in under both, so everyone downstream keeps that same choice.
