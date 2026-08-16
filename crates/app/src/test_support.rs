@@ -57,6 +57,14 @@ pub(crate) fn temp_repo() -> TempRoot {
     canonicalized(test_support::seed_repo())
 }
 
+/// A [`TempRoot`] whose repository `seed` builds against the canonicalized root, so a fixture that
+/// seeds commits and one that records app state agree on a single spelling of the path.
+pub(crate) fn temp_repo_with(seed: impl FnOnce(&Path)) -> TempRoot {
+    let root = canonicalized(tempfile::tempdir().expect("tempdir"));
+    seed(root.path());
+    root
+}
+
 fn canonicalized(dir: tempfile::TempDir) -> TempRoot {
     let root = dir.path().canonicalize().expect("canonicalize tempdir");
     TempRoot { _dir: dir, root }

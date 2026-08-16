@@ -11,13 +11,12 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::Command;
 
 use gpui::EntityInputHandler as _;
 
 use crate::hooks::settings_file::{PORT_ENV, TOKEN_ENV};
 use crate::provenance::{AgentKey, Author};
-use crate::root::focus::palette_focus_tests::open_test_app;
+use crate::test_support::{open_test_app, temp_repo_with};
 use crate::work_surface::agents::ProcessKind;
 
 const USERS_RS_BASE: &str = "\
@@ -40,14 +39,10 @@ impl UserApi {
 fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_set_row(
     cx: &mut gpui::TestAppContext,
 ) {
-    let repo = tempfile::tempdir().expect("tempdir");
-    git(repo.path(), &["init", "-b", "main"]);
-    git(repo.path(), &["config", "user.email", "test@example.com"]);
-    git(repo.path(), &["config", "user.name", "Test User"]);
-    std::fs::create_dir_all(repo.path().join("src/api")).expect("mkdir");
-    std::fs::write(repo.path().join("src/api/users.rs"), USERS_RS_BASE).expect("seed");
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-m", "initial"]);
+    let repo = temp_repo_with(|root| {
+        test_support::seed_empty_repo_at(root);
+        test_support::commit(root, "src/api/users.rs", USERS_RS_BASE, "initial");
+    });
 
     let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
@@ -157,13 +152,10 @@ fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_
 fn a_real_save_through_jerrys_own_editor_flips_exactly_its_own_lines_to_you(
     cx: &mut gpui::TestAppContext,
 ) {
-    let repo = tempfile::tempdir().expect("tempdir");
-    git(repo.path(), &["init", "-b", "main"]);
-    git(repo.path(), &["config", "user.email", "test@example.com"]);
-    git(repo.path(), &["config", "user.name", "Test User"]);
-    std::fs::write(repo.path().join("sample.txt"), "one\ntwo\nthree\n").expect("seed");
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-m", "initial"]);
+    let repo = temp_repo_with(|root| {
+        test_support::seed_empty_repo_at(root);
+        test_support::commit(root, "sample.txt", "one\ntwo\nthree\n", "initial");
+    });
 
     let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
     cx.run_until_parked();
@@ -234,21 +226,5 @@ fn post(port: u16, token: &str, query: &str, body: &str) {
     assert!(
         response.starts_with("HTTP/1.1 204"),
         "the listener must accept a real hook request, got: {response}"
-    );
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("failed to spawn git");
-    assert!(
-        output.status.success(),
-        "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-        args,
-        dir,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -268,53 +268,30 @@ impl AdeApp {
 mod worktree_history_regression_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
+    use crate::test_support::{temp_repo_with, TempRoot};
     use gpui::{Entity, TestAppContext};
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{git, git_output};
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
+    fn init_repo() -> TempRoot {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+        })
     }
 
     /// Same linked-worktree idiom `merge::flow`/`rail::render`'s own test modules use.
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
-        let path = container.path().join(name);
-        drop(container);
+        // `keep()`, not `drop()`: dropping the container deleted the directory and freed its
+        // random name for reuse, so under the parallel suite another fixture could be handed the
+        // same name and create `<name>` inside it first - `git worktree add` then failed with
+        // "already exists". Reproduced directly: 1 run in ~7 of the merge module under load.
+        // Keeping the (empty) directory costs nothing the old code did not already leak, since
+        // git recreated the path afterwards and nothing ever removed it.
+        let root = container.keep();
+        let path = root.join(name);
         git(
             repo_path,
             &[

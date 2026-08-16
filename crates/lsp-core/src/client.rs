@@ -1747,6 +1747,7 @@ fn run_stderr_drain_loop(stderr: std::process::ChildStderr, server: &'static str
 mod tests {
     use super::*;
     use std::time::Instant;
+    use test_support::ChildGuard;
 
     /// GitHub issue #46's own real, remaining Windows gotcha - `canonicalize`'s own docs. Not a
     /// no-op check: this is a genuine round trip against a real temp directory, proving the
@@ -2000,26 +2001,30 @@ mod tests {
     /// constructor of its own and the notification branches under test never write to it), plus
     /// the same real `Arc<Mutex<..>>` sinks [`LspClient::spawn`] wires up. Returns the child too,
     /// so the caller keeps it alive - and kills it - for the duration of the test.
+    #[cfg(unix)]
     struct IncomingHarness {
-        child: Child,
+        /// Kept alive for the test's duration, and killed on drop by the guard itself.
+        _child: ChildGuard,
         sinks: IncomingSinks,
         wake_rx: Receiver<()>,
     }
 
+    #[cfg(unix)]
     impl IncomingHarness {
         /// `subscribed` is the real [`ServerSpawnConfig::custom_notification_methods`] list this
         /// harness's `handle_incoming` calls are driven with.
         fn new(subscribed: &[&'static str]) -> Self {
-            let mut child = Command::new("cat")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawning a real `cat` for its stdin handle");
+            let mut child = ChildGuard::spawn(
+                Command::new("cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+            )
+            .expect("spawning a real `cat` for its stdin handle");
             let stdin = child.stdin.take().expect("piped stdin");
             let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
             Self {
-                child,
+                _child: child,
                 sinks: IncomingSinks {
                     pending: Arc::new(Mutex::new(HashMap::new())),
                     diagnostics: Arc::new(Mutex::new(HashMap::new())),
@@ -2043,16 +2048,10 @@ mod tests {
         }
     }
 
-    impl Drop for IncomingHarness {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
     /// The real capability `crate::client`'s notification branch gained so a server's own custom
     /// protocol extension stops being invisible: a subscribed method is queued verbatim, method
     /// and raw params both intact, in real arrival order.
+    #[cfg(unix)]
     #[test]
     fn a_subscribed_notification_is_queued_verbatim_for_draining() {
         let harness = IncomingHarness::new(&["tsserver/request", "server/other"]);
@@ -2091,6 +2090,7 @@ mod tests {
     /// this app's pre-existing servers) queues nothing at all, no matter how much unrelated
     /// notification traffic its server produces. Behaviorally identical to before this capability
     /// existed.
+    #[cfg(unix)]
     #[test]
     fn a_client_that_subscribed_to_nothing_queues_nothing_at_all() {
         let harness = IncomingHarness::new(&[]);
@@ -2113,6 +2113,7 @@ mod tests {
 
     /// Subscription is per-method, not all-or-nothing: an un-subscribed method is still ignored
     /// even on a client that subscribed to something else.
+    #[cfg(unix)]
     #[test]
     fn an_unsubscribed_method_is_ignored_even_when_other_methods_are_subscribed() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -2127,6 +2128,7 @@ mod tests {
     /// The other half of the partition: `publishDiagnostics` keeps going only to its own real,
     /// typed sink and must never *also* appear on the custom-notification path, which would give
     /// callers two disagreeing sources for the same real data.
+    #[cfg(unix)]
     #[test]
     fn publish_diagnostics_never_appears_on_the_custom_notification_path() {
         // Subscribed on purpose: even an explicit subscription must not divert it from its own
@@ -2163,6 +2165,7 @@ mod tests {
 
     /// Both paths send the same real wake signal, so the `app` crate's single existing poll loop
     /// notices either without new polling machinery.
+    #[cfg(unix)]
     #[test]
     fn a_custom_notification_sends_the_same_real_wake_signal_diagnostics_do() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -2185,6 +2188,7 @@ mod tests {
     /// A server that sends a subscribed notification faster than anything drains it must not grow
     /// this queue without limit - the *oldest* entry is dropped, so the newest, most relevant ones
     /// are the ones that survive.
+    #[cfg(unix)]
     #[test]
     fn the_custom_notification_queue_is_bounded_and_drops_the_oldest_first() {
         let harness = IncomingHarness::new(&["server/custom"]);
@@ -2216,6 +2220,7 @@ mod tests {
 
     /// A server-initiated *request* (an `id` alongside the `method`) still takes the real
     /// reply path and must not leak onto the notification queue, which has no way to answer one.
+    #[cfg(unix)]
     #[test]
     fn a_server_initiated_request_is_not_treated_as_a_custom_notification() {
         let harness = IncomingHarness::new(&["client/registerCapability"]);
@@ -2239,6 +2244,7 @@ mod tests {
     // (`crate::lib.rs`/`Cargo.toml`'s `[target.'cfg(unix)'.dependencies]`), a real, pre-existing
     // gap this project's own CI never caught since it only ever built (not tested) on Windows.
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2277,6 +2283,7 @@ mod tests {
     /// Unix-only - real `pid_exists` (`crate::proc`) has no Windows equivalent here (see that
     /// helper's own docs).
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn drop_without_shutdown_does_not_leave_an_orphaned_process() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2301,6 +2308,7 @@ mod tests {
         }
     }
 
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn a_second_request_after_the_connection_closes_fails_fast_not_after_the_full_timeout() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2349,6 +2357,7 @@ mod tests {
     /// docs, and the step report's "indexing state" section, for why `has_diagnostics_result`
     /// itself is still the right, honest signal for the UI layer even though it can be `true`
     /// with a since-superseded empty result for a brief real window like this one.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn rust_analyzer_reports_a_real_diagnostic_for_a_real_type_error() {
         let project = write_scratch_project(
@@ -2438,6 +2447,7 @@ mod tests {
     /// (`Self::diagnostics_for`) after a `did_change_full` call and hung for the full real 60s+
     /// deadline every time - a genuine, live-reproduced correctness gap this fix closes, not a
     /// hypothetical one.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn did_change_full_then_a_real_pull_reports_a_real_new_diagnostic() {
         let project = write_scratch_project(
@@ -2560,6 +2570,7 @@ mod tests {
     /// there (via a version-0 sync-independent probe is not available, so a distinguishing
     /// baseline is used instead - see inline comments) rather than merely re-observing identical
     /// content.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn a_stale_lower_version_pull_never_clobbers_an_already_landed_newer_one() {
         let project = write_scratch_project(
@@ -2672,6 +2683,7 @@ mod tests {
     /// above - this test's own real "kill it out from under the client" step uses `crate::proc`/
     /// `nix` directly, both unix-only.
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn killing_the_real_process_flips_is_connection_alive_to_false() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2717,6 +2729,7 @@ mod tests {
     /// process is genuinely still alive, genuinely still holds its end of the pipe open, and
     /// genuinely never drains it - exactly what a deadlocked or thrashing real server does.
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn a_real_but_frozen_server_fails_the_write_within_the_budget_instead_of_hanging_forever() {
         let project = write_scratch_project("fn main() {\n    let x: i32 = 1;\n}\n");
@@ -2778,6 +2791,7 @@ mod tests {
     /// diagnostics-pull retry, that is the difference between reporting a dead server promptly and
     /// appearing to hang for minutes.
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn a_connection_already_known_dead_fails_further_writes_immediately() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2844,6 +2858,7 @@ mod tests {
     /// Driven against a real, `SIGSTOP`ped rust-analyzer, with a real second thread genuinely
     /// contending for the real mutex.
     #[cfg(unix)]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn a_writer_queued_behind_one_that_gives_up_is_refused_rather_than_corrupting_the_stream() {
         let project = write_scratch_project("fn main() {}\n");
@@ -2961,6 +2976,7 @@ mod tests {
     /// `const bad: number = "not a number";` type mismatch, performs a real handshake, receives
     /// a real `didOpen` tagged with the real `"typescript"` language id, and asynchronously
     /// pushes back a real `textDocument/publishDiagnostics` referencing the introduced mismatch.
+    #[ignore = "external: typescript-language-server; see docs/testing.md"]
     #[test]
     fn typescript_language_server_reports_a_real_diagnostic_for_a_real_type_error() {
         let project =
@@ -3015,6 +3031,7 @@ mod tests {
 
     /// A real end-to-end proof of hover for TypeScript, mirroring
     /// [`rust_analyzer_returns_a_real_hover_for_a_documented_function`] above.
+    #[ignore = "external: typescript-language-server; see docs/testing.md"]
     #[test]
     fn typescript_language_server_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_ts_project(
@@ -3143,6 +3160,7 @@ mod tests {
     /// typescript-language-server) needs them to behave well, against a real scratch file with a
     /// genuine `x: int = "not a number"` type error, performs a real handshake, receives a real
     /// `didOpen` tagged `"python"`, and asynchronously pushes back a real diagnostic.
+    #[ignore = "external: pyright-langserver; see docs/testing.md"]
     #[test]
     fn pyright_reports_a_real_diagnostic_for_a_real_type_error() {
         let project = write_scratch_py_project(
@@ -3202,6 +3220,7 @@ mod tests {
 
     /// A real end-to-end proof of hover for Python, mirroring the TypeScript/rust-analyzer
     /// hover tests above.
+    #[ignore = "external: pyright-langserver; see docs/testing.md"]
     #[test]
     fn pyright_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_py_project(
@@ -3316,6 +3335,7 @@ mod tests {
     /// generous real wait - `rust-analyzer` needs to finish enough of its own real indexing to
     /// answer a hover query, which (like diagnostics) is not instantaneous even for a trivial
     /// fixture, so this polls with real retries rather than a single immediate request.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn rust_analyzer_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_project(
@@ -3398,6 +3418,7 @@ mod tests {
     /// the same real call-site position the hover test above uses returns a real
     /// `GotoDefinitionResponse` whose location genuinely points back at the function's own real
     /// definition line in the same file - not a placeholder location.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[test]
     fn rust_analyzer_returns_a_real_definition_location_for_a_call_site() {
         let project = write_scratch_project(

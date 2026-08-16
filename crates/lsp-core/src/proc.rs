@@ -201,6 +201,7 @@ pub fn terminate_tree(root_pid: u32, grace: Duration) {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+    use test_support::ChildGuard;
 
     /// The two answers [`pid_exists`] has to get right for [`terminate_tree`]'s grace loop to
     /// mean anything: a process that is genuinely running, and one that has already been
@@ -233,27 +234,32 @@ mod tests {
     /// forces a real fork on every shell - the same form the sibling test below already uses.
     #[test]
     fn collect_descendant_pids_finds_a_real_child_process() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30 & wait")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning `sh -c 'sleep 30 & wait'` should succeed");
+        // `ChildGuard`: the assertion below used to sit between the spawn and the manual kill,
+        // so a failing walk left a real 30-second `sleep` tree behind.
+        let mut child = ChildGuard::spawn(
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30 & wait")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawning `sh -c 'sleep 30 & wait'` should succeed");
         let sh_pid = child.id();
 
-        // Give the shell a moment to actually fork `sleep` as its own child.
-        std::thread::sleep(Duration::from_millis(200));
-
-        let descendants = collect_descendant_pids(sh_pid);
+        // The shell forks `sleep` asynchronously, so poll for it rather than guessing how long
+        // that takes on a loaded machine.
+        let mut descendants = Vec::new();
+        let forked = test_support::wait_until(Duration::from_secs(5), || {
+            descendants = collect_descendant_pids(sh_pid);
+            !descendants.is_empty()
+        });
         assert!(
-            !descendants.is_empty(),
+            forked,
             "expected `sh -c 'sleep 30 & wait'` to have spawned a real, discoverable `sleep` child"
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_and_wait().expect("reap the shell");
         for pid in descendants {
             signal_pid(pid, nix::sys::signal::Signal::SIGKILL);
         }
@@ -261,19 +267,25 @@ mod tests {
 
     #[test]
     fn terminate_tree_kills_a_real_process_and_its_real_child() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30 & wait")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning the shell pipeline should succeed");
+        let mut child = ChildGuard::spawn(
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30 & wait")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawning the shell pipeline should succeed");
         let sh_pid = child.id();
-        std::thread::sleep(Duration::from_millis(200));
 
-        let descendants = collect_descendant_pids(sh_pid);
-        assert!(!descendants.is_empty(), "expected a real sleep grandchild");
+        let mut descendants = Vec::new();
+        assert!(
+            test_support::wait_until(Duration::from_secs(5), || {
+                descendants = collect_descendant_pids(sh_pid);
+                !descendants.is_empty()
+            }),
+            "expected a real sleep grandchild"
+        );
 
         terminate_tree(sh_pid, Duration::from_millis(500));
         let _ = child.wait();

@@ -1201,30 +1201,17 @@ mod status_bar_deletion_tests {
 #[cfg(test)]
 mod status_bar_branch_cluster_visibility_tests {
     use crate::root::focus::palette_focus_tests;
+    use crate::test_support::{temp_repo_with, TempRoot};
     use gpui::TestAppContext;
-    use std::path::Path;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-    }
 
     /// A real repo on a real branch, so the cluster has genuine branch text to show rather than
     /// falling through to `"(detached)"` for want of a git repository at all. Shared with
     /// `super::resources_popover_tests`, which needs the same real worktree list.
-    pub(super) fn seeded_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("a.txt"), "1").expect("write a.txt");
-        git(repo.path(), &["add", "a.txt"]);
-        git(repo.path(), &["commit", "-m", "base"]);
-        repo
+    pub(super) fn seeded_repo() -> TempRoot {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "a.txt", "1", "base");
+        })
     }
 
     #[gpui::test]

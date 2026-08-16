@@ -188,42 +188,7 @@ pub fn reset(worktree_path: &Path, mode: ResetMode, commit: &str) -> Result<(), 
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        dir
-    }
+    use test_support::{git, git_output, seed_empty_repo};
 
     fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
         fs::write(dir.join(file), contents).expect("write file");
@@ -242,7 +207,7 @@ mod tests {
 
     #[test]
     fn checkout_really_moves_head_to_the_target_commit_detached() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         let tip = commit(repo.path(), "a.txt", "changed", "second commit");
         assert_eq!(head_sha(repo.path()), tip);
@@ -263,7 +228,7 @@ mod tests {
 
     #[test]
     fn checkout_on_a_dirty_worktree_with_a_real_conflict_surfaces_gits_own_refusal() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "other"]);
         commit(repo.path(), "a.txt", "other branch content", "other change");
@@ -301,7 +266,7 @@ mod tests {
 
     #[test]
     fn create_branch_at_really_creates_the_branch_at_the_commit_and_switches_to_it() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         commit(repo.path(), "a.txt", "changed again", "second commit");
 
@@ -326,7 +291,7 @@ mod tests {
 
     #[test]
     fn create_branch_at_with_a_colliding_name_surfaces_gits_own_real_error() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["branch", "existing-branch"]);
 
@@ -348,7 +313,7 @@ mod tests {
 
     #[test]
     fn checkout_branch_really_switches_with_head_attached_not_detached() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit(repo.path(), "a.txt", "on feature", "feature commit");
@@ -366,7 +331,7 @@ mod tests {
 
     #[test]
     fn checkout_branch_refuses_a_nonexistent_branch_with_gits_own_real_error() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
         let result = checkout_branch(repo.path(), "no-such-branch");
@@ -392,7 +357,7 @@ mod tests {
     /// value`).
     #[test]
     fn checkout_branch_refuses_a_flag_shaped_name_instead_of_parsing_it_as_an_option() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
         let result = checkout_branch(repo.path(), "--orphan");
@@ -415,7 +380,7 @@ mod tests {
 
     #[test]
     fn rename_branch_really_moves_the_ref_to_the_new_name_and_leaves_no_old_one() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["branch", "old-name"]);
 
@@ -439,7 +404,7 @@ mod tests {
 
     #[test]
     fn rename_branch_onto_an_existing_name_surfaces_gits_own_real_error() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["branch", "old-name"]);
         git(repo.path(), &["branch", "taken"]);
@@ -468,7 +433,7 @@ mod tests {
 
     #[test]
     fn renaming_the_currently_checked_out_branch_really_moves_head_onto_the_new_name() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let tip = commit(repo.path(), "a.txt", "base", "base");
         assert_eq!(
             current_branch(repo.path()),
@@ -497,7 +462,7 @@ mod tests {
     /// genuinely user-typed, so this is reachable by typing it.
     #[test]
     fn rename_branch_refuses_a_flag_shaped_name_instead_of_destroying_two_refs() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let main_tip = commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["branch", "feature"]);
 
@@ -538,7 +503,7 @@ mod tests {
     /// today, so this pins the guard rather than a live bug.
     #[test]
     fn delete_branch_treats_a_flag_shaped_name_as_a_branch_name_not_an_option() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["branch", "keepme"]);
 
@@ -562,7 +527,7 @@ mod tests {
 
     #[test]
     fn delete_branch_really_removes_a_fully_merged_branch() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         // A branch pointing at the current tip - fully merged by construction, which is exactly
         // what `git branch -d` is willing to remove.
@@ -579,7 +544,7 @@ mod tests {
 
     #[test]
     fn delete_branch_refuses_an_unmerged_branch_with_gits_own_real_refusal() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "unmerged"]);
         commit(repo.path(), "b.txt", "work", "work only on unmerged");
@@ -608,7 +573,7 @@ mod tests {
 
     #[test]
     fn delete_branch_refuses_the_branch_checked_out_in_this_worktree() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
         let result = delete_branch(repo.path(), "main");
@@ -634,7 +599,7 @@ mod tests {
 
     #[test]
     fn reset_soft_keeps_the_index_and_working_tree_and_only_moves_the_branch_tip() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         commit(repo.path(), "a.txt", "changed", "second commit");
 
@@ -659,7 +624,7 @@ mod tests {
 
     #[test]
     fn reset_mixed_unstages_but_keeps_the_working_tree_content() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         commit(repo.path(), "a.txt", "changed", "second commit");
 
@@ -685,7 +650,7 @@ mod tests {
 
     #[test]
     fn reset_hard_discards_the_working_tree_change_entirely() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "a.txt", "base", "base");
         commit(repo.path(), "a.txt", "changed", "second commit");
 

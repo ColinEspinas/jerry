@@ -4785,6 +4785,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test-support",
  "thiserror 1.0.69",
  "url",
 ]

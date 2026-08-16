@@ -75,3 +75,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Shared fixtures - `ChildGuard`'s kill-on-drop teardown for the real `cat` child the
+# `handle_incoming` harness borrows a `ChildStdin` from. Usable here precisely because
+# `test-support` carries no `gpui` (docs/architecture/decisions.md §1).
+test-support = { path = "../test-support" }

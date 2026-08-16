@@ -471,35 +471,17 @@ mod history_surface_tests {
     use crate::hooks::store::LiveRun;
     use crate::rail::status::Status;
     use crate::root::focus::palette_focus_tests;
+    use crate::test_support::{temp_repo_with, TempRoot};
     use crate::work_surface::agents::AgentKind;
     use crate::work_surface::state::TabRef;
     use gpui::TestAppContext;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed in {dir:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
+    fn init_repo() -> TempRoot {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+        })
     }
 
     /// Files one real, *finished* run into the real status store, exactly the way
@@ -808,7 +790,7 @@ mod history_surface_tests {
     #[gpui::test]
     fn opening_another_checkouts_run_selects_that_checkout(cx: &mut TestAppContext) {
         let repo = init_repo();
-        let wt = TempDir::new().expect("tempdir wt");
+        let wt = temp_repo_with(|_| {});
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
@@ -944,7 +926,7 @@ mod history_surface_tests {
     #[gpui::test]
     fn a_worktree_with_history_and_no_agent_gets_the_earlier_runs_line(cx: &mut TestAppContext) {
         let repo = init_repo();
-        let wt = TempDir::new().expect("tempdir wt");
+        let wt = temp_repo_with(|_| {});
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
@@ -1039,7 +1021,7 @@ mod history_surface_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = init_repo();
-        let wt = TempDir::new().expect("tempdir wt with history, no agent");
+        let wt = temp_repo_with(|_| {});
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
