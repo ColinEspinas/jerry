@@ -18,9 +18,11 @@
 //! ## Platform scope: full on unix, narrower (but real) on Windows
 //!
 //! The reader-thread shutdown signaling (a self-pipe polled alongside the pty fd) and the
-//! process-tree kill (process-group signals plus a `/proc` descendant walk) are `#[cfg(unix)]`.
-//! `child_pids_of`/`pid_exists` read Linux's `/proc` specifically; on a non-Linux unix (e.g.
-//! macOS) they already degrade gracefully to "found nothing" (see their own docs), so
+//! process-tree kill (process-group signals plus a descendant walk) are `#[cfg(unix)]`.
+//! `pid_exists` is the portable POSIX `kill(pid, 0)` probe, so it answers the same on every
+//! unix. `child_pids_of` is per-OS: Linux reads `/proc/<pid>/task/<pid>/children`, macOS calls
+//! `libproc`'s `proc_listchildpids` (there is no `/proc` there). Any other unix has neither and
+//! degrades gracefully to "found nothing" (see that function's own docs), so
 //! `terminate_process_tree` still sends real signals to the child's process group there, just
 //! without the escaped-grandchild walk.
 //!
@@ -121,11 +123,11 @@
 //! shell). That's not sufficient alone: a descendant that calls `setsid()` itself (e.g.
 //! `setsid sleep 100 &`, or any daemonizing tool) detaches into its own session and process
 //! group, unreachable via the parent's pgid. To handle that, [`kill`](PtySession::kill) /
-//! [`shutdown`](PtySession::shutdown) / `Drop` all first walk `/proc/<pid>/task/<pid>/children`
-//! (Linux procfs; breadth-first, depth-capped) to snapshot the *entire* descendant set
-//! **before** sending any signal - reading it after the fact races against the kernel
-//! reparenting a dying process's children out from under that file - then signal both the
-//! process group and every discovered descendant individually. See
+//! [`shutdown`](PtySession::shutdown) / `Drop` all first walk the descendant tree
+//! (breadth-first, depth-capped, through the per-OS `child_pids_of` above) to snapshot the
+//! *entire* descendant set **before** sending any signal - reading it after the fact races
+//! against the kernel reparenting a dying process's children out from under it - then signal
+//! both the process group and every discovered descendant individually. See
 //! `drop_terminates_entire_process_tree_including_escaped_grandchild` in the test module for
 //! the regression case this fixes.
 //!
@@ -1035,9 +1037,9 @@ impl Drop for PtySession {
 
 /// Reads the current direct children of `pid` from Linux's `/proc/<pid>/task/<pid>/children`.
 /// Best-effort: returns an empty list if the file can't be read (process already gone,
-/// non-Linux unix, permissions, etc.) rather than erroring - this is used for cleanup,
+/// a unix without procfs, permissions, etc.) rather than erroring - this is used for cleanup,
 /// where "found nothing to additionally clean up" is an acceptable fallback.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn child_pids_of(pid: u32) -> Vec<u32> {
     let path = PathBuf::from(format!("/proc/{pid}/task/{pid}/children"));
     std::fs::read_to_string(&path)
@@ -1050,9 +1052,57 @@ fn child_pids_of(pid: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Breadth-first, depth-capped walk of `root_pid`'s descendant tree via `/proc`. Must be
-/// called *before* signaling anything: reading it after a process starts dying races
-/// against the kernel reparenting its children out from under `children`.
+/// Reads the current direct children of `pid` from macOS's `libproc`, which has no `/proc` for
+/// the branch above to read. Best-effort in exactly the same way: an empty list, never an
+/// error, when the process is already gone or cannot be queried.
+///
+/// `proc_listchildpids` returns the number of pids it wrote and truncates *silently* when the
+/// buffer is too small - it reports the capacity it filled with no error of any kind - so a
+/// completely full buffer is retried at double the capacity rather than trusted to be complete.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn child_pids_of(pid: u32) -> Vec<u32> {
+    // A parent with more direct children than this is pathological, not a real agent process
+    // tree; the doubling below stops here rather than growing without bound.
+    const MAX_CAPACITY: usize = 4096;
+
+    let Ok(ppid) = libc::pid_t::try_from(pid) else {
+        return Vec::new();
+    };
+
+    let mut capacity = 64usize;
+    loop {
+        let mut buffer: Vec<libc::pid_t> = vec![0; capacity];
+        let buffer_bytes = capacity * std::mem::size_of::<libc::pid_t>();
+
+        // SAFETY: `proc_listchildpids` writes at most `buffersize` bytes through the buffer
+        // pointer, which addresses a live, uniquely borrowed `Vec` allocation of exactly
+        // `buffer_bytes` bytes for the whole call and is not retained by the callee. The cast
+        // is the one Apple's own header requires - the parameter is a bare `void *`. It reports
+        // how many pids it wrote, or 0 on failure, and never a negative count.
+        let written = unsafe {
+            libc::proc_listchildpids(
+                ppid,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer_bytes as libc::c_int,
+            )
+        };
+
+        let written = usize::try_from(written).unwrap_or(0).min(capacity);
+        if written < capacity || capacity == MAX_CAPACITY {
+            buffer.truncate(written);
+            return buffer
+                .into_iter()
+                .filter_map(|child| u32::try_from(child).ok())
+                .collect();
+        }
+        capacity = (capacity * 2).min(MAX_CAPACITY);
+    }
+}
+
+/// Breadth-first, depth-capped walk of `root_pid`'s descendant tree via [`child_pids_of`]. Must
+/// be called *before* signaling anything: reading it after a process starts dying races
+/// against the kernel reparenting its children out from under it.
 #[cfg(unix)]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     let mut discovered = Vec::new();
@@ -1078,9 +1128,21 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     discovered
 }
 
+/// Whether `pid` is still a live (or zombie-but-unreaped) process, via the portable POSIX
+/// `kill(pid, 0)` existence probe - no procfs, so this answers the same on every unix.
+///
+/// `EPERM` counts as "exists": the kernel only reports it for a process that is genuinely
+/// there but not signalable by this user, and treating that as gone would make
+/// [`terminate_process_tree`]'s grace loop declare victory over something still running.
 #[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None) {
+        Ok(()) => true,
+        Err(errno) => errno == nix::errno::Errno::EPERM,
+    }
 }
 
 /// Terminates `root_pid`'s process group *and* any descendants that escaped it (e.g. via
@@ -1222,7 +1284,12 @@ mod tests {
     /// structure changing, not a live hazard being probed.
     ///
     /// `seq` writes into a pty, so the line discipline turns each `\n` into `\r\n`; the
-    /// comparison below normalizes that rather than pretending it doesn't happen.
+    /// comparison below normalizes that rather than pretending it doesn't happen. It drops
+    /// every `\r` rather than only collapsing `\r\n`, because macOS's line discipline re-emits
+    /// the `\r` when its output queue fills mid-expansion and yields `\r\r\n` - observed on a
+    /// real Mac roughly once per 4096-byte queue boundary under exactly the backpressure this
+    /// test creates, with no byte lost, reordered or duplicated. `seq`'s own payload is digits
+    /// only, so dropping carriage returns costs the assertions below nothing.
     #[test]
     fn long_output_arrives_complete_and_in_order_across_chunk_boundaries() {
         const LINES: usize = 200_000;
@@ -1255,7 +1322,7 @@ mod tests {
         }
 
         let text = String::from_utf8(collected).expect("`seq` output is plain ASCII");
-        let normalized = text.replace("\r\n", "\n");
+        let normalized = text.replace('\r', "");
         let lines: Vec<&str> = normalized.trim_end_matches('\n').split('\n').collect();
 
         assert_eq!(
@@ -1275,6 +1342,35 @@ mod tests {
                  truncated or duplicated somewhere around a chunk boundary",
             );
         }
+    }
+
+    /// The two answers [`pid_exists`] has to get right for every teardown assertion below to
+    /// mean anything: a process that is genuinely running, and one that has already been
+    /// reaped.
+    ///
+    /// unix-only: uses `pid_exists` directly, which is a `#[cfg(unix)]` helper function (see
+    /// the crate-level "Platform scope" docs).
+    #[cfg(unix)]
+    #[test]
+    fn pid_exists_separates_a_live_process_from_a_reaped_one() {
+        assert!(
+            pid_exists(std::process::id()),
+            "this very test process is unambiguously alive"
+        );
+
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning `true` should succeed");
+        let pid = child.id();
+        child.wait().expect("reaping `true` should succeed");
+
+        assert!(
+            !pid_exists(pid),
+            "pid {pid} was reaped, so it should read as gone rather than alive"
+        );
     }
 
     // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
@@ -1312,15 +1408,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drop_terminates_entire_process_tree_including_escaped_grandchild() {
-        // Regression test for a process that escapes the child's process group by
-        // calling `setsid()` itself (e.g. a daemonizing subprocess): `killpg` on the
-        // direct child's pgid alone cannot reach it. The shell reports the detached
-        // grandchild's pid back to us over the pty so we don't have to race /proc to
-        // discover it ourselves.
+        // Regression test for a process that escapes the child's process group (e.g. a
+        // daemonizing subprocess): `killpg` on the direct child's pgid alone cannot reach it,
+        // so only the descendant walk can. The shell reports the detached grandchild's pid
+        // back over the pty so we don't have to race the walk to discover it ourselves.
+        //
+        // `set -m` rather than a `setsid` prefix: turning on job control makes the shell put
+        // each background job in its own process group, which is precisely what defeats
+        // `killpg`, and unlike `setsid(1)` it is a shell builtin that exists everywhere -
+        // macOS ships no `setsid` binary at all, so that spelling silently degraded this into
+        // a test whose "grandchild" was a `command not found` zombie.
         let session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
-                .arg("setsid sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
+                .arg("set -m; sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
 
@@ -1340,6 +1441,14 @@ mod tests {
         assert!(
             pid_exists(grandchild_pid),
             "detached grandchild {grandchild_pid} should be alive before drop"
+        );
+        // `pid_exists` alone would also be satisfied by an unreaped zombie, which is what this
+        // test degraded into on macOS before; the walk only lists a pid the kernel still
+        // reports as a child, and it is the mechanism actually under test here.
+        assert!(
+            collect_descendant_pids(direct_pid).contains(&grandchild_pid),
+            "the descendant walk should discover the detached grandchild {grandchild_pid} \
+             under direct child {direct_pid} - without it, `Drop` has no way to reach it"
         );
 
         drop(session);

@@ -4776,6 +4776,7 @@ name = "lsp-core"
 version = "0.1.1"
 dependencies = [
  "dunce",
+ "libc",
  "log",
  "lsp-types",
  "nix",
@@ -6148,6 +6149,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "filedescriptor",
+ "libc",
  "nix",
  "portable-pty",
  "tempfile",

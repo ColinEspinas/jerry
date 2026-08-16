@@ -20,12 +20,22 @@ anyhow = { workspace = true }
 # crate-level "Platform scope" docs for why non-unix has no self-pipe/poll shutdown signal.
 filedescriptor = "0.8"
 
-# Process-group signals and the `/proc` descendant walk are unix-only; see the crate-level
-# doc comment in src/lib.rs for why non-unix instead calls `portable_pty::Child::kill()`
-# directly. Already a transitive dep of `portable-pty` 0.9.0 on unix (pinned here to the
-# exact version already resolved in Cargo.lock, so this adds no new version surface).
+# Process-group signals, the `kill(pid, 0)` liveness check and the descendant walk are
+# unix-only; see the crate-level doc comment in src/lib.rs for why non-unix instead calls
+# `portable_pty::Child::kill()` directly. Already a transitive dep of `portable-pty` 0.9.0 on
+# unix (pinned here to the exact version already resolved in Cargo.lock, so this adds no new
+# version surface).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }
+
+# macOS only: there is no `/proc` there, so `child_pids_of`'s descendant walk goes through
+# `libproc`'s `proc_listchildpids` (declared in `<libproc.h>`, implemented in libSystem, which
+# every macOS binary already links) instead. Raw `libc` rather than the `libproc` crate for the
+# reasons `crates/app/src/status_bar/process_stats/macos.rs` already sets out: `libc` declares
+# the call with the exact signature used, and it is already resolved in this workspace's lock
+# file, so this adds no new build surface.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Test-only: `resolve_on_path_skips_a_same_named_directory` needs a real, isolated temporary
