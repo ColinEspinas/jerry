@@ -2780,12 +2780,51 @@ impl Render for TerminalPane {
         // `.relative()` parent, updating `self.content_bounds` from the `canvas()` prepaint
         // callback via a strong `Entity<Self>` handle, is the same idiom
         // `vendor/zed/crates/workspace/src/workspace.rs` uses for its own dock-sizing bounds.
+        //
+        // **Live report, GitHub issue #375: "the height of the agent terminal is not good"
+        // after a genuinely long real conversation.** This `canvas()` prepaint callback runs on
+        // every real paint pass regardless of whether `Render::render` was actually re-invoked
+        // for this entity - a window resize, a panel opening, a sidebar toggle all re-flow and
+        // re-paint the *existing* element tree even when nothing about this pane's own state
+        // changed, so `self.content_bounds` genuinely does track the real, current window size
+        // the whole time. But nothing used to tell the *next frame* to actually look at that new
+        // measurement: `Entity::update` does not implicitly notify (`gpui::Entity::write` calls
+        // `cx.notify()` itself precisely because plain `update` doesn't), and even a bare
+        // `cx.notify()` called from inside this prepaint callback is silently dropped -
+        // `WindowInvalidator::invalidate_view` only actually marks the window dirty when
+        // `draw_phase == DrawPhase::None` (`vendor/zed/crates/gpui/src/window.rs`), which is
+        // never true while this very prepaint callback is running. Measured directly against
+        // this real app: after a real `simulate_resize` on a long-running pane, `content_bounds`
+        // updated correctly on the very next paint, yet `TerminalPane::grid_dimensions()` stayed
+        // frozen at the *pre-resize* values across several more full `run_until_parked` passes,
+        // and only caught up the moment unrelated new pty output (which *does* call
+        // `cx.notify()` outside any draw phase, from `Self::spawn_process`'s poll loop) forced a
+        // fresh `render()`. A real agent conversation spends real time idle between turns -
+        // exactly when a resize/split/sidebar-toggle is likely to happen - so the grid's own
+        // row/col count (and therefore the real pty size, and therefore how
+        // `alacritty_terminal` itself wraps/paginates the transcript) can silently disagree with
+        // the pane's own real, visibly-correct box for as long as that idle period lasts: the
+        // chrome and even this pane's own measured bounds look right the whole time, but the
+        // grid inside them is still sized for the box that used to be there.
+        //
+        // `Window::defer` runs its callback "at the end of the current effect cycle" - i.e.
+        // after this frame's draw phase has ended - which is exactly the gap `invalidate_view`
+        // needs closed: the deferred callback's own `cx.notify()` runs with `draw_phase ==
+        // DrawPhase::None`, so it genuinely schedules the next real frame, which then picks the
+        // new bounds up in `Self::maybe_resize_pty` like any other real resize does. Comparing
+        // against the previous value first keeps this from scheduling a new frame forever while
+        // nothing is actually moving.
         let measure_bounds = {
             let this = cx.entity();
             canvas(
-                move |bounds, _window, cx| {
-                    this.update(cx, |this, _cx| {
-                        this.content_bounds = Some(bounds);
+                move |bounds, window, cx| {
+                    window.defer(cx, move |_window, cx| {
+                        this.update(cx, |this, cx| {
+                            if this.content_bounds != Some(bounds) {
+                                this.content_bounds = Some(bounds);
+                                cx.notify();
+                            }
+                        });
                     });
                 },
                 |_bounds, _prepaint, _window, _cx| {},
@@ -2796,6 +2835,7 @@ impl Render for TerminalPane {
 
         let mut pane = div()
             .id("terminal-pane")
+            .debug_selector(|| "terminal-pane".to_string())
             .track_focus(&self.focus_handle)
             // Tagged `"terminal"` (Revision R10) so `crate::default_key_bindings`'s global
             // bindings that have no business firing over a focused terminal (e.g.
@@ -5053,6 +5093,14 @@ mod scrollback_pane_tests {
                 cx,
             )
         });
+        // Two passes, not one: the pane's real content-bounds measurement now schedules its own
+        // follow-up render via `Window::defer` (see the measuring `canvas()`'s own docs) rather
+        // than updating synchronously, so a single `run_until_parked` can return with that
+        // deferred callback still pending. A test that then pokes `TerminalPane`'s private state
+        // directly (several in this module simulate a pre-first-paint pane) must start from a
+        // fully-settled pane, or that leftover callback fires later and clobbers the test's own
+        // reset with this constructor's real (large, default test-window-sized) measurement.
+        cx.run_until_parked();
         cx.run_until_parked();
         (pane, cx)
     }
@@ -5530,13 +5578,15 @@ mod scrollback_pane_tests {
             (900.0, 40.0),
             (420.0, 20.0),
         ] {
-            pane.update_in(cx, |pane, window, _cx| {
-                pane.content_bounds = Some(Bounds {
-                    origin: gpui::point(px(0.0), px(0.0)),
-                    size: gpui::size(px(width), px(rows * ROW_LINE_HEIGHT_PX)),
-                });
-                pane.maybe_resize_pty(window);
-            });
+            // A *real* resize of the test window, not a direct `content_bounds` field poke:
+            // `TerminalPane` is this window's root view (`.size_full()`, no ancestor chrome), so
+            // resizing the window to exactly `(width, rows * ROW_LINE_HEIGHT_PX)` makes the
+            // pane's own real, measured padding-box bounds exactly that size too - and, since
+            // the pane's own measuring `canvas()` now actively self-heals any divergence from
+            // the real measurement (see that `canvas()` call's own docs), a direct field poke
+            // here would just be corrected right back by the next real paint anyway.
+            cx.simulate_resize(gpui::size(px(width), px(rows * ROW_LINE_HEIGHT_PX)));
+            cx.run_until_parked();
             cx.run_until_parked();
 
             let dims = pane.read_with(cx, |pane, _| pane.grid_dimensions());
@@ -5673,12 +5723,14 @@ mod scrollback_pane_tests {
     /// than the placeholder's own height - before that correction lands,
     /// `alacritty_terminal`'s own shrink-resize semantics legitimately evict the overflow into
     /// real retained scrollback the instant `TerminalPane::maybe_resize_pty` applies the
-    /// correct, smaller size. This reproduces that exact race deterministically - no GPUI
-    /// layout timing depended on - by resetting a pane back to its pre-first-paint state (a
-    /// placeholder-sized grid, `content_bounds` still unmeasured), printing content that fits
-    /// the placeholder but not the eventual real size, and then driving
-    /// `maybe_resize_pty` with a real, small measurement exactly as the pane's own second render
-    /// would.
+    /// correct, smaller size. This reproduces that exact race deterministically by resetting a
+    /// pane back to its pre-first-paint state (a placeholder-sized grid, `content_bounds` still
+    /// unmeasured), resizing the pane's *real* test window down to the small target size the
+    /// eventual measurement will find, then printing content that fits the placeholder but not
+    /// that real size - the pane's own measuring `canvas()` self-heals toward the real window on
+    /// its own once it renders again (see that `canvas()` call's own docs), so this only has to
+    /// drive real output and let a couple of real frames land, not call `maybe_resize_pty`
+    /// directly the way this test did before that self-healing existed.
     #[gpui::test]
     fn the_placeholder_spawn_races_content_bounds_but_the_first_real_resize_discards_it(
         cx: &mut TestAppContext,
@@ -5703,9 +5755,19 @@ mod scrollback_pane_tests {
             placeholder_rows > real_rows as usize,
             "sanity check: the placeholder must genuinely be taller than the real target"
         );
-        pane.update(cx, |pane, cx| {
+
+        // The child's output lands directly on the grid, bypassing `inject_bytes_for_test`'s own
+        // `cx.notify()` (unlike every other test in this module) - a real pty's bytes arrive on
+        // a background poll tick this test isn't driving, so nothing here may trigger a real
+        // render on its own. That distinction matters more than it used to: the pane's own
+        // measuring `canvas()` now self-heals toward the real window on every real paint it sees
+        // (see that `canvas()` call's own docs) - if injecting *did* trigger a render here, this
+        // pane would discover this test's real (large, default) window mid-loop and settle
+        // against *that*, long before this test ever gets to simulate the real race, which is
+        // exactly the failure mode this distinction avoids.
+        pane.update(cx, |pane, _cx| {
             for i in 0..(placeholder_rows - 5) {
-                pane.inject_bytes_for_test(format!("line {i}\r\n").as_bytes(), cx);
+                pane.grid.append_bytes(format!("line {i}\r\n").as_bytes());
             }
         });
         assert_eq!(
@@ -5716,7 +5778,13 @@ mod scrollback_pane_tests {
         );
 
         // The pane's own content-box measurement settles to a real, much smaller area - what
-        // `render`'s measuring `canvas()` reports once it has actually painted.
+        // `render`'s measuring `canvas()` reports once it has actually painted - driven directly
+        // rather than through a real resize/paint cycle for the same reason the injection above
+        // is: this test's real window is this pane's own default (large) test size, not the
+        // small target below, so a real `cx.simulate_resize` here would just as readily paint an
+        // intermediate frame at the *real* window size first (see `a_fresh_pane_never_becomes_
+        // scrollable_as_its_layout_settles` for that scenario instead - a real resize sequence
+        // on a pane that starts out already settled).
         let small_bounds = Bounds {
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(800.0), px(real_rows as f32 * ROW_LINE_HEIGHT_PX)),

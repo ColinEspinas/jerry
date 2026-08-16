@@ -2134,6 +2134,7 @@ impl AdeApp {
 
         let header = div()
             .id("pty-header")
+            .debug_selector(|| "pty-header".to_string())
             .flex()
             .flex_none()
             .items_center()
@@ -2631,6 +2632,7 @@ impl AdeApp {
                 } else {
                     div()
                         .id("pty-surface")
+                        .debug_selector(|| "pty-surface".to_string())
                         .flex()
                         .flex_col()
                         .flex_1()
@@ -2641,6 +2643,8 @@ impl AdeApp {
                         .child(self.render_pty_header(agent, cx))
                         .child(
                             div()
+                                .id("pty-surface-content")
+                                .debug_selector(|| "pty-surface-content".to_string())
                                 .flex_1()
                                 .min_h_0()
                                 .min_w_0()
@@ -5777,6 +5781,154 @@ mod agent_pane_readout_tests {
             cx.debug_bounds("pty-header-pid").is_some(),
             "the pid moves to the header rather than being lost with the info footer - \
              `{{ focus.cli }}  pid {{ focus.pid }}` in the mock's `isChat` header"
+        );
+    }
+
+    /// **Live report: "the height of the agent terminal is not good... it get a scrollbar" against
+    /// a genuinely long real Claude agent transcript** - investigated for both of this project's
+    /// two prior sizing-bug classes (#368's fresh-pane grid/pty measurement race, #356's stacked
+    /// header/footer chrome) and a third (a font-fallback-driven row-height blowup); none
+    /// reproduced under real, repeated measurement. This is the real, direct check of the
+    /// remaining candidate root cause `debug_bounds` can answer: does this pane's own real,
+    /// painted geometry - header band + the terminal's own content band + its bottom bar - ever
+    /// stop summing to the pane's real total height, on a pane that has had genuinely long real
+    /// output (well past #356's chrome rebuild and #368's fresh-pane latch, both scoped to a
+    /// pane's very first frames)? A gap here would mean the grid is sized against a region
+    /// different from what is really on screen - exactly the shape "the height is not good" would
+    /// take, independent of whether a scrollbar is also, separately, correct.
+    #[gpui::test]
+    fn header_content_and_footer_bands_sum_to_the_real_pane_height_on_a_long_transcript(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let pane = app
+            .read_with(cx, |app, _| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.pane.clone())
+            })
+            .expect("the spawned agent");
+
+        // A genuinely long real transcript - matches the user's own repro (~165 numbered lines),
+        // well past one screen's worth of content, so a scrollbar is *expected*; what this test
+        // checks is whether the pane's own real geometry stays self-consistent, not whether
+        // scrolling exists at all.
+        pane.update(cx, |pane, cx| {
+            for i in 1..=165 {
+                pane.inject_bytes_for_test(format!("line {i}\r\n").as_bytes(), cx);
+            }
+        });
+        cx.run_until_parked();
+
+        // Checked once at the pane's initial size, and again below after a *real* window resize
+        // on this now-long-running pane - hypothesis: does the grid's own row/col count, and the
+        // chrome around it, stay correct across a real resize once a pane has real accumulated
+        // output, or can it drift/go stale the way a fresh, empty pane's once did (#368)?
+        let check = |cx: &mut gpui::VisualTestContext, when: &str| {
+            let surface = cx
+                .debug_bounds("pty-surface")
+                .unwrap_or_else(|| panic!("the pty surface must paint ({when})"));
+            let header = cx
+                .debug_bounds("pty-header")
+                .unwrap_or_else(|| panic!("the header must paint ({when})"));
+            let content = cx
+                .debug_bounds("pty-surface-content")
+                .unwrap_or_else(|| panic!("the content band must paint ({when})"));
+            let footer = cx.debug_bounds("pty-footer").unwrap_or_else(|| {
+                panic!("a real agent tab's own readout strip must paint ({when})")
+            });
+            let terminal = cx
+                .debug_bounds("terminal-pane")
+                .unwrap_or_else(|| panic!("the terminal pane itself must paint ({when})"));
+
+            let summed_height = header.size.height + content.size.height + footer.size.height;
+            assert!(
+                (summed_height.as_f32() - surface.size.height.as_f32()).abs() < 1.0,
+                "{when}: header ({:?}) + content ({:?}) + footer ({:?}) = {summed_height:?} must \
+                 sum to the pane's real total height {:?}, with no unaccounted-for gap or overlap",
+                header.size.height,
+                content.size.height,
+                footer.size.height,
+                surface.size.height,
+            );
+
+            // The terminal itself must exactly fill the content band it was given - not claim
+            // less (dead space) or more (painting over the header/footer).
+            assert_eq!(
+                terminal.size, content.size,
+                "{when}: the terminal pane must exactly fill its own content band, got \
+                 terminal={terminal:?} content={content:?}"
+            );
+        };
+        check(cx, "at initial size, after 165 real lines");
+
+        // The terminal's *own* internally-measured content-area bounds - what
+        // `TerminalPane::maybe_resize_pty` actually sizes the grid from - must match its
+        // externally-measured painted bounds. If these ever disagreed, the grid would be sized
+        // for a region different from what is really on screen.
+        let assert_internal_matches_external = |cx: &mut gpui::VisualTestContext, when: &str| {
+            let terminal = cx.debug_bounds("terminal-pane").expect("checked above");
+            let internal = pane
+                .read_with(cx, |pane, _| pane.content_bounds_for_test())
+                .expect("the pane must have painted at least once");
+            assert!(
+                (internal.size.width.as_f32() - terminal.size.width.as_f32()).abs() < 1.0
+                    && (internal.size.height.as_f32() - terminal.size.height.as_f32()).abs() < 1.0,
+                "{when}: the terminal's own internal measurement {internal:?} must match its \
+                 real, externally painted bounds {terminal:?}"
+            );
+        };
+        assert_internal_matches_external(cx, "at initial size, after 165 real lines");
+
+        // A real resize - a window resize, a panel opening, a sidebar toggle all land here -
+        // happening *after* this pane has real, long-accumulated output, not just at spawn.
+        let initial_size = cx.debug_bounds("pty-surface").expect("checked above").size;
+        let resized = gpui::size(
+            initial_size.width - px(280.0),
+            initial_size.height - px(140.0),
+        );
+        cx.simulate_resize(resized);
+        // A couple of parked passes - matching `maybe_resize_pty`'s own documented one-frame
+        // measurement lag - not the many an unfixed pane would actually need (it never caught up
+        // on its own at all; see the fix this test guards).
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        check(cx, "after a real resize on a long-running pane");
+        assert_internal_matches_external(cx, "after a real resize on a long-running pane");
+
+        // And the grid itself must have really followed - immediately, without needing any
+        // *unrelated* event (e.g. new pty output) to force a fresh render first: its own
+        // reported column/row count must be consistent with the terminal's newly measured
+        // content area and cell size, not left over from before the resize.
+        let (cell_size, (cols, rows), content_bounds) = pane.update_in(cx, |pane, window, _cx| {
+            (
+                pane.cell_size_for_test(window),
+                pane.grid_dimensions(),
+                pane.content_bounds_for_test()
+                    .expect("the pane must have painted at least once"),
+            )
+        });
+        let expected_cols =
+            ((content_bounds.size.width.as_f32() - 16.0) / cell_size.width.as_f32()) as u16;
+        let expected_rows =
+            ((content_bounds.size.height.as_f32() - 16.0) / cell_size.height.as_f32()) as u16;
+        assert!(
+            cols.abs_diff(expected_cols) <= 1 && rows.abs_diff(expected_rows) <= 1,
+            "after a real resize on a long-running pane, the grid's own dimensions ({cols}x{rows}) \
+             must track its newly measured content area (expected ~{expected_cols}x{expected_rows} \
+             from content_bounds={content_bounds:?}, cell_size={cell_size:?}) - not be stale from \
+             before the resize"
         );
     }
 
