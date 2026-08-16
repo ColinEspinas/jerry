@@ -1110,30 +1110,41 @@ keyword = "#ff79c6"
         assert_eq!(theme.base, None);
     }
 
+    /// Every real way a theme file can be wrong, and the exact error each one has to produce -
+    /// a typo'd key must be named, not silently ignored, or a user edits a file and sees nothing
+    /// change with no explanation.
     #[test]
-    fn an_unknown_key_is_a_real_rejection_not_a_silently_ignored_typo() {
-        let err =
-            parse_theme_file_str("name = \"T\"\n\n[syntax]\nkeywrod = \"#ff79c6\"\n").unwrap_err();
-        assert_eq!(
-            err,
-            ThemeFileError::UnknownKey("syntax.keywrod".to_string())
-        );
-    }
+    fn every_real_malformed_theme_file_is_rejected_with_an_error_naming_what_is_wrong() {
+        for (name, text, expected) in [
+            (
+                "a typo'd key",
+                "name = \"T\"\n\n[syntax]\nkeywrod = \"#ff79c6\"\n",
+                ThemeFileError::UnknownKey("syntax.keywrod".to_string()),
+            ),
+            (
+                "a typo'd table",
+                "name = \"T\"\n\n[surfaces]\nwindow = \"#0c0d10\"\n",
+                ThemeFileError::UnknownKey("surfaces.window".to_string()),
+            ),
+            (
+                "a top-level key outside any table",
+                "name = \"T\"\nwindow = \"#0c0d10\"\n",
+                ThemeFileError::UnknownTable("window".to_string()),
+            ),
+            (
+                "a blank name",
+                "name = \"   \"\n",
+                ThemeFileError::EmptyName,
+            ),
+            (
+                "a name a built-in theme already has",
+                "name = \"Jerry Dark\"\n",
+                ThemeFileError::NameCollidesWithBuiltin("Jerry Dark".to_string()),
+            ),
+        ] {
+            assert_eq!(parse_theme_file_str(text).unwrap_err(), expected, "{name}");
+        }
 
-    #[test]
-    fn an_unknown_table_is_a_real_rejection() {
-        let err =
-            parse_theme_file_str("name = \"T\"\n\n[surfaces]\nwindow = \"#0c0d10\"\n").unwrap_err();
-        assert_eq!(
-            err,
-            ThemeFileError::UnknownKey("surfaces.window".to_string())
-        );
-        let err = parse_theme_file_str("name = \"T\"\nwindow = \"#0c0d10\"\n").unwrap_err();
-        assert_eq!(err, ThemeFileError::UnknownTable("window".to_string()));
-    }
-
-    #[test]
-    fn every_real_invalid_colour_shape_is_rejected_with_the_offending_key_named() {
         for bad in ["0c0d10", "#0c0", "#gggggg", "#0c0d1012", "not-a-color", ""] {
             let err =
                 parse_theme_file_str(&format!("name = \"T\"\n\n[surface]\nwindow = \"{bad}\"\n"))
@@ -1143,9 +1154,27 @@ keyword = "#ff79c6"
                 ThemeFileError::InvalidColor {
                     key: "surface.window".to_string(),
                     value: bad.to_string(),
-                }
+                },
+                "colour {bad:?}"
             );
         }
+
+        for text in [
+            "name = \"T\"\npreview = [\"#010203\"]\n",
+            "name = \"T\"\npreview = \"#010203\"\n",
+            "name = \"T\"\npreview = [\"nope\", \"#040506\", \"#070809\", \"#0a0b0c\", \"#0d0e0f\"]\n",
+        ] {
+            let err = parse_theme_file_str(text).unwrap_err();
+            assert!(
+                matches!(err, ThemeFileError::InvalidPreview(_)),
+                "expected an InvalidPreview error for {text:?}, got {err:?}"
+            );
+        }
+
+        assert!(matches!(
+            parse_theme_file_str("this is not valid toml {{{").unwrap_err(),
+            ThemeFileError::Parse(_)
+        ));
     }
 
     #[test]
@@ -1156,27 +1185,6 @@ keyword = "#ff79c6"
         .expect("pair and array keys are real");
         assert_eq!(theme.overrides["agent.sonnet.fg"], rgba(0xff0000));
         assert_eq!(theme.overrides["graph.lanes.0"], rgba(0x00ff00));
-    }
-
-    #[test]
-    fn an_empty_name_is_a_real_rejection_not_a_silent_fallback() {
-        let err = parse_theme_file_str("name = \"   \"\n").unwrap_err();
-        assert_eq!(err, ThemeFileError::EmptyName);
-    }
-
-    #[test]
-    fn a_name_colliding_with_a_builtin_theme_is_rejected() {
-        let err = parse_theme_file_str("name = \"Jerry Dark\"\n").unwrap_err();
-        assert_eq!(
-            err,
-            ThemeFileError::NameCollidesWithBuiltin("Jerry Dark".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_theme_file_str_rejects_garbage_toml_with_a_real_parse_error() {
-        let err = parse_theme_file_str("this is not valid toml {{{").unwrap_err();
-        assert!(matches!(err, ThemeFileError::Parse(_)));
     }
 
     /// A real round trip through this module's own writer and reader - the property
@@ -1259,36 +1267,20 @@ keyword = "#ff79c6"
         );
     }
 
-    #[test]
-    fn a_malformed_preview_is_a_real_rejection() {
-        for (text, _) in [
-            ("name = \"T\"\npreview = [\"#010203\"]\n", ()),
-            ("name = \"T\"\npreview = \"#010203\"\n", ()),
-            (
-                "name = \"T\"\npreview = [\"nope\", \"#040506\", \"#070809\", \"#0a0b0c\", \"#0d0e0f\"]\n",
-                (),
-            ),
-        ] {
-            let err = parse_theme_file_str(text).unwrap_err();
-            assert!(
-                matches!(err, ThemeFileError::InvalidPreview(_)),
-                "expected an InvalidPreview error for {text:?}, got {err:?}"
-            );
-        }
-    }
-
     // ---- readability ------------------------------------------------------------------------
 
     /// A palette whose body text is literally the same colour as the surface behind it is the real
     /// unreadable case this check exists for.
+    /// Text the same colour as the surface behind it is the extreme, and a few hex digits off is
+    /// the near-miss a hand-author could easily mistake for "different enough" - both are
+    /// unreadable and both must be rejected.
     #[test]
-    fn text_the_same_colour_as_its_background_is_rejected() {
-        let mut palette = theme::Palette::new();
-        palette.insert("surface.window", rgba(0x0c0d10));
-        palette.insert("text.body", rgba(0x0c0d10));
-        let err = check_palette_readability(&palette).unwrap_err();
+    fn text_that_does_not_clear_the_contrast_floor_against_its_background_is_rejected() {
+        let mut identical = theme::Palette::new();
+        identical.insert("surface.window", rgba(0x0c0d10));
+        identical.insert("text.body", rgba(0x0c0d10));
         assert_eq!(
-            err,
+            check_palette_readability(&identical).unwrap_err(),
             ThemeFileError::LowContrast {
                 what: "body text",
                 foreground: "text.body",
@@ -1297,21 +1289,16 @@ keyword = "#ff79c6"
                 floor_per_hundred: MIN_CONTRAST_PER_HUNDRED,
             }
         );
-    }
 
-    /// A real near-miss, not just the identical-colour extreme: a hand-author could easily mistake
-    /// this for "different enough", but it is still unreadable.
-    #[test]
-    fn text_a_few_hex_digits_off_from_its_background_is_still_rejected() {
-        let mut palette = theme::Palette::new();
-        palette.insert("surface.window", rgba(0x0c0d10));
-        palette.insert("text.body", rgba(0x11131a));
+        let mut near_miss = theme::Palette::new();
+        near_miss.insert("surface.window", rgba(0x0c0d10));
+        near_miss.insert("text.body", rgba(0x11131a));
         assert!(
             matches!(
-                check_palette_readability(&palette),
+                check_palette_readability(&near_miss),
                 Err(ThemeFileError::LowContrast { .. })
             ),
-            "expected a LowContrast rejection"
+            "a near-miss is still unreadable"
         );
     }
 
@@ -1354,24 +1341,11 @@ keyword = "#ff79c6"
         assert!(check_palette_readability(&theme::Palette::new()).is_ok());
     }
 
-    #[test]
-    fn every_built_in_theme_is_really_readable_once_compiled() {
-        for def in THEME_DEFS.iter() {
-            let palette = compile_palette_by_name(def.name, &[])
-                .expect("a bundled theme must compile")
-                .unwrap_or_default();
-            assert!(
-                check_palette_readability(&palette).is_ok(),
-                "{} is not readable: {:?}",
-                def.name,
-                check_palette_readability(&palette)
-            );
-        }
-    }
-
     /// Pins the real measured headroom every bundled theme has over the floor - so a future edit
     /// that quietly weakened the floor, or a palette change that quietly ate the margin, shows up
-    /// as a real test failure rather than passing on a technicality.
+    /// as a real test failure rather than passing on a technicality. Strictly stronger than
+    /// `check_palette_readability`'s own 1.6:1 validity floor, over the same pairs, so it stands
+    /// in for a plain "is it readable at all" check too.
     #[test]
     fn every_built_in_theme_clears_the_floor_with_real_headroom() {
         for def in THEME_DEFS.iter() {
@@ -1503,23 +1477,20 @@ keyword = "#ff79c6"
         assert_eq!(palette["surface.window"], rgba(0x333333));
     }
 
+    /// A cycle in the `base` chain must come back as a real reported error naming the loop, not
+    /// a hang - including the one-theme case, where a theme names itself.
     #[test]
     fn a_base_cycle_is_a_real_reported_error_not_a_hang() {
         let a = theme_named("A", Some("B"), &[]);
         let b = theme_named("B", Some("A"), &[]);
-        let err = compile_palette(&a, &[&a, &b]).unwrap_err();
         assert_eq!(
-            err,
+            compile_palette(&a, &[&a, &b]).unwrap_err(),
             ThemeFileError::BaseCycle(vec!["A".to_string(), "B".to_string(), "A".to_string()])
         );
-    }
 
-    #[test]
-    fn a_theme_naming_itself_as_its_own_base_is_a_real_reported_cycle() {
         let self_based = theme_named("Loop", Some("Loop"), &[]);
-        let err = compile_palette(&self_based, &[&self_based]).unwrap_err();
         assert_eq!(
-            err,
+            compile_palette(&self_based, &[&self_based]).unwrap_err(),
             ThemeFileError::BaseCycle(vec!["Loop".to_string(), "Loop".to_string()])
         );
     }
@@ -2042,19 +2013,19 @@ keyword = "#ff79c6"
 
     #[test]
     fn custom_themes_dir_for_is_a_real_sibling_of_the_given_settings_path() {
-        let settings_path = Path::new("/home/user/.config/jerry/settings.toml");
-        assert_eq!(
-            custom_themes_dir_for(settings_path),
-            Path::new("/home/user/.config/jerry/themes")
-        );
-    }
-
-    #[test]
-    fn custom_themes_dir_for_falls_back_to_a_bare_name_for_a_settings_path_with_no_parent() {
-        assert_eq!(
-            custom_themes_dir_for(Path::new("settings.toml")),
-            Path::new("themes")
-        );
+        for (settings_path, expected) in [
+            (
+                "/home/user/.config/jerry/settings.toml",
+                "/home/user/.config/jerry/themes",
+            ),
+            // No parent at all - a bare name rather than an empty path.
+            ("settings.toml", "themes"),
+        ] {
+            assert_eq!(
+                custom_themes_dir_for(Path::new(settings_path)),
+                Path::new(expected)
+            );
+        }
     }
 
     /// Proves the built-in files really do go through the *same* parse/validate core a

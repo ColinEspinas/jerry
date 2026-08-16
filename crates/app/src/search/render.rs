@@ -1371,16 +1371,15 @@ mod tests {
 #[cfg(test)]
 mod panel_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use crate::search::state::SearchField;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
-    use tempfile::TempDir;
 
     /// A real worktree on disk with `refresh_token` across four files - the same corpus
     /// `Jerry.dc.html`'s own search fixture uses, so what these tests see is what the design was
     /// drawn against.
-    fn fixture_repo() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
+    fn fixture_repo() -> crate::search::fixtures::TempRepo {
+        let repo = crate::search::fixtures::temp_repo();
         let write = |relative: &str, content: &str| {
             let path = repo.path().join(relative);
             std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
@@ -1402,9 +1401,9 @@ mod panel_tests {
 
     fn open_search<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &crate::search::fixtures::TempRepo,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| app.open_search_panel(window, cx));
         cx.run_until_parked();
         (app, cx)
@@ -1479,7 +1478,7 @@ mod panel_tests {
     #[gpui::test]
     fn mod_shift_f_opens_the_panel_with_the_query_focused(cx: &mut TestAppContext) {
         let repo = fixture_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.dispatch_action(SearchInWorktree);
         cx.run_until_parked();
 
@@ -1784,7 +1783,7 @@ mod panel_tests {
     /// clamping to a valid one.
     #[gpui::test]
     fn clicking_a_match_row_opens_the_file_on_exactly_the_line_it_reports(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let repo = crate::search::fixtures::temp_repo();
         let mut content = String::new();
         for line in 1..=41 {
             content.push_str(&format!("// padding line {line}\n"));
@@ -2026,9 +2025,8 @@ mod panel_tests {
 #[cfg(test)]
 mod search_virtualization_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
-    use tempfile::TempDir;
 
     /// Deliberately more match rows than any plausible test viewport can show at
     /// `theme::band::SEARCH_MATCH_ROW` each - a single file with `ROW_COUNT` distinct one-per-line
@@ -2036,8 +2034,8 @@ mod search_virtualization_tests {
     /// shape the live report itself described.
     const ROW_COUNT: usize = 300;
 
-    fn fixture_repo() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
+    fn fixture_repo() -> crate::search::fixtures::TempRepo {
+        let repo = crate::search::fixtures::temp_repo();
         let mut content = String::new();
         for i in 0..ROW_COUNT {
             content.push_str(&format!("let needle_{i} = needle;\n"));
@@ -2048,9 +2046,9 @@ mod search_virtualization_tests {
 
     fn open_search<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &crate::search::fixtures::TempRepo,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| app.open_search_panel(window, cx));
         cx.run_until_parked();
         (app, cx)
@@ -2571,9 +2569,8 @@ impl AdeApp {
 #[cfg(test)]
 mod find_bar_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
-    use tempfile::TempDir;
 
     const SAMPLE: &str = "let refresh_token = issue();\n\
                           if refresh_token.expired() { drop(refresh_token); }\n\
@@ -2582,11 +2579,15 @@ mod find_bar_tests {
 
     fn repo_with_open_file(
         cx: &mut TestAppContext,
-    ) -> (TempDir, gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        let repo = TempDir::new().expect("tempdir");
+    ) -> (
+        crate::search::fixtures::TempRepo,
+        gpui::Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = crate::search::fixtures::temp_repo();
         let file = repo.path().join("session.rs");
         std::fs::write(&file, SAMPLE).expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file.clone(), window, cx);
         });

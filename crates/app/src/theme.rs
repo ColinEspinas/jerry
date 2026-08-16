@@ -3794,36 +3794,21 @@ mod lang_token_tests {
         same(a.0.resolve(), b.0.resolve()) && same(a.1.resolve(), b.1.resolve())
     }
 
+    /// The four language chips design spec D pins by hex. The rest of the chips are checked only
+    /// for distinctness, below - the spec names these four.
     #[test]
-    fn ts_matches_the_real_spec_d_hex_pair() {
-        assert!(same_pair(
-            lang::TS,
-            (rgba_from_u32(0x6b9bd1), rgba_from_u32(0x1b2838))
-        ));
-    }
-
-    #[test]
-    fn vue_matches_the_real_spec_d_hex_pair() {
-        assert!(same_pair(
-            lang::VUE,
-            (rgba_from_u32(0x5cb87f), rgba_from_u32(0x16261e))
-        ));
-    }
-
-    #[test]
-    fn py_matches_the_real_spec_d_hex_pair() {
-        assert!(same_pair(
-            lang::PY,
-            (rgba_from_u32(0xc9b04a), rgba_from_u32(0x2a2612))
-        ));
-    }
-
-    #[test]
-    fn go_matches_the_real_spec_d_hex_pair() {
-        assert!(same_pair(
-            lang::GO,
-            (rgba_from_u32(0x5fa8c4), rgba_from_u32(0x152730))
-        ));
+    fn every_spec_pinned_lang_chip_still_carries_its_spec_hex_pair() {
+        for (name, chip, foreground, background) in [
+            ("ts", lang::TS, 0x6b9bd1, 0x1b2838),
+            ("vue", lang::VUE, 0x5cb87f, 0x16261e),
+            ("py", lang::PY, 0xc9b04a, 0x2a2612),
+            ("go", lang::GO, 0x5fa8c4, 0x152730),
+        ] {
+            assert!(
+                same_pair(chip, (rgba_from_u32(foreground), rgba_from_u32(background))),
+                "{name}'s chip no longer matches its spec hex pair"
+            );
+        }
     }
 
     #[test]
@@ -3864,29 +3849,13 @@ mod ui_scale_tests {
     use super::ui_scale::scaled_px;
 
     #[test]
-    fn one_hundred_percent_is_a_real_no_op() {
-        assert_eq!(scaled_px(12.0, 100), px(12.0));
-    }
-
-    #[test]
-    fn scales_up_and_down_proportionally() {
-        // `125`/`50` (not e.g. `90`) so the expected value is exactly representable in `f32`
-        // and this stays an exact-equality check rather than needing an epsilon comparison.
-        assert_eq!(scaled_px(12.0, 125), px(15.0));
-        assert_eq!(scaled_px(12.0, 50), px(6.0));
+    fn ui_scale_scales_proportionally_and_leaves_one_hundred_percent_alone() {
+        for (percent, expected) in [(100, 12.0), (150, 18.0), (50, 6.0)] {
+            assert_eq!(scaled_px(12.0, percent), px(expected), "at {percent}%");
+        }
     }
 }
 
-/// Real, source-parsing coverage that [`TOKEN_GROUPS`] is honestly *total* - the property every
-/// other piece of this rewrite depends on. The registry is what theme-file key validation
-/// (`crate::settings::custom_theme`), the built-in theme generator
-/// (`crate::settings::builtin_themes`) and the "generate from colour" action all walk, so a token
-/// that exists in this file but not in the registry would be a colour no theme could ever change
-/// *and* one no generated file would ever mention - silently, with nothing else failing.
-///
-/// Reflection can't see `const` declarations, so these tests read this module's own real source
-/// (`include_str!("theme.rs")` - the literal file being compiled, not a copy) and compare what it
-/// declares against what the registry lists.
 #[cfg(test)]
 mod token_registry_tests {
     use super::*;
@@ -4821,23 +4790,6 @@ mod syntax_contrast_tests {
             .collect()
     }
 
-    #[test]
-    fn every_syntax_token_clears_a_real_contrast_floor_in_jerry_dark_and_paper() {
-        const MIN_RATIO: f32 = 2.5;
-        for name in ["Jerry Dark", "Paper"] {
-            let _guard = with_bundled_theme(name);
-            let background = surface::CENTER.resolve();
-            for (key, token) in syntax_tokens() {
-                let ratio = contrast_ratio(token.resolve(), background);
-                assert!(
-                    ratio >= MIN_RATIO,
-                    "{key} only reaches {ratio:.2}:1 against surface::CENTER in {name} - below \
-                     the real {MIN_RATIO}:1 floor"
-                );
-            }
-        }
-    }
-
     /// The sidebar strip's one structural invariant, in every bundled theme (GitHub issue #291).
     ///
     /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "a tab only reads as
@@ -4882,18 +4834,27 @@ mod syntax_contrast_tests {
         }
     }
 
+    /// Two floors, because `Jerry Dark` and `Paper` are the two palettes actually authored - the
+    /// other four are mechanical `derive_shift` transforms and are held to a looser bound so a
+    /// derivation artifact does not read as a palette defect.
     #[test]
-    fn every_syntax_token_clears_a_looser_floor_across_every_bundled_theme() {
+    fn every_syntax_token_clears_its_themes_own_contrast_floor() {
+        const MIN_RATIO_AUTHORED: f32 = 2.5;
         const MIN_RATIO: f32 = 1.5;
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
+            let min_ratio = if matches!(def.name, "Jerry Dark" | "Paper") {
+                MIN_RATIO_AUTHORED
+            } else {
+                MIN_RATIO
+            };
             let background = surface::CENTER.resolve();
             for (key, token) in syntax_tokens() {
                 let ratio = contrast_ratio(token.resolve(), background);
                 assert!(
-                    ratio >= MIN_RATIO,
+                    ratio >= min_ratio,
                     "{key} only reaches {ratio:.2}:1 against surface::CENTER in {} - below the \
-                     real {MIN_RATIO}:1 floor",
+                     real {min_ratio}:1 floor",
                     def.name
                 );
             }
@@ -4974,42 +4935,15 @@ mod syntax_bracket_ring_tests {
     }
 
     /// The whole point of the feature: two nesting levels a reader is comparing must not look
-    /// alike. Cyclically adjacent (depth `n` against `n + 1`) is the pair that matters most, since
-    /// those two nest directly inside one another.
-    #[test]
-    fn cyclically_adjacent_ring_colours_stay_far_apart_in_every_bundled_theme() {
-        // Lower again than the ring this replaced, and for the same *kind* of reason it was
-        // lowered once before: ΔE is bought with chroma, and the redesign's ring is deliberately
-        // held below the palette's accents in chroma (that is the spec - a bracket must never
-        // shout louder than a string). Six hues at one lightness and one low chroma have a
-        // mathematical ceiling on how far apart they can be, and 18 is set from what a reader
-        // needs - ~8x the ~2.3 just-noticeable difference - not from what an optimiser can reach.
-        // Real measured worst case across every bundled theme: 20.7.
-        const MIN_DELTA_E: f32 = 18.0;
-        for def in crate::settings::state::THEME_DEFS.iter() {
-            let _guard = with_bundled_theme(def.name);
-            let ring = ring_tokens();
-            for index in 0..ring.len() {
-                let (name_a, token_a) = ring[index];
-                let (name_b, token_b) = ring[(index + 1) % ring.len()];
-                let distance = delta_e(token_a.resolve(), token_b.resolve());
-                assert!(
-                    distance >= MIN_DELTA_E,
-                    "{name_a} and {name_b} are adjacent depths but only ΔE {distance:.1} apart in \
-                     {} - a reader could not tell one nesting level from the next",
-                    def.name
-                );
-            }
-        }
-    }
-
-    /// Non-adjacent depths matter too, just less: six levels of nesting has to stay legible, not
-    /// merely three.
+    /// alike. Every pair, not only the cyclically adjacent ones - six levels of nesting has to
+    /// stay legible, not merely three.
     #[test]
     fn no_two_ring_colours_collide_in_any_bundled_theme() {
-        // With six hues evenly spaced at one lightness and one chroma, the nearest pair *is* an
-        // adjacent pair, so this floor is the same one - see above for why it is what it is. Real
-        // measured worst case: 20.7.
+        // ΔE is bought with chroma, and this ring is deliberately held below the palette's accents
+        // in chroma (a bracket must never shout louder than a string). Six hues at one lightness
+        // and one low chroma have a mathematical ceiling on how far apart they can be, so 18 is
+        // set from what a reader needs - ~8x the ~2.3 just-noticeable difference - not from what
+        // an optimiser can reach. Real measured worst case across every bundled theme: 20.7.
         const MIN_DELTA_E: f32 = 18.0;
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
@@ -5027,11 +4961,14 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// No ring colour may be confusable with a semantic accent - the spec's own words. This is a
-    /// new check, and it exists because of a real defect in the ring this replaced: its
-    /// `BRACKET_1` sat at OKLCH hue 23 against `ERROR_UNDERLINE`'s 25, two degrees apart, so a
-    /// matched depth-0 bracket wore essentially the error colour. Every ΔE check of the day passed,
-    /// because they only ever compared ring colours to *plain text* and to each other.
+    /// No ring colour may be confusable with a semantic accent - the spec's own words. It exists
+    /// because of a real defect in the ring this replaced: its `BRACKET_1` sat at OKLCH hue 23
+    /// against `ERROR_UNDERLINE`'s 25, two degrees apart, so a matched depth-0 bracket wore
+    /// essentially the error colour. Every ΔE check of the day passed, because they only ever
+    /// compared ring colours to *plain text* and to each other.
+    ///
+    /// Two floors, because Jerry Dark is where these colours are actually authored and the other
+    /// themes are mechanical `derive_shift` transforms of it: 18 there, 12 everywhere.
     #[test]
     fn no_ring_colour_is_confusable_with_a_syntax_accent() {
         // This floor was **raised** from 8.0 when the ring moved off the accent lightness band
@@ -5060,13 +4997,23 @@ mod syntax_bracket_ring_tests {
             ("VARIABLE", syntax::VARIABLE),
             ("ERROR_UNDERLINE", syntax::ERROR_UNDERLINE),
         ];
+        /// Measured worst case in Jerry Dark itself is 20.8, against 11.3 for the ring this
+        /// replaced - a palette that grew from eight semantic hue families to ten ended up with a
+        /// *more* clearly separated ring, which is the whole argument for spending lightness
+        /// rather than hue on it.
+        const MIN_DELTA_E_AUTHORED: f32 = 18.0;
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
+            let floor = if def.name == "Jerry Dark" {
+                MIN_DELTA_E_AUTHORED
+            } else {
+                MIN_DELTA_E
+            };
             for (ring_name, ring_token) in ring_tokens() {
                 for (accent_name, accent_token) in accents {
                     let distance = delta_e(ring_token.resolve(), accent_token.resolve());
                     assert!(
-                        distance >= MIN_DELTA_E,
+                        distance >= floor,
                         "{ring_name} is only ΔE {distance:.1} from {accent_name} in {} - a \
                          coloured bracket must never impersonate a semantic token",
                         def.name
@@ -5076,52 +5023,31 @@ mod syntax_bracket_ring_tests {
         }
     }
 
-    /// The other thing an uncoloured bracket can be. Since the redesign,
-    /// `syntax::PUNCTUATION_BRACKET` is no longer plain text but its own dimmer tone, so a ring
-    /// colour has to stay clear of *both* - this covers the half
-    /// `every_ring_colour_is_perceptibly_different_from_plain_text` does not.
+    /// A *matched* bracket reading like an *unmatched* one would erase the whole
+    /// matched/unmatched distinction this feature's honest-degradation design rests on. Since the
+    /// redesign there are two tones to stay clear of, not one: plain text, and
+    /// `syntax::PUNCTUATION_BRACKET`'s own dimmer unmatched tone.
     #[test]
-    fn every_ring_colour_stays_clear_of_the_de_emphasized_bracket_tone() {
+    fn every_ring_colour_stays_clear_of_both_tones_it_must_not_be_mistaken_for() {
+        // Real measured worst case: 16.7, in Jerry Dark. If this fires after a change to the
+        // defaults, the generated theme files probably need regenerating (see
+        // `crate::settings::builtin_themes`).
         const MIN_DELTA_E: f32 = 14.0;
         for def in crate::settings::state::THEME_DEFS.iter() {
             let _guard = with_bundled_theme(def.name);
-            let unmatched = syntax::PUNCTUATION_BRACKET.resolve();
-            for (name, token) in ring_tokens() {
-                let distance = delta_e(token.resolve(), unmatched);
-                assert!(
-                    distance >= MIN_DELTA_E,
-                    "{name} is only ΔE {distance:.1} from the unmatched-bracket tone in {} - the \
-                     matched/unmatched distinction would be invisible",
-                    def.name
-                );
-            }
-        }
-    }
-
-    /// A *matched* bracket reading identically to an *unmatched* one would erase the whole
-    /// matched/unmatched distinction this feature's honest-degradation design rests on - and
-    /// `syntax::PUNCTUATION_BRACKET` is exactly `syntax::TEXT` by deliberate design, so this one
-    /// check covers both.
-    #[test]
-    fn every_ring_colour_is_perceptibly_different_from_plain_text() {
-        // Real measured worst case: 16.7, in Jerry Dark. Note this check got *harder* in the
-        // redesign, not easier: `syntax::PUNCTUATION_BRACKET` is no longer plain text but a
-        // genuinely dimmer tone, so a ring colour now has to stay clear of two different things.
-        // `every_ring_colour_stays_clear_of_the_de_emphasized_bracket_tone` covers the other one.
-        const MIN_DELTA_E: f32 = 14.0;
-        for def in crate::settings::state::THEME_DEFS.iter() {
-            let _guard = with_bundled_theme(def.name);
-            let text = syntax::TEXT.resolve();
-            for (name, token) in ring_tokens() {
-                let distance = delta_e(token.resolve(), text);
-                assert!(
-                    distance >= MIN_DELTA_E,
-                    "{name} is only ΔE {distance:.1} from plain text in {} - a matched bracket \
-                     would be indistinguishable from an unmatched one. If this fired after a \
-                     change to the defaults, the five generated theme files probably need \
-                     regenerating (see crate::settings::builtin_themes).",
-                    def.name
-                );
+            for (reference_name, reference) in [
+                ("the unmatched-bracket tone", syntax::PUNCTUATION_BRACKET),
+                ("plain text", syntax::TEXT),
+            ] {
+                for (name, token) in ring_tokens() {
+                    let distance = delta_e(token.resolve(), reference.resolve());
+                    assert!(
+                        distance >= MIN_DELTA_E,
+                        "{name} is only ΔE {distance:.1} from {reference_name} in {} - a matched \
+                         bracket would be indistinguishable from an unmatched one",
+                        def.name
+                    );
+                }
             }
         }
     }
@@ -5234,42 +5160,6 @@ mod syntax_bracket_ring_tests {
                  far enough out of register to read as a foreign accent",
                 def.name
             );
-        }
-    }
-
-    /// A ring colour sits between two semantic hues and must never be mistakable for either.
-    ///
-    /// The strict, Jerry-Dark-only counterpart to
-    /// `no_ring_colour_is_confusable_with_a_syntax_accent`. Its floor was raised from 11 to 18 when
-    /// the ring moved onto the punctuation lightness band: measured worst case here is now ΔE 20.8,
-    /// against 11.3 for the ring this replaced. A palette that grew from eight semantic hue
-    /// families to ten therefore ended up with a *more* clearly separated bracket ring, not a less
-    /// one - which is the whole argument for spending lightness rather than hue on it.
-    #[test]
-    fn no_ring_colour_impersonates_the_semantic_token_it_borrows_its_hue_from() {
-        const MIN_DELTA_E: f32 = 18.0;
-        let semantic: [(&str, ColorToken); 10] = [
-            ("KEYWORD", syntax::KEYWORD),
-            ("FUNCTION", syntax::FUNCTION),
-            ("FUNCTION_DEFINITION", syntax::FUNCTION_DEFINITION),
-            ("TYPE", syntax::TYPE),
-            ("CONSTANT", syntax::CONSTANT),
-            ("STRING", syntax::STRING),
-            ("VARIABLE", syntax::VARIABLE),
-            ("VARIABLE_PARAMETER", syntax::VARIABLE_PARAMETER),
-            ("PROPERTY", syntax::PROPERTY),
-            ("ATTRIBUTE", syntax::ATTRIBUTE),
-        ];
-        let _guard = with_bundled_theme("Jerry Dark");
-        for (ring_name, ring_token) in ring_tokens() {
-            for (semantic_name, semantic_token) in semantic {
-                let distance = delta_e(ring_token.resolve(), semantic_token.resolve());
-                assert!(
-                    distance >= MIN_DELTA_E,
-                    "{ring_name} is only ΔE {distance:.1} from {semantic_name} - a coloured \
-                     bracket would read as that token rather than as structure"
-                );
-            }
         }
     }
 

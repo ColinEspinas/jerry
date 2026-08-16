@@ -1446,6 +1446,10 @@ mod tests {
         );
     }
 
+    /// Save then load has to be the identity on every field a user can change - a field that
+    /// silently reverts to its default on the next launch is not a real setting. Asserted as a
+    /// whole-value equality rather than field by field, so a newly added field is covered here
+    /// the moment it is mutated below.
     #[test]
     fn a_settings_value_round_trips_through_real_toml_save_and_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1455,6 +1459,10 @@ mod tests {
         settings.window.controls = WindowControlsStyle::MacosStyle;
         settings.appearance.interface_scale_percent = 125;
         settings.appearance.editor_font_size = 15.5;
+        assert!(
+            settings.appearance.show_indent_guides,
+            "premise: the real default is guides on, so `false` below is a real change"
+        );
         settings.appearance.show_indent_guides = false;
         settings.theme.name = "Slate".to_string();
         settings.theme.high_contrast_diff = true;
@@ -1465,34 +1473,6 @@ mod tests {
         assert_eq!(settings, loaded);
     }
 
-    /// GitHub issue #122's `show_indent_guides` toggle, round-tripped through real TOML
-    /// save/load exactly like [`a_settings_value_round_trips_through_real_toml_save_and_load`]
-    /// above covers several other `AppearanceSettings` fields - a dedicated test so a future
-    /// change to that shared fixture can't silently stop covering this one field.
-    #[test]
-    fn show_indent_guides_round_trips_through_real_toml_save_and_load() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.toml");
-
-        assert!(
-            Settings::default().appearance.show_indent_guides,
-            "sanity check: the real default is guides on"
-        );
-
-        let mut settings = Settings::default();
-        settings.appearance.show_indent_guides = false;
-        settings.save_at(&path).expect("save should succeed");
-        let loaded = Settings::load_or_init_at(&path);
-
-        assert_eq!(settings, loaded);
-        assert!(!loaded.appearance.show_indent_guides);
-    }
-
-    /// GitHub issue #168's `bracket_pair_colorization` toggle, round-tripped through real TOML
-    /// save/load - same dedicated-test discipline as [`show_indent_guides_round_trips_through_real_toml_save_and_load`]
-    /// above, and additionally pinning that a file written *before* this key existed still loads
-    /// with the feature on. That backward-compatibility case is the one that matters here: this
-    /// shipped enabled, so a missing key has to mean "on", never "off".
     #[test]
     fn bracket_pair_colorization_round_trips_and_defaults_on_for_an_older_file() {
         let dir = tempfile::tempdir().expect("tempdir");
