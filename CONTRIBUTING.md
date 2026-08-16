@@ -28,20 +28,24 @@ Every change must pass, locally, before you open a PR — the same checks CI run
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo nextest run --workspace
 ```
 
 Run them together as `/check` if you're working through Claude Code. None are optional or "mostly
-passing." The test suite is intentionally not part of this list right now — see
-[issue #348](https://github.com/ColinEspinas/jerry/issues/348); run the tests relevant to what
-you're touching manually instead, scoped to a crate:
+passing."
+
+`.config/nextest.toml` gives every test its own process and kills one that is still running after
+two minutes, so a hung test fails that test instead of the whole run. `cargo test` has no
+equivalent and will sit there indefinitely — prefer `cargo nextest run`. While iterating, scope it
+to what you're touching:
 
 ```sh
 cargo nextest run -p wt-core
 ```
 
-`.config/nextest.toml` gives every test its own process and kills one that is still running after
-two minutes, so a hung test fails that test instead of the whole run. `cargo test` has no
-equivalent and will sit there indefinitely — prefer `cargo nextest run`.
+That covers the `unit` and `ui` tiers. The `external` tier — tests that spawn a real language
+server — is `#[ignore]`d, never part of the PR gate, and runs in its own nightly CI job. See
+[`docs/testing.md`](docs/testing.md).
 
 See [`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
 from a GitHub issue to a merged PR in this repo, including which Claude Code skill covers which

@@ -107,15 +107,14 @@ deliberately, not casually.
 ```sh
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo nextest run --workspace
 ```
 
 must all pass — see [`CLAUDE.md`](CLAUDE.md) for the full standards, [`CONTRIBUTING.md`](CONTRIBUTING.md)
 for the process, and [`docs/development-workflow.md`](docs/development-workflow.md) for how a
 change moves from issue to merged PR. `.github/workflows/ci.yml` runs the same checks on every
-push. The test suite is not currently part of this gate — see
-[issue #348](https://github.com/ColinEspinas/jerry/issues/348) — but tests run under
-[`cargo-nextest`](https://nexte.st) rather than `cargo test`, for the per-test process isolation
-and timeout configured in `.config/nextest.toml`:
+push, on Linux, macOS and Windows. Tests run under [`cargo-nextest`](https://nexte.st) rather than
+`cargo test`, for the per-test process isolation and timeout configured in `.config/nextest.toml`:
 
 ```sh
 cargo install cargo-nextest --locked

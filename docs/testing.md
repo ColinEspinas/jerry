@@ -138,11 +138,38 @@ a signal the subject already emits: perturbing nothing beats polling coarsely.
 
 ## Running tests
 
-`cargo test --workspace` is deliberately **not** part of the pre-commit gate — see `CLAUDE.md` and
-[GitHub issue #348](https://github.com/ColinEspinas/jerry/issues/348). Run what you touched:
+`cargo nextest run --workspace` is part of the pre-commit gate (`CLAUDE.md`, `/check`) and runs on
+every PR in CI, on Linux, macOS and Windows. It covers the `unit` and `ui` tiers: the `external`
+tier is `#[ignore]`d, and nextest skips ignored tests unless asked for them.
+
+While iterating, scope it to what you touched:
 
 ```sh
 cargo nextest run -p wt-core
 cargo nextest run -p test-support
 cargo nextest run -p app --lib -E 'test(/my_concern_tests/)'
 ```
+
+### The `external` tier
+
+Never on a PR. It runs in `ci.yml`'s `External (real language servers)` job, on a nightly schedule
+and on `workflow_dispatch`. To run it locally you need the servers on `PATH` and a live npm
+registry (one fixture does its own `npm install typescript@5`):
+
+```sh
+rustup component add rust-analyzer
+npm install -g "@vue/language-server@3.3.8" typescript-language-server pyright
+cargo nextest run --workspace --profile external --run-ignored all
+```
+
+`--profile external` inherits the `ci` profile and raises `slow-timeout` to 120s — a real
+handshake plus a first index pass legitimately takes seconds, which the default 30s/2min budget
+cannot tell apart from a hang.
+
+Only `@vue/language-server` is pinned, to the version `crate::language`'s own module docs were
+written against. `typescript-language-server` and `pyright` are knowingly unpinned: no commit
+message or comment in this repo records the version their tests were written against, and the only
+established fact is negative — `typescript-language-server@5.3.0` fails them. The nightly job
+prints `npm ls -g --depth=0` so a pin can eventually be derived from a run that actually passes,
+rather than guessed. `gopls` is not installed: `crate::language` gives Go `lsp: None`, so nothing
+in this workspace ever spawns it.
