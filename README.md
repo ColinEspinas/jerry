@@ -277,5 +277,4 @@ a change moves from issue to merged PR is in
 
 ## License
 
-**[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — take whichever suits you.** Open a PR and your
-code goes in under both, so everyone downstream keeps that same choice.
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
