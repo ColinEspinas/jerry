@@ -1069,10 +1069,14 @@ pub mod tree {
     /// const; it is now its own independently-keyed token that merely starts at the same value, so
     /// a theme can retune tree guides without touching every 1px rule in the app.
     pub const INDENT_GUIDE: ColorToken = token("tree.indent_guide", 0x22262a);
-    /// The guide for a level in the selected file's ancestor chain - defaults to
-    /// [`super::border::SELECTED_EDGE`]'s own value (`#3f5b74`), the same blue the selected-row
-    /// edge uses, so "this line leads to what's selected" is the same visual language in both
-    /// places by default. Independently keyed for the same reason as above.
+    /// Formerly the guide colour for a level in the selected/open file's ancestor chain, defaulting
+    /// to [`super::border::SELECTED_EDGE`]'s own value (`#3f5b74`). GitHub issue #406: the file
+    /// tree's indent guides no longer ever paint this - they always render
+    /// [`INDENT_GUIDE`], regardless of selection, focus, or which file is open, per explicit
+    /// product feedback that a coloured guide read as wrong even when nothing was actually
+    /// selected. Left defined (rather than removed) purely so a custom theme file that still sets
+    /// `tree.indent_guide_active` keeps loading instead of failing on an unknown key; it has no
+    /// remaining effect on anything painted.
     pub const INDENT_GUIDE_ACTIVE: ColorToken = token("tree.indent_guide_active", 0x3f5b74);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
