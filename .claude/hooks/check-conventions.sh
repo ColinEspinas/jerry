@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Deterministic ratchet check for the two structural rules in CLAUDE.md that clippy can't
-# express without the glob-import cleanup first (docs/architecture/decisions.md, entry 3):
-# no new `use super::*` glob, no new adapter call from a render.rs file. This does not rely on
-# an LLM following instructions - it's a real grep run by a real script, wired to three points
-# so drift is caught as early as possible rather than only at the end:
+# Deterministic ratchet check for three rules this repo enforces by counting rather than by
+# review. Two are the structural rules in CLAUDE.md that clippy can't express without the
+# glob-import cleanup first (docs/architecture/decisions.md, entry 3): no new `use super::*`
+# glob, no new adapter call from a render.rs file. The third is design_handoff_jerry_ade/
+# citations in source comments (docs/design/decisions.md, entry 14): the bundle is being
+# replaced by docs/design/, roughly a third of the existing citations already point at
+# `revision N/` paths that were never committed, and CLAUDE.md's comment rule excludes exactly
+# this material - design history, revision IDs, issue archaeology - from source comments anyway.
+# This does not rely on an LLM following instructions - it's a real grep run by a real script,
+# wired to three points so drift is caught as early as possible rather than only at the end:
 #   1. PostToolUse:Edit|Write (settings.json) - fires right after every file edit, for the
 #      fastest possible feedback. Can't block the edit that already happened, but the failing
 #      exit code and message surface immediately instead of waiting for a commit attempt.
@@ -36,9 +41,11 @@ fi
 
 glob_baseline=$(jq -r '.glob_imports_app_src' "$BASELINE_FILE")
 adapter_baseline=$(jq -r '.render_adapter_calls' "$BASELINE_FILE")
+handoff_baseline=$(jq -r '.design_handoff_citations' "$BASELINE_FILE")
 
 glob_current=$(grep -rE "use super::\*;" crates/app/src 2>/dev/null | wc -l | tr -d ' ')
 adapter_current=$(grep -rE "wt_core::|pty_core::|lsp_core::|process::Command::new" crates/app/src --include='render.rs' 2>/dev/null | wc -l | tr -d ' ')
+handoff_current=$(grep -rE "design_handoff|Jerry\.dc\.html" crates 2>/dev/null | wc -l | tr -d ' ')
 
 fail=0
 
@@ -54,8 +61,14 @@ if [ "$adapter_current" -gt "$adapter_baseline" ]; then
   fail=1
 fi
 
+if [ "$handoff_current" -gt "$handoff_baseline" ]; then
+  echo "check-conventions: FAIL - design_handoff_jerry_ade/ citations in crates/ rose from $handoff_baseline to $handoff_current." >&2
+  echo "  That bundle is being replaced by docs/design/ (docs/design/decisions.md, entry 14) and many of its paths were never committed. Cite docs/design/<file>.md, or drop the reference - CLAUDE.md's comment rule excludes design history from source comments." >&2
+  fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
-  echo "check-conventions: OK (glob imports: $glob_current/$glob_baseline, render adapter calls: $adapter_current/$adapter_baseline)"
+  echo "check-conventions: OK (glob imports: $glob_current/$glob_baseline, render adapter calls: $adapter_current/$adapter_baseline, handoff citations: $handoff_current/$handoff_baseline)"
 fi
 
 exit $fail
