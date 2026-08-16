@@ -1010,7 +1010,7 @@ impl TerminalGrid {
 }
 
 #[cfg(test)]
-mod tests {
+mod grid_emulation_tests {
     use super::*;
 
     fn row_text(row: &[GridCell]) -> String {
@@ -1164,15 +1164,6 @@ mod tests {
         assert!(row_text(&rows[0]).starts_with("SECOND"));
     }
 
-    #[test]
-    fn sgr_red_foreground_resolves_to_the_named_palette_color() {
-        let mut grid = TerminalGrid::new(2, 10);
-        grid.append_bytes(b"\x1b[31mR\x1b[0m");
-        let rows = grid.visible_rows(&TerminalPalette::default());
-        assert_eq!(rows[0][0].c, 'R');
-        assert_eq!(rows[0][0].fg, TerminalPalette::default().ansi[1]);
-    }
-
     /// GitHub issue #208's pure half. Two renders of the *same* grid state under two different
     /// palettes must produce two different sets of colours - which is only true because every
     /// resolution path (unstyled default fg/bg, a named ANSI colour, and `Color::Indexed(0..=15)`)
@@ -1257,30 +1248,20 @@ mod tests {
         assert!(rows[0][0].bold);
     }
 
+    /// A resize has to change what the emulator reports *and* what it hands the renderer - a
+    /// `dimensions()` that moved without the painted rows following it would silently paint the
+    /// old geometry.
     #[test]
-    fn resize_changes_the_visible_row_and_column_count() {
+    fn a_resize_changes_both_the_reported_dimensions_and_the_visible_rows() {
         let mut grid = TerminalGrid::new(5, 20);
+        assert_eq!(grid.dimensions(), (20, 5));
+
         grid.resize(10, 40);
+
+        assert_eq!(grid.dimensions(), (40, 10));
         let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0].len(), 40);
-    }
-
-    #[test]
-    fn clear_screen_erases_previously_written_text() {
-        let mut grid = TerminalGrid::new(5, 20);
-        grid.append_bytes(b"hello");
-        grid.append_bytes(b"\x1b[2J\x1b[1;1H");
-        let rows = grid.visible_rows(&TerminalPalette::default());
-        assert_eq!(row_text(&rows[0]).trim(), "");
-    }
-
-    #[test]
-    fn dimensions_reports_the_real_current_cols_and_rows() {
-        let mut grid = TerminalGrid::new(5, 20);
-        assert_eq!(grid.dimensions(), (20, 5));
-        grid.resize(10, 40);
-        assert_eq!(grid.dimensions(), (40, 10));
     }
 
     #[test]
@@ -1305,14 +1286,6 @@ mod tests {
         // not wherever the cursor happened to be before.
         grid.append_bytes(b"X");
         assert_eq!(grid.visible_rows(&TerminalPalette::default())[0][0].c, 'X');
-    }
-
-    #[test]
-    fn mark_ended_sets_the_flag() {
-        let mut grid = TerminalGrid::new(2, 10);
-        assert!(!grid.ended);
-        grid.mark_ended();
-        assert!(grid.ended);
     }
 
     /// Pushes `count` numbered lines (`"line 0\r\n"`, `"line 1\r\n"`, ...) through a real grid -
@@ -1805,67 +1778,54 @@ mod wide_char_tests {
         row.iter().map(|cell| cell.width).collect()
     }
 
-    /// The core fact this issue rests on, straight out of real parsed UTF-8: a CJK ideograph
-    /// occupies its own cell plus a following spacer cell, and both are now labelled as such.
-    #[test]
-    fn a_cjk_character_is_a_wide_cell_followed_by_a_spacer_cell() {
-        let mut grid = TerminalGrid::new(2, 10);
-        grid.append_bytes("你好X".as_bytes());
-        let rows = grid.visible_rows(&TerminalPalette::default());
-
-        assert_eq!(rows[0][0].c, '你');
-        assert_eq!(rows[0][2].c, '好');
-        assert_eq!(rows[0][4].c, 'X');
-        assert_eq!(
-            widths(&rows[0][..5]),
-            vec![
-                CellWidth::Wide,
-                CellWidth::Spacer,
-                CellWidth::Wide,
-                CellWidth::Spacer,
-                CellWidth::Narrow,
-            ],
-        );
-    }
-
-    /// The spacer's own `c` is a literal space `alacritty_terminal` wrote there
+    /// The core fact this issue rests on, straight out of real parsed UTF-8: what counts as a
+    /// double-width character and what does not. CJK ideographs and emoji occupy their own cell
+    /// plus a following spacer; `é` is multi-*byte* but single-*width*, and conflating the two
+    /// would push every accented Latin character a column to the right.
+    ///
+    /// The spacer's own `c` is checked here too: it is a literal space `alacritty_terminal` wrote
     /// (`term/mod.rs:1127-1129`), not a copy of the character or a NUL - which is precisely why
     /// painting it used to insert a stray blank column after every wide glyph. Pinned so a future
     /// dependency bump that changed it can't silently invalidate the renderer's assumption.
     #[test]
-    fn the_spacer_cell_really_holds_a_plain_space_of_its_own() {
-        let mut grid = TerminalGrid::new(2, 10);
-        grid.append_bytes("好".as_bytes());
-        let rows = grid.visible_rows(&TerminalPalette::default());
-        assert_eq!(rows[0][1].c, ' ');
-        assert_eq!(rows[0][1].width, CellWidth::Spacer);
-    }
+    fn real_utf8_is_labelled_wide_or_narrow_by_its_real_column_width() {
+        let wide = || vec![CellWidth::Wide, CellWidth::Spacer];
+        for (text, chars, expected) in [
+            (
+                "你好X",
+                vec!['你', '好', 'X'],
+                [wide(), wide(), vec![CellWidth::Narrow]].concat(),
+            ),
+            // `🎉` (U+1F389) is a real 4-byte sequence `unicode-width` reports as two columns.
+            (
+                "🎉ok",
+                vec!['🎉', 'o', 'k'],
+                [wide(), vec![CellWidth::Narrow; 2]].concat(),
+            ),
+            ("éa", vec!['é', 'a'], vec![CellWidth::Narrow; 2]),
+        ] {
+            let mut grid = TerminalGrid::new(2, 10);
+            grid.append_bytes(text.as_bytes());
+            let rows = grid.visible_rows(&TerminalPalette::default());
 
-    /// Emoji, not just CJK - the other half of what issue #211 asks for. `🎉` (U+1F389) is a real
-    /// 4-byte UTF-8 sequence and `unicode-width` reports it as two columns.
-    #[test]
-    fn an_emoji_is_a_wide_cell_too() {
-        let mut grid = TerminalGrid::new(2, 10);
-        grid.append_bytes("🎉ok".as_bytes());
-        let rows = grid.visible_rows(&TerminalPalette::default());
-
-        assert_eq!(rows[0][0].c, '🎉');
-        assert_eq!(rows[0][0].width, CellWidth::Wide);
-        assert_eq!(rows[0][1].width, CellWidth::Spacer);
-        assert_eq!(rows[0][2].c, 'o');
-        assert_eq!(rows[0][2].width, CellWidth::Narrow);
-    }
-
-    /// A multi-byte UTF-8 character that is *not* double-width (`é`, two bytes, one column) must
-    /// stay [`CellWidth::Narrow`] - "multi-byte" and "double-width" are different properties, and
-    /// conflating them would push every accented Latin character a column to the right.
-    #[test]
-    fn a_multi_byte_but_single_width_character_stays_narrow() {
-        let mut grid = TerminalGrid::new(2, 10);
-        grid.append_bytes("éa".as_bytes());
-        let rows = grid.visible_rows(&TerminalPalette::default());
-        assert_eq!(rows[0][0].c, 'é');
-        assert_eq!(widths(&rows[0][..2]), vec![CellWidth::Narrow; 2]);
+            assert_eq!(
+                widths(&rows[0][..expected.len()]),
+                expected,
+                "cell widths for {text:?}"
+            );
+            let painted: Vec<char> = rows[0][..expected.len()]
+                .iter()
+                .zip(&expected)
+                .filter(|(_, width)| **width != CellWidth::Spacer)
+                .map(|(cell, _)| cell.c)
+                .collect();
+            assert_eq!(painted, chars, "characters for {text:?}");
+            for (cell, width) in rows[0].iter().zip(&expected) {
+                if *width == CellWidth::Spacer {
+                    assert_eq!(cell.c, ' ', "a spacer cell holds a plain space of its own");
+                }
+            }
+        }
     }
 
     /// The end-of-row case: a wide character that doesn't fit in the last column wraps, and
@@ -1961,8 +1921,10 @@ mod selection_tests {
         }
     }
 
+    /// Every way a gesture can end up selecting nothing worth copying - none of which may
+    /// overwrite the clipboard with an empty string or a stray character.
     #[test]
-    fn nothing_is_selected_until_a_selection_is_actually_dragged() {
+    fn nothing_worth_copying_is_never_reported_as_a_selection() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"hello world");
         assert_eq!(grid.selected_text(), None, "no selection has been anchored");
@@ -1975,6 +1937,15 @@ mod selection_tests {
             None,
             "an anchored-but-never-dragged selection must not put a stray character on the \
              clipboard"
+        );
+
+        // A real drag, but across rows that have nothing on them at all.
+        grid.start_selection(left(2, 0));
+        grid.update_selection(right(2, 15));
+        assert_eq!(
+            grid.selected_text(),
+            None,
+            "an all-blank span must not overwrite the clipboard with an empty string"
         );
     }
 
@@ -2050,18 +2021,6 @@ mod selection_tests {
         assert_eq!(grid.selected_text(), None);
     }
 
-    #[test]
-    fn a_drag_across_blank_screen_selects_nothing_worth_copying() {
-        let mut grid = TerminalGrid::new(5, 20);
-        grid.start_selection(left(2, 0));
-        grid.update_selection(right(2, 15));
-        assert_eq!(
-            grid.selected_text(),
-            None,
-            "an all-blank span must not overwrite the clipboard with an empty string"
-        );
-    }
-
     /// The selection has to be *visible*, not just readable - a `GridCell` that never carried
     /// the flag would leave the renderer with nothing to paint, so a user dragging across the
     /// terminal would see no feedback at all.
@@ -2069,6 +2028,14 @@ mod selection_tests {
     fn selected_cells_are_flagged_for_the_renderer() {
         let mut grid = TerminalGrid::new(5, 20);
         grid.append_bytes(b"hello world");
+        assert!(
+            grid.visible_rows(&TerminalPalette::default())
+                .iter()
+                .flatten()
+                .all(|cell| !cell.selected),
+            "sanity check: with no selection anchored, no cell carries the flag"
+        );
+
         grid.start_selection(left(0, 6));
         grid.update_selection(right(0, 10));
 
@@ -2083,14 +2050,6 @@ mod selection_tests {
             rows[1].iter().all(|cell| !cell.selected),
             "a single-row selection must not flag cells on any other row"
         );
-    }
-
-    #[test]
-    fn no_selection_means_no_cell_is_flagged() {
-        let mut grid = TerminalGrid::new(5, 20);
-        grid.append_bytes(b"hello world");
-        let rows = grid.visible_rows(&TerminalPalette::default());
-        assert!(rows.iter().flatten().all(|cell| !cell.selected));
     }
 
     /// A wide character's *trailing spacer* column is genuinely part of the selection as far as

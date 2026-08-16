@@ -42,3 +42,8 @@ libc = "0.2"
 # directory to prepend to `$PATH` (see that test's docs). Matches the exact version
 # `crates/app/Cargo.toml`/`crates/wt-core/Cargo.toml` already pin.
 tempfile = "3"
+# The workspace's shared fixtures: `wait_until` (the one sanctioned wall-clock wait, replacing
+# this crate's hand-rolled poll loops) and `ChildGuard` (kill-on-drop teardown for a test that
+# spawns a real process outside a `PtySession`). Deliberately `gpui`-free, so depending on it
+# here cannot violate `docs/architecture/decisions.md` §1.
+test-support = { path = "../test-support" }

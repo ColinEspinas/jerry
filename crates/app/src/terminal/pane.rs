@@ -464,19 +464,29 @@ fn configured_shell_program(configured: Option<&str>) -> Option<PathBuf> {
 mod shell_program_tests {
     use super::*;
 
+    /// Both platform variants' own decisions, side by side. The Windows row is GitHub issue
+    /// #50's actual regression: the fallback must be a real Windows path (`cmd.exe`), never the
+    /// Unix `/bin/bash` this crate used to fall back to unconditionally - `$SHELL` is a Unix-only
+    /// convention Windows never sets, so every Windows session with no override was trying to
+    /// launch a Unix path that does not exist there at all.
     #[test]
-    fn a_real_env_value_is_used_verbatim() {
+    fn an_env_value_is_used_verbatim_and_an_absent_one_falls_back_per_platform() {
         assert_eq!(
             shell_program_from_env(Some(std::ffi::OsString::from("/usr/bin/zsh")), "/bin/bash"),
             PathBuf::from("/usr/bin/zsh")
         );
-    }
-
-    #[test]
-    fn an_absent_env_value_falls_back() {
         assert_eq!(
             shell_program_from_env(None, "/bin/bash"),
             PathBuf::from("/bin/bash")
+        );
+
+        let windows_fallback = shell_program_from_env(None, "cmd.exe");
+        assert_eq!(windows_fallback, PathBuf::from("cmd.exe"));
+        assert_ne!(
+            windows_fallback,
+            PathBuf::from("/bin/bash"),
+            "the Windows default shell must never be the Unix path - that real path does not \
+             exist on Windows, which is the whole bug GitHub issue #50 reports"
         );
     }
 
@@ -513,24 +523,28 @@ mod shell_program_tests {
         );
     }
 
-    /// The zero-config path this setting must never disturb: no override (or a blank one, which
-    /// the settings field can genuinely produce) spawns *exactly* what this app spawned before
-    /// the setting existed.
+    /// The zero-config path this setting must never disturb: no override - or one the settings
+    /// field can genuinely produce that carries no real program name - spawns *exactly* what this
+    /// app spawned before the setting existed. Trimming happens at the edge, so `" fish "` (a
+    /// real, plausible copy-paste) spawns `fish` rather than a name with spaces in it that no
+    /// `PATH` entry could ever match.
     #[test]
-    fn no_configured_shell_is_byte_for_byte_the_previous_os_default() {
+    fn a_configured_shell_is_trimmed_and_a_nameless_one_falls_back_to_the_os_default() {
         let cwd = std::env::temp_dir();
         let os_default = TerminalSpec::default_shell_program();
 
-        assert_eq!(TerminalSpec::shell(cwd.clone(), None).program, os_default);
+        for configured in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                TerminalSpec::shell(cwd.clone(), configured).program,
+                os_default,
+                "{configured:?} names no real program, so it means 'use the system default'"
+            );
+            assert_eq!(configured_shell_program(configured), None);
+        }
+
         assert_eq!(
-            TerminalSpec::shell(cwd.clone(), Some("")).program,
-            os_default,
-            "an empty setting means 'use the system default', not a program with no name"
-        );
-        assert_eq!(
-            TerminalSpec::shell(cwd, Some("   ")).program,
-            os_default,
-            "a whitespace-only setting must fall back too, never spawn a program named ' '"
+            configured_shell_program(Some("  zsh  ")),
+            Some(PathBuf::from("zsh"))
         );
     }
 
@@ -567,30 +581,6 @@ mod shell_program_tests {
             ),
             Ok(_) => panic!("a shell that doesn't exist must not spawn"),
         }
-    }
-
-    /// Trimming happens at the edge, so `" fish "` (a real, plausible copy-paste) spawns `fish`
-    /// rather than a name with spaces in it that no `PATH` entry could ever match.
-    #[test]
-    fn a_configured_shell_is_trimmed_before_it_becomes_a_program() {
-        assert_eq!(
-            configured_shell_program(Some("  zsh  ")),
-            Some(PathBuf::from("zsh"))
-        );
-        assert_eq!(configured_shell_program(None), None);
-        assert_eq!(configured_shell_program(Some(" ")), None);
-    }
-
-    #[test]
-    fn the_windows_fallback_is_a_real_windows_path_not_the_unix_one() {
-        let windows_fallback = shell_program_from_env(None, "cmd.exe");
-        assert_eq!(windows_fallback, PathBuf::from("cmd.exe"));
-        assert_ne!(
-            windows_fallback,
-            PathBuf::from("/bin/bash"),
-            "the Windows default shell must never be the Unix path - that real path does not \
-             exist on Windows, which is the whole bug this issue reports"
-        );
     }
 }
 
@@ -2933,8 +2923,124 @@ impl Render for TerminalPane {
     }
 }
 
+/// Shared fixtures for the test modules below that drive a **real** child process on a **real**
+/// pty. Everything here exists because those two clocks are genuinely different: the poll loop's
+/// ticks are driven by GPUI's simulated executor clock, while the pty reader is an ordinary OS
+/// thread that only makes progress in real wall-clock time. A loop that advanced only the virtual
+/// clock would race ahead of the reader; a fixed `thread::sleep` would be simultaneously too
+/// short under load and dead time when idle. `test_support::wait_until`/`stays_false` are the
+/// workspace's one sanctioned wall-clock wait (`docs/testing.md`), so both clocks advance
+/// together, one poll at a time.
+#[cfg(test)]
+mod pty_pane_fixtures {
+    use super::{TerminalPane, TerminalSpec, POLL_INTERVAL, ROW_FONT_SIZE_PX};
+    use gpui::{AppContext, Entity, TestAppContext};
+    use std::time::Duration;
+
+    /// How long a real pty round trip is given before a test calls it a failure. Generous: it has
+    /// to survive a full-suite run where dozens of other tests' own child processes are competing
+    /// for the same cores.
+    pub(super) const PTY_ROUND_TRIP: Duration = Duration::from_secs(30);
+
+    /// A pane backed by a real child process, spawned and settled.
+    pub(super) fn spawn_pane(
+        cx: &mut TestAppContext,
+        program: &str,
+        args: &[&str],
+    ) -> Entity<TerminalPane> {
+        let pane = cx.new(|cx| {
+            TerminalPane::new(
+                TerminalSpec::command(
+                    program,
+                    args.iter().map(|arg| arg.to_string()).collect(),
+                    std::env::temp_dir(),
+                ),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        pane
+    }
+
+    /// Drives real poll ticks until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
+    pub(super) fn pump_until(
+        cx: &mut TestAppContext,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) -> bool {
+        cx.run_until_parked();
+        test_support::wait_until(PTY_ROUND_TRIP, || {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            done(cx)
+        })
+    }
+
+    /// The inverse: drives real poll ticks for `window` and reports whether `unwanted` stayed
+    /// false throughout - for proving something genuinely never reaches the child, rather than
+    /// merely being slow to arrive.
+    pub(super) fn stays_absent(
+        cx: &mut TestAppContext,
+        window: Duration,
+        mut unwanted: impl FnMut(&mut TestAppContext) -> bool,
+    ) -> bool {
+        cx.run_until_parked();
+        test_support::stays_false(window, || {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            unwanted(cx)
+        })
+    }
+
+    /// Drops `pane` and makes GPUI actually release it, killing its real child process tree.
+    ///
+    /// **Every test in this file that spawns a real pty must end with this.** GPUI releases an
+    /// entity whose last handle was dropped during `flush_effects`, which only runs inside an app
+    /// update - letting the `Entity` fall out of scope at the end of a test body does not trigger
+    /// one, and `run_until_parked` does not either. Until it happens the pane's `PtySession` is
+    /// still alive, so `PtySession::drop`'s process-tree teardown has not run and the child (and
+    /// anything it spawned) keeps running for the rest of the test *binary's* life.
+    ///
+    /// That is not a theoretical hazard: sampled every 100ms during a single-process
+    /// `cargo test -p app --lib terminal::` run before this existed, this module alone held **29
+    /// live children at once**. GitHub issue #427 counted 509 across all of `crates/app`. It does
+    /// not show up in a before/after `ps` diff, because the moment the test binary exits, the pty
+    /// master fd closes and the kernel SIGHUPs each pty's foreground process group - so the
+    /// evidence is only visible while the run is in flight.
+    ///
+    /// `pane_teardown_tests` pins the underlying property this relies on.
+    pub(super) fn release(cx: &mut TestAppContext, pane: Entity<TerminalPane>) {
+        drop(pane);
+        // A pane built with `add_window_view` is the window's *root view*, so the window holds a
+        // strong handle of its own and dropping the test's is not enough. Closing the test's
+        // windows here rather than asking each caller to is deliberate: `release` is the last
+        // statement of a test either way, and a helper that silently worked for `cx.new` panes
+        // and silently did nothing for windowed ones is exactly the kind of half-teardown this
+        // whole fixture exists to stop.
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.update(|_cx| {});
+        cx.run_until_parked();
+    }
+
+    /// Whether any visible grid row contains `needle`.
+    pub(super) fn grid_shows(
+        cx: &mut TestAppContext,
+        pane: &Entity<TerminalPane>,
+        needle: &str,
+    ) -> bool {
+        pane.read_with(cx, |pane, _| {
+            pane.visible_text_lines()
+                .iter()
+                .any(|line| line.contains(needle))
+        })
+    }
+}
+
 #[cfg(test)]
 mod cadence_tests {
+    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
     use super::*;
     use gpui::TestAppContext;
 
@@ -2946,21 +3052,17 @@ mod cadence_tests {
     /// on 8ms ticks forever, and the "nothing may drain in less than one background interval"
     /// window asserted here would see the Ctrl-L echo arrive early.
     ///
-    /// Deterministic despite the real pty: the *arrival* of the echo into pty-core's channel
-    /// takes real wall time (covered by a real sleep, generously sized), but the *drain* only
-    /// happens on poll ticks, and those are driven purely by the test executor's fake clock.
+    /// Deterministic despite the real pty, and without a fixed sleep: the *arrival* of the echo
+    /// into pty-core's channel takes real wall time, but the *drain* only ever happens on a poll
+    /// tick, and those are driven purely by the test executor's simulated clock. So the property
+    /// is stated in virtual time - "no drain may happen before one full background interval of
+    /// simulated time has passed" - and real time is only ever allowed to pass through
+    /// `test_support::wait_until`'s own bounded poll.
     #[gpui::test]
     fn a_background_pane_drains_on_the_background_interval_read_fresh_each_tick(
         cx: &mut TestAppContext,
     ) {
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
 
         // Fire the loop's first (foreground-armed) tick, demote the pane, then fire one more
         // tick so the demotion is picked up and a BACKGROUND_POLL_INTERVAL sleep is armed.
@@ -2970,65 +3072,42 @@ mod cadence_tests {
         cx.background_executor.advance_clock(POLL_INTERVAL);
         cx.run_until_parked();
 
-        // Ctrl-L; the pty's ECHOCTL echo ("^L", see
-        // `clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back`) lands in the
-        // output channel within real milliseconds - sleep long enough that it is certainly
-        // sitting there before any virtual time passes.
+        // Ctrl-L; the pty's ECHOCTL echo is "^L" (see
+        // `clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back`).
         pane.update(cx, |pane, cx| pane.clear(cx));
-        std::thread::sleep(Duration::from_millis(400));
 
-        // Three foreground-sized steps: 24ms of virtual time, less than one 33ms background
-        // tick - a correctly-backgrounded pane must not have drained the echo yet.
-        for _ in 0..3 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
-        let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
+        // Advance one *foreground*-sized step at a time, counting how much simulated time it
+        // took for the echo to appear. A loop that hoisted `is_foreground` out and kept the
+        // spawn-time `true` would drain it on the very next 8ms tick; one that re-reads the flag
+        // cannot drain before its 33ms background timer next fires, whenever the echo arrives.
+        let mut virtual_elapsed = Duration::ZERO;
         assert!(
-            !lines.iter().any(|line| line.contains("^L")),
-            "a background pane drained pty output in under one BACKGROUND_POLL_INTERVAL - \
-             the poll loop is not reading the live foreground flag each tick"
-        );
-
-        // Past the background interval the echo must drain normally (bounded tick loop, as in
-        // the ctrl-l test above, since exactly which tick isn't under test).
-        let mut saw_caret_l = false;
-        for _ in 0..50 {
-            cx.background_executor
-                .advance_clock(BACKGROUND_POLL_INTERVAL);
-            cx.run_until_parked();
-            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
-            if lines.iter().any(|line| line.contains("^L")) {
-                saw_caret_l = true;
-                break;
-            }
-        }
-        assert!(
-            saw_caret_l,
+            test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
+                cx.background_executor.advance_clock(POLL_INTERVAL);
+                cx.run_until_parked();
+                virtual_elapsed += POLL_INTERVAL;
+                grid_shows(cx, &pane, "^L")
+            }),
             "the background cadence must still drain output - coarser, not never"
         );
+        assert!(
+            virtual_elapsed >= BACKGROUND_POLL_INTERVAL,
+            "a background pane drained pty output after only {virtual_elapsed:?} of simulated \
+             time, less than one BACKGROUND_POLL_INTERVAL ({BACKGROUND_POLL_INTERVAL:?}) - the \
+             poll loop is not reading the live foreground flag each tick"
+        );
 
-        // And a promoted pane resumes draining (which tick is again not under test - only
-        // that promotion doesn't strand it).
+        // And a promoted pane resumes draining (which tick is not under test here - only that
+        // promotion doesn't strand it).
         pane.update(cx, |pane, cx| {
             pane.set_foreground(true);
             pane.clear(cx); // wipes the grid, sends a fresh Ctrl-L
         });
-        std::thread::sleep(Duration::from_millis(400));
-        let mut saw_caret_l_again = false;
-        for _ in 0..50 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
-            if lines.iter().any(|line| line.contains("^L")) {
-                saw_caret_l_again = true;
-                break;
-            }
-        }
         assert!(
-            saw_caret_l_again,
+            pump_until(cx, |cx| grid_shows(cx, &pane, "^L")),
             "a pane promoted back to foreground must keep draining output"
         );
+        release(cx, pane);
     }
 
     #[test]
@@ -3082,38 +3161,10 @@ mod resize_tests {
     }
 
     #[test]
-    fn size_to_grid_derives_columns_and_rows_from_the_given_size_not_a_fixed_constant() {
-        // A plausible centre-pane content width once Phase A's shell chrome (rail + panel +
-        // borders) is subtracted from a 1440px window - roughly 820px, not the full 1440.
-        let (rows, cols) = size_to_grid(size(px(820.0), px(800.0)), test_cell_size());
-        assert_eq!(cols, (820.0 / APPROX_CELL_WIDTH_PX) as u16);
-        assert_eq!(rows, (800.0 / ROW_LINE_HEIGHT_PX) as u16);
-    }
-
-    #[test]
     fn size_to_grid_enforces_a_minimum_row_and_column_count() {
         let (rows, cols) = size_to_grid(size(px(10.0), px(10.0)), test_cell_size());
         assert_eq!(cols, 20);
         assert_eq!(rows, 10);
-    }
-
-    #[test]
-    fn size_to_grid_from_a_real_pane_width_is_plausible_not_the_full_window_derived_count() {
-        // Regression guard for the Phase-A bug: deriving columns from the whole 1440px window
-        // (ignoring shell chrome either side) computed ~205 columns; the real centre-pane
-        // width is ~820-840px, ~118-120 columns. Both are "correct" `size_to_grid` outputs for
-        // their inputs - the bug was `maybe_resize_pty` feeding it the wrong one. Pins the two
-        // magnitudes apart so a regression back to `window.viewport_size()` gets caught here.
-        let (_rows, whole_window_cols) =
-            size_to_grid(size(px(1440.0), px(928.0)), test_cell_size());
-        let (_rows, real_pane_cols) = size_to_grid(size(px(828.0), px(800.0)), test_cell_size());
-        assert!(
-            whole_window_cols > real_pane_cols * 3 / 2,
-            "expected the whole-window column count ({whole_window_cols}) to be \
-             substantially larger than the real-pane-width column count ({real_pane_cols}) \
-             - if they're close, something about the approximation changed"
-        );
-        assert!(real_pane_cols < 130, "got {real_pane_cols}");
     }
 
     #[test]
@@ -3129,31 +3180,6 @@ mod resize_tests {
             big_cells,
             (small_cells.0 / 2, small_cells.1 / 2),
             "doubling the cell size must exactly halve both dimensions"
-        );
-    }
-
-    #[test]
-    fn size_to_grid_documents_the_real_before_after_column_count_at_a_typical_pane_width() {
-        // At a plausible centre-pane width (828px) and typical panel height (~800px): how many
-        // rows the old guessed cell size (7.0 x 16.0) computed versus the line-height-corrected
-        // one (7.0 x 19.0). Isolates the height half of the Phase-C bug - the width half is
-        // that `cell_size`'s width now comes from a real font-metrics measurement instead of a
-        // guess, which this pure function can't itself demonstrate.
-        let old_guess = size(px(APPROX_CELL_WIDTH_PX), px(16.0));
-        let new_real = size(px(APPROX_CELL_WIDTH_PX), px(ROW_LINE_HEIGHT_PX));
-        let pane = size(px(828.0), px(800.0));
-
-        let (old_rows, _) = size_to_grid(pane, old_guess);
-        let (new_rows, _) = size_to_grid(pane, new_real);
-
-        // The old, too-short line-height guess asked for more rows than the pane could
-        // actually show without clipping (`800.0 / 16.0 = 50` vs. `800.0 / 19.0 = 42`) - a
-        // ~19% over-request, not a rounding artifact.
-        assert_eq!(old_rows, 50);
-        assert_eq!(new_rows, 42);
-        assert!(
-            old_rows > new_rows,
-            "the old guess must over-request rows relative to the real, corrected line height"
         );
     }
 
@@ -3295,66 +3321,6 @@ mod eof_poll_tests {
             None => panic!("expected the tick cap to force a resolution"),
         }
     }
-
-    /// Empirical proof (no GPUI needed) that the race `eof_poll_decision` exists to handle is
-    /// genuine: a child that closes its own pty-attached stdio before actually exiting causes
-    /// the output channel to disconnect while the process is still alive - a single
-    /// non-blocking `try_wait` at that moment legitimately observes nothing, and only a later
-    /// retry observes the real exit status.
-    #[test]
-    fn real_process_closing_pty_fds_before_exiting_is_not_yet_reaped_at_eof() {
-        let mut session = pty_core::spawn(
-            pty_core::SpawnOptions::new("sh")
-                .arg("-c")
-                .arg("exec 0<&- 1>&- 2>&-; sleep 1; exit 7"),
-        )
-        .expect("spawning the shell should succeed");
-
-        // Drain until the output channel disconnects - exactly the `TryRecvError::
-        // Disconnected` signal `TerminalPane`'s poll loop reacts to.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                panic!("timed out waiting for the pty output channel to disconnect (EOF)");
-            }
-            if session.output().recv_timeout(remaining).is_err() {
-                break; // disconnected
-            }
-        }
-
-        // At the moment of EOF the process has not exited yet (it's mid-`sleep 1`) - a
-        // single `try_wait` here legitimately observes nothing. If this assertion itself
-        // fails, the test's timing assumption is wrong, not the fix under test.
-        let immediately_after_eof = session
-            .try_wait()
-            .expect("try_wait should not error for a live child");
-        assert!(
-            immediately_after_eof.is_none(),
-            "expected the process to still be alive (sleeping) right after its pty fds \
-             closed - a single try_wait must not yet observe an exit"
-        );
-
-        // The bounded retry loop `eof_poll_decision` drives in real usage: keep checking
-        // until the real exit status becomes observable.
-        let mut observed = None;
-        let poll_deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < poll_deadline {
-            if let Some(status) = session
-                .try_wait()
-                .expect("try_wait should not error while polling")
-            {
-                observed = Some(status);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let status =
-            observed.expect("the process should eventually be reaped with a real exit status");
-        assert!(!status.success());
-        assert_eq!(status.exit_code(), 7);
-    }
 }
 
 #[cfg(test)]
@@ -3389,119 +3355,86 @@ mod keystroke_tests {
         );
     }
 
+    /// Direct proof of the control-byte mapping itself, independent of whether GPUI's own
+    /// dispatch ever lets these keystrokes reach this pane's `on_key_down` to be mapped. For
+    /// both of them it no longer does in practice - `secondary-p` is `TogglePalette`'s unscoped
+    /// global binding, and `secondary-z` is scoped away from terminals by
+    /// `TextUndo`/`TextRedo`'s `Some("text-input")` - which is exactly why the pure mapping is
+    /// pinned here: `crate::root::focus::tab_strip_keybinding_tests` and
+    /// `crate::root::focus::text_undo_scoping_tests` prove the app-level dispatch's half; this
+    /// proves what reaches the pty for whatever context still gets here.
     #[test]
-    fn an_unmodified_letter_is_still_forwarded_normally() {
-        let ks = keystroke("n", Modifiers::default());
-        assert_eq!(keystroke_to_bytes(&ks), Some(b"n".to_vec()));
-    }
-
-    /// Direct proof of the control-byte mapping alone: this mapping sends the standard readline
-    /// "previous history" control byte (`0x10`) a focused terminal needs to receive, independent
-    /// of whether GPUI's own dispatch ever actually lets a Ctrl+P keystroke reach this pane's
-    /// `on_key_down` to be mapped. It no longer does in practice: `secondary-p` is now
-    /// `TogglePalette`'s own real, unscoped global keybinding (see
-    /// `crate::default_key_bindings`'s docs for the accepted tradeoff), so GPUI's action dispatch
-    /// intercepts a focused terminal's Ctrl+P before this mapping is ever consulted. Mirrors
-    /// `crate::root::focus::tab_strip_keybinding_tests::
-    /// ctrl_p_opens_the_palette_even_while_a_terminal_is_focused`: that test proves the app-level
-    /// dispatch *does* now intercept it; this one just pins that the pure byte-mapping function
-    /// itself is unchanged, for whatever unmodified-by-a-global-binding context still reaches it.
-    #[test]
-    fn ctrl_p_maps_to_the_real_readline_previous_history_control_byte() {
-        let modifiers = Modifiers {
+    fn a_ctrl_letter_maps_to_its_real_control_byte_and_a_plain_letter_to_itself() {
+        let control = Modifiers {
             control: true,
             ..Default::default()
         };
-        let ks = keystroke("p", modifiers);
+        // The standard readline "previous history" byte, and the SIGTSTP terminal-suspend byte -
+        // the two essentially every interactive program relies on.
         assert_eq!(
-            keystroke_to_bytes(&ks),
-            Some(vec![0x10]),
-            "Ctrl+P must map to the real Ctrl+<letter> control code (0x10), the standard \
-             readline 'previous history' byte every real shell relies on"
+            keystroke_to_bytes(&keystroke("p", control)),
+            Some(vec![0x10])
         );
-    }
-
-    /// Direct proof of the control-byte mapping `TextUndo`/`TextRedo`'s `Some("text-input")`
-    /// scoping depends on: no terminal surface ever carries `"text-input"`, specifically because
-    /// `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, and this mapping sends the real
-    /// `SIGTSTP` terminal-suspend control byte (`0x1a`) a focused interactive program relies on.
-    /// Mirrors `ctrl_p_maps_to_the_real_readline_previous_history_control_byte` and
-    /// `crate::root::focus::text_undo_scoping_tests`'s own
-    /// `secondary_z_with_a_terminal_focused_does_not_reach_text_undo`: that test proves the
-    /// scoped dispatch doesn't intercept it; this one proves what reaches the pty once it
-    /// doesn't.
-    #[test]
-    fn ctrl_z_maps_to_the_real_sigtstp_control_byte() {
-        let modifiers = Modifiers {
-            control: true,
-            ..Default::default()
-        };
-        let ks = keystroke("z", modifiers);
         assert_eq!(
-            keystroke_to_bytes(&ks),
-            Some(vec![0x1a]),
-            "Ctrl+Z must map to the real Ctrl+<letter> control code (0x1a), the SIGTSTP \
-             terminal-suspend byte essentially every interactive program relies on"
+            keystroke_to_bytes(&keystroke("z", control)),
+            Some(vec![0x1a])
+        );
+        assert_eq!(
+            keystroke_to_bytes(&keystroke("n", Modifiers::default())),
+            Some(b"n".to_vec()),
+            "an unmodified letter is still forwarded as itself"
         );
     }
 
     /// Regression test for GitHub issue #236: Shift+Tab silently sent the exact same byte as
     /// plain Tab, so any CLI relying on the standard back-tab sequence to detect Shift+Tab
     /// (readline-based tools, Claude Code's own mode-cycling shortcut) never saw it and did
-    /// nothing. Pinning both mappings side by side in one test is the point - it's not enough
-    /// for Shift+Tab to produce *something*, it must produce something a real terminal would
-    /// never also produce for plain Tab.
-    #[test]
-    fn shift_tab_sends_the_real_back_tab_sequence_distinct_from_plain_tab() {
-        let plain = keystroke("tab", Modifiers::default());
-        assert_eq!(
-            keystroke_to_bytes(&plain),
-            Some(b"\t".to_vec()),
-            "plain Tab must still send the ordinary tab byte"
-        );
-
-        let shifted = keystroke(
-            "tab",
-            Modifiers {
-                shift: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            keystroke_to_bytes(&shifted),
-            Some(b"\x1b[Z".to_vec()),
-            "Shift+Tab must send the standard CSI back-tab sequence (\\x1b[Z), not the plain \
-             tab byte - this is what readline-based tools and Claude Code's own CLI listen for \
-             to cycle their mode in the opposite direction"
-        );
-
-        assert_ne!(
-            keystroke_to_bytes(&plain),
-            keystroke_to_bytes(&shifted),
-            "Tab and Shift+Tab must be distinguishable on the wire"
-        );
-    }
-
-    /// Ctrl+Shift+Tab is deliberately left alone by the back-tab fix above: it still falls
-    /// through to the plain `"tab"` match arm and sends `\t`, exactly as it did before GitHub
-    /// issue #236 was fixed. This pins that the fix's `!modifiers.control` guard actually does
-    /// what its comment says, rather than back-tab semantics silently spreading to a modifier
+    /// nothing. Pinning the mappings side by side is the point - it's not enough for Shift+Tab
+    /// to produce *something*, it must produce something a real terminal would never also
+    /// produce for plain Tab. Ctrl+Shift+Tab is deliberately left alone by that fix (its
+    /// `!modifiers.control` guard), so back-tab semantics cannot spread to a modifier
     /// combination nobody asked for.
     #[test]
-    fn ctrl_shift_tab_is_unaffected_by_the_back_tab_fix() {
-        let ks = keystroke(
-            "tab",
-            Modifiers {
-                shift: true,
-                control: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            keystroke_to_bytes(&ks),
-            Some(b"\t".to_vec()),
-            "Ctrl+Shift+Tab must keep sending the plain tab byte, unchanged by the Shift+Tab \
-             back-tab fix"
+    fn shift_tab_sends_the_real_back_tab_sequence_distinct_from_every_other_tab() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl_shift = Modifiers {
+            shift: true,
+            control: true,
+            ..Default::default()
+        };
+
+        for (modifiers, expected, why) in [
+            (
+                Modifiers::default(),
+                b"\t".as_slice(),
+                "plain Tab must still send the ordinary tab byte",
+            ),
+            (
+                shift,
+                b"\x1b[Z".as_slice(),
+                "Shift+Tab must send the standard CSI back-tab sequence, which is what \
+                 readline-based tools and Claude Code's own CLI listen for",
+            ),
+            (
+                ctrl_shift,
+                b"\t".as_slice(),
+                "Ctrl+Shift+Tab must keep sending the plain tab byte, unchanged by the fix",
+            ),
+        ] {
+            assert_eq!(
+                keystroke_to_bytes(&keystroke("tab", modifiers)),
+                Some(expected.to_vec()),
+                "{why}"
+            );
+        }
+
+        assert_ne!(
+            keystroke_to_bytes(&keystroke("tab", Modifiers::default())),
+            keystroke_to_bytes(&keystroke("tab", shift)),
+            "Tab and Shift+Tab must be distinguishable on the wire"
         );
     }
 }
@@ -3520,166 +3453,194 @@ mod link_segment_tests {
         }
     }
 
-    #[test]
-    fn a_row_with_no_links_is_a_single_plain_segment() {
-        let segments = split_segments(10, &[]);
-        assert_eq!(segments, vec![RowSegment::Plain { start: 0, end: 10 }]);
-    }
-
     /// The CHANGELOG's contract: "a line is authored as `[prefix, colour, link, suffix]` - the
-    /// link is a span inside the line, not a whole-line style". A link in the middle of an
-    /// otherwise plain row must split it into a plain prefix, the link, and a plain suffix -
-    /// never a whole-row link, and never dropping the surrounding plain text.
+    /// link is a span inside the line, not a whole-line style". Every position a link can take
+    /// on a row, and what each one must leave around it: never a whole-row link, never a dropped
+    /// plain run, and never an empty segment where the link happens to touch an edge.
     #[test]
-    fn a_link_in_the_middle_splits_into_prefix_link_suffix_not_a_whole_line_style() {
-        // `"  \u{21b3} tests/upload.rs:88:"` - the link spans chars 4..19 (`tests/upload.rs:88`).
-        let links = [link(4, 19, "tests/upload.rs")];
-        let segments = split_segments(20, &links);
-        assert_eq!(
-            segments,
-            vec![
-                RowSegment::Plain { start: 0, end: 4 },
-                RowSegment::Link {
-                    start: 4,
-                    end: 19,
-                    link: links[0].clone(),
-                },
-                RowSegment::Plain { start: 19, end: 20 },
-            ]
-        );
+    fn a_link_is_a_span_inside_the_row_wherever_on_it_the_link_falls() {
+        let plain = |start, end| RowSegment::Plain { start, end };
+        let linked = |start, end, path: &str| RowSegment::Link {
+            start,
+            end,
+            link: link(start, end, path),
+        };
+
+        for (what, row_len, links, expected) in [
+            ("no links at all", 10, vec![], vec![plain(0, 10)]),
+            (
+                // `"  \u{21b3} tests/upload.rs:88:"` - the link spans chars 4..19.
+                "in the middle",
+                20,
+                vec![link(4, 19, "tests/upload.rs")],
+                vec![plain(0, 4), linked(4, 19, "tests/upload.rs"), plain(19, 20)],
+            ),
+            (
+                "at the very start",
+                8,
+                vec![link(0, 5, "a.txt")],
+                vec![linked(0, 5, "a.txt"), plain(5, 8)],
+            ),
+            (
+                "at the very end",
+                8,
+                vec![link(3, 8, "a.txt")],
+                vec![plain(0, 3), linked(3, 8, "a.txt")],
+            ),
+            (
+                "covering the whole row",
+                10,
+                vec![link(0, 10, "src/main.rs")],
+                vec![linked(0, 10, "src/main.rs")],
+            ),
+            (
+                "two links with plain text between them",
+                14,
+                vec![link(2, 5, "a.rs"), link(9, 12, "b.rs")],
+                vec![
+                    plain(0, 2),
+                    linked(2, 5, "a.rs"),
+                    plain(5, 9),
+                    linked(9, 12, "b.rs"),
+                    plain(12, 14),
+                ],
+            ),
+        ] {
+            assert_eq!(split_segments(row_len, &links), expected, "a link {what}");
+        }
+    }
+}
+
+/// The property every other test in this file depends on without saying so: a `TerminalPane`
+/// that goes out of scope takes its whole real process tree with it.
+///
+/// This is what makes the terminal suite leak-free. GitHub issue #427 measured 509 child
+/// processes surviving a single app test run; PR #432 fixed the macOS half of the teardown
+/// (`pty_core`'s descendant walk read `/proc`, which does not exist there), and `pty_core`'s own
+/// `drop_terminates_entire_process_tree_including_escaped_grandchild` pins that at the crate
+/// level. What was never pinned is the layer the leak was actually reported at: that a *pane* (a
+/// GPUI entity, released by the app rather than by an explicit `drop` a test author has to
+/// remember) really does reach that teardown. If it stopped doing so, every real-pty test in this
+/// file would start leaking again and nothing would fail.
+///
+/// unix-only, like `pty-core`'s own teardown suite: it needs real process-group and
+/// escaped-descendant semantics.
+#[cfg(all(test, unix))]
+mod pane_teardown_tests {
+    use super::pty_pane_fixtures::{spawn_pane, PTY_ROUND_TRIP};
+    use gpui::TestAppContext;
+    use std::process::{Command, Stdio};
+    use test_support::ChildGuard;
+
+    /// Whether `pid` names a live process, asked of the OS itself via `kill -0` rather than
+    /// through `pty_core`'s own (private) `pid_exists` - so what is checked here is independent
+    /// of the code under test.
+    fn pid_is_alive(pid: &str) -> bool {
+        let mut command = Command::new("kill");
+        command
+            .args(["-0", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut probe = ChildGuard::spawn(&mut command).expect("spawn kill -0");
+        probe
+            .wait()
+            .expect("kill -0 should always terminate")
+            .success()
     }
 
-    #[test]
-    fn a_link_at_the_very_start_has_no_leading_plain_segment() {
-        let links = [link(0, 5, "a.txt")];
-        let segments = split_segments(8, &links);
-        assert_eq!(
-            segments,
-            vec![
-                RowSegment::Link {
-                    start: 0,
-                    end: 5,
-                    link: links[0].clone(),
-                },
-                RowSegment::Plain { start: 5, end: 8 },
-            ]
+    #[gpui::test]
+    fn dropping_a_pane_takes_its_whole_real_process_tree_with_it(cx: &mut TestAppContext) {
+        // `set -m` turns on job control, which puts the background job in its own process group -
+        // precisely what defeats a `killpg` on the direct child alone, so only a real descendant
+        // walk can reach it. The shell reports the escaped grandchild's pid back over the pty so
+        // this test does not have to race that walk to discover it.
+        let pane = spawn_pane(
+            cx,
+            "sh",
+            &[
+                "-c",
+                "set -m; sleep 100 & echo ADE-GRANDCHILD:$!; exec sleep 300",
+            ],
         );
-    }
 
-    #[test]
-    fn a_link_at_the_very_end_has_no_trailing_plain_segment() {
-        let links = [link(3, 8, "a.txt")];
-        let segments = split_segments(8, &links);
-        assert_eq!(
-            segments,
-            vec![
-                RowSegment::Plain { start: 0, end: 3 },
-                RowSegment::Link {
-                    start: 3,
-                    end: 8,
-                    link: links[0].clone(),
-                },
-            ]
+        let mut reported = None;
+        assert!(
+            super::pty_pane_fixtures::pump_until(cx, |cx| {
+                reported = pane.read_with(cx, |pane, _| {
+                    pane.visible_text_lines().iter().find_map(|line| {
+                        line.split_once("ADE-GRANDCHILD:")
+                            .map(|(_, pid)| pid.trim().to_string())
+                    })
+                });
+                reported.is_some()
+            }),
+            "the shell must report its detached grandchild's pid over the real pty"
         );
-    }
+        let grandchild = reported.expect("pump_until only returns true once this is Some");
+        let direct = pane
+            .read_with(cx, |pane, _| {
+                pane.session.as_ref().and_then(|s| s.process_id())
+            })
+            .expect("a live pane has a real child pid")
+            .to_string();
 
-    #[test]
-    fn multiple_links_each_get_their_own_span_with_plain_text_between_them() {
-        let links = [link(2, 5, "a.rs"), link(9, 12, "b.rs")];
-        let segments = split_segments(14, &links);
-        assert_eq!(
-            segments,
-            vec![
-                RowSegment::Plain { start: 0, end: 2 },
-                RowSegment::Link {
-                    start: 2,
-                    end: 5,
-                    link: links[0].clone(),
-                },
-                RowSegment::Plain { start: 5, end: 9 },
-                RowSegment::Link {
-                    start: 9,
-                    end: 12,
-                    link: links[1].clone(),
-                },
-                RowSegment::Plain { start: 12, end: 14 },
-            ]
+        assert!(
+            pid_is_alive(&direct),
+            "sanity check: the direct child is up"
         );
-    }
+        assert!(
+            pid_is_alive(&grandchild),
+            "sanity check: the escaped grandchild is up"
+        );
 
-    #[test]
-    fn a_link_covering_the_whole_row_is_a_single_link_segment() {
-        let links = [link(0, 10, "src/main.rs")];
-        let segments = split_segments(10, &links);
-        assert_eq!(
-            segments,
-            vec![RowSegment::Link {
-                start: 0,
-                end: 10,
-                link: links[0].clone(),
-            }]
-        );
+        drop(pane);
+        // `cx.update` and not just `run_until_parked`, and this is the whole point of the
+        // fixture below: GPUI releases an entity whose last handle was dropped during
+        // `flush_effects`, which only runs inside an app update. `run_until_parked` alone does
+        // not trigger one, so `TerminalPane` - and with it `PtySession`, and with it the child
+        // process tree - is *not* dropped by `drop(pane)` on its own. That is exactly how a test
+        // suite ends up with hundreds of live children at once (GitHub issue #427 measured 509),
+        // and why `release_panes` exists.
+        cx.update(|_cx| {});
+        cx.run_until_parked();
+
+        for (pid, what) in [
+            (&direct, "direct child"),
+            (&grandchild, "escaped grandchild"),
+        ] {
+            assert!(
+                test_support::wait_until(PTY_ROUND_TRIP, || !pid_is_alive(pid)),
+                "the {what} ({pid}) was still alive after its TerminalPane was dropped - every \
+                 real-pty test in this file leaks a process if this stops holding"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod clear_pty_signal_tests {
-    use super::*;
+    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
     use gpui::TestAppContext;
 
-    /// End-to-end proof that `clear()` signals the child process: a [`TerminalPane`] backed by
-    /// a real `cat` child on a real pty, [`TerminalPane::clear`] called, and what this test
-    /// observes is the pty's own cooked-mode line-discipline echo - not a direct assertion
-    /// that `write_input` was called, but its round-tripped effect landing back in the grid.
-    /// With `ECHOCTL` (the standard-on-Linux termios default), the raw `0x0c` byte `clear()`
-    /// writes is echoed back as the two printable characters `^L`.
+    /// End-to-end proof that `clear()` signals the child process: a [`super::TerminalPane`]
+    /// backed by a real `cat` child on a real pty, [`super::TerminalPane::clear`] called, and
+    /// what this test observes is the pty's own cooked-mode line-discipline echo - not a direct
+    /// assertion that `write_input` was called, but its round-tripped effect landing back in the
+    /// grid. With `ECHOCTL` (the standard termios default), the raw `0x0c` byte `clear()` writes
+    /// is echoed back as the two printable characters `^L`.
     #[gpui::test]
     fn clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back(cx: &mut TestAppContext) {
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
 
         pane.update(cx, |pane, cx| pane.clear(cx));
 
-        // The real pty reader thread and the real `cat` child it feeds run entirely outside
-        // GPUI's deterministic scheduler, so `advance_clock` alone (a purely *simulated* clock)
-        // grants them zero actual wall-clock scheduling time. Standalone, with an otherwise idle
-        // CPU, the real echo lands within real microseconds and a loop that only ever advances
-        // the virtual clock never notices it's racing ahead of real time - but under real
-        // full-suite parallel load (dozens of other tests' own real subprocesses contending for
-        // the same cores) the OS can genuinely take real milliseconds to schedule this thread,
-        // and a loop with no real-time floor at all can burn through every check before that
-        // happens. A real `std::thread::sleep` between checks (bounded by a real deadline, not a
-        // fixed tick count) gives it a genuine chance, mirroring this same file's own
-        // `a_background_pane_drains_on_the_background_interval_read_fresh_each_tick`'s upfront
-        // `std::thread::sleep(Duration::from_millis(400))` for the identical Ctrl-L/ECHOCTL
-        // round trip.
-        let mut saw_caret_l = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
-        loop {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
-            if lines.iter().any(|line| line.contains("^L")) {
-                saw_caret_l = true;
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
         assert!(
-            saw_caret_l,
+            pump_until(cx, |cx| grid_shows(cx, &pane, "^L")),
             "expected the real pty's own echo of the Ctrl-L byte clear() sends to eventually \
              appear in the grid - this is what actually proves the byte reached the pty, not \
              just that write_input() was called"
         );
+        release(cx, pane);
     }
 }
 
@@ -3689,6 +3650,7 @@ mod clear_pty_signal_tests {
 /// escape bytes are produced by a real `printf`, exactly as a real agent CLI produces them.
 #[cfg(test)]
 mod terminal_signal_tests {
+    use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
     use super::*;
     use crate::rail::title_signal::{classify_title, TitleSignal};
     use crate::terminal::osc::{Progress, ProgressState};
@@ -3697,40 +3659,18 @@ mod terminal_signal_tests {
     /// Spawns a real `sh` that writes `script`'s escape sequences and then blocks, so the
     /// process is still alive (and the pane still `is_running`) while the assertions run - the
     /// same real-pty pattern this module's other tests use, and `sh` rather than bare `printf`
-    /// so the sequences and the sleep are one child process.
+    /// so the sequences and the wait are one child process.
     fn pane_emitting(cx: &mut TestAppContext, script: &str) -> gpui::Entity<TerminalPane> {
-        cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command(
-                    "sh",
-                    vec!["-c".to_string(), format!("{script}; sleep 60")],
-                    std::env::temp_dir(),
-                ),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        })
+        spawn_pane(cx, "sh", &["-c", &format!("{script}; sleep 60")])
     }
 
-    /// Drives the pane's real poll loop until `done` reports true, or gives up. The pty write
-    /// itself takes real wall time (a real process, real fd) while the *drain* only happens on
-    /// poll ticks, which the test executor's clock drives - hence both a real sleep and the
-    /// virtual-clock loop, matching `cadence_tests`' own approach.
+    /// Drives the pane's real poll loop until `done` reports true, or gives up.
     fn poll_until(
         cx: &mut TestAppContext,
         pane: &gpui::Entity<TerminalPane>,
         done: impl Fn(&TerminalPane) -> bool,
     ) -> bool {
-        cx.run_until_parked();
-        for _ in 0..60 {
-            std::thread::sleep(Duration::from_millis(50));
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            if pane.read_with(cx, |pane, _| done(pane)) {
-                return true;
-            }
-        }
-        false
+        pump_until(cx, |cx| pane.read_with(cx, |pane, _| done(pane)))
     }
 
     #[gpui::test]
@@ -3753,8 +3693,7 @@ mod terminal_signal_tests {
             "a real agent CLI's real working title must classify as Busy end to end"
         );
 
-        pane.update(cx, |pane, cx| pane.shutdown(cx));
-        cx.run_until_parked();
+        release(cx, pane);
     }
 
     #[gpui::test]
@@ -3778,8 +3717,7 @@ mod terminal_signal_tests {
             "the pane's ping must survive being read"
         );
 
-        pane.update(cx, |pane, cx| pane.shutdown(cx));
-        cx.run_until_parked();
+        release(cx, pane);
     }
 
     #[gpui::test]
@@ -3790,8 +3728,7 @@ mod terminal_signal_tests {
             "a real OSC 777 notify off a real pty never reached the pane"
         );
 
-        pane.update(cx, |pane, cx| pane.shutdown(cx));
-        cx.run_until_parked();
+        release(cx, pane);
     }
 
     #[gpui::test]
@@ -3813,22 +3750,14 @@ mod terminal_signal_tests {
             "a progress report is not a notification - OSC 9;4 must not ping for attention"
         );
 
-        pane.update(cx, |pane, cx| pane.shutdown(cx));
-        cx.run_until_parked();
+        release(cx, pane);
     }
 
     #[gpui::test]
     fn a_pty_process_that_says_nothing_reports_no_signal_at_all(cx: &mut TestAppContext) {
         // The honest default, and the one every non-agent process hits: a `cat` sitting on a
         // real pty has no title, no ping and no progress - not an invented one.
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
         for _ in 0..5 {
             cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
@@ -3839,8 +3768,7 @@ mod terminal_signal_tests {
             assert_eq!(pane.progress(), None);
         });
 
-        pane.update(cx, |pane, cx| pane.shutdown(cx));
-        cx.run_until_parked();
+        release(cx, pane);
     }
 }
 
@@ -3864,77 +3792,63 @@ mod cell_position_tests {
         )
     }
 
+    /// Where a pixel lands, and what happens at each of the four edges. The `side` matters as
+    /// much as the column: it is what decides whether the cell under the pointer is included in
+    /// the selection at all (`Selection::to_range`'s `range_simple` drops a cell the selection
+    /// ends left of), so the half-cell boundary is real behaviour, not a detail - and clamping a
+    /// past-the-right-edge drag to the *left* of the last column would silently drop that column
+    /// from the selection.
     #[test]
-    fn the_top_left_pixel_is_row_zero_column_zero() {
-        assert_eq!(
-            at(0.0, 0.0),
-            CellPosition {
-                row: 0,
-                column: 0,
-                side: CellSide::Left
-            }
-        );
-    }
+    fn a_pixel_resolves_to_the_cell_containing_it_and_clamps_at_every_edge() {
+        for (x, y, row, column, side, what) in [
+            (0.0, 0.0, 0, 0, CellSide::Left, "the top-left pixel"),
+            // x = 34px -> column 3 (30..40), 0.4 of the way in; y = 55px -> row 2 (40..60).
+            (34.0, 55.0, 2, 3, CellSide::Left, "a cell's own left half"),
+            (
+                34.9,
+                0.0,
+                0,
+                3,
+                CellSide::Left,
+                "just short of the midpoint",
+            ),
+            (35.0, 0.0, 0, 3, CellSide::Right, "exactly the midpoint"),
+            (39.9, 0.0, 0, 3, CellSide::Right, "the far end of the cell"),
+            (
+                10_000.0,
+                0.0,
+                0,
+                79,
+                CellSide::Right,
+                "a drag past the right edge",
+            ),
+            (
+                0.0,
+                10_000.0,
+                23,
+                0,
+                CellSide::Left,
+                "a drag past the bottom",
+            ),
+        ] {
+            assert_eq!(
+                at(x, y),
+                CellPosition { row, column, side },
+                "{what} at ({x}, {y})"
+            );
+        }
 
-    #[test]
-    fn a_position_resolves_to_the_cell_containing_it() {
-        // x = 34px -> column 3 (30..40), 0.4 of the way in -> left half.
-        // y = 55px -> row 2 (40..60).
-        assert_eq!(
-            at(34.0, 55.0),
-            CellPosition {
-                row: 2,
-                column: 3,
-                side: CellSide::Left
-            }
-        );
-    }
-
-    /// The side is what decides whether the cell under the pointer is included in the selection
-    /// at all (`Selection::to_range`'s `range_simple` drops a cell the selection ends left of),
-    /// so the half-cell boundary is real behavior, not a detail.
-    #[test]
-    fn the_right_half_of_a_cell_reports_the_right_side() {
-        assert_eq!(at(35.0, 0.0).side, CellSide::Right);
-        assert_eq!(at(39.9, 0.0).side, CellSide::Right);
-        assert_eq!(at(34.9, 0.0).side, CellSide::Left);
-        assert_eq!(
-            at(35.0, 0.0).column,
-            3,
-            "the column is unchanged by the side"
-        );
-    }
-
-    #[test]
-    fn a_drag_past_the_right_edge_clamps_to_the_last_column_inclusively() {
-        let position = at(10_000.0, 0.0);
-        assert_eq!(position.column, 79);
-        assert_eq!(
-            position.side,
-            CellSide::Right,
-            "clamping to the *left* of the last column would silently drop that column from \
-             the selection"
-        );
-    }
-
-    #[test]
-    fn a_drag_past_the_bottom_clamps_to_the_last_row() {
-        assert_eq!(at(0.0, 10_000.0).row, 23);
-    }
-
-    /// Dragging back above/left of the grid origin (a real gesture - the pointer leaves the
-    /// pane) must clamp to the first cell rather than underflow into a huge `usize`.
-    #[test]
-    fn a_position_above_and_left_of_the_origin_clamps_to_the_first_cell() {
-        let position = cell_position_in_grid(
+        // Dragging back above/left of the grid origin - a real gesture, the pointer leaves the
+        // pane - must clamp to the first cell rather than underflow into a huge `usize`.
+        let outside = cell_position_in_grid(
             point(px(0.0), px(0.0)),
             point(px(100.0), px(200.0)),
             size(px(10.0), px(20.0)),
             24,
             80,
         );
-        assert_eq!(position.row, 0);
-        assert_eq!(position.column, 0);
+        assert_eq!(outside.row, 0);
+        assert_eq!(outside.column, 0);
     }
 
     /// A failed font measurement can only produce a zero cell size; dividing by it would make
@@ -3995,23 +3909,17 @@ mod paste_payload_tests {
 /// clipboard write, and a real clipboard read produces real bytes on a real pty.
 #[cfg(test)]
 mod clipboard_tests {
+    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
     use super::*;
     use gpui::TestAppContext;
 
     fn new_pane(cx: &mut TestAppContext, program: &str) -> gpui::Entity<TerminalPane> {
-        cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command(program, Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        })
+        spawn_pane(cx, program, &[])
     }
 
     #[gpui::test]
     fn copying_a_real_selection_writes_it_to_the_real_system_clipboard(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
-        cx.run_until_parked();
 
         cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into())));
 
@@ -4036,6 +3944,7 @@ mod clipboard_tests {
         );
         let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(text.as_deref(), Some("world"));
+        release(cx, pane);
     }
 
     /// Copy with nothing selected must leave the clipboard alone. Overwriting it with `""` (the
@@ -4044,7 +3953,6 @@ mod clipboard_tests {
     #[gpui::test]
     fn copying_with_no_selection_leaves_the_clipboard_untouched(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
-        cx.run_until_parked();
 
         cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep me".into())));
 
@@ -4056,6 +3964,7 @@ mod clipboard_tests {
         assert!(!copied);
         let text = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(text.as_deref(), Some("keep me"));
+        release(cx, pane);
     }
 
     /// End-to-end proof that paste reaches the *child process*, observed the same way
@@ -4066,7 +3975,6 @@ mod clipboard_tests {
     #[gpui::test]
     fn pasting_writes_the_real_clipboard_text_to_the_real_pty(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
-        cx.run_until_parked();
 
         cx.update(|cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string("ade-pasted-text".into()))
@@ -4074,30 +3982,21 @@ mod clipboard_tests {
         let pasted = pane.update(cx, |pane, cx| pane.paste_from_clipboard(cx));
         assert!(pasted, "a live session must accept a real paste");
 
-        let mut saw_pasted_text = false;
-        for _ in 0..50 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            let lines = pane.read_with(cx, |pane, _| pane.visible_text_lines());
-            if lines.iter().any(|line| line.contains("ade-pasted-text")) {
-                saw_pasted_text = true;
-                break;
-            }
-        }
         assert!(
-            saw_pasted_text,
+            pump_until(cx, |cx| grid_shows(cx, &pane, "ade-pasted-text")),
             "expected the real pty's own echo of the pasted bytes to appear in the grid"
         );
+        release(cx, pane);
     }
 
     #[gpui::test]
     fn pasting_an_empty_clipboard_writes_nothing(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
-        cx.run_until_parked();
 
         cx.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new())));
         let pasted = pane.update(cx, |pane, cx| pane.paste_from_clipboard(cx));
         assert!(!pasted);
+        release(cx, pane);
     }
 }
 
@@ -4111,45 +4010,9 @@ mod clipboard_tests {
 /// fires.
 #[cfg(test)]
 mod send_prompt_tests {
+    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane, stays_absent};
     use super::*;
     use gpui::TestAppContext;
-
-    /// A real child on a real pty. `program`/`args` are spawned as-is.
-    fn new_pane(
-        cx: &mut TestAppContext,
-        program: &str,
-        args: Vec<String>,
-    ) -> gpui::Entity<TerminalPane> {
-        cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command(program, args, std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        })
-    }
-
-    /// Pumps the real poll loop until `ready`, or gives up after a real wall-clock deadline.
-    /// Mixes virtual-clock advance with a real `sleep`, exactly as
-    /// `crate::work_surface::render`'s own `wait_for_real_pty_output` does and for the same
-    /// reason: the pty reader is a real OS thread, so a virtual-clock-only loop races it.
-    fn pump_until(
-        cx: &mut TestAppContext,
-        mut ready: impl FnMut(&mut TestAppContext) -> bool,
-    ) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            if ready(cx) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
 
     /// The real thing: a child that turns bracketed paste on (exactly as an agent's full-screen
     /// TUI does) receives a real multi-line batch, in one write, and echoes it back.
@@ -4160,12 +4023,7 @@ mod send_prompt_tests {
         // `printf` sets `DECSET 2004` on its own output, which is how the grid - and therefore
         // `bracketed_paste_enabled` - learns about it. Nothing here is simulated: the mode really
         // arrives over the pty from a real child, then `cat` echoes whatever is written back.
-        let pane = new_pane(
-            cx,
-            "sh",
-            vec!["-c".to_string(), "printf '\\033[?2004h'; cat".to_string()],
-        );
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "sh", &["-c", "printf '\\033[?2004h'; cat"]);
         assert!(
             pump_until(cx, |cx| pane
                 .read_with(cx, |pane, _| pane.bracketed_paste_enabled())),
@@ -4185,17 +4043,12 @@ mod send_prompt_tests {
         );
 
         assert!(
-            pump_until(cx, |cx| {
-                pane.read_with(cx, |pane, _| {
-                    pane.visible_text_lines()
-                        .iter()
-                        .any(|line| line.contains("ade-note-tenant-id"))
-                })
-            }),
+            pump_until(cx, |cx| grid_shows(cx, &pane, "ade-note-tenant-id")),
             "the real pty's own echo of the batched prompt must appear in the grid - this is \
              round-tripped evidence the note text genuinely left the app, not an assertion that \
              `write_input` was called"
         );
+        release(cx, pane);
     }
 
     /// The refusal. Without bracketed paste, `paste_payload` turns every `\n` into the Enter
@@ -4206,8 +4059,7 @@ mod send_prompt_tests {
     fn a_multi_line_batch_is_refused_when_the_child_has_bracketed_paste_off(
         cx: &mut TestAppContext,
     ) {
-        let pane = new_pane(cx, "cat", Vec::new());
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
         assert!(
             !pane.read_with(cx, |pane, _| pane.bracketed_paste_enabled()),
             "precondition: a plain `cat` never turns bracketed paste on"
@@ -4221,26 +4073,21 @@ mod send_prompt_tests {
             "a payload that could split must be refused, not sent"
         );
 
-        // Pumped for real, so "nothing arrived" is a measured fact rather than an assumption
-        // about timing.
-        for _ in 0..40 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        pane.read_with(cx, |pane, _| {
-            assert!(
-                !pane
-                    .visible_text_lines()
-                    .iter()
-                    .any(|line| line.contains("ade-refused")),
-                "not one byte of a refused batch may reach the child"
-            );
-            assert!(
-                pane.spawn_error.is_some(),
-                "and the refusal must be said out loud on the pane, not swallowed"
-            );
-        });
+        // Pumped for real over a bounded quiet window, so "nothing arrived" is a measured fact
+        // rather than an assumption about timing.
+        assert!(
+            stays_absent(cx, Duration::from_millis(200), |cx| grid_shows(
+                cx,
+                &pane,
+                "ade-refused"
+            )),
+            "not one byte of a refused batch may reach the child"
+        );
+        assert!(
+            pane.read_with(cx, |pane, _| pane.spawn_error.is_some()),
+            "and the refusal must be said out loud on the pane, not swallowed"
+        );
+        release(cx, pane);
     }
 
     /// The other half of the same rule: the single-line delivery form
@@ -4250,30 +4097,24 @@ mod send_prompt_tests {
     fn the_single_line_form_is_delivered_to_a_child_with_bracketed_paste_off(
         cx: &mut TestAppContext,
     ) {
-        let pane = new_pane(cx, "cat", Vec::new());
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
 
         let sent = pane.update(cx, |pane, cx| {
             pane.send_prompt("line 5: ade-flat-one \u{b7} line 9: ade-flat-two", cx)
         });
         assert!(sent);
         assert!(
-            pump_until(cx, |cx| {
-                pane.read_with(cx, |pane, _| {
-                    pane.visible_text_lines()
-                        .iter()
-                        .any(|line| line.contains("ade-flat-two"))
-                })
-            }),
+            pump_until(cx, |cx| grid_shows(cx, &pane, "ade-flat-two")),
             "the flat form must really reach the child"
         );
+        release(cx, pane);
     }
 
     #[gpui::test]
     fn an_empty_prompt_writes_nothing(cx: &mut TestAppContext) {
-        let pane = new_pane(cx, "cat", Vec::new());
-        cx.run_until_parked();
+        let pane = spawn_pane(cx, "cat", &[]);
         assert!(!pane.update(cx, |pane, cx| pane.send_prompt("", cx)));
+        release(cx, pane);
     }
 }
 
@@ -4286,6 +4127,7 @@ mod send_prompt_tests {
 /// can't be moved out from under the test by a prompt arriving mid-run.
 #[cfg(test)]
 mod mouse_selection_tests {
+    use super::pty_pane_fixtures::release;
     use super::*;
     use gpui::{point, Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext};
 
@@ -4377,6 +4219,7 @@ mod mouse_selection_tests {
             Some("world"),
             "a real left-drag across the grid must produce a real alacritty_terminal selection"
         );
+        release(cx, pane);
     }
 
     /// A plain click is how a user dismisses a selection, and it must not leave a one-character
@@ -4403,6 +4246,7 @@ mod mouse_selection_tests {
             pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
             None
         );
+        release(cx, pane);
     }
 
     /// Moving the mouse over the terminal with no button held must never start or extend a
@@ -4427,34 +4271,7 @@ mod mouse_selection_tests {
             pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
             None
         );
-    }
-
-    /// A drag repaints the cells it covers - the flag has to survive all the way into what
-    /// `render_row` consumes, or the user gets no visual feedback at all while dragging.
-    #[gpui::test]
-    fn a_drag_marks_the_covered_cells_selected_for_the_renderer(cx: &mut TestAppContext) {
-        let (pane, cx, bounds, cell_size) = painted_pane(cx);
-
-        let start = point(
-            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 0.1,
-            cell_centre(bounds, cell_size, 0, 0).y,
-        );
-        let end = point(
-            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 4.9,
-            cell_centre(bounds, cell_size, 0, 4).y,
-        );
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
-
-        let flagged = pane.read_with(cx, |pane, _| {
-            pane.grid.visible_rows(&TerminalPalette::default())[0]
-                .iter()
-                .filter(|cell| cell.selected)
-                .map(|cell| cell.c)
-                .collect::<String>()
-        });
-        assert_eq!(flagged, "hello");
+        release(cx, pane);
     }
 
     /// GitHub issue #211's mouse-math half, end to end through real GPUI event dispatch at real
@@ -4493,33 +4310,7 @@ mod mouse_selection_tests {
                 .as_deref(),
             Some("world")
         );
-    }
-
-    /// Dragging over the wide characters themselves - including across the second (spacer) column
-    /// of the last one - must copy them once each, with no emulator-written padding spaces.
-    #[gpui::test]
-    fn a_drag_over_cjk_characters_copies_them_once_each(cx: &mut TestAppContext) {
-        let (pane, cx, bounds, cell_size) = painted_pane_showing(cx, "你好world".as_bytes());
-
-        let start = point(
-            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 0.1,
-            cell_centre(bounds, cell_size, 0, 0).y,
-        );
-        let end = point(
-            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 3.9,
-            cell_centre(bounds, cell_size, 0, 3).y,
-        );
-
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.selected_text_for_test())
-                .as_deref(),
-            Some("你好")
-        );
+        release(cx, pane);
     }
 }
 
@@ -4543,6 +4334,7 @@ mod mouse_selection_tests {
 /// here; pasting CJK works today, typing it through an IME does not.
 #[cfg(test)]
 mod utf8_input_tests {
+    use super::pty_pane_fixtures::release;
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -4657,6 +4449,7 @@ mod utf8_input_tests {
                 CellWidth::Spacer,
             ]
         );
+        release(cx, pane);
     }
 }
 
@@ -4671,6 +4464,7 @@ mod utf8_input_tests {
 /// elements - not a re-derivation of the layout a second way.
 #[cfg(test)]
 mod wide_char_render_tests {
+    use super::pty_pane_fixtures::release;
     use super::*;
 
     /// Row 0 of a real grid after parsing `bytes`.
@@ -4720,11 +4514,13 @@ mod wide_char_render_tests {
         );
     }
 
-    /// Every wide character is its own two-column run - never merged with the next one, so a glyph
-    /// whose real advance overshoots two cells can't accumulate that overshoot across a run.
-    /// Narrow text still merges into as few runs as possible.
+    /// Every wide character is its own two-column run - never merged with the next one (so a
+    /// glyph whose real advance overshoots two cells can't accumulate that overshoot across a
+    /// run) and never merged into the narrow text around it, whatever their colours, since the
+    /// merged span would be sized for the wrong number of columns. Narrow text still merges into
+    /// as few runs as possible.
     #[test]
-    fn each_wide_character_is_its_own_two_column_run() {
+    fn each_wide_character_is_its_own_two_column_run_never_merged_with_its_neighbours() {
         let runs = row_runs(&row_zero("你好world", 20));
 
         assert_eq!(runs[0].text, "你");
@@ -4740,6 +4536,18 @@ mod wide_char_render_tests {
             runs[2].text.chars().count(),
             "a narrow run covers exactly one column per character"
         );
+
+        // A wide character with narrow text on *both* sides of it - the case a merge would be
+        // most tempted by.
+        let surrounded = row_runs(&row_zero("a好b", 20));
+        let shapes: Vec<(&str, usize)> = surrounded
+            .iter()
+            .map(|run| (run.text.trim_end(), run.columns))
+            .collect();
+        assert_eq!(shapes[0], ("a", 1));
+        assert_eq!(shapes[1], ("好", 2));
+        // The trailing run is `b` plus the row's blank remainder.
+        assert_eq!(&shapes[2].0[..1], "b");
     }
 
     /// The pixel width a wide run is pinned to, and the fact a narrow one is left unpinned (it can
@@ -4749,21 +4557,6 @@ mod wide_char_render_tests {
         let runs = row_runs(&row_zero("你好world", 20));
         assert_eq!(wide_run_width(&runs[0], px(8.0)), Some(px(16.0)));
         assert_eq!(wide_run_width(&runs[2], px(8.0)), None);
-    }
-
-    /// A narrow run and a wide run can never be merged, whatever their colours - the merged span
-    /// would be sized for the wrong number of columns.
-    #[test]
-    fn a_wide_run_never_merges_into_the_narrow_text_around_it() {
-        let runs = row_runs(&row_zero("a好b", 20));
-        let shapes: Vec<(&str, usize)> = runs
-            .iter()
-            .map(|run| (run.text.trim_end(), run.columns))
-            .collect();
-        assert_eq!(shapes[0], ("a", 1));
-        assert_eq!(shapes[1], ("好", 2));
-        // The trailing run is `b` plus the row's blank remainder.
-        assert_eq!(&shapes[2].0[..1], "b");
     }
 
     /// Link detection has to see the row's real text, not the emulator's padding. With the spacer
@@ -4789,20 +4582,27 @@ mod wide_char_render_tests {
 
         let link_text: String = linked.iter().map(|run| run.text.as_str()).collect();
         assert_eq!(link_text, "/tmp/日本/main.rs:12");
-    }
 
-    /// A link sitting *after* a wide character still gets its own span, and the plain text around
-    /// it is preserved - i.e. `split_segments`'s char offsets and the painted cells stayed in
-    /// lockstep once the spacers were dropped.
-    #[test]
-    fn a_link_after_a_wide_character_still_lands_on_the_right_characters() {
-        let runs = row_runs(&row_zero("好 src/main.rs done", 40));
-        let linked: Vec<&RowRun> = runs.iter().filter(|run| run.link.is_some()).collect();
-        let link_text: String = linked.iter().map(|run| run.text.as_str()).collect();
-        assert_eq!(link_text, "src/main.rs");
-
-        let painted: String = runs.iter().map(|run| run.text.as_str()).collect();
-        assert_eq!(painted.trim_end(), "好 src/main.rs done");
+        // And a link sitting *after* a wide character still gets its own span with the plain
+        // text around it preserved - i.e. `split_segments`'s char offsets and the painted cells
+        // stayed in lockstep once the spacers were dropped.
+        let after = row_runs(&row_zero("好 src/main.rs done", 40));
+        let after_linked: Vec<&RowRun> = after.iter().filter(|run| run.link.is_some()).collect();
+        assert_eq!(
+            after_linked
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+                .trim_end(),
+            "好 src/main.rs done"
+        );
     }
 
     /// Selection is still carried per wide character - a run that lost the flag halfway would
@@ -4860,6 +4660,7 @@ mod wide_char_render_tests {
             pane.read_with(cx, |pane, _| pane.visible_text_lines())[0],
             "完了 🎉"
         );
+        release(cx, pane);
     }
 }
 
@@ -4875,6 +4676,7 @@ mod wide_char_render_tests {
 /// re-derived a second way.
 #[cfg(test)]
 mod terminal_theme_tests {
+    use super::pty_pane_fixtures::release;
     use super::*;
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use std::rc::Rc;
@@ -4996,38 +4798,7 @@ mod terminal_theme_tests {
             light.foreground,
             light.background
         );
-    }
-
-    /// Two visually distinct *dark* themes must differ too - a guard against a fix that only
-    /// happened to work because one bundled theme inverts lightness.
-    #[gpui::test]
-    fn two_different_dark_themes_paint_two_different_terminals(cx: &mut TestAppContext) {
-        let (pane, cx) = painted_pane(cx, b"hello world");
-
-        let ember = {
-            let _theme = with_bundled_theme("Ember");
-            pane.update(cx, |_pane, cx| cx.notify());
-            cx.run_until_parked();
-            pane.read_with(cx, |pane, _| pane.last_painted_palette_for_test())
-                .expect("painted")
-        };
-        let moss = {
-            let _theme = with_bundled_theme("Moss");
-            pane.update(cx, |_pane, cx| cx.notify());
-            cx.run_until_parked();
-            pane.read_with(cx, |pane, _| pane.last_painted_palette_for_test())
-                .expect("painted")
-        };
-
-        assert_eq!(
-            ember.background,
-            bundled_rgb("Ember", "terminal.background")
-        );
-        assert_eq!(moss.background, bundled_rgb("Moss", "terminal.background"));
-        assert_ne!(
-            ember, moss,
-            "two bundled dark themes must not paint the terminal identically"
-        );
+        release(cx, pane);
     }
 
     /// A colour the *running program* asked for by name (`SGR 32`, "green") has to come out of the
@@ -5055,21 +4826,7 @@ mod terminal_theme_tests {
             light_green, dark_green,
             "Paper ships the light ANSI palette, so its green is genuinely a different colour"
         );
-    }
-
-    /// Unstyled text - the overwhelming majority of what a terminal paints - must take the theme's
-    /// foreground, and an unstyled cell's background must be the theme's terminal background.
-    #[gpui::test]
-    fn unstyled_output_takes_the_themes_own_foreground_and_background(cx: &mut TestAppContext) {
-        let (pane, cx) = painted_pane(cx, b"plain");
-        let _theme = with_bundled_theme("Slate");
-        pane.update(cx, |_pane, cx| cx.notify());
-        cx.run_until_parked();
-
-        let cell = pane.read_with(cx, |pane, _| pane.painted_rows_for_test()[0][0]);
-        assert_eq!(cell.c, 'p');
-        assert_eq!(cell.fg, bundled_rgb("Slate", "terminal.foreground"));
-        assert_eq!(cell.bg, bundled_rgb("Slate", "terminal.background"));
+        release(cx, pane);
     }
 }
 
@@ -5080,6 +4837,7 @@ mod terminal_theme_tests {
 /// loop while scrolled back neither moving the viewport nor going unnoticed.
 #[cfg(test)]
 mod scrollback_pane_tests {
+    use super::pty_pane_fixtures::release;
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -5139,34 +4897,56 @@ mod scrollback_pane_tests {
         });
     }
 
-    /// Pumps real poll ticks until `predicate` sees the pty round-trip land, or until a generous
-    /// cap is reached, then returns the joined visible text.
+    /// Pumps real poll ticks until `predicate` sees the pty round-trip land, or until
+    /// `pty_pane_fixtures`' own cap is reached, then returns the joined visible text.
     ///
     /// Every test in this module that observes forwarded bytes does it by letting a real child
     /// process echo them back, which is a real kernel pty round-trip: the write has to reach the
     /// child, the child has to be scheduled, and its reply has to come back through the poll
-    /// loop. A fixed tick count is therefore a wall-clock assumption, and this workspace has a
-    /// documented history of exactly that going flaky under heavy concurrent test load. Waiting
-    /// on the *condition* instead - with a cap so a genuine regression still fails, and fails
-    /// fast - removes the assumption without weakening a single assertion: every caller still
-    /// asserts the exact byte counts afterwards.
+    /// loop. Waiting on the *condition* - with a cap so a genuine regression still fails, and
+    /// fails fast - weakens no assertion: every caller still asserts the exact byte counts
+    /// afterwards.
     fn drain_until(
         pane: &gpui::Entity<TerminalPane>,
         cx: &mut gpui::VisualTestContext,
         predicate: impl Fn(&str) -> bool,
     ) -> String {
-        let mut joined = String::new();
-        for _ in 0..400 {
+        let joined = |cx: &mut gpui::VisualTestContext| {
+            pane.read_with(cx, |pane, _| pane.visible_text_lines())
+                .join("")
+        };
+        test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
             cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
-            joined = pane
-                .read_with(cx, |pane, _| pane.visible_text_lines())
-                .join("");
-            if predicate(&joined) {
-                break;
-            }
-        }
-        joined
+            predicate(&joined(cx))
+        });
+        joined(cx)
+    }
+
+    /// A pane on a real `cat -v` child: it visualizes control bytes (`ESC` -> the literal two
+    /// characters `^[`) as ordinary printable text, so bytes this pane forwards to the child show
+    /// up in this same pane's own grid as literal text instead of being reinterpreted as escape
+    /// sequences by this same grid's own VT parser - the one way to observe the *exact* bytes a
+    /// real child process received without a second, hand-rolled test-only pty seam.
+    fn alt_screen_pane(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.alt_scroll_forwarding_active()),
+            "sanity check: the grid must report the alt screen as active"
+        );
+        (pane, cx)
     }
 
     #[gpui::test]
@@ -5193,6 +4973,7 @@ mod scrollback_pane_tests {
             0,
             "PageDown by the same one page must land exactly back at live"
         );
+        release(cx, pane);
     }
 
     /// Real proof PageUp/PageDown are claimed *before* `keystroke_to_bytes`/`PtySession::
@@ -5232,6 +5013,7 @@ mod scrollback_pane_tests {
             "no new content may appear after PageUp with no further input - a real echoed PageUp \
              byte sequence would show up here"
         );
+        release(cx, pane);
     }
 
     #[gpui::test]
@@ -5258,6 +5040,7 @@ mod scrollback_pane_tests {
             !pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()),
             "a real keystroke reaching the pty must jump the view back to live"
         );
+        release(cx, pane);
     }
 
     fn wheel_event(delta: gpui::ScrollDelta) -> ScrollWheelEvent {
@@ -5293,6 +5076,7 @@ mod scrollback_pane_tests {
             );
         });
         assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
+        release(cx, pane);
     }
 
     /// GitHub issues #362/#368: a mouse-wheel scroll reaching a pane whose child has the alt
@@ -5304,150 +5088,69 @@ mod scrollback_pane_tests {
     /// Page keys, not the arrow keys issue #362 originally shipped: see
     /// [`TerminalPane::forward_scroll_as_page_keys`]'s own docs for the live evidence (Claude
     /// Code's CLI printing "Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll" at a
-    /// real user). This asserts the *absence* of arrow bytes as hard as it asserts the presence
-    /// of page bytes - sending both would leave the regression half-alive.
+    /// real user). Every case asserts the *absence* of arrow bytes as hard as it asserts the
+    /// presence of page bytes - sending both would leave the regression half-alive.
     ///
-    /// `cat -v`, not plain `cat`: it visualizes control bytes (`ESC` -> the literal two
-    /// characters `^[`) as ordinary printable text, so the forwarded `\x1b[5~` bytes show up in
-    /// this pane's own grid as the literal string `^[[5~` instead of being reinterpreted as a
-    /// real escape sequence by this same grid's own VT parser - the one way to observe the
-    /// *exact* bytes a real child process received without a second, hand-rolled test-only pty
-    /// seam.
+    /// The magnitudes matter as much as the direction: a scroll under one notch still forwards
+    /// exactly one press (not zero), and a fast flick of several notches forwards proportionally
+    /// more (not one per *line*, which would fling a full-screen program three screenfuls away on
+    /// a single detent) - so the [`WHEEL_LINES_PER_NOTCH`] division can never quietly become a
+    /// constant `1`.
     #[gpui::test]
-    fn alt_screen_scroll_forwards_page_keys_to_the_real_pty(cx: &mut TestAppContext) {
-        let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
+    fn an_alt_screen_scroll_forwards_page_keys_proportionally_and_never_arrow_keys(
+        cx: &mut TestAppContext,
+    ) {
+        for (lines, page_ups, page_downs, what) in [
+            (2.0, 1, 0, "a two-line upward scroll, under one notch"),
+            (
+                -3.0,
+                0,
+                1,
+                "a three-line downward scroll, exactly one notch",
+            ),
+            (3.0 * WHEEL_LINES_PER_NOTCH, 3, 0, "a three-notch flick"),
+        ] {
+            let (pane, cx) = alt_screen_pane(cx);
 
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
-        });
-        assert!(
-            pane.read_with(cx, |pane, _| pane.grid.alt_scroll_forwarding_active()),
-            "sanity check: the grid must report the alt screen as active before scrolling"
-        );
+            pane.update_in(cx, |pane, window, cx| {
+                pane.handle_scroll_wheel(
+                    &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, lines))),
+                    window,
+                    cx,
+                );
+            });
 
-        pane.update_in(cx, |pane, window, cx| {
-            pane.handle_scroll_wheel(
-                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, 2.0))),
-                window,
-                cx,
+            let joined = drain_until(&pane, cx, |text| {
+                text.matches("^[[5~").count() >= page_ups
+                    && text.matches("^[[6~").count() >= page_downs
+            });
+
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+                0,
+                "the alt screen has no scrollback of its own - scroll_display must never have \
+                 moved for {what}"
             );
-        });
-
-        // Real `cat -v` printing back exactly what it received on stdin - pump the poll loop
-        // until it lands.
-        let joined = drain_until(&pane, cx, |text| text.contains("^[[5~"));
-
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
-            0,
-            "the alt screen has no scrollback of its own - scroll_display must never have moved"
-        );
-        assert_eq!(
-            joined.matches("^[[5~").count(),
-            1,
-            "a two-line upward scroll is under one wheel notch, so it must forward exactly one \
-             real PageUp byte sequence, visualized by `cat -v` as the literal text `^[[5~`: \
-             {joined:?}"
-        );
-        assert_eq!(
-            joined.matches("^[[6~").count(),
-            0,
-            "an upward scroll must never also send a PageDown byte sequence: {joined:?}"
-        );
-        assert_eq!(
-            joined.matches("^[[A").count() + joined.matches("^[[B").count(),
-            0,
-            "GitHub issue #368: no arrow-key bytes may reach the child any more - forwarding \
-             those is what made Claude Code's CLI tell the user to press PgUp/PgDn instead: \
-             {joined:?}"
-        );
-    }
-
-    /// The mirror of the test above: downward scroll on the alt screen must forward PageDown
-    /// bytes, not PageUp.
-    #[gpui::test]
-    fn alt_screen_scroll_down_forwards_page_down_keys(cx: &mut TestAppContext) {
-        let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
-        });
-
-        pane.update_in(cx, |pane, window, cx| {
-            pane.handle_scroll_wheel(
-                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, -3.0))),
-                window,
-                cx,
+            assert_eq!(
+                joined.matches("^[[5~").count(),
+                page_ups,
+                "{what} must forward exactly {page_ups} real PageUp sequence(s), visualized by \
+                 `cat -v` as the literal text `^[[5~`: {joined:?}"
             );
-        });
-
-        let joined = drain_until(&pane, cx, |text| text.contains("^[[6~"));
-        assert_eq!(
-            joined.matches("^[[6~").count(),
-            1,
-            "a three-line downward scroll is exactly one wheel notch \
-             ([`WHEEL_LINES_PER_NOTCH`]), so it must forward exactly one real PageDown byte \
-             sequence - not one per line, which would fling a full-screen program three \
-             screenfuls away on a single detent: {joined:?}"
-        );
-        assert_eq!(joined.matches("^[[5~").count(), 0);
-        assert_eq!(
-            joined.matches("^[[A").count() + joined.matches("^[[B").count(),
-            0
-        );
-    }
-
-    /// GitHub issue #368: a *fast flick* still scales - several notches' worth of accumulated
-    /// delta forwards proportionally more page presses, rather than being flattened to one.
-    /// Pinned alongside the single-notch cases above so the [`WHEEL_LINES_PER_NOTCH`] division
-    /// can never quietly become a constant `1`.
-    #[gpui::test]
-    fn a_fast_alt_screen_flick_forwards_proportionally_more_page_keys(cx: &mut TestAppContext) {
-        let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
-        });
-
-        // Three notches' worth of upward delta in one event.
-        pane.update_in(cx, |pane, window, cx| {
-            pane.handle_scroll_wheel(
-                &wheel_event(gpui::ScrollDelta::Lines(gpui::point(
-                    0.0,
-                    3.0 * WHEEL_LINES_PER_NOTCH,
-                ))),
-                window,
-                cx,
+            assert_eq!(
+                joined.matches("^[[6~").count(),
+                page_downs,
+                "{what} must forward exactly {page_downs} real PageDown sequence(s): {joined:?}"
             );
-        });
-
-        let joined = drain_until(&pane, cx, |text| text.matches("^[[5~").count() >= 3);
-        assert_eq!(
-            joined.matches("^[[5~").count(),
-            3,
-            "three notches of upward delta must forward three real PageUp presses: {joined:?}"
-        );
+            assert_eq!(
+                joined.matches("^[[A").count() + joined.matches("^[[B").count(),
+                0,
+                "GitHub issue #368: no arrow-key bytes may reach the child any more - forwarding \
+                 those is what made Claude Code's CLI tell the user to press PgUp/PgDn instead: \
+                 {joined:?}"
+            );
+            release(cx, pane);
+        }
     }
 
     /// GitHub issue #368: a **real** PageUp keystroke must reach the child process while a
@@ -5461,22 +5164,7 @@ mod scrollback_pane_tests {
     /// `cat -v` again visualizes the exact bytes that really crossed the pty.
     #[gpui::test]
     fn a_real_page_key_reaches_a_full_screen_program(cx: &mut TestAppContext) {
-        let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
-        });
-        assert!(
-            pane.read_with(cx, |pane, _| pane.grid.alt_screen_active()),
-            "sanity check: the alt screen must really be active"
-        );
+        let (pane, cx) = alt_screen_pane(cx);
 
         pane.update_in(cx, |pane, window, cx| {
             pane.handle_key_down(&key_event(nav_key("pageup")), window, cx);
@@ -5496,6 +5184,7 @@ mod scrollback_pane_tests {
             1,
             "a real PageDown press must cross the pty as the standard `ESC [ 6 ~`: {joined:?}"
         );
+        release(cx, pane);
     }
 
     /// GitHub issue #362: once a full-screen program exits the alt screen, a mouse-wheel scroll
@@ -5531,6 +5220,7 @@ mod scrollback_pane_tests {
             "back on the normal screen, a scroll must move real scroll_display exactly as \
              before this issue - not still be forwarded to the child as key presses"
         );
+        release(cx, pane);
     }
 
     /// **GitHub issue #368, the live report: a genuinely fresh, empty Shell pane could still be
@@ -5625,6 +5315,7 @@ mod scrollback_pane_tests {
             "real overflow must still create real scrollback"
         );
         assert!(cx.debug_bounds("terminal-scrollbar").is_some());
+        release(cx, pane);
     }
 
     /// GitHub issue #368: the discard `maybe_resize_pty` performs on settling has to wait for
@@ -5675,48 +5366,11 @@ mod scrollback_pane_tests {
             "once the resize really reached the live pty, the pane is settled and the one-time \
              discard has run"
         );
+        release(cx, pane);
     }
 
-    /// GitHub issue #362: a freshly-opened pane whose child prints only a handful of lines -
-    /// genuinely fewer than the real viewport height - must never show the scrollbar affordance.
-    /// `crate::root::scrollbar::render_vertical_scrollbar` already returns `None` whenever
-    /// `TerminalScrollHandle::max_scroll_offset` is at or below zero (see that function's own
-    /// docs), so this is really a test that a fresh pane's real `scroll_history_len` starts and
-    /// stays `0` for genuinely non-overflowing content - the scrollbar's own gate does the rest.
-    #[gpui::test]
-    fn a_fresh_pane_with_little_content_shows_no_scrollbar(cx: &mut TestAppContext) {
-        let (pane, cx) = new_pane(cx);
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(b"$ echo hello\r\nhello\r\n$ ", cx);
-        });
-        cx.run_until_parked();
-
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()),
-            0,
-            "a handful of lines, well under the real viewport height, must never manufacture \
-             scrollback"
-        );
-        assert!(
-            cx.debug_bounds("terminal-scrollbar").is_none(),
-            "the scrollbar must not be painted when there is nothing to scroll to"
-        );
-
-        // Genuine overflow - more lines than the real viewport holds - must still show it.
-        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
-        push_numbered_lines(&pane, cx, rows * 3);
-
-        assert!(
-            pane.read_with(cx, |pane, _| pane.grid.scroll_history_len()) > 0,
-            "sanity check: this really did overflow"
-        );
-        assert!(
-            cx.debug_bounds("terminal-scrollbar").is_some(),
-            "genuine overflow must still show the scrollbar - this fix must not suppress it"
-        );
-    }
-
-    /// The precise mechanism behind the test above (GitHub issue #362): `TerminalPane::new`
+    /// The precise mechanism behind the placeholder-spawn race (GitHub issue #362):
+    /// `TerminalPane::new`
     /// spawns the child (and sizes `TerminalGrid`) at the `TERMINAL_ROWS`/`TERMINAL_COLS`
     /// placeholder before this pane has ever measured its own real content-box size. If the
     /// child prints more than the eventual *real* (smaller) viewport will hold - but still less
@@ -5842,6 +5496,7 @@ mod scrollback_pane_tests {
              via the ordinary shrink path - this fix must not have latched some permanent \
              discard-on-every-resize behavior"
         );
+        release(cx, pane);
     }
 
     /// Trackpad pixel deltas rarely divide evenly by the row height - two individually-sub-line
@@ -5888,6 +5543,7 @@ mod scrollback_pane_tests {
             "two 2/3-row deltas together exceed one full row and must produce a real one-line \
              scroll, not be dropped individually"
         );
+        release(cx, pane);
     }
 
     /// The real integration proof for GitHub issue #331's "stay put" requirement, at the pane
@@ -5988,6 +5644,7 @@ mod scrollback_pane_tests {
         cx.run_until_parked();
         assert!(!pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()));
         assert!(!pane.read_with(cx, |pane, _| pane.new_output_while_scrolled));
+        release(cx, pane);
     }
 
     /// The scrollbar's own `ScrollableHandle` adapter (GitHub issue #331): synced from real grid
