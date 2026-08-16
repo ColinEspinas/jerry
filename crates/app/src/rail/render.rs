@@ -1765,8 +1765,14 @@ impl AdeApp {
             .child(caret)
             .child(branch_div)
             .when(!has_agents, |el| {
+                // `debug_selector`ed (GitHub issue #<earlier-runs-spacing>): the same
+                // "`main checkout \u{b7} clean`" note the earlier-runs-link row's own regression
+                // test measures against as a known-good, real single-line sibling row.
+                let note_selector: &'static str =
+                    Box::leak(format!("worktree-row-note-{index}").into_boxed_str());
                 el.child(
                     div()
+                        .debug_selector(move || note_selector.to_string())
                         .flex_none()
                         .font(font(theme::font::MONO))
                         .text_size(self.ui_text_size(9.5))
@@ -2079,7 +2085,11 @@ impl AdeApp {
         let target = path.to_path_buf();
         let element_id = gpui::SharedString::from(format!("earlier-runs-{}", path.display()));
         let selector = element_id.clone();
-        div()
+        let icon_selector: &'static str =
+            Box::leak(format!("earlier-runs-icon-{}", path.display()).into_boxed_str());
+        let label_selector: &'static str =
+            Box::leak(format!("earlier-runs-label-{}", path.display()).into_boxed_str());
+        let row = div()
             .id(element_id)
             .debug_selector(move || selector.to_string())
             .w_full()
@@ -2100,6 +2110,7 @@ impl AdeApp {
             }))
             .child(
                 div()
+                    .debug_selector(move || icon_selector.to_string())
                     .flex_none()
                     .font(font(theme::font::MONO))
                     .text_size(self.ui_text_size(9.5))
@@ -2108,13 +2119,36 @@ impl AdeApp {
             )
             .child(
                 div()
+                    .debug_selector(move || label_selector.to_string())
                     .flex_none()
                     .font(font(theme::font::SANS))
                     .text_size(self.ui_text_size(9.5))
                     .text_color(theme::text::FAINT)
                     .child(crate::run_history::model::earlier_runs_label(count)),
-            )
-            .when(trailing_pb, |el| el.pb(px(7.0)))
+            );
+
+        // `trailing_pb`'s 7px must be a real sibling spacer box, never `.pb()` on `row` itself:
+        // `row` carries a fixed `.h(px(19.0))`, and `taffy`'s default `BoxSizing::BorderBox` (see
+        // `Self::render_worktree_row`'s identical note on `header`, and
+        // `Self::render_repo_group_header`'s own use of the same idiom) means padding added to a
+        // fixed-height box eats into that box's own content area rather than adding space below
+        // it. That is exactly what broke here: with `.pb(px(7.0))` on `row`, its 19px content area
+        // shrank to 12px, and `items_center()` centered the icon and label glyphs in *that*
+        // 12px - real measured bounds showed both landing 3.5px above the row's own vertical
+        // center, spilling 1.5px above the row's own top edge (screenshot-reported "earlier run
+        // row spacing is wrong"). A sibling spacer box leaves `row`'s own 19px untouched and adds
+        // the 7px gap after it instead.
+        if trailing_pb {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(row)
+                .child(div().h(px(7.0)))
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     /// The real `Y GB` (`+` suffixed if [`Self::disk_usage`] was truncated) disk-usage label, or
