@@ -2708,8 +2708,31 @@ impl AdeApp {
     /// The review and graph tabs share the identical shape and were silently carrying the same
     /// bug; this closes it for all three at the one root, rather than teaching each caller a
     /// fourth flag to check.
+    ///
+    /// GitHub issue #382: the File/Diff surface (Surface C) shares the identical shape and was
+    /// still missing here, left out of the original #227 fix because that fix only chased the
+    /// three flag-gated occupants (review/run/graph) and never the fourth, structurally different
+    /// one - `Self::open_change`, a `PathBuf` rather than a `bool`. Opening a file tab while an
+    /// agent tab was active left the agent's rail row *and* tab strip entry still drawn as
+    /// selected, with the file tab now also selected: the exact "two selected at once" shape
+    /// #227 fixed, just for a fourth occupant nobody had chased down yet.
+    ///
+    /// `open_change.is_some()` alone is not enough to conclude Surface C is genuinely on screen -
+    /// see [`crate::code_surface::editing::AdeApp::active_edit_target`]'s own docs (which mirror
+    /// this exact predicate for the identical reason) for the real, reachable state that predicate
+    /// is guarding against: a tab can be "active" (its path still in `open_change`) without a diff
+    /// to show it (`open_diff_file_cache` is `None`) and `code_view` left on `Diff`, in which case
+    /// [`Self::render_center_pane`] falls through to the agent/merge surface with `open_change`
+    /// still `Some` the whole time - the weaker check would wrongly report the agent pane as not
+    /// showing while it genuinely is.
     pub(crate) fn active_agent_pane_id(&self) -> Option<AgentId> {
-        if self.review_tab_active || self.run_tab_active || self.graph_tab_active {
+        let file_or_diff_surface_showing = self.open_change.is_some()
+            && (self.open_diff_file_cache.is_some() || self.code_view == code_view::CodeView::File);
+        if self.review_tab_active
+            || self.run_tab_active
+            || self.graph_tab_active
+            || file_or_diff_surface_showing
+        {
             return None;
         }
         self.agents.active_id()
@@ -4921,6 +4944,102 @@ mod tab_scoping_tests {
             persisted.len(),
             3,
             "the on-disk persisted order must keep all three files"
+        );
+    }
+
+    /// GitHub issue #382: [`AdeApp::active_agent_pane_id`]'s own cascade - the fix for GitHub
+    /// issue #227 - only ever zeroed out for the review/run/graph tabs, because those three are
+    /// plain `bool` flags. The File/Diff surface is a fourth centre-pane occupant with the
+    /// identical shape, but tracked through `Self::open_change` (a `PathBuf`, not a `bool`), and
+    /// was left out of the original fix. Opening a file tab while an agent was the active centre-
+    /// pane content left that agent's own tab strip entry (and rail row, which reads the same
+    /// method) still drawn as selected, alongside the file tab that had genuinely taken over the
+    /// centre pane - the exact "two selected at once" shape #227 fixed, just for a fourth occupant
+    /// nobody had chased down yet. Mirrors
+    /// `crate::run_history::render::tab_scoping_tests::switching_between_an_agent_and_a_history_run_leaves_exactly_one_selected`'s
+    /// own "exactly one selected" idiom, but for a file tab, and checks the real painted surfaces
+    /// (`"pty-surface"`/`"file-view-code-list"`) rather than only the logical predicate, so this
+    /// fails if the fix is real but `render_center_pane` itself ever drifts from
+    /// `active_agent_pane_id`'s cascade.
+    #[gpui::test]
+    fn switching_from_an_agent_to_a_file_tab_leaves_exactly_one_selected(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("mod.rs"), "fn main() {}\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // A real second agent (the startup shell is `Agents`' first entry) so this exercises a
+        // genuine agent tab rather than the guaranteed startup shell.
+        app.update_in(cx, |app, window, cx| {
+            app.new_agent(ProcessKind::Agent(AgentKind::Claude), window, cx)
+        });
+        cx.run_until_parked();
+        let agent_id = app.read_with(cx, |app, _| {
+            app.agents.iter().last().expect("a spawned agent").id
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active_agent_pane_id()),
+            Some(agent_id),
+            "premise: the freshly spawned agent is the one genuinely selected right now"
+        );
+        assert!(
+            cx.debug_bounds("pty-surface").is_some(),
+            "premise: the agent's own pty surface is genuinely on screen"
+        );
+
+        // The real click path: `Self::open_file_view`, the same call go-to-definition, a
+        // file-tree row click and a palette file result all make.
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("mod.rs"), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("file-view-code-list").is_some(),
+            "the file's own code view must now genuinely be on screen"
+        );
+        assert!(
+            cx.debug_bounds("pty-surface").is_none(),
+            "the agent's pty surface must no longer be on screen - the file tab replaced it in \
+             the centre pane"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.active_agent_pane_id(),
+                None,
+                "the agent's rail row/tab must no longer read as selected - the centre pane is \
+                 showing the file tab, not that agent's pane. Before the fix this was still \
+                 `Some(agent_id)`, because `active_agent_pane_id` only zeroed out for the \
+                 review/run/graph tabs and never checked `open_change`"
+            );
+            assert_eq!(
+                app.agents.active_id(),
+                Some(agent_id),
+                "the *underlying* remembered agent must be untouched, though - it's what \
+                 `select_agent` returns to, not something opening a file tab should ever clear"
+            );
+        });
+
+        // Switch back to the agent - the real click path (`render_agent_tab`'s/`render_agent_row`'s
+        // own `on_click`, both of which call `select_agent`).
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(agent_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.active_agent_pane_id()),
+            Some(agent_id),
+            "selecting the agent tab again must make it read as selected once more"
+        );
+        assert!(
+            cx.debug_bounds("pty-surface").is_some(),
+            "and its pty surface must genuinely be back on screen"
+        );
+        assert!(
+            cx.debug_bounds("file-view-code-list").is_none(),
+            "with the file view genuinely gone, `select_agent` clears `open_change` on its way \
+             back to the agent pane"
         );
     }
 }
