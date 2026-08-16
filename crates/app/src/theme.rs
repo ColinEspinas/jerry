@@ -3620,10 +3620,15 @@ pub mod band {
     pub const SEARCH_FILE_ROW: Pixels = px(24.0);
     /// One match row under it - line number, then the line with its hit highlighted.
     pub const SEARCH_MATCH_ROW: Pixels = px(19.0);
-    /// The square hit box every 17x17 icon button in the search panel's count row uses, matching
-    /// `crate::icons::IconSize::Control`'s own optical box (`STAGE-A-CHANGELOG.md` §4w raised
-    /// fold-all 15 -> 17 to land exactly here).
-    pub const SEARCH_ICON_BUTTON: Pixels = px(17.0);
+    /// The square hit box every 17x17 icon-only control button uses - the search panel's count
+    /// row and find bar, and the rail footer's prune button (`STAGE-A-CHANGELOG.md` §4w: "Same
+    /// 17px hit box as the other icon buttons"). **Not** the icon's own optical size - that is
+    /// `crate::icons::IconSize::Control` (12px), a real measurement off the mock's actual glyph
+    /// geometry, which sits inset and centred inside this box rather than filling it. The two
+    /// were wrongly conflated when this constant was first named after `IconSize::Control`'s
+    /// (then-incorrect) 17px value; GitHub issue filed 2026-08-16 for the "icons too big"
+    /// screenshot report this caused.
+    pub const ICON_BUTTON_HIT: Pixels = px(17.0);
 }
 
 pub mod zone {

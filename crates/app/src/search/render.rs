@@ -258,8 +258,8 @@ impl AdeApp {
             .id(SharedString::from(format!("search-modifier-{key}")))
             .debug_selector(move || format!("search-modifier-{key}"))
             .flex_none()
-            .w(theme::band::SEARCH_ICON_BUTTON)
-            .h(theme::band::SEARCH_ICON_BUTTON)
+            .w(theme::band::ICON_BUTTON_HIT)
+            .h(theme::band::ICON_BUTTON_HIT)
             .rounded(theme::radius::CHIP)
             .flex()
             .items_center()
@@ -430,8 +430,8 @@ impl AdeApp {
                     .id("search-fold-all")
                     .debug_selector(|| "search-fold-all".to_string())
                     .flex_none()
-                    .w(theme::band::SEARCH_ICON_BUTTON)
-                    .h(theme::band::SEARCH_ICON_BUTTON)
+                    .w(theme::band::ICON_BUTTON_HIT)
+                    .h(theme::band::ICON_BUTTON_HIT)
                     .rounded(theme::radius::CHIP)
                     .flex()
                     .items_center()
@@ -454,8 +454,12 @@ impl AdeApp {
             }))
     }
 
-    /// One 17x17 toggle in the count row - `⇄` or the funnel, both drawn in the active pair
-    /// `REVISION-2026-08-14.md` §5 gives the modifier buttons.
+    /// One toggle in the count row - `⇄` or the funnel, both drawn in the active pair
+    /// `REVISION-2026-08-14.md` §5 gives the modifier buttons. The button itself is the shared
+    /// 17x17 hit box (`theme::band::ICON_BUTTON_HIT`); the glyph `icons` draws inside it is the
+    /// smaller `icons::IconSize::Control` optical box (12px), centred by this row's own
+    /// `items_center`/`justify_center` - see `IconSize::Control`'s doc comment for why those two
+    /// numbers are not the same.
     #[allow(clippy::too_many_arguments)]
     fn render_search_toggle_button(
         &self,
@@ -471,8 +475,8 @@ impl AdeApp {
             .id(id)
             .debug_selector(move || id.to_string())
             .flex_none()
-            .w(theme::band::SEARCH_ICON_BUTTON)
-            .h(theme::band::SEARCH_ICON_BUTTON)
+            .w(theme::band::ICON_BUTTON_HIT)
+            .h(theme::band::ICON_BUTTON_HIT)
             .rounded(theme::radius::CHIP)
             .flex()
             .items_center()
@@ -1363,6 +1367,55 @@ mod panel_tests {
         cx.run_until_parked();
     }
 
+    /// Regression for the screenshot-reported "icons in buttons are too big" bug: the count row's
+    /// `⇄`/funnel toggle buttons kept their real 17px hit box, but the SVG glyph inside each one
+    /// was wrongly stretched to fill that whole box instead of painting at
+    /// `icons::IconSize::Control`'s real 12px optical box (`icons.rs`'s doc comment has the
+    /// bounding-box measurements off `Jerry.dc.html` this 12 comes from).
+    #[gpui::test]
+    fn the_count_row_toggle_icons_paint_smaller_than_their_hit_box(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (_app, cx) = open_search(cx, &repo);
+
+        for (button_selector, icon_selector) in [
+            ("search-toggle-replace", "icon-arrows-left-right"),
+            ("search-toggle-globs", "icon-funnel"),
+        ] {
+            let button = cx
+                .debug_bounds(button_selector)
+                .unwrap_or_else(|| panic!("`{button_selector}` must really paint"));
+            assert_eq!(button.size.width, px(17.0), "{button_selector}'s hit box");
+            assert_eq!(button.size.height, px(17.0), "{button_selector}'s hit box");
+
+            let icon = cx
+                .debug_bounds(icon_selector)
+                .unwrap_or_else(|| panic!("`{icon_selector}` must paint inside {button_selector}"));
+            assert_eq!(
+                icon.size.width,
+                px(12.0),
+                "{icon_selector} must paint at IconSize::Control's real optical box (12px), not \
+                 stretched to fill the 17px hit box"
+            );
+            assert_eq!(icon.size.height, px(12.0));
+
+            // Centred, not pinned to a corner of the larger hit box.
+            let left_gap = icon.origin.x - button.origin.x;
+            let right_gap =
+                (button.origin.x + button.size.width) - (icon.origin.x + icon.size.width);
+            let top_gap = icon.origin.y - button.origin.y;
+            let bottom_gap =
+                (button.origin.y + button.size.height) - (icon.origin.y + icon.size.height);
+            assert_eq!(
+                left_gap, right_gap,
+                "{icon_selector} must be horizontally centred in {button_selector}"
+            );
+            assert_eq!(
+                top_gap, bottom_gap,
+                "{icon_selector} must be vertically centred in {button_selector}"
+            );
+        }
+    }
+
     #[gpui::test]
     fn mod_shift_f_opens_the_panel_with_the_query_focused(cx: &mut TestAppContext) {
         let repo = fixture_repo();
@@ -2173,8 +2226,8 @@ impl AdeApp {
                         .id("find-bar-close")
                         .debug_selector(|| "find-bar-close".to_string())
                         .flex_none()
-                        .w(theme::band::SEARCH_ICON_BUTTON)
-                        .h(theme::band::SEARCH_ICON_BUTTON)
+                        .w(theme::band::ICON_BUTTON_HIT)
+                        .h(theme::band::ICON_BUTTON_HIT)
                         .rounded(theme::radius::CHIP)
                         .flex()
                         .items_center()
@@ -2217,8 +2270,8 @@ impl AdeApp {
             .id(SharedString::from(format!("find-bar-modifier-{key}")))
             .debug_selector(move || format!("find-bar-modifier-{key}"))
             .flex_none()
-            .w(theme::band::SEARCH_ICON_BUTTON)
-            .h(theme::band::SEARCH_ICON_BUTTON)
+            .w(theme::band::ICON_BUTTON_HIT)
+            .h(theme::band::ICON_BUTTON_HIT)
             .rounded(theme::radius::CHIP)
             .flex()
             .items_center()
@@ -2267,8 +2320,8 @@ impl AdeApp {
             .id(id)
             .debug_selector(move || id.to_string())
             .flex_none()
-            .w(theme::band::SEARCH_ICON_BUTTON)
-            .h(theme::band::SEARCH_ICON_BUTTON)
+            .w(theme::band::ICON_BUTTON_HIT)
+            .h(theme::band::ICON_BUTTON_HIT)
             .rounded(theme::radius::CHIP)
             .flex()
             .items_center()

@@ -2168,8 +2168,11 @@ impl AdeApp {
     /// The two-click arm/confirm is unchanged, only restated: an armed control turns
     /// [`theme::button::DANGER_FG`] and its tooltip becomes [`rail::prune_armed_tooltip`]. The
     /// glyph is `crate::icons::Icon::Trash`, drawn through the shared `crate::icons::IconRow` at
-    /// `crate::icons::IconSize::Control` - the 17px box §7 rule 7 exists to keep every icon
-    /// button in the app sharing.
+    /// `crate::icons::IconSize::Control` (12px) - §7 rule 7's shared optical box. That is
+    /// deliberately smaller than this control's own 17px hit box
+    /// ([`theme::band::ICON_BUTTON_HIT`]): the mock's hand-drawn bin glyph only ever painted a
+    /// 9x12 mark inset in the 17px square, and the first Phosphor migration wrongly stretched the
+    /// vendored SVG to fill the whole hit box (screenshot-reported "icons too big").
     pub(in crate::rail) fn render_rail_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Includes error'd entries - the count should match what `wt_core::list_worktrees`
         // reported, problems included, not silently shrink.
@@ -2207,8 +2210,8 @@ impl AdeApp {
             .flex()
             .items_center()
             .justify_center()
-            .w(crate::icons::IconSize::Control.box_size())
-            .h(crate::icons::IconSize::Control.box_size())
+            .w(theme::band::ICON_BUTTON_HIT)
+            .h(theme::band::ICON_BUTTON_HIT)
             .rounded(theme::radius::CHIP)
             .tooltip(text_tooltip(tooltip_text))
             .child(
@@ -5109,12 +5112,37 @@ mod rail_rev6_render_tests {
         assert_eq!(
             button.size.height,
             px(17.0),
-            "the shared 17px icon-button box (`icons::IconSize::Control`), not a text button's \
-             own intrinsic size"
+            "the shared 17px icon-button hit box (`theme::band::ICON_BUTTON_HIT`), not a text \
+             button's own intrinsic size"
         );
-        assert!(
-            cx.debug_bounds("icon-trash").is_some(),
-            "and the real vendored Phosphor `trash` SVG must be what paints inside it"
+
+        // Regression for the screenshot-reported "icons in buttons are too big" bug: the SVG
+        // glyph itself must paint at `IconSize::Control`'s real 12px optical box, not stretched
+        // to fill the 17px hit box around it.
+        let icon = cx
+            .debug_bounds("icon-trash")
+            .expect("the real vendored Phosphor `trash` SVG must paint inside it");
+        assert_eq!(
+            icon.size.width,
+            px(12.0),
+            "the trash glyph must paint at `icons::IconSize::Control`'s real optical box (12px), \
+             not the 17px hit box it sits inside"
+        );
+        assert_eq!(icon.size.height, px(12.0));
+
+        // And it must be centred in the hit box, not pinned to a corner.
+        let left_gap = icon.origin.x - button.origin.x;
+        let right_gap = (button.origin.x + button.size.width) - (icon.origin.x + icon.size.width);
+        let top_gap = icon.origin.y - button.origin.y;
+        let bottom_gap =
+            (button.origin.y + button.size.height) - (icon.origin.y + icon.size.height);
+        assert_eq!(
+            left_gap, right_gap,
+            "the smaller glyph must be horizontally centred in the 17px hit box"
+        );
+        assert_eq!(
+            top_gap, bottom_gap,
+            "the smaller glyph must be vertically centred in the 17px hit box"
         );
     }
 
