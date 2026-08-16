@@ -2,35 +2,6 @@
 //! (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §5: "a funnel for path filters",
 //! and STAGE-A-CHANGELOG.md §4v's "Include/exclude globs behind `⋯` - `src/**, tests/**` /
 //! `target/**, *.lock`").
-//!
-//! ## Why hand-rolled rather than `globset`
-//!
-//! The two fields hold a *comma-separated list* of shell-style patterns matched against one
-//! worktree-relative, `/`-separated path each. That is a genuinely small language (`**`, `*`,
-//! `?`), and this crate already declines to add a dependency for something this size - see
-//! `crate::sidebar::file_ops`'s own hand-rolled name validation, and
-//! `crate::palette::state::substring_match`. `globset` would also bring `aho-corasick` and
-//! `bstr` in for it. Being pure and dependency-free is what lets every rule below be a real unit
-//! test rather than a claim about a third party's semantics.
-//!
-//! ## The rules, exactly
-//!
-//! - A pattern is split on `/` into segments and matched segment-by-segment against the path's
-//!   own segments.
-//! - `**` matches **zero or more whole segments**, so `target/**` matches `target/debug/x.rs` and
-//!   `src/**/mod.rs` matches both `src/mod.rs` and `src/a/b/mod.rs`.
-//! - `*` matches any run of characters **within one segment** (never across a `/`), `?` matches
-//!   exactly one character within one segment.
-//! - A pattern containing **no** `/` is matched against every path's *basename*, i.e. `*.lock` is
-//!   read as `**/*.lock`. That is the rule VS Code's own search globs use, and it is what makes
-//!   the design's own `*.lock` example mean what a reader expects it to. It is also why `src` and
-//!   `src/` are genuinely different patterns: the trailing slash is what anchors it.
-//! - Everything else is anchored at the worktree root: `src/**` does not match `crates/src/x.rs`.
-//! - Matching is case-sensitive, because paths on this app's primary platform are.
-//!
-//! An empty list matches nothing ([`GlobList::is_empty`]); the *caller* is what decides that an
-//! empty `include` means "no include filter at all" rather than "exclude everything" - see
-//! [`crate::search::engine::PathFilter`].
 
 /// One parsed pattern: its segments, plus whether it was basename-only (no `/` anywhere).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,10 +47,6 @@ impl Glob {
 }
 
 /// `**` matches zero or more whole segments; every other segment matches exactly one.
-///
-/// Recursion is bounded by the pattern's own segment count (each non-`**` step consumes one path
-/// segment, each `**` step recurses on a strictly shorter pattern), and real patterns are a
-/// handful of segments long - see this module's own docs for why this is not `globset`.
 fn match_segments(pattern: &[String], path: &[&str]) -> bool {
     let Some((head, rest)) = pattern.split_first() else {
         return path.is_empty();
@@ -227,7 +194,6 @@ mod tests {
 
     #[test]
     fn a_pathological_star_pattern_still_terminates_and_answers_correctly() {
-        // The exponential case a naive recursive matcher blows up on - a user can type this.
         assert!(matches("a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"));
         assert!(!matches("a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"));
     }

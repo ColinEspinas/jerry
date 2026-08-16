@@ -4,30 +4,6 @@
 //! dependency so it's directly unit-testable; `crate::root` turns the result into `gpui::Div`
 //! trees. Config-file-backed values live in `crate::settings::store` instead - this module is
 //! about live app state, not disk state.
-//!
-//! ## Which pages are real
-//!
-//! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, Language servers, and
-//! Notifications render real, live-derived content (see [`SettingsPage::is_implemented`]).
-//! Integrations and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
-//! copy, "not designed in this mockup". Editor is a partial exception, not a full one: its one
-//! real row is the minimap (`crate::code_surface::minimap`, GitHub issue #30's
-//! `editor.minimap.enabled`) - indentation/soft-wrap/whitespace-display still have no real
-//! backing anywhere in this codebase, so those stay left off the page entirely rather than
-//! growing controls bound to nothing, the same "only what's real" discipline every other page
-//! here already follows. Notifications (GitHub issue #226) is the newest of the real pages -
-//! sound design, off by default, real settings-backed toggles and a real, importable sound
-//! library - see `crate::sound`'s own module docs and `crate::settings::render`'s
-//! `render_settings_notifications_page`.
-//!
-//! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
-//!
-//! `Jerry.dc.html`'s `settingsRows.agents`/`settingsRows.worktrees` fixtures show toggles like
-//! "Plan before editing" or a "Worktree root" path field, but nothing in this app persists a
-//! value per agent or per worktree (even `crate::settings::store::Settings` is a flat, global
-//! struct with nowhere to hang a per-agent bool). Rendering them anyway would be a control bound
-//! to nothing, so only the two sections backed by real, already-loaded state - the Installed
-//! agents card and the Disk worktrees card - are built.
 
 use std::path::PathBuf;
 
@@ -334,19 +310,6 @@ pub struct ThemeDef {
 /// parse_builtin_theme_file_str_parses_every_embedded_built_in_theme_file_into_the_exact_documented_swatches`
 /// and this module's own `theme_defs_match_the_documented_exact_names_subtitles_and_hex_swatches`
 /// for the regression pins), only *where they live* changed.
-///
-/// A `std::sync::LazyLock`, not a `const`, since parsing TOML is real runtime work - computed
-/// exactly once, on first access, and cached for the rest of the process; every existing call
-/// site across this crate (`crate::theme`, `crate::root`, `crate::settings::render`,
-/// `crate::settings::store`) already only ever indexes (`THEME_DEFS[i]`) or iterates
-/// (`THEME_DEFS.iter()`) this array, both of which `LazyLock`'s `Deref` impl serves exactly like
-/// the old `const` did, so none of them needed to change for this. `name`/`subtitle` are each
-/// leaked once (`Box::leak`) into real `&'static str`s, so [`ThemeDef`] keeps its existing
-/// `Copy`-friendly shape rather than growing owned `String` fields just for six values that live
-/// for the process's entire lifetime anyway.
-///
-/// `crate::settings::store::ThemeSettings::name` - not this fixture's own `on` field, which this
-/// app never reads - is the persisted source of truth for which one is selected.
 pub static THEME_DEFS: std::sync::LazyLock<[ThemeDef; 6]> = std::sync::LazyLock::new(|| {
     const FILES: [&str; 6] = [
         include_str!("../../../../assets/themes/jerry-dark.toml"),
@@ -516,16 +479,6 @@ pub struct KeybindingRow {
 /// existing label source covers all four: the palette's `PaletteCommand::label` covers three,
 /// but `TogglePalette`/`GotoDefinition` have no `PaletteCommand` counterpart (the palette can't
 /// open itself, and go-to-definition isn't a palette command).
-///
-/// The test `every_registered_global_keybinding_has_a_real_keybindings_page_label` (below) is
-/// the drift guard: it asserts every binding in `crate::default_key_bindings()` resolves to
-/// `Some` here, so a new global binding without a matching label fails a test rather than
-/// silently rendering blank on the Keybindings page.
-///
-/// `pub(crate)`, not private - `crate::settings::render`'s real collision-message renderer
-/// (`keymap_overrides::find_colliding_binding` returns a raw `gpui::KeyBinding`, not a
-/// `KeybindingRow`) needs the same label this module's own rows already use, rather than showing
-/// a raw `gpui::Action::name()` compiler identifier in a user-facing error.
 pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
     match action.name() {
         "app::NewAgent" => Some("New agent"),
@@ -725,16 +678,6 @@ impl ShellStatus {
 /// looks like a path is checked as a real file on disk. Whitespace-only (or absent) is
 /// [`ShellStatus::SystemDefault`], matching
 /// `crate::settings::store::TerminalSettings::shell_override`.
-///
-/// Takes `resolve` as a parameter - in production `pty_core::resolve_on_path` - for the same
-/// reason [`detect_agent_rows`] does: so this is unit-testable independently of which shells
-/// happen to be installed on the machine running the suite. The on-disk check for a path-shaped
-/// value is a real `Path::is_file` call rather than a second injected closure; a test can point
-/// it at a real temp file, which is a truer check than a fake.
-///
-/// This is deliberately *advisory*. It cannot be a guarantee - `resolve_on_path` is a second
-/// implementation of `portable-pty`'s own search (see its docs for the disclosed divergences) -
-/// so it is used to inform the settings row, never to gate the spawn.
 pub fn detect_shell_status(
     configured: Option<&str>,
     resolve: impl Fn(&str) -> Option<PathBuf>,
@@ -765,11 +708,6 @@ pub fn detect_shell_status(
 /// One genuinely-present shell offered under the General page's free-text "Shell" field (GitHub
 /// issue #213's follow-up: "would a select + auto-detect installed shells be better?" - a hybrid,
 /// so the common case needs no typing while the field itself stays unrestricted).
-///
-/// Every one of these was found by real I/O - a line of `/etc/shells` whose file is on disk right
-/// now, or a real `$PATH`/`%PATH%` hit - never a hardcoded "shells people usually have". A name
-/// that isn't genuinely resolvable is never offered, because clicking it would configure a shell
-/// that cannot spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellSuggestion {
     /// The program's own file name (`bash`, `pwsh.exe`) - what a user recognizes at a glance.
@@ -799,35 +737,16 @@ pub const ETC_SHELLS: &str = "/etc/shells";
 /// installed, so [`unix_shell_suggestions`] probes `PATH` for them as a supplement - not as the
 /// primary mechanism, and never as an answer of its own: a name here is only ever offered when a
 /// real `PATH` search actually finds it.
-///
-/// The list is short and evidence-driven rather than a general "common shells" guess. Registering
-/// a shell in `/etc/shells` is the *distribution packager's* job, and each of these is
-/// predominantly installed by a route that has no packager: fish's and PowerShell's own install
-/// instructions tell the user to append the path to `/etc/shells` by hand afterwards (which is
-/// only necessary because the install genuinely doesn't), Nushell ships mainly through
-/// `cargo install` and release tarballs, Xonsh through `pip`, and Elvish through `go install` and
-/// tarballs. None of those routes touch `/etc/shells` at all.
 #[cfg(unix)]
 const UNIX_SUPPLEMENTARY_SHELLS: [&str; 5] = ["fish", "nu", "pwsh", "elvish", "xonsh"];
 
 /// Shell programs a Windows install may genuinely have on `%PATH%`, probed one by one - see
 /// [`windows_shell_suggestions`], which only offers the ones a real search actually finds.
-///
-/// There is no `/etc/shells` equivalent on Windows, so this is a probe list rather than a source
-/// of truth, and it is deliberately confined to names that are real, well-known program names -
-/// not a catalogue of everything that might be a shell. `bash.exe` is a real example of why the
-/// *probe* matters more than the name: on a given machine it could be WSL's bash shim, Git Bash,
-/// or Cygwin's, and this makes no claim about which - only that the file the search found really
-/// exists and would really run.
 const WINDOWS_PROBED_SHELLS: [&str; 3] = ["powershell.exe", "pwsh.exe", "bash.exe"];
 
 /// Every shell this machine genuinely has, for the field's suggestion list - the production
 /// entry point, wired to the real `/etc/shells`, the real `%COMSPEC%`, and the real
 /// `pty_core::resolve_on_path`.
-///
-/// Does real filesystem and `PATH` I/O, so like [`detect_agent_rows`] and [`detect_shell_status`]
-/// it is called when Settings opens (`AdeApp::refresh_shell_suggestions`) and the result is held
-/// in state - never from `render`, which would put a directory walk on the frame path.
 pub fn detect_installed_shells() -> Vec<ShellSuggestion> {
     #[cfg(unix)]
     {
@@ -844,15 +763,6 @@ pub fn detect_installed_shells() -> Vec<ShellSuggestion> {
 /// entries that are *actually a file on disk right now*. A listed shell can have been
 /// uninstalled without the line being removed, and offering a path that isn't there would be
 /// offering a shell that cannot spawn.
-///
-/// Then, and only then, [`UNIX_SUPPLEMENTARY_SHELLS`] are looked for on `PATH` via `resolve` and
-/// appended if genuinely found - see that constant's docs for why a supplement is warranted and
-/// why it is not the primary source.
-///
-/// `shells_file`/`resolve` are parameters, not constants read inside, for the same reason
-/// [`detect_agent_rows`] takes its resolver: a test can point this at a real, hand-written
-/// `/etc/shells` in a real tempdir and get a deterministic answer, instead of asserting on
-/// whatever the machine running the suite happens to have installed.
 #[cfg(unix)]
 pub fn unix_shell_suggestions(
     shells_file: &std::path::Path,
@@ -888,17 +798,6 @@ pub fn unix_shell_suggestions(
 /// mechanism (`crate::terminal::pane::TerminalSpec::default_shell_program`), so the first
 /// suggestion is literally the program an empty field already runs - and a real `PATH` search for
 /// each of [`WINDOWS_PROBED_SHELLS`].
-///
-/// Both sources are verified before anything is offered: `%COMSPEC%` must name a file that
-/// genuinely exists, and a probed name must be genuinely found by `resolve`. A name that is
-/// merely plausible on Windows is never listed.
-///
-/// Takes `comspec`/`resolve` as parameters rather than reading the environment itself so this is
-/// exercisable as a real unit test (with a real temp file standing in for a real `%COMSPEC%`
-/// target) on any host, including the Linux machines this project's suite runs on - the
-/// alternative being a Windows code path with no test coverage whatsoever. It is compiled on
-/// every platform for exactly that reason (it is only *called* under `#[cfg(windows)]`), so the
-/// Linux suite really runs it rather than only type-checking it.
 pub fn windows_shell_suggestions(
     comspec: Option<std::ffi::OsString>,
     resolve: impl Fn(&str) -> Option<PathBuf>,
@@ -924,17 +823,6 @@ pub fn windows_shell_suggestions(
 
 /// Appends `path` as a suggestion unless an equivalent one is already listed, keyed on
 /// `(file name, real canonicalized target)`.
-///
-/// Both halves of that key are load-bearing against real, live `/etc/shells` content. On any
-/// usr-merged distribution the file lists `/bin/bash` *and* `/usr/bin/bash`, which are the same
-/// binary reached through a symlinked directory - two rows that would offer a user the same
-/// choice twice, so the canonical target dedupes them. But `/bin/sh` and `/bin/dash` also
-/// canonicalize to the same target on Debian, and those are genuinely different choices a user
-/// means differently (POSIX `sh` semantics vs. dash by name), so the file name keeps them apart.
-///
-/// Symlink resolution failure falls back to the path itself rather than dropping the entry: the
-/// entry has already been proven to be a real file, and a failure to canonicalize is a reason to
-/// keep it, not to hide it.
 fn push_unique_shell(
     found: &mut Vec<ShellSuggestion>,
     seen: &mut Vec<(String, PathBuf)>,
@@ -959,11 +847,6 @@ fn push_unique_shell(
 /// substring match against both the shell's name and its full path, mirroring
 /// [`filter_keybinding_rows`]'s own established "one lowercase substring test per searchable
 /// field" shape rather than inventing a second matching rule.
-///
-/// An empty (or whitespace-only) field matches everything: with nothing typed yet, every real
-/// shell on the machine is a legitimate suggestion. A query nothing matches yields nothing, which
-/// is exactly what should happen when a user is typing a custom path the machine has never heard
-/// of - the field stays entirely usable, the dropdown simply has nothing to add.
 pub fn filter_shell_suggestions<'a>(
     suggestions: &'a [ShellSuggestion],
     query: &str,
@@ -1001,10 +884,6 @@ mod tests {
         path
     }
 
-    /// The heart of the Unix detection (GitHub issue #213's follow-up): a real `/etc/shells`-format
-    /// file is parsed for real, and a line whose program is genuinely not on disk is never
-    /// offered, because a listed shell can have been uninstalled and suggesting it would be
-    /// suggesting a tab that cannot start.
     #[cfg(unix)]
     #[test]
     fn only_shells_that_really_exist_on_disk_are_suggested() {
@@ -1055,8 +934,6 @@ mod tests {
         );
     }
 
-    /// A missing `/etc/shells` (a system that genuinely has none) is not an error and not a
-    /// fabricated fallback list - it just means the supplementary `PATH` probe is all there is.
     #[cfg(unix)]
     #[test]
     fn a_missing_shells_file_yields_only_what_path_really_has() {
@@ -1076,9 +953,6 @@ mod tests {
         );
     }
 
-    /// The supplementary probe's whole reason to exist: fish/nu/pwsh & co. are routinely installed
-    /// by routes that never register them in `/etc/shells`, so they must still be offered - and a
-    /// probed name that `PATH` genuinely doesn't have must not be.
     #[cfg(unix)]
     #[test]
     fn a_shell_missing_from_etc_shells_is_still_found_on_path() {
@@ -1105,10 +979,6 @@ mod tests {
         );
     }
 
-    /// Real usr-merge duplication (`/bin/bash` and `/usr/bin/bash` are one binary on every modern
-    /// distribution, and this machine's own `/etc/shells` lists both) collapses to one row, while
-    /// two genuinely different *names* for the same binary - `sh` and `dash` on Debian - stay two
-    /// rows, because a user choosing "sh" means something different by it.
     #[cfg(unix)]
     #[test]
     fn the_same_binary_listed_twice_is_offered_once_but_two_names_are_not_merged() {
@@ -1119,7 +989,6 @@ mod tests {
         // The real usr-merge shape: /bin is a symlink to /usr/bin, so /bin/dash and /usr/bin/dash
         // are the same file reached two ways.
         std::os::unix::fs::symlink("usr/bin", dir.path().join("bin")).expect("symlink");
-        // And the real Debian shape for `sh`: a differently-named symlink to that same binary.
         std::os::unix::fs::symlink("dash", usr_bin.join("sh")).expect("symlink");
 
         let shells_file = dir.path().join("shells");
@@ -1150,10 +1019,6 @@ mod tests {
         );
     }
 
-    /// Windows has no `/etc/shells`, so the two real sources are `%COMSPEC%` (this app's own
-    /// existing default-shell mechanism) and a real `PATH` search - both verified before anything
-    /// is offered. Runs on every platform, deliberately: the alternative is a Windows-only code
-    /// path this project's Linux-only suite could never execute.
     #[test]
     fn windows_offers_comspec_and_real_path_hits_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1192,9 +1057,6 @@ mod tests {
         );
     }
 
-    /// The filter is a convenience over real data, never a gate: it narrows on both the name and
-    /// the path, and a query matching nothing yields nothing rather than falling back to
-    /// everything (which would offer suggestions for a custom path the machine has never heard of).
     #[test]
     fn the_suggestion_filter_matches_name_and_path_case_insensitively() {
         let suggestions = vec![
@@ -1229,9 +1091,6 @@ mod tests {
         );
     }
 
-    /// The real production detector on the real machine running this suite: whatever it returns,
-    /// every single entry must be a file that genuinely exists right now. This is the honesty
-    /// claim the whole feature rests on, checked against reality rather than a fixture.
     #[test]
     fn every_really_detected_shell_is_a_file_that_really_exists() {
         for suggestion in detect_installed_shells() {
@@ -1255,9 +1114,6 @@ mod tests {
         }
     }
 
-    /// This project's own CI hosts really do have `/etc/shells` with real shells in it, so the
-    /// production detector must genuinely find some - a detector that always returned an empty
-    /// list would pass every test above without doing anything at all.
     #[cfg(unix)]
     #[test]
     fn real_detection_finds_at_least_one_real_shell_on_this_machine() {
@@ -1277,8 +1133,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #213's advisory found/not-found hint: both real forms a user can type, plus
-    /// the "nothing configured" case that must never be reported as an error.
     #[test]
     fn shell_status_reports_each_real_configured_form_honestly() {
         let fake_path_search =
@@ -1306,8 +1160,6 @@ mod tests {
         );
     }
 
-    /// A path-shaped value is checked against the real filesystem, not searched for on `PATH` -
-    /// exercised against a genuinely existing temp file and a genuinely missing one.
     #[test]
     fn a_path_shaped_shell_is_checked_on_disk_not_on_path() {
         let never_resolves = |_: &str| -> Option<PathBuf> {
@@ -1330,8 +1182,6 @@ mod tests {
         );
     }
 
-    /// The real production resolver, on a real binary this test environment genuinely has -
-    /// proof the injected-resolver tests above aren't only true of the fake.
     #[cfg(unix)]
     #[test]
     fn the_real_path_resolver_finds_a_real_shell() {
@@ -1487,7 +1337,6 @@ mod tests {
 
     #[test]
     fn detect_agent_rows_can_report_mixed_real_and_not_found_status() {
-        // Proves the two rows' statuses are independent, not all-or-nothing.
         let rows = detect_agent_rows(|name| {
             if name == "claude" {
                 Some(PathBuf::from("/usr/bin/claude"))
@@ -1613,13 +1462,6 @@ mod tests {
         assert_eq!(THEME_DEFS[0].name, "Jerry Dark");
     }
 
-    /// The real regression guard for the built-in themes' own identity: `THEME_DEFS` is built at
-    /// runtime from `assets/themes/*.toml`, so this pins the exact names, subtitles and card
-    /// preview swatches those files must produce. The swatch values are the same five each theme
-    /// was originally defined by, before the theme system's rewrite turned them into full literal
-    /// palettes - each generated file carries them forward as its explicit `preview`, so the
-    /// Themes page's cards look exactly as they always have. A single-digit typo in one of those
-    /// files would silently change the app's real appearance, and this is what would catch it.
     #[test]
     fn theme_defs_match_the_documented_exact_names_subtitles_and_preview_swatches() {
         let expected: [(&str, &str, [u32; 5]); 6] = [
@@ -1666,9 +1508,6 @@ mod tests {
         }
     }
 
-    /// Jerry Dark is the real identity theme: its file names no colour overrides at all, because
-    /// every `crate::theme::ColorToken`'s own compiled default *is* Jerry Dark. Every other
-    /// built-in is a full, literal palette that inherits from it.
     #[test]
     fn jerry_dark_overrides_nothing_and_every_other_builtin_is_a_full_palette_based_on_it() {
         let jerry_dark = THEME_DEFS[0].theme;
@@ -1695,11 +1534,6 @@ mod tests {
         }
     }
 
-    /// A hand-edited `settings.toml` from before this refactor persists a built-in theme
-    /// selection purely by its `name` (`crate::settings::store::ThemeSettings::name`'s own docs) -
-    /// this proves that lookup still resolves for every one of the six real names after built-ins
-    /// moved from a `const` array to `assets/themes/*.toml` files, so an existing user's settings
-    /// file keeps loading and resolving exactly as it did before.
     #[test]
     fn every_documented_built_in_theme_name_still_resolves_by_name_lookup() {
         for name in ["Jerry Dark", "Jerry Dim", "Slate", "Ember", "Moss", "Paper"] {
@@ -1710,10 +1544,6 @@ mod tests {
         }
     }
 
-    /// [`lsp_languages`] now derives its length directly from
-    /// `crate::language::settings_lsp_entries` (a real `Vec`, not a fixed-size array), so there is
-    /// no separate count to drift - this just pins the real, current number of settings-row
-    /// languages so a change to that registry is still visible in a test diff.
     #[test]
     fn settings_lsp_entries_count_matches_lsp_languages_len() {
         assert_eq!(
@@ -1722,13 +1552,6 @@ mod tests {
         );
     }
 
-    /// A real proof that [`build_lsp_languages`] (the shape [`lsp_languages`] itself is a thin
-    /// wrapper over) cannot panic in a genuinely mismatched-count scenario - the exact bug class
-    /// the old `std::array::from_fn` + a hardcoded `LSP_LANGUAGES_COUNT` `.expect()` was
-    /// vulnerable to (a fixed-size array assuming an iterator yields exactly N items). This feeds
-    /// a synthetic entry list whose length and `settings_row`-presence doesn't match
-    /// [`crate::language::EXTENSIONS`]'s own real, current size at all (some `Some`, some `None`,
-    /// a different count entirely) and confirms it just filters, never panics.
     #[test]
     fn lsp_languages_never_panics_on_a_mismatched_entry_count() {
         use crate::language::{ExtensionEntry, SettingsLspRow};
@@ -1787,8 +1610,6 @@ mod tests {
         assert!(rows.iter().all(|row| row.status_label() == "not installed"));
     }
 
-    /// Proves [`detect_lsp_rows`] carries the real install URL straight through from
-    /// `crate::language`'s registry - not a second, independently-authored copy that could drift.
     #[test]
     fn detect_lsp_rows_carries_the_real_install_url_from_the_language_registry() {
         let rows = detect_lsp_rows(|_| None);
@@ -1833,7 +1654,6 @@ mod tests {
 
     #[test]
     fn every_registered_global_keybinding_has_a_real_keybindings_page_label() {
-        // The drift guard `action_label`'s docs describe.
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert_eq!(
@@ -1849,14 +1669,6 @@ mod tests {
         );
     }
 
-    /// The real drift guard for the exact bug an audit caught: `KeybindingRow::context` used to
-    /// collapse every scoped predicate down to the single literal `"scoped"`, so two bindings
-    /// that share a command label and keystroke but are scoped to different, mutually-exclusive
-    /// contexts (real, live example: `EditorCopy` bound once under `"file-editor"` and once
-    /// under `"merge-editor"`) rendered as literally indistinguishable rows. Asserts every real
-    /// `(command, context, keystrokes)` triple is unique - this is the actual, real property the
-    /// Keybindings page needs (never two rows a user genuinely cannot tell apart), not just a
-    /// row *count*, which the collision this guards against would not have changed at all.
     #[test]
     fn every_keybinding_row_is_genuinely_distinguishable_from_every_other() {
         let bindings = crate::default_key_bindings();
@@ -1923,7 +1735,6 @@ mod tests {
                 "Editor: extend selection right",
                 "Editor: extend selection up",
                 "Editor: extend selection down",
-                // GitHub issue #27's "Ctrl+Shift+arrows (word-wise)".
                 "Editor: move left one word",
                 "Editor: move right one word",
                 "Editor: extend selection left one word",
@@ -1936,7 +1747,6 @@ mod tests {
                 "Editor: paste",
                 "Editor: save file",
                 "Editor: save file (overwrite external change)",
-                // Multi-cursor (Revision R13, issue #28): Ctrl+D/Ctrl+Shift+L/Ctrl+K Ctrl+D.
                 "Editor: select next occurrence",
                 "Editor: select all occurrences",
                 "Editor: skip occurrence",
@@ -2010,11 +1820,8 @@ mod tests {
                 "Files tree: delete",
                 "Files tree: undo",
                 "Files tree: redo",
-                // GitHub issue #26's `Ctrl+W` - closes the focused tab, scoped `Some("!terminal")`.
                 "Close focused tab",
-                // GitHub issue #20's terminal footer `clear`, scoped `Some("terminal")`.
                 "Terminal: clear",
-                // GitHub issue #158's terminal copy/paste, both scoped `Some("terminal")`.
                 "Terminal: copy selection",
                 "Terminal: paste",
                 // GitHub issue #304's interactive-rebase plan verbs, scoped
@@ -2221,7 +2028,6 @@ mod tests {
             gpui::Keystroke::parse("ctrl-shift-g").unwrap()
         );
 
-        // Every other row must be completely untouched by an override that isn't theirs.
         for other in &rows {
             if other.command == "Go to definition" {
                 continue;
@@ -2230,10 +2036,6 @@ mod tests {
         }
     }
 
-    /// A malformed persisted override (only reachable via a hand-edited `settings.toml`) must
-    /// fall back to the real default keystroke, mirroring
-    /// `keymap_overrides::effective_key_bindings`'s own fallback - the page must never claim a
-    /// keystroke is registered when it genuinely isn't.
     #[test]
     fn a_malformed_override_keystroke_falls_back_to_the_real_default_and_is_not_marked_overridden()
     {
@@ -2285,7 +2087,6 @@ mod tests {
     fn filter_keybinding_rows_matches_command_case_insensitively() {
         let rows = keymap_page_rows();
         let filtered = filter_keybinding_rows(&rows, "PALETTE");
-        // Exactly one row matches - `secondary-p` is the only keystroke bound to TogglePalette.
         assert_eq!(filtered.len(), 1);
         assert!(filtered.iter().all(|row| row.command == "Command palette"));
     }

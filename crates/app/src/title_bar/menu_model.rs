@@ -5,31 +5,6 @@
 //! the Windows/Linux in-window popover ([`crate::title_bar::menu`]) and the real macOS
 //! `NSApp.mainMenu` (`crate::title_bar::native_menu`) so the two surfaces can never silently
 //! drift onto two different command sets (GitHub issue #235).
-//!
-//! Deliberately window-free: no `AdeApp`, no `Context`, no enablement predicate, no click
-//! handler. Those all need live app state this module has no access to (and, for `AdeApp`
-//! itself, importing it back here would be circular - `AdeApp` lives in `crate::root`, which is
-//! *above* `crate::title_bar` in the module tree). This module only answers "what commands exist
-//! and in what order" - `crate::root::menu_commands` layers "is this one enabled right now" and
-//! "what does clicking it actually do" on top, on `AdeApp` itself, not in here.
-//!
-//! ## One enum, one `ALL`, exhaustive matches - not parallel tables
-//!
-//! Same discipline as [`crate::root::menus::MenuSurface`]: a payload-free enum, an exhaustive
-//! `ALL` array in declaration order, and exhaustive `match`es in [`MenuCommand::action`],
-//! [`MenuCommand::label`], and [`MenuCommand::keystroke_spec`] rather than four separately
-//! declared arrays that happen to agree today. Adding a variant here is a compile error in all
-//! three matches until it's really given an action, a label, and a keystroke spec (even if that
-//! spec is `None`) - there is no way for a new command to end up with only some of the three.
-//!
-//! ## `#[allow(dead_code)]` covers only the macOS-only half
-//!
-//! [`MenuCommand::label`]/[`MenuCommand::keystroke_spec`]/[`MenuCommand::rows`] are read by
-//! `crate::title_bar::menu`'s popover on every platform. [`MenuCommand::action`] and
-//! [`MenuCommand::app_menu_rows`] are read only by `crate::title_bar::native_menu`, which is
-//! `#[cfg(target_os = "macos")]` - so on a Linux/Windows build those two genuinely have no call
-//! site at all, which is what this attribute covers. On macOS itself, nothing here is actually
-//! dead.
 #![allow(dead_code)]
 
 use crate::root;
@@ -136,12 +111,6 @@ impl MenuCommand {
     /// The real `gpui::Action` this command dispatches - a fresh boxed instance every call,
     /// matching every other `Box<dyn Action>` call site in this codebase (there is no reusable
     /// singleton to hand back, since `gpui`'s dispatch APIs take ownership).
-    ///
-    /// Reuses the app's already-existing action types wherever one already means exactly this
-    /// (`Save` → [`root::EditorSave`], `CommandPalette` → [`root::TogglePalette`], and so on -
-    /// see this module's own docs for the full "don't duplicate" list) rather than adding a
-    /// second, redundant action type per command; only commands with no existing equivalent got
-    /// a brand new `actions!` entry in `crate::root`.
     pub(crate) fn action(self) -> Box<dyn Action> {
         match self {
             MenuCommand::OpenFile => Box::new(root::OpenFile),
@@ -321,14 +290,6 @@ impl MenuCommand {
     /// only a real `NSApp.mainMenu` can host at all (the Windows/Linux popover has no equivalent
     /// surface for these four, since there is no window-manager-level "hide this app" concept to
     /// wire them to there).
-    ///
-    /// The `Services` submenu that also belongs on this application menu
-    /// (`gpui::MenuItem::os_submenu`) is deliberately not represented as a [`MenuRow`] here: it
-    /// isn't a [`MenuCommand`] at all
-    /// (no label/keystroke/action of its own - the OS populates it), so
-    /// `crate::title_bar::native_menu::native_menus` (a later revision) inserts it directly
-    /// alongside these rows rather than this module inventing a `MenuRow` variant with no real
-    /// content behind it.
     pub(crate) fn app_menu_rows() -> &'static [MenuRow] {
         use MenuRow::{Command, Separator};
         &[
@@ -351,8 +312,6 @@ mod menu_model_tests {
     use std::any::TypeId;
     use std::collections::HashSet;
 
-    /// Every command must have something real to show - an empty label would be a silently
-    /// broken menu row.
     #[test]
     fn every_command_has_a_non_empty_label() {
         for command in MenuCommand::ALL {
@@ -363,9 +322,6 @@ mod menu_model_tests {
         }
     }
 
-    /// No two commands may share one action type - if they did, disabling/dispatching one would
-    /// silently disable/dispatch the other too, since `gpui` keys enablement and dispatch off the
-    /// action's own `TypeId`.
     #[test]
     fn no_two_commands_share_the_same_action_type() {
         let mut seen: HashSet<TypeId> = HashSet::new();
@@ -379,9 +335,6 @@ mod menu_model_tests {
         }
     }
 
-    /// Every real command must appear in at least one real menu - a command declared in
-    /// [`MenuCommand::ALL`] but never placed in any [`MenuCommand::rows`]/
-    /// [`MenuCommand::app_menu_rows`] would be permanently unreachable from any menu.
     #[test]
     fn every_command_appears_in_at_least_one_menu() {
         let mut covered: HashSet<MenuCommand> = HashSet::new();
@@ -406,10 +359,6 @@ mod menu_model_tests {
         }
     }
 
-    /// Regression pin for the File menu's exact row order -
-    /// `crate::title_bar::menu::title_menu_tests::nth_row_click_point`-style tests implicitly
-    /// depend on this order to compute a row's real click point, so a silent reorder here would
-    /// break them in a much more confusing way than this direct assertion does.
     #[test]
     fn file_menu_row_order_matches_the_popover() {
         assert_eq!(

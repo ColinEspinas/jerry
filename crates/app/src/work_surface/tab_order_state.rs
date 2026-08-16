@@ -1,53 +1,5 @@
 //! Real, on-disk persistence for **one worktree's whole tab session** - which tabs were open, of
 //! which kind, in which order - so quitting Jerry and relaunching it brings them all back.
-//!
-//! Started life as GitHub issue #16's drag-order-only store ("the resulting layout... persists per
-//! session/worktree and restores on relaunch"), and still is exactly that for file tabs;
-//! [`WorktreeTabOrder::tabs`] widened it from "the order of whatever happens to be open" into "the
-//! real set of tabs that *were* open", which is what `crate::work_surface::session` needs to
-//! genuinely reopen them. `crate::root::AdeApp::tab_order` remains the live, in-session mirror of
-//! one worktree's order; this module is the durable half.
-//!
-//! ## Why an agent tab *can* be recorded now, when it deliberately couldn't before
-//!
-//! A [`crate::work_surface::state::TabRef::Agent`] carries an
-//! [`crate::work_surface::agents::AgentId`] - a per-window counter that restarts at zero on every
-//! launch, so a freshly-spawned agent can never match a persisted one by id, and this module's
-//! original docs correctly refused to write a value nothing could read back.
-//!
-//! [`SessionTab::Agent`] persists something else entirely: never an id, only the two facts that
-//! genuinely survive a restart - the [`crate::work_surface::agents::AgentKind`] and the real
-//! Claude Code `session_id` (`crate::hooks::event::HookReport::session_id`, GitHub issue #227)
-//! that a literal `claude --resume <session_id>` can pick the same conversation back up from.
-//! A record with no session id is therefore *not* resumable and is honestly dropped at restore
-//! time rather than turned into a fresh, contextless agent occupying the same slot - see
-//! `crate::work_surface::session::AdeApp::restore_worktree_session`'s own docs.
-//!
-//! [`SessionTab::Shell`] carries nothing at all, for the same honesty: a real OS shell process
-//! cannot survive an app quit, so "restoring" one can only ever mean spawning a fresh shell into
-//! the same worktree, in the same tab slot. There is no process-reattachment anywhere in this
-//! codebase to pretend otherwise with.
-//!
-//! ## [`WorktreeTabOrder::files`] is kept, written, and never independently authored
-//!
-//! [`WorktreeTabOrder::tabs`] is authoritative. `files` is issue #16's original field, still
-//! written on every save - derived by the one writer ([`TabOrderState::set_session_tabs`]) from
-//! the very same list - purely so a Jerry build older than this one, sharing a `~/.config/jerry`,
-//! keeps reading a real drag order rather than an empty one. It is read back only when `tabs` is
-//! absent (a file written *by* such a build), which is why the two can never disagree: nothing
-//! ever sets one without setting the other in the same call.
-//!
-//! ## Everything else - file format, atomicity, multi-instance merge - mirrors `fold_state`
-//!
-//! Copied rather than reinvented, matching `crate::rail::repo::RepoState`'s own precedent for
-//! doing the same against this exact module: real crash-safe atomic writes
-//! ([`TabOrderState::save_at`]: a process-unique sibling temp file, `sync_all`, `rename`, a
-//! directory sync), and a merge-not-clobber real write path
-//! ([`TabOrderState::save_merged_at`]) so a second `jerry` instance browsing a different
-//! repository can't erase this one's saved order. See `crate::sidebar::fold_state`'s own module
-//! docs for the full reasoning behind both, which applies here unchanged - including the same
-//! honest limits (an unlocked read-modify-write around the merge; two instances open on the
-//! *same* worktree still last-writer-wins).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -199,10 +151,6 @@ pub const TAB_KIND_AGENT: &str = "agent";
 
 /// One tab, decoded into the form a caller can act on - the read/write currency of this module's
 /// whole session API ([`TabOrderState::session_tabs`]/[`TabOrderState::set_session_tabs`]).
-///
-/// [`Self::File`] carries an **absolute** path (already resolved against the worktree root), so a
-/// caller never has to re-derive one and can never accidentally resolve it against the wrong root;
-/// the relative encoding is this module's own storage detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTab {
     File(PathBuf),
@@ -319,11 +267,6 @@ impl TabOrderState {
     /// actually owns into whatever is currently on disk, then writes the result via
     /// [`Self::save_at`] - identical reasoning to
     /// `crate::sidebar::fold_state::FoldState::save_merged_at`.
-    ///
-    /// GitHub issue #90: wrapped in `crate::persisted_state_lock::with_locked_merge` - see that
-    /// module's own docs for the real intra-process concurrent-writer race "New Window" made
-    /// reachable here, and why one process-wide lock, shared with `crate::rail::repo::RepoState`/
-    /// `crate::sidebar::fold_state::FoldState`'s own identical methods, is enough to close it.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = TabOrderState::load_at(path);
@@ -342,11 +285,6 @@ impl TabOrderState {
     /// error, matching a fresh worktree's own real "nothing recorded yet" state. Individual
     /// records that don't decode are silently skipped ([`PersistedTab::decode`]), so one entry
     /// written by a future release can never cost a user the rest of their session.
-    ///
-    /// Falls back to [`WorktreeTabOrder::files`] when [`WorktreeTabOrder::tabs`] is empty - see
-    /// the module docs: that is exactly a file written by a Jerry build predating the session
-    /// record, whose file tabs are still real, still in the user's real drag order, and still
-    /// worth reopening.
     pub fn session_tabs(&self, root: &Path) -> Vec<SessionTab> {
         let Some(key) = worktree_key(root) else {
             return Vec::new();
@@ -388,16 +326,6 @@ impl TabOrderState {
     /// counterpart to [`Self::session_tabs`], and the **only** writer of either field, which is
     /// what keeps [`WorktreeTabOrder::files`] from ever disagreeing with
     /// [`WorktreeTabOrder::tabs`] (see the module docs).
-    ///
-    /// A [`SessionTab::File`] whose path isn't a plain, UTF-8 descendant of `root` is silently
-    /// dropped from the recorded session rather than refusing the whole call: unlike
-    /// `FoldState::set_expanded`'s single-path calls, this always records a whole worktree's
-    /// session at once, and one unrecordable entry must not lose every other real, recordable one
-    /// alongside it.
-    ///
-    /// An empty result removes the worktree's entry entirely rather than leaving an empty one
-    /// behind forever - the same "closing every tab forgets the worktree" contract this method's
-    /// file-only predecessor already had.
     pub fn set_session_tabs(&mut self, root: &Path, tabs: &[SessionTab]) {
         let Some(root_key) = worktree_key(root) else {
             return;
@@ -617,9 +545,6 @@ mod tests {
         assert_eq!(siblings, vec!["tab-order.toml".to_string()]);
     }
 
-    /// The whole point of the session record: a heterogeneous tab strip - a file, then a shell,
-    /// then a resumable Claude agent - must round-trip through a real file with every kind, every
-    /// payload, and the real interleaved *order* intact.
     #[test]
     fn a_mixed_session_round_trips_through_a_real_file_with_its_order_intact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -646,9 +571,6 @@ mod tests {
         );
     }
 
-    /// A Codex agent never has a session id (no hooks exist for it at all) - the record must still
-    /// round-trip honestly as a Codex agent with `None`, so the restore side can make its own real
-    /// "this one can't be resumed" decision rather than this layer inventing one.
     #[test]
     fn an_agent_with_no_session_id_round_trips_as_exactly_that() {
         let root = Path::new("/repo/worktree-a");
@@ -669,9 +591,6 @@ mod tests {
         );
     }
 
-    /// `files` exists only so an older Jerry build sharing this config directory keeps reading a
-    /// real drag order - it must therefore always be written, and always agree with the file half
-    /// of `tabs`, never be authored separately.
     #[test]
     fn the_legacy_files_field_is_always_written_from_the_same_session_record() {
         let root = Path::new("/repo/worktree-a");
@@ -696,9 +615,6 @@ mod tests {
         assert_eq!(entry.tabs.len(), 3, "and `tabs` keeps the shell as well");
     }
 
-    /// The other half of that compatibility promise: a `tab-order.toml` written *by* such an older
-    /// build has no `tabs` at all, and its file tabs are still real, still in the user's own drag
-    /// order, and must still be restored rather than silently ignored.
     #[test]
     fn a_file_written_before_sessions_existed_still_restores_its_file_tabs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -719,9 +635,6 @@ mod tests {
         );
     }
 
-    /// A record written by a *future* release (an unknown tab kind, or an agent label this build
-    /// doesn't know) must be skipped, never guessed at - and skipping it must not cost the user
-    /// the real tabs recorded around it.
     #[test]
     fn an_unrecognised_record_is_skipped_without_losing_the_real_tabs_around_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -750,8 +663,6 @@ mod tests {
         );
     }
 
-    /// The same traversal guard `files` has always had, applied to a hand-edited `tabs` entry: a
-    /// `..` path must never decode into a file outside the worktree it is filed under.
     #[test]
     fn a_traversal_session_entry_in_a_hand_edited_file_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -777,9 +688,6 @@ mod tests {
         );
     }
 
-    /// A worktree whose whole session is a single unrecordable file (outside the root) must be
-    /// forgotten entirely rather than left with an empty entry - the same contract an explicitly
-    /// empty session already has.
     #[test]
     fn a_session_that_encodes_to_nothing_forgets_the_worktree() {
         let root = Path::new("/repo/worktree-a");

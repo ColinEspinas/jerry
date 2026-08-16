@@ -1,26 +1,5 @@
 //! Real OS-level filesystem watching that backs the worktree sidebar's live refresh (GitHub
 //! issue #12: "the worktrees panel is populated once and never invalidated").
-//!
-//! `git worktree add`/`remove`/`lock` all mutate files under `$GIT_COMMON_DIR/worktrees/**`
-//! (creating/removing each linked worktree's own admin subdirectory, or its `locked` file), and
-//! a branch switch inside *any* worktree rewrites that worktree's own `HEAD` file. For every
-//! linked worktree, that `HEAD` lives inside its own admin subdirectory under
-//! `$GIT_COMMON_DIR/worktrees/<name>/HEAD` - already covered by a single recursive watch on
-//! `worktrees/` itself (`notify`'s recursive mode picks up newly created subdirectories as they
-//! appear, so this doesn't need to be re-armed every time a worktree is added). The *main*
-//! worktree is the one exception: its `HEAD` lives directly at `$GIT_COMMON_DIR/HEAD`, one level
-//! above `worktrees/`, so it needs its own separate, explicit watch.
-//!
-//! Both watches are set up **once**, from `repo_path` alone, when
-//! `crate::root::AdeApp::start_worktree_watch` first runs - multi-repo support is explicitly out
-//! of scope for this feature (see the issue), so `repo_path` never changes over the app's
-//! lifetime and neither does `$GIT_COMMON_DIR`; there is no dynamic per-worktree watch set to
-//! maintain.
-//!
-//! What this can't catch: a worktree's own working-directory being deleted by hand (`rm -rf`)
-//! touches nothing under `$GIT_COMMON_DIR` at all - `crate::root::AdeApp::start_worktree_watch`'s
-//! 5s poll fallback is what notices that case (and is also the sole backstop if watcher setup
-//! itself failed - see [`spawn_worktree_watcher`]'s docs).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,12 +9,6 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Set by the watcher's real OS-thread event callback whenever it observes *any* change under
 /// the watched paths, and cleared by the refresh loop once it has acted on it.
-///
-/// A plain `AtomicBool` rather than a channel of individual events: the refresh loop only ever
-/// asks "has anything changed since I last looked", never *what* changed or *how many* events
-/// fired - which is exactly the coalescing the issue's "a single `git worktree add` touches
-/// several files; collapse to one refresh" debounce requirement wants. Many events between two
-/// checks collapse into the identical single `true`.
 pub type DirtyFlag = Arc<AtomicBool>;
 
 /// Starts a real filesystem watcher for `repo_path`'s worktree admin state (see this module's
@@ -44,19 +17,6 @@ pub type DirtyFlag = Arc<AtomicBool>;
 /// `crate::root::AdeApp::_worktree_watcher`'s own docs) for the OS-level watch to keep running;
 /// dropping the returned value silently stops all notifications with no error of any kind, since
 /// that's simply how the `notify` crate's `Watcher` works.
-///
-/// Returns `None` if `repo_path` isn't inside a git repository at all
-/// (`wt_core::git_common_dir` failing), or if the underlying OS watcher itself couldn't be
-/// constructed - both real, honestly-reported "there is nothing to watch" cases, not treated as
-/// fatal: `crate::root::AdeApp::start_worktree_watch`'s poll fallback still runs regardless, so a
-/// `None` here only means every refresh comes from that timer instead of also being able to fire
-/// early.
-///
-/// A repository that has never had a linked worktree has no `worktrees/` subdirectory yet to
-/// watch (a `notify` watch target must already exist) - this falls back to watching
-/// `$GIT_COMMON_DIR` itself in that case, which still catches `worktrees/`'s own creation (the
-/// first ever `git worktree add`), non-recursively, so it doesn't also start reporting every
-/// object-database write.
 pub fn spawn_worktree_watcher(repo_path: &Path, dirty: DirtyFlag) -> Option<RecommendedWatcher> {
     let common_dir = wt_core::git_common_dir(repo_path).ok()?;
 
@@ -241,9 +201,6 @@ mod tests {
         );
     }
 
-    /// The one case this module's docs call out as needing its own explicit watch, not just the
-    /// `worktrees/` recursive one: a branch switch *in the main worktree itself*, whose `HEAD`
-    /// lives one level up from `worktrees/`.
     #[test]
     fn a_branch_switch_in_the_main_worktree_is_noticed() {
         let repo = init_repo();
@@ -261,8 +218,6 @@ mod tests {
         );
     }
 
-    /// A branch switch inside a *linked* worktree - covered by the recursive `worktrees/` watch
-    /// alone, since that worktree's real `HEAD` lives under there.
     #[test]
     fn a_branch_switch_in_a_linked_worktree_is_noticed() {
         let repo = init_repo();
@@ -300,11 +255,6 @@ mod tests {
         assert!(spawn_worktree_watcher(dir.path(), dirty).is_none());
     }
 
-    /// The fallback path documented on [`spawn_worktree_watcher`]: a repository that has never
-    /// had a linked worktree has no `worktrees/` directory yet for `notify` to watch (it must
-    /// already exist), so this falls back to watching `$GIT_COMMON_DIR` itself - and the very
-    /// first `git worktree add` (which creates `worktrees/`) must still be observed through
-    /// that fallback, not silently missed until the next poll.
     #[test]
     fn the_very_first_worktree_add_in_a_repo_is_still_noticed_via_the_fallback_watch() {
         let repo = init_repo();

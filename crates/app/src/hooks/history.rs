@@ -17,11 +17,6 @@ use crate::work_surface::agents::AgentKind;
 
 /// One closed (or at least not-currently-open) agent's real, persisted state - what a history UI
 /// needs to render a row and, where possible, offer a real resume.
-///
-/// Deliberately does **not** carry a conversation title, a transcript excerpt, or anything else
-/// Phase 2 never captured - see [`crate::hooks::store::PersistedAgentStatus`]'s own field list for
-/// exactly what a hook payload gave Jerry to keep. [`Self::activity`]/[`Self::question`] are the
-/// closest real substitute for "what was it doing" this data actually has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PastAgent {
     /// The persisted record's own key (`crate::review::state::baseline_key`) - stable identity
@@ -58,9 +53,6 @@ pub struct PastAgent {
 }
 
 /// What a run really changed, measured against its own review baseline at the moment it ended.
-///
-/// One struct rather than three loose `Option<u32>`s on [`PastAgent`], because the three are one
-/// measurement: a header printing `6 files` beside `+0 −0` would be reporting half a fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunDiffstat {
     pub files: u32,
@@ -126,14 +118,6 @@ pub fn past_agents(state: &AgentStatusState) -> Vec<PastAgent> {
 
 /// [`past_agents`] filtered to exactly one worktree, and to records that are genuinely *past* -
 /// excluding any key in `live_keys`.
-///
-/// That exclusion matters because a persisted record also exists for an agent that is still
-/// running: `crate::hooks::flow::AdeApp::record_agent_statuses` records every agent with a fresh
-/// hook fact, live ones included, not just closed ones (see that function's own module docs on
-/// why "past" isn't something the store itself can decide). A still-open agent already has a
-/// real, live rail row; showing it again under "History" would be the same agent rendered twice.
-/// `live_keys` is `crate::review::state::baseline_key` for every currently open agent, computed by
-/// the caller from live `Agent` state - this module has no notion of "currently open" itself.
 pub fn past_agents_for_worktree(
     state: &AgentStatusState,
     worktree: &Path,
@@ -162,9 +146,6 @@ mod tests {
         crate::review::state::baseline_key(Path::new(worktree), AgentKind::Claude, spawned)
     }
 
-    /// The real round trip GitHub issue #227's whole read side depends on: a record written
-    /// through `AgentStatusState`'s real save path, reloaded from a real file, and turned into a
-    /// UI-facing `PastAgent` with every field intact.
     #[test]
     fn a_persisted_record_really_round_trips_into_a_past_agent() {
         let dir = tempfile::tempdir().expect("temp dir");

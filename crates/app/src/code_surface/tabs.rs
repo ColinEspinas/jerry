@@ -11,37 +11,6 @@ impl AdeApp {
     /// Loads (or reloads) the diff of `root` against its detected base branch. Runs on
     /// `cx.background_executor()` since `diff_against_base` does blocking I/O (gix reads plus a
     /// spawned `git diff` process) and must not run on the GPUI foreground thread.
-    ///
-    /// Also genuinely re-derives [`Self::staged_files`] from `root`'s real git index
-    /// (`wt_core::stage::staged_paths` - a real `git diff --cached --name-only`), in the same
-    /// background task, rather than caching a per-worktree copy the way
-    /// [`Self::open_files_by_worktree`]/[`Self::edit_buffers`] do: `staged_files` isn't purely
-    /// this app's own state the way an open-tab list is - real git staging can change out from
-    /// under it at any moment (an agent CLI process running its own `git add`/`git reset` in this
-    /// same worktree, exactly the interleaving hazard `wt_core::undo::commit_paths`'s own docs
-    /// already call out), so a cache would need its own invalidation story on top of the one
-    /// `load_diff` already has. Re-querying fresh every time this - the one real chokepoint every
-    /// worktree switch, tree operation, and post-commit reload already runs through - reloads the
-    /// diff is a live mirror of real git state instead, at the cost of one extra fast local `git`
-    /// call per reload. This is also what makes a worktree with something already staged in real
-    /// git *before* Jerry ever opened it read as staged the moment it's loaded, rather than
-    /// starting at an empty, UI-only set the way it used to.
-    ///
-    /// The same background task also re-derives [`Self::dirty_files`]
-    /// (`wt_core::stage::dirty_paths`, a real `git status --porcelain` read) for exactly the same
-    /// reasons, plus one specific to it: `diff_against_base` diffs against the **merge-base with
-    /// the default branch**, so the file list it produces mixes already-committed changes with
-    /// live uncommitted ones, and only this second query can tell them apart (GitHub issue #220 -
-    /// see [`Self::dirty_files`]' own docs). It is reset to `None` ("not known yet") synchronously
-    /// here rather than left holding the outgoing diff's answer, so a stale set can never outlive
-    /// the diff it described.
-    ///
-    /// This is the entry point for every caller whose `root` is a worktree being switched **to**
-    /// (a new window, `Self::select_worktree`, a vanished-worktree recovery). A caller that wants
-    /// the exact same real reload for the worktree *already* showing - `crate::sidebar::render::
-    /// AdeApp::set_right_sidebar_view`'s "switching into Changes always recomputes" - wants
-    /// [`Self::refresh_diff`] instead: see its own docs for why blanking the screen first is
-    /// correct here and wrong there.
     pub(crate) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
@@ -67,25 +36,6 @@ impl AdeApp {
     /// [`Self::uncommitted_diff`]/[`Self::branch_commits`] to `Loading` first, so whatever the
     /// Changes panel is already showing keeps rendering, undisturbed, for the real duration of the
     /// reload - only flipping once the fresh answer actually lands.
-    ///
-    /// That is safe here in a way it is *not* safe for `load_diff`'s own callers: every one of
-    /// those names a worktree that is being switched **to**, so whatever was on screen before
-    /// belongs to a different checkout and showing it a frame longer would be the real cross-
-    /// worktree leak `Self::reset_repo_scoped_state`'s own docs guard against. This method's one
-    /// caller (`crate::sidebar::render::AdeApp::set_right_sidebar_view`) never changes
-    /// `Self::diff_root` at all - it re-reads the *same* worktree that was already showing, so the
-    /// stale-but-still-displayed data is, at worst, a few seconds old for the checkout genuinely on
-    /// screen, never another one's.
-    ///
-    /// This is the same "don't blank a still-good cache while a refresh is in flight" idiom
-    /// `crate::code_surface::state::FileLoadState`'s own docs describe for [`Self::file_view_cache`],
-    /// applied to an always-unconditional refresh rather than a freshness-gated skip, since (unlike
-    /// a single file's mtime) there is no cheap way to tell in advance whether any of these five git
-    /// queries would actually come back different. The live report this fixes: "when going to the
-    /// changes pane it is first empty and then fills up" - `set_right_sidebar_view`'s docs already
-    /// explain *why* every switch into Changes must recompute rather than trust a snapshot (an agent
-    /// may have changed files while the panel wasn't showing); recomputing was never the defect,
-    /// unconditionally blanking the screen to do it was.
     pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
         let root = self.diff_root.clone();
         self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
@@ -180,7 +130,6 @@ impl AdeApp {
                 // The reloaded diff may have changed whether `open_change`'s path has a
                 // `DiffFile`, so refresh the cache immediately rather than leaving it stale.
                 this.refresh_open_diff_file_cache();
-                // The palette's file-candidate list also carries diff marks; rebuild it too.
                 this.rebuild_palette_file_candidates();
                 // GitHub issue #284: the Changes rows read their diffstat off the change set, so
                 // it has to be rebuilt from the same write that replaced the diff it is derived
@@ -206,44 +155,6 @@ impl AdeApp {
     /// terminal path link, and a just-created file. [`Self::open_file_view`] and
     /// [`Self::open_change_diff`] are now thin `view`-choosing wrappers over this, not two
     /// parallel implementations.
-    ///
-    /// It does four things that used to be spread across (or missing from) those callers, and
-    /// they belong together because two of them were genuinely inconsistent:
-    ///
-    /// 1. **Opens the tab** - `push_open_file` + `open_change`, so the tab list can never drift
-    ///    from what's showing, and an already-open path is *reused*, never duplicated.
-    /// 2. **Moves real keyboard focus into the editor** ([`Self::focus_code_surface`]). This is
-    ///    what makes the caret paint at all: `crate::code_surface::editing`'s per-row paint only
-    ///    emits the caret quad when `code_focus_handle.is_focused(window)`, and only registers
-    ///    the real `Window::handle_input` for the caret's own row - so "the next keystroke lands
-    ///    in the buffer" is a consequence of this call, not a separate feature.
-    /// 3. **Reveals and highlights it in the Files tree** - `reveal_in_tree` expands (and
-    ///    persists, issue #18 §5) every ancestor, then `selected_tree_path` highlights the row.
-    /// 4. Drops the per-file caches and popups that belong to whatever was showing before.
-    ///
-    /// Points 2 and 3 are exactly the two halves GitHub issue #15 and the "Reveal in tree selects
-    /// but doesn't open" report were about, and they were previously split: the palette's
-    /// diff-less branch did (3) and neither (1) nor (2) - it revealed and highlighted a row while
-    /// opening nothing and leaving focus wherever it was - while `open_change_diff` did (1) and
-    /// (2) and neither half of (3), so opening a *changed* file from the palette left the tree
-    /// pointing at something else entirely. Having one function do all four is what makes "reveal
-    /// and open are one action" true structurally rather than by convention.
-    ///
-    /// `relative` is the key `open_files`/`open_change`/`edit_buffers` use; `absolute` is the
-    /// real on-disk path, used only for the tree reveal. They are passed separately rather than
-    /// derived one from the other because the two callers resolve against *different* roots -
-    /// see [`Self::open_change_diff`]'s own docs for the real state in which they differ.
-    ///
-    /// `focus_editor` controls point 2 above - `true` for every caller except the Files tree's
-    /// own row click (GitHub issue #105): a click there is a real *selection* gesture the same
-    /// way a folder click already is, and folder clicks have always kept keyboard focus on
-    /// `Self::tree_focus_handle` rather than handing it to the editor. Before this, only file
-    /// rows silently broke that symmetry - `open_and_focus_file` unconditionally moved focus off
-    /// the tree the instant a file was clicked, so every `"file-tree"`-scoped shortcut (`Ctrl+C`/
-    /// `X`/`V`, `F2`, `Shift+F10`) went dead the moment the single most common selection gesture
-    /// happened. `false` never transiently focuses the editor at all (rather than focusing it and
-    /// immediately handing focus back to the tree), so no editor-focus/-blur side effect ever
-    /// fires for a plain tree click.
     fn open_and_focus_file(
         &mut self,
         relative: PathBuf,
@@ -332,18 +243,6 @@ impl AdeApp {
 
     /// Opens `path`'s diff in the centre pane (the Changes row click handler, and a palette file
     /// result for a file that really is in the loaded diff).
-    ///
-    /// `path` is relative to [`Self::diff_root`] here - that is the form `wt_core::diff`'s own
-    /// `DiffFile::path` carries, and the form every caller of this method already holds. It is
-    /// also what `open_files`/`open_change` key by, so it is passed through unchanged.
-    ///
-    /// The absolute path handed to [`Self::open_and_focus_file`] is therefore resolved against
-    /// `diff_root`, **not** `file_tree_root`. The two are normally equal, but they genuinely
-    /// diverge: `crate::merge::flow` and `crate::worktree_history::flow` both call `load_diff`
-    /// with the main repo path while the user has a worktree selected. Resolving against the
-    /// wrong one produced a path that exists nowhere, which `open_and_focus_file` would then have
-    /// revealed and persisted into this worktree's fold state - found by this branch's own
-    /// adversarial audit. That function's own `starts_with` guard is the second half of the fix.
     pub(crate) fn open_change_diff(
         &mut self,
         path: PathBuf,
@@ -427,15 +326,6 @@ impl AdeApp {
     /// [`Self::open_change_diff`]/[`Self::open_file_view`], which open a file that may not have a
     /// tab yet. Calls [`Self::push_open_file`] itself so `open_change` can never point at a path
     /// missing from `open_files`.
-    ///
-    /// Switching to a different tab with a diff resets [`Self::code_view`] to `Diff`, matching a
-    /// freshly opened changed file, rather than inheriting whatever `Diff`/`File` toggle state a
-    /// different file left `code_view` in (it's a single global field, not per-tab).
-    ///
-    /// Re-clicking the already-"active" tab is not always a no-op: the tab can be active without
-    /// being shown (e.g. its diff disappeared after a revert, so [`Self::render_center_pane`]
-    /// falls back to the active agent while the tab strip still marks it active). That case
-    /// falls back to `code_view = File`, which always has content to show.
     pub(crate) fn activate_file_tab(
         &mut self,
         path: PathBuf,
@@ -496,35 +386,6 @@ impl AdeApp {
     /// `path` was the active tab, activates the neighbor to its right, else the one to its left,
     /// else falls back to the active agent's terminal (restoring focus like
     /// [`Self::close_settings`] does). No-op if `path` isn't an open tab.
-    ///
-    /// Cancels any real, in-flight debounced LSP sync/completion-request task for `path` (via
-    /// [`Self::_lsp_sync_tasks`]) and drops a real, stale [`Self::completions`] popup for it, if
-    /// one is open - Revision R8.5b audit finding 3's fix for a real, live-reproduced data-
-    /// corruption bug: without this, a completions popup requested against `path` could survive
-    /// its own tab closing entirely, then resurrect and let stale, wrong-context text be spliced
-    /// into whatever file is active if `path`'s tab (with the same buffer, still held in
-    /// [`Self::edit_buffers`] - this viewer never actually drops a buffer on tab close, only its
-    /// tab entry) is reopened later. The buffer itself is deliberately *not* dropped here (a real
-    /// tab close is not a "discard this file's edits" action - reopening the same path restores
-    /// its real, still-unsaved content), only the completions/sync state tied to the tab that no
-    /// longer exists.
-    /// Real entry point for every real close gesture (GitHub issue #26): the tab strip's `×`,
-    /// middle-click, and the global `Ctrl+W`/[`crate::root::CloseFocusedTab`] action all call this
-    /// instead of [`Self::close_file_tab`] directly, so none of them can bypass the real unsaved-
-    /// changes confirmation below.
-    ///
-    /// A tab whose [`crate::code_surface::edit_buffer::EditBuffer::is_dirty`] is `false` closes
-    /// immediately - there is nothing real to lose (and, per [`Self::close_file_tab`]'s own docs,
-    /// this app doesn't even drop the buffer on an ordinary close - reopening the same path
-    /// restores it - so a prompt there would be friction over nothing). A *dirty* tab needs one
-    /// real confirming gesture on the same `path` first: the first call arms
-    /// [`AdeApp::close_tab_confirm_armed`] (which `crate::work_surface::render`'s tab renderers
-    /// read to show a real, visible "close without saving?" cue - never a silent internal flag
-    /// with no on-screen feedback) and returns without closing anything; a second call while still
-    /// armed for the *same* `path` disarms and really closes it - the same real two-gesture
-    /// idiom [`Self::request_prune`]/[`crate::worktree_history::flow::AdeApp::
-    /// request_discard_worktree`] already establish for this app's other destructive-feeling
-    /// actions, reused here rather than a third, independently-invented confirmation mechanism.
     pub(crate) fn request_close_file_tab(
         &mut self,
         path: PathBuf,
@@ -917,11 +778,6 @@ impl AdeApp {
     /// link in an agent's terminal output. `path` is already resolved against the agent's cwd
     /// (see `crate::terminal::links::resolve`). Reuses [`Self::open_file_at_line`] when the
     /// link carried a line number, else [`Self::open_file_view`].
-    ///
-    /// Unlike every other caller of `open_file_view`, a terminal link's path isn't guaranteed to
-    /// exist: `crate::terminal::links`'s regex is a heuristic over plain text, not a filesystem lookup.
-    /// The synchronous `Path::is_file()` check is affordable here since it runs once per click,
-    /// not per render; without it, a false-positive link would open a permanent junk tab.
     pub(crate) fn open_terminal_link(
         &mut self,
         path: PathBuf,
@@ -959,13 +815,6 @@ impl AdeApp {
     /// [`Self::file_tree_root`] otherwise (`Self::open_and_focus_file`'s own two callers,
     /// [`Self::open_change_diff`]/[`Self::open_file_view`], resolve exactly this way). `None` iff
     /// no file tab is showing at all.
-    ///
-    /// GitHub issue #127: this - not [`Self::selected_tree_path`] - is the Files tree's real
-    /// "which row is the open file" signal, since it stays correct regardless of tree focus and
-    /// survives every way `selected_tree_path` can drift from the centre pane's actual content: a
-    /// directory click (which updates `selected_tree_path` to a path that was never opened at
-    /// all) and switching tabs via the tab strip ([`Self::activate_file_tab`] never touches
-    /// `selected_tree_path`).
     pub(crate) fn open_change_absolute_path(&self) -> Option<PathBuf> {
         let relative = self.open_change.as_ref()?;
         let root = match self.code_view {
@@ -983,13 +832,6 @@ mod code_view_cache_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// A direct wall-clock proof that opening a large file no longer blocks `render_center_pane`
-    /// on the full `load_file` parse: a timing comparison against a synchronous baseline on the
-    /// same file, same machine, same test run (a ratio, not an absolute threshold, so it isn't
-    /// flaky under CI load).
-    ///
-    /// Uses this crate's own `lsp/client.rs` - its largest single source file - as the large
-    /// `.rs` fixture. (It was `root/code_surface.rs` before that file was split into this folder.)
     #[gpui::test]
     fn opening_a_large_real_file_does_not_block_render_on_the_full_parse(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -999,7 +841,6 @@ mod code_view_cache_tests {
                 .expect("read this crate's own lsp/client.rs as a real, large .rs fixture");
         std::fs::write(&file_path, &source).expect("write large.rs");
 
-        // The synchronous baseline: how long the blocking read+parse takes on this machine.
         let baseline_start = std::time::Instant::now();
         code_view::load_file(&file_path).expect("load_file baseline");
         let baseline_duration = baseline_start.elapsed();
@@ -1027,7 +868,6 @@ mod code_view_cache_tests {
              executor and returns immediately, it does not run the parse inline"
         );
 
-        // Drive the background load to completion and confirm the whole file loaded.
         cx.run_until_parked();
         let cached_line_count = app.read_with(cx, |app, _| {
             app.file_view_cache
@@ -1043,11 +883,6 @@ mod code_view_cache_tests {
         );
     }
 
-    /// Confirms two things: (1) the parse happens off the foreground thread - `file_view_cache`
-    /// is still `None` right after the render that kicks off the load, before
-    /// `run_until_parked()` drives it to completion; (2) once loaded, further re-renders reuse
-    /// the cached parse - proven by pointer identity of `ParsedFile::lines`, since a fresh
-    /// `load_file` call would allocate a new `Vec`.
     #[gpui::test]
     fn repeated_renders_of_the_same_open_file_reuse_the_cached_parse(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1075,7 +910,6 @@ mod code_view_cache_tests {
              during render() again"
         );
 
-        // Drives `spawn_file_load`'s background task, and its write-back, to completion.
         cx.run_until_parked();
 
         let first_render_ptr = app.update(cx, |app, cx| {
@@ -1105,10 +939,6 @@ mod code_view_cache_tests {
         }
     }
 
-    /// A content change (different mtime/len) must invalidate the cache - confirms this isn't a
-    /// cache that never refreshes. Sleeps past [`FILE_FRESHNESS_CHECK_INTERVAL`] first, since the
-    /// throttle window itself is covered separately by
-    /// `renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change` below.
     #[gpui::test]
     fn a_real_on_disk_change_to_the_open_file_invalidates_the_cache(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1134,14 +964,12 @@ mod code_view_cache_tests {
                 .len()
         });
 
-        // A content change with more lines than before.
         std::fs::write(
             &file_path,
             "fn add() -> i32 {\n    1\n}\n\nfn subtract() -> i32 {\n    -1\n}\n",
         )
         .expect("rewrite sample.rs");
 
-        // Past the throttle window, so the next freshness check isn't skipped.
         std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
 
         app.update(cx, |app, cx| {
@@ -1166,9 +994,6 @@ mod code_view_cache_tests {
         );
     }
 
-    /// Proves [`AdeApp::file_view_last_freshness_check`]'s throttling: a change made within
-    /// [`FILE_FRESHNESS_CHECK_INTERVAL`] of the last check isn't picked up yet, but the same
-    /// change is picked up once the window passes.
     #[gpui::test]
     fn renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change(
         cx: &mut TestAppContext,
@@ -1196,7 +1021,6 @@ mod code_view_cache_tests {
                 .len()
         });
 
-        // A content change made immediately, within the throttle window.
         std::fs::write(
             &file_path,
             "fn add() -> i32 {\n    1\n}\n\nfn subtract() -> i32 {\n    -1\n}\n",
@@ -1227,7 +1051,6 @@ mod code_view_cache_tests {
             "no reload should have been dispatched while the freshness check was throttled"
         );
 
-        // Past the throttle window - the change is now observed.
         std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -1287,12 +1110,10 @@ mod cross_file_navigation_tests {
             app.render_center_pane(cx);
         });
 
-        // Before B's load resolves, the user opens unrelated file C.
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_c.clone(), window, cx);
         });
         app.update(cx, |app, cx| {
-            // Dispatches C's background load, dropping (and so cancelling) B's in-flight one.
             app.render_center_pane(cx);
         });
         cx.run_until_parked();
@@ -1389,16 +1210,6 @@ mod unreadable_file_tests {
 /// touching the list, and [`AdeApp::close_file_tab`] is the only place a tab leaves the list.
 /// GitHub issue #15's "reopening a previously visited file restores its last caret/scroll
 /// position when known; otherwise caret at 1:1, scrolled to top."
-///
-/// What is actually implemented, stated precisely because the issue's wording is looser than the
-/// mechanism: no scroll *position* is stored anywhere. The buffer's caret is what survives (see
-/// [`AdeApp::edit_buffers`]' own docs), and both the status bar's line indicator and the scroll
-/// are re-derived from it on reopen. For a file whose caret never moved that is exactly "1:1,
-/// scrolled to top"; for one whose caret is on line 400 it is line 400, centred. A file with no
-/// `EditBuffer` at all - truncated past `code_view::MAX_FILE_BYTES`, or not valid UTF-8, both of
-/// which this app deliberately keeps read-only - has no caret to derive from, so the shared
-/// `file_view_scroll_handle` keeps whatever offset the previously shown file left it at. A real,
-/// deliberately unfixed gap rather than an unnoticed one.
 #[cfg(test)]
 mod reopened_file_caret_tests {
     use super::*;
@@ -1423,12 +1234,6 @@ mod reopened_file_caret_tests {
         });
     }
 
-    /// The buffer's caret itself already survived a tab switch (`edit_buffers` deliberately
-    /// outlives a tab close - see that field's docs). What did not was the *visible* half:
-    /// `spawn_file_load`'s completion handler hard-reset `code_cursor` - the status bar's real
-    /// `ln N` indicator - to 1 for any load with no go-to-definition target, so a file reopened
-    /// with its caret on line 4 reported line 1 while the caret really sat on line 4. A visible
-    /// lie about where the next keystroke will land, in the one widget that exists to say so.
     #[gpui::test]
     fn reopening_a_file_reports_its_restored_caret_line_not_line_one(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1464,7 +1269,6 @@ mod reopened_file_caret_tests {
             "premise: a first open really is scrolled to the top"
         );
 
-        // Move the real caret down through the real editor actions.
         app.update_in(cx, |app, window, cx| {
             for _ in 0..200 {
                 app.handle_editor_down_action(&crate::root::EditorDown, window, cx);
@@ -1481,7 +1285,6 @@ mod reopened_file_caret_tests {
         );
         assert_eq!(app.read_with(cx, |app, _| app.code_cursor), Some(201));
 
-        // Switch away and back, which is what makes `spawn_file_load` run again.
         open_and_settle(&app, cx, other);
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(target, window, cx);
@@ -1526,10 +1329,6 @@ mod reopened_file_caret_tests {
         });
     }
 
-    /// The "otherwise" half of the same clause. This one deliberately still passes with the fix
-    /// reverted - it is an over-correction guard, not coverage: it fails only if some future edit
-    /// makes a *first* open report anything but 1:1, which is the direction "always restore the
-    /// buffer's caret" would break if the buffer were ever seeded at a non-zero offset.
     #[gpui::test]
     fn a_first_open_is_caret_at_line_one(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1577,8 +1376,6 @@ mod multi_file_tab_tests {
         ((a, b, c), rel)
     }
 
-    /// Opening the same file twice must not append a second tab - `Self::push_open_file`'s own
-    /// real no-duplicate rule.
     #[gpui::test]
     fn opening_the_same_file_twice_does_not_duplicate_its_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1606,9 +1403,6 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Closing the active tab activates a sensible neighbor: the tab that was to its right first
-    /// - `Self::close_file_tab`'s own documented "prefer right, then left, then fall back to the
-    /// active agent" order.
     #[gpui::test]
     fn closing_the_active_tab_activates_the_tab_that_was_to_its_right(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1669,8 +1463,6 @@ mod multi_file_tab_tests {
         assert!(app.read_with(cx, |app, _| app.open_files().is_empty()));
     }
 
-    /// Closing a tab that is *not* the active one must not change what's currently active - the
-    /// other real half of [`AdeApp::close_file_tab`]'s contract.
     #[gpui::test]
     fn closing_a_non_active_tab_does_not_change_what_is_active(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1685,7 +1477,6 @@ mod multi_file_tab_tests {
             app.open_file_view(b, window, cx);
         });
         cx.run_until_parked();
-        // Reactivate `a` so `b` (opened more recently) is the real non-active tab under test.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(a_rel.clone(), window, cx);
         });
@@ -1706,9 +1497,6 @@ mod multi_file_tab_tests {
         assert_eq!(app.read_with(cx, |app, _| app.open_files().len()), 1);
     }
 
-    /// Clicking an agent tab while a file tab is active deactivates the file (it stops being
-    /// shown) without closing it - it stays in `open_files`, exactly like switching away from a
-    /// browser tab doesn't close it.
     #[gpui::test]
     fn selecting_a_agent_deactivates_the_open_file_tab_without_closing_it(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1752,9 +1540,6 @@ mod multi_file_tab_tests {
         });
     }
 
-    /// [`AdeApp::next_changed_file`]'s "no active file -> first entry, otherwise advance,
-    /// wrapping past the last entry" behavior, against a real git-backed diff so this also
-    /// exercises `Self::current_diff`'s data.
     #[gpui::test]
     fn next_changed_file_advances_through_every_changed_file_and_wraps_around(
         cx: &mut TestAppContext,
@@ -1859,10 +1644,6 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Regression test for "switching tabs shows the wrong Diff/File view": `code_view` is a
-    /// single global field, not per-tab, so switching from a tab left in `File` view to a
-    /// different tab with a diff used to incorrectly stay in `File` view instead of forcing
-    /// `Diff` back.
     #[gpui::test]
     fn switching_to_a_tab_with_a_real_diff_shows_the_diff_not_the_last_view_mode(
         cx: &mut TestAppContext,
@@ -1885,7 +1666,6 @@ mod multi_file_tab_tests {
         let changed_rel = PathBuf::from("changed.txt");
         let plain_abs = repo.path().join("plain.txt");
 
-        // Open the diff file first - lands in Diff view, matching `open_change_diff`'s default.
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(changed_rel.clone(), window, cx);
         });
@@ -1894,7 +1674,6 @@ mod multi_file_tab_tests {
             code_view::CodeView::Diff
         );
 
-        // Open a second, unrelated, unchanged file - forced into File view (no diff).
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(plain_abs, window, cx);
         });
@@ -1921,12 +1700,6 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Regression test for the "active but not actually showing" gap: a file tab can stay
-    /// `open_change`-active even after its diff disappears (e.g. the underlying change was
-    /// reverted), so `render_center_pane`'s `has_diff_or_file_view` check falls back to the
-    /// active agent while the tab strip still paints the file tab as active. Before the fix,
-    /// `activate_file_tab` early-returned as a dead no-op whenever `path` already equalled
-    /// `open_change`, so re-clicking such a tab did nothing.
     #[gpui::test]
     fn reactivating_a_tab_whose_diff_disappeared_shows_real_content_again(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1970,7 +1743,6 @@ mod multi_file_tab_tests {
              show for it"
         );
 
-        // Re-click the same, now-content-less tab - before the fix this was a dead no-op.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(rel, window, cx);
         });
@@ -1982,14 +1754,6 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §3 ("Switching worktrees swaps the whole strip. Each worktree
-    /// remembers its own ... open files") - the real bug this revision fixes: `AdeApp::
-    /// select_worktree` used to clear `open_files` unconditionally on every switch, so a
-    /// worktree's tabs were lost the moment you navigated away. Drives two *real* worktrees
-    /// (temp directories, real `AdeApp::select_worktree` switches, real `open_file_view` calls),
-    /// not the pure free-function `reset_per_worktree_ui_state` unit tests already covering the
-    /// helper in isolation.
     #[gpui::test]
     fn switching_worktrees_and_back_preserves_each_worktree_s_open_file_tabs(
         cx: &mut TestAppContext,
@@ -2039,7 +1803,6 @@ mod multi_file_tab_tests {
         });
         cx.run_until_parked();
 
-        // Two real tabs opened in worktree A.
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a1, window, cx);
         });
@@ -2075,7 +1838,6 @@ mod multi_file_tab_tests {
             "sanity check: worktree B's own real tab should be open"
         );
 
-        // Switching back to worktree A must restore its own two tabs exactly - the real fix.
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
         });
@@ -2087,7 +1849,6 @@ mod multi_file_tab_tests {
              lose them to the switch away and back"
         );
 
-        // And worktree B's own tab must still be there too, untouched by A's own switch back.
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(1, window, cx);
         });
@@ -2135,10 +1896,6 @@ mod stale_completions_popup_tests {
         }
     }
 
-    /// The exact scenario the audit reproduced live: open a completions popup on file A, switch
-    /// to file B, switch back to A - the popup must not resurrect. Exercised via
-    /// [`AdeApp::activate_file_tab`] (the tab-strip click handler), the real code path a real tab
-    /// switch drives.
     #[gpui::test]
     fn switching_tabs_away_and_back_does_not_resurrect_a_stale_completions_popup(
         cx: &mut TestAppContext,
@@ -2167,7 +1924,6 @@ mod stale_completions_popup_tests {
             "sanity check: the seeded popup should genuinely be open for the active file, a"
         );
 
-        // Switch to b - a real, ordinary tab switch, not a close.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(b_rel.clone(), window, cx);
         });
@@ -2178,7 +1934,6 @@ mod stale_completions_popup_tests {
              reproduced bug this fix closes"
         );
 
-        // Switch back to a - the real, load-bearing assertion: no resurrection.
         app.update_in(cx, |app, window, cx| {
             app.activate_file_tab(a_rel, window, cx);
         });
@@ -2190,11 +1945,6 @@ mod stale_completions_popup_tests {
         );
     }
 
-    /// The second half of the audit's own scenario: closing a tab with an open popup, then
-    /// opening a *different* file, must never show or let the user accept stale completions meant
-    /// for the closed file - and, separately, reopening the *same*, closed path later must not
-    /// resurrect it either (the buffer itself survives a tab close - see [`AdeApp::
-    /// close_file_tab`]'s own docs - so the popup must be dropped independently of the buffer).
     #[gpui::test]
     fn closing_a_tab_with_an_open_popup_never_lets_it_resurface_for_another_file(
         cx: &mut TestAppContext,
@@ -2217,7 +1967,6 @@ mod stale_completions_popup_tests {
             cx.notify();
         });
 
-        // Close a's tab while its popup is open.
         app.update_in(cx, |app, window, cx| {
             app.close_file_tab(a_rel.clone(), window, cx);
         });
@@ -2342,8 +2091,6 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// The mod-held-click gesture matters: a bare click on the same link must not navigate, so
-    /// an ordinary click inside the terminal is never silently hijacked into a file navigation.
     #[gpui::test]
     fn a_bare_click_on_a_detected_link_does_not_open_anything(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2368,12 +2115,6 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// The bug `crate::terminal::pane::click_included_secondary_modifier` fixes:
-    /// `gpui::ClickEvent::modifiers()` only reports the modifiers held at mouse-up
-    /// (vendor/zed/crates/gpui/src/interactive.rs, `ClickEvent::modifiers`), so a click sequence
-    /// that releases the modifier just before releasing the mouse button used to silently do
-    /// nothing. Drives mouse-down/mouse-up separately (not `simulate_click`, which holds the
-    /// same modifiers for both) to hold the modifier only at mouse-down.
     #[gpui::test]
     fn mod_held_only_during_mouse_down_still_opens_the_real_file_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2399,13 +2140,9 @@ mod terminal_link_click_tests {
         });
     }
 
-    /// A false-positive class `crate::terminal::links`'s regex can't rule out: a plausible-looking
-    /// path that doesn't exist on disk. `open_terminal_link`'s `Path::is_file()` check must
-    /// refuse it, not open a permanent junk tab.
     #[gpui::test]
     fn mod_click_on_a_link_to_a_nonexistent_path_does_not_open_a_tab(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        // Deliberately never created: `src/` itself doesn't exist in this repo at all.
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);

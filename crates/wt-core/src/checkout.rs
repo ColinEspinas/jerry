@@ -1,14 +1,8 @@
-//! Real git `HEAD`/branch-pointer operations that are *not* history-rewrites: checking out a
-//! commit, creating a branch at a commit, and resetting the current branch's tip - the git graph
-//! row menu's "Check out" / "Create branch here" / Soft-Mixed-Hard reset (GitHub issue #241).
+//! `HEAD` and branch-pointer moves that are not history rewrites: checking out, creating and
+//! renaming branches, and resetting a branch tip.
 //!
-//! Kept in a module of its own rather than folded into [`crate::rewrite`]: every one of
-//! `rewrite`'s cherry-pick/revert/rebase-onto creates or replays a real commit, changing what
-//! some commit *contains*; none of the three functions here ever do that - they only ever move
-//! `HEAD` or a branch ref to point somewhere else. Same real-git-invocation discipline as
-//! `rewrite` throughout: every mutation shells out to a real `git` subprocess and surfaces git's
-//! own real stderr on failure ([`Error::GitCommand`]), nothing simulated or pre-validated beyond
-//! what's needed to avoid a clearly-broken invocation.
+//! Separate from [`crate::rewrite`], whose operations all create or replay a commit; nothing here
+//! changes what any commit contains. Failures surface as git's own stderr, unvalidated.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -16,97 +10,46 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{check_success, run_git};
 
-/// Real `git checkout <commit>` for `worktree_path`: moves `HEAD` (detached) onto `commit`,
-/// leaving the current branch pointer untouched - the row menu's "Check out".
+/// Detaches `HEAD` onto `commit`, leaving the current branch pointer alone.
 ///
-/// `commit` is always a real object id resolved from this app's own graph, never user-typed -
-/// exactly like [`crate::rewrite::cherry_pick`]/[`crate::rewrite::revert`]/
-/// [`crate::rewrite::rebase_onto`]'s own commit arguments - so no `--` terminator is needed to
-/// guard against a flag-shaped value.
-///
-/// Plain `git checkout` already refuses on its own, with its own real, unmodified error, if
-/// switching would silently overwrite modified tracked files; this makes no attempt to pre-check
-/// or second-guess that itself - the worktree is left exactly where the equivalent command-line
-/// invocation would leave it, for the user to resolve.
-///
-/// Performs blocking I/O.
+/// No `--` terminator: `commit` is always an object id resolved from the caller's own graph,
+/// never user-typed. Use [`checkout_branch`] for anything that is.
 pub fn checkout(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["checkout".into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Real `git checkout -b <name> <commit>` for `worktree_path`: creates a new branch named `name`
-/// at `commit` and switches to it in one atomic step - the row menu's "Create branch here".
+/// Creates branch `name` at `commit` and switches to it.
 ///
-/// `name` is genuinely user-typed (the row menu's own inline branch-name prompt), unlike almost
-/// every other string this crate shells out with. It still needs no `--` terminator, unlike
-/// `crate::add_worktree`'s own positional `worktree_path`: `-b`'s argument is always consumed as
-/// `-b`'s own option-value by git's argument parser, never re-parsed as a flag regardless of its
-/// content - confirmed empirically (`git checkout -b --evil <commit>` reports `fatal: '--evil'
-/// is not a valid branch name`, not an unknown-option error) - so there is no positional slot
-/// here for a `--` terminator to protect. A name colliding with an existing branch surfaces as
-/// git's own real [`Error::GitCommand`] (`fatal: a branch named '<name>' already exists`), not
-/// hand-rolled collision detection.
-///
-/// Performs blocking I/O.
+/// `name` is user-typed but needs no `--`: it lands in `-b`'s option-value slot, which git never
+/// re-parses as a flag (`-b --evil` reports "not a valid branch name"). Collisions surface as
+/// git's own error rather than being pre-checked.
 pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["checkout".into(), "-b".into(), name.into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Real `git switch -- <branch>` for `worktree_path`: switches to an existing local branch with
-/// `HEAD` attached to it - the Branches panel's own branch context menu "Checkout Branch"
-/// (GitHub issue #241). Deliberately not [`checkout`]: that function's own docs establish it is
-/// safe *only* because every existing caller passes a commit id resolved from this app's own
-/// graph, never user-typed or taken from a branch listing - a guarantee this new caller (a real
-/// branch name, sourced from the Branches panel's own list, not this app's graph) does not share.
+/// Switches to an existing local branch with `HEAD` attached to it.
 ///
-/// The `--` here is not decorative, and plain `git checkout <branch>` (what [`checkout`] runs)
-/// is not a substitute - live-reproduced: `git checkout --orphan` (no branch of that name exists
-/// or ever could, since git itself refuses to create one starting with `-`) is parsed as the
-/// real `--orphan` *flag*, not refused as an unknown branch, because `checkout`'s argument
-/// parser inspects a leading positional for flag-shaped text before it is ever resolved as a
-/// ref. `git switch` has no pathspec overload the way `checkout` does, so `--` here keeps its
-/// ordinary "end of options" meaning without changing what gets checked out (unlike `checkout --
-/// <ref>`, which would instead try to check out `<ref>` as a *file path*): `git switch --
-/// --orphan` is refused honestly (`fatal: invalid reference: --orphan`), and `git switch --
-/// <real-branch>` switches to it exactly like a bare `git switch <real-branch>` would.
-///
-/// A branch that doesn't exist, or a real failure switching (uncommitted changes that would be
-/// overwritten), surfaces as git's own real stderr through [`Error::GitCommand`] - the same
-/// no-pre-checking discipline every mutation in this module follows.
-///
-/// Performs blocking I/O.
+/// `switch --`, not [`checkout`], because `branch` comes from a branch listing rather than the
+/// caller's graph: `git checkout --orphan` parses as the `--orphan` flag rather than as an
+/// unknown branch. `switch` has no pathspec overload, so `--` keeps its plain end-of-options
+/// meaning here - unlike `checkout -- <ref>`, which would look for a *file* by that name.
 pub fn checkout_branch(worktree_path: &Path, branch: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["switch".into(), "--".into(), branch.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Real `git branch -m <old_name> <new_name>` for `worktree_path`: renames an existing local
-/// branch, keeping its tip commit, its reflog and its upstream configuration - the Branches
-/// panel's own branch context menu "Rename Branch…" (GitHub issue #241).
+/// Renames a local branch, keeping its tip, reflog and upstream configuration.
 ///
-/// `new_name` is genuinely user-typed (the same hand-rolled prompt [`create_branch_at`] uses), so
-/// the `--` terminator here is **mandatory**, not decorative - unlike [`create_branch_at`], whose
-/// name lands in `-b`'s own option-value slot and so can never be re-parsed as a flag. `git branch
-/// -m`'s arguments are ordinary positionals, and git's `parse-options` really does consume a
-/// flag-shaped one as an option: live-reproduced on git 2.43 against a real repository, `git
-/// branch -m feature --force` exits **0** having parsed `--force` as `-M`, renaming the
-/// *currently checked-out* branch on top of `feature` and destroying both refs - reported to the
-/// caller as a successful rename. With `--` in front, that same invocation is refused honestly
-/// (`fatal: '--force' is not a valid branch name`, exit 128).
+/// The `--` is mandatory here, unlike in [`create_branch_at`]: these are ordinary positionals, and
+/// `git branch -m feature --force` otherwise parses `--force` as `-M`, exits 0, and destroys both
+/// refs by renaming the checked-out branch over `feature`. With `--` it is refused.
 ///
-/// Nothing else is pre-validated: a `new_name` that already exists (`fatal: a branch named
-/// '<name>' already exists`) or is not a legal ref name surfaces as git's own real stderr through
-/// [`Error::GitCommand`], exactly like [`create_branch_at`]'s own collision handling. Renaming the
-/// branch that is currently checked out is *not* a special case either - git itself moves `HEAD`
-/// onto the new name, which is the correct behaviour and is proven directly by this module's own
-/// tests.
-///
-/// Performs blocking I/O.
+/// Renaming the checked-out branch is not a special case; git moves `HEAD` onto the new name.
 pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec![
         "branch".into(),
@@ -119,32 +62,17 @@ pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Re
     check_success(&args, &output)
 }
 
-/// Real `git branch -d <name>` for `worktree_path`: the **safe** delete - the Branches panel's
-/// own branch context menu "Delete Branch…" (GitHub issue #241).
+/// `-d`, never `-D`: git refuses an unmerged branch, and one checked out in any worktree. Neither
+/// refusal is pre-checked; both surface as git's own stderr.
 ///
-/// Deliberately `-d`, never `-D`: git itself refuses to delete a branch whose commits are not
-/// already merged into its upstream or into `HEAD` (`error: the branch '<name>' is not fully
-/// merged`), and refuses to delete a branch that is checked out in *this* or any other worktree
-/// of the repository (`error: cannot delete branch '<name>' used by worktree at '<path>'`). Neither
-/// refusal is pre-checked here - both surface as git's own real stderr via [`Error::GitCommand`],
-/// matching every other mutation in this module. The UI layer's own two-click confirmation (see
-/// `app::graph_view`'s `GraphTabState::delete_branch_confirm_armed`) is about the user's intent,
-/// not about second-guessing git's own safety rules.
-///
-/// Carries the same mandatory `--` terminator [`rename_branch`] documents: `name` reaches here
-/// from this app's own branch list rather than a text field, but it is the same ordinary
-/// positional slot, and one `--` is cheaper than depending on that provenance never changing
-/// (`git branch -d -- --evil` reports `error: branch '--evil' not found`, never an option parse).
-///
-/// Performs blocking I/O.
+/// Carries the same mandatory `--` as [`rename_branch`], for the same positional-parsing reason,
+/// rather than depending on `name`'s provenance never changing.
 pub fn delete_branch(worktree_path: &Path, name: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["branch".into(), "-d".into(), "--".into(), name.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// The three real `git reset` modes the row menu's "Reset" section offers - see [`reset`]'s own
-/// docs for what each really does to the working tree/index/branch tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
     Soft,
@@ -162,22 +90,12 @@ impl ResetMode {
     }
 }
 
-/// Real `git reset --soft|--mixed|--hard <commit>` for `worktree_path`: moves the current
-/// branch's tip to `commit` - the row menu's "Reset" section.
+/// - [`ResetMode::Soft`] leaves index and working tree alone, so the difference ends up staged.
+/// - [`ResetMode::Mixed`] resets the index only, so it ends up unstaged.
+/// - [`ResetMode::Hard`] resets both, discarding uncommitted changes outright. Destructive;
+///   confirming it is the caller's job.
 ///
-/// - [`ResetMode::Soft`] leaves the index and working tree exactly as they were: every
-///   difference between the old tip and `commit` ends up staged.
-/// - [`ResetMode::Mixed`] (git's own default) resets the index to match `commit` but leaves the
-///   working tree untouched: those differences end up unstaged instead.
-/// - [`ResetMode::Hard`] resets both the index *and* the working tree to `commit`, discarding any
-///   uncommitted changes outright - genuinely destructive, which is why the row menu only ever
-///   reaches this for `Hard` after its own two-click confirmation
-///   (`GraphTabState::hard_reset_confirm_armed`), never on a first click.
-///
-/// `commit` is always a real object id resolved from this app's own graph, never user-typed -
-/// exactly like [`checkout`] above - so no `--` terminator is needed.
-///
-/// Performs blocking I/O.
+/// No `--` terminator, for the same reason as [`checkout`]: `commit` is never user-typed.
 pub fn reset(worktree_path: &Path, mode: ResetMode, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["reset".into(), mode.flag().into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
@@ -268,8 +186,6 @@ mod tests {
         git(repo.path(), &["checkout", "-b", "other"]);
         commit(repo.path(), "a.txt", "other branch content", "other change");
         git(repo.path(), &["checkout", "main"]);
-        // An uncommitted change to the same file that genuinely conflicts with what "other"
-        // holds - real git refuses to silently clobber it.
         fs::write(repo.path().join("a.txt"), "uncommitted dirty content").expect("write");
 
         let result = checkout(repo.path(), "other");
@@ -383,13 +299,6 @@ mod tests {
         }
     }
 
-    /// The whole reason [`checkout_branch`] exists rather than reusing [`checkout`]: a
-    /// flag-shaped string in this positional slot must be refused as an invalid reference, never
-    /// silently parsed as an option to `git switch` itself. No branch actually named `--orphan`
-    /// can exist (git refuses to create one), so this proves the refusal is the *safe* one
-    /// (`fatal: invalid reference`) rather than [`checkout`]'s own real failure mode reproduced in
-    /// this module's docs (`--orphan` consumed as a flag, `error: option 'orphan' requires a
-    /// value`).
     #[test]
     fn checkout_branch_refuses_a_flag_shaped_name_instead_of_parsing_it_as_an_option() {
         let repo = init_repo();
@@ -490,11 +399,6 @@ mod tests {
         );
     }
 
-    /// A live-reproduced data-loss path this function's `--` terminator exists to close, not a
-    /// hypothetical: on git 2.43, `git branch -m feature --force` (no terminator) exits **0**,
-    /// having parsed `--force` as `-M` and renamed the *currently checked-out* branch on top of
-    /// `feature` - destroying both refs while reporting success. The rename prompt's name is
-    /// genuinely user-typed, so this is reachable by typing it.
     #[test]
     fn rename_branch_refuses_a_flag_shaped_name_instead_of_destroying_two_refs() {
         let repo = init_repo();
@@ -534,8 +438,6 @@ mod tests {
         );
     }
 
-    /// The same terminator, on the delete side - `name` comes from this app's own branch list
-    /// today, so this pins the guard rather than a live bug.
     #[test]
     fn delete_branch_treats_a_flag_shaped_name_as_a_branch_name_not_an_option() {
         let repo = init_repo();
@@ -564,7 +466,7 @@ mod tests {
     fn delete_branch_really_removes_a_fully_merged_branch() {
         let repo = init_repo();
         commit(repo.path(), "a.txt", "base", "base");
-        // A branch pointing at the current tip - fully merged by construction, which is exactly
+        // A branch at the current tip: fully merged by construction, which is exactly
         // what `git branch -d` is willing to remove.
         git(repo.path(), &["branch", "merged-branch"]);
 

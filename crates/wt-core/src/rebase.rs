@@ -1,143 +1,13 @@
-//! Real, headless `git rebase --interactive` - GitHub issue #242 phase A: the engine only, no
-//! UI. Every mutation shells out to a real `git rebase` subprocess and drives it non-interactively
-//! via `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`, exactly the mechanism a human's `$EDITOR` would be
-//! invoked through, just pointed at scripts this module writes instead. All of the mechanics
-//! below were verified empirically against a real `git` (2.43.0) before being committed to; see
-//! each function's docs for what was tested and why the alternative it replaced didn't work.
+//! Headless `git rebase --interactive`: the engine, with no UI.
 //!
-//! ## The six real rebase actions, and which ones stop
+//! Real `git rebase` driven non-interactively through `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` - the
+//! same hooks a human's `$EDITOR` goes through, pointed at scripts this module writes. See
+//! `docs/architecture/decisions.md` §7 for the mechanism and why each part of it is load-bearing.
 //!
-//! [`RebaseAction`] models git's own `pick`/`reword`/`edit`/`squash`/`fixup`/`drop` todo verbs,
-//! plus one addition on top of plain git: [`RebaseAction::Reword`] carries an
-//! `Option<String>` - a pre-supplied replacement message. Plain `git rebase -i` always stops to
-//! invoke `$EDITOR` for every `reword` step; this module's headless `GIT_EDITOR` script supplies
-//! the message itself when one was given, so most rewords never have to stop at all. `pick`,
-//! `squash`, `fixup`, and `drop` never stop for a message on their own - a `squash` step's
-//! message-combination editor invocation always accepts git's own default (both original
-//! messages, unmodified), and `fixup` never invokes the message editor at all (git's own
-//! behavior, verified below). `edit` always stops (git's native behavior, no editor involved).
-//! `reword` with no supplied message also stops - empirically, this behaves *identically* to
-//! `edit` at every level of git's own on-disk state (same `stopped-sha`, same `REBASE_HEAD`, same
-//! "nothing to commit, working tree clean" with `HEAD` left at the picked-but-not-yet-amended
-//! commit) rather than needing a special "waiting for a message" mechanism: git's own message
-//! editor for that step is made to fail (see [`write_editor_script`]'s docs), and git's real
-//! response to an editor failure during `reword` is to leave the commit exactly where `edit`
-//! would. [`RebasePlanEntry`]'s own plan (built by the caller, in oldest-first order - the same
-//! order git's own generated todo uses) is persisted alongside git's own rebase state (see
-//! below) so a later stop can be cross-referenced back to "was this row `edit`, or a
-//! message-less `reword`" for [`RebaseOutcome::StoppedForEdit`]'s `reason` field, even across a
-//! process restart - git itself has no way to tell the two apart once stopped.
+//! Sidecar state lives under `<git-dir>/ade-rebase/` until the rebase completes or aborts, so
+//! [`rebase_status`] can reconstruct a stop after a process restart.
 //!
-//! ## Driving the todo list: `GIT_SEQUENCE_EDITOR`
-//!
-//! `git rebase -i <onto>` generates its own default todo (one `pick <sha> <subject>` line per
-//! commit, oldest first - confirmed empirically), writes it to a temp file, then invokes
-//! `$GIT_SEQUENCE_EDITOR <path-to-that-file>` once to let the invoked program rewrite it.
-//! [`write_plan_state`] writes this module's own plan to a file and sets
-//! `GIT_SEQUENCE_EDITOR="cp <path>"`; git splices that value verbatim into `sh -c "<value>
-//! \"$@\""` (confirmed empirically: a `cat`-as-sequence-editor genuinely dumped the *real*
-//! generated todo to stdout, proving both the default todo's shape and this invocation form), so
-//! a plain `cp` really does copy this module's plan over git's own generated file - no bespoke
-//! script needed here, unlike `GIT_EDITOR` below. `pick <sha>`/`drop <sha>` with no subject text
-//! at all was also confirmed to work (git only inspects the verb and the object id; the rest of
-//! the line is cosmetic), so this module's todo lines never bother including one.
-//!
-//! Because the value is spliced unquoted into a shell command line, a path containing a space (a
-//! real, already-tested case elsewhere in this crate - see
-//! [`crate::parse_worktree_list_porcelain`]'s "My Projects" test) would otherwise be silently
-//! word-split and break the injected command; [`shell_single_quote`] POSIX-single-quotes every
-//! path embedded into these env var values, and this was verified end-to-end against a real
-//! rebase run from a worktree path containing a space with a plan file *also* under a
-//! space-containing path.
-//!
-//! ## Driving messages: `GIT_EDITOR`
-//!
-//! `GIT_EDITOR` is invoked for every step that needs a real commit-message edit: `reword`'s own
-//! message, `squash`'s message-combination step, and - this was **not** anticipated up front,
-//! only found by testing a real conflict mid-rebase - a plain `pick` (or any other step) that hit
-//! a real conflict and is being finished via `git rebase --continue`. That last case goes through
-//! git's ordinary `git commit` codepath (unlike a clean `pick`, which never invokes an editor at
-//! all), which opens the message editor pre-filled with the original message. If this module's
-//! script mishandled that case, it would misinterpret an ordinary conflict-resume as a `reword`
-//! step and consume a queued message meant for a *later* real `reword` - a real, empirically
-//! reproduced bug during development of this module (see the "cascading conflicts before a
-//! reword" test below, which specifically guards against a queue-index regression here).
-//!
-//! [`write_editor_script`] resolves each invocation into exactly one of three cases by reading
-//! the message file git hands it, matched by content, not by invocation order (per this module's
-//! own design goal of never guessing blindly):
-//! 1. The file's first line is `# This is a combination of ...` (git's own fixed boilerplate,
-//!    confirmed to appear on every squash message-combination invocation and no other) - accept
-//!    the file completely unmodified and exit `0`.
-//! 2. The file contains the line `You are currently editing a commit` (confirmed to appear on
-//!    every real `reword` invocation, and *no* other case - a squash-combination invocation says
-//!    "rebasing branch", not "editing a commit") - pop the next slot from this rebase's own
-//!    ordered reword-message queue (see below). If a message was queued there, overwrite the file
-//!    with it and exit `0`. If nothing was queued (a message-less `reword`), exit non-zero,
-//!    which reproduces `edit`'s own stop exactly (confirmed empirically).
-//! 3. Anything else (a conflict-resumed `pick`/`fixup`/`drop`/`squash`, or any other case this
-//!    module doesn't have a specific reason to touch) - accept the file exactly as git pre-filled
-//!    it and exit `0`, *without* touching the reword queue's cursor at all. Confirmed empirically
-//!    that this branch really is reached for a conflict-resumed `pick`, and that leaving the
-//!    cursor untouched there is what keeps a later real `reword` in the same rebase pointed at
-//!    the right queue slot.
-//!
-//! ## The reword-message queue
-//!
-//! Because `GIT_EDITOR` may be invoked again on a later `git rebase --continue`/`--skip` call -
-//! a separate process invocation, possibly after this application itself restarted - the queue
-//! can't just live in this process's memory. [`write_plan_state`] persists it as one plain file
-//! per queued message (`queue/<n>` for the `n`-th `reword` row in the plan, 0-indexed among
-//! `reword` rows only; a message-less `reword` simply has no file at its slot) plus a `cursor`
-//! file the script itself advances, all inside this rebase's own state directory (see below) -
-//! deliberately plain files, not JSON, so the `GIT_EDITOR` script (itself just `/bin/sh`) never
-//! needs a JSON parser.
-//!
-//! ## Where this module's own state lives
-//!
-//! Everything this module writes (the plan's todo file, the `GIT_EDITOR` script, the reword
-//! queue, and a `commits.txt` cross-reference of each plan row's own commit id and action) lives
-//! under `<git-dir>/ade-rebase/`, where `<git-dir>` is *this worktree's own* private
-//! administrative directory (`git rev-parse --git-dir`, confirmed to resolve to the
-//! worktree-specific `<common-dir>/worktrees/<name>` for a linked worktree, not the shared common
-//! dir - each worktree has its own independent rebase state, so this module's own sidecar state
-//! must be equally worktree-specific). This directory persists for exactly as long as the rebase
-//! itself is stopped (removed on [`RebaseOutcome::Completed`] and on [`abort_rebase`]), so
-//! [`rebase_status`] can recover it - including [`RebaseOutcome::StoppedForEdit`]'s `reason` -
-//! after a real process restart mid-rebase, without the caller needing to hold the original plan
-//! in memory.
-//!
-//! ## Detecting conflicts vs. deliberate stops
-//!
-//! After driving `git rebase` (via [`start_interactive_rebase`], [`continue_rebase`], or
-//! [`skip_rebase_commit`]), a non-zero exit means either a real conflict or a deliberate stop
-//! (`edit`, or the `GIT_EDITOR` script's own non-zero exit for a message-less `reword`).
-//! `git diff --name-only --diff-filter=U` (pinned to `core.quotePath=false`, exactly
-//! [`crate::merge`]'s own convention) distinguishes the two: non-empty means a real conflict
-//! ([`RebaseOutcome::StoppedForConflict`]); empty, with `.git/rebase-merge/stopped-sha` present,
-//! means a deliberate stop ([`RebaseOutcome::StoppedForEdit`]) - both were confirmed empirically
-//! to populate `stopped-sha` identically, so it's read unconditionally and only the conflict
-//! check decides which outcome to report. Neither present is a genuine, unexpected failure,
-//! surfaced as [`Error::GitCommand`] with git's own real stderr, matching every other module in
-//! this crate.
-//!
-//! ## Not resolving conflicts itself
-//!
-//! Matches [`crate::rewrite`]'s own documented convention: a real conflict leaves the worktree in
-//! exactly the state the equivalent command-line `git rebase -i` would (conflict markers,
-//! `REBASE_HEAD`, `.git/rebase-merge/`), for the caller to resolve through this app's own
-//! conflict-resolution surface or a real terminal - never silently rolled back, never
-//! auto-resolved.
-//!
-//! ## Platform
-//!
-//! This module's `GIT_EDITOR` script is a POSIX `/bin/sh` script; it is only ever exercised on
-//! Unix-like platforms in this crate's own tests, matching [`crate::error::GitExit`]'s own
-//! existing Unix-only signal handling. On a platform with no `/bin/sh` this would surface as a
-//! real `git`/spawn failure rather than silently misbehaving.
-//!
-//! Performs blocking I/O everywhere in this module (shells out to `git`, writes real files under
-//! `.git/`); see the crate-level docs on offloading this to a background thread.
+//! Unix-only: the editor script is `/bin/sh`. Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::fs;
@@ -146,33 +16,25 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, GitExit};
 use crate::{absolutize, check_success, format_args, git_command, run_git};
 
-/// One of git's own six interactive-rebase todo verbs, plus Jerry's own pre-supplied-message
-/// addition to `reword` - see the module docs.
+/// One of git's six interactive-rebase todo verbs, with a pre-supplied message added to `reword`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseAction {
     Pick,
-    /// `git rebase -i`'s `reword`. `Some(message)` supplies the replacement message up front,
-    /// so this row runs straight through with no stop; `None` behaves exactly like
-    /// [`RebaseAction::Edit`] - a real, deliberate stop (see the module docs for why this is
-    /// implemented as "let git's own message editor fail" rather than a bespoke waiting state).
+    /// `Some(message)` runs straight through with no stop; `None` stops exactly as
+    /// [`RebaseAction::Edit`] does, by letting git's message editor fail.
     Reword(Option<String>),
-    /// Always stops after applying the commit, before the next step - git's own native
-    /// behavior, no editor involved.
+    /// Always stops after applying the commit; git's native behaviour, no editor involved.
     Edit,
-    /// Folds this commit into the previous row's commit. The combined message is always git's
-    /// own default (both original messages, unmodified); this module never stops to let a
-    /// caller edit it.
+    /// Folds into the previous row, always keeping git's default combined message.
     Squash,
-    /// Folds this commit into the previous row's commit, discarding this commit's own message
-    /// entirely (keeps only the previous row's). Never invokes a message editor at all - git's
-    /// own behavior, confirmed empirically.
+    /// Folds into the previous row, discarding this commit's message. Never opens an editor.
     Fixup,
     /// Removes this commit from history entirely.
     Drop,
 }
 
 impl RebaseAction {
-    /// The literal verb git's own interactive-rebase todo format expects.
+    /// The literal verb git's todo format expects.
     fn todo_verb(&self) -> &'static str {
         match self {
             RebaseAction::Pick => "pick",
@@ -184,9 +46,8 @@ impl RebaseAction {
         }
     }
 
-    /// The tag persisted in `commits.txt` for this row - see [`lookup_stop_reason`]. Distinct
-    /// from [`Self::todo_verb`] only for `Reword`, where the message's presence matters for
-    /// cross-referencing a later stop.
+    /// The tag persisted in `commits.txt`. Differs from [`Self::todo_verb`] only for `Reword`,
+    /// where a later stop must be cross-referenced against whether a message was supplied.
     fn state_tag(&self) -> &'static str {
         match self {
             RebaseAction::Pick => "pick",
@@ -200,69 +61,54 @@ impl RebaseAction {
     }
 }
 
-/// One row of an interactive rebase plan: a real commit id, and what to do with it. A full plan
-/// (`&[RebasePlanEntry]`) is given oldest-first, the same order git's own generated todo uses -
-/// see [`start_interactive_rebase`].
+/// One row of a rebase plan. A full plan is given oldest-first, matching git's generated todo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebasePlanEntry {
-    /// A real object id (full, not abbreviated - this module always resolves/accepts full ids,
-    /// confirmed to work directly in git's own todo format).
+    /// A full object id, not abbreviated.
     pub commit: String,
     pub action: RebaseAction,
 }
 
-/// Why a real stop reported as [`RebaseOutcome::StoppedForEdit`] happened, cross-referenced
-/// against this rebase's own persisted plan (see the module docs) purely for a future UI's
-/// pause-column semantics - git itself treats both cases identically on disk. `None` when the
-/// stopped commit's own row couldn't be found in the persisted plan (e.g. this rebase's state
-/// directory was already cleaned up, or the in-progress rebase wasn't started by this module at
-/// all) - deliberately not fabricated to `Some(StopReason::Edit)` as a default.
+/// Why a [`RebaseOutcome::StoppedForEdit`] happened, recovered from the persisted plan - git
+/// treats both cases identically on disk.
+///
+/// `None` when the stopped commit is not in the plan (state already cleaned up, or the rebase was
+/// not started by this module), never defaulted to [`StopReason::Edit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// The stopped commit's own plan row was [`RebaseAction::Edit`].
+    /// The stopped row was [`RebaseAction::Edit`].
     Edit,
-    /// The stopped commit's own plan row was [`RebaseAction::Reword`] with no supplied message.
+    /// The stopped row was [`RebaseAction::Reword`] with no supplied message.
     RewordNeedsMessage,
 }
 
-/// The real result of driving one `git rebase` invocation
-/// ([`start_interactive_rebase`]/[`continue_rebase`]/[`skip_rebase_commit`]).
+/// The result of driving one `git rebase` invocation.
 ///
-/// There is deliberately no `Aborted` variant here: [`abort_rebase`] is its own, separately
-/// fallible operation (`Result<(), Error>`) rather than one more outcome of driving a step - it
-/// doesn't "drive" anything forward the way the other three do, so folding it into this enum
-/// would suggest a continuity ("aborted, but still mid-plan-at-row-N") that doesn't really exist
-/// once `git rebase --abort` has run.
+/// No `Aborted` variant: [`abort_rebase`] does not drive the plan forward, and folding it in here
+/// would imply a continuity that does not survive `git rebase --abort`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseOutcome {
-    /// The whole plan applied with no stops remaining. This module's own state directory has
-    /// already been cleaned up by the time this is returned.
+    /// The whole plan applied; the state directory is already cleaned up.
     Completed,
-    /// A deliberate, non-conflict stop: either an [`RebaseAction::Edit`] row, or a
-    /// message-less [`RebaseAction::Reword`] row. `commit` is the real object id (as it
-    /// appeared in the original plan) of the stopped row. Resolve with [`continue_rebase`]
-    /// (after e.g. `git commit --amend`) or [`skip_rebase_commit`], exactly as the
-    /// command-line workflow would.
+    /// A deliberate, non-conflict stop at an `edit` or message-less `reword` row. Resolve with
+    /// [`continue_rebase`] or [`skip_rebase_commit`], as the command line would.
     StoppedForEdit {
         commit: String,
         reason: Option<StopReason>,
     },
-    /// A real conflict: the worktree is left with real conflict markers and `REBASE_HEAD`, for
-    /// the caller to resolve through this app's own conflict-resolution surface or a real
-    /// terminal - see the module docs. `commit` is the real object id of the commit that failed
-    /// to apply.
+    /// A conflict: the worktree keeps its markers and `REBASE_HEAD` for the caller to resolve.
+    /// `commit` is the commit that failed to apply.
     StoppedForConflict {
         commit: String,
         conflicted_files: Vec<PathBuf>,
     },
 }
 
-/// The real, on-disk state of an interactive rebase that's currently stopped mid-flight, as
-/// read directly from git's own `.git/rebase-merge/` (plus this module's own persisted plan
-/// cross-reference, when available) - not a cache of anything this process remembers, so this
-/// reflects reality even after a real process restart. Every field besides `conflicted_files` is
-/// `Option`/best-effort rather than fabricated: a field git's own state files don't currently
-/// expose (or that this module's own state directory can't corroborate) is `None`, never guessed.
+/// The on-disk state of a rebase stopped mid-flight, read from `.git/rebase-merge/` rather than
+/// cached, so it survives a process restart.
+///
+/// Every field but `conflicted_files` is `None` when git's own state files do not expose it,
+/// never guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebaseStatus {
     /// The commit the rebase is replaying onto (`.git/rebase-merge/onto`), if readable.
@@ -271,34 +117,26 @@ pub struct RebaseStatus {
     pub current_step: Option<usize>,
     /// Total number of steps in the plan (`.git/rebase-merge/end`), if readable.
     pub total_steps: Option<usize>,
-    /// The real object id of the commit currently stopped at (`.git/rebase-merge/stopped-sha`),
-    /// if any - present for both a deliberate stop and a real conflict.
+    /// The commit stopped at, present for both a deliberate stop and a conflict.
     pub stopped_commit: Option<String>,
-    /// Files with real, unresolved `<<<<<<</=======/>>>>>>>` conflict markers, if any. Non-empty
-    /// here is what distinguishes a real conflict from a deliberate stop.
+    /// Unresolved conflicted files. Non-empty is what distinguishes a conflict from a stop.
     pub conflicted_files: Vec<PathBuf>,
-    /// Why the stop is deliberate (not a conflict) - see [`StopReason`]. Always `None` when
-    /// `conflicted_files` is non-empty.
+    /// Always `None` when `conflicted_files` is non-empty.
     pub stop_reason: Option<StopReason>,
 }
 
-/// This module's own sidecar state directory name, nested under a worktree's private
-/// administrative directory (`git rev-parse --git-dir`) - see the module docs for why here
-/// specifically, not under `.git/rebase-merge/` itself (which git may not have created yet at
-/// the moment this module wants to start writing) and not under the shared common dir (rebase
-/// state, and so this module's own cross-reference of it, is per-worktree).
+/// The sidecar state directory, under the worktree's own administrative directory.
+///
+/// Not under `.git/rebase-merge/`, which git may not have created yet when this starts writing,
+/// and not the shared common dir, since rebase state is per-worktree.
 const STATE_DIR_NAME: &str = "ade-rebase";
 
 fn state_dir(git_dir: &Path) -> PathBuf {
     git_dir.join(STATE_DIR_NAME)
 }
 
-/// Resolve `worktree_path`'s own private administrative directory (`git rev-parse --git-dir`) -
-/// for a linked worktree this is `<common-dir>/worktrees/<name>`, confirmed empirically to be
-/// distinct from [`crate::git_common_dir`]'s shared common dir, which is why this module doesn't
-/// just reuse that function.
-///
-/// Performs blocking I/O.
+/// Resolves `worktree_path`'s own administrative directory, which for a linked worktree is
+/// `<common-dir>/worktrees/<name>` - distinct from [`crate::git_common_dir`]'s shared one.
 fn worktree_git_dir(worktree_path: &Path) -> Result<PathBuf, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "--git-dir".into()];
     let output = run_git(worktree_path, &args)?;
@@ -307,15 +145,10 @@ fn worktree_git_dir(worktree_path: &Path) -> Result<PathBuf, Error> {
     Ok(absolutize(Path::new(raw.trim()), worktree_path))
 }
 
-/// POSIX-single-quote `path` for safe embedding inside a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`
-/// value string.
+/// POSIX-single-quotes `path` for embedding in a `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR` value.
 ///
-/// git splices that value verbatim into `sh -c "<value> \"$@\""` rather than treating it as an
-/// already-quoted argument (confirmed empirically - see the module docs), so a path containing a
-/// space or other shell metacharacter would otherwise be silently word-split and break the
-/// injected command; single-quoting the embedded path (escaping any literal `'` as `'\''`, the
-/// standard POSIX technique) was verified end-to-end against a real rebase run from a
-/// space-containing worktree path with a space-containing plan-file path too.
+/// git splices those values verbatim into `sh -c "<value> \"$@\""` rather than treating them as
+/// already-quoted arguments, so a path containing a space would otherwise be word-split.
 fn shell_single_quote(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut out = String::with_capacity(raw.len() + 2);
@@ -331,8 +164,8 @@ fn shell_single_quote(path: &Path) -> String {
     out
 }
 
-/// Template for [`write_editor_script`]'s real `GIT_EDITOR` script - see the module docs for
-/// what each of the three cases handles and why, and for how this was verified.
+/// Template for [`write_editor_script`]'s `GIT_EDITOR` script; its three cases are set out in
+/// `docs/architecture/decisions.md` §7.
 const EDITOR_SCRIPT_TEMPLATE: &str = r#"#!/bin/sh
 set -eu
 QUEUE_DIR=__QUEUE_DIR__
@@ -381,8 +214,7 @@ fn make_executable(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Write this rebase's real `GIT_EDITOR` script into `dir` (this rebase's own state directory)
-/// and return its path.
+/// Writes the `GIT_EDITOR` script into `dir` and returns its path.
 fn write_editor_script(dir: &Path) -> Result<PathBuf, Error> {
     let script_path = dir.join("editor.sh");
     let queue_dir = dir.join("queue");
@@ -395,9 +227,8 @@ fn write_editor_script(dir: &Path) -> Result<PathBuf, Error> {
     Ok(script_path)
 }
 
-/// Write `plan`'s real todo file (for `GIT_SEQUENCE_EDITOR`), reword-message queue (for the
-/// `GIT_EDITOR` script), and `commits.txt` cross-reference into `dir`, creating it fresh.
-/// Returns the todo file's path.
+/// Writes `plan`'s todo file, reword-message queue and `commits.txt` cross-reference into a fresh
+/// `dir`, returning the todo file's path.
 fn write_plan_state(dir: &Path, plan: &[RebasePlanEntry]) -> Result<PathBuf, Error> {
     fs::create_dir_all(dir)?;
     let queue_dir = dir.join("queue");
@@ -433,16 +264,15 @@ fn write_plan_state(dir: &Path, plan: &[RebasePlanEntry]) -> Result<PathBuf, Err
     Ok(todo_path)
 }
 
-/// Remove this rebase's own state directory (idempotent - fine if it's already gone). Called
-/// once a rebase genuinely finishes ([`RebaseOutcome::Completed`]) or is aborted.
+/// Removes the state directory, idempotently, once a rebase finishes or is aborted.
 fn cleanup_state(git_dir: &Path) {
     let _ = fs::remove_dir_all(state_dir(git_dir));
 }
 
-/// Read `.git/rebase-merge/stopped-sha`, trimmed, or `None` if absent/unreadable/empty.
-/// Confirmed empirically to be populated identically for both a real conflict and a deliberate
-/// stop, so callers read it unconditionally and only branch on [`conflicted_files`] to decide
-/// which [`RebaseOutcome`] variant applies.
+/// Reads `stopped-sha`, or `None` if absent or empty.
+///
+/// Populated identically for a conflict and a deliberate stop, so callers read it unconditionally
+/// and branch on [`conflicted_files`] instead.
 fn read_stopped_sha(git_dir: &Path) -> Option<String> {
     read_trimmed(&git_dir.join("rebase-merge").join("stopped-sha"))
 }
@@ -454,10 +284,8 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Cross-reference `commit` against this rebase's own persisted `commits.txt` (see
-/// [`write_plan_state`]) to recover which [`StopReason`] a stop at `commit` represents. `None`
-/// if the state file is missing (state already cleaned up, or this rebase wasn't started by
-/// this module) or `commit` isn't in it.
+/// Recovers the [`StopReason`] for a stop at `commit` from the persisted `commits.txt`. `None`
+/// if that file is missing or does not list `commit`.
 fn lookup_stop_reason(git_dir: &Path, commit: &str) -> Option<StopReason> {
     let content = fs::read_to_string(state_dir(git_dir).join("commits.txt")).ok()?;
     for line in content.lines() {
@@ -466,9 +294,7 @@ fn lookup_stop_reason(git_dir: &Path, commit: &str) -> Option<StopReason> {
             return match tag {
                 "edit" => Some(StopReason::Edit),
                 "reword-nomsg" => Some(StopReason::RewordNeedsMessage),
-                // "reword-msg" never actually stops (a supplied message always runs straight
-                // through) - if this is somehow reached anyway, there's no real reason to
-                // report, so this deliberately falls through to `None` rather than guessing.
+                // "reword-msg" never stops, so there is no reason to report if this is reached.
                 _ => None,
             };
         }
@@ -476,13 +302,8 @@ fn lookup_stop_reason(git_dir: &Path, commit: &str) -> Option<StopReason> {
     None
 }
 
-/// Real `git diff --name-only --diff-filter=U` in `worktree_path`, pinned to
-/// `core.quotePath=false` - exactly [`crate::merge`]'s own convention (see that module's docs
-/// for why: an unresolved conflicted path containing non-ASCII/space characters would otherwise
-/// come back quoted/octal-escaped, and this module would then either silently mismatch it
-/// against the real on-disk file or misreport it to a caller).
-///
-/// Performs blocking I/O.
+/// The unresolved conflicted paths, with `core.quotePath=false` pinned so a non-ASCII path does
+/// not come back octal-escaped and mismatch the file on disk.
 fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -500,19 +321,12 @@ fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
         .collect())
 }
 
-/// Interpret the result of driving one `git rebase`/`--continue`/`--skip` invocation into a real
-/// [`RebaseOutcome`] - shared by [`start_interactive_rebase`], [`continue_rebase`], and
-/// [`skip_rebase_commit`]. See the module docs for the real conflict-vs-deliberate-stop
-/// detection this implements.
+/// Interprets one `git rebase`/`--continue`/`--skip` invocation into a [`RebaseOutcome`].
 ///
-/// Deliberately does **not** branch on `output.status` first: confirmed empirically that a
-/// native `edit` stop (and, distinctly, a message-less `reword`'s deliberate stop, since
-/// `edit`/`reword` are meant to behave identically - see the module docs) has different exit
-/// codes depending on *how* the stop was reached - a sole/final `edit` row exits `0`, while a
-/// `reword` stopped via the `GIT_EDITOR` script's own non-zero exit exits `1` - so `output.status
-/// == success` is not a reliable "did this really finish" signal on its own. The real, reliable
-/// signal is whether `.git/rebase-merge/` still exists at all: git only ever removes it on a
-/// genuine completion (or abort, handled separately by [`abort_rebase`]).
+/// Does not branch on exit status: a deliberate stop's exit code depends on how it was reached -
+/// a final `edit` row exits 0, while a `reword` stopped by the editor script's own failure exits 1.
+/// The reliable signal is whether `.git/rebase-merge/` still exists, which git removes only on
+/// completion or abort.
 fn interpret_result(
     worktree_path: &Path,
     git_dir: &Path,
@@ -524,8 +338,7 @@ fn interpret_result(
             cleanup_state(git_dir);
             return Ok(RebaseOutcome::Completed);
         }
-        // No rebase state left at all, yet the command failed: a genuine, unexpected error
-        // (bad `onto`, not a repository, etc.), not any kind of stop.
+        // No rebase state left, yet the command failed: an unexpected error, not a stop.
         return Err(Error::GitCommand {
             args: format_args(args),
             exit: GitExit::from_status(&output.status),
@@ -533,7 +346,7 @@ fn interpret_result(
         });
     }
 
-    // Still genuinely stopped mid-rebase, regardless of exit code - see this function's docs.
+    // Still stopped mid-rebase, regardless of exit code.
     let stopped_commit = read_stopped_sha(git_dir);
     let conflicted = conflicted_files(worktree_path)?;
 
@@ -549,8 +362,7 @@ fn interpret_result(
         return Ok(RebaseOutcome::StoppedForEdit { commit, reason });
     }
 
-    // Rebase state exists but neither a known conflict nor a known deliberate stop could be
-    // read from it: a genuine, unexpected failure rather than a fabricated outcome.
+    // State exists but reports neither a conflict nor a stop: an unexpected failure.
     Err(Error::GitCommand {
         args: format_args(args),
         exit: GitExit::from_status(&output.status),
@@ -558,17 +370,10 @@ fn interpret_result(
     })
 }
 
-/// Every real commit id `git rebase -i <onto>` would default to `pick`-ing, oldest first (`git
-/// rev-list --reverse <onto>..HEAD`) - exactly the commits reachable from `HEAD` but not from
-/// `onto`. GitHub issue #242 phase B: the graph pane's "Rebase onto this commit" row needs
-/// this to build its initial plan - [`start_interactive_rebase`] never reads git's own
-/// autogenerated todo at all (it overwrites it outright with the caller's own plan - see the
-/// module docs), so computing "what would the default plan even contain" is the caller's job,
-/// not something this module derives internally.
+/// Every commit `git rebase -i <onto>` would default to picking, oldest first.
 ///
-/// `onto` must be a real commit-ish git accepts (a full/short object id, or a ref name).
-///
-/// Performs blocking I/O.
+/// Building the initial plan is the caller's job: [`start_interactive_rebase`] overwrites git's
+/// autogenerated todo rather than reading it, so nothing derives this internally.
 pub fn commits_to_rebase(worktree_path: &Path, onto: &str) -> Result<Vec<String>, Error> {
     let args: Vec<OsString> = vec![
         "rev-list".into(),
@@ -584,13 +389,9 @@ pub fn commits_to_rebase(worktree_path: &Path, onto: &str) -> Result<Vec<String>
         .collect())
 }
 
-/// Start a real interactive rebase of `worktree_path`'s current branch onto `onto`, driving
-/// `plan` through to completion or the first real stop - see the module docs for exactly how.
+/// Rebases the current branch onto `onto`, driving `plan` to completion or the first stop.
 ///
-/// `plan` is given oldest-first (the same order git's own generated todo uses); this function
-/// does not reverse it.
-///
-/// Performs blocking I/O.
+/// `plan` is oldest-first and is not reversed here.
 pub fn start_interactive_rebase(
     worktree_path: &Path,
     onto: &str,
@@ -620,29 +421,15 @@ pub fn start_interactive_rebase(
     interpret_result(worktree_path, &git_dir, &args, &output)
 }
 
-/// Real `git commit --amend -m <message>` against `worktree_path`'s current `HEAD` - GitHub
-/// issue #242 phase B's own real need: when a rebase is genuinely stopped on a message-less
-/// `reword` row (a [`RebaseOutcome::StoppedForEdit`] with
-/// [`StopReason::RewordNeedsMessage`]) and the caller has since obtained a real message from the
-/// user, this is how it actually gets applied to the stopped commit before
-/// [`continue_rebase`] resumes - exactly the same real `git commit --amend` step this module's
-/// own tests use to drive that scenario (see `reword_with_no_message_stops_and_reports_the_right_commit_and_reason`).
-/// This module's `GIT_EDITOR` script has already fixed the reword-message queue for this rebase
-/// at [`start_interactive_rebase`] time (see the module docs); a message obtained *after* a
-/// message-less stop can only be applied this way, not by retroactively feeding the queue.
+/// Amends `HEAD`'s message, for applying a message obtained *after* a message-less `reword` stop.
 ///
-/// Two real guards, both refusals rather than silent corruption:
-/// - `expected_head_original` must be the real, full commit id `HEAD` is still expected to be
-///   pointing at (the stopped row's own commit) - a live `git rev-parse HEAD` mismatch means the
-///   rebase already moved on (a double-`Continue`, a resumed-then-re-amended stale caller) and
-///   this refuses with [`Error::RebaseAmendHeadMoved`] rather than amending whatever commit
-///   `HEAD` now happens to be.
-/// - The real index must have no staged changes (`git diff --cached --quiet`) - refuses with
-///   [`Error::RebaseAmendIndexDirty`] rather than silently folding unrelated staged content
-///   (something else - an unpaused agent, a stray `git add` - added while the rebase was
-///   stopped) into the amended commit alongside the real message change.
+/// The reword queue is fixed at [`start_interactive_rebase`] time, so a late message can only be
+/// applied this way, not by feeding the queue retroactively.
 ///
-/// Performs blocking I/O.
+/// Two guards, both refusals rather than silent corruption: `expected_head_original` must still
+/// be `HEAD` ([`Error::RebaseAmendHeadMoved`]), catching a stale or double-continued caller; and
+/// the index must be clean ([`Error::RebaseAmendIndexDirty`]), so unrelated staged content does
+/// not get folded into the amended commit.
 pub fn amend_head_message(
     worktree_path: &Path,
     expected_head_original: &str,
@@ -665,10 +452,7 @@ pub fn amend_head_message(
     let diff_args: Vec<OsString> = vec!["diff".into(), "--cached".into(), "--quiet".into()];
     let diff_output = run_git(worktree_path, &diff_args)?;
     match diff_output.status.code() {
-        // `git diff --cached --quiet` exits 0 when there is no staged diff, 1 when there is -
-        // confirmed exit-code convention for `--quiet`, mirroring `crate::merge`'s own use of
-        // `git diff --name-only --diff-filter=U` conventions elsewhere in this crate for reading
-        // real git state through exit codes rather than parsing output.
+        // `--quiet` exits 0 with no staged diff and 1 with one.
         Some(0) => {}
         Some(1) => {
             return Err(Error::RebaseAmendIndexDirty {
@@ -694,12 +478,11 @@ pub fn amend_head_message(
     check_success(&args, &output)
 }
 
-/// Drive one `git rebase <extra_arg>` (`--continue` or `--skip`) with this rebase's own
-/// persisted `GIT_EDITOR` script active (needed in case a later plan row still requires it -
-/// `reword`/squash message combination can recur after a resumed step), falling back to
-/// `GIT_EDITOR=true` (accept whatever's pre-filled, never block) if this rebase's own state was
-/// already cleaned up or was never created by this module in the first place - either way, this
-/// call must never be left waiting on a real interactive editor that can never open.
+/// Drives one `git rebase --continue`/`--skip` with the persisted `GIT_EDITOR` script active,
+/// since a later row may still need it.
+///
+/// Falls back to `GIT_EDITOR=true` when that state is gone, so this can never be left waiting on
+/// an interactive editor that will never open.
 fn run_rebase_step(
     worktree_path: &Path,
     git_dir: &Path,
@@ -721,29 +504,19 @@ fn run_rebase_step(
     interpret_result(worktree_path, git_dir, &args, &output)
 }
 
-/// Resume a stopped interactive rebase in `worktree_path` (real `git rebase --continue`),
-/// driving it through to completion or the next real stop.
-///
-/// Performs blocking I/O.
+/// Resumes a stopped rebase, driving it to completion or the next stop.
 pub fn continue_rebase(worktree_path: &Path) -> Result<RebaseOutcome, Error> {
     let git_dir = worktree_git_dir(worktree_path)?;
     run_rebase_step(worktree_path, &git_dir, "--continue")
 }
 
-/// Skip the commit a stopped interactive rebase in `worktree_path` is currently stopped at (real
-/// `git rebase --skip`), driving it through to completion or the next real stop.
-///
-/// Performs blocking I/O.
+/// Skips the commit a stopped rebase is at, driving it to completion or the next stop.
 pub fn skip_rebase_commit(worktree_path: &Path) -> Result<RebaseOutcome, Error> {
     let git_dir = worktree_git_dir(worktree_path)?;
     run_rebase_step(worktree_path, &git_dir, "--skip")
 }
 
-/// Abort an in-progress interactive rebase in `worktree_path` (real `git rebase --abort`),
-/// restoring it to exactly the state it was in before [`start_interactive_rebase`] ran, and
-/// cleaning up this module's own state directory.
-///
-/// Performs blocking I/O.
+/// Aborts an in-progress rebase, restoring the pre-rebase state and cleaning up.
 pub fn abort_rebase(worktree_path: &Path) -> Result<(), Error> {
     let git_dir = worktree_git_dir(worktree_path)?;
     let args: Vec<OsString> = vec!["rebase".into(), "--abort".into()];
@@ -753,12 +526,7 @@ pub fn abort_rebase(worktree_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Read the real, on-disk state of an interactive rebase in `worktree_path`, if one is currently
-/// stopped mid-flight - `Ok(None)` if no rebase is in progress at all. Reads git's own
-/// `.git/rebase-merge/` directly (not any in-memory record), so this reflects reality even after
-/// a real process restart - see [`RebaseStatus`]'s own docs for why each field is best-effort.
-///
-/// Performs blocking I/O.
+/// The on-disk state of a stopped rebase, or `Ok(None)` if none is in progress.
 pub fn rebase_status(worktree_path: &Path) -> Result<Option<RebaseStatus>, Error> {
     let git_dir = worktree_git_dir(worktree_path)?;
     let rebase_merge = git_dir.join("rebase-merge");
@@ -1054,7 +822,6 @@ mod tests {
             "expected RebaseAmendHeadMoved, got a different error: {err:?}"
         );
 
-        // Refused, not partially applied - the real message must be untouched.
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
         assert_eq!(commit_message(repo.path(), &head), "original message");
     }
@@ -1065,9 +832,6 @@ mod tests {
         commit(repo.path(), "a.txt", "1", "original message");
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
-        // A real staged change unrelated to the amend - the exact hazard the guard exists to
-        // catch (an unpaused agent, or a stray `git add`, staging something while the rebase is
-        // stopped).
         fs::write(repo.path().join("sneaky.txt"), "sneaky").expect("write sneaky.txt");
         git(repo.path(), &["add", "sneaky.txt"]);
 
@@ -1078,7 +842,6 @@ mod tests {
             "expected RebaseAmendIndexDirty, got a different error: {err:?}"
         );
 
-        // Refused, not partially applied - neither the message nor the tree changed.
         let after_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
         assert_eq!(after_head, head);
         assert_eq!(commit_message(repo.path(), &head), "original message");
@@ -1117,7 +880,6 @@ mod tests {
             other => panic!("expected StoppedForEdit, got {other:?}"),
         }
 
-        // Amend for real, then continue - completes with the amended message applied.
         git(repo.path(), &["commit", "--amend", "-m", "amended message"]);
         let outcome = continue_rebase(repo.path()).expect("continue_rebase");
         assert_eq!(outcome, RebaseOutcome::Completed);
@@ -1153,9 +915,8 @@ mod tests {
 
     // --- Real conflicts, abort, skip -----------------------------------------------------
 
-    /// Sets up a real conflict: `base` sets `file.txt`, `v1` and `v2` each change it
-    /// differently, and the plan replays `v1` directly onto `base` (skipping `v2`'s own base),
-    /// which really conflicts.
+    /// Sets up a conflict: `base` sets `file.txt`, `v1` and `v2` change it differently, and the
+    /// plan replays `v1` straight onto `base`.
     fn conflicting_repo() -> (TempDir, String, String, String) {
         let repo = init_repo();
         let base = commit(repo.path(), "file.txt", "base", "base");
@@ -1318,11 +1079,6 @@ mod tests {
         assert!(squashed_message.contains("commit 2"));
     }
 
-    /// Reproduces a real bug found during development: a plain `pick` that hits a real conflict
-    /// invokes `GIT_EDITOR` too (git's ordinary `git commit` codepath for a conflict-resumed
-    /// step, confirmed empirically - see the module docs). If the `GIT_EDITOR` script
-    /// misclassified that as a `reword` invocation, it would consume a queue slot meant for a
-    /// *later* real `reword`, applying the wrong message (or stopping when it shouldn't).
     #[test]
     fn cascading_conflicts_before_a_reword_do_not_misalign_the_message_queue() {
         let repo = init_repo();

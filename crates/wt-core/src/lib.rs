@@ -1,27 +1,16 @@
 //! `wt-core`: git worktree management.
 //!
-//! This crate has three responsibilities:
+//! Enumerates a repository's worktrees into a typed model via [`gix`], and creates and removes
+//! them through the `git` CLI - refusing to discard uncommitted work unless the caller passes
+//! `force`. See `docs/architecture/decisions.md` §5 for which of the two any given operation uses.
 //!
-//! 1. Enumerate the worktrees of a git repository into a typed model, reading the
-//!    repository via [`gix`] (never shelling out for reads, per project convention).
-//! 2. Create new worktrees by shelling out to the real `git` CLI.
-//! 3. Remove worktrees by shelling out to the real `git` CLI, refusing to discard
-//!    uncommitted work unless the caller explicitly opts in with `force`.
+//! Every invocation uses an explicit argument vector, never an interpolated shell string.
 //!
-//! Every git invocation (both `gix` calls and `git` CLI calls) uses explicit argument
-//! vectors; nothing is ever built as an interpolated shell string.
-//!
-//! ## Blocking
-//!
-//! Every public function in this crate performs blocking I/O: `gix` reads the object
-//! database from disk, and the CLI-backed functions spawn a `git` child process and wait
-//! on it. None of this is async. Callers embedding this in a GUI event loop (this crate
-//! exists to back one) must offload calls to a background thread/executor rather than
-//! invoking them from a UI main thread.
+//! **Everything here blocks.** `gix` reads the object database from disk and the CLI-backed
+//! functions wait on a child process. A caller on a UI thread must offload to a background
+//! executor.
 
-// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
-// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
-// `expect_used`.
+// Only production code is held to `unwrap_used`/`expect_used`; see `CLAUDE.md`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod blame;
@@ -46,11 +35,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// A single git worktree: either the main working tree of a repository, or one of the
-/// linked worktrees created by `git worktree add`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
-    /// Absolute path to the worktree's working directory.
     pub path: PathBuf,
     /// The short name of the branch checked out in this worktree (e.g. `"main"`), or
     /// `None` if `HEAD` is detached.
@@ -58,49 +44,26 @@ pub struct Worktree {
     /// The full commit id `HEAD` currently resolves to, or `None` if the branch is
     /// "unborn" (a freshly initialized repository with no commits yet).
     pub head_commit: Option<String>,
-    /// Whether this is the main worktree (the one created by `git init` or `git clone`),
-    /// as opposed to a linked worktree created by `git worktree add`.
     pub is_main: bool,
-    /// Whether the worktree is locked (see `git worktree lock`), which signals that it
-    /// should not be pruned, moved, or deleted, typically because it lives on removable
-    /// storage. Always `false` for the main worktree: git has no `worktree lock` concept
-    /// for it (only linked worktrees can be locked), so this isn't something we forgot to
-    /// check.
+    /// See `git worktree lock`. Always `false` for the main worktree: git has no lock concept
+    /// for it, so this is not an unchecked case.
     pub is_locked: bool,
-    /// The reason given when the worktree was locked, if any and if it could be read.
-    /// `None` both when the worktree isn't locked and when it's locked with an empty
-    /// reason (git allows `git worktree lock` with no `--reason`). Always `None` for the
-    /// main worktree, for the same reason `is_locked` is always `false` for it.
+    /// `None` both when the worktree is unlocked and when it is locked with no `--reason`.
     pub lock_reason: Option<String>,
 }
 
-/// The outcome of describing a single worktree: `Ok` on success, or the specific `Error`
-/// that made this one worktree's metadata unreadable (e.g. a corrupt `gitdir` file, or a
-/// checkout whose `HEAD` couldn't be resolved). A problem with one worktree should not
-/// hide the others, so [`list_worktrees`] returns one of these per worktree instead of
-/// aborting the whole listing on the first error.
+/// Fallible per entry, so one corrupt worktree does not hide the others.
 pub type WorktreeResult = Result<Worktree, Error>;
 
-/// List every worktree (the main worktree, if any, plus any linked worktrees) belonging
-/// to the repository at `repo_path`.
+/// Lists every worktree belonging to the repository at `repo_path`, which may itself be any one
+/// of them. A bare repository reports only its linked worktrees, having no checkout of its own.
 ///
-/// `repo_path` may point at the main worktree or at any linked worktree; either way, all
-/// worktrees sharing the same repository are returned.
-///
-/// If the repository is bare, it has no main worktree to report (a bare repository has no
-/// checkout of its own; it's only ever a `git worktree add` target), so in that case only
-/// linked worktrees, if any, are returned.
-///
-/// Each entry is independent: a problem reading one worktree is reported as an `Err`
-/// inside that entry rather than failing the whole call. The outer `Result` is only for
-/// failures that make listing impossible altogether, such as `repo_path` not being a git
-/// repository.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// Entries are independent: an unreadable worktree is an `Err` in its own entry. The outer
+/// `Result` covers only failures that make listing impossible at all.
 pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeResult>, Error> {
     let repo = open_repo(repo_path)?;
-    // Normalize to the repository owning the main worktree so that `worktrees()` below
-    // enumerates every linked worktree regardless of which worktree `repo_path` pointed at.
+    // Normalizing to the main repository is what makes `worktrees()` enumerate all of them
+    // regardless of which one `repo_path` pointed at.
     let main_repo = repo.main_repo().map_err(|source| Error::Open {
         path: repo_path.to_path_buf(),
         source: Box::new(source),
@@ -128,13 +91,10 @@ fn open_repo(repo_path: &Path) -> Result<gix::Repository, Error> {
     })
 }
 
-/// Read a linked worktree's location and lock state from its [`gix::worktree::Proxy`],
-/// then open it and read its `HEAD` to fill in the rest of a [`Worktree`].
 fn describe_linked_worktree(proxy: gix::worktree::Proxy<'_>) -> Result<Worktree, Error> {
     let path = proxy.base()?;
     let is_locked = proxy.is_locked();
-    // An empty `locked` file (i.e. `git worktree lock` with no `--reason`) must surface as
-    // `None`, not `Some("")`.
+    // An empty `locked` file must surface as `None`, not `Some("")`.
     let lock_reason = proxy
         .lock_reason()
         .map(|reason| reason.to_string())
@@ -148,8 +108,6 @@ fn describe_linked_worktree(proxy: gix::worktree::Proxy<'_>) -> Result<Worktree,
     describe_worktree(&linked_repo, path, false, is_locked, lock_reason)
 }
 
-/// Read the branch name and resolved `HEAD` commit id of `repo`, and assemble a
-/// [`Worktree`] from it plus the already-known metadata.
 fn describe_worktree(
     repo: &gix::Repository,
     path: PathBuf,
@@ -176,63 +134,37 @@ fn describe_worktree(
     })
 }
 
-/// A single worktree as reported by `git worktree list --porcelain`, used by the sidebar's
-/// live-refresh watcher (`app::rail::worktree_watch`, GitHub issue #12) rather than
-/// [`Worktree`]/[`list_worktrees`].
+/// A worktree as `git worktree list --porcelain` reports it, for the sidebar's refresh watcher.
 ///
-/// This is a deliberate, narrow exception to this crate's usual "never shell out for reads"
-/// convention (see the crate-level docs): `git` itself already computes locked/prunable state
-/// (including the "administrative gitdir points at a now-missing working tree" case a plain
-/// [`Path::exists`] check on our side can't fully replicate - e.g. a `gitdir` file that's
-/// itself corrupt or missing) and hands it back in one cheap call, which is exactly what a
-/// refresh loop that runs every few seconds wants: a single source of truth to diff against the
-/// previous snapshot, not a second bespoke traversal reimplementing git's own prunability rules.
-/// [`list_worktrees`] remains the one true source for every other consumer in this crate
-/// (`blame`/`merge`/`undo`), which need real `gix` repository access anyway and have no reason
-/// to shell out.
+/// Shelled out rather than read through `gix` because git already computes prunability - including
+/// a corrupt or missing `gitdir` file, which a [`Path::exists`] check cannot replicate - in one
+/// cheap call. A loop running every few seconds wants that single snapshot to diff against, not a
+/// reimplementation of git's prunability rules. [`list_worktrees`] stays the source for everything
+/// else, which needs `gix` repository access anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeStatus {
     /// Absolute path to the worktree's working directory (or where it used to be, if
     /// [`Self::is_prunable`]).
     pub path: PathBuf,
-    /// Whether this is the main worktree - true for the first entry `git worktree list`
-    /// reports, unless that entry is itself [`Self::is_bare`] (a bare repository has no main
-    /// *worktree* to report, mirroring [`list_worktrees`]'s own doc for the gix-backed path).
     pub is_main: bool,
-    /// Whether this entry is the bare repository itself (only ever the first entry, and only
-    /// for a bare repository) rather than a real checkout.
     pub is_bare: bool,
     /// The full commit id `HEAD` resolves to, or `None` for an unborn branch.
     pub head_commit: Option<String>,
     /// The short branch name if `HEAD` is a real branch ref, `None` if detached or bare.
     pub branch: Option<String>,
-    /// Whether `HEAD` is detached (a real commit checked out directly, not via a branch ref).
     pub is_detached: bool,
-    /// Whether the worktree is locked (`git worktree lock`).
     pub is_locked: bool,
-    /// The reason given when locked, if any and non-empty.
     pub lock_reason: Option<String>,
-    /// Whether `git` itself considers this worktree prunable: its administrative metadata
-    /// points at a working tree that's no longer there (e.g. the directory was deleted by hand
-    /// outside of `git worktree remove`).
+    /// Whether git considers this prunable: its metadata points at a working tree that is gone.
     pub is_prunable: bool,
-    /// The reason `git` gives for prunability, if any and non-empty (typically names the
-    /// missing path).
     pub prunable_reason: Option<String>,
 }
 
-/// Lists every worktree of the repository at `repo_path` by shelling out to
-/// `git worktree list --porcelain` and parsing its stable, machine-readable output (see
-/// [`parse_worktree_list_porcelain`]'s docs for why the porcelain form specifically, not the
-/// human-readable default). See [`WorktreeStatus`]'s docs for why this exists alongside the
-/// `gix`-backed [`list_worktrees`] rather than replacing it.
+/// Lists every worktree via `git worktree list --porcelain`; see [`WorktreeStatus`] for why this
+/// exists alongside [`list_worktrees`].
 ///
-/// Returns `Err` if `repo_path` is not inside a git repository at all (or any other case `git
-/// worktree list` itself fails for) - there is no per-entry fallibility the way
-/// [`list_worktrees`] has, since `git` itself already resolved every entry by the time this
-/// output exists.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// No per-entry fallibility, unlike [`list_worktrees`]: git has already resolved every entry by
+/// the time this output exists.
 pub fn list_worktrees_porcelain(repo_path: &Path) -> Result<Vec<WorktreeStatus>, Error> {
     let args: Vec<OsString> = vec!["worktree".into(), "list".into(), "--porcelain".into()];
     let output = run_git(repo_path, &args)?;
@@ -241,22 +173,10 @@ pub fn list_worktrees_porcelain(repo_path: &Path) -> Result<Vec<WorktreeStatus>,
     Ok(parse_worktree_list_porcelain(&stdout))
 }
 
-/// Parses `git worktree list --porcelain`'s output into [`WorktreeStatus`] rows.
-///
-/// Deliberately parses the porcelain form, not the human-readable default table: the plain
-/// format is genuinely ambiguous for a path containing spaces (nothing marks where the path
-/// ends and the next column begins), while porcelain gives one `key`-prefixed line per fact,
-/// blank-line-separated per worktree, with the path (and lock/prunable reasons) as the *entire*
-/// remainder of their line - so this only ever splits each line on its first space
-/// (`str::split_once(' ')`), never on whitespace generally, and never truncates a
-/// space-containing value.
-///
-/// Unrecognized keys (a future `git` version adding a new porcelain field) are silently
-/// ignored rather than treated as a parse error - forward compatible with any output field this
-/// type doesn't (yet) model, matching git's porcelain contract that consumers may see and must
-/// tolerate new fields it hasn't documented here.
-///
-/// CRLF line endings are normalized to LF first, so this parses identically on Windows.
+/// Parses the porcelain form, not the default table, which is ambiguous for a path
+/// containing spaces. Each line is split on its *first* space only, so a space-containing value
+/// is never truncated. Unrecognized keys are ignored, per git's porcelain contract. CRLF is
+/// normalized first, so this parses identically on Windows.
 pub fn parse_worktree_list_porcelain(text: &str) -> Vec<WorktreeStatus> {
     let text = text.replace("\r\n", "\n");
     let mut items = Vec::new();
@@ -310,13 +230,9 @@ pub fn parse_worktree_list_porcelain(text: &str) -> Vec<WorktreeStatus> {
         }
 
         let Some(path) = path else {
-            // A block with no `worktree` line at all isn't a real entry (shouldn't happen for
-            // real `git` output, but a stray blank run must not fabricate a row).
             continue;
         };
-        // Only the very first *real* entry can be the main worktree - and a bare repository's
-        // own entry (always first, if present) never is one, mirroring `list_worktrees`'s own
-        // "a bare repo has no main worktree" rule.
+        // Only the first entry can be the main worktree, and a bare repository's never is.
         let is_main = items.is_empty() && !is_bare;
         items.push(WorktreeStatus {
             path,
@@ -335,17 +251,10 @@ pub fn parse_worktree_list_porcelain(text: &str) -> Vec<WorktreeStatus> {
     items
 }
 
-/// Resolves `$GIT_COMMON_DIR` for the repository at `repo_path`: the one directory shared by
-/// the main worktree and every linked worktree (`<repo>/.git` for a non-bare repo, the bare
-/// repo's own directory for a bare one). `app::rail::worktree_watch` watches this directory's
-/// `worktrees` subdirectory and its own `HEAD` file directly, rather than re-deriving the same
-/// path with ad hoc string logic.
+/// Resolves `$GIT_COMMON_DIR`: the directory shared by the main worktree and every linked one.
 ///
-/// Shells out to `git rev-parse --git-common-dir` and resolves a relative result (`git` prints
-/// one when run from inside the repository, e.g. `.git`) against `repo_path` - mirroring
-/// [`absolutize`]'s reasoning for every other path this crate hands back.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// git prints a relative path when run from inside the repository, so the result is resolved
+/// against `repo_path`.
 pub fn git_common_dir(repo_path: &Path) -> Result<PathBuf, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "--git-common-dir".into()];
     let output = run_git(repo_path, &args)?;
@@ -355,10 +264,8 @@ pub fn git_common_dir(repo_path: &Path) -> Result<PathBuf, Error> {
     Ok(absolutize(Path::new(trimmed), repo_path))
 }
 
-/// If `path` is relative, resolve it against `base` instead of the process's current
-/// working directory - every function in this module that runs `git` uses
-/// `current_dir(repo_path)` (or the worktree-local equivalent), so a relative
-/// `worktree_path` must resolve the same way `git` itself would.
+/// Resolves a relative `path` against `base` rather than the process's working directory, since
+/// every `git` invocation here sets `current_dir` and must resolve paths the same way.
 fn absolutize(path: &Path, base: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -367,18 +274,11 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
     }
 }
 
-/// Create a new worktree at `worktree_path` for the repository at `repo_path`.
+/// Creates a worktree at `worktree_path`.
 ///
-/// Shells out to `git worktree add`. If `branch` is given, a new branch by that name is
-/// created and checked out (`-b <branch>`); otherwise the existing branch or commit named
-/// by `commit_ish` is checked out directly. If both are `None`, `git` picks its own
-/// default (typically `HEAD`).
-///
-/// `worktree_path` and `commit_ish` are always passed as positional arguments after a `--`
-/// terminator, so a value that happens to look like a flag (e.g. a `commit_ish` of
-/// `"--detach"`) can never be misparsed as one.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// `branch` creates and checks out a new branch; otherwise `commit_ish` is checked out directly.
+/// Both `None` lets git pick its default. Positionals go after `--`, so a flag-shaped value can
+/// never be misparsed as one.
 pub fn add_worktree(
     repo_path: &Path,
     worktree_path: &Path,
@@ -402,23 +302,11 @@ pub fn add_worktree(
     check_success(&args, &output)
 }
 
-/// Remove the worktree at `worktree_path` from the repository at `repo_path`.
+/// Removes the worktree at `worktree_path`, refusing a dirty one with [`Error::DirtyWorktree`]
+/// unless `force`.
 ///
-/// Unless `force` is `true`, this refuses to remove a worktree with uncommitted changes:
-/// modifications to tracked files, staged changes, or the presence of untracked files are
-/// all treated conservatively as "dirty" and cause this to return
-/// [`Error::DirtyWorktree`] without touching anything.
-///
-/// Passing `force: true` passes `--force` to git *twice*. A single `--force` is enough to
-/// override a dirty worktree, but git additionally requires it twice to override a
-/// *locked* worktree ("`use 'remove -f -f' to override or unlock first`"); passing it
-/// twice unconditionally means `force: true` really does mean "remove regardless" for both
-/// cases, rather than silently still refusing locked worktrees.
-///
-/// `worktree_path` is always passed as a positional argument after a `--` terminator, so a
-/// path starting with `-` can never be misparsed as a flag.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// `force` passes `--force` twice: once overrides a dirty worktree, but git wants it twice to
+/// override a *locked* one, so a single flag would still silently refuse those.
 pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> Result<(), Error> {
     let worktree_path = absolutize(worktree_path, repo_path);
 
@@ -440,18 +328,12 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> R
     check_success(&args, &output)
 }
 
-/// Conservatively determine whether `worktree_dir` has uncommitted changes: any modified
-/// tracked file (staged or not) or any untracked file counts as dirty.
+/// Whether `worktree_dir` has uncommitted changes; any modified tracked file or untracked file
+/// counts as dirty.
 ///
-/// Reads at most one byte of `git status --porcelain` output - any output at all means
-/// dirty - so a huge untracked tree is never buffered in memory. Since the child may still
-/// be writing when we stop reading, we kill it rather than risk blocking on a full pipe,
-/// then wait it to reap the process.
-///
-/// Public because the session rail's "by project" mode needs the same clean/dirty signal
-/// too (see `app::rail`'s docs), not just [`remove_worktree`] internally.
-///
-/// Performs blocking I/O; see the crate-level docs.
+/// Reads at most one byte of `git status --porcelain` - any output at all means dirty - so a huge
+/// untracked tree is never buffered. The child is killed rather than left to block on a full pipe,
+/// then reaped.
 pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec![
         "status".into(),
@@ -488,8 +370,7 @@ pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     drop(stdout);
 
     if found_output {
-        // We already have our answer; don't risk blocking on a full pipe by waiting for
-        // the rest of a potentially large status listing to be written.
+        // The answer is already known; waiting out a large listing risks a full pipe.
         let _ = child.kill();
         let _ = child.wait();
         return Ok(true);
@@ -514,10 +395,8 @@ pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     }
 }
 
-/// Environment variables that could redirect a `git` invocation to a different repository,
-/// worktree, or index than the one we explicitly select via `current_dir`. Cleared so a
-/// value inherited from the parent process's environment (plausible for a GUI app launched
-/// from an arbitrary shell or tool) can't silently make us read or write the wrong repo.
+/// Variables that could redirect `git` away from the repository `current_dir` selects. Cleared so
+/// one inherited from the launching shell cannot make this read or write the wrong repository.
 const GIT_ENV_OVERRIDES: [&str; 5] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -643,7 +522,6 @@ mod tests {
         let repo = init_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("linked-wt");
-        // Remove the dir itself; `git worktree add` creates it.
         drop(linked_dir);
 
         git(
@@ -725,9 +603,8 @@ mod tests {
         let linked_path = linked_dir.path().join("dashy-wt");
         drop(linked_dir);
 
-        // `--detach` looks like a flag but, thanks to the `--` terminator, must be treated
-        // as a (nonexistent) commit-ish instead: git reports it as a bad revision rather
-        // than accepting or misinterpreting it as an actual `--detach` option.
+        // Behind the `--` terminator, `--detach` must read as a (nonexistent) commit-ish: git
+        // reports a bad revision rather than accepting it as an option.
         let err = add_worktree(repo.path(), &linked_path, None, Some("--detach"))
             .expect_err("a flag-shaped commit-ish must fail as a bad revision");
         match err {
@@ -911,7 +788,6 @@ mod tests {
 
         add_worktree(repo.path(), &linked_path, Some("dirty-branch"), None).expect("add_worktree");
 
-        // Dirty a tracked file without committing.
         fs::write(linked_path.join("file.txt"), "changed\n").expect("write");
 
         let err = remove_worktree(repo.path(), &linked_path, false)
@@ -930,7 +806,6 @@ mod tests {
             "worktree directory must still exist after a refused removal"
         );
 
-        // Now force it.
         remove_worktree(repo.path(), &linked_path, true).expect("forced remove should succeed");
         assert!(!linked_path.exists());
     }
@@ -945,7 +820,6 @@ mod tests {
         add_worktree(repo.path(), &linked_path, Some("untracked-branch"), None)
             .expect("add_worktree");
 
-        // An untracked file must also count as dirty.
         fs::write(linked_path.join("new_untracked.txt"), "surprise\n").expect("write");
 
         let err = remove_worktree(repo.path(), &linked_path, false)
@@ -1185,11 +1059,6 @@ mod tests {
         assert_eq!(linked.lock_reason.as_deref(), Some("on a USB drive"));
     }
 
-    /// The real, honest reproduction of the issue's "prunable / missing worktree" case: the
-    /// worktree's own directory is deleted by hand (not via `git worktree remove`), leaving
-    /// git's own administrative metadata pointing at nothing. `git worktree list --porcelain`
-    /// is expected to flag this itself - this test asserts that real git behavior, not an
-    /// assumption about it.
     #[test]
     fn list_worktrees_porcelain_flags_a_manually_deleted_worktree_as_prunable() {
         let repo = init_repo();

@@ -16,23 +16,6 @@ use crate::work_surface::render::render_dropdown_menu_row;
 /// [`Self::label`] for each one's real display text and [`render_title_menu`] for what each now
 /// genuinely opens. [`Self::index`] keeps this in lockstep with [`AdeApp::title_menu_button_bounds`],
 /// which is captured in [`Self::ALL`]'s own order.
-///
-/// ## History: these used to be inert
-///
-/// Until this app grew enough real, already-wired functionality to hang a genuine menu off each
-/// label, this app had no real menu hierarchy behind them at all, and they rendered as honest,
-/// hover-only labels with no `cursor_pointer()`/`on_click()` - a deliberate choice over a
-/// dropdown that looked openable but showed nothing. Every row in every one of these five real
-/// dropdowns now calls a real, already-existing `AdeApp` method (the same ones the tab strip's
-/// `+` menu, the command palette, and the agent footer already call) - never a placeholder row
-/// that only closes the menu.
-///
-/// ## One source of truth, not two parallel arrays
-///
-/// An earlier revision paired this enum with a separately-declared `WINDOWS_MENU_ITEMS: [&str; 5]`
-/// label array and a `from_index(usize) -> Option<Self>` lookup, with nothing enforcing the two
-/// stayed the same length/order - [`Self::ALL`] plus [`Self::label`] below is the real fix: one
-/// array, indexed directly, so there is no second array that can silently drift out of lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TitleMenu {
     File,
@@ -80,29 +63,6 @@ impl AdeApp {
     /// ([`Self::render`]/`AdeApp::render`'s own `.when_some(self.title_menu_open, ..)`) has
     /// already guarded on it being `Some`; re-deriving that with a second `.expect(..)` down here
     /// would just be a second place the same invariant could silently stop holding.
-    ///
-    /// Same scrim-plus-popover shape as
-    /// [`crate::work_surface::render::AdeApp::render_plus_menu`]: a full-screen transparent
-    /// scrim closes the menu on any click outside it, and the popover itself is absolutely
-    /// positioned directly off the open label's own painted bounds
-    /// ([`AdeApp::title_menu_button_bounds`]) rather than a second, independently-computed
-    /// offset. Every row is a real [`render_dropdown_menu_row`] built by [`Self::title_menu_rows`]
-    /// from [`crate::title_bar::menu_model::MenuCommand`] - the same shared model the real macOS
-    /// menu (`crate::title_bar::native_menu`, a later revision) reads too (GitHub issue #235).
-    ///
-    /// ## No new keybinding opens or drives this menu
-    ///
-    /// This menu is mouse-only - clicking a [`TitleMenu::label`] is the only way to open it, and
-    /// there is no `gpui::KeyBinding` for it in `crate::default_key_bindings`. That's a
-    /// deliberate scope decision: this project has repeatedly hit real, live-reproduced bugs
-    /// where a *global* keybinding stole a keystroke a focused terminal/agent needed
-    /// (`crate::default_key_bindings`'s own docs cover several it scoped away from this exact
-    /// way - unscoped `"]"`, unscoped `secondary-z` - and one, `secondary-p`, it ultimately
-    /// accepted stealing anyway as a deliberate, discussed tradeoff). A title-bar menu has no
-    /// conventional shortcut of its own to
-    /// conflict with anything, so the safest way to avoid adding an eighth instance of that bug
-    /// class is simply not adding a keybinding at all - every row it offers is already reachable
-    /// some other real way (a keybinding of its own, the `+` menu, or the command palette).
     pub(crate) fn render_title_menu(
         &self,
         menu: TitleMenu,
@@ -144,11 +104,6 @@ impl AdeApp {
     }
 
     /// A thin 1px divider between two groups of rows within a [`render_title_menu`] popover.
-    ///
-    /// Kept as a named method purely for this module's own call sites; the element itself is
-    /// `crate::root::widgets::render_menu_group_divider`, shared with the file tree's right-click
-    /// context menu (GitHub issue #19) so the app has exactly one in-menu divider rather than two
-    /// that happen to agree today.
     fn render_title_menu_divider() -> gpui::AnyElement {
         render_menu_group_divider()
     }
@@ -182,14 +137,6 @@ impl AdeApp {
     /// actually spawn right now, per `crate::work_surface::agent_tint`/`agent_initial`) rather
     /// than anything the window-free `crate::title_bar::menu_model` could know statically, so
     /// that one case is resolved here instead.
-    ///
-    /// Enablement and the row's real effect both come from `crate::root::menu_commands`
-    /// ([`AdeApp::menu_command_enabled`]/[`AdeApp::perform_menu_command`]) - the same two
-    /// functions the real macOS menu (`crate::title_bar::native_menu`, a later revision) uses, so
-    /// a row here can never show as enabled/disabled or do something different from what its
-    /// native-menu counterpart would. A disabled row gets no `on_click` at all (rather than one
-    /// that silently no-ops), matching [`render_dropdown_menu_row`]'s own enabled/disabled
-    /// contract every pre-issue-#235 row already followed.
     fn menu_command_row(
         &self,
         cmd: MenuCommand,
@@ -525,9 +472,6 @@ mod title_menu_tests {
         )
     }
 
-    /// Clicking the real "File" label - a genuine painted div with its own `on_click`, hit-test
-    /// via a real simulated click at its own captured bounds - opens the real File dropdown, not
-    /// just a state flip.
     #[gpui::test]
     fn clicking_the_file_label_opens_the_real_file_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -549,9 +493,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The File menu's first row ("Open File…") really opens the command palette scoped to
-    /// files - the same real `open_palette` + `PaletteScope::Files` the `+` menu's own "Open
-    /// file…" row already uses - and closes the title menu.
     #[gpui::test]
     fn file_menu_open_file_row_opens_the_real_files_scoped_palette(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -580,12 +521,6 @@ mod title_menu_tests {
         });
     }
 
-    /// GitHub issue #90's "Open Folder…" row - the File menu's second row. Drives it through a
-    /// real simulated click plus a real simulated native-picker response
-    /// (`TestAppContext::simulate_path_prompt_response`, the same real `gpui::App::
-    /// prompt_for_paths` seam `AdeApp::start_choose_repo_folder` itself calls), and asserts the
-    /// real effect: the chosen folder becomes this window's own focused repo, not merely that a
-    /// dialog was requested.
     #[gpui::test]
     fn file_menu_open_folder_row_focuses_a_real_chosen_folder_in_this_window(
         cx: &mut TestAppContext,
@@ -626,9 +561,6 @@ mod title_menu_tests {
         });
     }
 
-    /// GitHub issue #90's "New Window" row: opens a genuinely *second*, empty-state window -
-    /// never this window's own repo, and never whatever repo happens to be focused here - even
-    /// though this window under test starts with a real repo focused.
     #[gpui::test]
     fn file_menu_new_window_row_opens_a_second_genuinely_empty_window(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -694,14 +626,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Edit menu's *first* row is now real **text** undo (GitHub issue #17), and it is a real
-    /// affordance in both directions: inert with nothing to undo (no `on_click` attached at all,
-    /// per `render_dropdown_menu_row`'s own enabled/disabled contract), and genuinely undoing the
-    /// active buffer's own last step once there is one.
-    ///
-    /// The negative half matters as much as the positive one: before this issue that same first
-    /// row fired a real `git reset --soft` while advertising `mod+z`, which is no longer what
-    /// `mod+z` does inside a text widget.
     #[gpui::test]
     fn edit_menu_text_undo_row_is_inert_until_there_is_real_text_to_undo(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -724,12 +648,10 @@ mod title_menu_tests {
             })
         };
 
-        // Nothing open, nothing typed: the row must be genuinely inert, not merely ineffective.
         let bounds = open_edit_menu(&app, cx);
         cx.simulate_click(first_row_click_point(bounds), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        // Now open a real file, type into it, and click the same row again.
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -785,8 +707,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The View menu's first row ("Command Palette") really opens the real palette (default
-    /// scope, unlike the File menu's files-scoped row).
     #[gpui::test]
     fn view_menu_command_palette_row_opens_the_real_palette(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -824,9 +744,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Agent menu's first row ("New Terminal") really spawns a new real agent tab (the
-    /// same real `Agents::spawn` call the tab strip's own `+` menu row and `secondary-n` use),
-    /// not just a decoration - the agent count genuinely increases.
     #[gpui::test]
     fn agent_menu_new_terminal_row_spawns_a_real_agent(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -869,11 +786,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Help menu's real "About" row (the third row, after a divider - so this test drives it
-    /// through `AdeApp::select_settings_page` state directly rather than computing a third row's
-    /// pixel offset, since the exact click-point math for a row-after-a-divider is already
-    /// covered by the simpler first-row tests above) really opens Settings on the real
-    /// `SettingsPage::About` page.
     #[gpui::test]
     fn help_menu_about_opens_real_settings_on_the_about_page(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -893,10 +805,6 @@ mod title_menu_tests {
         });
     }
 
-    /// Opening the palette while a title-bar menu happens to still be open must close it -
-    /// mirrors `crate::root::focus::tab_strip_keybinding_tests::
-    /// opening_the_palette_closes_an_already_open_plus_menu`'s identical regression for the `+`
-    /// menu, now that [`AdeApp::open_palette`] resets both.
     #[gpui::test]
     fn opening_the_palette_closes_an_already_open_title_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -914,11 +822,6 @@ mod title_menu_tests {
         );
     }
 
-    /// GitHub issue #176 for this surface: clicking a real title-bar label while another menu is
-    /// open must close that one rather than stack on top of it. The file tree's context menu is
-    /// the interesting partner - its scrim `.occlude()`s, but deliberately starts *below* the
-    /// title bar (so the window's caption buttons stay reachable), which is exactly why this click
-    /// really does reach the "File" label and really can leave two menus open.
     #[gpui::test]
     fn clicking_a_title_label_closes_an_open_tree_context_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
@@ -965,14 +868,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Agent menu's "Discard worktree" row's real two-step confirm - mirrors the agent
-    /// footer's own identical two-click button
-    /// (`crate::work_surface::render::AdeApp::render_footer_action_button`), reusing the
-    /// exact same real [`AdeApp::request_discard_worktree`]/[`AdeApp::discard_confirm_armed`]
-    /// this test drives through the menu row instead of the footer button. Needs a real,
-    /// non-main worktree (`crate::worktree_history::flow::AdeApp::request_discard_worktree`
-    /// unconditionally refuses on the main worktree), so this sets one up the same way
-    /// `crate::worktree_history::flow::worktree_history_regression_tests::add_worktree` does.
     #[gpui::test]
     fn agent_menu_discard_row_arms_then_executes_a_real_discard(cx: &mut TestAppContext) {
         use std::process::Command;
@@ -1064,15 +959,6 @@ mod title_menu_tests {
         });
     }
 
-    /// The title menu's own click-handling for the Discard row (not just
-    /// `request_discard_worktree` itself, already covered above): the first, arming click must
-    /// leave the menu open so the row's label can really swap to "confirm discard?" for a second
-    /// click, and the second, executing click must close it. Drives this through two real
-    /// simulated clicks on the actual rendered Discard row ([`nth_row_click_point`]), matching
-    /// this file's own established style for every other title-menu test - an earlier version of
-    /// this test hand-copied the row's `on_click` condition inline instead, which meant it could
-    /// never actually catch a bug in the real rendered row's own click wiring (e.g. a wrong
-    /// bounds computation, or the row silently missing its `on_click` entirely).
     #[gpui::test]
     fn agent_menu_discard_row_stays_open_while_armed_and_closes_once_confirmed(
         cx: &mut TestAppContext,
@@ -1147,7 +1033,6 @@ mod title_menu_tests {
         });
         let discard_row_point = nth_row_click_point(bounds, 7, 2);
 
-        // First, arming click on the real rendered Discard row.
         cx.simulate_click(discard_row_point, gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(
@@ -1186,26 +1071,6 @@ mod title_menu_tests {
         );
     }
 
-    /// [`crate::work_surface::render::AdeApp::select_relative_agent`] (the Agent menu's
-    /// "Next Agent"/"Previous Agent" rows) - real coverage of the cyclic-index logic itself:
-    /// cycling forward through three real agents wraps back to the first, and cycling backward
-    /// from the first wraps to the last, via the same real [`AdeApp::select_agent`] every
-    /// tab-strip click already goes through.
-    ///
-    /// Also real, live-reproduced coverage for this revision's own self-audit finding: an
-    /// earlier version of `select_relative_agent` cycled the flat `self.agents` list
-    /// directly rather than [`AdeApp::current_worktree_agents`], so "Next Agent" could jump
-    /// to a *different* worktree's agent entirely - which `AdeApp::select_agent` then
-    /// silently promotes into a full `AdeApp::select_worktree` switch, landing the user on the
-    /// wrong worktree's `edit_buffers` entries (keyed by `(worktree, path)` - see that field's
-    /// own docs) rather than the one they were actually cycling through. Spawning every test
-    /// agent into the *same* worktree (as an earlier version of this test did) can't distinguish
-    /// that bug from correct behaviour at all - this seeds a **second** worktree with its own
-    /// agent alongside the three under test, and asserts cycling never leaves the first worktree
-    /// (`AdeApp::selected` stays put) and a real unsaved edit seeded in the first worktree's
-    /// `AdeApp::edit_buffers` entry is still resolvable there after cycling - which an accidental
-    /// jump to the second (buffer-less) worktree would break, since [`AdeApp::edit_buffer_contains`]
-    /// resolves through whichever worktree is genuinely current.
     #[gpui::test]
     fn select_relative_agent_cycles_through_real_agents_and_wraps_around(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1373,14 +1238,6 @@ mod title_menu_tests {
         });
     }
 
-    /// GitHub issue #381: `Next Agent`/`Previous Agent` skip plain terminals, and - because the
-    /// active tab being a terminal is the *normal* state, not an edge case - stepping from one
-    /// enters the agent cycle at its near end rather than doing nothing.
-    ///
-    /// The strip here is `[shell, claude, codex]`, which is what a worktree looks like the moment
-    /// a user starts two agents in it: the startup shell `select_worktree` opened, then their
-    /// agents. Before this fix the cycle had three stops and half of every user's presses landed
-    /// them back on the terminal they were trying to leave.
     #[gpui::test]
     fn next_agent_skips_shells_and_enters_the_cycle_from_one(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1402,7 +1259,6 @@ mod title_menu_tests {
             app.agents.set_kind_for_test(ids[2], ProcessKind::codex());
         });
 
-        // Sitting on the shell: `Next Agent` must be offered, and must go somewhere.
         app.update_in(cx, |app, window, cx| app.select_agent(ids[0], window, cx));
         app.read_with(cx, |app, _| {
             assert!(
@@ -1420,7 +1276,6 @@ mod title_menu_tests {
              never be a silent no-op"
         );
 
-        // Forward again wraps across the two agents - the shell is not a stop.
         app.update_in(cx, |app, window, cx| {
             app.select_relative_agent(1, window, cx)
         });
@@ -1437,7 +1292,6 @@ mod title_menu_tests {
             "the cycle wraps between the two real agents and never lands on the shell"
         );
 
-        // Backwards off a terminal enters at the far end instead.
         app.update_in(cx, |app, window, cx| app.select_agent(ids[0], window, cx));
         app.update_in(cx, |app, window, cx| {
             app.select_relative_agent(-1, window, cx)
@@ -1448,7 +1302,6 @@ mod title_menu_tests {
             "stepping backward off a terminal must enter at the last agent"
         );
 
-        // And with no agent session at all there is genuinely nothing to offer.
         app.update_in(cx, |app, window, cx| {
             app.agents.set_kind_for_test(ids[1], ProcessKind::Shell);
             app.agents.set_kind_for_test(ids[2], ProcessKind::Shell);

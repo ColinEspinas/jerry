@@ -13,15 +13,6 @@ use std::rc::Rc;
 
 /// Every row of the Diff view's virtualized list, in the flat order it scrolls in - built once
 /// per frame by [`diff_rows`] and then indexed by `uniform_list`'s row builder.
-///
-/// The same shape (and the same reason) as `crate::sidebar::render`'s own `TreeRow`: the row
-/// builder closure is `'static` and cannot hold a borrow of `self` or of the `&DiffFile` being
-/// rendered, so a row names *where* its content lives rather than carrying the content itself.
-/// It is `Copy` for the same reason - nothing here owns a `String`.
-///
-/// The three real row kinds this list interleaves (hunk header, fold marker, diff line) all
-/// render at the same `rems(1.6)` height, which is `uniform_list`'s one real requirement - see
-/// [`AdeApp::render_diff_file_detail`]'s own docs on how that is enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffRow {
     /// `⋯ N unchanged lines` between two hunks - `gap` from `changes::fold_gap_between`, never
@@ -44,18 +35,6 @@ enum DiffRow {
     },
     /// One pinned review note (GitHub issue #288), directly beneath the diff line it is anchored
     /// to.
-    ///
-    /// A note is a **row of this list**, not a sibling panel and not an overlay:
-    /// `STAGE-A-CHANGELOG.md` §1's own wording is *"pinned beneath the line"*, and the issue is
-    /// explicit that notes *"interleave into the existing `DiffRow` stream (adjust the enum; reuse
-    /// the diff renderer - no parallel list)"*. Being a real item is also what makes a note
-    /// virtualize, scroll and measure exactly like everything around it rather than needing its
-    /// own answer to any of those.
-    ///
-    /// It names its `anchor`, not the note's text, for the same reason every other variant here
-    /// names a position rather than content: the row builder is `'static`, so it re-resolves the
-    /// note out of `AdeApp` by (worktree, path, anchor) at build time. `note_row` is a flat
-    /// per-file counter that names this row's own `diff-note-{n}` debug selector.
     Note { anchor: NoteAnchor, note_row: usize },
     /// The trailing `... diff truncated for this file` notice - a genuine final *item* of the
     /// list, not a sibling below it (see [`render_diff_truncated_row`]).
@@ -67,26 +46,6 @@ enum DiffRow {
 /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`], and a trailing truncation notice when this file's diff
 /// really was cut short (either by that cap here or by `wt_core::diff`'s own load-time cap,
 /// `DiffFile::truncated`).
-///
-/// Pure, and separate from [`AdeApp::render_diff_file_detail`], for two reasons: `uniform_list`
-/// needs a real item *count* before it ever calls its row builder, and both numbers have to come
-/// from the same plan or the list would be sized by one shape and drawn from another. Being pure
-/// also makes the interleaving directly `#[test]`-able without a GPUI window - see
-/// `diff_row_plan_tests`.
-///
-/// The cap is applied exactly where the pre-virtualization render loop applied it, including its
-/// one subtlety: the cap is only checked *inside* a hunk's line loop, so a hunk whose first line
-/// would exceed it still contributes its header (and fold marker) before the plan stops. That is
-/// deliberately preserved rather than "cleaned up" - it is what makes the truncation notice read
-/// as sitting under a real hunk boundary instead of mid-hunk.
-///
-/// `noted` is the set of [`NoteAnchor`]s this worktree really has a review note pinned on for this
-/// path (GitHub issue #288). A note row is appended directly after the line it is anchored to,
-/// which is what makes *"pinned beneath the line"* a fact about the row plan rather than about
-/// where something is drawn. Note rows deliberately do **not** count toward
-/// [`MAX_RENDERED_DIFF_LINES_PER_FILE`]: that cap exists to bound how much *diff* is built per
-/// frame, and a reviewer's own notes on the lines already within it are neither unbounded nor
-/// something the cap has any business hiding.
 fn diff_rows(file: &DiffFile, noted: &[NoteAnchor]) -> Vec<DiffRow> {
     // At most one header + one fold marker per hunk, the capped line count, the notice, and one
     // row per real note.
@@ -151,12 +110,6 @@ fn diff_rows(file: &DiffFile, noted: &[NoteAnchor]) -> Vec<DiffRow> {
 
 /// Every diff line of `file` that a review note could be pinned to, in the order the diff really
 /// lays them out, top to bottom.
-///
-/// GitHub issue #288's batched prompt has to list its notes *"line-anchored"* in the order the
-/// reviewer sees them - not in whatever order a `BTreeMap` happens to hold anchors, which puts
-/// every `New` before every `Old` and so would jumble a hunk that removed and added around the
-/// same place. `crate::review_notes::flow::AdeApp::batched_review_prompt` sorts by position in
-/// this list.
 pub(crate) fn note_anchors_in_diff_order(file: &DiffFile) -> Vec<NoteAnchor> {
     let mut anchors = Vec::new();
     let mut rendered_lines = 0usize;
@@ -175,18 +128,6 @@ pub(crate) fn note_anchors_in_diff_order(file: &DiffFile) -> Vec<NoteAnchor> {
 }
 
 /// Which surface [`AdeApp::render_diff_file_detail`] is drawing into.
-///
-/// GitHub issue #225 introduced a second place that shows a file's hunks - the agent Review tab -
-/// and the decision was explicitly **not** to write a second diff renderer for it. There is one
-/// hunk renderer in this app, and this parameter is the whole of what differs between its two
-/// callers: which highlight cache to read, which scroll handle to drive, and which element-id/
-/// `debug_selector` prefix to use so the two surfaces' elements stay distinguishable.
-///
-/// The three resources are genuinely per-surface, not shared, because both surfaces can hold a
-/// *different* open file at the same time: one shared highlight cache would have its identity
-/// guard reject every read as the user moved between them (recomputing both files' highlighting
-/// on every switch), and one shared scroll handle would drag each surface's scroll position onto
-/// the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffDetailSurface {
     /// The git-side Diff view, opened from the Changes sidebar or the File/Diff toggle.
@@ -229,13 +170,6 @@ impl DiffDetailSurface {
     }
 
     /// The `DiffFile` this surface currently has open, if any.
-    ///
-    /// The row builder inside [`AdeApp::render_diff_file_detail`]'s `uniform_list` is `'static`
-    /// (GitHub issue #224) and so cannot hold a borrow of the `&DiffFile` the method itself was
-    /// handed - it re-resolves through this instead, the same way the pre-#225 Changes-only
-    /// closure re-resolved `self.open_diff_file_cache` directly. Reading through `surface` rather
-    /// than hardcoding that field is what lets one virtualized list implementation serve both
-    /// surfaces correctly.
     fn open_file(self, app: &AdeApp) -> Option<&DiffFile> {
         match self {
             DiffDetailSurface::Changes => app.open_diff_file_cache.as_ref(),
@@ -256,18 +190,6 @@ impl AdeApp {
     /// not a background `cx.spawn()` task like [`Self::spawn_file_load`] uses for a whole file's
     /// `load_file` - justified below by the real, measured cost this cap keeps small, not
     /// assumed.
-    ///
-    /// Highlights at most [`MAX_RENDERED_DIFF_LINES_PER_FILE`] lines total, hunk by hunk,
-    /// truncating the last hunk's own fed-in line list once the cap is reached -
-    /// [`Self::render_diff_file_detail`]'s render loop never shows more than that many lines
-    /// either, so highlighting a file's full, uncapped (up to `wt_core::diff`'s own
-    /// `MAX_HUNK_LINES_PER_FILE` per hunk) hunk list would do real work no render could ever
-    /// show. Measured directly against what was then this crate's own largest real `.rs`
-    /// file (the ~3,900-line `root/code_surface.rs`, since split into this folder) in a
-    /// debug build: highlighting it whole took ~80ms; capped to this
-    /// constant (300 lines, split across several hunk-sized calls) took ~5-6ms - the real,
-    /// measured reason this stays a synchronous call at a real, infrequent change point rather
-    /// than needing a background task.
     pub(crate) fn ensure_diff_highlight_cache(&mut self) {
         let Some(file) = self.open_diff_file_cache.clone() else {
             self.diff_highlight_cache = None;
@@ -321,75 +243,12 @@ impl AdeApp {
     /// file's hunks are already eagerly loaded, so the design's "press ⏎ to load this hunk"
     /// treatment doesn't apply here; capped by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] independent
     /// of `wt_core::diff`'s own load-time cap.
-    ///
-    /// ## Cache identity guard
-    ///
-    /// `self.diff_highlight_cache` is read through a real `file`-identity filter (`cache`,
-    /// below) before anything positional (`per_hunk.get(hunk_index)`/`lines.get(line_index)`) is
-    /// read from it - never read positionally on its own. Without this, a cache that's ever even
-    /// briefly stale relative to `file` (e.g. a future caller racing a fast switch between two
-    /// open diffs) wouldn't just show wrong *colors* - `hunk_index`/`line_index` would be valid
-    /// positions into a *different* file's real source lines and gutter numbers, rendered under
-    /// the *current* file's correct diff signs, the single most misleading output this surface
-    /// could show. When the filter fails (mismatched or not-yet-built), `cache` is `None` for
-    /// this whole render pass, so every line falls back to [`render_diff_line`]'s own plain-text/
-    /// blank-gutter path - real, honestly-blank output, never another file's real content. The
-    /// guard itself is [`diff_highlight_cache_for`], factored out as its own pure, directly
-    /// unit-tested function - see its own docs and tests for the constructed-mismatch proof.
-    ///
-    /// The guard is consulted *inside* the row builder, once per invocation of it, rather than
-    /// once per frame in this method: the builder is `'static` and re-resolves the open
-    /// `DiffFile` through `surface.open_file(self)` (below), so the cache has to be filtered
-    /// against that same re-resolved file for the check to mean anything. Nothing about the check
-    /// itself changed - same function, same `None`-means-fall-back-to-plain-text contract, and
-    /// the per-row `per_hunk.get(hunk)`/`lines.get(line)` reads are still reachable only through
-    /// it.
-    ///
-    /// ## Virtualization (GitHub issue #224), generalized to two surfaces (GitHub issue #225)
-    ///
-    /// A real `gpui::uniform_list`, following
-    /// `crate::code_surface::file_view::AdeApp::render_file_view`'s established pattern for this
-    /// same content shape (see `vendor/zed/crates/gpui/examples/uniform_list.rs` for the API
-    /// itself). Until issue #224 every row of the whole capped diff - up to
-    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] lines plus every hunk header and fold marker - was
-    /// built, laid out and painted on *every single frame*, inside a plain
-    /// `div().overflow_y_scroll()`, including the great majority scrolled off screen. That is
-    /// structurally the same per-frame cost `crate::sidebar::render::AdeApp::render_file_tree`
-    /// and `crate::graph_view::render::AdeApp::render_graph_rows` (GitHub issue #218) were
-    /// carrying before they were virtualized; the file tree's own measurement of it (~72% of a
-    /// whole `Window::draw`) is *the file tree's*, on its row shape, not a measurement of this
-    /// view. What is measured here is `diff_virtualization_tests`' own before/after: a row far
-    /// below the viewport stopped being built at all.
-    ///
-    /// `surface` is what makes one `uniform_list` implementation correct for both the git Diff
-    /// view and the agent Review tab (issue #225): every place this method would otherwise reach
-    /// for `self.open_diff_file_cache`/`self.diff_highlight_cache`/`self.diff_view_scroll_handle`
-    /// directly instead goes through `surface.open_file`/`surface.highlight_cache`/
-    /// `surface.scroll_handle`, so the two surfaces can each hold a different open file without
-    /// either one's render pass reading the other's state.
-    ///
-    /// Two things `uniform_list` requires, both real:
-    /// - **Definite height.** Its default `ListSizingBehavior::Auto` gives it zero intrinsic
-    ///   height, so every pixel comes from the `.flex_1().min_h_0()` below - drop either and it
-    ///   renders zero rows, silently. It also owns its own scroll offset (hence both
-    ///   [`Self::diff_view_scroll_handle`] and [`Self::review_scroll_handle`] being a
-    ///   `gpui::UniformListScrollHandle`), so it needs no `overflow_y_scroll()` wrapper and must
-    ///   not be given one.
-    /// - **One uniform row height,** measured from item 0 alone and then used for every slot
-    ///   (`vendor/zed/crates/gpui/src/elements/uniform_list.rs`'s `measure_item`/`prepaint`).
-    ///   This list interleaves four differently-purposed rows, so each is pinned to the same
-    ///   `rems(1.6)` a diff line's own `line_height` already gives it: [`render_fold_marker`]
-    ///   already had `.h(rems(1.6))`, [`render_hunk_header`] and [`render_diff_truncated_row`]
-    ///   were given it here. `rems`, not `px`, so they all still scale together under
-    ///   [`zoom_scoped`] - which wraps the list exactly the way `render_file_view` wraps its own.
-    ///   A row that disagreed would simply be clipped, with no panic and no warning.
     pub(crate) fn render_diff_file_detail(
         &self,
         file: &DiffFile,
         surface: DiffDetailSurface,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // Read the effective zoom once and pass it to `zoom_scoped` at every return point below.
         let rem_px = self.effective_code_rem_px();
 
         if file.is_binary {
@@ -614,7 +473,6 @@ impl AdeApp {
                     .collect::<Vec<_>>()
             }),
         )
-        // Load-bearing, and it fails silently if removed - see this method's own docs.
         .flex_1()
         .min_h_0()
         .bg(theme::surface::PTY)
@@ -637,13 +495,6 @@ impl AdeApp {
     /// wrapper GitHub issue #30's overlay scrollbar needs - see `crate::sidebar::render::AdeApp::
     /// render_file_tree`'s own docs on why the scrollbar must never be a child of the scrolling
     /// element itself.
-    ///
-    /// Only the real hunk-rendering path uses this now. The two message return points (binary,
-    /// no-hunks) render through [`render_diff_message_pane`] instead, with no scrollbar at all:
-    /// a one-line message can never overflow the pane, and now that this handle's geometry is
-    /// written by the `uniform_list` alone, a message frame that still consulted it would be
-    /// reading whatever the last *diff* left there - a scrollbar for content that isn't on
-    /// screen.
     fn wrap_with_scrollbar(
         &self,
         surface: DiffDetailSurface,
@@ -684,12 +535,6 @@ fn render_diff_message_pane(id: String, message: String) -> impl IntoElement {
 }
 
 /// One hunk's `@@ ... @@` header row.
-///
-/// `.h(rems(1.6))` (with `.flex().items_center()`) rather than relying on its own line height:
-/// this is item 0 of [`AdeApp::render_diff_file_detail`]'s `uniform_list` for every real diff -
-/// the single row every other slot's height is measured from - so its height is stated outright
-/// rather than left to emerge from the text style, and it is the same `rems(1.6)` a diff line's
-/// `line_height` gives it. `rems`, not `px`, so it scales with zoom like the rows around it.
 pub(in crate::code_surface) fn render_hunk_header(
     header: &str,
     hunk_index: usize,
@@ -715,15 +560,6 @@ pub(in crate::code_surface) fn render_hunk_header(
 /// The `... diff truncated for this file` notice, shown when this file's diff really was cut
 /// short - by [`MAX_RENDERED_DIFF_LINES_PER_FILE`] here, or by `wt_core::diff`'s own load-time
 /// cap (`DiffFile::truncated`).
-///
-/// The final *item* of the row list rather than a sibling below it, which is what keeps it
-/// scrolling with the rows it is talking about - the same treatment
-/// `crate::graph_view::render::render_graph_load_more_row` gives the graph's own trailing notice
-/// (GitHub issue #218/#221), and for the same reason it carries the shared `rems(1.6)` row
-/// height: `uniform_list` sizes every slot from item 0 alone, so a taller row (which is exactly
-/// what the `render_sidebar_message` this replaces was, at `p(px(10.0))` around 10.5px text)
-/// would simply be clipped, with no panic and no warning. Same wording as before, in the same
-/// faint monospace as the fold markers it sits below.
 fn render_diff_truncated_row() -> impl IntoElement {
     div()
         .flex()
@@ -749,16 +585,6 @@ fn render_blank_diff_row() -> impl IntoElement {
 
 /// The diff view's `⋯ N unchanged lines` fold marker. `N` is derived from the hunks' `@@ ... @@`
 /// headers (`crate::sidebar::changes::fold_gap_between`), never an estimate.
-///
-/// Sized in `rems()`, not `px()`: unlike the line-number gutter and git-gutter column, this
-/// marker isn't exempt from zoom, so it must scale with the surrounding diff rows rather than
-/// staying a fixed-size sliver once zoom moves off 100%. `0.85` keeps it proportionally smaller
-/// than a diff line's own text, matching the 11px-vs-13px ratio at the 100% baseline.
-///
-/// Its `.h(rems(1.6))` - which predates virtualization - is also exactly the shared row height
-/// [`AdeApp::render_diff_file_detail`]'s `uniform_list` lays every slot out at, so this marker
-/// needed no height change to become a real item of that list. `before_hunk` names only this
-/// row's own `diff-fold-marker-{before_hunk}` debug selector (see [`DiffRow::FoldMarker`]).
 pub(in crate::code_surface) fn render_fold_marker(
     gap: usize,
     before_hunk: usize,
@@ -848,47 +674,6 @@ fn render_diff_gutter_number(number: Option<usize>) -> impl IntoElement {
 /// expressed only via the row background tint + accent bar + sign glyph, never the text itself,
 /// so it doesn't fight the real syntax coloring for the same tokens - see this function's own
 /// `accent` binding for why that's `ADD_FG`/`DEL_FG`, not `ADD_SIGN`/`DEL_SIGN`.
-///
-/// `rendered`/`numbers` are `None`/`(None, None)` whenever [`render_diff_file_detail`]'s cache
-/// identity guard couldn't confirm the cache actually belongs to the file being rendered (see
-/// that method's own docs) - not just "shouldn't happen in practice", a real, checked condition.
-/// This function stays honest either way: it falls back to `line`'s own raw, plainly-colored
-/// content and a blank gutter rather than panicking, guessing, or - the failure mode this guard
-/// exists to prevent - ever being handed (and blindly rendering) another file's real lines.
-///
-/// ## The author gutter (GitHub issue #287)
-///
-/// `author` adds a **second** left-edge channel, ahead of the diff-kind accent bar rather than
-/// instead of it: `REVISION-2026-08-14.md` §1's per-agent attribution answers *who wrote this
-/// line*, which is a different question from *what this diff does to it*, and the whole point of
-/// this row's existing "one fact per channel" discipline is that two facts never share one.
-/// Reading left to right the row now says: who wrote it, what changed, which lines, and what it
-/// says.
-///
-/// It is drawn **only where provenance really exists**. `None` - an unattributed line, a context
-/// line, or a file this worktree has no record for - paints no bar at all, not a neutral one:
-/// `crate::provenance::render::author_gutter_color`'s own `None` means "no answer", and the
-/// honest rendering of no answer is an empty gutter. The neutral tint is spoken for; it means
-/// `you`.
-///
-/// `filter` dims every line whose author is somebody *else* to
-/// `crate::provenance::render::FILTER_DIM_OPACITY` (the mock's 0.32). A line with no author is
-/// deliberately **not** dimmed - `Jerry.dc.html`'s own `muted = attr && who && who !== attr` - so
-/// filtering by one author never hides the context its work sits in.
-///
-/// ## The note channel (GitHub issue #288)
-///
-/// A **third** left-edge channel, and by the same discipline: *is there a note on this line* is
-/// its own fact, so it gets its own column rather than sharing one. `Jerry.dc.html` draws it as a
-/// 14px centred glyph immediately after the gutters - `●` where a note is pinned. `○` is the note
-/// **cursor**: the line `C` would toggle a note on, which in the mock is the "a note exists here
-/// but is hidden" state and here is "this is the line you are on". A line with neither draws
-/// nothing at all, following the author bar's own rule that the honest rendering of no answer is
-/// an empty column.
-///
-/// The whole row becomes clickable when - and only when - `chrome.anchor` is `Some`, i.e. when the
-/// line really has a stable file-line identity to pin a note to. A line the diff cannot name is
-/// not annotatable, and it does not pretend to be by being clickable.
 pub(in crate::code_surface) fn render_diff_line(
     line: &wt_core::diff::DiffLine,
     chrome: DiffLineChrome<'_>,
@@ -1080,11 +865,6 @@ fn render_note_column(note: Option<NoteMark>, is_note_cursor: bool) -> impl Into
 }
 
 /// Everything [`render_diff_line`] needs beyond the diff line itself.
-///
-/// A struct rather than eight more parameters: this row now carries four independent channels
-/// (diff kind, author, note, and the line numbers), each added by its own issue, and a
-/// nine-argument function is both unreadable and past `clippy::too_many_arguments`. Grouping them
-/// also makes the row builder's own resolution of each channel read as one block.
 pub(in crate::code_surface) struct DiffLineChrome<'a> {
     /// This line's per-token syntax highlighting, or `None` when the cache identity guard could
     /// not confirm the cache belongs to this file.
@@ -1138,11 +918,6 @@ mod diff_render_tests {
         );
     }
 
-    /// Renders a real diff of a real `.rs` file (one line changed - a real, git-produced
-    /// context/removed/added hunk) and checks real things about the result: every row really
-    /// painted (`debug_selector`), and the cache the render path reads from
-    /// (`AdeApp::diff_highlight_cache`) really contains per-token classification - a `fn`
-    /// keyword and the changed integer literal - not flat, uncoloured text.
     #[gpui::test]
     fn opening_a_real_diff_renders_real_syntax_highlighted_rows(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1214,12 +989,6 @@ mod diff_render_tests {
         });
     }
 
-    /// Proves `AdeApp::diff_highlight_cache` is genuinely *reused*, not silently recomputed
-    /// every time `Self::ensure_diff_highlight_cache` runs - pointer identity of the cached
-    /// `Vec`, since a fresh recompute would allocate a new one (mirrors
-    /// `code_view_cache_tests::repeated_renders_of_the_same_open_file_reuse_the_cached_parse`'s
-    /// identical technique for `file_view_cache`). If the `DiffFile` freshness check were ever
-    /// removed from `ensure_diff_highlight_cache`, this would fail.
     #[gpui::test]
     fn repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting(
         cx: &mut TestAppContext,
@@ -1257,7 +1026,6 @@ mod diff_render_tests {
                 .as_ptr()
         });
 
-        // The real hook this cache is recomputed from, called again with nothing changed.
         app.update(cx, |app, _cx| {
             app.refresh_open_diff_file_cache();
         });
@@ -1276,8 +1044,6 @@ mod diff_render_tests {
         );
     }
 
-    /// The other half of the same cache's correctness: switching to a *different* changed file
-    /// must genuinely recompute - not a cache that never refreshes.
     #[gpui::test]
     fn switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache(
         cx: &mut TestAppContext,
@@ -1342,16 +1108,6 @@ mod diff_render_tests {
         });
     }
 
-    /// Regression for the highlight cache's real `MAX_RENDERED_DIFF_LINES_PER_FILE` cap: a diff
-    /// with more lines than the render loop will ever show must still render every one of the
-    /// lines it *does* show with real highlighting (not a `None`-cache fallback row), and must
-    /// not panic at the exact truncation boundary.
-    ///
-    /// GitHub issue #224 changed *when* the last row within the cap paints, not whether it is
-    /// reachable: the list is a real `gpui::uniform_list` now, so row 299 is only built once it
-    /// is genuinely scrolled into view. The assertion below therefore scrolls first - and the
-    /// row past the cap must still not exist at any scroll position at all, which is the half of
-    /// this test that is really about the cap.
     #[gpui::test]
     fn a_diff_past_the_rendered_line_cap_still_highlights_every_line_it_actually_renders(
         cx: &mut TestAppContext,
@@ -1364,7 +1120,6 @@ mod diff_render_tests {
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "initial"]);
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // One hunk, 350 added lines - more than MAX_RENDERED_DIFF_LINES_PER_FILE (300).
         let mut content = String::from("fn noop() {}\n");
         for index in 0..350 {
             content.push_str(&format!("fn generated_{index}() -> i32 {{ {index} }}\n"));
@@ -1439,13 +1194,6 @@ mod diff_render_tests {
         }
     }
 
-    /// The CRITICAL fix's core proof: a cache built for `file_a` must never be read
-    /// positionally for a render of `file_b`, even though both have the exact same hunk/line
-    /// shape (so a purely positional `per_hunk.get(0).get(0)` lookup - the real bug this guard
-    /// replaces - would "succeed" and silently hand back `file_a`'s real highlighted source
-    /// text). `diff_highlight_cache_for` must reject the mismatch and return `None`, the signal
-    /// [`AdeApp::render_diff_file_detail`] treats as "fall back to `file_b`'s own real, plain
-    /// text" rather than ever painting `file_a`'s real content under `file_b`'s diff row.
     #[test]
     fn cache_identity_guard_rejects_a_mismatched_cache_entry() {
         let file_a = sample_diff_file("a.rs");
@@ -1466,8 +1214,6 @@ mod diff_render_tests {
         );
     }
 
-    /// The other half: a cache that genuinely does belong to the file being rendered must still
-    /// be usable - the guard must not reject real, fresh, matching cache entries too.
     #[test]
     fn cache_identity_guard_accepts_a_matching_cache_entry() {
         let file = sample_diff_file("a.rs");
@@ -1485,8 +1231,6 @@ mod diff_render_tests {
         assert_eq!(cached_numbers[0][0], (Some(1), Some(1)));
     }
 
-    /// No cache built yet (`None`) must also fall back cleanly, not panic - the same honest
-    /// "nothing to read yet" case as a genuine mismatch.
     #[test]
     fn cache_identity_guard_handles_no_cache_yet() {
         let file = sample_diff_file("a.rs");
@@ -1497,11 +1241,6 @@ mod diff_render_tests {
 
 /// The pure half of GitHub issue #224: [`diff_rows`], the flat row plan
 /// [`AdeApp::render_diff_file_detail`]'s `uniform_list` is both sized by and drawn from.
-///
-/// These need no GPUI window at all, which is the point of factoring the plan out of the render
-/// method: the interleaving of hunk headers, fold markers, diff lines and the truncation notice -
-/// and the exact place [`MAX_RENDERED_DIFF_LINES_PER_FILE`] cuts it off - is directly assertable
-/// here, while `diff_virtualization_tests` below covers what only a real render can show.
 #[cfg(test)]
 mod diff_row_plan_tests {
     use super::*;
@@ -1524,8 +1263,6 @@ mod diff_row_plan_tests {
         }
     }
 
-    /// The ordinary shape: header, that hunk's lines, then - only where the headers say there is
-    /// a real unchanged gap - a fold marker before the next header.
     #[test]
     fn the_row_plan_interleaves_headers_fold_markers_and_lines_in_scroll_order() {
         let file = file_with(
@@ -1578,8 +1315,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// Back-to-back hunks (no real unchanged span between them) get no fold marker, so the plan
-    /// can't invent scroll extent that isn't there.
     #[test]
     fn back_to_back_hunks_produce_no_fold_marker() {
         let file = file_with(
@@ -1604,10 +1339,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// The cap is unchanged by virtualization (deliberately - GitHub issue #224 is about
-    /// per-frame render cost, not about how much of a diff is reachable): exactly
-    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] line rows, then the truncation notice as the final
-    /// item of the list.
     #[test]
     fn the_row_plan_stops_at_the_render_cap_and_ends_with_the_truncation_notice() {
         let lines: Vec<wt_core::diff::DiffLine> = (0..MAX_RENDERED_DIFF_LINES_PER_FILE + 50)
@@ -1639,8 +1370,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// The loader's own cap (`wt_core::diff`'s `DiffFile::truncated`) is a second, independent
-    /// reason for that notice - a file well under this view's own render cap still gets it.
     #[test]
     fn a_loader_truncated_file_under_the_cap_still_ends_with_the_notice() {
         let file = file_with(
@@ -1653,9 +1382,6 @@ mod diff_row_plan_tests {
         assert_eq!(diff_rows(&file, &[]).last(), Some(&DiffRow::Truncated));
     }
 
-    /// GitHub issue #288: a note is a real row of *this* list, directly after the line it is
-    /// anchored to - the structural half of *"pinned beneath the line"* and of *"no parallel
-    /// list"*.
     #[test]
     fn a_note_row_interleaves_directly_beneath_the_line_it_is_anchored_to() {
         // `@@ -4,2 +4,2 @@`: old lines 4-5, new lines 4-5. The removed line is old 4, the added
@@ -1702,8 +1428,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// The removed-line half: `NoteAnchor::Old(4)` and `NoteAnchor::New(4)` are different lines of
-    /// the same hunk, and each pins its note under its own.
     #[test]
     fn a_note_on_a_removed_line_pins_under_the_removed_line() {
         let file = file_with(
@@ -1734,8 +1458,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// An anchor naming a line this diff does not show pins nothing, rather than pinning to
-    /// whatever line is nearest.
     #[test]
     fn an_anchor_no_longer_in_the_diff_plans_no_note_row() {
         let file = file_with(
@@ -1753,8 +1475,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// The order the batched prompt lists its notes in has to be the order the reviewer sees
-    /// them, which is neither of the two orders a `BTreeMap<NoteAnchor, _>` offers.
     #[test]
     fn diff_order_interleaves_removed_and_added_anchors_the_way_the_hunk_does() {
         let file = file_with(
@@ -1776,7 +1496,6 @@ mod diff_row_plan_tests {
         );
     }
 
-    /// And a whole, untruncated diff must not grow a notice out of nowhere.
     #[test]
     fn a_complete_diff_gets_no_truncation_notice() {
         let file = file_with(
@@ -1793,23 +1512,6 @@ mod diff_row_plan_tests {
 /// Real, live-rendered proof that the Diff view's row list is genuinely virtualized (GitHub issue
 /// #224, "Diff file view is lagging") - that a row scrolled far below the viewport is not merely
 /// *invisible* but never becomes a painted element at all.
-///
-/// None of this is observable from [`diff_rows`]' pure plan, which is identical either way: only
-/// a real render can tell "built 300 rows and clipped 250 of them" apart from "built 50". These
-/// tests therefore also assert the positive half - that the rows which should paint really do,
-/// that the absent ones are still reachable by really scrolling, and that the list's three other
-/// row kinds (hunk header, fold marker, truncation notice) survived being folded into a list that
-/// lays every slot out at one fixed height - so a future change that "virtualizes" by rendering
-/// nothing, or by silently clipping every non-line row, fails here rather than passing.
-///
-/// The first two were run against the pre-fix eager `flex_col` before being committed, and both
-/// genuinely failed against it: with 350 real changed lines open, `diff-line-250` had painted
-/// bounds with the list untouched at the top, and so had `diff-line-299`, the very last row
-/// within the render cap. Both pass against the `uniform_list`. That is what they measure and all
-/// they measure - no frame timing is claimed here, for this view.
-///
-/// Mirrors `crate::graph_view::render::graph_virtualization_tests`, the same proof for the git
-/// graph's commit rows.
 #[cfg(test)]
 mod diff_virtualization_tests {
     use super::*;
@@ -1838,11 +1540,6 @@ mod diff_virtualization_tests {
 
     /// A real repository whose working tree differs from its committed base by `added` brand-new
     /// lines in one file - a single real git hunk, `added` lines long.
-    ///
-    /// 350 is deliberately more than [`MAX_RENDERED_DIFF_LINES_PER_FILE`] (300), so the same seed
-    /// exercises the cap and the truncation notice; the test viewport is 1920x1080, so at the
-    /// `rems(1.6)` row height (about 21px at the default editor font size) only on the order of
-    /// 50 rows can be on screen at once - far fewer than either number.
     fn seed_big_diff(dir: &std::path::Path, added: usize) {
         init_repo(dir);
         std::fs::write(dir.join("big.rs"), "fn noop() {}\n").expect("write big.rs");
@@ -1924,11 +1621,6 @@ mod diff_virtualization_tests {
         );
     }
 
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable. This scrolls the real list with a real `gpui::ScrollWheelEvent`
-    /// and asserts the row that was absent genuinely materializes - which simultaneously proves
-    /// the list still scrolls at all now that the former `div().overflow_y_scroll()` wrapper is
-    /// gone, the one behaviour this change could plausibly have broken outright.
     #[gpui::test]
     fn scrolling_the_virtualized_diff_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
@@ -1960,12 +1652,6 @@ mod diff_virtualization_tests {
         );
     }
 
-    /// The three rows that are not diff lines have to survive being items of a list that measures
-    /// item 0 and lays every other slot out at exactly that height: a hunk header (which *is*
-    /// item 0 of every real diff), the `⋯ N unchanged lines` fold marker between two hunks, and
-    /// the second hunk's own header after it. All three must paint, in that order, each exactly
-    /// as tall as a real diff line - a row that disagreed would be clipped, with no panic and no
-    /// warning.
     #[gpui::test]
     fn hunk_headers_and_fold_markers_paint_at_the_shared_row_height(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2029,10 +1715,6 @@ mod diff_virtualization_tests {
         );
     }
 
-    /// The truncation notice is the final *item* of the list rather than a sibling below it, so
-    /// it has to sit directly under the last row within the cap and carry the same fixed height.
-    /// (As a `render_sidebar_message` - what it used to be - it would have been a ~31px element
-    /// in a ~21px slot, i.e. clipped.)
     #[gpui::test]
     fn the_truncation_notice_is_the_last_item_of_the_list_at_the_shared_row_height(
         cx: &mut TestAppContext,
@@ -2070,12 +1752,6 @@ mod diff_virtualization_tests {
         );
     }
 
-    /// GitHub issue #30's overlay scrollbar has to keep working across the handle's type change
-    /// (`gpui::ScrollHandle` -> `gpui::UniformListScrollHandle`): it reads its geometry through
-    /// `crate::root::scrollbar::ScrollableHandle`, which already covered both kinds, but the
-    /// values behind it are written by the `uniform_list` now rather than by a scrolling `div`.
-    /// A diff long enough to overflow must still get a real, painted track - and one that fits
-    /// must still get none, so this can't pass by drawing a scrollbar unconditionally.
     #[gpui::test]
     fn the_overlay_scrollbar_still_tracks_the_virtualized_list(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2093,7 +1769,6 @@ mod diff_virtualization_tests {
              this fails the handle's geometry is no longer reaching it"
         );
 
-        // A diff that genuinely fits must still get no scrollbar at all.
         let small = tempfile::tempdir().expect("tempdir");
         init_repo(small.path());
         std::fs::write(small.path().join("small.rs"), "fn a() -> i32 {\n    1\n}\n")
@@ -2117,18 +1792,6 @@ mod diff_virtualization_tests {
         );
     }
 
-    /// The cache identity guard under virtualization. The guard itself is unchanged
-    /// ([`diff_highlight_cache_for`], still covered directly by `diff_render_tests`' own
-    /// constructed-mismatch proofs) but *where* it is consulted moved: into the row builder,
-    /// which now resolves one row at a time by `(hunk, line)` instead of walking hunks in order.
-    /// That is exactly the indexing a virtualized rewrite could plausibly get wrong - and getting
-    /// it wrong would reproduce the original CRITICAL bug's symptom, one line's real source text
-    /// under another line's diff sign and gutter number.
-    ///
-    /// So this walks the real row plan for a real two-hunk diff and resolves each line row
-    /// through the guard exactly the way the row builder does, asserting the text it lands on is
-    /// that row's own content - including for the second hunk, whose rows are the ones a
-    /// flat-counter mix-up would misroute.
     #[gpui::test]
     fn every_virtualized_row_resolves_its_own_line_through_the_identity_guard(
         cx: &mut TestAppContext,

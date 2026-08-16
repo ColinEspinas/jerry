@@ -1,62 +1,10 @@
 //! Turning one raw Claude Code hook payload into the small, already-decided fact Jerry's rail
 //! needs (GitHub issue #239, phase 2).
-//!
-//! GPUI-free, socket-free and process-free: takes an event name and the raw JSON bytes Claude
-//! Code wrote to the forwarder's stdin, and returns a [`HookReport`] - so every extraction rule
-//! below is directly `#[test]`-able without a window, a listener or a child process. That is the
-//! same contract [`crate::rail::status`] and `crate::rail::title_signal` already hold.
-//!
-//! ## Why this is a real signal and the pty is not
-//!
-//! Phase 1 read what an agent CLI *happened to render into its terminal* - a title glyph, an
-//! OSC 9 ping. Those are real, but they are presentation: they exist because a human was meant
-//! to look at them, they are coarse (a spinner says "busy", never "editing auth.rs"), and a CLI
-//! is free to restyle them in any release. A hook payload is the opposite kind of fact - it is a
-//! documented, structured side-channel Claude Code emits *for programs*, delivered out-of-band
-//! from the interactive TUI's stdio, carrying the actual tool name and the actual argument. It
-//! is the difference between reading a progress bar off a screenshot and being handed the event.
-//!
-//! ## The payload shapes below were captured, not guessed
-//!
-//! Every field this module reads was verified against real payloads emitted by a real
-//! `claude` 2.1.228 binary on this machine (a scratch project, hooks pointed at a capture
-//! script, a prompt that drove a real `Bash` call and a real `Write` call), cross-checked
-//! against <https://code.claude.com/docs/en/hooks>. That matters because the shapes are not
-//! uniform: the "interesting" argument lives under a *different key per tool*
-//! (`tool_input.command` for `Bash`, `tool_input.file_path` for `Edit`/`Write`/`Read`,
-//! `tool_input.pattern` for `Grep`), so a single hardcoded field name would silently produce a
-//! bare tool name for every tool but one. [`tool_input_preview`] is the real per-tool lookup,
-//! ordered most-specific first, with a documented fallback rather than a guess.
-//!
-//! ## What is deliberately *not* extracted
-//!
-//! `tool_output` (`PostToolUse`) and `last_assistant_message` (`Stop`) are real fields carrying
-//! real text, and both are ignored. They are model/command output of unbounded size and
-//! arbitrary content, and the rail has one short line to render - a truncated first line of a
-//! compiler's stderr is noise wearing the costume of a status. `Stop` is used purely as the turn
-//! boundary it is; what changed during the turn is answered by the real review diff
-//! (`crate::review::flow`), which is a fact about the worktree rather than about what the model
-//! said it did.
 
 use std::time::Duration;
 
 /// How long a hook fact keeps outranking the pty-quiescence and terminal-title heuristics before
 /// Jerry falls back to them - see [`crate::rail::status::HookSignal`] for how the fallback works.
-///
-/// 30 minutes, matching the TTL the research for GitHub issue #239 found in a competitor's
-/// hook-based implementation. The value is a statement about *staleness*, not about session
-/// length: a hook fact is a point-in-time observation, and the failure it must bound is the
-/// process that stopped emitting hooks entirely (Claude Code killed with `SIGKILL`, a crashed
-/// forwarder, a `claude` upgrade that renames an event) while its pty stays open. Left
-/// unbounded, such an agent would pin whatever status it last reported forever, which is exactly
-/// the "confidently wrong" failure the quiescence floor exists to catch.
-///
-/// Why not shorter: a real turn genuinely can run far longer than a few minutes between a
-/// `PreToolUse` and its `PostToolUse` - a long test suite, a big build - and expiring mid-turn
-/// would hand the row back to the quiescence guess precisely during the long silence that guess
-/// is worst at (the false "needs input" this whole issue exists to fix). Why not longer: past
-/// half an hour, a fact this stale is not evidence about the present, and an agent silently
-/// wedged for 30 minutes *should* fall back to being reported by its silence.
 pub const HOOK_SIGNAL_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Longest [`HookReport::activity`] Jerry will keep - the rail renders this as trailing text on
@@ -71,12 +19,6 @@ pub const ACTIVITY_MAX_CHARS: usize = 80;
 pub const QUESTION_MAX_CHARS: usize = 200;
 
 /// Longest [`HookReport::prompt`] Jerry will keep - GitHub issue #227's run title.
-///
-/// Narrower than [`QUESTION_MAX_CHARS`] and wider than [`ACTIVITY_MAX_CHARS`], because this is a
-/// *title*: `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3's history row shows it
-/// on one truncated line ("Reproduce the refresh race in a test"), and the transcript tab header
-/// shows the same string. A user's first message can be a page long; the first sentence of it is
-/// what names the run.
 pub const PROMPT_MAX_CHARS: usize = 120;
 
 /// The largest hook payload Jerry will parse at all. Claude Code payloads are small - the real
@@ -109,25 +51,6 @@ pub enum HookFact {
 
 /// Whether an event is a real lifecycle **transition** or merely a **nudge** re-announcing a
 /// state the agent is already in.
-///
-/// This distinction is not cosmetic, and it was found empirically rather than reasoned about: a
-/// real `claude` 2.1.228 session emits `Notification` immediately *after* the lifecycle event that
-/// caused it, and every `Notification` message is one of a handful of fixed generic strings.
-/// Against [`crate::hooks::server::HookInbox`]'s "latest wins" rule that made every hook fact
-/// Jerry could ever show one of those constants:
-///
-/// - A real permission prompt fires `PermissionRequest` (carrying the real tool and its real
-///   argument - "Write needs permission: notes.txt") and then, milliseconds later, a
-///   `Notification` whose entire message is `"Claude needs your permission"`. The specific
-///   question this module carefully builds was overwritten before it could ever be rendered.
-/// - A finished turn fires `Stop` ([`HookFact::TurnEnded`], the turn boundary the whole review
-///   surface hangs off) and then, about a minute later, an `idle_prompt` `Notification`. That
-///   flipped every finished agent from `Review`/`Idle` back to `Ask` with the constant
-///   `"Claude is waiting for your input"` - erasing exactly the "a turn that ended is a review
-///   boundary" capability this phase exists to add, roughly one minute after it appeared.
-///
-/// Both were observed live against a real binary before this type existed. See
-/// [`crate::hooks::server::HookInbox::record`] for the rule that acts on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// A real lifecycle event: the agent moved from one state to another, and this report is the
@@ -144,13 +67,6 @@ pub enum EventKind {
 }
 
 /// Whether an edit event fired *before* the agent wrote, or *after*.
-///
-/// Both halves are load-bearing for per-agent attribution (GitHub issue #284), and for opposite
-/// reasons. `PreToolUse` is the only moment anything in this process can still see what the file
-/// looked like *before* the agent touched it - without it, the first edit to a five-hundred-line
-/// file has nothing to diff against and the agent would appear to have written all of it.
-/// `PostToolUse` is the moment the new content is really on disk, so it is the only moment the
-/// diff is worth taking. See `crate::provenance::store` for what each one does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditPhase {
     /// `PreToolUse`: the agent is about to write this file.
@@ -176,16 +92,6 @@ pub struct EditedFile {
 
 /// The tools whose whole purpose is to write a file, and the `tool_input` key each puts the path
 /// under.
-///
-/// An allow-list rather than "any tool with a `file_path`", because the distinction being drawn
-/// is *did the file just change*, and `Read`/`Grep`/`Glob` all carry a `file_path`/`path` while
-/// changing nothing. Attributing on a `Read` would hand an agent every line of every file it
-/// merely looked at.
-///
-/// `Bash` is deliberately absent even though `sed -i`/`>` really do write: the payload carries a
-/// shell command, not a path, and guessing which files a command touched from its text is exactly
-/// the "confidently wrong" class this codebase refuses elsewhere. Such a change is instead picked
-/// up as an unattributed or hand edit, which is the honest answer.
 const EDITING_TOOLS: [(&str, &str); 4] = [
     ("Edit", "file_path"),
     ("Write", "file_path"),
@@ -229,42 +135,12 @@ pub struct HookReport {
     /// [`QUESTION_MAX_CHARS`]. `None` unless the event actually carries human-facing text.
     pub question: Option<String>,
     /// The real Claude Code `session_id` this payload carried, if any (GitHub issue #227).
-    ///
-    /// Verified present on *every* real event type this module parses - a real `claude` 2.1.228
-    /// binary was driven through `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`
-    /// and `Stop` (a scratch project, `--settings` pointed at a capture script) and every single
-    /// payload carried the same `session_id` for the whole conversation, including across a real
-    /// `claude --resume <session_id>` re-invocation (`SessionStart`'s `source` simply reads
-    /// `"resume"` instead of `"startup"`). That is the real, durable identifier `claude
-    /// --resume`/`-r` takes - confirmed against the same real binary: resuming by this id and
-    /// asking what the agent had just done answered correctly, proving it is the *same*
-    /// conversation rather than a fresh one that merely inherited some context.
-    ///
-    /// `None` for a payload that omits it (untrusted input off the socket - not every hand-made
-    /// or malformed request will carry one), which a reader must treat as "no id available",
-    /// never as a reason to fail the rest of the report.
     pub session_id: Option<String>,
     /// The file this tool call writes, for GitHub issue #284's per-agent line provenance. `None`
     /// for every event that is not a file-writing tool call - which is most of them.
-    ///
-    /// This is the one thing this module extracts that the *rail* has no use for. It is here
-    /// rather than in a second parser because the raw payload only exists at this one point in
-    /// the program (`crate::hooks::server::handle_connection` hands over these bytes and keeps
-    /// nothing), and a second parse of the same JSON for a second consumer is how two readers of
-    /// one payload start disagreeing about what it said.
     pub edit: Option<EditedFile>,
     /// The literal text the human typed, off a `UserPromptSubmit` payload's own `prompt` field,
     /// truncated to [`PROMPT_MAX_CHARS`] (GitHub issue #227). `None` for every other event.
-    ///
-    /// This is what gives a past run a real **title**. Before it, the only thing a history row
-    /// could name a run by was its worktree's directory name (which is the same for every run in
-    /// that checkout) or its last tool call (which describes a moment, not a task). The task the
-    /// user actually asked for is a real, dated statement the user themselves made - the same
-    /// standard [`crate::hooks::store`]'s module docs set for everything else persisted here.
-    ///
-    /// Only the *first* prompt of a session becomes the title; see
-    /// [`crate::hooks::server::HookRecord::first_prompt`] for where that is decided and why it is
-    /// decided there rather than here.
     pub prompt: Option<String>,
 }
 
@@ -306,16 +182,6 @@ fn truncated(text: &str, max_chars: usize) -> Option<String> {
 }
 
 /// The interesting argument out of a `tool_input` object, as `(value, was_found)`.
-///
-/// Ordered most-specific-first over the real per-tool keys, because there is genuinely no single
-/// field: `Bash` puts its command in `command`, the file tools put a path in `file_path`, the
-/// search tools put a needle in `pattern`/`query`, and `Task` puts a human label in
-/// `description`. Anything unrecognised - including every MCP tool, whose input schema is defined
-/// by a third-party server and cannot be enumerated here - falls through to `None`, which renders
-/// as the bare tool name rather than as a wrong-but-plausible field.
-///
-/// `AskUserQuestion` needs the extra arm below because its content is *nested*, and a flat
-/// top-level lookup finds nothing at all for it - see [`first_question`].
 fn tool_input_preview(tool_input: &serde_json::Value) -> Option<&str> {
     const KEYS: [&str; 6] = [
         "command",
@@ -342,21 +208,6 @@ fn tool_input_preview(tool_input: &serde_json::Value) -> Option<&str> {
 }
 
 /// The first entry of an `AskUserQuestion` `tool_input.questions` array.
-///
-/// `AskUserQuestion` is the one tool whose interesting text is not a top-level string, so
-/// [`tool_input_preview`]'s flat lookup could never reach it: the real shape is
-/// `{"questions": [{"question": .., "header": .., "options": [..], "multiSelect": bool}]}`, and
-/// none of `command`/`file_path`/`path`/`pattern`/`query`/`description` appears anywhere in it.
-/// The result was the exact failure the module docs above warn about - a bare `AskUserQuestion`
-/// on the rail, with the actual question nowhere, at the one moment the agent is blocked on the
-/// human and the row most needs to say what it is blocked *on*.
-///
-/// Captured, not guessed, to this module's standing rule: a real `claude` 2.1.228 was driven
-/// through a real interactive session (headless `-p` does not expose this tool at all, which is
-/// why it had never turned up in a capture before) with hooks pointed at a capture script. The
-/// shape above is the verbatim `tool_input` it emitted, cross-checked against the tool's input
-/// schema in the shipped binary. Only the first question is previewed: the schema allows 1-4, the
-/// rail renders one line, and the first is the one the dialog opens on.
 fn first_question(tool_input: &serde_json::Value) -> Option<&serde_json::Value> {
     tool_input
         .get("questions")
@@ -365,12 +216,6 @@ fn first_question(tool_input: &serde_json::Value) -> Option<&serde_json::Value> 
 }
 
 /// The full question sentence an `AskUserQuestion` is blocking on, for the rail's *question* slot.
-///
-/// Deliberately not the same extraction as [`tool_input_preview`]. [`QUESTION_MAX_CHARS`] already
-/// documents why the two slots differ - a question is "a real sentence a human has to act on"
-/// where an activity line "is a label" - and Claude Code hands over both fields separately, so
-/// each slot gets the field that was designed for it rather than one string stretched across
-/// both. `header` remains the fallback for a payload that somehow carries only the chip.
 fn asked_question(tool_input: &serde_json::Value) -> Option<&str> {
     let question = first_question(tool_input)?;
     ["question", "header"]
@@ -379,17 +224,6 @@ fn asked_question(tool_input: &serde_json::Value) -> Option<&str> {
 }
 
 /// Whether a `Notification`'s `notification_type` really means "a human is being waited on".
-///
-/// This distinction is the entire reason the field is read rather than treating every
-/// `Notification` as attention-worthy: Claude Code emits real notification types that are pure
-/// information (`auth_success`, `agent_completed`, the `elicitation_*` lifecycle echoes), and
-/// promoting those to [`crate::rail::status::Status::Ask`] would light the rail up with rows
-/// that need nothing - the exact false-positive class GitHub issue #239 exists to remove. Only
-/// the types that describe a *block* count.
-///
-/// Unknown types deliberately return `false`: a notification type this build has never heard of
-/// is not evidence a human is needed, and the quiescence floor still catches a genuinely stuck
-/// agent on its own.
 fn notification_wants_human(notification_type: &str) -> bool {
     matches!(
         notification_type,
@@ -399,12 +233,6 @@ fn notification_wants_human(notification_type: &str) -> bool {
 
 /// Parses one hook event into the fact Jerry acts on, or `None` if this event carries nothing
 /// worth changing a row over.
-///
-/// `None` is a real, common answer, not just an error path: Jerry declares only the events it
-/// uses, but a payload that fails to parse, an event this build doesn't act on, or a
-/// `Notification` that isn't about a block must all leave the row exactly as it was rather than
-/// force some default. Malformed JSON is likewise `None` - never a panic and never an error the
-/// listener has to handle, because a hook payload is untrusted input arriving on a socket.
 pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return None;
@@ -599,11 +427,6 @@ mod tests {
 
     /// The real `PreToolUse` a real `claude` 2.1.228 wrote when it invoked `AskUserQuestion`,
     /// captured verbatim (only `transcript_path`/`session_id` shortened).
-    ///
-    /// This one needed an *interactive* session to capture at all: in headless `-p` mode the tool
-    /// is not exposed to the model, which is why the shape had never appeared in a capture and why
-    /// the flat key lookup silently produced a bare tool name for it. Captured by driving a real
-    /// `claude` over a real pty with hooks pointed at a capture script.
     const REAL_PRE_TOOL_USE_ASK: &[u8] = br#"{"session_id":"6ca8b423","cwd":"/tmp/capture","prompt_id":"826cb806","permission_mode":"default","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which date library should we use?","header":"Date lib","options":[{"label":"date-fns","description":"Modular, tree-shakeable pure functions operating on native Date objects. Larger API surface, no wrapper object."},{"label":"dayjs","description":"Tiny (~2KB) immutable wrapper with a Moment-compatible chainable API. Plugin-based for extras like timezones."}],"multiSelect":false}]},"tool_use_id":"toolu_01ACQnZZPUuATtRma6f1iv9e"}"#;
 
     /// The real `PermissionRequest` that followed it milliseconds later, from the same capture -
@@ -885,7 +708,6 @@ mod tests {
 
     #[test]
     fn only_notification_types_that_really_block_a_human_reach_needs_input() {
-        // The real reason `notification_type` is read at all (see `notification_wants_human`).
         for blocking in [
             "permission_prompt",
             "idle_prompt",
@@ -1043,7 +865,6 @@ mod tests {
 
     #[test]
     fn malformed_oversized_and_unknown_input_is_ignored_rather_than_trusted() {
-        // Untrusted bytes off a socket: none of these may panic, and none may produce a fact.
         assert_eq!(parse("PreToolUse", b"not json at all"), None);
         assert_eq!(parse("PreToolUse", b""), None);
         assert_eq!(parse("PreToolUse", b"{\"truncated\":"), None);
@@ -1055,18 +876,15 @@ mod tests {
         assert_eq!(parse("Stop", b"[]"), None);
         assert_eq!(parse("Stop", b"null"), None);
         assert_eq!(parse("StopFailure", b"12345"), None);
-        // A `PreToolUse` with no `tool_name` has nothing to report on.
         assert_eq!(
             parse("PreToolUse", br#"{"tool_input":{"command":"x"}}"#),
             None
         );
-        // An event Jerry does not act on.
         assert_eq!(
             parse("PreCompact", br#"{"hook_event_name":"PreCompact"}"#),
             None
         );
         assert_eq!(parse("", b"{}"), None);
-        // Oversized bodies are refused before the JSON parser is ever handed them.
         let huge = vec![b'x'; MAX_PAYLOAD_BYTES + 1];
         assert_eq!(parse("PreToolUse", &huge), None);
     }

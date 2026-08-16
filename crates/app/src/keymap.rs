@@ -1,64 +1,11 @@
 //! One shared platform-style setting driving two related pieces of chrome: which title-bar
 //! variant `crate::title_bar` renders, and which glyphs a keybinding spec string (e.g.
 //! `"mod+shift+K"`) resolves to for `crate::root::widgets`'s keycap renderers.
-//!
-//! Deliberately GPUI-free, mirroring `crate::palette::state`/`crate::work_surface::state`'s own split: this
-//! module only maps a platform choice onto plain strings, so that mapping is directly
-//! unit-testable without a live GPUI window - turning a resolved combo into `gpui::Div` keycap
-//! trees happens one layer up, in `crate::root::widgets`. [`resolve_keystroke`] is the one real
-//! exception: it takes a real, plain-data `gpui::Keystroke` (no live window needed) so the
-//! Settings › Keybindings page can resolve glyphs straight off `crate::default_key_bindings`'s
-//! actual registered bindings.
-//!
-//! ## One setting, not two
-//!
-//! [`WindowControlsStyle`] couples the title-bar look and the keycap glyphs: a user who
-//! overrides the title bar to look like Windows almost certainly wants `Ctrl`/`Alt` keycaps
-//! too, not a combination that doesn't exist on any real OS.
-//!
-//! ## This is a cosmetic preview, not a rebinding
-//!
-//! `crate::default_key_bindings`'s global bindings are registered exactly once, at real app
-//! startup, and `"secondary"` resolves to its per-OS modifier via `cfg!(target_os = "macos")` -
-//! a **compile-time** fact. No runtime toggle, including this one, can change which physical key
-//! actually triggers a shortcut on this process's real OS. So overriding
-//! [`WindowControlsStyle`] to `MacosStyle` on Linux renders `⌘P` everywhere, but the key that
-//! actually opens the palette is still Ctrl+P - a real, permanent mismatch between what's shown
-//! and what works while the override is active.
-//!
-//! This is accepted rather than fixed by decoupling entirely (which would gut the "preview
-//! another platform's look" feature down to the title bar alone) or by trying to make Cmd
-//! itself start working as a live shortcut on Linux (not possible - GPUI resolves `"secondary"`
-//! once, at compile time, per `cfg!`). The mismatch only exists behind a deliberate, explicit,
-//! opt-in command-palette action whose own label says "preview", not a promise that this
-//! agent's keys changed - a materially different risk profile than the original bug below,
-//! which silently mismatched every user's default, un-opted-into experience.
-//!
-//! ## Real platform detection
-//!
-//! [`std::env::consts::OS`] is real Rust `std`, documented to be `"macos"`/`"windows"`/`"linux"`
-//! on those platforms - the three values [`detected_platform_is_macos`] cares about.
-//!
-//! ## Persisted (R3)
-//!
-//! [`WindowControlsStyle`] is a real field of `crate::settings::store::Settings`
-//! (`WindowSettings::controls`), loaded from and saved to `~/.config/jerry/settings.toml`.
-//! `crate::root::AdeApp::window_controls_style` reads/writes that field directly, so the General
-//! settings page's `Window controls` row and the command palette's three `Window controls: …`
-//! entries mutate the same saved value.
 
 /// Which platform's chrome (title-bar variant, keycap glyphs) should render right now. `System`
 /// (the default) follows [`detected_platform_is_macos`]; the other two variants pin a specific
 /// look regardless of what's actually running, so a developer (or curious user) can preview the
 /// other platform's chrome without leaving the app.
-///
-/// This is a rendering-only preview: it can never change which physical key really triggers
-/// [`crate::default_key_bindings`]'s global shortcuts, which are fixed at compile time by the
-/// real OS - see this module's own docs, above, for why that's a deliberate limitation.
-///
-/// `#[derive(Serialize, Deserialize)]` with per-variant `#[serde(rename = ...)]`
-/// (`"system"`/`"macos"`/`"windows"`) backs `crate::settings::store::WindowSettings::controls` -
-/// see this module's "Persisted (R3)" docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WindowControlsStyle {
     #[default]
@@ -173,11 +120,6 @@ pub fn resolve_combo(spec: &str, macos: bool) -> Vec<String> {
 /// [`resolve_combo`] produces - the Settings › Keybindings page's input
 /// (`crate::settings::state::keybinding_rows`), so its rows read directly off what's really bound and
 /// can't drift the way a hand-copied list once did (R3: a wrong `context` label, a stale order).
-///
-/// `modifiers.secondary()` maps to the cross-platform `modifier` glyph. A literal `control` held
-/// without `secondary` falls back to the physical `ctrl` glyph instead - reachable on macOS
-/// (where `secondary()` tracks `platform`, not `control`) for a binding like
-/// `crate::default_key_bindings`'s `"ctrl-shift-t"`, which is a real, literal Ctrl on every OS.
 pub fn resolve_keystroke(keystroke: &gpui::Keystroke, macos: bool) -> Vec<String> {
     let table = if macos {
         &MACOS_TABLE

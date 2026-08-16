@@ -6,12 +6,6 @@ use crate::menu::model::{self, MenuEntry, MenuRow};
 
 /// Everything [`AdeApp::render_menu_overlay`] needs to paint one open menu: where it goes, what
 /// is in it, and what running a row (or clicking away) really does.
-///
-/// `A` is the opening surface's own action payload - `crate::sidebar::context_menu::MenuAction`,
-/// `crate::rail::menu::RailMenuAction`. The two callbacks are plain `fn` pointers rather than
-/// boxed closures on purpose: a menu row's handler is always "run this surface's dispatcher with
-/// this row's action", never a capture of per-row state, and a `fn` keeps every row's handler
-/// identical instead of one allocation per row per frame.
 pub(crate) struct MenuOverlay<A: Copy + 'static> {
     /// This menu's element-id prefix - the panel is `<id>`, its scrim `<id>-scrim`, and each row
     /// `<id>-<label>`. Also the `debug_selector` every real test resolves the menu through.
@@ -36,33 +30,6 @@ pub(crate) struct MenuOverlay<A: Copy + 'static> {
 impl AdeApp {
     /// One open menu: a full-window occluding scrim whose `on_click` dismisses, plus an
     /// absolutely-positioned panel that stops that click from bubbling.
-    ///
-    /// Zed's own `ui::ContextMenu` (`vendor/zed/crates/ui/src/components/context_menu.rs`) is not
-    /// reachable from here: it lives in Zed's `ui` crate, and this workspace deliberately depends
-    /// on `gpui`/`gpui_platform` only. This is the same real scrim + panel shape
-    /// `crate::work_surface::render::AdeApp::render_plus_menu` established for this app's first
-    /// popover, with the two differences the file tree's menu had to add, both forced by a real
-    /// reported bug:
-    ///
-    /// ## The scrim genuinely blocks what is behind it
-    ///
-    /// `.occlude()` (`gpui::InteractiveElement::occlude`, which sets
-    /// `HitboxBehavior::BlockMouse` - `vendor/zed/crates/gpui/src/window.rs`'s `hit_test` stops
-    /// walking hitboxes at the first one carrying it) is what makes this a real modal layer
-    /// rather than a decorative one. Without it the scrim's `on_click` fired *and* the row
-    /// underneath it took the same click - so dismissing the menu also opened whatever was under
-    /// the cursor - and every row under the pointer still painted its `:hover` fill and its
-    /// tooltip, because those read `Hitbox::is_hovered` directly and never consulted the click
-    /// handlers at all. A `cx.stop_propagation()` in the scrim's own handler could only ever have
-    /// fixed the click half; hover styling is not an event.
-    ///
-    /// ## It starts below the title bar
-    ///
-    /// A full-window occluding scrim swallows the window's own close/minimise/maximise caption
-    /// buttons and the title bar's drag region, so the window could not be closed or moved while
-    /// a menu was up. Reproduced against the real caption button by the file-tree menu's own
-    /// adversarial audit. [`MenuOverlay::origin_y`] is window-space, so the panel subtracts
-    /// `theme::band::TITLE_BAR` to place itself inside a scrim that starts there.
     pub(crate) fn render_menu_overlay<A: Copy + 'static>(
         &self,
         menu: MenuOverlay<A>,
@@ -125,29 +92,6 @@ impl AdeApp {
     /// One menu row. A disabled row is still drawn (so the menu's shape doesn't jump between
     /// right-clicks) but carries no click handler at all - not a handler that returns early,
     /// which would be a row that looks clickable and silently isn't.
-    ///
-    /// Speaks this app's own established dropdown-row language rather than one invented here:
-    /// every value below is `crate::work_surface::render::render_dropdown_menu_row`'s - the row
-    /// shared by the tab strip's `+` menu and the title bar's File/Edit/View/Agent/Help menus -
-    /// at the 24px height and 206px width `STAGE-A-CHANGELOG.md` §4t specifies for this
-    /// component. That function is deliberately *not* reused: its row is a fixed chip + label +
-    /// sub-label + keycap quad, and a context menu has no honest chip glyph or secondary text for
-    /// two of those four slots.
-    ///
-    /// A **destructive** row is `theme::status::FAIL` on a
-    /// `theme::surface::MENU_ROW_HOVER_DESTRUCTIVE` hover, so a destructive click is never
-    /// visually identical to `Copy path` - in either its resting or its hovered state, which a
-    /// shared neutral hover would have made it. §4t writes that pair as "destructive rows in
-    /// `#c4726d` on a `#2a1719` hover"; the hover is exactly that literal, and the *label* keeps
-    /// this app's own already-shipped destructive menu-row tint (`status::FAIL`, `#e0625c`, what
-    /// the file tree's `Delete` row has always been) rather than moving every existing
-    /// destructive row one shade for a two-hex difference. `#c4726d` is this app's
-    /// `theme::button::DANGER_FG` - its destructive *button* pair, not its menu-row accent.
-    ///
-    /// The **keycap** is resolved through `crate::keymap::resolve_combo` from the entry's own
-    /// binding spec, never a hard-coded glyph string, so a Ctrl/⌘ mismatch cannot be introduced
-    /// here and a keycap can only ever name a real, registered binding
-    /// (`crate::default_key_bindings`).
     fn render_menu_row<A: Copy + 'static>(
         &self,
         id_prefix: &'static str,

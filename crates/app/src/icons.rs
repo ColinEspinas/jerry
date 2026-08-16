@@ -1,73 +1,6 @@
 //! The app's shipped icon set: real [Phosphor Icons](https://phosphoricons.com) SVGs (MIT),
 //! vendored under `assets/icons/`, plus the one render helper every consuming surface draws them
 //! through (GitHub issue #282, `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §8).
-//!
-//! ## Why an asset, not another hand-drawn shape
-//!
-//! Every "icon" in the mock is absolutely-positioned 1px `div`s, and §8 records what that cost:
-//! "mismatched optical sizes in a row, two glyphs from one family a divider apart, marks that read
-//! as nothing at 17px". The deciding argument for Phosphor is this app's own build target -
-//! Phosphor ships raw SVGs and GPUI renders SVG natively, so each icon is a named asset
-//! (`assets/icons/<name>.svg` + `gpui::svg()`) instead of geometry someone has to reinterpret as
-//! paths.
-//!
-//! ## Scope: actions and views only
-//!
-//! §8's "Stays hand-drawn" list is Jerry's own vocabulary and is deliberately **not** touched by
-//! this module: agent tint chips, status dots, file-extension chips, diff gutter marks, and the
-//! graph's lanes and merge elbows. [`Icon`] is §8's eleven mapped slots plus the one slot §4u
-//! names outside that table (the overflow menu's Settings row, GitHub issue #290), no more.
-//!
-//! ## Sizing: one optical box per row, never one size per icon
-//!
-//! `REVISION-2026-08-14.md` §7 rule 7, verbatim: "A row of icons needs one shared optical box, not
-//! one size per icon." That is why the only way to draw an icon here is through an [`IconRow`]:
-//! a row is constructed once with one [`IconSize`], and every [`IconRow::draw`] call on it uses
-//! that same box. A lone icon (the rail footer's prune button) is simply a row of one.
-//!
-//! Every vendored Phosphor file is authored on the same `0 0 256 256` canvas (asserted by
-//! [`tests::every_vendored_icon_is_a_real_phosphor_svg_on_the_shared_256_canvas`]), so drawing two
-//! of them into equal boxes really does give them equal optical weight - the property the
-//! hand-drawn shapes could not hold.
-//!
-//! ## Weight: bold, because every named size is below 20px
-//!
-//! §8's rule, verbatim: "**Weight:** `bold` at 15-17px (`regular`'s 1.5px stroke reads thin
-//! against `#5e646a`); `regular` only at 20px+." [`weight_for_size`] is that rule as real code and
-//! [`VENDORED_WEIGHT`] is what `assets/icons/` actually holds; a test pairs them for every
-//! [`IconSize`], so adding a 20px+ size fails the test run until the matching `regular` files are
-//! vendored too, rather than silently drawing a bold glyph where the design asks for a regular one.
-//!
-//! ## Tinting
-//!
-//! GPUI rasterises an SVG to an **alpha mask** and paints it as a `MonochromeSprite` tinted with
-//! the element's own `text.color` (`vendor/zed/crates/gpui/src/elements/svg.rs:117` zips the path
-//! with `style.text.color`; `window.rs`'s `paint_svg` keeps only `p.alpha()` from the rasterised
-//! pixmap and colours the sprite). Two real consequences this module is built around:
-//!
-//! 1. A shipped icon tints like text, exactly as §8 wants - [`IconRow::draw`] takes the caller's
-//!    own [`ColorToken`], so an icon picks up the live theme like every other painted thing here.
-//! 2. An SVG element with **no** text colour paints *nothing at all* - `zip` yields `None` and
-//!    `paint_svg` is never called. "Untinted" is not "keeps its own colours" in GPUI; it is
-//!    "invisible". So [`IconRow::draw`] tints its icon-pack override too (see below) rather than
-//!    shipping a branch that is guaranteed to draw an empty box.
-//!
-//! ## User icon packs still override, by name
-//!
-//! `crate::icon_pack::resolve_icon` is unchanged and still wins: a pack that really contains
-//! `<name>.svg` for one of these names replaces the shipped file for that slot
-//! ([`resolve_source`]). The pack's own icons are looked up by the same design-handoff names this
-//! module uses (`folder`, `trash`, ...), so a pack author needs nothing but the name.
-//!
-//! Note this module deliberately does not change `crate::root::widgets`'
-//! `render_agent_chip_icon`, the one older icon-pack call site - it is a separate,
-//! already-shipped surface with a real difference from this one: a shipped Phosphor icon is
-//! deliberately monochrome and *should* pick up a theme tint (point 1 above), while an
-//! agent-chip pack icon is a full-color, user-supplied brand image that must keep its own
-//! colors. GitHub issue #309 fixed that older call site's own version of point 2 above (it drew
-//! empty boxes for the same "no text color" reason) by switching it to `gpui::img()`, which
-//! doesn't consult `style.text.color` at all - not by adding a tint, which would have been wrong
-//! for a full-color logo.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -83,9 +16,6 @@ use crate::theme::ColorToken;
 /// reads that directory at runtime (exactly how `crate::fonts::FONT_FILES` handles the bundled
 /// `.ttf`s). `crate::fonts::Assets` serves these through `gpui::AssetSource`, which is what
 /// `gpui::svg().path(..)` loads from.
-///
-/// Order matches [`Icon::ALL`]; [`tests::icon_files_and_the_icon_enum_are_the_same_set`] holds
-/// the two honestly in sync.
 pub const ICON_FILES: &[(&str, &[u8])] = &[
     (
         "icons/arrows-left-right.svg",
@@ -231,11 +161,6 @@ impl Icon {
 /// A named optical box: the one square every icon in a given row is drawn inside. Each variant is
 /// a real measurement off the reviewed mock (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`),
 /// not a round number picked here - the surfaces these serve are being rebuilt against that file.
-///
-/// Phosphor's canvas is square, so a box named here is square too. Where the mock's hand-drawn
-/// stand-in was slightly non-square (the segmented tabs' stated 11x10), the square box is the
-/// larger dimension, which is also what the mock's own markup really occupies - see
-/// [`IconSize::PanelTab`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconSize {
     /// 11px - the right panel's segmented Files/Search/Changes tabs. `STAGE-A-CHANGELOG.md` §4w:
@@ -259,17 +184,6 @@ pub enum IconSize {
     /// distinction this size got wrong the first time round (GitHub issue filed 2026-08-16,
     /// screenshot-reported: "icons in buttons are too big"). The hand-drawn stand-ins actually
     /// painted well inside that box:
-    ///
-    /// - funnel (`onClick="{{ onFindGlob }}"`): three bars at `left:3/5/7 width:11/7/3`, `top:5/8/11
-    ///   height:1` each - bounding box x 3-14 (11 wide), y 5-12 (7 tall).
-    /// - trash (rail prune): lid + nub + body at `left:4/7/5 top:4.5/2.5/6.5` - bounding box x
-    ///   4-13 (9 wide), y 2.5-14.5 (12 tall).
-    /// - `⇄` (replace) and the fold-all caret were plain text at `font-size:11px`.
-    ///
-    /// 12 is the largest real dimension in that set (the trash glyph's height) - the same
-    /// "the square box is the larger dimension" reading [`IconSize::PanelTab`]'s own doc comment
-    /// uses, so nothing here clips. Fold-all stays a text caret (`crate::search::render_search_caret`),
-    /// not an `Icon`, so it is unaffected by this box.
     Control,
 }
 
@@ -316,10 +230,6 @@ const REGULAR_WEIGHT_MIN_BOX: Pixels = px(20.0);
 
 /// `REVISION-2026-08-14.md` §8's weight rule as real code: "`bold` at 15-17px (`regular`'s 1.5px
 /// stroke reads thin against `#5e646a`); `regular` only at 20px+".
-///
-/// Pure and `Window`-free, so the rule is directly checkable - which is the point: a test pairs
-/// this against [`VENDORED_WEIGHT`] for every [`IconSize`], so a future 20px+ size cannot land
-/// without either vendoring the `regular` files or consciously restating the rule.
 pub fn weight_for_size(box_size: Pixels) -> IconWeight {
     if box_size >= REGULAR_WEIGHT_MIN_BOX {
         IconWeight::Regular
@@ -330,10 +240,6 @@ pub fn weight_for_size(box_size: Pixels) -> IconWeight {
 
 /// Which file an icon really resolves to right now: this app's own shipped asset, or a real
 /// on-disk file from the user's active icon pack.
-///
-/// Split out of [`IconRow::draw`] as a pure function so the override rule ("shipped icons are the
-/// default; a user icon pack still overrides by name") is testable against real temp directories
-/// without a live GPUI window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IconSource {
     /// This app's own vendored Phosphor file, by `gpui::AssetSource` path
@@ -354,14 +260,6 @@ pub fn resolve_source(pack: &IconPackSettings, icon: Icon) -> IconSource {
 }
 
 /// One row of icons sharing exactly one optical box - the only way to draw a shipped icon.
-///
-/// Constructed once per row with one [`IconSize`]; every [`Self::draw`] call uses that same box,
-/// so `REVISION-2026-08-14.md` §7 rule 7 ("A row of icons needs one shared optical box, not one
-/// size per icon") is structural here rather than a convention a call site can quietly break. A
-/// single icon is a row of one - the rail footer's prune button is exactly that.
-///
-/// Borrows the settings' [`IconPackSettings`] rather than cloning it: a row is built inside a
-/// render pass, which already has `&self`.
 #[derive(Debug, Clone, Copy)]
 pub struct IconRow<'a> {
     pack: &'a IconPackSettings,
@@ -380,15 +278,6 @@ impl<'a> IconRow<'a> {
     }
 
     /// `icon`, drawn inside this row's shared optical box and tinted `color`.
-    ///
-    /// The tint is applied with `.text_color(..)` because that is literally how GPUI colours an
-    /// SVG: it rasterises the file to an alpha mask and paints a `MonochromeSprite` in the
-    /// element's own text colour (see the module docs). It is applied to a pack override too -
-    /// an SVG element with no text colour paints nothing at all in GPUI, so leaving the override
-    /// untinted would ship a slot guaranteed to draw an empty box.
-    ///
-    /// Returns `gpui::Svg` rather than `AnyElement` so callers can still chain their own
-    /// interactivity (`.id(..)`, `.on_click(..)`) onto the real element.
     pub fn draw(&self, icon: Icon, color: ColorToken) -> Svg {
         let source = resolve_source(self.pack, icon);
         let name = icon.name();
@@ -536,11 +425,6 @@ mod tests {
         }
     }
 
-    /// The shipped icons have to be reachable through the *app's own* `gpui::AssetSource`, since
-    /// that is exactly what `gpui::svg().path(..)` loads from
-    /// (`vendor/zed/crates/gpui/src/window.rs`'s `paint_svg` -> `SvgRenderer::render_alpha_mask`
-    /// -> `asset_source.load(&params.path)`). A correct `asset_path()` that `Assets` does not
-    /// serve would render nothing at all, silently.
     #[test]
     fn the_apps_asset_source_serves_every_shipped_icon() {
         let assets = Assets;
@@ -573,9 +457,6 @@ mod tests {
         }
     }
 
-    /// Vendoring is only real if the files really are Phosphor's: one path on Phosphor's own
-    /// `0 0 256 256` canvas, filled `currentColor`. The shared canvas is also what makes equal
-    /// boxes give equal optical weight, so this is the sizing rule's own precondition.
     #[test]
     fn every_vendored_icon_is_a_real_phosphor_svg_on_the_shared_256_canvas() {
         for (path, bytes) in ICON_FILES {
@@ -624,10 +505,6 @@ mod tests {
         );
     }
 
-    // -- sizing -------------------------------------------------------------------------------
-
-    /// The four named boxes are real measurements off the reviewed mock, not round numbers -
-    /// pinned here so a later edit that "tidies" one of them has to argue with the design.
     #[test]
     fn named_sizes_match_the_mocks_own_boxes() {
         assert_eq!(IconSize::PanelTab.box_size(), px(11.0));
@@ -639,8 +516,6 @@ mod tests {
         assert_eq!(IconSize::Control.box_size(), px(12.0));
     }
 
-    /// §8's weight rule, checked against what `assets/icons/` really holds. This is the guard
-    /// that makes adding a 20px+ size a deliberate act: it fails until `regular` is vendored.
     #[test]
     fn every_named_size_wants_the_weight_that_is_actually_vendored() {
         for size in IconSize::ALL {
@@ -670,8 +545,6 @@ mod tests {
         );
     }
 
-    /// The whole of rule 7, as arithmetic on the real element: every icon in one row asks for
-    /// the identical width and height, so no call site can hand one glyph a different size.
     #[test]
     fn a_row_gives_every_icon_the_identical_box() {
         let pack = no_pack();
@@ -699,11 +572,6 @@ mod tests {
         }
     }
 
-    /// Rule 7 again, but proved against real rasterised pixels rather than style values: GPUI's
-    /// own `SvgRenderer` is handed each vendored file at one row's box, and every glyph in the
-    /// row has to come back the same number of device pixels wide and tall. This is also the
-    /// honest check that the vendored path data is real - a fabricated or truncated file either
-    /// fails to parse here or rasterises blank.
     #[test]
     fn every_icon_really_rasterises_to_one_shared_box_through_gpuis_own_renderer() {
         let renderer = SvgRenderer::new(Arc::new(Assets));
@@ -746,8 +614,6 @@ mod tests {
             }
         }
     }
-
-    // -- the icon-pack override ---------------------------------------------------------------
 
     #[test]
     fn shipped_icons_are_the_default_source() {
@@ -795,11 +661,6 @@ mod tests {
         }
     }
 
-    // -- tinting ------------------------------------------------------------------------------
-
-    /// GPUI paints an SVG as a `MonochromeSprite` in the element's own `text.color` and skips it
-    /// entirely when that colour is `None`, so this assertion is the difference between a visible
-    /// icon and an empty box.
     #[test]
     fn a_shipped_icon_is_tinted_with_the_callers_own_token() {
         let pack = no_pack();
@@ -836,8 +697,6 @@ mod tests {
         );
     }
 
-    // -- a real window ------------------------------------------------------------------------
-
     /// A row of every shipped icon, rendered on its own so these assets can be exercised through
     /// a real GPUI window without depending on any of the not-yet-built surfaces that will
     /// eventually consume them.
@@ -861,10 +720,6 @@ mod tests {
         }
     }
 
-    /// Every icon, drawn standalone in a real window, really paints - and every one of them
-    /// paints into the identical box. `debug_bounds` reads the *painted* frame, so this is the
-    /// end-to-end version of the two assertions above: the asset genuinely loads through
-    /// `crate::fonts::Assets`, and the row genuinely shares one optical box.
     #[gpui::test]
     fn every_icon_paints_into_the_rows_one_shared_box_in_a_real_window(cx: &mut TestAppContext) {
         // `debug_bounds` takes a `&'static str`, so the selectors cannot be interpolated from
@@ -911,8 +766,6 @@ mod tests {
         }
     }
 
-    /// The same window, with a real icon pack on disk: the overridden slot paints from the pack's
-    /// own file (a different debug selector) while its neighbours keep painting the shipped ones.
     #[gpui::test]
     fn a_pack_override_paints_in_place_of_just_its_own_shipped_icon(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("tempdir");

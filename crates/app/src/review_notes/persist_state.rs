@@ -1,19 +1,5 @@
 //! `review-notes.toml` - the sibling file that makes a review note survive scrolling past it,
 //! closing the file, and closing the app.
-//!
-//! The issue's requirement is that notes *"are keyed per worktree + path + line and survive
-//! scrolling/reopening"*. Scrolling alone would only need app state (the diff view is a
-//! `uniform_list`, so a note scrolled off screen stops being an element), but "reopening" means
-//! the working tree can be closed and come back, and a review that evaporates when you look at
-//! another file is not a review. So this is real durable state, in exactly the shape every other
-//! persisted Jerry state already takes: a TOML sibling of `settings.toml`, written atomically,
-//! merged under the shared lock so a second window cannot erase notes it knows nothing about.
-//!
-//! Copied deliberately, not abstracted: `crate::provenance::persist_state`,
-//! `crate::review::baseline_state`, `crate::sidebar::fold_state`,
-//! `crate::work_surface::tab_order_state` and `crate::rail::repo` are all the same five methods,
-//! and this project's own convention (see `fold_state::FoldState::save_at`'s docs) is that they
-//! stay parallel rather than growing a framework.
 
 use super::{NoteAnchor, NoteStore, ReviewNote};
 use serde::{Deserialize, Serialize};
@@ -54,10 +40,6 @@ pub struct PersistedFile {
 }
 
 /// One note.
-///
-/// `sent` is the delivered *wording*, not a flag, for the reason [`ReviewNote`] itself records:
-/// the draft/sent mark is derived by comparing it against the current text, so a restart has to
-/// bring the wording back or every previously-sent note would come back reading `draft`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedNote {
@@ -132,11 +114,6 @@ impl ReviewNotesState {
     /// The app's real write path: replaces only the worktree keys this window has actually
     /// touched, so a second window reviewing a different worktree cannot erase notes it knows
     /// nothing about.
-    ///
-    /// A key this window owns and now holds nothing for **is** removed - deleting your last note
-    /// on a worktree has to be able to stick. Same asymmetry as
-    /// `LineProvenanceState::save_merged_at`, and for the same reason: this is live state, not
-    /// history.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = ReviewNotesState::load_at(path);
@@ -151,9 +128,6 @@ impl ReviewNotesState {
     }
 
     /// Snapshots a live store into persistable form.
-    ///
-    /// Blank notes are skipped: a card that was opened and never written into is a click, and
-    /// writing it out would restore a phantom card on the next launch.
     pub fn capture(store: &NoteStore) -> ReviewNotesState {
         let mut state = ReviewNotesState::default();
         for worktree in store.worktrees() {
@@ -295,8 +269,6 @@ mod tests {
         store
     }
 
-    /// The whole point: a note - and, critically, its *sent* wording - comes back exactly as it
-    /// went out, so a restart cannot turn a sent note back into a draft.
     #[test]
     fn a_store_round_trips_through_a_real_file_with_its_draft_and_sent_states_intact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -322,7 +294,6 @@ mod tests {
         );
     }
 
-    /// A blank card is a click. It must not survive a restart as a phantom note.
     #[test]
     fn a_blank_card_is_never_written_out() {
         let mut store = NoteStore::default();
@@ -334,8 +305,6 @@ mod tests {
         );
     }
 
-    /// A hand-edited file must cost the rows this build cannot read, not the launch, and must
-    /// never resolve a path outside the worktree it is filed under.
     #[test]
     fn unreadable_rows_are_discarded_rather_than_trusted() {
         let mut state = ReviewNotesState::default();
@@ -393,7 +362,6 @@ mod tests {
         );
     }
 
-    /// A second window's worktree must survive this window's write.
     #[test]
     fn merging_leaves_another_windows_worktree_alone_and_still_lets_a_deletion_stick() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -424,7 +392,6 @@ mod tests {
             "the other window's worktree is untouched"
         );
 
-        // And this window deleting its last note really removes its rows.
         ReviewNotesState::capture(&NoteStore::default())
             .save_merged_at(&path, &owned)
             .expect("merge an emptied store");

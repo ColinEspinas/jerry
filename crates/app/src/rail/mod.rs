@@ -1,40 +1,4 @@
 //! Zone 1, the agent rail: everything about one feature, in one folder.
-//!
-//! Split the way every feature folder in this crate is split - pure, GPUI-window-free
-//! logic separate from the `gpui::Div`-building code that draws it:
-//!
-//! - [`repo`] - one added git repository (`Repo`/`RepoId`), the rail's group level
-//!   (Revision R12 Phase 0), plus its own crash-safe `~/.config/jerry/repos.toml`
-//!   persistence, mirroring [`crate::sidebar::fold_state`]'s pattern.
-//! - [`state`] - the pure row model: one row per worktree, aggregating every agent open
-//!   in it, plus the filter/grouping rules. No `gpui::Window`.
-//! - [`worktrees`] - maps `wt-core`'s raw worktree list into that row model's input shape, plus
-//!   the pure selection-recovery state machine (GitHub issue #12).
-//! - [`worktree_watch`] - the real `notify`-backed filesystem watcher behind the worktree
-//!   panel's live refresh (GitHub issue #12). No `gpui` dependency either - it hands back a
-//!   plain `AtomicBool` flag; `render::AdeApp::start_worktree_watch` is the `gpui`-side loop
-//!   that reads it.
-//! - [`status`] - derives an agent's `Status` ("who needs me") from already-read process
-//!   signals; the rail's whole reason for existing, and shared with the tab strip and
-//!   status bar that surface the same answer.
-//! - [`title_signal`] - the pure classifier turning an agent CLI's own terminal title into the
-//!   coarse busy/idle/needs-you signal [`status`] refines its quiescence heuristic with
-//!   (GitHub issue #239). No `gpui`, and no terminal types either.
-//! - [`menu`] - the pure row sets for the rail's worktree/agent context menus and the overflow
-//!   menu (GitHub issue #290), drawn through the app's one shared menu (`crate::menu`).
-//! - [`menu_render`] - the `impl AdeApp` half of those menus: opening one off a real
-//!   right-click, and running what its rows promise.
-//! - [`strip`] - the sidebar strip's pure model (GitHub issue #291): which views the left column
-//!   offers, each cell's marker and tooltip, and the gate that empties the strip on a day with no
-//!   worktrees.
-//! - [`strip_render`] - the `impl AdeApp` half of the strip: the real 36px band, the real view
-//!   switch, and the Problems view it switches to.
-//! - [`render`] - the real GPUI rail, its rows, hover affordances and click handlers, as
-//!   `impl AdeApp` methods.
-//!
-//! `render` glob-imports this module (`use super::*`), which is why the shared imports it
-//! needs live here rather than at the top of that file - the same convention `crate::root`
-//! established for its own submodules.
 
 use crate::keymap;
 use crate::rail::state::{

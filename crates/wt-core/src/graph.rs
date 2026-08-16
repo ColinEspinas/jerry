@@ -1,58 +1,9 @@
-//! Read-only commit-graph data for the git graph tab (design handoff
-//! `design_handoff_jerry_ade/revision 2/CHANGELOG.md`, 2026-07-31 entry, "git graph (issue #1)").
+//! Read-only commit-graph data: a commit list with each row assigned a lane, plus the refs
+//! pointing at each commit.
 //!
-//! This module builds the data a graph *view* renders: a topologically-walked list of commits,
-//! each assigned to a lane so merges and branch points can be drawn as a real lane diagram, plus
-//! the real refs (branches/tags/`HEAD`) that point at each commit (via
-//! [`gix::Repository::references`]).
-//!
-//! ## Walk order
-//!
-//! The walk is a real topological traversal ([`gix::traverse::commit::topo`], git's own
-//! incremental `--topo-order`/`--date-order` machinery) in
-//! [`Sorting::DateOrder`](gix::traverse::commit::topo::Sorting::DateOrder): commit-time order,
-//! except that **no parent is ever emitted before all of its children**. This module used to use
-//! a plain commit-time sort ([`gix::Repository::rev_walk`] with `Sorting::ByCommitTime`), and
-//! that was a real, user-visible bug ("on some screens the lines seem disconnected"): a pure
-//! time sort hands back a parent *before* one of its children whenever the two share a commit
-//! timestamp (the sort's priority queue breaks ties arbitrarily - and back-to-back commits,
-//! merge scripts and CI create same-second parent/child pairs routinely; this repository's own
-//! history has dozens) or whenever clocks genuinely skew across machines. [`layout_lanes`]
-//! honestly degrades on such input by omitting the affected parent edge (see its docs), so the
-//! affected commit painted as a floating dot - its connector to its own parent simply missing,
-//! on exactly the histories (and exactly the scroll regions) containing such a pair, while every
-//! other screen rendered fine. `git log --graph` implies `--topo-order` for precisely this
-//! reason; this walk now gives the lane layout the same guarantee. For histories whose time
-//! order already is topologically sound, `DateOrder` emits the identical sequence the old
-//! time-sorted walk did.
-//!
-//! The walk order is also a property of the *history*, not of the [`build_graph`] cap: a bigger
-//! `max_commits` reads further into the same deterministic sequence, which is what keeps
-//! `graph_walk_is_prefix_stable_across_caps` (the "load more" UX's foundation) true. A
-//! post-collection topological sort of the capped set - the obvious cheaper fix - would break
-//! exactly that property whenever an out-of-order pair straddles the cap.
-//!
-//! ## Scope
-//!
-//! [`GraphScope`] controls which ref tips seed the walk:
-//! - [`GraphScope::Current`] walks only `HEAD`'s first-parent ancestry (`first_parent_only`),
-//!   mirroring `git log --first-parent`.
-//! - [`GraphScope::All`] walks every local branch, remote-tracking branch and tag.
-//! - [`GraphScope::Worktrees`] walks only the branches actually checked out in one of this
-//!   repository's worktrees (via [`crate::list_worktrees`]) - a real, already-available signal
-//!   (which branches have a worktree at all), *not* a fabricated stand-in for the agent-to-
-//!   commit correlation feature (which branch a specific agent authored), which is a
-//!   separate, later feature.
-//!
-//! ## Lane layout
-//!
-//! [`layout_lanes`] is a small, independently testable pure function: given commits in the order
-//! [`build_graph`] already walked them (newest first) plus each commit's parent ids, it assigns
-//! each commit a lane number and describes, per row, which lanes pass straight through, which
-//! start or end at that row, and which elbows (branch points / merges) connect two lanes at that
-//! row. It knows nothing about `gix` and is tested with plain `&str` ids.
-//!
-//! Performs blocking I/O; see the crate-level docs.
+//! The walk is topological, not commit-time sorted: same-second parent/child pairs are routine,
+//! and a parent emitted first makes [`layout_lanes`] drop that edge and paint a floating dot.
+//! Sorting the capped set afterwards instead would break prefix stability across `max_commits`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -66,23 +17,20 @@ use crate::diff::AheadBehind;
 use crate::error::Error;
 use crate::{check_success, is_dirty, list_worktrees, open_repo, run_git};
 
-/// Safety cap on how many commits a single [`build_graph`] call loads, independent of what's
-/// rendered - mirrors `diff::MAX_FILES`'s "cap the loaded data" convention. A history with more
-/// commits than this is truncated, not silently hung on.
+/// Cap on how many commits one [`build_graph`] call loads; beyond it the history is truncated.
 pub const DEFAULT_MAX_COMMITS: usize = 500;
 
-/// Which ref tips seed the graph walk - the toolbar's `All | Worktrees | Current` scope segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraphScope {
+    /// Every local branch, remote-tracking branch and tag.
     #[default]
     All,
     /// Only branches checked out in one of this repository's worktrees.
     Worktrees,
-    /// Only `HEAD`'s first-parent ancestry.
+    /// Only `HEAD`'s first-parent ancestry, mirroring `git log --first-parent`.
     Current,
 }
 
-/// What kind of ref a [`RefChip`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
     LocalBranch,
@@ -90,17 +38,14 @@ pub enum RefKind {
     Tag,
 }
 
-/// One ref chip rendered on a commit row (a local branch, a remote-tracking branch, or a tag).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefChip {
     /// Short display name: `main`, `origin/main`, `v1.0`.
     pub name: String,
     pub kind: RefKind,
-    /// Whether this is the local branch `HEAD` currently points at.
     pub is_head: bool,
 }
 
-/// One real commit, as read from the object database - never fabricated fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitNode {
     pub id: String,
@@ -123,17 +68,15 @@ impl CommitNode {
     }
 }
 
-/// What kind of dot a [`GraphRow`] draws - design spec §2, "Four dot kinds".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DotKind {
     Commit,
     Head,
     Merge,
-    /// The synthetic first row representing real uncommitted changes in the worktree.
+    /// The synthetic first row representing uncommitted changes in the worktree.
     WorkingTree,
 }
 
-/// One lane's vertical segment at a single row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaneSegment {
     pub lane: usize,
@@ -141,33 +84,24 @@ pub struct LaneSegment {
     pub starts_here: bool,
     /// This lane ends at this row (draw only the top half).
     pub ends_here: bool,
-    /// The segment below this row's dot is dashed - only true for the synthetic working-tree
-    /// row's own lane, per spec §2: "its lane segment below the dot is dashed".
+    /// The segment below this row's dot is dashed; only the working-tree row's lane.
     pub dashed: bool,
 }
 
-/// Which of the two elbow shapes an [`Elbow`] draws - they are geometric mirrors of each other,
-/// occupying opposite halves of the row box (design spec §2's single "elbow" concept actually
-/// covers two distinct real cases; see [`layout_lanes`]'s Step 2 vs. Step 4 docs for why a row can
-/// need either, or both, kinds at once).
+/// Which of the two elbow shapes an [`Elbow`] draws. They are mirrors, occupying opposite halves
+/// of the row box; a row can need either or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElbowKind {
-    /// This row is itself a real merge commit: `from_lane` is this row's own dot (top of the
-    /// row's bottom half), curving down into `to_lane`, which continues in the row below. Drawn
-    /// in the row's *bottom* half.
+    /// This row is a merge commit: `from_lane` is its own dot, curving down into `to_lane`, which
+    /// continues below. Drawn in the row's bottom half.
     Diverging,
-    /// This row's commit is also the next expected commit for some *other*, unrelated lane (two
-    /// branches sharing an ancestor with no merge commit involved) - `from_lane` is that other,
-    /// *ending* lane (its line arriving from the row above, at the row's top edge), curving over
-    /// to join `to_lane`, which is this row's own dot. Drawn in the row's *top* half - the mirror
-    /// image of [`Self::Diverging`].
+    /// This row's commit is also the next expected commit for another lane - two branches sharing
+    /// an ancestor, no merge involved. `from_lane` is that other, ending lane, curving over to
+    /// join `to_lane`, this row's dot. Drawn in the row's top half.
     Converging,
 }
 
-/// A branch point, merge, or shared-ancestor join, connecting two lanes at this row, drawn as an
-/// elbow. See [`ElbowKind`] for what `from_lane`/`to_lane` mean for each kind - they are not
-/// symmetric (a `Diverging` elbow's `from_lane` is this row's own dot; a `Converging` elbow's
-/// `from_lane` is the *other*, ending lane).
+/// `from_lane`/`to_lane` are not symmetric between the two [`ElbowKind`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elbow {
     pub from_lane: usize,
@@ -185,7 +119,6 @@ pub struct GraphRow {
     pub elbows: Vec<Elbow>,
 }
 
-/// The full result of a [`build_graph`] call.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Graph {
     pub rows: Vec<GraphRow>,
@@ -195,14 +128,8 @@ pub struct Graph {
     pub truncated: bool,
 }
 
-/// Build the real commit graph for the repository at `repo_path`, scoped per [`GraphScope`].
-///
-/// `max_commits` of `0` uses [`DEFAULT_MAX_COMMITS`].
-///
-/// Performs blocking I/O: opens the repository via `gix`, walks the object database, and (for
-/// the working-tree row) spawns a `git status` child process via [`crate::is_dirty`]. Callers
-/// embedding this in a GUI event loop must offload it to a background thread/executor, per the
-/// crate-level docs.
+/// Builds the commit graph for `repo_path`, scoped per [`GraphScope`]. `max_commits` of `0` uses
+/// [`DEFAULT_MAX_COMMITS`].
 pub fn build_graph(
     repo_path: &Path,
     scope: GraphScope,
@@ -236,23 +163,16 @@ pub fn build_graph(
         return Ok(Graph::default());
     }
 
-    // Deduplicate tips before seeding the walk. Several refs legitimately point at one commit
-    // (a branch plus its tag, or two branches parked on the same tip), and unlike the previous
-    // simple walk - whose `seen` set absorbed duplicates on discovery - the topological walk
-    // seeds its initial queue with one entry per tip id it is handed, so a duplicated tip would
-    // emit its commit as two rows.
+    // Several refs legitimately point at one commit, and the topo walk seeds one queue entry per
+    // tip it is handed - so a duplicate would emit its commit as two rows.
     let mut seen_tips = std::collections::HashSet::with_capacity(tips.len());
     let tips: Vec<ObjectId> = tips
         .into_iter()
         .filter(|tip| seen_tips.insert(*tip))
         .collect();
 
-    // A real topological walk in date order - see the module docs' "Walk order" section for why
-    // a plain commit-time sort here was a real rendering bug. The commit-graph file is a pure
-    // accelerator (it carries the generation numbers that keep the indegree pass incremental,
-    // exactly as in `git log --topo-order`); a repository without one - or with an unreadable
-    // one - still walks correctly from the object database, so its absence must not fail the
-    // build.
+    // The commit-graph file is a pure accelerator: without it the walk still reads correctly from
+    // the object database, so its absence must not fail the build.
     let mut builder = topo::Builder::from_iters(&repo.objects, tips, None::<Vec<ObjectId>>)
         .sorting(topo::Sorting::DateOrder)
         .with_commit_graph(repo.commit_graph_if_enabled().ok().flatten());
@@ -277,13 +197,10 @@ pub fn build_graph(
             .map_err(|source| Error::RevWalkObject(Box::new(source)))?;
         let mut parent_ids: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
         if matches!(scope, GraphScope::Current) {
-            // `Parents::First` restricts the *traversal* to first parents, but the topo walk
-            // still reports every parent on each emitted commit (its `collect_all_parents`
-            // deliberately ignores the flag). The simple walk this replaces reported only the
-            // first parent under `first_parent_only`, and `GraphScope::Current`'s rows depend on
-            // that shape: with all parents listed, `layout_lanes` Step 4 would open a lane for a
-            // merge's second parent that this scope's walk then never visits - a line running
-            // off the bottom of the graph forever. Keep the rows first-parent-shaped.
+            // `Parents::First` restricts the traversal but the walk still reports every parent on
+            // each commit. Trimming them keeps rows first-parent-shaped: otherwise `layout_lanes`
+            // opens a lane for a merge's second parent this scope never visits, drawing a line
+            // that runs off the bottom of the graph forever.
             parent_ids.truncate(1);
         }
         let refs = refs_by_commit.get(&info.id).cloned().unwrap_or_default();
@@ -295,18 +212,13 @@ pub fn build_graph(
     let layouts = layout_lanes(&edges);
     let mut rows: Vec<GraphRow> = Vec::with_capacity(edges.len());
     for ((id, _parents), layout) in edges.iter().zip(layouts) {
-        // `nodes` was populated 1:1 with `edges` above, so this should always find an entry; if a
-        // future change to the walk ever produced a duplicate id, skipping it honestly (no row
-        // for data that isn't there) is safer than a library panic over a rendering nicety.
+        // Populated 1:1 above, so this always matches; skipping beats panicking if it ever
+        // stops being true.
         let Some(commit) = nodes.remove(id) else {
             continue;
         };
-        // `is_merge()` is checked *before* the `head_id` comparison, not after: a commit can
-        // honestly be both at once (this repository's own `master` tip is one right now - a
-        // real `Merge pull request` commit HEAD currently sits on), and merge-ness is the
-        // rarer, more structurally significant fact to lose - HEAD is already shown
-        // separately and unambiguously via the branch's own `RefChip::is_head` styling next
-        // to this row, so nothing is actually lost by not also ringing the dot for it here.
+        // Merge-ness is checked before HEAD-ness because a commit can be both, and merge is the
+        // structurally significant one to keep. `RefChip::is_head` already marks HEAD on the row.
         let dot_kind = if commit.is_merge() {
             DotKind::Merge
         } else if Some(*id) == head_id {
@@ -323,15 +235,11 @@ pub fn build_graph(
         });
     }
 
-    // The working-tree row: real, only added when the worktree is genuinely dirty, and only when
-    // `HEAD`'s own commit really is the first row - see the module docs on why this is skipped
-    // (not faked) for scopes where a newer commit on another branch legitimately sorts first.
+    // Only added when the worktree is dirty *and* `HEAD` is the first row - skipped, not faked,
+    // when a newer commit on another branch legitimately sorts first.
     //
-    // Named `Working tree`, not `Uncommitted changes`, since rev 6 (audit item I5, applied in
-    // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`'s §3.2.5 row). The panel already
-    // has a section called `Uncommitted`; this row is the working tree *as a point on the graph*,
-    // one step past `HEAD`, and naming it after the other surface's section made two different
-    // things share a word. `Jerry.dc.html`'s own `Git graph` state reads `Working tree`.
+    // Named "Working tree" rather than "Uncommitted changes" because the Changes panel already
+    // has a section by that name; this row is the working tree as a point on the graph.
     if let Some(first) = rows.first() {
         if Some(&first.commit.id) == head_id.map(|id| id.to_string()).as_ref()
             && is_dirty(repo_path).unwrap_or(false)
@@ -415,32 +323,18 @@ fn commit_node(
     })
 }
 
-/// Safety cap on how many changed files [`commit_changed_files`] returns, mirroring `diff::
-/// MAX_FILES`'s "cap the loaded data" convention.
 const MAX_COMMIT_FILES: usize = 300;
 
-/// One file changed by a single commit, as reported by `git show --name-status` - the Commit
-/// panel's "Files changed" list (design spec §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitFileChange {
     pub path: std::path::PathBuf,
     pub status: crate::diff::FileChangeStatus,
 }
 
-/// The real files a single commit changed, via `git show --format= --name-status <sha>`.
+/// A root commit diffs against the empty tree; a merge reports nothing at all, which is git's own
+/// default rather than this function guessing which parent to diff against.
 ///
-/// For an ordinary commit this is the diff against its sole parent; for a root commit (no
-/// parents) `git show` diffs against the empty tree; for a merge commit `git show` with no `-m`/
-/// `-c` flag reports no files at all (git's own default "a merge has no single meaningful diff"
-/// behavior) - an honestly empty list, not a fabricated one, rather than this function guessing
-/// which parent to diff against.
-///
-/// `commit_sha` must be a real hex object id (as every [`CommitNode::id`] already is) - checked
-/// before it ever reaches a spawned `git` argument, the same defensive guard
-/// [`ahead_behind_against_upstream`]'s sibling functions in `crate::diff` already apply to a
-/// commit id used the same way.
-///
-/// Performs blocking I/O: spawns a real `git` child process.
+/// `commit_sha` is checked as hex before reaching a `git` argument.
 pub fn commit_changed_files(
     repo_path: &Path,
     commit_sha: &str,
@@ -478,8 +372,7 @@ fn parse_name_status(text: &str) -> Vec<CommitFileChange> {
             Some(b'R') => crate::diff::FileChangeStatus::Renamed,
             _ => crate::diff::FileChangeStatus::Modified,
         };
-        // A rename/copy line is `R100\told\tnew` - the destination path is what's actually
-        // showing in the tree today, so that's what a "Files changed" row should name.
+        // A rename/copy line is `R100\told\tnew`; the destination is what exists in the tree.
         let path = rest.rsplit('\t').next().unwrap_or(rest);
         out.push(CommitFileChange {
             path: std::path::PathBuf::from(path),
@@ -489,54 +382,22 @@ fn parse_name_status(text: &str) -> Vec<CommitFileChange> {
     out
 }
 
-/// A real commit, resolved from a revision (a branch name, a tag, `HEAD`, ...) - both the full
-/// object id and git's own abbreviated form of it, which is what a UI actually displays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCommit {
     pub id: String,
-    /// git's own abbreviation of [`Self::id`] (`%h`), honouring the repository's real
-    /// `core.abbrev`/uniqueness rules - never a hand-truncated prefix of `id`.
+    /// git's own `%h` abbreviation of [`Self::id`], never a hand-truncated prefix.
     pub short_id: String,
 }
 
-/// Resolve `branch` (a local branch name) to its real tip commit, in `worktree_path` - both the
-/// full object id and git's own abbreviated form of it.
+/// Resolves a branch name to its tip commit, through `gix` rather than `git log`/`git rev-parse`
+/// because neither can be guarded
+/// the way [`crate::checkout::checkout_branch`] guards its positional: both overload a trailing
+/// `--` to mean "pathspec follows", so `git log -1 -- feature` exits 0 with no output rather than
+/// resolving the branch. Nor does putting the name first help - git's option parser consumes
+/// `--evil` as a flag before the `--` is reached. A `find_reference` lookup key has no command
+/// line to be misparsed as part of.
 ///
-/// The Branches panel's "Rebase current branch on Branch…" is what needs this (GitHub issue
-/// #241): the rebase engine and its banner both work in terms of a commit, and a *branch* is a
-/// moving pointer - resolving it once, at click time, pins the rebase to the tip that was really
-/// there when the user clicked, exactly like the row menu's own rebase entry already pins a row's
-/// commit id rather than its row index.
-///
-/// ## Why this resolves through `gix` rather than shelling out to `git log`/`git rev-parse`
-///
-/// `branch` is a real branch name, sourced from the Branches panel's own list rather than this
-/// app's graph - the same provenance as [`crate::checkout::checkout_branch`]/
-/// [`crate::remote::push_branch`], which both guard their own branch-name positional with a
-/// leading `--` for exactly this reason. That guard does not have an equivalent here: `git log`
-/// and `git rev-parse` both overload a trailing `--` to mean "everything after this is a
-/// pathspec, not a revision" (unlike `git branch -m --`/`git push origin --`, where `--` simply
-/// means "end of options, positionals follow"), so protecting the revision positional the same
-/// way silently breaks revision resolution instead of merely refusing a hostile one -
-/// live-reproduced: `git log -1 --format=... -- feature` (a real, existing branch) exits `0`
-/// with **no output at all**, because `--` makes git treat `feature` purely as a pathspec (no
-/// file named that exists), never as the branch. Putting `rev`/`branch` *before* the `--` doesn't
-/// help either: `git log -1 --format=... --evil --` still fails with `fatal: unrecognized
-/// argument: --evil`, i.e. git's option parser already consumed it as a flag before the trailing
-/// `--` is ever reached - `git log`'s flag surface (`--format`, `--output` among them) makes that
-/// a real risk, not just an ugly error. `gix::Repository::find_reference` takes `branch` as an
-/// ordinary Rust string used to build a ref-database lookup key - there is no subprocess command
-/// line for it to be misparsed as a flag of, the same reasoning `crate::diff::detect_default_base`
-/// (this crate's own established pattern for exactly this kind of branch-name-to-commit
-/// resolution) already relies on.
-///
-/// A `branch` that names nothing (deleted since the panel last loaded, a typo) is reported
-/// honestly via [`Error::WorktreeIo`] - never a fabricated or partially-resolved answer.
-///
-/// Performs blocking I/O: opens the repository via `gix`, then spawns a real `git rev-parse
-/// --short` child process to abbreviate the id `gix` already resolved (safe without a `--` guard,
-/// by [`crate::checkout::checkout`]'s own established reasoning - a real object id `gix` itself
-/// produced is never user-typed or flag-shaped).
+/// A `branch` naming nothing is reported via [`Error::WorktreeIo`].
 pub fn resolve_commit(worktree_path: &Path, branch: &str) -> Result<ResolvedCommit, Error> {
     let repo = crate::open_repo(worktree_path)?;
     let full_ref_name = format!("refs/heads/{branch}");
@@ -569,17 +430,11 @@ pub fn resolve_commit(worktree_path: &Path, branch: &str) -> Result<ResolvedComm
     })
 }
 
-/// Real ahead/behind counts for the worktree at `worktree_path` against its `HEAD` branch's real
-/// configured upstream (`@{upstream}`) - the graph toolbar's `Pull ↓2` / `Push ↑3` counts. This is
-/// deliberately a *different* comparison than [`crate::diff::ahead_behind_against_base`] (which
-/// compares against the repository's detected default branch, e.g. `main`): the toolbar's
-/// fetch/pull/push counts are about the branch's own remote-tracking ref, not the merge target.
+/// Counts against `HEAD`'s configured `@{upstream}` - a different comparison from
+/// [`crate::diff::ahead_behind_against_base`], which uses the detected default branch. Push/pull
+/// counts are about the remote-tracking ref, not the merge target.
 ///
-/// Returns `Ok(None)` when `HEAD` has no configured upstream (a local-only or newly created
-/// branch) rather than fabricating `{0, 0}`, matching this crate's established "no entry rather
-/// than a fabricated value" convention.
-///
-/// Performs blocking I/O: opens the repository via `gix` and spawns a real `git` child process.
+/// `Ok(None)`, not `{0, 0}`, when there is no configured upstream.
 pub fn ahead_behind_against_upstream(worktree_path: &Path) -> Result<Option<AheadBehind>, Error> {
     let repo = open_repo(worktree_path)?;
     let mut head = repo
@@ -597,11 +452,8 @@ pub fn ahead_behind_against_upstream(worktree_path: &Path) -> Result<Option<Ahea
         return Ok(None);
     }
 
-    // `@{upstream}` resolution (config-driven, remote-tracking branch lookup, worktree-local
-    // config overrides) is exactly the kind of revision-spec parsing the `git` CLI already gets
-    // right; asking it directly for the upstream's short name first (rather than guessing at
-    // `branch.<name>.merge`/`branch.<name>.remote` by hand) means a repository with unusual
-    // remote setups is handled the same way real `git pull`/`git push` would see it.
+    // Asking git to resolve `@{upstream}` beats reading `branch.<name>.merge`/`.remote` by hand:
+    // an unusual remote setup then resolves the same way `git pull`/`git push` would see it.
     let upstream_args: Vec<OsString> = vec![
         "rev-parse".into(),
         "--abbrev-ref".into(),
@@ -610,7 +462,6 @@ pub fn ahead_behind_against_upstream(worktree_path: &Path) -> Result<Option<Ahea
     ];
     let upstream_output = run_git(worktree_path, &upstream_args)?;
     if !upstream_output.status.success() {
-        // No upstream configured - not an error, just nothing to compare against.
         return Ok(None);
     }
 
@@ -626,24 +477,16 @@ pub fn ahead_behind_against_upstream(worktree_path: &Path) -> Result<Option<Ahea
     Ok(parse_counts(&text))
 }
 
-/// Which of `commits` (real, full object ids) are already reachable from `HEAD`'s configured
-/// `@{upstream}` - i.e. already pushed there. GitHub issue #242 phase B: the interactive-rebase
-/// UI's remote-tracking warning ("a force-with-lease push will be needed afterward") needs this
-/// per-commit; [`ahead_behind_against_upstream`]'s aggregate counts don't say *which* commits
-/// make up the divergence.
+/// Which of `commits` are already pushed to `HEAD`'s `@{upstream}`.
 ///
-/// `Ok(None)` when `HEAD` has no configured upstream - mirrors
-/// [`ahead_behind_against_upstream`]'s own "nothing to compare against" convention rather than
-/// fabricating an empty `Vec` (which would be indistinguishable from "checked, and none are
-/// already pushed").
+/// [`ahead_behind_against_upstream`]'s aggregate counts do not say *which* commits diverge, which
+/// a per-commit warning needs.
 ///
-/// One real `git merge-base --is-ancestor <commit> <upstream>` per commit - that command's exit
-/// code is the real, direct answer ("is `<commit>` an ancestor of `<upstream>`'s tip", i.e.
-/// already merged into its history): `0` means yes, `1` means no, anything else is a genuine
-/// error (e.g. `commit` doesn't exist), surfaced rather than silently treated as "no".
+/// `Ok(None)` with no configured upstream, rather than an empty `Vec` that would be
+/// indistinguishable from "checked, none pushed".
 ///
-/// Performs blocking I/O: one `git rev-parse` to resolve the upstream, then one `git merge-base
-/// --is-ancestor` per commit.
+/// One `git merge-base --is-ancestor` per commit; anything but its 0/1 exit is surfaced as an
+/// error rather than read as "no".
 pub fn commits_already_on_upstream(
     worktree_path: &Path,
     commits: &[String],
@@ -656,7 +499,6 @@ pub fn commits_already_on_upstream(
     ];
     let upstream_output = run_git(worktree_path, &upstream_args)?;
     if !upstream_output.status.success() {
-        // No upstream configured - not an error, just nothing to compare against.
         return Ok(None);
     }
     let upstream = String::from_utf8_lossy(&upstream_output.stdout)
@@ -694,15 +536,10 @@ fn parse_counts(text: &str) -> Option<AheadBehind> {
     Some(AheadBehind { ahead, behind })
 }
 
-/// Refs found by [`collect_refs`], grouped by the commit id they point at, plus the flat list of
-/// tip ids they represent (for [`GraphScope::All`]).
 type RefIndex = (HashMap<ObjectId, Vec<RefChip>>, Vec<ObjectId>);
 
-/// Real refs (local branches, remote-tracking branches, tags), grouped by the commit id they
-/// point at, plus the flat list of tip ids they represent (for [`GraphScope::All`]).
-///
-/// Annotated tags and the `refs/remotes/*/HEAD` symbolic pointer are peeled/skipped respectively,
-/// so a tag chip always names a real commit and no phantom `origin/HEAD` chip is ever shown.
+/// Annotated tags are peeled and `refs/remotes/*/HEAD` is skipped, so a tag chip always names a
+/// commit and no phantom `origin/HEAD` chip appears.
 fn collect_refs(repo: &gix::Repository, head_branch: Option<&str>) -> Result<RefIndex, Error> {
     let mut by_commit: HashMap<ObjectId, Vec<RefChip>> = HashMap::new();
     let mut tips: Vec<ObjectId> = Vec::new();
@@ -750,9 +587,7 @@ fn collect_refs(repo: &gix::Repository, head_branch: Option<&str>) -> Result<Ref
     Ok((by_commit, tips))
 }
 
-/// Tips for [`GraphScope::Worktrees`]: the `HEAD` commit of every worktree of this repository
-/// that has one checked out (main worktree included) - real data already surfaced by
-/// [`crate::list_worktrees`], not a guess at which branches have a worktree.
+/// Tips for [`GraphScope::Worktrees`]: the `HEAD` of every worktree that has one, main included.
 fn collect_worktree_tips(repo_path: &Path, repo: &gix::Repository) -> Result<Vec<ObjectId>, Error> {
     let worktrees = list_worktrees(repo_path)?;
     let mut tips = Vec::new();
@@ -764,11 +599,8 @@ fn collect_worktree_tips(repo_path: &Path, repo: &gix::Repository) -> Result<Vec
             tips.push(id);
         }
     }
-    // A worktree's `head_commit` may reference an object this particular `repo` handle can't
-    // resolve (e.g. a linked worktree opened relative to a different path); resolving through
-    // `repo.find_commit` here would need a second I/O round-trip per tip for no benefit, since
-    // `rev_walk` itself already tolerates (and simply yields nothing further from) an
-    // unreachable/unknown tip rather than erroring the whole walk.
+    // A worktree's `head_commit` may name an object this `repo` handle cannot resolve. Verifying
+    // costs a round-trip per tip for nothing: `rev_walk` already tolerates an unknown tip.
     let _ = repo;
     Ok(tips)
 }
@@ -781,27 +613,15 @@ struct RowLayout {
     elbows: Vec<Elbow>,
 }
 
-/// Assigns each commit a lane and describes each row's lane segments and elbows, given commits
-/// already in the order they should render (newest first) and each one's real parent ids.
+/// Assigns each commit a lane and describes each row's segments and elbows, given commits newest
+/// first with their parent ids.
 ///
-/// Pure and generic over the id type so it's testable with plain `&str`/`u32` ids, independent of
-/// `gix`. See the module docs for the algorithm's shape.
+/// Pure and generic over the id type, so it is testable with `&str` ids and independent of `gix`.
 ///
-/// ## Out-of-order input
-///
-/// This assumes the input is topologically sound - every commit appears before its parents.
-/// [`build_graph`] now *guarantees* that: its walk is a real topological traversal (see the
-/// module docs' "Walk order" section), so a parent can never be handed back before one of its
-/// children. It was not always so - the previous plain time-sorted walk violated the assumption
-/// on tied or clock-skewed timestamps, and the degradation below was the user-visible
-/// "disconnected lines" bug.
-///
-/// The degradation handling stays as defense-in-depth for any input that violates the
-/// assumption anyway (a corrupt history, or a future walk regression): rather than corrupting
-/// the graph with a lane that's left permanently expecting a commit it will never see again,
-/// [`layout_lanes`] tracks which ids it has already emitted as a row and skips wiring a parent
-/// edge to one of them: the affected row's elbow (or lane continuation) is simply omitted for
-/// that one edge, a real but honestly-degraded rendering rather than a silently-wrong one.
+/// Assumes topologically sound input - every commit before its parents - which [`build_graph`]
+/// guarantees. If that is ever violated, a parent edge pointing at an already-emitted row is
+/// dropped rather than leaving a lane permanently expecting a commit it will never see: a
+/// degraded rendering instead of a silently wrong one.
 fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> Vec<RowLayout> {
     let mut lanes: Vec<Option<Id>> = Vec::new();
     let mut seen: std::collections::HashSet<Id> =
@@ -810,16 +630,10 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
 
     for (id, parents) in commits {
         seen.insert(id.clone());
-        // Lanes free *before* this row makes any changes - Step 4's new-lane allocation below
-        // must only ever reuse one of these, never a lane this very row just freed itself (via
-        // Step 2's `Converging` collapse, or Step 3 freeing `own_lane` when this row's own first
-        // parent turns out to already have been seen). Reusing a same-row-freed lane produces
-        // either a bogus `Elbow { from_lane: N, to_lane: N }` self-loop (when the freed lane was
-        // `own_lane`) or two `LaneSegment`s for one lane index in one row - an `ends_here` one
-        // from Step 2 and a `starts_here` one from Step 4 - which paints as a single unbroken
-        // pass-through line for what are really two unrelated branches (when the freed lane was
-        // one of Step 2's `ends_here_lanes`). Both are real regressions an adversarial audit
-        // found in this fix; see `allocate_fresh_lane`'s own docs and `mod tests` below.
+        // Lanes free *before* this row changes anything. Step 4 must only reuse one of these,
+        // never a lane this same row just freed: that yields either a self-loop elbow, or two
+        // segments for one lane index in one row, which paints two unrelated branches as a single
+        // unbroken line.
         let free_before_row: std::collections::HashSet<usize> = lanes
             .iter()
             .enumerate()
@@ -832,19 +646,13 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
         let own_lane_is_new = own_lane.is_none();
         let own_lane = *own_lane.get_or_insert_with(|| allocate_lane(&mut lanes, id.clone()));
 
-        // Step 2: any *other* lane also expecting this same commit (multiple branches
-        // converging on a shared ancestor without this row itself being a merge) collapses into
-        // `own_lane` and ends here. Each one gets a real `Converging` elbow connecting its line
-        // (arriving from the row above) to `own_lane`'s dot - without it, the ending lane's
-        // top-half stub (drawn separately, per-`LaneSegment`) has nothing joining it to this
-        // row's own dot, which is the real bug this case exists to fix (see the module docs).
+        // Step 2: any *other* lane expecting this same commit - branches converging on a shared
+        // ancestor without this row being a merge - collapses into `own_lane` and ends here. Each
+        // gets a `Converging` elbow; without it the ending lane's top-half stub has nothing
+        // joining it to this row's dot.
         //
-        // No extra out-of-order filtering is needed here beyond what already exists: a lane's
-        // slot can only ever be set to expect `id` (by Step 3/4 of some *earlier* row) while `id`
-        // itself had not yet been seen - Step 3/4's own `seen.contains(parent)` check already
-        // refuses to point a lane at an id that's already been emitted. So by construction, every
-        // lane found here really was validly waiting for `id`, and `id`'s own row (this
-        // iteration) always renders - it is unconditionally pushed to `out` below.
+        // No out-of-order filtering is needed here: Step 3/4 already refuse to point a lane at an
+        // id that has been emitted, so every lane found here was validly waiting for `id`.
         let mut ends_here_lanes: Vec<usize> = Vec::new();
         let mut elbows = Vec::new();
         for (index, slot) in lanes.iter_mut().enumerate() {
@@ -870,8 +678,8 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
             .map(|(index, _)| index)
             .collect();
 
-        // Step 3: update `own_lane` to expect the first parent (or free it - a root commit, or a
-        // parent already emitted earlier out of order - see the out-of-order note above).
+        // Step 3: point `own_lane` at the first parent, or free it for a root commit or a parent
+        // already emitted out of order.
         let first_parent = parents.first().cloned();
         let first_parent_already_seen = first_parent.as_ref().is_some_and(|p| seen.contains(p));
         let own_ends_here = first_parent.is_none() || first_parent_already_seen;
@@ -881,9 +689,8 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
             first_parent
         };
 
-        // Step 4: additional parents (merges) either reuse an already-tracked lane (an elbow with
-        // no new lane) or open a new one (an elbow plus a freshly started lane). A parent already
-        // emitted earlier out of order is skipped entirely - see the out-of-order note above.
+        // Step 4: further parents either reuse a tracked lane (elbow only) or open a new one
+        // (elbow plus a started lane). A parent already emitted out of order is skipped.
         let mut new_lane_segments = Vec::new();
         for parent in parents.iter().skip(1) {
             if seen.contains(parent) {
@@ -950,9 +757,8 @@ fn layout_lanes<Id: Clone + Eq + std::hash::Hash>(commits: &[(Id, Vec<Id>)]) -> 
     out
 }
 
-/// Reuses the first free (`None`) lane slot, or appends a new one - this is how a lane index gets
-/// recycled across unrelated branches later in the same history (spec §2: "lanes are recycled
-/// after a branch merges").
+/// Reuses the first free lane slot or appends one, which is how a lane index gets recycled across
+/// unrelated branches later in the same history.
 fn allocate_lane<Id>(lanes: &mut Vec<Option<Id>>, expecting: Id) -> usize {
     if let Some(index) = lanes.iter().position(|slot| slot.is_none()) {
         lanes[index] = Some(expecting);
@@ -963,12 +769,8 @@ fn allocate_lane<Id>(lanes: &mut Vec<Option<Id>>, expecting: Id) -> usize {
     }
 }
 
-/// Like [`allocate_lane`], but for Step 4's *new*-lane case only: reuses a free lane slot only if
-/// it was already free *before this row began* (`free_before_row`) and isn't `own_lane` - never a
-/// lane this same row just freed itself (Step 2's `Converging` collapse or Step 3 freeing
-/// `own_lane`). Reusing a same-row-freed lane there produces a bogus self-loop elbow or a
-/// duplicate `LaneSegment` for one lane in one row - see the call site's own comment and
-/// `layout_lanes`' `free_before_row` docs for the two real regressions this exists to prevent.
+/// [`allocate_lane`] for Step 4's new-lane case: reuses a slot only if it was free before this
+/// row began and is not `own_lane`, never one this row just freed itself.
 fn allocate_fresh_lane<Id>(
     lanes: &mut Vec<Option<Id>>,
     free_before_row: &std::collections::HashSet<usize>,
@@ -1023,12 +825,8 @@ mod tests {
         git(dir, &["commit", "-m", message]);
     }
 
-    /// Like [`commit`], but with an explicit, real author/committer timestamp
-    /// (`unix_seconds` since the epoch) rather than "whenever this line of the test happened to
-    /// run". Real commits almost always have strictly increasing timestamps; tests that build a
-    /// multi-tip history (a branch plus a merge) need that same guarantee to exercise the normal,
-    /// well-ordered case deterministically, rather than depending on the test process happening
-    /// to cross a wall-clock second between two git invocations.
+    /// [`commit`] with an explicit timestamp, so a multi-tip history is well-ordered
+    /// deterministically rather than depending on the test crossing a wall-clock second.
     fn commit_at(dir: &Path, file: &str, contents: &str, message: &str, unix_seconds: i64) {
         fs::write(dir.join(file), contents).expect("write file");
         git(dir, &["add", file]);
@@ -1047,8 +845,7 @@ mod tests {
         );
     }
 
-    /// Like [`git`], but for `git merge`, with an explicit real commit timestamp - see
-    /// [`commit_at`]'s docs for why tests that build a merge need this.
+    /// `git merge` with an explicit timestamp; see [`commit_at`].
     fn merge_at(dir: &Path, branch: &str, message: &str, unix_seconds: i64) {
         let date = format!("{unix_seconds} +0000");
         let output = Command::new("git")
@@ -1081,8 +878,6 @@ mod tests {
         )
         .trim()
         .to_string();
-        // Resolve from a worktree sitting on a *different* branch, which is exactly how the
-        // Branches panel uses this - the branch being resolved is never the current one.
         git(repo.path(), &["checkout", "main"]);
 
         let resolved = resolve_commit(repo.path(), "feature").expect("resolve_commit");
@@ -1114,12 +909,6 @@ mod tests {
         }
     }
 
-    /// The whole reason [`resolve_commit`] resolves through `gix::Repository::find_reference`
-    /// rather than shelling out to `git log`/`git rev-parse`: there is no subprocess command line
-    /// here at all for a flag-shaped branch name to be misparsed as an option of. No branch can
-    /// actually be named `--evil` (git itself refuses to create one), so this proves the refusal
-    /// is the ordinary "no such branch" one - the same as any other nonexistent name - never
-    /// anything that touched a `git` argument parser.
     #[test]
     fn resolve_commit_treats_a_flag_shaped_branch_name_as_an_ordinary_ref_lookup() {
         let repo = init_repo();
@@ -1153,19 +942,16 @@ mod tests {
             .segments
             .iter()
             .any(|s| s.lane == 0 && s.ends_here));
-        // The very first row of the whole walk naturally "starts" its lane too (there is nothing
-        // above it) - that's expected, not a bug; what matters is no row in the *middle* of a
-        // linear chain claims to start a lane.
+        // The first row starts its lane, which is expected; what matters is that no row in the
+        // middle of a linear chain claims to.
         assert!(!layout[1].segments.iter().any(|s| s.starts_here));
         assert!(!layout[2].segments.iter().any(|s| s.starts_here));
     }
 
     #[test]
     fn layout_lanes_degrades_gracefully_when_a_parent_was_already_shown_out_of_order() {
-        // A pathological but real input shape: `merge`'s second parent (`feature`) was already
-        // emitted as an earlier row - possible when a time-sorted walk starts from multiple tips
-        // whose commits share (or skew past) a timestamp. This must not panic, infinite-loop, or
-        // leave a lane permanently dangling; the merge's edge to `feature` is simply omitted.
+        // `merge`'s second parent was already emitted as an earlier row. This must not panic,
+        // loop, or dangle a lane; the edge is simply omitted.
         let commits: Vec<(&str, Vec<&str>)> = vec![
             ("feature", vec!["base"]),
             ("merge", vec!["base", "feature"]),
@@ -1178,8 +964,6 @@ mod tests {
             "the merge's edge to the already-shown `feature` commit must be omitted, not left \
              pointing at a lane that will never resolve"
         );
-        // The final `base` row must end *every* lane that's still open (its own, plus the one
-        // `merge` opened for its first parent) - nothing left dangling.
         let base_row = &layout[2];
         assert!(base_row
             .segments
@@ -1189,7 +973,7 @@ mod tests {
             base_row.segments.iter().filter(|s| s.ends_here).count() >= 1,
             "at least the row's own lane must end at the root commit"
         );
-        // `merge`'s lane (still open, waiting for `base` as its first parent) genuinely reaches
+        // `merge`'s lane, still waiting for `base` as its first parent, reaches
         // `base` here (unlike the skipped `feature` edge above) - it must get a real Converging
         // elbow into `base_row`'s own lane, not just an ends_here stub with nothing connecting it.
         assert!(
@@ -1206,7 +990,6 @@ mod tests {
 
     #[test]
     fn branch_and_merge_opens_and_closes_a_second_lane() {
-        // c4 (merge, parents c3 + c2b) -> c3 (trunk) -> c2b (feature) -> c1 (trunk root, shared)
         let commits: Vec<(&str, Vec<&str>)> = vec![
             ("c4", vec!["c3", "c2b"]),
             ("c3", vec!["c1"]),
@@ -1516,7 +1299,6 @@ mod tests {
             "Merge branch 'feature'",
             1_700_000_200,
         );
-        // `main`'s own real HEAD is now this merge commit - no further commits after it.
 
         let graph = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
         let head_row = &graph.rows[0];
@@ -1730,22 +1512,6 @@ mod tests {
         assert!(subjects.contains("Merge branch 'feature'"));
     }
 
-    /// The property the graph tab's "load more" (GitHub issue #221) is built on: because
-    /// `build_graph` has no resumable cursor, loading more is a *re-walk with a bigger cap*, and
-    /// the UI keeps the user's selection, open row menu and scroll offset across that swap by
-    /// index. That is only sound if a bigger cap yields a strict, element-identical prefix - not
-    /// merely the same commits in the same order, but the same lane, dot kind, lane segments and
-    /// elbows for each of them, since a re-laned prefix would visibly rewrite the graph above the
-    /// user's viewport while they scrolled.
-    ///
-    /// It holds because the walk is deterministic *and its order is a property of the history,
-    /// not of the cap* (the topological walk's emission sequence never consults `max_commits`;
-    /// a bigger cap just reads further into the same sequence - see the module docs' "Walk
-    /// order" section) and `layout_lanes` is a single forward pass whose
-    /// output for row `i` is a function of commits `0..=i` alone. This test pins it against a
-    /// deliberately branchy history - a merge plus a still-extant side branch, so several lanes
-    /// are genuinely live at the cap boundary - rather than a linear one, where every cap trivially
-    /// agrees on lane 0.
     #[test]
     fn graph_walk_is_prefix_stable_across_caps() {
         let repo = init_repo();
@@ -1841,14 +1607,6 @@ mod tests {
         }
     }
 
-    /// The reported bug itself ("we have a bug with the git graph lines render. On some screens
-    /// the lines seem disconnected"), reproduced via real clock skew: a branch whose commit is
-    /// timestamped *before* its own parent - skewed clocks across machines, or any imported or
-    /// re-dated history. The old time-sorted walk emitted the parent first, `layout_lanes`
-    /// dropped the child's parent edge (its documented out-of-order degradation), and the
-    /// branch painted as a floating fragment connected to nothing - on exactly the histories,
-    /// and exactly the scroll regions, containing such a pair. The topological walk must keep
-    /// every edge drawable instead.
     #[test]
     fn a_clock_skewed_branch_still_connects_to_its_parent() {
         let repo = init_repo();
@@ -1857,7 +1615,6 @@ mod tests {
         commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_400);
         commit_at(repo.path(), "a.txt", "3", "main 2", 1_700_000_500);
         git(repo.path(), &["checkout", "skewed"]);
-        // Timestamped before its own parent ("base", t = ...300).
         commit_at(repo.path(), "b.txt", "1", "skewed work", 1_700_000_200);
         git(repo.path(), &["checkout", "main"]);
 
@@ -1889,12 +1646,6 @@ mod tests {
         );
     }
 
-    /// Same bug class via its far more common trigger: a parent and child sharing one commit
-    /// timestamp. Back-to-back commits, merge scripts and CI create same-second parent/child
-    /// pairs routinely (this repository's own history has dozens), and the old walk's priority
-    /// queue broke those ties arbitrarily - sometimes parent-first. Five commits and three tips
-    /// all in one second leave the walk nothing *but* ties to order by; every edge must still
-    /// come out drawable.
     #[test]
     fn same_second_parent_child_pairs_stay_topologically_ordered() {
         let repo = init_repo();
@@ -1914,13 +1665,6 @@ mod tests {
         assert_every_parent_edge_is_drawn(&graph);
     }
 
-    /// [`graph_walk_is_prefix_stable_across_caps`]'s guarantee, re-pinned against the
-    /// adversarial history: with a skewed branch in play, the *cheap* fix for the disconnect
-    /// bug - topologically sorting the capped set after collection - yields a different prefix
-    /// once a bigger cap pulls in the skewed child (whose row must move above its
-    /// already-loaded parent), visibly rewriting the graph above the user's viewport on a
-    /// load-more. The walk-level fix must not: the emission order is a property of the history
-    /// alone, and a bigger cap only ever reads further into the same sequence.
     #[test]
     fn graph_walk_prefix_stays_stable_across_caps_on_a_skewed_history() {
         let repo = init_repo();

@@ -3,33 +3,6 @@
 //! icons (styled `div()` shapes and Unicode glyphs, never image assets on their own). No active
 //! pack, or no matching file in the active pack, always falls back to the existing default
 //! rendering - this module only ever *adds* an override path, never removes the built-in look.
-//!
-//! ## Scope
-//!
-//! Only `crate::work_surface::state::agent_tint`/`agent_initial`'s three process-kind chips
-//! (Claude/Codex/Shell - `crate::work_surface::render::render_agent_icon`'s own real call
-//! sites) are wired to check a pack today. The other ~25 distinct icon concepts cataloged across
-//! this app (file-type chips, folder icons, chevrons, status dots, ...) are a real, stated
-//! follow-up, not yet wired - picking one well-scoped, high-value integration point first rather
-//! than touching every render call site in one pass.
-//!
-//! ## Real icon files, not a theme tint
-//!
-//! Unlike this app's own bundled UI icons (styled shapes/glyphs that all pick up a theme color
-//! token), a user-supplied pack icon is rendered via `gpui::img(..)` (GitHub issue #309) - a real,
-//! user-chosen brand icon (e.g. a real Claude/Codex logo) keeps whatever colors its own file
-//! defines, rather than being flattened to a single theme-matched fill the way this app's own
-//! icon-font-free UI chrome is.
-//!
-//! This must be `img()`, never `svg()`: GPUI's `svg()` rasterises to an alpha mask and paints it
-//! uniformly tinted with the element's own `style.text.color`, skipping the paint entirely when
-//! that color is unset (`vendor/zed/crates/gpui/src/elements/svg.rs`'s `paint`). An untinted
-//! `svg()` pack icon therefore does not "keep its own colors" - it paints nothing at all, an
-//! empty box. `img()` decodes the source's real pixels (raster formats and SVG alike) and paints
-//! them as a full-color sprite regardless of any text color, which is what "keeps its own
-//! colors" actually requires in this GPUI version. (`crate::icons`' shipped Phosphor icons are
-//! the opposite, intentional case: they *should* tint like text, and correctly go through
-//! `svg()` with an explicit color for exactly that reason - see that module's own docs.)
 
 use std::path::PathBuf;
 

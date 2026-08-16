@@ -1,14 +1,4 @@
 //! Recording what the hooks taught Jerry about each agent, onto disk (GitHub issue #239 phase 2).
-//!
-//! The `AdeApp`-side half of [`crate::hooks::store`]: it walks the live agents once per status
-//! poll, folds each one's real derived status and hook text into
-//! [`crate::root::AdeApp::agent_status_state`], and persists only when something genuinely
-//! changed.
-//!
-//! Originally nothing rendered any of this - it existed so GitHub issue #227 ("Agent history and
-//! resume/recover") would have real, structured, dated data to build on rather than having to
-//! invent a capture mechanism first (see [`crate::hooks::store`]'s module docs). Issue #227's own
-//! read side now reads it back - [`crate::hooks::history`] and the rail's history rows.
 
 use gpui::{Context, Window};
 
@@ -20,10 +10,6 @@ impl AdeApp {
     /// (`crate::review::state::baseline_key`) - GitHub issue #227's "this one is still live, don't
     /// show it twice under History" exclusion set for
     /// [`crate::hooks::history::past_agents_for_worktree`].
-    ///
-    /// A live agent's key is computed the identical way [`Self::record_agent_statuses`] computes
-    /// it before writing - same function, same three inputs (`cwd`, `kind`, `spawned_at_unix`) -
-    /// so this can never drift into excluding the wrong record.
     pub(crate) fn live_agent_status_keys(&self) -> std::collections::HashSet<String> {
         self.agents
             .iter()
@@ -42,20 +28,6 @@ impl AdeApp {
 
     /// GitHub issue #227's resume action: looks `key` up in
     /// [`Self::agent_status_state`], selects its worktree, and spawns a real agent back into it.
-    ///
-    /// **Literal conversation resume** (`claude --resume <session_id>`, via
-    /// [`crate::work_surface::agents::Agents::spawn_resume`]) when the record actually carries a
-    /// real Claude Code `session_id` - verified against a real `claude` 2.1.228 binary to
-    /// genuinely pick the same conversation back up (see
-    /// [`crate::hooks::event::HookReport::session_id`]'s own docs for how). Otherwise, a fresh
-    /// agent of the same recorded kind spawned into the same worktree - the honest fallback for a
-    /// Codex record (Codex has no hooks and so never captures a session id at all - Jerry never
-    /// claims otherwise) or for a Claude record predating this field. That fallback reconnects the
-    /// user to the right *place*, even though it cannot continue the exact prior conversation.
-    ///
-    /// A no-op returning `false` if `key` no longer names a decodable record, or its worktree is
-    /// no longer one of [`crate::root::AdeApp::worktrees`] (removed or pruned since it was
-    /// recorded) - there is no real place left to resume into.
     pub(crate) fn resume_past_agent(
         &mut self,
         key: &str,
@@ -120,19 +92,6 @@ impl AdeApp {
     }
 
     /// The hook injection for an agent about to be spawned, bringing the listener up on first use.
-    ///
-    /// `None` for anything that isn't a Claude agent, and `None` if the runtime can't start - both
-    /// of which simply mean "this agent reports no hooks", which is the pre-phase-2 behaviour.
-    ///
-    /// **Lazy rather than started at app startup**, which is a deliberate refinement of the
-    /// original design. It is still exactly one listener per `AdeApp`, shared by every Claude
-    /// agent that instance ever spawns - never one per agent. But a window that only ever holds
-    /// shells, or a Codex agent, now never opens a socket or writes a file at all. That matters
-    /// in two real places: a user who doesn't use Claude Code shouldn't have Jerry holding a
-    /// loopback port open for the whole session, and the test suite (which builds a great many
-    /// `AdeApp`s and spawns almost no Claude agents) no longer pays a listener thread and a temp
-    /// directory per app - real added contention that was measurably destabilising timing
-    /// sensitive tests elsewhere in the suite.
     pub(crate) fn hook_injection_for(
         &mut self,
         kind: crate::work_surface::agents::ProcessKind,
@@ -158,15 +117,6 @@ impl AdeApp {
 
     /// Folds every live agent's current real state into the persisted record, and writes the file
     /// if anything changed.
-    ///
-    /// Called from the rail's existing status poll (`crate::rail::render::AdeApp::start_status_polling`)
-    /// rather than from a timer of its own, matching how the review measurement already rides
-    /// that loop. Deliberately *not* called from `build_agent_rows`: that runs on every render,
-    /// and this ends in an `fsync`.
-    ///
-    /// Only agents that have really reported a hook are recorded - never a shell, never a Codex
-    /// agent, and never a Claude agent still running on the quiescence heuristic. See the comment
-    /// on the gate itself for why that is the feature rather than a shortcut.
     pub(crate) fn record_agent_statuses(&mut self, cx: &mut Context<Self>) {
         if self.agent_status_path.is_none() {
             return;
@@ -322,12 +272,6 @@ impl AdeApp {
     }
 
     /// Writes [`crate::root::AdeApp::agent_status_state`] to disk on the background executor.
-    ///
-    /// Off the UI thread deliberately, exactly like
-    /// `crate::review::flow::AdeApp::persist_review_baselines`: `save_merged_at` holds the
-    /// process-wide `crate::persisted_state_lock` mutex across two `fsync`s, and other persisted
-    /// files' writers contend for that same lock. Running it inline would put a disk flush on the
-    /// render thread.
     pub(crate) fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.agent_status_path.clone() else {
             return;

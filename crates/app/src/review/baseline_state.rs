@@ -1,44 +1,6 @@
 //! Real, on-disk persistence for agent review baselines (GitHub issue #225) - a sibling file
 //! next to `settings.toml`, in the same shape `crate::work_surface::tab_order_state` and
 //! `crate::sidebar::fold_state` already use.
-//!
-//! ## What is stored, and what is not
-//!
-//! Only *metadata*: which baseline exists, the real tree id and ref name it points at, when it
-//! was taken, and why. The snapshot's actual content lives where content belongs - in the
-//! repository's own object database, kept alive by the `refs/jerry/review/*` ref this file
-//! records the name of.
-//!
-//! ## Honest limitation: phase 1 cannot read these back
-//!
-//! `crate::work_surface::agents::AgentId` is a per-window counter that restarts at zero on every
-//! launch, and an agent's process does not survive a restart either - so after a restart there is
-//! no live agent for a persisted baseline to belong to, and nothing in this app can currently
-//! reconnect one. **This file is written today, and today nothing reads it back into a live
-//! review.**
-//!
-//! That is deliberate, not an oversight or a stub. GitHub issue #227 ("Agent history and
-//! resume/recover") is what gives agents durable identity; when it lands, the baselines it needs
-//! to reconnect to will already be here, with their real trees still anchored, instead of having
-//! been thrown away by every prior run. The alternative - not persisting until something can read
-//! it - would mean issue #227 arrives to find every historical baseline already destroyed. So
-//! this deliberately does *not* build a reconnection UI: there is genuinely nothing to reconnect
-//! to yet, and a UI implying otherwise would be a fake.
-//!
-//! [`ReviewBaselineState::forget`] is therefore called only from a real user-visible "this
-//! worktree is gone" action, never from an agent merely closing - see its own docs.
-//!
-//! ## Known gap: no orphan pruning
-//!
-//! Nothing sweeps entries whose agent is long gone. Entries accumulate, one small TOML record per
-//! agent ever spawned. Deliberately left as a known gap for the same reason as above: a
-//! time-based sweep would be deciding, on issue #227's behalf and before it exists, exactly which
-//! history is worthless. The file is small (a few hundred bytes per entry) and never read on a
-//! hot path.
-//!
-//! Atomicity, the multi-instance merge, and the corrupt/missing-file fallback are all copied from
-//! `crate::work_surface::tab_order_state` unchanged - see `crate::sidebar::fold_state`'s module
-//! docs for the full reasoning behind that shape, including its honest limits.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -197,15 +159,6 @@ impl ReviewBaselineState {
     /// The app's real write path: merges only the keys this instance owns into whatever is
     /// currently on disk, then writes the result - so a second `jerry` instance (or a second
     /// window) can't erase baselines it doesn't know about.
-    ///
-    /// Wrapped in `crate::persisted_state_lock::with_locked_merge`, sharing the same process-wide
-    /// lock as every other merged persisted file here - see that module's docs for the real
-    /// concurrent-writer race it closes.
-    ///
-    /// Unlike its siblings, a key absent from `self` is **not** removed from disk. A baseline is
-    /// history, not current layout: this instance simply not having a live agent for some key
-    /// (the normal case for every entry written by a previous run) must never be read as "delete
-    /// it". [`Self::forget`] is the one real way an entry goes away.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = ReviewBaselineState::load_at(path);
@@ -340,9 +293,6 @@ mod tests {
         );
     }
 
-    /// A hand-edited entry naming a reason this app doesn't know must be skipped, not guessed
-    /// at: telling a user "since you last reviewed" about a baseline that isn't one is worse
-    /// than showing nothing.
     #[test]
     fn an_entry_with_an_unrecognised_reason_is_skipped_rather_than_guessed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -413,9 +363,6 @@ mod tests {
         assert!(on_disk.get("key-b").is_some());
     }
 
-    /// The one place this file's merge deliberately differs from its siblings: an entry from a
-    /// previous run (which this instance has no live agent for, and so does not "own") must
-    /// survive a save. This is the property GitHub issue #227 will depend on.
     #[test]
     fn a_previous_runs_baseline_survives_a_save_that_does_not_know_about_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -453,8 +400,6 @@ mod tests {
         assert!(on_disk.get("new-key").is_some());
     }
 
-    /// The persisted worktree must be a real, decodable path rather than a `Path::display()`
-    /// string - it is the one field GitHub issue #227 will actually need to act on.
     #[test]
     fn a_persisted_worktree_round_trips_back_to_a_real_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -478,8 +423,6 @@ mod tests {
         );
     }
 
-    /// Coverage must persist: a later diff made with the wrong coverage against a tracked-only
-    /// baseline would report every untracked file as a brand-new addition.
     #[test]
     fn a_tracked_only_baseline_persists_its_narrower_coverage() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -505,8 +448,6 @@ mod tests {
         );
     }
 
-    /// An entry written before `tracked_only` existed must keep meaning what it meant - the
-    /// ordinary, full-coverage case - rather than failing to parse or flipping to the narrow one.
     #[test]
     fn an_entry_without_the_coverage_field_defaults_to_full_coverage() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -37,15 +37,6 @@ pub enum TabRef {
     /// (`crate::root::AdeApp::review_tab_open`).
     Review(AgentId),
     /// The run-transcript tab (GitHub issue #227), showing one finished run's own recording.
-    ///
-    /// Carries no payload, like `Graph` and unlike `Review`: `design_handoff_jerry_ade/revision
-    /// 5/REVISION-2026-08-13.md` §3 is "**one run tab per worktree**; opening another replaces
-    /// it", and this order is already per worktree
-    /// (`crate::root::AdeApp::tab_order`), so within one strip there is never a second one to
-    /// tell this apart from. Which run it shows lives in
-    /// `crate::root::AdeApp::run_tab_by_worktree` - keeping it out of the identity is what makes
-    /// "replaced" keep the tab's dragged position rather than closing and reopening it at the
-    /// end of the strip.
     Run,
 }
 
@@ -60,12 +51,6 @@ pub enum TabRef {
 /// `crate::root::AdeApp::tab_order` already remembers a different position per worktree for the
 /// same shared agent/file tab identities never do (an agent/file *is* worktree-scoped; the graph
 /// tab's own on-screen slot is what's being remembered here, not a second graph tab).
-///
-/// Pure and idempotent: calling it again on its own output, with the same
-/// `agents_for_cwd`/`open_files`/`graph_open`, changes nothing. That's what lets
-/// `crate::root::AdeApp::combined_tab_order` call this fresh on every render instead of caching
-/// a mutated copy - only a real drag-drop (`crate::root::AdeApp::reorder_tab`) needs to persist a
-/// changed `Vec<TabRef>` back into `tab_order`.
 pub fn reconcile_tab_order(
     stored: &[TabRef],
     agents_for_cwd: &[AgentId],
@@ -166,21 +151,6 @@ pub fn move_tab_order(
 /// animated rather than instant) over a short, fixed duration, the same idiom
 /// `crate::root::AdeApp::dropped_tab_settle`'s own settle-fade already uses for the dropped tab
 /// itself.
-///
-/// Only `dragged`'s own width (`dragged_width`, [`crate::root::AdeApp::tab_bounds`]'s own
-/// last-measured value for it) is ever needed, not each shifted tab's own width - removing and
-/// re-inserting exactly one item always shifts every tab strictly between its old and new slot by
-/// exactly that one item's width, regardless of how wide any of *them* individually are: a tab's
-/// old on-screen position already counted `dragged`'s width once, on one side of the splice; its
-/// new position counts it on the other side, or not at all. Either way the difference is always
-/// `dragged`'s own width, never a sum of any of the other tabs' widths. Never includes `dragged`
-/// itself in the result - that tab gets its own settle-fade instead
-/// ([`crate::root::AdeApp::dropped_tab_settle`]), never both.
-///
-/// Empty whenever [`move_tab_order`] itself would be a no-op (`dragged`/`target` unknown, or
-/// dropping a tab onto its own already-correct slot) - the same real no-op cases
-/// `drag_reorder_is_a_no_op_for_an_unknown_or_identical_id` proves for the underlying reorder
-/// itself, so a no-op drop animates nothing here either.
 pub fn tab_slide_offsets(
     old_order: &[TabRef],
     dragged: &TabRef,
@@ -238,18 +208,6 @@ pub const TRANSPARENT: Rgba = Rgba {
 /// The agent tint `(fg, bg)` for an agent's badge/chip - the one place an agent is turned into a
 /// colour, so the same agent is the same colour on its rail badge, its CLI tab chip, its Changes
 /// panel run rows and the conflict side headers.
-///
-/// Every tint returned here comes from [`theme::agent`]'s pool, which rev 6 reallocated to satisfy
-/// the reserved-hue rule in `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4a: agent
-/// identity is allocated only *outside* the five structural hue families (amber, violet, green,
-/// red, blue). Claude is copper and Codex is teal; both used to sit inside a reserved family
-/// (amber and green respectively), which is exactly what §4a fixed. See [`theme::agent`]'s own
-/// docs for the full rule and table, and `theme::agent_tint_allocation_tests` for the test that
-/// keeps it true - **map a new agent to a pool tint here rather than inventing a colour**, or that
-/// test will fail.
-///
-/// [`ProcessKind::Shell`] isn't an agent, so it gets a neutral chip rather than an invented tint -
-/// and, deliberately, is not a pool member: a shell has no identity to encode.
 pub fn agent_tint(kind: ProcessKind) -> (Rgba, Rgba) {
     match kind {
         // copper - `sonnet-4.5` in the mock's own `sessions`.
@@ -353,9 +311,6 @@ pub struct TabColors {
 /// headers line up, "**All three column headers are now 36** ... and all three borders are
 /// `#191c1f` - the centre strip had been `#1e2225`, which once the rules lined up would have read
 /// as one rule changing shade mid-span."
-///
-/// The active tab keeps painting its own background there instead - "so it joins the pane below" -
-/// which is the cut-out `crate::rail::strip_render`'s selected cell copies for the left column.
 pub fn tab_colors(active: bool) -> TabColors {
     if active {
         TabColors {
@@ -396,20 +351,6 @@ pub fn pty_state_label(is_running: bool, status: Status, exit_code: Option<u32>)
 }
 
 /// A tab's label: what the process inside that pane says it is *right now*.
-///
-/// `title` is the live OSC 0/2 window title the child process last set (`TerminalPane::title`,
-/// the same real fact `crate::rail::title_signal` already classifies into a status signal) - a
-/// shell reporting its cwd or the command it's running, an agent CLI reporting what it's doing.
-/// That is the whole label: no branch, no ordinal, no decoration, exactly like every real
-/// terminal emulator's tab. Two panes that genuinely report the same title therefore render the
-/// same label, which is the honest answer - they really are showing the same thing.
-///
-/// `program` (`TerminalPane::program_label`, the resolved binary name) is the fallback for the
-/// one real case where there is no title to show: a process that hasn't set one yet, or ever.
-/// Many shells only set a title from their prompt hook, so a freshly spawned one is silent until
-/// its first prompt - and plenty of setups never set one at all. An *empty* title is treated the
-/// same way: `\u{1b}]0;\u{7}` is a process clearing its title, which leaves nothing to show, not
-/// a reason to render a blank tab.
 pub fn live_tab_label(title: Option<&str>, program: &str) -> String {
     match title.map(str::trim).filter(|title| !title.is_empty()) {
         Some(title) => title.to_string(),
@@ -484,13 +425,6 @@ pub fn action_button_colors(style: ActionStyle) -> ActionColors {
 /// handlers dispatch on this. Every variant either has real backing logic wired up, or is
 /// rendered honestly disabled (see [`FooterAction::implemented`]) - never a button that looks
 /// clickable but silently does nothing.
-///
-/// GitHub issue #295 cut this enum from seven variants to two. `Interrupt`, `OpenTerminal`,
-/// `KeepAllChanges`, `OpenReview` and `Unimplemented` (`Open in editor`) are **deleted**, not
-/// hidden: `STAGE-A-CHANGELOG.md` §4t makes the agent pane's bottom strip a readout rather than
-/// an action bar, and `REVISION-2026-08-14.md` §7 rule 5 forbids leaving the old keys behind
-/// ("Replacing a control means deleting its old keys in the same edit - a key defined twice is
-/// two specifications of one thing, and the reader cannot tell which is real").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     /// Closes this tab and spawns a fresh agent of the same kind/cwd - an approximate
@@ -523,28 +457,6 @@ pub struct FooterAction {
 
 /// The footer action strip for one [`Status`] - GitHub issue #295's final state
 /// (`STAGE-A-CHANGELOG.md` §4e/§4r/§4t).
-///
-/// The agent pane is a terminal, so a button that duplicates a keystroke which already works in
-/// the focused surface is unearned space (§4t), and an action whose object is the *worktree* or
-/// the *branch* does not belong under one agent of a possibly multi-agent worktree (§4e/§4r).
-/// What is left is only what is run-scoped and has no other home:
-///
-/// | Status | Actions | Why the rest went |
-/// |---|---|---|
-/// | `Ask` (needs input) | none | "there is nothing to interrupt; the question is answered in the pane" (§4e) |
-/// | `Run` (running) | none | `⌃C` in the focused pty *is* the interrupt (§4t) |
-/// | `Fail` (failed) | `Retry ⌘R` · `Discard worktree` | the run really can be restarted, and the two-click discard is this app's only worktree deletion under an agent |
-/// | `Review` (finished) | none | "a finished transcript is a record; its actions live where their object lives" (§4r) |
-/// | `Idle` (paused) | `Resume ⌘⏎` | the one verb that restarts a stopped run |
-///
-/// Deleted outright rather than hidden, per `REVISION-2026-08-14.md` §7 rule 5 - see
-/// [`ActionKind`]'s own docs. The verbs that still exist elsewhere kept their real homes:
-/// `Archive` is the rail's agent/worktree context menus (`crate::rail::menu`, GitHub issue #290)
-/// and the title bar's Agent menu; `Keep all changes` and `Discard worktree` are also on that
-/// Agent menu; `Review` moved to it (`crate::title_bar::menu_model::MenuCommand::ReviewAgent`);
-/// `Open terminal` is the no-agent empty state's secondary CTA
-/// (`crate::work_surface::render::AdeApp::render_no_agents_empty_state`), where §4t keeps it
-/// because "with no agent there is no keystroke to duplicate and no readout to show".
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
         // §4r: "`review` now renders no bar, matching `ask`". `Keep all` was "a fiction borrowed
@@ -703,9 +615,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #295 / §4t: every action that survives has real backing logic. The
-    /// permanently-inert `Open in editor` row is gone with the rest, so there is no longer any
-    /// such thing as an unimplemented footer action.
     #[test]
     fn every_surviving_footer_action_has_real_backing_logic() {
         for status in Status::ORDER {
@@ -720,29 +629,21 @@ mod tests {
         }
     }
 
-    /// §4r, verbatim: "a finished transcript is a record; its actions live where their object
-    /// lives". `Keep all`, `Review`, `Open in editor` and `Discard worktree` all left.
     #[test]
     fn a_finished_agent_offers_no_footer_actions_at_all() {
         assert!(footer_actions(Status::Review).is_empty());
     }
 
-    /// §4e: "`Interrupt` offered on an agent that is *waiting for you* - there is nothing to
-    /// interrupt", and `Open terminal` "opens a *different* terminal, which does not answer the
-    /// question the agent is asking".
     #[test]
     fn an_asking_agent_offers_no_footer_actions_at_all() {
         assert!(footer_actions(Status::Ask).is_empty());
     }
 
-    /// §4t: `⌃C` in the focused pty is the interrupt, so the button duplicating it is deleted.
     #[test]
     fn a_running_agent_offers_no_footer_actions_at_all() {
         assert!(footer_actions(Status::Run).is_empty());
     }
 
-    /// The one status that keeps two verbs: the run really can be retried, and the two-click
-    /// discard is a real destructive action with no keystroke behind it. `Open terminal` went.
     #[test]
     fn fail_actions_are_exactly_a_real_retry_then_a_real_discard() {
         let actions = footer_actions(Status::Fail);
@@ -753,9 +654,6 @@ mod tests {
         assert!(actions.iter().all(|action| action.implemented));
     }
 
-    /// GitHub issue #20 kept `Archive` out of the idle footer because the context bar already
-    /// rendered it; issue #295 then deleted the context bar's copy too, so `Archive` now lives
-    /// only in the rail menus and the title bar's Agent menu - and idle is still just `Resume`.
     #[test]
     fn idle_actions_are_just_a_real_resume() {
         let actions = footer_actions(Status::Idle);
@@ -765,8 +663,6 @@ mod tests {
         assert!(actions[0].implemented);
     }
 
-    /// The two verbs §4t names as already-bound keystrokes, and the four §4e/§4r moved to their
-    /// objects' own surfaces, must not come back to any status's footer.
     #[test]
     fn no_status_offers_a_verb_that_lives_somewhere_else_now() {
         for status in Status::ORDER {
@@ -791,8 +687,6 @@ mod tests {
         }
     }
 
-    /// Every remaining button keeps its keycap where it really has one (issue #295's ride-along),
-    /// and never advertises one it does not - `Discard worktree` has no keybinding in this app.
     #[test]
     fn surviving_buttons_advertise_only_keycaps_that_really_exist() {
         let fail = footer_actions(Status::Fail);
@@ -801,7 +695,6 @@ mod tests {
         assert_eq!(footer_actions(Status::Idle)[0].keycap, Some("mod+enter"));
     }
 
-    /// A live title is the label, verbatim - no branch, no ordinal, nothing appended.
     #[test]
     fn a_live_title_is_the_whole_tab_label_with_nothing_appended() {
         assert_eq!(
@@ -811,21 +704,17 @@ mod tests {
         assert_eq!(live_tab_label(Some("~/src/jerry"), "zsh"), "~/src/jerry");
     }
 
-    /// The only fallback: a process that has said nothing yet still gets a real name.
     #[test]
     fn a_pane_whose_process_has_set_no_title_falls_back_to_its_program_name() {
         assert_eq!(live_tab_label(None, "zsh"), "zsh");
     }
 
-    /// A title cleared (or set empty) by the process is "nothing to show", not a blank tab.
     #[test]
     fn an_empty_or_whitespace_title_falls_back_rather_than_rendering_a_blank_tab() {
         assert_eq!(live_tab_label(Some(""), "bash"), "bash");
         assert_eq!(live_tab_label(Some("   "), "bash"), "bash");
     }
 
-    /// Two panes really showing the same thing render the same label - the duplicate is the
-    /// truth, and synthesising a `#1`/`#2` difference between them would be inventing one.
     #[test]
     fn two_panes_reporting_the_same_title_get_the_same_label() {
         assert_eq!(
@@ -834,7 +723,6 @@ mod tests {
         );
     }
 
-    /// Revision R12 §3's exact spec wording for the `+` menu's "New agent" row.
     #[test]
     fn the_new_agent_menu_row_shows_the_real_branch_never_a_model_name() {
         assert_eq!(
@@ -874,10 +762,6 @@ mod tests {
         }
     }
 
-    /// A fresh worktree (nothing dragged yet) must render its agents first, in creation order,
-    /// then its file tabs, in `open_files`' own order - exactly the old two-block layout, so this
-    /// revision's interleaving layer is a strict superset of the old behaviour, not a visible
-    /// change until a real drag happens.
     #[test]
     fn reconcile_with_no_stored_order_appends_agents_then_files_in_their_own_order() {
         let order = reconcile_tab_order(
@@ -899,9 +783,6 @@ mod tests {
         );
     }
 
-    /// The real interleaving case (GitHub issue #16): a stored order with a file tab sitting
-    /// between two agent tabs must survive reconciliation unchanged, as long as every entry in
-    /// it still exists.
     #[test]
     fn reconcile_preserves_a_stored_interleaved_order() {
         let stored = vec![
@@ -920,9 +801,6 @@ mod tests {
         assert_eq!(order, stored);
     }
 
-    /// A agent closed (or a file tab closed) since the order was last stored must be dropped,
-    /// not left as a dangling reference to something `crate::root::AdeApp::render_tab_strip`
-    /// would otherwise try to render.
     #[test]
     fn reconcile_drops_entries_that_no_longer_exist() {
         let stored = vec![
@@ -934,8 +812,6 @@ mod tests {
         assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
-    /// A brand new agent/file not yet in the stored order must be appended at the end, never
-    /// silently dropped or inserted somewhere the user never asked for.
     #[test]
     fn reconcile_appends_newly_opened_tabs_not_yet_in_the_stored_order() {
         let stored = vec![TabRef::Agent(1)];
@@ -957,18 +833,12 @@ mod tests {
         );
     }
 
-    /// GitHub issue #93: a freshly opened graph tab, not yet in the stored order, must be
-    /// appended at the end - the same "brand new tab lands last" rule every other kind already
-    /// gets, not silently dropped or given a hardcoded fixed position.
     #[test]
     fn reconcile_appends_a_freshly_opened_graph_tab() {
         let order = reconcile_tab_order(&[], &[1], &[], true, None, false);
         assert_eq!(order, vec![TabRef::Agent(1), TabRef::Graph]);
     }
 
-    /// The real point of GitHub issue #93: once a drag has recorded the graph tab somewhere
-    /// specific in the stored order, reconciliation must honor that real position - not always
-    /// re-append it at the end - as long as it's still open.
     #[test]
     fn reconcile_preserves_a_stored_graph_tab_position() {
         let stored = vec![TabRef::Graph, TabRef::Agent(1)];
@@ -976,9 +846,6 @@ mod tests {
         assert_eq!(order, stored);
     }
 
-    /// A closed graph tab must be dropped from the order, exactly like a closed agent or file
-    /// tab - not left as a dangling entry `crate::root::AdeApp::render_tab_strip` would try to
-    /// render for a tab that no longer exists.
     #[test]
     fn reconcile_drops_a_closed_graph_tab() {
         let stored = vec![TabRef::Agent(1), TabRef::Graph];
@@ -986,7 +853,6 @@ mod tests {
         assert_eq!(order, vec![TabRef::Agent(1)]);
     }
 
-    /// GitHub issue #225: a freshly opened review tab is appended like every other kind.
     #[test]
     fn reconcile_appends_a_freshly_opened_review_tab() {
         let order = reconcile_tab_order(&[], &[1], &[], false, Some(1), false);
@@ -1009,26 +875,18 @@ mod tests {
         assert_eq!(order, vec![TabRef::Agent(1)]);
     }
 
-    /// A review tab whose agent has closed must be dropped even while `review_open` still names
-    /// it - otherwise the strip would keep rendering a tab for an agent that no longer exists,
-    /// exactly the dangling-entry class `reconcile_tab_order` exists to prevent.
     #[test]
     fn reconcile_drops_a_review_tab_whose_agent_is_gone() {
         let stored = vec![TabRef::Review(7)];
         assert!(reconcile_tab_order(&stored, &[], &[], false, Some(7), false).is_empty());
     }
 
-    /// The review tab belongs to *one* worktree's strip - the worktree its agent runs in. Another
-    /// worktree's strip must not show it, even though `review_open` is a single window-wide slot.
     #[test]
     fn a_review_tab_never_leaks_into_another_worktrees_strip() {
-        // Worktree B's strip: its own agent 2 is open, but the review is for agent 1 (worktree A).
         let order = reconcile_tab_order(&[], &[2], &[], false, Some(1), false);
         assert_eq!(order, vec![TabRef::Agent(2)]);
     }
 
-    /// GitHub issue #227: the run-transcript tab joins the same order every other kind is in -
-    /// appended when freshly opened, kept where a drag put it, and dropped when closed.
     #[test]
     fn reconcile_treats_the_run_tab_like_every_other_kind() {
         assert_eq!(
@@ -1051,9 +909,6 @@ mod tests {
         );
     }
 
-    /// §3's "one run tab per worktree" is structural, not a rule the reconciler has to enforce:
-    /// [`TabRef::Run`] carries no payload, so a stored order physically cannot hold two of them
-    /// distinctly - and re-reconciling never grows a second.
     #[test]
     fn a_worktree_strip_can_never_hold_two_run_tabs() {
         let once = reconcile_tab_order(&[], &[1], &[], false, None, true);
@@ -1069,9 +924,6 @@ mod tests {
         );
     }
 
-    /// The real cross-kind drag this revision exists to unlock: dropping a file tab so it lands
-    /// immediately before an agent tab must actually interleave them, not just reorder within
-    /// each tab's own kind.
     #[test]
     fn move_tab_order_drops_a_file_tab_before_a_agent_tab() {
         let mut order = vec![
@@ -1095,9 +947,6 @@ mod tests {
         );
     }
 
-    /// `insert_after` must land the dragged tab on the far side of the target from a plain
-    /// "insert before" - the real distinction the insertion-caret precision (left half vs. right
-    /// half of the hovered tab) is for.
     #[test]
     fn move_tab_order_respects_insert_after() {
         let mut order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
@@ -1108,8 +957,6 @@ mod tests {
         );
     }
 
-    /// `move_tab_order` must never corrupt the order on a bad move - dropping a tab onto itself,
-    /// an unknown dragged entry, or an unknown target must all be real no-ops.
     #[test]
     fn move_tab_order_is_a_no_op_for_an_unknown_or_identical_entry() {
         let original = vec![TabRef::Agent(1), TabRef::File(PathBuf::from("a.rs"))];
@@ -1120,12 +967,6 @@ mod tests {
         assert_eq!(order, original);
     }
 
-    /// Dragging rightward (into a later slot) must slide every tab it passed over - and only
-    /// those tabs - left by exactly the dragged tab's own width, never by any of *their* own
-    /// widths (`tab_slide_offsets`'s own docs on why only `dragged_width` is ever needed). The
-    /// dragged tab itself must never appear in the result, and a tab outside the passed-over span
-    /// (here, nothing - every other tab actually is between the two slots) must never appear
-    /// either.
     #[test]
     fn tab_slide_offsets_slides_every_passed_over_tab_left_by_the_dragged_tabs_own_width() {
         let order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
@@ -1139,9 +980,6 @@ mod tests {
         );
     }
 
-    /// The mirror image of the rightward case: dragging leftward must slide every passed-over tab
-    /// *right* by the dragged tab's own width (a negative starting offset, sliding back to `0`),
-    /// not left.
     #[test]
     fn tab_slide_offsets_slides_every_passed_over_tab_right_when_dragging_leftward() {
         let order = vec![TabRef::Agent(1), TabRef::Agent(2), TabRef::Agent(3)];
@@ -1155,9 +993,6 @@ mod tests {
         );
     }
 
-    /// A tab outside the span the dragged tab actually passed over must never slide - only its
-    /// own real neighbours-in-transit do. Dragging tab 1 to sit immediately after tab 2 only ever
-    /// passes over tab 2 itself; tabs 3 and 4 never moved and must not appear in the result.
     #[test]
     fn tab_slide_offsets_never_slides_a_tab_outside_the_passed_over_span() {
         let order = vec![
@@ -1178,8 +1013,6 @@ mod tests {
         );
     }
 
-    /// Dropping a tab immediately before its own already-adjacent slot is a real no-op
-    /// (`move_tab_order`'s own docs) - nothing actually changed position, so nothing may slide.
     #[test]
     fn tab_slide_offsets_is_empty_when_the_drop_lands_on_the_tabs_own_already_adjacent_slot() {
         let order = vec![
@@ -1195,10 +1028,6 @@ mod tests {
         assert!(slides.is_empty());
     }
 
-    /// `move_tab_order`'s own no-op rules (unknown dragged/target entry, or dropping a tab onto
-    /// its own slot) must produce zero slide offsets too - a no-op reorder must animate nothing,
-    /// mirroring `drag_reorder_is_a_no_op_for_an_unknown_or_identical_id`'s own proof for the
-    /// underlying reorder.
     #[test]
     fn tab_slide_offsets_is_empty_for_every_move_tab_order_no_op() {
         let order = vec![TabRef::Agent(1), TabRef::Agent(2)];

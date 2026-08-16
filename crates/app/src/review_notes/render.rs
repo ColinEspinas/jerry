@@ -48,10 +48,6 @@ pub const SEND_TOOLTIP: &str = "Send every note as one prompt to this run's agen
 
 /// What the send control says while this worktree has no agent session to send to - see
 /// [`AdeApp::render_send_notes_unavailable`].
-///
-/// **A derivation, not a transcription.** The mock's diff always has a run beside it, so it has
-/// no empty state for this control at all; it names the *missing thing* rather than an agent
-/// precisely because there is no agent to name.
 pub const SEND_UNAVAILABLE_LABEL: &str = "Send notes \u{2014} no agent in this worktree";
 
 /// And why, at the length a tooltip can afford.
@@ -66,22 +62,9 @@ pub const SEND_UNAVAILABLE_TOOLTIP: &str =
 pub const SEND_NOTES_SPEC: &str = "mod+enter";
 
 /// What an empty card says while it is waiting to be written into.
-///
-/// **A derivation, not a transcription.** `Jerry.dc.html`'s cards are all pre-authored demo data,
-/// so the mock has no empty state for one at all - in it, "toggle a note" can only ever mean
-/// show/hide something that already exists. A real reviewer starts from nothing, and a blank card
-/// with no prompt would read as a rendering fault.
 const NOTE_PLACEHOLDER: &str = "what should change on this line?";
 
 /// The notes bar's own count sentence, and the design copy it is checked against.
-///
-/// A pure function, apart from the element that draws it, precisely so the exact wording is
-/// assertable: `STAGE-A-CHANGELOG.md` §3's verification list is *"bar reads `1 note on this file`,
-/// send → `1 note sent — awaiting revision`"*, and those two strings are the acceptance criteria.
-/// A render test can prove the label painted; only this can prove it says the right thing.
-///
-/// Both counts go through [`plural::count`] (GitHub issue #281's helper), so `1 note` and
-/// `2 notes` are the helper's answer rather than a second, inlined rule.
 pub fn notes_bar_label(state: super::FileNoteState) -> String {
     let count = plural::count(state.count, "note", None);
     if state.all_sent {
@@ -94,11 +77,6 @@ pub fn notes_bar_label(state: super::FileNoteState) -> String {
 impl AdeApp {
     /// Wraps the diff's hunks with the notes bar above them (GitHub issue #288's *"batched, from
     /// the top"*).
-    ///
-    /// The container carries the `diff-view` key context and a real focus handle, which is what
-    /// makes `mod+enter` (send) and `c` (note on line) bound keystrokes rather than decoration -
-    /// the same arrangement `crate::graph_view::rebase_render`'s `rebase-plan` surface uses, and
-    /// for the same reason: those hints are drawn as keycaps, so they have to be real.
     pub(crate) fn wrap_diff_with_notes(
         &self,
         path: std::path::PathBuf,
@@ -122,23 +100,6 @@ impl AdeApp {
 
     /// The open note's real keyboard input node - zero-sized, and deliberately **not** inside the
     /// diff's row list.
-    ///
-    /// This looks like misdirection and is the opposite. The pinned card is a row of a
-    /// `gpui::uniform_list`, which builds only the rows in its visible range: put the
-    /// `track_focus`/`key_context`/`on_key_down` on the card and scrolling the card off screen
-    /// deletes the focused node from the dispatch tree mid-sentence. GPUI then evaluates every
-    /// predicate against an **empty context stack**, where
-    /// `KeyBindingContextPredicate::eval_inner` short-circuits to `false` - so the keystrokes
-    /// stop being typed, `mod+enter` and `c` stop firing, and nothing on screen says so. That is
-    /// the exact bug class `crate::keymap_overrides::real_context_stacks` includes the empty
-    /// stack for, and it is reachable here without anyone calling
-    /// [`AdeApp::close_note_draft`].
-    ///
-    /// Anchoring the node here instead makes the input's lifetime the *draft's* lifetime rather
-    /// than the scroll position's. The card keeps the caret (which only *reads*
-    /// `FocusHandle::is_focused`, so it needs no node of its own) and the text; exactly one
-    /// element ever tracks [`AdeApp::note_focus_handle`], which is the other half of the same
-    /// rule.
     fn render_note_input_node(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.note_draft.as_ref()?;
         Some(
@@ -271,23 +232,6 @@ impl AdeApp {
     }
 
     /// The send control when there is **nobody to send to** - drawn, muted, and saying why.
-    ///
-    /// Live report: *"I can't really submit the comments, maybe there is something I don't
-    /// understand"*. There was nothing to understand. This bar used to render the send button
-    /// only once [`AdeApp::review_note_target`] resolved a live agent session in the worktree,
-    /// and to render **nothing at all** otherwise - so a reviewer who opened a diff before
-    /// starting an agent (which is the ordinary order: you read the change, then you ask for a
-    /// revision) got a bar that counted their notes, explained that they would be sent as one
-    /// prompt, and offered no control, no keycaps, and no explanation. `mod+enter` was bound the
-    /// whole time and would have said `no agent open in this worktree to send to` - but the only
-    /// place that keystroke is ever advertised is *inside the button that was not being drawn*.
-    ///
-    /// `REVISION-2026-08-14.md` §7 rule 1 (*"ship the affordance with the behaviour, or ship
-    /// neither"*) is what the original shape was reaching for, and it is not violated here: the
-    /// behaviour **is** shipped - the batch, the binding, the delivery - and the only thing
-    /// missing is a target the reviewer can supply in one keystroke. What that rule forbids is a
-    /// control that pretends to do something it cannot, which is why this one is deliberately not
-    /// clickable, carries no hover, and names the thing that is missing rather than an agent.
     fn render_send_notes_unavailable(&self) -> gpui::AnyElement {
         let macos = self.window_controls_style().is_macos();
         div()
@@ -330,10 +274,6 @@ impl AdeApp {
     }
 
     /// `Send notes to <agent>` - the agent's own chip, its name, and the `mod+enter` keycaps.
-    ///
-    /// Drawn only when a target really resolved. A button naming an agent that is not there is
-    /// worse than no button: `REVISION-2026-08-14.md` §7's rule 1 is *"ship the affordance with
-    /// the behaviour, or ship neither"*.
     fn render_send_notes_button(
         &self,
         path: std::path::PathBuf,
@@ -410,27 +350,6 @@ impl AdeApp {
     }
 
     /// One pinned note, as a row of the diff's own `uniform_list`.
-    ///
-    /// ## The one place this is not the mock
-    ///
-    /// `Jerry.dc.html` draws the card as a free-height block whose text wraps. It cannot be one
-    /// here: since GitHub issue #224 the diff is a `gpui::uniform_list`, which measures item 0 and
-    /// lays **every** slot out at exactly that height (`rems(1.6)`, a diff line's own line
-    /// height). A taller card would be silently clipped, and a list that measured itself from a
-    /// card would make every diff line as tall as one.
-    ///
-    /// The alternative considered and rejected was letting a note occupy N slots and painting
-    /// bands of one card across them: `N` would have to be guessed from the text before layout
-    /// knows the pane's width, so a wrong guess either clips a review comment or leaves a hole -
-    /// and it would fail outright the moment the card's head scrolled off the top, since only
-    /// visible slots are ever built.
-    ///
-    /// So the card is one row: the same four elements in the same order (selection-blue left edge,
-    /// author chip, text, `draft`/`sent` mark), with the text kept on one line and the whole of it
-    /// available as a tooltip. That is a real, stated loss against the mock's wrapping card, taken
-    /// because the surface it lives in has a hard constraint the mock does not - and it is also
-    /// exactly the shape of every other text input in this app, all five of which are single-line
-    /// (`crate::text_history`'s own module docs).
     pub(crate) fn render_review_note_card(
         &self,
         path: std::path::PathBuf,

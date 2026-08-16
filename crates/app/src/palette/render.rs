@@ -10,12 +10,6 @@ use crate::sidebar::render::{next_right_sidebar_view, RightSidebarView};
 /// Live secondary line for one of the three `Window controls: …` palette commands - names which
 /// chrome that option resolves to and flags the one that's already active, like
 /// `Self::build_palette_groups`'s other live-state secondaries.
-///
-/// [`WindowControlsStyle`] is a rendering-only preview of another platform's title bar and
-/// keycap glyphs, never a rebinding of this agent's globally-bound shortcuts (fixed at compile
-/// time by the real OS - see `crate::keymap`'s "cosmetic preview, not a rebinding" docs).
-/// Picking "macOS" on Linux/Windows makes every keycap render `⌘`-style while the key that
-/// actually works is still Ctrl - a deliberate tradeoff, not an oversight.
 fn window_controls_secondary(current: WindowControlsStyle, option: WindowControlsStyle) -> String {
     let resolved = if option.is_macos() {
         "macOS dots"
@@ -40,11 +34,6 @@ pub(crate) struct FileDiffMark {
 
 /// Every changed file's [`FileDiffMark`], keyed by the repo-relative path `wt_core::diff` reports
 /// (see `crate::sidebar::changes::split_dir_name`'s docs on that shape).
-///
-/// Owned rather than borrowed from the diff, and bounded by the *diff's* size rather than the
-/// tree's, so `AdeApp::load_file_tree` can take a snapshot of it on the foreground thread in
-/// constant-ish time and then hand it to a background task. Built once, not once per file - that
-/// avoids an O(files × diff_files) rescan (the same idiom as `AdeApp::tree_change_marks`).
 pub(crate) type FileDiffMarks = HashMap<PathBuf, FileDiffMark>;
 
 /// Snapshots the currently loaded diff as [`FileDiffMarks`].
@@ -68,12 +57,6 @@ pub(crate) fn file_diff_marks(diff: Option<&wt_core::diff::WorktreeDiff>) -> Fil
 
 /// Builds the palette's file-candidate list: one [`palette::FileCandidate`] per non-directory
 /// entry in an already-walked file tree, with `marks` overlaid where the file has a diff.
-///
-/// Pure, and deliberately free of `AdeApp` - this is `O(entries)` with a handful of allocations
-/// each, which since GitHub issue #160 removed the walk's entry cap is unbounded work.
-/// `AdeApp::load_file_tree` therefore runs it on `gpui::BackgroundExecutor`, not in its
-/// walk-completion handler; `AdeApp::rebuild_palette_file_candidates` still calls it directly for
-/// the much cheaper "same tree, new diff marks" case.
 pub(crate) fn build_file_candidates(
     entries: &[file_tree::FileTreeEntry],
     root: &std::path::Path,
@@ -119,13 +102,6 @@ impl AdeApp {
     /// `crate::palette::state::build_groups`. Called both by rendering ([`Self::render_palette`]) and
     /// by keyboard handling ([`Self::move_palette_selection`]/[`Self::run_selected_palette_entry`]),
     /// built fresh every call so what's drawn and what `⏎`/`↑`/`↓` act on can never disagree.
-    ///
-    /// `agents`/`commands` are cheap (bounded by open-tab count plus 10 fixed commands) and
-    /// built fresh here. `files` is the expensive part - one candidate per file in the whole
-    /// loaded tree, and since GitHub issue #160 removed the walk's entry cap that is unbounded -
-    /// so it is *not* rebuilt here: this reads the cached [`Self::palette_file_candidates`],
-    /// which is refreshed only at the two points its inputs really change (see
-    /// [`Self::rebuild_palette_file_candidates`] and [`Self::load_file_tree`]).
     pub(crate) fn build_palette_groups(&self, cx: &App) -> Vec<palette::PaletteGroup> {
         // A drill-down step replaces the root list entirely rather than adding a group to it -
         // the palette is asking one question ("which server?") and every row on screen has to be
@@ -298,11 +274,6 @@ impl AdeApp {
     /// live clients [`Self::restartable_language_servers`] reports - never a fixed menu of the
     /// server names this app knows how to spawn, so a row exists exactly when a real process (or
     /// a real failed spawn) does.
-    ///
-    /// The label is the client key itself; the language display name is looked up from the real
-    /// registry (`crate::language::language_for_lsp_client_key`) and shown beside the server's
-    /// live state, which is what a user picking "the broken one" is actually reading. A failed
-    /// client shows its own real failure text rather than the word "failed".
     pub(in crate::palette) fn language_server_candidates(
         &self,
     ) -> Vec<palette::LanguageServerCandidate> {
@@ -342,11 +313,6 @@ impl AdeApp {
 
     /// Runs [`palette::PaletteCommand::RestartLanguageServer`]: either restarts the one server
     /// there is, or moves the palette into its "which server?" step.
-    ///
-    /// Skipping the step for a single server is deliberate. A one-row menu isn't a choice, and
-    /// making the user confirm it would be the same fake ceremony this app refuses elsewhere -
-    /// the command's own secondary line already named exactly which server it would restart, so
-    /// nothing is hidden by doing it.
     pub(in crate::palette) fn begin_language_server_pick(&mut self, cx: &mut Context<Self>) {
         let servers = self.restartable_language_servers();
         match servers.as_slice() {
@@ -387,12 +353,6 @@ impl AdeApp {
     /// [`Self::current_diff`], on the calling (foreground) thread. This is the *diff* side's
     /// entry point - [`Self::load_diff`]'s completion handler, and `open_file_tab`'s - where the
     /// tree is unchanged and only the marks laid over it moved.
-    ///
-    /// The *tree* side no longer comes through here: [`Self::load_file_tree`] builds the same
-    /// candidates on the background executor, in the same task as the walk, because that is the
-    /// one path whose cost scales with the whole loaded tree and GitHub issue #160 removed the
-    /// cap that used to bound it. Both call the same [`build_file_candidates`], so the two can't
-    /// produce different candidates for the same inputs.
     pub(crate) fn rebuild_palette_file_candidates(&mut self) {
         self.palette_file_candidates = build_file_candidates(
             &self.file_tree,
@@ -422,10 +382,6 @@ impl AdeApp {
     /// Dispatches a [`palette::PaletteCommand`] to the same `AdeApp` method its existing UI
     /// affordance calls (see [`palette::PaletteCommand`]'s per-variant docs) - never a second,
     /// independent implementation.
-    ///
-    /// Takes `window`, unlike other palette-adjacent methods, purely for
-    /// [`palette::PaletteCommand::OpenSettings`]: [`Self::open_settings`] needs it to capture
-    /// keyboard focus, the same way [`Self::open_palette`] does.
     pub(crate) fn execute_palette_command(
         &mut self,
         command: palette::PaletteCommand,
@@ -475,21 +431,6 @@ impl AdeApp {
     /// Runs a palette file result (GitHub issue #15): opens the file - its diff if it is changed
     /// in the currently loaded diff, otherwise the editable File view - moves real keyboard focus
     /// into it, and reveals and highlights it in the Files tree.
-    ///
-    /// All of that is [`Self::open_and_focus_file`]'s, reached through the same
-    /// [`Self::open_change_diff`]/[`Self::open_file_view`] pair a Changes row click and a tree row
-    /// click use. This function decides exactly one thing - which of the two views to open - and
-    /// switches Zone 3 to `Files` so the row it just revealed is actually on screen.
-    ///
-    /// ## What this used to do
-    ///
-    /// The diff-less branch revealed the file in the tree, highlighted its row, and *stopped*: no
-    /// tab was opened, nothing was shown in the centre, and focus stayed wherever it was, so the
-    /// palette closed onto an unchanged screen with a highlighted tree row. That is issue #15's
-    /// report and the separately-reported "reveal in tree selects the file but does not open it"
-    /// in one defect. The diff branch did open a tab and focus it, but never revealed or
-    /// highlighted the file in the tree - so which of the two halves you got depended on whether
-    /// the file happened to be in the diff. Both now run the one path that does all of it.
     // `pub(crate)`, not `pub(in crate::palette)`: `crate::sidebar::render`'s own
     // "reveal in tree" regression test drives this real flow rather than calling
     // `AdeApp::reveal_in_tree` directly, so that the wiring between the two is what's covered.
@@ -525,31 +466,6 @@ impl AdeApp {
     /// Runs the currently highlighted palette result (`⏎`) - looks it up fresh via
     /// [`Self::build_palette_groups`], dispatches by its [`palette::EntryTarget`], then closes
     /// the palette.
-    ///
-    /// ## "An action focuses its result" (GitHub issue #15)
-    ///
-    /// An entry that opens something owns keyboard focus afterwards; an entry that opens nothing
-    /// leaves focus where it was before the palette. Both are the same closing step here, and
-    /// which one applies is *observed* rather than declared: focus is read before dispatch (it is
-    /// the palette's own handle, since the palette is open and focused) and again after, and the
-    /// entry is taken to have claimed focus exactly when it moved it. `Window::focus` writes
-    /// `Window::focus` synchronously (`vendor/zed/crates/gpui/src/window.rs`), so by the time
-    /// dispatch returns this comparison is already the real answer.
-    ///
-    /// Deliberately not a per-entry `bool` the way this app's first sketch of it was, for the
-    /// reason `crate::default_key_bindings`' own docs give about this codebase's most-shipped bug
-    /// class: a flag has to be set at every site that focuses something, and the failure mode of
-    /// forgetting one is a silently swallowed keystroke. There is nothing to forget here - a new
-    /// palette entry that focuses its result keeps focus automatically, and one that doesn't
-    /// restores automatically, with no third state to get wrong.
-    ///
-    /// What this fixes concretely: [`Self::open_palette_file_result`] moves focus into the
-    /// editor, and [`Self::close_palette`]'s unconditional `restore_focus` then moved it straight
-    /// back to whatever was focused before the palette opened - so the file really did open and
-    /// the very next keystroke still went to the terminal. `OpenSettings` had the same shape and
-    /// survived only because [`Self::close_palette`] carries a hand-written special case for
-    /// Settings specifically; that case is now subsumed by this general rule (it is kept, since
-    /// `close_palette` is also reached from Esc and the scrim, where no entry ran at all).
     pub(in crate::palette) fn run_selected_palette_entry(
         &mut self,
         window: &mut Window,
@@ -801,17 +717,6 @@ impl AdeApp {
     /// on: before the placeholder (empty query) or after the real typed text (non-empty).
     /// The palette's input row: scope-prefix glyph, typed query (or its placeholder), a caret at
     /// the real insertion point, and the clickable segmented scope control.
-    ///
-    /// The caret used to be a fixed bar rendered unconditionally *after* the text/placeholder,
-    /// which read as a UI artefact rather than a real insertion-point indicator (the design
-    /// audit's own wording). It now sits before the placeholder while the query is empty, and
-    /// immediately after the real typed text once something has been entered - matching
-    /// `Jerry.dc.html`'s own two-position fixture.
-    ///
-    /// In a drill-down step the placeholder states the question being asked and the segmented
-    /// scope control is dropped: scopes filter the root list's three candidate kinds, and a step
-    /// lists exactly one kind, so leaving the control up would offer three switches that either
-    /// do nothing or silently abandon the question.
     pub(in crate::palette) fn render_palette_input_row(
         &self,
         cx: &mut Context<Self>,
@@ -1126,15 +1031,6 @@ impl AdeApp {
     /// The palette footer: `↑↓ move · ⏎ run · ⇥ next scope · esc close`, plus the result count -
     /// `total` reflects rows actually rendered (post [`palette::MAX_ENTRIES_PER_GROUP`] capping
     /// in `crate::palette::state::build_groups`), so it never overstates what's on screen.
-    ///
-    /// Each hint is a `[keycap] label` pair resolved through `crate::keymap::resolve_combo`.
-    /// `↑↓` isn't one of `resolve_combo`'s recognized modifier/key tokens, so it passes through
-    /// unchanged - the same path a bare letter like `N` takes.
-    ///
-    /// A drill-down step gets its own three hints, and every one of them is a real difference in
-    /// what those keys do there: `⏎` restarts the highlighted server rather than "running" a
-    /// command, `esc` goes back to the command list rather than closing, and `⇥` has no scopes to
-    /// cycle so it isn't offered at all (see [`Self::handle_palette_key_down`]).
     pub(in crate::palette) fn render_palette_footer(&self, total: usize) -> impl IntoElement {
         let macos = self.window_controls_style().is_macos();
         let hints: &[(&str, &str)] = match self.palette_step {
@@ -1368,11 +1264,6 @@ mod palette_caret_tests {
 /// Real end-to-end coverage for the palette's one drill-down step (`Restart Language Server…`):
 /// entering it, filtering/leaving it with the same keys the rest of the palette uses, and picking
 /// a row actually restarting that one server and nothing else.
-///
-/// Driven through the real overlay - real `TogglePalette`, real keystrokes into the real
-/// `handle_palette_key_down`, real `run_selected_palette_entry` - against real
-/// `AdeApp::lsp_clients` entries (one of them a genuinely spawned server process), never by
-/// calling the step's own helpers directly.
 #[cfg(test)]
 mod palette_language_server_step_tests {
     use super::*;
@@ -1485,9 +1376,6 @@ mod palette_language_server_step_tests {
         });
     }
 
-    /// The step is filterable and navigable with the same keys as the root list, and `Esc` inside
-    /// it means "back", not "close" - the whole reason this is a step in the existing overlay
-    /// rather than a second widget.
     #[gpui::test]
     fn typing_filters_the_step_and_escape_goes_back_before_it_closes(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1593,8 +1481,6 @@ mod palette_language_server_step_tests {
         });
     }
 
-    /// One running server is not a choice. The command's own secondary line already names it, so
-    /// asking would be ceremony rather than information.
     #[gpui::test]
     fn a_single_running_server_is_restarted_without_a_pointless_second_step(
         cx: &mut TestAppContext,

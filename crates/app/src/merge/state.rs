@@ -376,11 +376,9 @@ mod tests {
     #[test]
     fn hunk_position_in_file_counts_only_conflict_segments() {
         let file = conflicted_file("a.txt", 3);
-        // Segments: Common, Conflict(hunk1@1), Common, Conflict(hunk2@3), Common, Conflict(hunk3@5)
         assert_eq!(hunk_position_in_file(&file, 1), Some(1));
         assert_eq!(hunk_position_in_file(&file, 3), Some(2));
         assert_eq!(hunk_position_in_file(&file, 5), Some(3));
-        // Index 0 is a `Common` segment, not a conflict.
         assert_eq!(hunk_position_in_file(&file, 0), None);
         assert_eq!(hunk_position_in_file(&file, 99), None);
     }

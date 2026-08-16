@@ -1,154 +1,5 @@
 //! Generating the real `--settings` file and forwarder script Jerry hands a spawned `claude`
 //! (GitHub issue #239, phase 2).
-//!
-//! ## `--settings` merges hook arrays, it does not replace them - verified, not assumed
-//!
-//! The dangerous version of this feature is the one where Jerry's generated settings file
-//! silently disables hooks the *user* configured. That would be a real regression: someone's
-//! formatter-on-write or commit-guard hook quietly stopping the moment they open the agent in
-//! Jerry, with no error and no clue why.
-//!
-//! So it was tested against a real `claude` binary (2.1.228) on a real scratch project rather
-//! than inferred from the docs, whose wording on the point is indirect. Three hooks were declared
-//! on the same `SessionStart` event at three different layers - user (`~/.claude/settings.json`,
-//! via a temp `HOME`), project (`.claude/settings.json`), and a Jerry-style `--settings` file
-//! outside the project - each appending a distinct marker to a file. A real session was run.
-//! **All three markers were written**: hook arrays are merged across every settings layer, and a
-//! `--settings` file adds to them rather than overriding them.
-//!
-//! That is why nothing here reads or splices the user's existing settings: doing so would be
-//! *worse* than useless. Claude Code already merges, so a Jerry file that also copied the user's
-//! hooks in would run every one of them twice.
-//!
-//! This is a real behavioural dependency on Claude Code, so it is pinned by a real test
-//! (`crate::hooks::integration_tests`) that runs the actual binary when one is installed.
-//!
-//! ## Why a script rather than an inline one-liner
-//!
-//! The settings file names one small script, written once per launch and shared by every hook
-//! entry and every agent, instead of embedding a shell pipeline in each of nine `command`
-//! strings. The nine entries then differ only by the event name they pass as `$1`, which keeps
-//! the quoting problem to exactly one place.
-//!
-//! ## Why the forwarder is dumb, and why that is the safety property
-//!
-//! It reads stdin, POSTs it verbatim, and exits 0. It parses no JSON - all extraction happens in
-//! Jerry's own Rust ([`crate::hooks::event`]) with a real parser, because a shell script picking
-//! fields out of untrusted JSON with `sed` is exactly how a payload becomes a command.
-//!
-//! Two properties are load-bearing:
-//!
-//! - **It no-ops outside Jerry.** If `JERRY_HOOK_PORT`/`JERRY_HOOK_TOKEN`/`JERRY_AGENT_ID` are
-//!   not all set, it exits 0 immediately, having done nothing. Those variables are injected on
-//!   the spawned process (see `crate::terminal::pane::TerminalSpec::env`), so they exist only
-//!   inside a pane Jerry spawned. If a user ever copies the generated command into their own
-//!   settings, or runs the script by hand, it does nothing at all rather than posting their
-//!   session's payloads at whatever now answers on that port.
-//! - **It always exits 0.** A hook's exit code is not advisory - exit code 2 *blocks the tool
-//!   call*, and any other non-zero code surfaces a "hook error" to the user. If Jerry has since
-//!   quit, or the port is dead, or `curl` isn't installed, the agent must carry on completely
-//!   unaffected. `curl`'s status is therefore discarded rather than propagated: the worst
-//!   outcome of a broken listener is that Jerry falls back to the Phase 1 heuristics, never that
-//!   the user's agent stops working.
-//!
-//! ## Two forwarders: POSIX `sh` and Windows PowerShell
-//!
-//! Both properties above are a *contract*, not a script - so there are two scripts honouring it,
-//! [`UNIX_FORWARDER_SCRIPT`] and [`WINDOWS_FORWARDER_SCRIPT`], and the platform picks one. Native
-//! Windows was originally left out of hook injection entirely (`is_supported()` was `cfg!(unix)`),
-//! which meant every Windows user silently got only the Phase 1 title/OSC and quiescence
-//! heuristics no matter what Claude Code was actually reporting. That was a real, load-bearing
-//! gap, not a cosmetic one, and it is what this half of the module closes.
-//!
-//! ### Which shell runs the `command`, and why that had to be pinned
-//!
-//! Claude Code's own hook documentation (<https://code.claude.com/docs/en/hooks>) is explicit
-//! that a `command` hook with no `args` is *shell form*: the string is handed to `sh -c` on
-//! macOS/Linux, and on Windows to **"Git Bash, or PowerShell if Git Bash isn't installed"**. Two
-//! possible shells with two different quoting languages is not something a generated command
-//! string can be quietly correct under, so Jerry pins it with the documented `shell` field, which
-//! "Accepts `"bash"` or `"powershell"`" and, set to `"powershell"`, "runs the command via
-//! PowerShell on Windows".
-//!
-//! That the field is really honoured - and, more to the point, that adding it does not make a
-//! real `claude` reject the whole settings file - was checked against the actual binary (2.1.228)
-//! rather than taken from the docs: a settings file declaring three `SessionStart` hooks, one
-//! plain shell-form, one with `"shell": "bash"`, and one exec-form with `args`, was run through a
-//! real session, and all three fired.
-//!
-//! Exec form (`args`, no shell at all) was the other candidate and is genuinely tempting - it
-//! removes the quoting problem outright. It was rejected on its *failure* mode. Exec form needs
-//! `command` to name a real executable, so it would have to be `powershell.exe` with the script
-//! path moved into `args`; a Claude Code that did not understand `args` would then fall back to
-//! shell form and run a bare `powershell.exe` with the hook payload on its stdin - i.e. hand
-//! model-authored JSON to a shell as a script to execute. Shell form's failure mode is a hook
-//! that doesn't fire. That asymmetry decided it.
-//!
-//! For the same "be wrong safely" reason the generated string is deliberately written so that it
-//! is *also* a valid Git Bash command line, in case a Claude Code release ever ignores `shell`:
-//! `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '<path>' <Event>`
-//! parses identically in PowerShell's argument mode and in `bash`, because both treat a
-//! single-quoted token as a wholly literal string. See [`powershell_quote`] for the one character
-//! where the two disagree and why that disagreement is safe - and for the four characters
-//! PowerShell *also* treats as a closing single quote, which is why quoting a path is fallible
-//! rather than total.
-//!
-//! ### Why the Windows forwarder is a `.ps1` invoked through a second `powershell.exe`
-//!
-//! A `.ps1` cannot simply be `&`-invoked from the shell Claude Code already started: PowerShell's
-//! execution policy governs running script *files*, and the default on Windows client SKUs is
-//! `Restricted`, so the script would be refused and hooks would silently never fire - precisely
-//! the bug class this change exists to fix. `-ExecutionPolicy Bypass -File` is the documented way
-//! to run one script without changing any machine state, and it costs one extra process launch
-//! per hook. The alternative that avoids that launch - reading the file and running it through
-//! `[ScriptBlock]::Create` - is the textbook execution-policy-evasion pattern that endpoint
-//! protection flags, which is a worse trade for a tool that has to just work on a corporate
-//! laptop.
-//!
-//! A `.cmd`/`.bat` forwarder would start faster than PowerShell, and was considered for that
-//! reason, but batch expands `%JERRY_HOOK_TOKEN%` *textually into a command line*: the class of
-//! bug where a value containing `&` or `"` stops being data and becomes another command. The
-//! PowerShell forwarder puts the same value into a `CreateProcess` command line instead, which no
-//! shell ever sees, so `&` and `|` are inert there by construction rather than by escaping.
-//!
-//! ### How the Windows forwarder gets stdin to curl without PowerShell's text pipeline
-//!
-//! The `sh` forwarder hands its own stdin straight to `curl --data-binary @-`. The PowerShell one
-//! cannot simply pipe, because every *text*-shaped route is actively wrong on Windows:
-//! `[Console]::In` decodes stdin using the console code page (OEM 437 on a default English
-//! install) and piping a string into a native command re-encodes it with `$OutputEncoding`, which
-//! is ASCII in Windows PowerShell 5.1. Either one silently mangles every non-ASCII character in
-//! the payload.
-//!
-//! So it starts curl itself, through `System.Diagnostics.Process` with `RedirectStandardInput`,
-//! and copies `[Console]::OpenStandardInput()` into `StandardInput.BaseStream` - the raw pipe
-//! *underneath* the `StreamWriter`, so no encoder is involved at any point - with curl reading it
-//! back as `--data-binary @-`. `Stream.CopyTo` between two byte streams cannot mangle anything.
-//!
-//! **This used to spool the payload to a file, and that was a real at-rest exposure.** The
-//! original wrote stdin to `payload-<guid>.json` in the launch directory, passed
-//! `--data-binary @<file>`, and deleted it in a `finally`. A `finally` does not run when the
-//! process is *killed* - a hook that exceeds Claude Code's timeout, a pane closed mid-tool-call,
-//! Jerry quit while a hook is in flight - and all three are routine rather than exotic. What was
-//! left on disk is not innocuous: a `PreToolUse` payload carries the tool's real input, which for
-//! `Write`/`Edit` is file contents and for `Bash` is the whole command line, secrets and all
-//! (`export AWS_SECRET_ACCESS_KEY=...` is exactly the shape of thing an agent runs). It then sat
-//! there for the rest of a running Jerry's session, since [`sweep_stale_directories`] only
-//! collects directories whose pid is *dead*, and indefinitely after a hard-killed one that is
-//! never relaunched. Streaming removes the exposure rather than trying harder to guarantee the
-//! cleanup: there is no file to leak, on any path, including the ones that skip cleanup entirely.
-//!
-//! The one thing the file bought that a pipe does not is that curl could be started with a real
-//! argument *vector* (`& $curl @args`) instead of a command line. `ProcessStartInfo.ArgumentList`
-//! would give that back, but it does not exist on .NET Framework, which is what Windows PowerShell
-//! 5.1 runs on - so the forwarder builds the command line itself, in `ConvertTo-JerryArgument`,
-//! to the `CommandLineToArgvW` rules. That is a materially smaller hazard than the shell quoting
-//! this module worries about elsewhere: a `CreateProcess` command line is parsed by the callee's
-//! C runtime and by nothing else, so `&`, `|`, `;` and `$` have no meaning in it at all and the
-//! worst a hostile value could do is become another *curl option*. It was checked by round-tripping
-//! adversarial values (embedded quotes, trailing backslash runs, an `x" --output ... "` option
-//! injection, the empty string) through the real `CommandLineToArgvW`, and end-to-end against real
-//! curl with a hostile `JERRY_HOOK_TOKEN`, which arrived intact inside its header and wrote no file.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -196,8 +47,6 @@ pub const FORWARDER_NAME: &str = WINDOWS_FORWARDER_NAME;
 const SETTINGS_NAME: &str = "jerry-hook-settings.json";
 
 /// The POSIX `sh` forwarder - see the module docs for why it is shaped exactly like this.
-///
-/// `$1` is the event name, supplied per hook entry by the generated settings file.
 pub const UNIX_FORWARDER_SCRIPT: &str = r#"#!/bin/sh
 # Written by Jerry (github.com/ColinEspinas/jerry) to forward Claude Code hook payloads to the
 # Jerry instance that spawned this agent. Safe to run anywhere: without the JERRY_* environment
@@ -223,13 +72,6 @@ exit 0
 /// The Windows PowerShell forwarder - the exact same contract as [`UNIX_FORWARDER_SCRIPT`] (no-op
 /// without the `JERRY_*` environment, POST stdin verbatim, parse nothing, always exit 0), written
 /// in the one language the module docs explain Jerry pins Claude Code's hook shell to.
-///
-/// The event name arrives as the single positional argument `powershell.exe -File <this> <Event>`
-/// passes through, which is the `$1` of the `sh` script.
-///
-/// `$JerryHookEvent`, not `$Event`: `$Event` is a PowerShell *automatic* variable (the eventing
-/// subsystem's), and a `param()` that shadows an automatic variable is a real footgun rather than
-/// a style point.
 pub const WINDOWS_FORWARDER_SCRIPT: &str = r#"# Written by Jerry (github.com/ColinEspinas/jerry) to forward Claude Code hook payloads to the
 # Jerry instance that spawned this agent. Safe to run anywhere: without the JERRY_* environment
 # variables Jerry injects on the panes it spawns, this exits immediately having done nothing.
@@ -354,19 +196,6 @@ impl HookFiles {
     }
 
     /// Writes this launch's forwarder script and settings file into a fresh private directory.
-    ///
-    /// `parent` is the directory to create the launch directory inside - the OS temp directory in
-    /// production. Deliberately *not* `~/.claude/settings.json` or any path Claude Code reads on
-    /// its own: this file must only ever affect sessions Jerry itself spawned with an explicit
-    /// `--settings`, so a `claude` the user starts from their own terminal is completely
-    /// untouched by Jerry having been installed.
-    ///
-    /// A failure part-way through takes the launch directory back down with it. That matters more
-    /// than it used to: [`settings_json`] became genuinely fallible when [`powershell_quote`]
-    /// started refusing paths it cannot safely quote, so "created the directory, then failed" is a
-    /// reachable state rather than a theoretical one - and nothing would ever clean it up, since
-    /// the directory is only owned (and so only dropped) by a `HookFiles` that was never returned,
-    /// and [`sweep_stale_directories`] deliberately leaves a *live* pid's directories alone.
     pub fn write_in(parent: &Path) -> io::Result<HookFiles> {
         // Tidy away anything a previously crashed Jerry left here. Best-effort and never fatal.
         sweep_stale_directories(parent);
@@ -406,14 +235,6 @@ impl Drop for HookFiles {
     /// leftover directory in the OS temp directory is harmless - it holds no secret, since the
     /// token lives only in this process's memory and its children's environments, never in these
     /// files), and `Drop` cannot report one anyway.
-    ///
-    /// Best-effort is load-bearing rather than merely tolerant on Windows, where an open file
-    /// blocks the removal of its directory: a hook that is in flight at the moment Jerry quits
-    /// still has the forwarder script itself open, and this then fails. That is the intended
-    /// outcome, not a leak - the directory is left for [`sweep_stale_directories`] to collect on
-    /// the next launch, by which point this instance's pid is genuinely dead. (The payload no
-    /// longer contributes to that: since the forwarder streams stdin into curl, nothing but the
-    /// two generated files is ever in the directory - see the module docs.)
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
@@ -421,29 +242,6 @@ impl Drop for HookFiles {
 
 /// Creates this instance's launch directory: unpredictably named, owner-only from the instant it
 /// exists, and refusing to reuse anything already at that path.
-///
-/// All three properties are load-bearing, and an earlier version of this had none of them. It
-/// built a fully predictable name (`jerry-hooks-<pid>-<counter>`) under the world-writable OS temp
-/// directory, called `create_dir_all`, and only *then* chmod'ed to `0o700`. That is two real bugs:
-///
-/// - **A permissions window.** `mkdir` applies `0o777 & !umask`, so under a permissive umask
-///   (`002`, `000` - both real in the wild) the directory was group- or world-writable for the
-///   window between creation and the chmod.
-/// - **A symlink attack, which is the serious one.** `create_dir_all` on a path that is already a
-///   symlink to a directory returns `Ok`, and `set_permissions` follows symlinks. So a local
-///   attacker who pre-created `<temp>/jerry-hooks-<pid>-0` as a symlink - trivial, since every
-///   component of the name was predictable - got the forwarder script written into, and `0o700`
-///   applied to, a directory of their choosing. Verified empirically before fixing.
-///
-/// The fix is to make creation itself atomic and exclusive rather than to repair the state after:
-/// [`std::fs::DirBuilder`] with an explicit `mode` applies the permissions in the `mkdir` syscall
-/// (umask can only *remove* bits, so the result is never more permissive than `0o700`), and
-/// `create` - unlike `recursive(true)` - fails with `AlreadyExists` if anything is already at the
-/// path, symlink included. A random suffix then removes the predictability that made pre-creation
-/// worth attempting at all, and the retry loop covers the (vanishing) chance of a collision.
-///
-/// The pid stays in the name so [`sweep_stale_directories`] can still tell a dead instance's
-/// leftovers from a live instance's working directory.
 fn create_private_dir(parent: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(parent)?;
     let mut last_error = None;
@@ -471,32 +269,6 @@ fn new_dir_owner_only(path: &Path) -> io::Result<()> {
 /// `CreateDirectoryW(path)`, failing if anything already exists at `path` - the Windows half of
 /// [`create_private_dir`]'s three properties, and a real code path now that [`is_supported`] is
 /// true here.
-///
-/// **Exclusivity carries over exactly.** `DirBuilder::create` is non-recursive, so it is a single
-/// `CreateDirectoryW`, which fails with `ERROR_ALREADY_EXISTS` if *anything* is at the path -
-/// including a directory symlink or any other reparse point. That is the same guarantee the Unix
-/// path's `create`-not-`recursive(true)` gives, and it is what stops a pre-planted path from being
-/// adopted. The unpredictable random suffix carries over unchanged too.
-///
-/// **The `0o700` has no Windows spelling, and does not need one here.** There is no mode argument
-/// to `CreateDirectoryW`; access is decided by the DACL, which - with a null
-/// `SECURITY_ATTRIBUTES`, as `std` passes - is inherited from the parent directory. In production
-/// the parent is `std::env::temp_dir()`, i.e. `GetTempPath2W`, i.e. `%TMP%`/`%TEMP%`, which by
-/// default is the *per-user* `%LOCALAPPDATA%\Temp`. That directory's default ACL grants full
-/// control to the owning user, `SYSTEM` and `Administrators`, and nothing to other interactive
-/// users, so the inherited result is the practical equivalent of `0o700`: another logged-in
-/// non-administrator cannot read or write inside it. Windows has no world-writable `/tmp`
-/// equivalent in the default configuration, which is the specific hazard `0o700` exists to answer.
-///
-/// **The residual gap, stated rather than papered over.** If `%TEMP%` has been redirected to a
-/// permissively-ACL'd shared location, the inherited DACL is whatever that location grants, and a
-/// local attacker who won the race against the 64-bit random suffix could overwrite the forwarder
-/// script and get it run by Claude Code as this user. Writing an explicit DACL would need
-/// `CreateDirectoryW` with a hand-built `SECURITY_ATTRIBUTES` through raw FFI, which is a
-/// materially larger `unsafe` surface than this module carries anywhere else; it is a named,
-/// real follow-up rather than something quietly assumed away. Note the files themselves still
-/// hold no secret in that scenario - the token is only ever in this process's memory and in its
-/// children's environments (see [`HookFiles::drop`]).
 #[cfg(windows)]
 fn new_dir_owner_only(path: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new().create(path)
@@ -504,25 +276,6 @@ fn new_dir_owner_only(path: &Path) -> io::Result<()> {
 
 /// Writes `contents` to a newly created file with `mode`, refusing to follow or overwrite
 /// anything already at `path`.
-///
-/// `create_new` is `O_EXCL | O_CREAT`, which fails on an existing file *and* on a symlink rather
-/// than writing through it, and the mode is applied by `open` itself rather than by a later
-/// chmod - the same "atomic, not repaired afterwards" reasoning as [`create_private_dir`]. The
-/// containing directory is already `0o700` and unpredictably named by the time this runs, so this
-/// is defence in depth rather than the primary barrier.
-///
-/// `mode` is a no-op on Windows, and deliberately so rather than for want of an equivalent:
-///
-/// - The *access* half is answered by the containing directory, exactly as
-///   [`new_dir_owner_only`]'s Windows twin documents - `create_new` maps to `CREATE_NEW`, so the
-///   exclusivity that stops a pre-planted path being written through carries over unchanged, and
-///   a null `SECURITY_ATTRIBUTES` means the new file inherits the launch directory's DACL.
-/// - The *execute* half simply does not exist. The whole reason the Unix path re-`fchmod`s after
-///   `open` is that a umask could strip `0o700` down to `0o600`, leave the script non-executable,
-///   and make Claude Code's invocation exit 126 with hooks silently never firing. Windows has no
-///   execute bit, and the Windows forwarder is never exec'd anyway: it is passed as an *argument*
-///   to `powershell.exe -File`, which only needs to be able to read it. There is nothing here
-///   that a mode could get wrong.
 fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -559,21 +312,6 @@ fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
 }
 
 /// Removes launch directories left behind by Jerry instances that are no longer running.
-///
-/// [`HookFiles::drop`] handles the normal case, but `Drop` does not run for a `SIGKILL`, a hard
-/// crash, or an `abort` - so without this, every abnormal exit leaves a small directory in the OS
-/// temp directory forever. Called once per [`HookFiles::write_in`], which is the only moment
-/// Jerry is guaranteed to be looking at this directory anyway.
-///
-/// Liveness is decided by the pid embedded in the name, *not* by age. An age-based sweep - the
-/// convention this codebase uses for its `*.tmp` siblings - would be wrong here: a Jerry left open
-/// for a week is entirely normal, and deleting its forwarder script out from under its running
-/// agents would silently kill their hooks, which is precisely the bug the per-instance directory
-/// naming exists to prevent.
-///
-/// Everything is best-effort. A directory whose name doesn't parse, or that belongs to a live
-/// process, or that refuses to delete (another user's, on a shared temp directory) is simply left
-/// alone - this is tidying, and it must never be able to fail a launch.
 fn sweep_stale_directories(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -605,11 +343,6 @@ fn sweep_stale_directories(parent: &Path) {
 }
 
 /// Whether a process with this id currently exists.
-///
-/// `kill(pid, 0)` is the portable POSIX existence check - it sends no signal and only reports
-/// whether the process exists and could be signalled. `EPERM` counts as alive: the process is
-/// real, it simply belongs to another user, which is a case that genuinely occurs on a shared
-/// `/tmp` and must not be read as "dead, delete its files".
 #[cfg(unix)]
 // SAFETY of the FFI call below is justified at its own call site.
 #[allow(unsafe_code)]
@@ -625,52 +358,6 @@ fn process_is_alive(pid: u32) -> bool {
 
 /// Whether a process with this id currently exists - the Windows twin of the `kill(pid, 0)` check
 /// above.
-///
-/// This used to be a hardcoded `true`, which was honest while hook injection was disabled on
-/// Windows (nothing was ever written, so there was nothing to sweep) and is not any more: it would
-/// now mean every `SIGKILL`-equivalent of a Jerry - Task Manager's "End task", a crash, a power
-/// loss - leaks its launch directory into `%TEMP%` forever.
-///
-/// Two Win32 calls rather than one, because the obvious single-call version is wrong:
-///
-/// - `OpenProcess` failing with `ERROR_INVALID_PARAMETER` is the real "no such process" answer.
-///   `ERROR_ACCESS_DENIED` means the opposite - the process exists, it just belongs to another
-///   user or is more privileged - and is reported as alive, the same call the Unix path makes for
-///   `EPERM`, and for the same reason: "not mine" must never be read as "dead, delete its files".
-///   Any other failure is also treated as alive, because this is tidying and a wrong "dead" is the
-///   only answer here that destroys anything.
-/// - A successful `OpenProcess` is *not* on its own proof of life. A process that has exited but
-///   still has an open handle somewhere remains openable by pid, so liveness is decided by
-///   `WaitForSingleObject(handle, 0)`: the handle is signalled once the process terminates, so
-///   `WAIT_OBJECT_0` means exited and anything else means "not confirmed exited".
-///   `GetExitCodeProcess` was the alternative and is subtly broken - it reports `STILL_ACTIVE`
-///   (259) for a live process and for a dead one that genuinely exited with code 259.
-///
-/// **The wait has three outcomes, not two, and the third had this backwards.** This used to read
-/// `state == WAIT_TIMEOUT`, i.e. "alive exactly when the wait timed out". But `WaitForSingleObject`
-/// can also return `WAIT_FAILED` (`0xFFFFFFFF`) - a handle that lost its `SYNCHRONIZE` right, an
-/// out-of-memory kernel, anything Win32 chooses to fail with - and under that test a *failure to
-/// tell* read as "dead", which is the one answer that destroys something: `sweep_stale_directories`
-/// would delete a running Jerry's launch directory, taking the forwarder script and settings file
-/// out from under every agent that instance had spawned, and silently killing their hooks for the
-/// rest of the session. The invariant the `OpenProcess` branch already honours - every failure
-/// reads as alive - now holds here too, by testing for the single value that is real proof of
-/// death.
-///
-/// The access mask is `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`, and both halves are
-/// needed. `SYNCHRONIZE` is the right `WaitForSingleObject` actually requires - without it the
-/// wait fails rather than reporting liveness, which would make every process look dead and every
-/// directory sweepable. `PROCESS_QUERY_LIMITED_INFORMATION` is the *weakest* query right, chosen
-/// over `PROCESS_QUERY_INFORMATION` because it is grantable across integrity levels, so an
-/// unelevated Jerry can still tell that an elevated (or another user's) process is alive rather
-/// than falling into the error path. `windows-sys` exposes `SYNCHRONIZE` only under
-/// `Win32::Storage::FileSystem` - it is one of the standard access rights shared by every kind of
-/// securable object, and that module is simply where the generated bindings happen to put it; both
-/// constants are plain `u32`, so the mask composes as written.
-///
-/// Windows recycles pids aggressively, so a swept-too-early directory is the failure worth
-/// designing against, and recycling can only push this the safe way: a reused pid belongs to a
-/// live process, which reads as alive and simply leaves the directory for a later sweep.
 #[cfg(windows)]
 // SAFETY of each FFI call below is justified at its own call site.
 #[allow(unsafe_code)]
@@ -713,45 +400,17 @@ fn random_suffix() -> String {
 }
 
 /// Whether Jerry can install hooks on this platform at all.
-///
-/// Unix *and* Windows. Both have a real forwarder ([`UNIX_FORWARDER_SCRIPT`],
-/// [`WINDOWS_FORWARDER_SCRIPT`]) and a real, deliberately-pinned shell for Claude Code to run the
-/// generated `command` through - see the module docs for the whole Windows design and for what in
-/// it was verified against a real `claude` versus reasoned through.
-///
-/// This is not `true`. Anything that is neither Unix nor Windows - a `wasm32` target, say - has no
-/// forwarder written for it, and gets the honest answer: hook injection is skipped and every agent
-/// falls back to the Phase 1 title/OSC and quiescence signals, which work identically everywhere.
-/// The graceful fallback in [`crate::hooks::HookRuntime::start`] still covers the real per-machine
-/// failures (an unwritable temp directory, a loopback port that will not bind) on every supported
-/// platform alike.
 pub const fn is_supported() -> bool {
     cfg!(unix) || cfg!(windows)
 }
 
 /// Builds the real `--settings` JSON declaring every [`FORWARDED_EVENTS`] entry against
 /// `forwarder`.
-///
-/// Built with `serde_json` rather than string formatting so the script's path is escaped
-/// correctly no matter what it contains. The path is additionally quoted *within* the shell
-/// command string, because Claude Code runs a `command` hook through a shell - an unquoted path
-/// containing a space would otherwise be split into a wrong program plus stray arguments. Which
-/// shell, and therefore which quoting language, is [`unix_hook_entry`] versus
-/// [`windows_hook_entry`].
-///
-/// Fallible for a second reason as of the quoting fix: [`powershell_quote`] refuses a path it
-/// cannot safely quote, and that refusal has to reach [`crate::hooks::HookRuntime::start`] so hook
-/// injection is skipped altogether rather than a broken settings file being written.
 fn settings_json(forwarder: &Path) -> io::Result<String> {
     settings_json_with(forwarder, hook_entry)
 }
 
 /// [`settings_json`] with the per-platform entry builder handed in explicitly.
-///
-/// The seam exists for the tests, and for the same reason [`windows_hook_entry`] is compiled
-/// everywhere: the refusal path that [`powershell_quote`] introduces is a *Windows* one, so
-/// without this the only suite that could prove it propagates all the way to a `Result` at
-/// [`HookFiles::write_in`]'s boundary would be a Windows suite nobody routinely runs.
 fn settings_json_with(
     forwarder: &Path,
     entry: fn(&str, &str) -> io::Result<serde_json::Value>,
@@ -783,11 +442,6 @@ fn hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json::Value> {
 
 /// One `"type": "command"` entry running the POSIX forwarder, for the `sh -c` Claude Code uses on
 /// macOS and Linux.
-///
-/// Compiled on every platform even though it is only *called* on Unix, so the Windows suite runs
-/// it too rather than only type-checking it - the same call
-/// `crate::settings::state::windows_shell_suggestions` already makes in the other direction, and
-/// the only way a machine that can run one of these can test the other's string generation at all.
 pub fn unix_hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "command",
@@ -798,13 +452,6 @@ pub fn unix_hook_entry(forwarder: &str, event: &str) -> serde_json::Value {
 /// One `"type": "command"` entry running the PowerShell forwarder on Windows - see the module docs
 /// for why the shell is pinned, why the invocation goes through a second `powershell.exe`, and why
 /// the resulting string is deliberately also valid `bash`.
-///
-/// Compiled on every platform for the same reason as [`unix_hook_entry`].
-///
-/// `Err` when [`powershell_quote`] refuses the path - see there for the one class of character
-/// that provokes it and why refusing beats escaping. Fallible rather than lossy on purpose: the
-/// caller's only correct response is to skip hook injection entirely, which is what
-/// [`crate::hooks::HookRuntime::start`] does with it.
 pub fn windows_hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json::Value> {
     let quoted = powershell_quote(forwarder)?;
     Ok(serde_json::json!({
@@ -828,95 +475,11 @@ fn shell_quote(value: &str) -> String {
 
 /// The characters PowerShell's tokenizer will end a single-quoted literal on, *other* than the
 /// ASCII apostrophe that opens it.
-///
-/// PowerShell does not have one single-quote character, it has five. Its tokenizer's
-/// `CharTraits.IsSingleQuote` answers true for `'` (U+0027) and for four typographic quotes -
-/// U+2018 `‘`, U+2019 `’`, U+201A `‚`, U+201B `‛` - and `ScanStringLiteral` ends the literal on
-/// *any* of them, symmetrically: a literal opened with an ASCII `'` is closed just as happily by a
-/// `’`. That is the whole vulnerability this list exists to close. It is not folklore: it was
-/// established here by parsing `'X<c>` with the real `System.Management.Automation.Language.Parser`
-/// on Windows PowerShell 5.1 for **every code point in the BMP** and collecting the ones that made
-/// it a complete (rather than unterminated) literal. Exactly these four plus U+0027 came back, and
-/// nothing else did, so the list is exhaustive by construction rather than by reading; a surrogate
-/// half cannot be a member, so no astral code point can be one either.
 const POWERSHELL_QUOTE_DELIMITERS: [char; 4] = ['\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'];
 
 /// Wraps `value` in PowerShell single quotes, escaping any ASCII single quote inside it by doubling
 /// it - and **refusing outright** any `value` containing one of the four typographic quotes
 /// PowerShell also treats as a quote delimiter ([`POWERSHELL_QUOTE_DELIMITERS`]).
-///
-/// PowerShell's single-quoted string is otherwise the exact analogue of `sh`'s: nothing inside it
-/// is expanded, so `$env:PATH`, a backtick, `$(...)`, `;`, `&`, `|` and a Windows path's
-/// backslashes are all literal, and `''` is the language's own way of writing one literal quote.
-///
-/// This is used in PowerShell's *argument* mode, not expression mode: the generated command starts
-/// with the bare word `powershell.exe`, which puts the parser in command mode for the rest of the
-/// line, where a token beginning with `'` is parsed as a literal string argument.
-///
-/// ## Why this refuses rather than escapes, which is the whole point
-///
-/// The version of this function that shipped in the first draft of the Windows work doubled the
-/// ASCII quote and nothing else, on the stated belief that "there is no escape sequence *inside* a
-/// single-quoted string that can end it early". That belief is false, and a security review proved
-/// it by execution: `C:\Temp\x’; Start-Process calc.exe; ‘` quoted by that function parses as
-/// **three statements**, the middle one live PowerShell, run as the user on every single tool call
-/// the agent makes. A temp path is not usually attacker-controlled, but `%TMP%` is a plain
-/// environment variable, and "hostile input can never reach the command line" was the property the
-/// whole design rested on.
-///
-/// Doubling the typographic quotes as well - the obvious repair - is deliberately *not* what this
-/// does, for two reasons, both checked against the real 5.1 tokenizer rather than assumed:
-///
-/// - **The escape is asymmetric and undocumented.** `ScanStringLiteral` ends the literal on any of
-///   the five, then keeps the *second* character of the doubled pair: `’’` yields `’`, but `’'`
-///   yields an ASCII `'`. So the pairing is not a self-inverse escape at all, it is a lookahead
-///   whose result depends on which of five characters follows which. PowerShell's grammar documents
-///   only "use a second consecutive single quotation mark", says nothing about the typographic
-///   four, and gives no compatibility promise about how a mixed pair collapses. Pinning a security
-///   property to that is betting on an implementation detail that differs between hosts - and the
-///   failure mode when it differs is not a quoting error but a *silently different path*, i.e.
-///   hooks that never fire, with nothing anywhere reporting why.
-/// - **It would not survive the `bash` insurance property.** The module docs explain that the
-///   generated string is deliberately also a valid Git Bash command line. `bash` has exactly one
-///   quote character, so a doubled `’’` there is two literal characters, naming a path that does
-///   not exist.
-///
-/// Refusing is the answer this module already has for "hook support cannot be brought up on this
-/// machine". The error propagates through [`settings_json`] and [`HookFiles::write_in`] to
-/// [`crate::hooks::HookRuntime::start`], which logs it and returns `None`, and every agent then
-/// falls back to the Phase 1 title/OSC and quiescence signals - the identical, already-exercised
-/// path an unbindable loopback port or an unwritable temp directory takes. That is strictly better
-/// than the alternative on offer: the pre-refusal code did not merely risk injection, it *broke*
-/// for an ordinary user. `C:\Users\O’Brien\...` is a perfectly legal Windows profile path - the
-/// typographic apostrophe is not a reserved filename character, and word processors, browsers and
-/// chat clients autocorrect a straight quote into one - and it makes the generated command a parse
-/// error, which means a real PowerShell error on stderr on every hook firing, violating this
-/// module's own "a hook must never surface an error to the user" contract.
-///
-/// **How reachable is this in production?** Rare, but real, and it is the *user's* machine that
-/// decides. The path quoted here is `std::env::temp_dir()`, which on Windows is `GetTempPath2W` -
-/// `%TMP%`, then `%TEMP%`, then `%USERPROFILE%`, then `C:\Windows`. The default is
-/// `C:\Users\<account>\AppData\Local\Temp`, and `<account>` is the profile directory name, which
-/// Windows derives from the account name and which may contain a typographic apostrophe. `%TMP%`
-/// itself is an ordinary user-settable environment variable pointing anywhere. So the honest answer
-/// is "almost never, and not never".
-///
-/// **The remaining divergence from `bash`, and why it is safe.** The ASCII escape still differs:
-/// `bash` writes a literal quote as `'\''` and PowerShell as `''`. A path containing an ordinary
-/// apostrophe therefore round-trips correctly under PowerShell and, under a `bash` fallback,
-/// collapses to a path with the apostrophe removed - a file that does not exist, so the hook does
-/// not fire and the rail falls back to the Phase 1 signals. It is *not* a quoting escape: `bash`
-/// also treats the doubled quote as string concatenation, never as an end to quoting followed by
-/// live text. Wrong, visibly, in the safe direction, only on a Claude Code old enough to ignore a
-/// documented field, only for a user whose temp path contains an apostrophe.
-///
-/// **What was checked and found genuinely inert, so as not to over-reject.** The neighbouring
-/// character classes PowerShell's tokenizer also special-cases - the three typographic double
-/// quotes (U+201C/D/E), the en dash, em dash and horizontal bar it accepts in place of a parameter
-/// `-`, and the non-breaking space and NEL it accepts as whitespace - cannot appear in
-/// `IsSingleQuote`, so `ScanStringLiteral` copies them through verbatim; the BMP-wide parser sweep
-/// above confirms none of them terminates a literal. Neither do `"`, backtick, `$`, `&`, `;`, `|`
-/// or a control character, which the tests above already pin.
 pub fn powershell_quote(value: &str) -> io::Result<String> {
     if let Some(delimiter) = value
         .chars()
@@ -1169,12 +732,10 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("temp dir");
 
-        // pid 1 always exists; a "dead" pid that no longer does.
         let live = temp.path().join(format!("{DIRECTORY_PREFIX}1-deadbeef"));
         let dead = temp
             .path()
             .join(format!("{DIRECTORY_PREFIX}4294967294-cafebabe"));
-        // Something that simply isn't ours.
         let unrelated = temp.path().join("someone-elses-directory");
         for path in [&live, &dead, &unrelated] {
             std::fs::create_dir_all(path).expect("create");
@@ -1236,7 +797,6 @@ mod tests {
             !forwarder.contains(&token),
             "the forwarder script must never contain the auth token - it reads it from the environment"
         );
-        // It must genuinely read the token from the environment instead.
         assert!(
             forwarder.contains(TOKEN_ENV),
             "the forwarder must take the token from ${TOKEN_ENV}"
@@ -1333,7 +893,6 @@ mod tests {
         let files = HookFiles::write_in(temp.path()).expect("must write");
         let forwarder = files.settings_path().with_file_name(FORWARDER_NAME);
 
-        // Bind and immediately drop, so the port is real but certainly closed.
         let dead_port = {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
             listener.local_addr().expect("addr").port()
@@ -1403,7 +962,6 @@ mod tests {
         }
 
         if cfg!(unix) {
-            // Run the generated command string through a real shell to prove it resolves.
             let output = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(command)
@@ -1494,7 +1052,6 @@ mod tests {
                     .contains(&format!("U+{:04X}", delimiter as u32)),
                 "the refusal must name the character, or nobody can diagnose it: {error}"
             );
-            // And the refusal must reach the caller as a refusal, not as a half-built entry.
             assert!(
                 windows_hook_entry(&path, "Stop").is_err(),
                 "the hook entry must not be built at all for {delimiter:?}"
@@ -1839,7 +1396,6 @@ mod tests {
              pipe under the StreamWriter, so no encoder ever sees it (see the module docs for why \
              every text-shaped route on Windows mangles a non-ASCII payload)"
         );
-        // `$Event` is a PowerShell automatic variable; shadowing it in `param()` is a real footgun.
         assert!(
             !script.contains("param([string] $Event"),
             "the event parameter must not shadow PowerShell's `$Event` automatic variable"
@@ -1872,7 +1428,6 @@ mod tests {
                 script.contains(TOKEN_ENV),
                 "the token must be read from ${TOKEN_ENV} at run time"
             );
-            // The only place a literal token could plausibly be spliced is a `Bearer` header.
             let bearer = script
                 .split("Bearer ")
                 .nth(1)
@@ -1916,12 +1471,6 @@ mod tests {
 
     /// The tests that genuinely need a Windows kernel: a real `powershell.exe` to run the real
     /// generated script, and real Win32 process handles.
-    ///
-    /// These cannot run on the Linux machines this suite is usually run on - there is no
-    /// PowerShell and no `OpenProcess` - so they are `#[cfg(windows)]` rather than skipped at run
-    /// time, and they are written to be run for real in Windows CI or on a developer's Windows
-    /// machine. Everything above this module is the part that *can* be checked anywhere, and it
-    /// deliberately covers all of the string generation.
     #[cfg(windows)]
     mod windows_only {
         use super::*;
@@ -2045,7 +1594,6 @@ mod tests {
                 .expect("parent")
                 .to_path_buf();
 
-            // Bound but never accepted, so the POST hangs until curl's own --max-time 5 expires.
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
             let port = listener.local_addr().expect("addr").port();
 
@@ -2064,7 +1612,6 @@ mod tests {
                     .ok();
             }
 
-            // While it is running, and again once it has finished: neither moment may show a file.
             let mut seen: Vec<String> = Vec::new();
             for _ in 0..20 {
                 seen.extend(
@@ -2179,7 +1726,6 @@ mod tests {
 
         #[test]
         fn a_dead_instance_s_directory_is_swept_but_a_live_one_s_is_left_alone() {
-            // The Windows twin of the `sweep_stale_directories` test above, keyed on a real pid.
             let temp = tempfile::tempdir().expect("temp dir");
             let live = temp
                 .path()

@@ -18,15 +18,6 @@ use std::collections::HashSet;
 impl AdeApp {
     /// GitHub issue #202: the visual-row <-> buffer-line translation this file needs *right now*,
     /// given whichever of its blocks the user has collapsed (`AdeApp::file_view_folds`).
-    ///
-    /// [`fold::FoldMap::unfolded`] - the identity, and the fast path every method on it
-    /// short-circuits on - whenever nothing is folded here, or whenever there is no live edit
-    /// buffer at all. That second case is deliberate rather than a gap: the read-only fallback
-    /// view (a truncated or non-UTF-8 file, which `EditBuffer` refuses to open at all) carries no
-    /// fold affordances, so it can never have a non-empty fold set to honour.
-    ///
-    /// `&mut self` because the fold ranges themselves are memoized on the buffer - see
-    /// [`edit_buffer::EditBuffer::fold_ranges`] for why they must not be recomputed per frame.
     pub(in crate::code_surface) fn file_view_fold_map(
         &mut self,
         absolute_path: &Path,
@@ -47,12 +38,6 @@ impl AdeApp {
     /// Collapses the region starting at 0-based `start_line`, or expands it if it is already
     /// collapsed - the whole behavior behind one click on a gutter chevron
     /// (`crate::code_surface::editing::render_fold_chevron`).
-    ///
-    /// Collapsing can swallow the row the caret is sitting on, which is not merely cosmetic: only
-    /// the caret's *own* row registers the real `window.handle_input` wiring
-    /// (`render_editable_file_view_line`'s paint callback), so a caret on a row that no longer
-    /// paints would leave typing silently doing nothing. [`Self::lift_caret_out_of_folds`] is what
-    /// makes that unreachable.
     pub(in crate::code_surface) fn toggle_code_fold(
         &mut self,
         absolute_path: &Path,
@@ -105,16 +90,6 @@ impl AdeApp {
 
     /// Scrolls the File view so 0-based buffer line `line` is in view, first *expanding* any
     /// collapsed region currently hiding it.
-    ///
-    /// Every caller used to hand `line` straight to `UniformListScrollHandle::scroll_to_item`,
-    /// which indexes *visual rows*; with a fold active those two numbers differ and the list
-    /// would scroll somewhere unrelated. Routing all of them through here is what keeps go-to-
-    /// definition, caret-follow and file-open landing on the right row.
-    ///
-    /// Expanding rather than merely scrolling to the collapsed row is deliberate: every caller is
-    /// putting the caret on `line`, and a caret on a row that does not paint has no
-    /// `window.handle_input` registration, so typing would silently stop working. See this
-    /// module's own fold tests for the coverage that pins this down.
     pub(crate) fn scroll_file_view_to_line(
         &mut self,
         absolute_path: &Path,
@@ -163,23 +138,6 @@ impl AdeApp {
     /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
     /// (`crate::code_surface::code_view`), and a status bar for whichever file `relative_path` (resolved
     /// against [`Self::file_tree_root`]) names on disk.
-    ///
-    /// ## Caching, and staying off the foreground thread
-    ///
-    /// [`code_view::load_file`] runs a `tree-sitter` parse and is only dispatched (via
-    /// [`Self::spawn_file_load`]) when [`Self::file_view_cache`] is missing or
-    /// [`code_view::cache_is_fresh`] says it's stale - never unconditionally on every render, and
-    /// never run inline on the foreground thread (see [`FileLoadState`]'s docs for the measured
-    /// cost this avoids). Covered by this module's `code_view_cache_tests` below.
-    ///
-    /// ## Virtualization
-    ///
-    /// Every line of `parsed.lines` is reachable - no cap like
-    /// [`MAX_RENDERED_DIFF_LINES_PER_FILE`] applies here. `gpui::uniform_list` (see
-    /// vendor/zed/crates/gpui/examples/uniform_list.rs and
-    /// vendor/zed/crates/git_ui/src/git_panel.rs's `commit_history_list`) only constructs
-    /// [`render_file_view_line`] elements for rows scrolled into view, so a large file stays
-    /// scrollable end to end.
     pub(in crate::code_surface) fn render_file_view(
         &mut self,
         relative_path: &Path,
@@ -943,12 +901,6 @@ impl AdeApp {
 /// diagnostics (`crate::code_surface::lsp_ui`), `changed_lines` backs the git-gutter stripe
 /// (`render_file_view_line`), `cursor_line` is the real blinking caret's own line - not a second,
 /// parallel data source invented for the scrollbar.
-///
-/// Only [`Severity::Error`]/[`Severity::Warning`] get a diagnostic mark (matching most real
-/// editors' own overview-ruler convention of not drawing a mark per hint/information diagnostic,
-/// which on a large file can vastly outnumber the lines actually worth flagging at a glance).
-/// `line_count == 0` returns no marks at all (nothing to divide a fraction by) rather than
-/// panicking or producing `NaN` fractions.
 pub(in crate::code_surface) fn editor_scrollbar_marks(
     diagnostics: &HashMap<usize, Vec<diagnostics_view::LineDiagnostic>>,
     changed_lines: &HashSet<usize>,
@@ -1052,7 +1004,6 @@ mod editor_scrollbar_mark_tests {
             &fold::FoldMap::unfolded(100),
         );
         assert_eq!(marks.len(), 1);
-        // Line 51 of 100, 1-based -> fraction 0.50.
         assert!((marks[0].fraction - 0.50).abs() < 0.001);
     }
 
@@ -1079,7 +1030,6 @@ mod editor_scrollbar_mark_tests {
             &fold::FoldMap::unfolded(100),
         );
         assert_eq!(marks.len(), 1);
-        // Line 100 of 100, 1-based -> fraction 0.99.
         assert!((marks[0].fraction - 0.99).abs() < 0.001);
     }
 
@@ -1112,16 +1062,6 @@ pub(in crate::code_surface) struct Crumb {
 /// The File view breadcrumb's real crumb list: `relative_path`'s own directory/file segments
 /// (`code_view::breadcrumb_segments`) followed by `symbol_path`, the chain of declarations
 /// enclosing wherever the caret currently is (`crate::code_surface::symbols::symbol_path_at`).
-///
-/// GitHub issue #178: the path half alone is what this band used to render, which the Surface C
-/// toolbar directly above it already shows - the literal duplicate the issue is about. The symbol
-/// half is what makes it the design's `src › db › query_builder.rs › impl QueryBuilder › build`
-/// instead. `symbol_path` is legitimately empty in real, reachable states (caret at a file's top
-/// level, a language with no enclosing-declaration concept, or no live edit buffer for this file
-/// yet), and the band then honestly renders the path alone rather than padding it out.
-///
-/// Pure and separately tested, so "what does the breadcrumb actually say for this caret" is a
-/// real assertion rather than something only reachable through a GPUI window.
 pub(in crate::code_surface) fn breadcrumb_crumbs(
     relative_path: &Path,
     symbol_path: &[String],
@@ -1146,11 +1086,6 @@ pub(in crate::code_surface) fn breadcrumb_crumbs(
 /// The File view's breadcrumb (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26 (`src › db ›
 /// query_builder.rs › impl QueryBuilder › build`, 10.5px mono, separators `#3d4248`, active crumb
 /// `#a9b0b7`) with error/warning counts right").
-///
-/// `symbol_path` is the live enclosing-symbol chain at the caret and `diagnostic_counts` the real
-/// `(errors, warnings)` pair from this same frame's `LspFileStatus::Analyzed` - `None` whenever
-/// this file has no analyzed language-server result at all, in which case no count dots are drawn
-/// rather than a fabricated `0 0`.
 pub(in crate::code_surface) fn render_file_breadcrumb(
     relative_path: &Path,
     symbol_path: &[String],
@@ -1208,12 +1143,6 @@ pub(in crate::code_surface) fn render_file_breadcrumb(
 
 /// One `● N` group on the breadcrumb's right edge - a 5px severity-coloured dot plus the count,
 /// per the design mockup's File view breadcrumb band.
-///
-/// `None` when `count` is 0: a clean file shows nothing at all rather than a `0`, which is both
-/// the mockup's own shape (it only ever draws groups for non-zero counts) and the honest reading -
-/// the absence of a dot is unambiguous where a grey `0` next to a red dot is not. The dot colour
-/// comes from [`diagnostic_underline_color`], the same severity->colour map the in-code dotted
-/// underlines use, so the breadcrumb can never disagree with the markers it is counting.
 fn diagnostic_count_dot(
     severity: diagnostics_view::Severity,
     count: usize,
@@ -1345,11 +1274,6 @@ mod db {
         assert!(diagnostic_count_dot(diagnostics_view::Severity::Error, 1).is_some());
     }
 
-    /// The counts the band draws come straight off `LspFileStatus::Analyzed`, which
-    /// `crate::lsp::client::lsp_file_status` builds with
-    /// `diagnostics_view::count_errors_and_warnings` - so this drives real `lsp_types::
-    /// Diagnostic` values through that same real counting function and checks the pair the
-    /// breadcrumb would be handed.
     #[test]
     fn the_breadcrumb_counts_come_from_a_real_diagnostics_list() {
         let diagnostics = vec![
@@ -1605,18 +1529,6 @@ pub(in crate::code_surface) fn render_file_view_line(
 /// own answer for its extension - `None` only when the caller couldn't resolve one, which for a
 /// file that has any status at all shouldn't happen, and falls back to the honest generic word
 /// "language server" rather than naming some other language's binary).
-///
-/// Derived, never hardcoded: these strings used to say `"rust-analyzer"` literally, for every
-/// language. That was merely generic until a two-server language could produce a status of its
-/// own. `LspConnection::liveness_failure_reason` names the real dead process, so a dead Vue
-/// companion rendered as the actively-wrong `"rust-analyzer: typescript-language-server (vue)'s
-/// connection was lost..."`, and a `.vue` file mid-spawn said `"starting rust-analyzer..."` while
-/// `vue-language-server` was the thing actually starting.
-///
-/// [`LspFileStatus::Failed`]'s own message deliberately gets **no** prefix at all: every real
-/// source of it already names its own server (`lsp_core::LspError`'s variants all carry `server`,
-/// `liveness_failure_reason` carries `LspClient::name()`, and the companion's prerequisite errors
-/// name Vue), so prefixing would either duplicate that name or contradict it.
 fn lsp_status_label(status: &LspFileStatus, binary: Option<&str>) -> (gpui::Rgba, String) {
     let binary = binary.unwrap_or("language server");
     match status {
@@ -1774,9 +1686,6 @@ mod lsp_status_label_tests {
         );
     }
 
-    /// Both diagnostic counts conjugate, and they conjugate *independently* (GitHub issue
-    /// #281). This label used to hardcode both plurals, so the single-error/single-warning
-    /// case - much the most common one while actually editing - read `1 errors, 1 warnings`.
     #[test]
     fn diagnostic_counts_conjugate_independently_at_zero_one_and_two() {
         let label = |errors: usize, warnings: usize| {
@@ -1786,7 +1695,6 @@ mod lsp_status_label_tests {
             )
             .1
         };
-        // 0/0 is the qualitatively different "no diagnostics" state, not a conjugation case.
         assert_eq!(label(0, 0), "rust-analyzer: no diagnostics");
         assert_eq!(label(1, 0), "rust-analyzer: 1 error, 0 warnings");
         assert_eq!(label(0, 1), "rust-analyzer: 0 errors, 1 warning");
@@ -1796,10 +1704,6 @@ mod lsp_status_label_tests {
         assert_eq!(label(2, 2), "rust-analyzer: 2 errors, 2 warnings");
     }
 
-    /// The specific bug this issue's own new `LspConnection::liveness_failure_reason` made
-    /// actively wrong rather than merely generic: it already names the real dead process, so the
-    /// old `format!("rust-analyzer: {message}")` produced a label naming two different servers,
-    /// one of which had nothing to do with the file.
     #[test]
     fn a_failure_message_is_shown_as_is_because_it_already_names_its_own_server() {
         let dead_companion =
@@ -1829,8 +1733,6 @@ mod lsp_status_label_tests {
         );
     }
 
-    /// The honest fallback when no binary could be resolved at all - a generic word, never some
-    /// other language's real server name.
     #[test]
     fn an_unresolved_binary_falls_back_to_a_generic_word_not_another_language() {
         assert_eq!(
@@ -1848,9 +1750,6 @@ mod lsp_status_label_tests {
 /// language server stop is actually looking, so it is a real, clickable recovery - driven here
 /// through a genuine painted-bounds click, the same idiom the status bar's own zoom-value test
 /// uses, rather than by calling the handler directly.
-///
-/// Without this, the recovery existed but was reachable only by already knowing to search the
-/// command palette for it - which is not a recovery path a user can find.
 #[cfg(test)]
 mod lsp_failed_status_chip_tests {
     use super::*;

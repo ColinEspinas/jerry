@@ -4,11 +4,6 @@
 //! accepted. Deliberately `gpui`-free (no `gpui` type appears anywhere in this module), mirroring
 //! `crate::lsp::hover`'s own split between pure logic here and `crate::root`'s live request
 //! dispatch/popover painting - see that module's own top doc comment for the same convention.
-//!
-//! `crate::lsp::hover`'s own top docs used to say a Completions popup was out of scope because
-//! the File view was read-only with "no caret and no text insertion" - Revision R8.5a made the
-//! File view a real text editor, closing exactly that gap, which is what this module (and
-//! `crate::lsp::completion_popup`, its GPUI-facing counterpart) now build on.
 
 use std::ops::Range;
 
@@ -43,10 +38,6 @@ pub fn is_identifier_continuation(ch: char) -> bool {
 /// a server-advertised trigger character (e.g. TypeScript's `.`) is real, authoritative evidence
 /// the server wants a request there, even for a character `is_identifier_continuation` would
 /// otherwise reject.
-///
-/// `None` for anything else (whitespace, a closing bracket, a semicolon, ...) - the real, honest
-/// "don't fire a request here" case a caller also reads as "dismiss an already-open popup", since
-/// the context that justified it is gone.
 pub fn completion_trigger(
     char_before_cursor: Option<char>,
     trigger_characters: &[String],
@@ -125,61 +116,12 @@ pub fn identifier_prefix_start(line_text: &str, cursor: usize) -> usize {
 /// A completion item's real display label plus an optional secondary detail string - what
 /// `crate::lsp::completion_popup`'s popover row actually renders on the row's own right side,
 /// factored out here so it's testable without a live `gpui` window.
-///
-/// Reads the legacy top-level `CompletionItem::detail`, run through [`clean_completion_detail`] -
-/// **not** `CompletionItemLabelDetails::detail`, despite that field's own doc comment sounding
-/// like the right one ("rendered less prominently directly after the label ... function
-/// signatures or type annotations"). A real, live dump against both servers this app supports
-/// (see this function's own git history for the raw dump) found that field means two genuinely
-/// different, both-real-but-neither-matching-the-spec things: `typescript-language-server` never
-/// populates it at all, even after a real `completionItem/resolve` round trip; `rust-analyzer`
-/// populates it only for a trait-provided method, with a short trait-source annotation
-/// (`"(as Into)"`, `"(as TryInto)"`) that is not a type at all - preferring it there actively
-/// broke the row hint for some of the most common real completions (`.into()`, `.try_into()`,
-/// `.clone()`). The legacy `detail` field, by contrast, is the one both real servers reliably
-/// populate with genuine type/signature text for every item tried.
-///
-/// `CompletionItemLabelDetails::**description**` is a third field again, deliberately read only
-/// for the import source and never for the type slot: under this app's own real handshake
-/// (`labelDetailsSupport` advertised, `resolveSupport` deliberately not - see
-/// `lsp_core::client`'s capabilities) a live `rust-analyzer` fills it with a verbatim copy of
-/// `detail`, so consulting it would add nothing, while `pyright-langserver` fills it with the
-/// *module* an auto-import would come from. See [`split_completion_detail`] for the full
-/// per-server field survey, dumped live through that exact handshake.
 pub fn completion_item_display(item: &lsp_types::CompletionItem) -> (String, Option<String>) {
     (item.label.clone(), split_completion_detail(item).signature)
 }
 
 /// The real, per-slot split of whatever a server packed into `CompletionItem`'s three descriptive
 /// fields.
-///
-/// The popup has three genuinely different slots - the row's own type hint, the row's import
-/// source (also the detail pane's module footer), and the pane's signature line - and the LSP
-/// gives `detail`, `labelDetails.detail` and `labelDetails.description` to fill them. Dumped live
-/// from every server this app spawns that can also be spawned here, each through this app's own
-/// exact handshake (`labelDetailsSupport` advertised, `resolveSupport` deliberately not - see
-/// `lsp_core::client`'s `ClientCapabilities`), no two agree on which field means what:
-///
-/// | | `detail`, unresolved | `labelDetails.detail` | `labelDetails.description` |
-/// |---|---|---|---|
-/// | `rust-analyzer` | the real signature/type (`usize`, `const fn(&self) -> usize`), or the label again for a type item | `(use std::io::Result)`, `(as Into)`, `(alias ==, !=)` | a verbatim copy of `detail` |
-/// | `typescript-language-server` | `null`, or a bare module specifier on an auto-import (`fs`, `fs/promises`, `vue`) | never set | never set |
-/// | `pyright-langserver` | `null`, or the literal marker `Auto-import` | never set | the module (`os`) on an auto-import |
-///
-/// (That handshake matters: told `resolveSupport` covers `detail`, `rust-analyzer` sends `null`
-/// there instead and defers the type to `completionItem/resolve`. This app doesn't tell it that,
-/// which is why every `rust-analyzer` row genuinely does carry its type on the very first
-/// response.)
-///
-/// So each slot is filled from whichever field genuinely holds that kind of thing:
-///
-/// - **type**: `detail`, when it is a real signature rather than a path, a marker, or the label
-///   over again.
-/// - **import source**: `typescript-language-server`'s `"Auto import from 'X'"` note or bare
-///   specifier, `rust-analyzer`'s `(use path)` note, `pyright`'s `description` beside an
-///   `Auto-import` marker. See [`completion_import_source`] for why a row needs this at all.
-/// - and a slot with nothing genuine to show stays empty rather than showing a path, a marker, or
-///   an echo of the label.
 struct CompletionDetail {
     /// The type/signature slot - `None` when the server sent nothing that is genuinely one.
     signature: Option<String>,
@@ -238,19 +180,6 @@ fn split_completion_detail(item: &lsp_types::CompletionItem) -> CompletionDetail
 
 /// Whether this item's `detail` is `pyright-langserver`'s own literal `"Auto-import"` marker,
 /// which is neither a type nor a path and must not be printed as either.
-///
-/// Live dump against a real `pyright-langserver`: across four completion positions, every single
-/// `detail` it sent was either `null` or exactly this one string, on every kind it offers -
-/// `{"label":"path","kind":6,"detail":"Auto-import","labelDetails":{"description":"os"}}`,
-/// `{"label":"PathLike","kind":7,...}`, `{"label":"_path","kind":9,...}`,
-/// `{"label":"P_NOWAIT","kind":21,...}`. The real module always sits in
-/// `labelDetails.description` (`"os"`) instead.
-///
-/// It carries no whitespace and no path separator, so without this the module-specifier rule filed
-/// it as a module path on the kinds [`kind_has_no_one_word_type`] covers and as a *type* on the
-/// rest: a literal `Auto-import` printed across a whole Python completion list in two different
-/// slots, neither of which it belongs in, while `os` went unread. Matched exactly, not by prefix -
-/// this is a fixed marker string, and anything longer is real prose that deserves its own reading.
 fn detail_is_auto_import_marker(item: &lsp_types::CompletionItem) -> bool {
     item.detail.as_deref().map(str::trim) == Some("Auto-import")
 }
@@ -258,25 +187,6 @@ fn detail_is_auto_import_marker(item: &lsp_types::CompletionItem) -> bool {
 /// The path out of `rust-analyzer`'s own real `"(use std::io::Result)"` import note, which it puts
 /// in `CompletionItemLabelDetails::detail` - `Some("std::io::Result")` here, and `None` for
 /// anything else that field carries.
-///
-/// Live dump, completing `let r: Resu` against a real `rust-analyzer`: **four** items labelled
-/// `Result` come back, three of them auto-import candidates whose only difference at all is this
-/// note (`"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`).
-/// `detail` is `null` on all three and their `textEdit`s are byte-identical, so nothing else could
-/// have told those rows apart - and this field was read nowhere, leaving three rows a user cannot
-/// choose between for three genuinely different `use` statements.
-///
-/// Narrow on purpose: of the 14 items carrying a `label_details.detail` in that same dump, 8 were
-/// `(use ...)` notes and the rest were doc-alias notes (`"(alias ==, !=)"`, `"(alias ?, ?Sized)"`,
-/// `"(alias list, vector)"`), with an ordinary trait method carrying `"(as Into)"`. None of those
-/// names a module, so only the literal `use` form is accepted, and the extracted text still has to
-/// pass [`looks_like_module_path`] before it counts.
-///
-/// Searched for rather than anchored at the start, because `rust-analyzer` really does concatenate
-/// the two kinds of note when an item has both - verbatim from that same dump:
-/// `"(alias GetTempPath, GetTempPath2) (use std::env::temp_dir)"` on `std::env::temp_dir`. An
-/// anchored match would have dropped the import source on exactly the items carrying the most
-/// annotation.
 fn use_note_module_path(note: &str) -> Option<String> {
     let after_use = note.split_once("(use ")?.1;
     let path = after_use[..after_use.find(')')?].trim();
@@ -287,11 +197,6 @@ fn use_note_module_path(note: &str) -> Option<String> {
 /// and the signature that follows it (`"Auto import from './helper'\nconstructor RemoteHelper():
 /// RemoteHelper"` -> `(Some("./helper"), "constructor RemoteHelper(): RemoteHelper")`), captured
 /// verbatim from a real resolved completion against a live server.
-///
-/// Without this the whole two-line string reached a single-line type slot, so the only part the
-/// user could actually read was the import note - a module path standing exactly where a type
-/// belongs. Returns the input untouched when there is no such note, which is every
-/// `rust-analyzer` item and every non-import TypeScript item.
 fn split_auto_import_note(detail: &str) -> (Option<String>, &str) {
     let (first_line, rest) = match detail.split_once('\n') {
         Some((first_line, rest)) => (first_line.trim(), rest.trim()),
@@ -310,17 +215,6 @@ fn split_auto_import_note(detail: &str) -> (Option<String>, &str) {
 /// Whether `text` genuinely reads as a module path/import specifier rather than a type or
 /// signature - a deliberately narrow test, since its whole job is to keep a path *out* of the type
 /// slot without ever exiling a real type into the footer.
-///
-/// Requires a real path separator (`::` or `/`) and rejects anything carrying the punctuation or
-/// whitespace a signature has, so the real strings observed live sort correctly:
-/// `"std::collections::HashMap"` and `"./helper"` are paths; `"String"`, `"Widget"`,
-/// `"fn(self) -> T"`, `"macro_rules! assert"` and `"bar: string"` are not.
-///
-/// This also guards the footer against `rust-analyzer`'s own real
-/// `CompletionItemLabelDetails::description`, which - despite the LSP spec describing that field
-/// as "fully qualified names or file path" - it fills with the *signature* for ordinary items
-/// (`description: "fn(self) -> T"` on `.into()`), which the footer used to print as if it were a
-/// module path.
 fn looks_like_module_path(text: &str) -> bool {
     !text.is_empty()
         && !text.contains(char::is_whitespace)
@@ -331,23 +225,6 @@ fn looks_like_module_path(text: &str) -> bool {
 /// The same question for `CompletionItem::detail` specifically, where a real separator is *not*
 /// required - the live-reported "the types are loading only after in a weird way replacing the
 /// module names".
-///
-/// In a project using the ordinary `"moduleResolution": "node"`, `typescript-language-server`
-/// reports an auto-import from an installed package as that package's **bare** specifier, with no
-/// separator at all. Dumped verbatim from a live server: `label: "createProgram", kind: FUNCTION,
-/// detail: "typescript"`, whose `completionItem/resolve` response is `"Auto import from
-/// 'typescript'\nfunction ts.createProgram(...): ts.Program"`. [`looks_like_module_path`] called
-/// that a type, so the row printed the module name in its type slot until the resolve landed and
-/// visibly overwrote it with the signature - a swap, where the design promises the type slot only
-/// ever gains a type it didn't have.
-///
-/// A bare `typescript` is indistinguishable *as a string* from a one-word type like `usize`, so
-/// [`CompletionItemKind`](lsp_types::CompletionItemKind) settles it - see
-/// [`kind_has_no_one_word_type`]. Deliberately scoped to `detail`: `label_details.description` has
-/// never been observed carrying a bare package specifier (`typescript-language-server` doesn't
-/// populate `label_details` at all), while `rust-analyzer` genuinely does put a bare type name
-/// there for a type item, so widening the rule to that field would exile real types into the
-/// footer.
 fn detail_is_module_specifier(text: &str, kind: Option<lsp_types::CompletionItemKind>) -> bool {
     if looks_like_module_path(text) {
         return true;
@@ -360,35 +237,6 @@ fn detail_is_module_specifier(text: &str, kind: Option<lsp_types::CompletionItem
 
 /// Whether an item of this kind could ever have a genuine *one-word* type/signature in `detail` -
 /// `false` here means a separator-less `detail` on such an item can only be a module specifier.
-///
-/// Decided by a real survey rather than by reasoning about the spec: every single-token `detail`
-/// (no whitespace, no punctuation, not just the label again) that a live `rust-analyzer` and a
-/// live `typescript-language-server` emit across method/field/path/type positions falls into
-/// exactly two disjoint groups.
-///
-/// - `rust-analyzer` sends one only on `FIELD` (`"usize"`, `"String"`, `"bool"`) and `VARIABLE`
-///   (`"String"`, `"Widget"`) - value-shaped items whose type genuinely *is* one word. Its
-///   functions and methods always carry a real signature there instead (`"const fn(&self) ->
-///   usize"`), which the whitespace test in [`detail_is_module_specifier`] has already excluded.
-/// - `typescript-language-server` sends one only on `FUNCTION`, and every one observed was a bare
-///   package specifier (`"typescript"`) on an unresolved auto-import.
-///
-/// So the kinds listed here are the ones that cannot name a type in one word - a function, method,
-/// constructor, class, interface, enum, struct or module has either a signature or nothing.
-/// `FIELD`/`VARIABLE`/`PROPERTY`/`CONSTANT` and friends are deliberately absent: a real one-word
-/// type on those is the common case, and misrouting it into the module-path footer would be a
-/// worse bug than the one this fixes.
-///
-/// A known, still-unhandled case, recorded here rather than guessed at: a live
-/// `typescript-language-server` *does* send a bare package specifier on a `VARIABLE` too
-/// (`{"label":"createApp","kind":6,"detail":"vue"}` for an unresolved auto-import from `vue`, seen
-/// on screen), so `vue` shows in that row's type slot until the resolve moves it to the import
-/// source. Widening this list to `VARIABLE` would fix that and break `rust-analyzer`'s own real
-/// `{"label":"text","kind":6,"detail":"String"}` in the same stroke. The one discriminator that
-/// separates them in every dump taken here - `typescript-language-server` never sends
-/// `labelDetails` at all, `rust-analyzer` always does - holds for the three servers that could be
-/// spawned and probed in this sandbox, but `gopls` (also in `crate::language`'s registry) could
-/// not be, so it is left unused rather than adopted on two thirds of a survey.
 fn kind_has_no_one_word_type(kind: Option<lsp_types::CompletionItemKind>) -> bool {
     matches!(
         kind,
@@ -425,18 +273,6 @@ pub fn completion_signature_text(item: &lsp_types::CompletionItem) -> String {
 /// and typing" a user reported seeing, with no separate structured field (see
 /// [`completion_item_display`]'s own docs) this app could read the clean half from instead. Two
 /// independent, both-conservative steps:
-///
-/// 1. A leading `"(word[ word]) "` parenthetical is dropped only when its own content has no `:`
-///    or `,` - the real shape every one of TypeScript's own kind descriptors (`method`,
-///    `property`, `local var`, `alias`, `type parameter`, ...) takes, and never the shape a real
-///    parameter list or tuple type does (`"(x: number)"`, `"(number, string)"`) - so a real
-///    completion whose detail genuinely starts with a parenthesized *type* is never misread as a
-///    kind descriptor and mangled.
-/// 2. If `label` then occurs near the very start of what's left, preceded by a bare `"Qualifier."`
-///    (no whitespace before the `.`), that qualifier is dropped too - `rust-analyzer`'s own
-///    already-clean detail strings (`"fn(&mut self, &str)"`, `"fn(self) -> T"`) never match this
-///    shape at all (no `(word) ` prefix, and `label` never reappears inside them), so they pass
-///    through this function completely untouched.
 pub fn clean_completion_detail(detail: &str, label: &str) -> String {
     let without_kind_prefix = strip_leading_kind_parenthetical(detail);
     if let Some(label_start) = without_kind_prefix.find(label) {
@@ -481,12 +317,6 @@ fn strip_leading_kind_parenthetical(detail: &str) -> &str {
 /// Plex Sans #7d848b, module path footer" - the Completions popup's own doc/module-path pane,
 /// mirroring `crate::lsp::hover::HoverRenderModel::doc` exactly). `None` for an item with no real
 /// documentation - an honest "nothing to show", never a fabricated empty string.
-///
-/// Reuses [`crate::lsp::hover::degrade_markdown_to_plain_text`] for a genuinely `Markdown`-kinded
-/// `MarkupContent` - the same real fenced-code/heading/bold-stripping pass that module's own docs
-/// describe, not a second, independently-maintained copy of it. `Documentation::String` (the
-/// LSP's older, deprecated shape) is passed through unmodified, same as that module's own
-/// `MarkedString::String` handling.
 pub fn completion_documentation_text(item: &lsp_types::CompletionItem) -> Option<String> {
     let text = match item.documentation.as_ref()? {
         lsp_types::Documentation::String(text) => text.clone(),
@@ -503,70 +333,18 @@ pub fn completion_documentation_text(item: &lsp_types::CompletionItem) -> Option
 
 /// A completion item's real fully-qualified path/module, for the detail pane's own footer
 /// (`README.md`: "module path footer", mirroring `crate::lsp::hover::HoverRenderModel::module_path`).
-///
-/// Whichever real path [`split_completion_detail`] found - `typescript-language-server`'s own
-/// `"Auto import from './helper'"` note, an unresolved import item's bare specifier, or
-/// `CompletionItemLabelDetails::description` when that genuinely holds a path rather than the
-/// signature `rust-analyzer` actually puts there. `None` when the server sent no real path - never
-/// a guessed or re-derived one, and never a signature dressed up as a path.
 pub fn completion_module_path(item: &lsp_types::CompletionItem) -> Option<String> {
     split_completion_detail(item).module_path
 }
 
 /// The module a completion *row* says this item would be imported from - the same real path
 /// [`completion_module_path`] gives the detail pane's footer, surfaced on the row itself.
-///
-/// Exists because the footer describes the **selected** row alone, and the real, live-reported
-/// duplicates are precisely rows that differ in nothing else. Two verbatim dumps:
-///
-/// - `typescript-language-server`, completing `app` in a real project with `@types/node`: two
-///   `appendFile` items, both `kind: FUNCTION`, both with no `labelDetails`, `filterText`,
-///   `insertText` or `textEdit` at all, differing only in `detail` - `"fs"` against
-///   `"fs/promises"`. Two genuinely different `import` statements.
-/// - `rust-analyzer`, completing `let r: Resu`: three `Result` items differing only in
-///   `labelDetails.detail` - `"(use std::fmt::Result)"`, `"(use std::io::Result)"`,
-///   `"(use std::thread::Result)"`. Three genuinely different `use` statements.
-///
-/// Both sets are real choices, so [`rank_completion_items`] deliberately keeps every row (see
-/// [`interchangeable_completion_key`]). But neither server sends a signature for any of them
-/// before `completionItem/resolve` - of a real 1029-item TypeScript response, not one item carried
-/// a multi-token `detail` - so the type slot was empty on all of them and the rows painted
-/// identically. The fix is not fewer rows; it is a row that shows the one thing that differs.
-///
-/// A separate span from the type hint on purpose: this string must read the same before and after
-/// `completionItem/resolve` (`"fs"` unresolved, `"Auto import from 'fs'\nnamespace appendFile..."`
-/// resolved, both yielding `"fs"`), where the type slot legitimately goes from empty to a
-/// signature. Sharing one slot would put the module name where a type belongs and then visibly
-/// swap it - the exact behaviour [`detail_is_module_specifier`] exists to stop.
 pub fn completion_import_source(item: &lsp_types::CompletionItem) -> Option<String> {
     completion_module_path(item)
 }
 
 /// The one secondary string a completion **row** shows beside its label - the origin/module the
 /// item comes from when the server named one, and the signature it sent inline otherwise.
-///
-/// The rule this exists to enforce is not about which string is nicer; it is that a row must be
-/// complete when the popup opens and must never change afterwards. Live-reported, twice: "the
-/// types are loading only after in a weird way replacing the module names", then "it should not be
-/// like this, all data should be here without needing to select the suggestion". Both were the
-/// same mechanism - the row showed the *type*, `typescript-language-server` sends no type inline
-/// for any item, and so every row sat blank until its own `completionItem/resolve` landed, which
-/// only ever happens for the row the user has selected.
-///
-/// So the type left the row and moved to the detail pane, where filling in on selection is what a
-/// detail pane is *for*, and the row took the thing servers do send up front:
-///
-/// - `typescript-language-server`: the auto-import specifier (`fs`, `fs/promises`, `vue`) - which
-///   is what the row showed before any of this, and what VS Code shows in the same place.
-/// - `pyright-langserver`: the module out of `labelDetails.description` (`os`), rather than the
-///   literal `Auto-import` marker it puts in `detail`.
-/// - `rust-analyzer`: no module for an in-scope item, but a real signature inline
-///   (`const fn(&self) -> usize`), sent on the very first response and byte-identical in the
-///   resolve - so showing it costs nothing and changes nothing.
-///
-/// Callers must pass the server's **untouched** item, never a resolve-merged one; the app keeps
-/// those apart in `crate::root::AdeApp::completions_resolved_items` precisely so this can't be got
-/// wrong by accident.
 pub fn completion_row_hint(item: &lsp_types::CompletionItem) -> Option<String> {
     completion_import_source(item).or_else(|| split_completion_detail(item).signature)
 }
@@ -641,14 +419,6 @@ pub enum CompletionMatchTier {
     /// The query *is* the candidate, ignoring case (`app` against `app`, or against `App`) - the
     /// user has already typed the whole identifier, and nothing that merely starts with it can be
     /// a better answer.
-    ///
-    /// Live-reported, and the reason this tier exists: typing `app` in a real Vue + `@types/node`
-    /// project put `app` and `App` - the local `const app` and the imported `App` type, both of
-    /// them exactly what was typed - *below* `appendFile`, `appendFile`, `appendFile`,
-    /// `appendFile`, `appendFileSync`, `appendFileSync`. Every one of those is a real prefix
-    /// match too, so with only a `Prefix` tier to separate them the tiebreak fell to how the
-    /// server happened to order its response, and seven rows of `@types/node` noise sat between
-    /// the user and the two symbols they had fully spelled out.
     Exact,
     /// The query is a real leading prefix of the candidate (`ver` in `version`).
     Prefix,
@@ -662,15 +432,6 @@ pub enum CompletionMatchTier {
 /// One candidate's real match quality, ordered best-first: `derive(Ord)` compares the fields in
 /// declaration order, which *is* the ranking policy, so the ordering rule lives in one place
 /// rather than in a hand-written `cmp`.
-///
-/// - `tier` first (see [`CompletionMatchTier`]).
-/// - `start` - an earlier match is a better one (`ver` in `xver` beats `ver` in `xxxxver`).
-/// - `gaps` - how many times the match had to skip characters at a position that *isn't* a real
-///   word start; skipping to a `snake_case`/`camelCase` boundary is free, since that is exactly
-///   the query shape (`rts` for `read_to_string`) a real fuzzy matcher is supposed to reward.
-/// - `span` - how much of the candidate the match had to stretch across; a tighter match wins.
-/// - `case_mismatches` - matching is case-insensitive, but an exactly-cased match wins the tie
-///   (`Ver` prefers `Version` over `version`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompletionMatch {
     pub tier: CompletionMatchTier,
@@ -696,26 +457,6 @@ fn is_word_start(chars: &[char], index: usize) -> bool {
 
 /// The real match, if any, of `query` against `candidate` - `None` when `query`'s characters do
 /// not all occur in `candidate`, in order.
-///
-/// ## Why a real subsequence match, and why this isn't a second copy of the palette's matcher
-///
-/// The command palette (`crate::palette::state`) deliberately matches on *contiguous* substrings
-/// only, and says so in its own module docs: a palette row highlights one contiguous span, and
-/// scattered highlight characters would read as noise there. That decision is about the palette's
-/// own rendering, not about matching in general, so it can't simply be adopted here - every real
-/// LSP client (VSCode, coc.nvim, ...) filters completions by a real *subsequence* match against
-/// `filterText`, which is what GitHub issue #189 explicitly asks this popup to behave like.
-///
-/// So the palette's own real, tested [`crate::palette::state::substring_match`] is *reused as-is*
-/// for the two contiguous tiers rather than reimplemented here (it already does the leftmost,
-/// alignment-safe ASCII-folded search this needs), and only the genuinely new part - the scattered
-/// subsequence tier and the tier/gap/span ranking above it - is added. Nothing is duplicated.
-///
-/// The subsequence walk is a deterministic greedy leftmost one, not a full dynamic-programming
-/// optimum like VSCode's own `fuzzyScore`: for identifier-length strings the difference only ever
-/// affects the *ranking* of an already-matching item (never whether it matches at all), and the
-/// two tiers that carry real ranking weight - prefix and contiguous substring - are resolved
-/// exactly, before the greedy walk is ever reached.
 pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch> {
     if query.is_empty() {
         // Nothing typed past the trigger point yet: every candidate the server returned is
@@ -794,36 +535,6 @@ pub fn completion_match(candidate: &str, query: &str) -> Option<CompletionMatch>
 /// The real, client-side narrowed and re-ranked view of `items` for the prefix the user has typed
 /// since the completion was triggered: indices into `items`, best match first, with every item
 /// that doesn't match `query` at all left out entirely.
-///
-/// This is the whole point of GitHub issue #189: real language servers (rust-analyzer included)
-/// answer a `textDocument/completion` request with a broad, position-relevant candidate set and
-/// expect the *client* to narrow it locally as more characters arrive, rather than re-narrowing it
-/// themselves on every keystroke. Returning indices (not cloned items) is what lets
-/// `crate::lsp::completion_popup` keep the server's full response intact underneath, so pressing
-/// Backspace genuinely widens the list back out instead of having to re-ask the server for what it
-/// already sent.
-///
-/// Where this ranking genuinely cannot tell two candidates apart, the server's own
-/// `CompletionItem::sortText` breaks the tie before the response's own arbitrary order does - the
-/// spec's exact rule, including its "when omitted the label is used" fallback. This is what keeps
-/// `@types/node` auto-import candidates (`typescript-language-server` gives every one of them
-/// `sortText: "\u{ffff}16"`, its lowest band) below the in-scope and already-imported symbols it
-/// marks `"11"`, instead of wherever they happened to land in a 1029-item response.
-///
-/// Skipped entirely when *no* item carries a `sortText`: falling back to the label there would
-/// silently re-sort the whole list alphabetically and destroy the server's own ordering, which for
-/// a server that expresses priority through response order alone is the only signal there is.
-///
-/// Ties past that fall back to the item's own original index, so the server's ordering still
-/// decides wherever nothing above it has anything real to say.
-///
-/// Two dedupe passes run over the ranked list, both keeping the best-ranked row of each group and
-/// dropping the rest: [`interchangeable_completion_key`] (rows a user cannot tell apart *or* act
-/// on differently) and [`same_choice_key`] (rows offering the same completed identifier by a
-/// different route - the live-reported `appendFile` x4). Deduping here rather than over `items`
-/// keeps `crate::lsp::completion_popup::CompletionsStatus::Ready::items` the server's untouched
-/// response, so every index the resolve path holds stays valid and Backspace still widens back out
-/// of the same list.
 pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -> Vec<usize> {
     let server_ranks = items.iter().any(|item| item.sort_text.is_some());
     let sort_text = |item: &'_ lsp_types::CompletionItem| -> String {
@@ -872,17 +583,6 @@ pub fn rank_completion_items(items: &[lsp_types::CompletionItem], query: &str) -
 
 /// Of two candidates that would write the same import, whether `candidate` is the one to show -
 /// which for Node's two spellings of a builtin means the `node:`-prefixed one.
-///
-/// Live-asked ("I am not sure removing the node: syntax is good because this is the best
-/// practice"), and the answer is that it is: `node:` cannot be shadowed by a userland package of
-/// the same name, and Node's newer builtins are prefix-only outright - checked in the installed
-/// `@types/node`, which declares `node:test`, `node:sea` and `node:sqlite` with **no bare form at
-/// all**, against `fs`/`path`/`os`/`async_hooks` which have both.
-///
-/// This was already the outcome, but only by accident: `typescript-language-server` happens to
-/// list `node:fs` ahead of `fs` and the group kept whichever came first. That is not a promise the
-/// server makes anywhere, and a reordering upstream would have silently started writing the bare
-/// form. Now it is decided here.
 fn prefers_this_spelling(
     candidate: &lsp_types::CompletionItem,
     incumbent: &lsp_types::CompletionItem,
@@ -897,27 +597,6 @@ fn prefers_this_spelling(
 /// text, out of this module. Two rows with equal keys put the same word in the file *and* import it
 /// from the same place - so there is genuinely nothing to choose between them, and the second is
 /// noise on an already-crowded list.
-///
-/// This is the blunter half of the live-reported "the autocomplete has multiple suggestions for the
-/// same things", and the half the narrower [`interchangeable_completion_key`] does not touch.
-/// Typing `app` in a real Vue + `@types/node` project returns `appendFile` from `node:fs`, `fs`,
-/// `fs/promises` **and** `node:fs/promises`, `appendFileSync` from `node:fs` and `fs`,
-/// `asyncWrapProviders` from `async_hooks` and `node:async_hooks` - nine rows for five real
-/// choices, because Node ships every one of its modules under two spellings.
-///
-/// The module is in the key, canonicalized only by [`canonical_import_source`], and this is
-/// deliberately the *narrowest* rule that removes the reported repeats. Two earlier versions were
-/// both too broad and both live-corrected:
-///
-/// - Keyed on label/kind/text alone, it merged two same-named exports of two unrelated packages -
-///   a real hazard in a Vue project, where plenty of packages export a `Ref` or a `Component`, and
-///   the survivor would have imported from whichever ranked first.
-/// - Keyed on the *package*, it merged `fs` with `fs/promises` (the callback API and the promise
-///   API - genuinely different things a user picks between) and `std::io::Result` with
-///   `std::fmt::Result` (three different `use` lines).
-///
-/// So nothing is merged across modules any more. Only the two spellings of one module fold
-/// together, which is the only case where the two rows would have written the same import.
 fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String, Option<String>) {
     let inserted = match item.text_edit.as_ref() {
         Some(lsp_types::CompletionTextEdit::Edit(edit)) => edit.new_text.clone(),
@@ -940,32 +619,6 @@ fn same_choice_key(item: &lsp_types::CompletionItem) -> (String, String, String,
 }
 
 /// One module, spelled one way: the `node:` prefix dropped, and nothing else touched.
-///
-/// Node ships every builtin under two specifiers, and `typescript-language-server` offers both as
-/// separate candidates for the identical export - `appendFile` from `node:fs` and from `fs`,
-/// `appendFileSync` from both, `asyncWrapProviders` from `async_hooks` and `node:async_hooks`.
-/// Accepting either writes an import of the same module, so they are one row.
-///
-/// *Which* spelling survives is deliberately not decided here: [`rank_completion_items`] keeps the
-/// first row of each group, so it is whichever the server itself ranked first. In a live dump that
-/// is `node:fs` ahead of `fs` - the form Node's own documentation recommends, and the one
-/// `unicorn/prefer-node-protocol` enforces.
-///
-/// There is, checked rather than assumed, **no** setting anywhere that changes that order.
-/// TypeScript 5.9's own `UserPreferences` has no `node:`-protocol option at all, and
-/// `importModuleSpecifierPreference` - which sounds like the one - only chooses between
-/// `"shortest" | "project-relative" | "relative" | "non-relative"`, i.e. relative-path style. So
-/// this is the server's own fixed preference, and a project that wants the bare `fs` spelling has
-/// to suppress the other with `autoImportSpecifierExcludeRegexes` (an
-/// `initializationOptions.preferences` field this app does not forward yet) rather than reorder
-/// them.
-///
-/// Nothing else is folded, on direct instruction after a broader version was tried and rejected.
-/// `fs` and `fs/promises` are two rows: same package, but the callback API and the promise API are
-/// a real choice. `std::io::Result`, `std::fmt::Result` and `std::thread::Result` are three rows:
-/// three different `use` lines. `os` and `os.path`, `typing` and `typing_extensions`, `vue` and
-/// anything else exporting the same name - all kept apart. The row itself names its module (see
-/// [`completion_import_source`]), so telling them apart costs the user nothing.
 fn canonical_import_source(source: &str) -> String {
     source.strip_prefix("node:").unwrap_or(source).to_string()
 }
@@ -973,25 +626,6 @@ fn canonical_import_source(source: &str) -> String {
 /// Everything about a completion item that a user can either *see* on its row or *get* by
 /// accepting it. Two items with equal keys offer no choice at all: they paint the same row and
 /// splice the same text over the same range, so a second row for the second one is pure noise.
-///
-/// This is the real, live-reproduced "the autocomplete has multiple suggestions for the same
-/// things". Completing `.` on a `String` against a live `rust-analyzer` returns `len`, `is_empty`
-/// and `as_bytes` **twice each** - once as the inherent `String` method and once through
-/// `Deref<Target = str>` - and the two copies of each are identical in `label`, `kind`, `detail`,
-/// `labelDetails`, `filterText`, `sortText` and `textEdit`. Only `documentation` differs
-/// ("Returns the length of this `String`, in bytes" vs "Returns the length of `self`").
-///
-/// `documentation` is therefore deliberately *not* part of the key. It is the one thing that
-/// differs, but it is invisible until an item is selected, so keeping both rows would not let a
-/// user pick the doc they wanted - it would only make them scroll past a row that does the same
-/// thing. Server order decides which survives, which for the case above keeps the inherent
-/// method's own doc. `data` is left out for the same reason (an opaque server token, never
-/// rendered); everything else that could change the row or the edit is in.
-///
-/// A `String` rather than a derived `Hash`: `lsp_types::CompletionItem`'s own fields are not
-/// `Hash`, and the fields that matter here (`CompletionTextEdit`, `CompletionItemLabelDetails`,
-/// `Command`, `TextEdit`) are all `Serialize`, so their real wire form is the honest identity -
-/// no hand-written field-by-field comparison to drift out of sync with `lsp_types`.
 fn interchangeable_completion_key(item: &lsp_types::CompletionItem) -> String {
     #[derive(serde::Serialize)]
     struct Key<'a> {
@@ -1269,18 +903,6 @@ mod tests {
             .collect()
     }
 
-    /// The real, live-reported "the autocomplete has multiple suggestions for the same things",
-    /// reproduced verbatim against a live `rust-analyzer` at the single most ordinary position
-    /// there is - `.` on a `String`. `String::len` and `str::len` (reachable through `Deref`) both
-    /// come back, and the two items are identical in `label`, `kind`, `detail`, `labelDetails`,
-    /// `filterText`, `sortText` **and** `textEdit`; the only field that differs at all is
-    /// `documentation` ("Returns the length of this `String`, in bytes" vs "Returns the length of
-    /// `self`"). `is_empty` and `as_bytes` arrive doubled the same way.
-    ///
-    /// So the popup painted two rows a user cannot tell apart and cannot choose between: same
-    /// badge, same label, same right-hand type hint, and accepting either splices the identical
-    /// `"len"` over the identical range. The first one wins because the server's own order puts
-    /// the inherent method ahead of the deref'd one.
     #[test]
     fn two_rows_a_user_cannot_tell_apart_or_choose_between_collapse_into_one() {
         let deref_twin = |doc: &str| lsp_types::CompletionItem {
@@ -1305,14 +927,6 @@ mod tests {
         );
     }
 
-    /// `rust-analyzer`'s own version of the same pile-up, from a live dump at `let r: Resu`: three
-    /// `Result` items that differ only in what they'd import (`labelDetails.detail` reads
-    /// `"(use std::fmt::Result)"`, `"(use std::io::Result)"`, `"(use std::thread::Result)"`) and
-    /// splice the identical `Result` over the identical range.
-    ///
-    /// These are three real choices and keep three rows - directly instructed, after a broader
-    /// version of [`same_choice_key`] merged them by package. Each writes a different `use` line,
-    /// and each row names which (`completion_import_source`), so they are told apart on sight.
     #[test]
     fn several_import_candidates_for_one_name_each_keep_their_row() {
         let import_candidate = |path: &str| lsp_types::CompletionItem {
@@ -1338,9 +952,6 @@ mod tests {
         );
     }
 
-    /// Two items that would insert genuinely different text are never collapsed either, however
-    /// alike their rows look - the dedupe is about rows a user cannot choose between, not about
-    /// labels that happen to match.
     #[test]
     fn an_identical_looking_row_with_a_different_edit_keeps_its_own_row() {
         let with_insert = |insert: &str| lsp_types::CompletionItem {
@@ -1420,7 +1031,6 @@ mod tests {
     #[test]
     fn a_real_prefix_match_outranks_a_substring_match_which_outranks_a_scattered_one() {
         let items = [
-            // Deliberately server-ordered worst-first, so only real re-ranking can fix it.
             item("vector_of_readers"), // scattered subsequence
             item("has_version"),       // contiguous, but not at the start
             item("version"),           // real prefix
@@ -1486,13 +1096,6 @@ mod tests {
         assert_eq!(completion_item_display(&no_detail_item).1, None);
     }
 
-    /// The real, live-reported bug: `rust-analyzer`'s own real `label_details.detail` for a
-    /// trait-provided method (`.into()`, `.try_into()`, ...) is a short trait-source annotation
-    /// (`"(as Into)"`), not a type at all - a real, live dump proved preferring it over the
-    /// legacy `detail` field (which *is* the real, clean signature for these same items) broke
-    /// the row hint for some of the most common completions there are. Both
-    /// `completion_item_display` and `completion_signature_text` must ignore `label_details`
-    /// entirely and read the legacy field.
     #[test]
     fn completion_item_display_ignores_a_real_rust_analyzer_trait_source_label_details_detail() {
         let item = lsp_types::CompletionItem {
@@ -1564,11 +1167,6 @@ mod tests {
         assert_eq!(completion_signature_text(&item), "push_str");
     }
 
-    /// The real, live-reported bug ("the shown things are still modules instead of real types"),
-    /// reproduced from a verbatim dump of a real resolved `typescript-language-server` auto-import
-    /// completion. Its `detail` is genuinely two lines - an import note, *then* the signature - so
-    /// a single-line type slot showed only the module path. The path belongs in the footer that
-    /// exists for paths; the type slot belongs to the real signature underneath it.
     #[test]
     fn a_real_typescript_auto_import_detail_splits_into_a_real_signature_and_a_real_path() {
         let item = lsp_types::CompletionItem {
@@ -1595,10 +1193,6 @@ mod tests {
         );
     }
 
-    /// The same real auto-import item *before* a `completionItem/resolve` round trip, dumped
-    /// verbatim from the live server: `detail` is then nothing but the bare module specifier. A
-    /// bare path is not a type, so the type slot must stay empty rather than showing a module
-    /// where the design promises a type.
     #[test]
     fn a_real_unresolved_typescript_auto_import_shows_no_type_and_a_real_path() {
         let item = lsp_types::CompletionItem {
@@ -1615,13 +1209,6 @@ mod tests {
         assert_eq!(completion_module_path(&item).as_deref(), Some("./helper"));
     }
 
-    /// The live-reported "the types are loading only after in a weird way replacing the module
-    /// names", dumped verbatim from a real `typescript-language-server` in a project configured
-    /// with the ordinary `"moduleResolution": "node"`: an auto-import from an installed *package*
-    /// carries that package's bare specifier - `detail: "typescript"`, with no separator of any
-    /// kind - and only the `completionItem/resolve` response carries the real signature. A
-    /// separator-only path test called that a type, so the row printed the module name in its type
-    /// slot until the resolve landed and visibly overwrote it with the signature.
     #[test]
     fn a_real_bare_package_specifier_is_a_module_path_not_a_type() {
         let item = lsp_types::CompletionItem {
@@ -1643,9 +1230,6 @@ mod tests {
         );
     }
 
-    /// The other half of the same real dump: the resolved form of that exact item, so the only
-    /// thing the resolve round trip changes is that a type *appears* where there was none - never
-    /// that one visible string is swapped for a different one.
     #[test]
     fn resolving_a_bare_package_import_only_adds_a_type_and_keeps_the_same_path() {
         let resolved = lsp_types::CompletionItem {
@@ -1673,12 +1257,6 @@ mod tests {
         );
     }
 
-    /// The regression this must never cause, dumped verbatim from a live `rust-analyzer`: a real
-    /// *field* completion's `detail` genuinely is a one-word type (`pub count: usize` ->
-    /// `label: "count"`, `detail: "usize"`), and so is a local variable's. A survey of every
-    /// single-token `detail` both servers emit found them only ever on those two value-shaped
-    /// kinds, which is exactly why the module-specifier rule is scoped to the kinds that cannot
-    /// have a one-word type at all.
     #[test]
     fn a_real_one_word_field_type_is_still_a_type() {
         for (label, kind, detail) in [
@@ -1706,10 +1284,6 @@ mod tests {
         }
     }
 
-    /// A real `rust-analyzer` type completion, dumped verbatim from a live server: `detail` is the
-    /// label repeated (`label: "Widget"`, `detail: "Widget"`, and identically for every primitive:
-    /// `i32`, `str`, `bool`). Rendering it printed the name twice on one row for no information at
-    /// all; the type slot should simply stay empty.
     #[test]
     fn a_real_rust_analyzer_type_completion_does_not_echo_its_own_label_as_a_type() {
         let item = lsp_types::CompletionItem {
@@ -1730,10 +1304,6 @@ mod tests {
         );
     }
 
-    /// A real `rust-analyzer` method completion, dumped verbatim from a live server: it fills
-    /// `label_details.description` with the *signature*, not the "fully qualified names or file
-    /// path" the LSP spec describes that field as holding. The footer must not print a signature
-    /// as if it were a module path - while the type slot keeps showing that same real signature.
     #[test]
     fn a_real_rust_analyzer_signature_is_never_mistaken_for_a_module_path() {
         let item = lsp_types::CompletionItem {
@@ -1753,9 +1323,6 @@ mod tests {
         assert_eq!(completion_module_path(&item), None);
     }
 
-    /// A real `rust-analyzer` auto-import path *does* arrive in `label_details.description`, and
-    /// must still reach the footer - the guard above narrows that field to genuine paths, it does
-    /// not abandon it.
     #[test]
     fn a_real_qualified_path_description_still_reaches_the_footer() {
         let item = lsp_types::CompletionItem {
@@ -1773,19 +1340,6 @@ mod tests {
         );
     }
 
-    /// `pyright-langserver`, the third real server this app spawns, uses `detail` for neither a
-    /// type nor a path: a live dump shows it holds the literal marker string `"Auto-import"` and
-    /// nothing else, with the real module in `labelDetails.description`:
-    ///
-    /// ```text
-    /// {"label":"_path","kind":9,"detail":"Auto-import","labelDetails":{"description":"os"}}
-    /// {"label":"path","kind":6,"detail":"Auto-import","labelDetails":{"description":"os"}}
-    /// ```
-    ///
-    /// `"Auto-import"` is a single token with no path separator, so the module-specifier rule was
-    /// filing it as this item's *module path* on class/function/module-kinded rows and as its
-    /// *type* on variable/constant-kinded ones - a literal `Auto-import` printed in both slots
-    /// across a whole Python completion list, while the real module name (`os`) went unread.
     #[test]
     fn a_real_pyright_auto_import_marker_is_neither_a_type_nor_a_module_path() {
         for (label, kind) in [
@@ -1818,20 +1372,6 @@ mod tests {
         }
     }
 
-    /// The whole live-reported list, end to end: what typing `app` in a real Vue + `@types/node`
-    /// project actually returned, and what the popup has to make of it.
-    ///
-    /// Every label, kind and `sortText` below is verbatim from a live `typescript-language-server`
-    /// at that caret (`"11"` = in scope or already imported, `"15"` = a global, `"\u{ffff}16"` =
-    /// an auto-import candidate, which is the server's own lowest band). What the user saw was
-    /// twelve rows led by *seven* `@types/node` auto-imports - `appendFile` four times - with the
-    /// local `app` and the imported `App` and `createApp` scattered among and below them.
-    ///
-    /// Three separate rules have to hold for this list to come out usable, and this pins the
-    /// result of all three together because any one of them alone still leaves it unreadable:
-    /// `app`/`App` are fully-typed matches and lead ([`CompletionMatchTier::Exact`]); the
-    /// auto-imports drop below everything the server ranked higher (`sortText`); and the repeats
-    /// collapse to one row each ([`same_choice_key`]).
     #[test]
     fn the_real_reported_app_completion_list_comes_out_readable() {
         let item =
@@ -1890,9 +1430,6 @@ mod tests {
         );
     }
 
-    /// The rule underneath that, on its own: a candidate the query spells out in full outranks one
-    /// that merely starts with it, however the server ordered them. `app` and `App` are both fully
-    /// typed; `App` follows only because its case doesn't match exactly.
     #[test]
     fn a_fully_typed_candidate_outranks_one_that_merely_starts_with_it() {
         let bare = |label: &str| lsp_types::CompletionItem {
@@ -1907,9 +1444,6 @@ mod tests {
         assert_eq!(ranked, vec!["app", "App", "appendFile"]);
     }
 
-    /// A server that expresses priority through response order alone - no `sortText` on any item -
-    /// must keep that order exactly. The spec's "when omitted the label is used" fallback, applied
-    /// to a list where *nothing* carries one, would quietly re-sort everything alphabetically.
     #[test]
     fn a_response_with_no_sort_text_at_all_keeps_the_servers_own_order() {
         let bare = |label: &str| lsp_types::CompletionItem {
@@ -1932,9 +1466,6 @@ mod tests {
         );
     }
 
-    /// And the reverse: once the server *does* rank its items, that ranking decides between two
-    /// candidates this matcher scores identically - here two exact-quality prefix matches, one of
-    /// which the server put in its lowest band.
     #[test]
     fn a_real_server_sort_text_outranks_the_responses_own_arbitrary_order() {
         let ranked_item = |label: &str, sort: &str| lsp_types::CompletionItem {
@@ -1953,13 +1484,6 @@ mod tests {
         assert_eq!(ranked, vec!["valueInScope", "valueFromNodeTypes"]);
     }
 
-    /// The live-reported over-collapse: "some things should not have counted as duplicates."
-    ///
-    /// An earlier version of [`same_choice_key`] keyed on label, kind and inserted text alone, so
-    /// two same-named exports of two *unrelated* packages were merged and one silently vanished.
-    /// In a Vue project that is a real hazard - plenty of packages export a `Ref`, a `Component`,
-    /// a `Plugin` - and the surviving row would have imported from whichever the ranking happened
-    /// to put first.
     #[test]
     fn two_same_named_exports_of_unrelated_packages_keep_their_own_rows() {
         let from = |module: &str| lsp_types::CompletionItem {
@@ -2002,15 +1526,6 @@ mod tests {
         );
     }
 
-    /// When two spellings of one Node builtin collapse, the surviving row is the `node:` one -
-    /// decided here rather than inherited from whatever order the server happened to send.
-    ///
-    /// `node:` cannot be shadowed by a userland package of the same name, and Node's newer
-    /// builtins are prefix-only outright: the installed `@types/node` declares `node:test`,
-    /// `node:sea` and `node:sqlite` with no bare form at all, against `fs`/`path`/`os` which have
-    /// both. The second half of this test is the one that matters - it feeds the group in the
-    /// *opposite* order to the one a live `typescript-language-server` uses, which is exactly the
-    /// case the old "keep whichever came first" rule would have got wrong.
     #[test]
     fn the_node_prefixed_spelling_is_the_row_that_survives_whatever_order_it_arrives_in() {
         let candidate = |module: &str| lsp_types::CompletionItem {
@@ -2021,7 +1536,6 @@ mod tests {
             ..Default::default()
         };
 
-        // The order a live server actually sends.
         let items = [candidate("node:fs"), candidate("fs")];
         let ranked = rank_completion_items(&items, "app");
         assert_eq!(ranked, vec![0]);
@@ -2030,7 +1544,6 @@ mod tests {
             Some("node:fs")
         );
 
-        // And the reverse, which no longer changes the answer.
         let items = [candidate("fs"), candidate("node:fs")];
         let ranked = rank_completion_items(&items, "app");
         assert_eq!(
@@ -2045,8 +1558,6 @@ mod tests {
         );
     }
 
-    /// The preference must not disturb the row's *position*: a group keeps the rank its best
-    /// member earned, so preferring a later member cannot float it above unrelated rows.
     #[test]
     fn preferring_a_spelling_does_not_move_the_row_up_or_down_the_list() {
         let candidate = |label: &str, module: Option<&str>, sort: &str| lsp_types::CompletionItem {
@@ -2070,23 +1581,16 @@ mod tests {
         );
     }
 
-    /// What [`canonical_import_source`] does and, far more importantly, does not do. Every pair
-    /// below was decided against a live dump and then confirmed directly: only Node's two
-    /// spellings of one module fold together.
     #[test]
     fn only_nodes_two_spellings_of_one_module_are_the_same_import() {
         for (source, canonical) in [
-            // The one fold: `typescript-language-server` offers both spellings of every builtin.
             ("node:fs", "fs"),
             ("node:fs/promises", "fs/promises"),
             ("node:async_hooks", "async_hooks"),
             ("fs", "fs"),
-            // Same package, different module - the callback API and the promise API. Two rows.
             ("fs/promises", "fs/promises"),
-            // Three different `use` lines, from a live `rust-analyzer` dump. Three rows.
             ("std::io::Result", "std::io::Result"),
             ("std::fmt::Result", "std::fmt::Result"),
-            // Everything else, untouched.
             ("os", "os"),
             ("os.path", "os.path"),
             ("typing", "typing"),
@@ -2098,8 +1602,6 @@ mod tests {
         }
     }
 
-    /// Collapsing is by what a row *inserts*, not by its label: two items that share a label but
-    /// would splice genuinely different text are two real choices and keep their own rows.
     #[test]
     fn two_rows_that_insert_different_text_are_never_collapsed() {
         let with_insert = |insert: &str| lsp_types::CompletionItem {
@@ -2112,19 +1614,6 @@ mod tests {
         assert_eq!(rank_completion_items(&items, "new"), vec![0, 1]);
     }
 
-    /// The live-reported "`appendFile` appears four times", dumped verbatim from a real
-    /// `typescript-language-server` against a real scratch project with a real `@types/node`
-    /// installed, completing `app` at `const other = app`.
-    ///
-    /// The two `appendFile` items that come back are two genuinely different auto-import
-    /// candidates - `import { appendFile } from 'fs'` and `import { appendFile } from
-    /// 'fs/promises'` - so they keep two rows, each naming its own module. Only Node's *other*
-    /// spelling of one of them (`node:fs`) folds in ([`canonical_import_source`]).
-    ///
-    /// Neither item carries a signature before `completionItem/resolve` (the whole 1029-item
-    /// response carries not one multi-token `detail`), so a row showing the *type* would have been
-    /// blank until selected. The module is right there in the first response, which is why it -
-    /// and not the type - is what a row shows. See [`completion_row_hint`].
     #[test]
     fn a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated() {
         let candidate = |module: &str| lsp_types::CompletionItem {
@@ -2156,9 +1645,6 @@ mod tests {
         );
     }
 
-    /// `rust-analyzer`'s in-scope items name no module at all, but do carry a real signature
-    /// inline, on the first response - so that is what their row shows, and it is complete
-    /// immediately. Verbatim from a live dump at `text.le` and `w.c`.
     #[test]
     fn a_real_rust_analyzer_row_shows_the_signature_it_was_sent_inline() {
         for (label, kind, detail) in [
@@ -2183,15 +1669,6 @@ mod tests {
         }
     }
 
-    /// The rule that makes a row genuinely frozen: an item with **no** origin and **no** inline
-    /// signature paints nothing, and keeps painting nothing no matter what a later resolve says.
-    /// This is the live-reported "all data should be here without needing to select the
-    /// suggestion" - a row that fills in on selection is the bug, not the cure.
-    ///
-    /// `app` here is verbatim: a real `typescript-language-server` sends it bare
-    /// (`{"label":"app","kind":6}`), and its resolve returns `detail: "const app: App<Element>"` -
-    /// which belongs to the detail pane, and which [`completion_row_hint`] must not put on a row
-    /// even when handed the resolved item.
     #[test]
     fn a_resolve_response_can_never_put_anything_new_on_a_row() {
         let inline = lsp_types::CompletionItem {
@@ -2218,10 +1695,6 @@ mod tests {
         );
     }
 
-    /// The same import source must read identically before and after `completionItem/resolve`, or
-    /// the row would visibly swap one string for another under the user - the exact complaint
-    /// `detail_is_module_specifier` was added for. Both halves dumped verbatim from the same live
-    /// `typescript-language-server` response above.
     #[test]
     fn a_resolved_auto_import_candidate_keeps_the_very_same_import_source_on_its_row() {
         let unresolved = lsp_types::CompletionItem {
@@ -2254,17 +1727,6 @@ mod tests {
         );
     }
 
-    /// `rust-analyzer`'s own version of the same thing, dumped verbatim from a live server at
-    /// `let r: Resu`: **four** items labelled `Result`, three of them auto-import candidates that
-    /// differ in nothing but `labelDetails.detail` - `"(use std::fmt::Result)"`,
-    /// `"(use std::io::Result)"`, `"(use std::thread::Result)"`. Their `detail` is `null` and
-    /// their `textEdit` is byte-identical, so every one of those rows painted a bare `Result` and
-    /// an empty type slot: three rows a user genuinely cannot choose between, for three genuinely
-    /// different `use` statements.
-    ///
-    /// That note is the one field carrying the difference, and nothing rendered it anywhere -
-    /// [`split_completion_detail`] only ever consulted `label_details.description`, which these
-    /// items leave unset.
     #[test]
     fn three_real_rust_analyzer_import_candidates_each_name_the_use_they_would_add() {
         let candidate = |path: &str| lsp_types::CompletionItem {
@@ -2299,9 +1761,6 @@ mod tests {
         }
     }
 
-    /// `rust-analyzer` really does concatenate a doc-alias note and an import note on one item, so
-    /// the import source has to be found inside the string rather than anchored at its start.
-    /// Verbatim from the same live dump, on `std::env::temp_dir`.
     #[test]
     fn a_real_combined_alias_and_use_note_still_yields_the_import_source() {
         let item = lsp_types::CompletionItem {
@@ -2328,13 +1787,6 @@ mod tests {
         );
     }
 
-    /// The narrowness that rule needs, from the same live `rust-analyzer` dump: of the 14 items
-    /// carrying a `labelDetails.detail` at that position, 8 were `"(use ...)"` import notes and
-    /// the other 6 were `"(alias ==, !=)"`, `"(alias <, >, <=, >=)"`, `"(alias ?, ?Sized)"`,
-    /// `"(alias list, vector)"` - doc aliases, not imports - and an ordinary method carries
-    /// `"(as Into)"` there (see
-    /// [`a_real_rust_analyzer_signature_is_never_mistaken_for_a_module_path`]). None of those is a
-    /// path, and printing one as an import source would be a fresh version of the same bug.
     #[test]
     fn a_real_alias_or_trait_note_is_not_an_import_source() {
         for note in [
@@ -2361,9 +1813,6 @@ mod tests {
         }
     }
 
-    /// Real, live-observed shapes from both servers this app supports - a real dump against a
-    /// genuinely spawned rust-analyzer/typescript-language-server, not synthetic guesses (see
-    /// `clean_completion_detail`'s own docs).
     #[test]
     fn clean_completion_detail_strips_a_real_typescript_method_kind_and_qualifier_prefix() {
         assert_eq!(
@@ -2392,10 +1841,6 @@ mod tests {
         );
     }
 
-    /// The real guard against a false-positive strip: a genuine parenthesized parameter list or
-    /// tuple type at the very start of `detail` must never be mistaken for a kind descriptor -
-    /// distinguished by the real presence of `:`/`,` inside the parens, which no real TypeScript
-    /// kind descriptor (`method`, `property`, `local var`, ...) ever contains.
     #[test]
     fn clean_completion_detail_never_strips_a_real_parenthesized_type() {
         assert_eq!(

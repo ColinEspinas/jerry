@@ -1,21 +1,5 @@
 //! The rail's menus, wired up (GitHub issue #290): opening one off a real right-click, drawing it
 //! through the app's one shared popover ([`crate::menu`]), and running what its rows promise.
-//!
-//! The row sets themselves are [`crate::rail::menu`]'s, and the popover is
-//! [`AdeApp::render_menu_overlay`]'s - what is here is only this surface's own glue.
-//!
-//! ## Both menus render at the root, not in the rail
-//!
-//! `REVISION-2026-08-14.md` §4, verbatim: "All menus render outside the scrolling list. Inside it
-//! they are clipped by the scroller and scroll away from their anchor." The rail's Worktrees list
-//! really is a scroller - a real virtualized `gpui::list` (`crate::rail::render::AdeApp::
-//! rail_list_state`) painted inside the same `#agent-rail-list` band - so a menu rendered as a
-//! child of a row would be clipped by it, would slide away from the pointer it was anchored to on
-//! the next wheel event, and would vanish outright whenever its row left the viewport.
-//! `STAGE-A-CHANGELOG.md` §4w generalises it: "an overlay anchored in viewport coordinates must
-//! live at the root. If it is nested in a panel, every property of that panel - its scroll, its
-//! clip, its mount condition - becomes a bug in the overlay." Both of these are therefore
-//! children of `crate::root::AdeApp::render`'s own overlay list.
 
 use super::*;
 use crate::menu::model as menu_model;
@@ -30,12 +14,6 @@ use crate::work_surface::agents::AgentId;
 impl AdeApp {
     /// Opens the worktree/agent row menu at a real pointer position, clamped so the whole popover
     /// stays inside the window ([`menu_model::clamp_menu_origin`]).
-    ///
-    /// Deliberately does **not** change the rail's selection the way the file tree's right-click
-    /// does: selecting a rail row switches the whole app's worktree/agent context (and can even
-    /// check a different repo out), which is far too much to happen because someone aimed at a
-    /// menu. Every row that needs the target selected does that itself, as part of the action the
-    /// user actually asked for.
     pub(crate) fn open_rail_row_menu(
         &mut self,
         target: RailMenuTarget,
@@ -182,11 +160,6 @@ impl AdeApp {
 
     /// Every run `Archive N agents` really ends: the agent sessions open in `worktree_path`, in
     /// the rail's own order.
-    ///
-    /// Deliberately the same `ProcessKind::is_agent_session` filter [`AdeApp::build_agent_rows`]
-    /// uses to decide which agents get a rail row at all, so the count in the label is exactly
-    /// the number of rows the user can see under that worktree. A count that also included plain
-    /// shells would promise to archive things the worktree row never showed.
     fn worktree_archivable_agent_ids(&self, worktree_path: &std::path::Path) -> Vec<AgentId> {
         self.agents
             .iter_for_cwd(worktree_path.to_path_buf())
@@ -209,10 +182,6 @@ impl AdeApp {
     /// Runs one rail menu row. Reads its target off whichever menu is open, exactly like the file
     /// tree's own dispatcher does - a row's action names *what* to do, and the open menu is the
     /// only honest source for *to what*.
-    ///
-    /// Every row closes the menu, with the two deliberate exceptions the design asks for:
-    /// `Open in…` replaces it with its own second level, and the first click of
-    /// `Remove worktree…` leaves it open so the confirming click has something to land on.
     pub(crate) fn run_rail_menu_action(
         &mut self,
         action: RailMenuAction,
@@ -380,18 +349,6 @@ impl AdeApp {
 
     /// The `⋯` More cell (§4t: "a permanent cell in a 5-cell strip is a claim that you switch to
     /// it constantly. If you don't, it belongs in the overflow").
-    ///
-    /// It is the strip's last cell, and it is a *cell*: GitHub issue #291 moved it out of the
-    /// stop-gap rail header it was parked in and into the sidebar strip that was always its home,
-    /// where it goes through `crate::rail::strip_render::strip_cell` like every other child - so
-    /// it carries the column rule, the 38px width and the glyph-only hover the rest of the strip
-    /// does. `Jerry.dc.html` gives it a `border-left` (rather than the view cells' `border-right`)
-    /// because it sits on the far side of the strip's flex spacer.
-    ///
-    /// None of the menu machinery below changed in that move, exactly as this comment promised it
-    /// would not: a `gpui::canvas` still captures the button's real window-space rect (the same
-    /// capture the commit composer's `▾` menu uses), because §4w anchors this menu to the
-    /// button's own rect rather than to the pointer.
     pub(in crate::rail) fn render_rail_overflow_button(
         &self,
         cx: &mut Context<Self>,
@@ -622,9 +579,6 @@ mod rail_menu_tests {
         painted.into_iter().map(|(_, label)| label).collect()
     }
 
-    /// `REVISION-2026-08-14.md` §4's worktree row set, through a real right-click on a real row:
-    /// "`New agent here`, `Archive N agents`, `Copy branch name`, `Copy path`, `Open in…`,
-    /// `Remove worktree…`" - and the count really comes from the agents open in *that* worktree.
     #[gpui::test]
     fn right_clicking_a_worktree_row_paints_the_row_set_the_revision_lists(
         cx: &mut TestAppContext,
@@ -649,7 +603,6 @@ mod rail_menu_tests {
             painted_row_labels(&app, cx, "rail-row-menu"),
             vec![
                 "New agent here",
-                // The startup shell really lives in the main worktree, so its count is real.
                 "Archive 1 agent",
                 "Copy branch name",
                 "Copy path",
@@ -658,7 +611,6 @@ mod rail_menu_tests {
             ]
         );
 
-        // A worktree with no agent in it reports that, rather than offering to archive nothing.
         cx.simulate_click(
             gpui::Point::new(px(600.0), px(400.0)),
             gpui::Modifiers::none(),
@@ -672,9 +624,6 @@ mod rail_menu_tests {
         );
     }
 
-    /// §7 rule 1 ("Ship the affordance with the behaviour, or ship neither"), taken literally for
-    /// the row that spawns work: `New agent here` really spawns a real agent into the worktree it
-    /// was opened on - including one that was not the selected worktree when the menu opened.
     #[gpui::test]
     fn new_agent_here_really_spawns_an_agent_into_that_worktree(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -709,8 +658,6 @@ mod rail_menu_tests {
         });
     }
 
-    /// §4/§6's agent row set: `Open`, exactly one of `Pause`/`Resume`, and one `Archive run` -
-    /// with no red `Delete run…` beside it (§7 rule 3).
     #[gpui::test]
     fn right_clicking_an_agent_row_paints_open_one_pause_or_resume_and_one_archive_run(
         cx: &mut TestAppContext,
@@ -744,12 +691,6 @@ mod rail_menu_tests {
         );
     }
 
-    /// `REVISION-2026-08-14.md` §4, verbatim: "All menus render outside the scrolling list. Inside
-    /// it they are clipped by the scroller and scroll away from their anchor."
-    ///
-    /// Scrolls the real rail list under a really-open menu and asserts the menu did not move a
-    /// pixel - with the row it was opened from really moving, so the scroll is proven to have had
-    /// an effect rather than the test passing on a scroller that never scrolled.
     #[gpui::test]
     fn scrolling_the_rail_does_not_move_or_clip_an_open_menu(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -820,8 +761,6 @@ mod rail_menu_tests {
         );
     }
 
-    /// The `⋯` overflow (§4t/§4u/§4w): History and Settings only, hanging off the button's own
-    /// rect with right edges aligned.
     #[gpui::test]
     fn the_overflow_button_opens_history_and_settings_under_its_own_right_edge(
         cx: &mut TestAppContext,
@@ -864,8 +803,6 @@ mod rail_menu_tests {
         );
     }
 
-    /// Every row of the overflow does something on day one (§7 rule 1) - proven by really doing
-    /// it: Settings opens the real Settings surface, and the menu closes behind it.
     #[gpui::test]
     fn picking_settings_from_the_overflow_really_opens_settings(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -889,9 +826,6 @@ mod rail_menu_tests {
         });
     }
 
-    /// §6, verbatim: "Ends the run. It stays in History with its transcript, diffstat and notes;
-    /// the files it wrote are untouched." Asserted as behaviour: the run's tab is really gone,
-    /// and the worktree and the file it wrote are really still there.
     #[gpui::test]
     fn archive_run_ends_the_run_and_leaves_the_worktree_and_its_files_alone(
         cx: &mut TestAppContext,
@@ -917,9 +851,6 @@ mod rail_menu_tests {
         assert!(written.exists(), "and so are the files the run wrote");
     }
 
-    /// `Remove worktree…` routes into the existing two-step discard flow: the first click only
-    /// arms (and re-labels the row, leaving the menu open under the pointer), the second really
-    /// removes the checkout.
     #[gpui::test]
     fn remove_worktree_takes_two_clicks_and_then_really_removes_the_checkout(
         cx: &mut TestAppContext,
@@ -961,8 +892,6 @@ mod rail_menu_tests {
         });
     }
 
-    /// Closing the menu by *any* means disarms a half-confirmed removal - so the next open can
-    /// never be one click away from deleting a checkout.
     #[gpui::test]
     fn dismissing_the_menu_disarms_a_half_confirmed_removal(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -979,7 +908,6 @@ mod rail_menu_tests {
             );
         });
 
-        // A real click away, on the menu's own scrim.
         cx.simulate_click(
             gpui::Point::new(px(700.0), px(500.0)),
             gpui::Modifiers::none(),
@@ -999,8 +927,6 @@ mod rail_menu_tests {
         assert!(feature.exists(), "and nothing may have been removed");
     }
 
-    /// `Open in…` really opens its own second level in the same popover, rather than silently
-    /// picking one of the two destinations its ellipsis promises.
     #[gpui::test]
     fn open_in_opens_its_second_level_in_the_same_menu(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -1023,9 +949,6 @@ mod rail_menu_tests {
         );
     }
 
-    /// A menu opened at the very foot of the window flips above the pointer and stays painted
-    /// inside the window - `REVISION-2026-08-14.md` §4's "flip above when they would overflow the
-    /// rail's bottom", asserted against the popover's *painted* bounds rather than its arithmetic.
     #[gpui::test]
     fn a_menu_opened_at_the_windows_foot_flips_above_the_pointer(cx: &mut TestAppContext) {
         let repo = init_repo();

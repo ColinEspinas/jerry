@@ -7,173 +7,6 @@
 //! `Window` construction - see that module's own top doc comment for the same convention. The
 //! real GPUI wiring (`EntityInputHandler`, keyboard actions, painting a real cursor/selection)
 //! lives in `crate::code_surface::editing`, which drives this module's methods.
-//!
-//! ## Real multi-step undo/redo (GitHub issue #17)
-//!
-//! Ordinary editing - typing, IME composition, Backspace/Delete/Enter, paste, cut, an accepted
-//! completion - funnels through exactly two public methods ([`Self::replace_range`] and
-//! [`Self::replace_and_mark_range`]) and one private splice ([`Self::splice_lines`]). That choke
-//! point is what makes a real history cheap to attach correctly: both public methods record the
-//! splice they just performed - the byte offset, the exact text removed, the exact text inserted,
-//! and the real selection on either side - into [`Self::history`]
-//! (`crate::text_history::TextHistory`), which owns the coalescing policy. See that module's own
-//! docs for the policy itself and for why it lives there rather than here.
-//!
-//! Two real exceptions to that funnel, both deliberate and both recording:
-//! [`Self::reload_from_disk`] replaces the whole buffer (and rebuilds the derived tables directly
-//! rather than splicing), and [`Self::content`] is a `pub` field, so the funnel is a convention
-//! this type's own methods keep, not something the type system enforces the way
-//! `crate::text_history::TextField` does for the app's single-line inputs. [`Self::undo`]/
-//! [`Self::redo`] therefore validate a group against the buffer's real current bytes before
-//! applying any of it, and refuse outright rather than half-applying - see [`Self::undo`]'s own
-//! docs.
-//!
-//! [`Self::undo`]/[`Self::redo`] replay a whole group through the same `splice_lines` every real
-//! edit already uses, so the incremental line/UTF-16 tables below stay correct by construction
-//! rather than by a second, parallel implementation. They restore the recorded caret **and**
-//! selection, never just the text.
-//!
-//! Recording is suppressed while a group is being replayed ([`Self::replaying`]) - otherwise an
-//! undo would immediately record itself as a fresh edit and the stack could never move backwards.
-//!
-//! What is deliberately *not* here: history does not survive the buffer itself. `AdeApp::
-//! edit_buffers` keeps one buffer per open file for as long as the tab lives, so switching tabs and
-//! back preserves that file's history (a real regression test covers exactly that), but closing the
-//! tab or switching worktree drops the buffer and its history with it - explicitly out of scope per
-//! GitHub issue #17's own checklist.
-//!
-//! ### Multi-cursor edits are one real undo step (issue #28, landing on top of issue #17)
-//!
-//! `crate::text_history`'s own docs call this out as a design goal it was built to accommodate: an
-//! [`text_history::EditGroup`] holds a `Vec<TextEdit>`, not a single edit, specifically so that N
-//! simultaneous multi-cursor splices recorded into one group become one undo step. [`Self::
-//! apply_at_every_cursor`] does exactly that - it calls [`TextHistory::record`] once per cursor's
-//! own splice, chaining each call's `before` snapshot to the previous call's `after` so the
-//! coalescing policy's own caret-continuity rule (`before == top.after`) merges every one of them
-//! into a single group rather than starting a fresh one per cursor. The group's *stored*
-//! `before`/`after` (what undo/redo actually restore) are the chain's real first/last values, not
-//! synthetic ones - see that method's own docs for exactly which cursor's snapshot each is.
-//!
-//! **A real, documented limitation, not a fabricated "it just works"**: [`text_history::
-//! SelectionSnapshot`] - shared with every other real text widget in this app
-//! (`crate::text_history::TextField`) - holds exactly one caret/selection, mirroring this buffer's
-//! own primary [`Self::selected_range`]/[`Self::selection_reversed`] pair. It has no way to
-//! represent [`Self::secondary_cursors`]. So undoing/redoing a multi-cursor edit correctly restores
-//! **all of the text** as one atomic step (every cursor's own edit reverses/replays together,
-//! genuinely one Ctrl+Z), but only restores the **primary** cursor's own caret/selection
-//! precisely; every secondary cursor from that edit is not reconstructed by undo/redo, and the
-//! buffer is left in ordinary single-cursor state afterward. Extending `SelectionSnapshot` to a real
-//! multi-cursor shape would touch every one of `crate::text_history`'s own consumers (`rail`,
-//! `palette`, `settings`, `root::new_file`), not just this buffer - real, separate, cross-cutting
-//! work outside this one sub-issue's scope, left as a documented gap rather than guessed at.
-//!
-//! ## Multi-cursor: `Self::secondary_cursors`
-//!
-//! [`Self::selected_range`]/[`Self::selection_reversed`] remain the *primary* cursor exactly as
-//! before this revision (Revision R13, issue #28) - every existing single-cursor method
-//! (`Self::move_left`, `Self::replace_range`, etc.) keeps its exact prior behavior, unchanged,
-//! whenever [`Self::secondary_cursors`] is empty (the default, and the only state a freshly
-//! constructed buffer or a plain click ever leaves it in). [`Self::secondary_cursors`] holds every
-//! *additional* real cursor/selection - VS Code-style `Ctrl+D` ("Add Selection To Next Find
-//! Match"), `Ctrl+Shift+L` ("Select All Occurrences"), and Alt+click all populate it (see
-//! [`Self::select_word_or_add_next_occurrence`], [`Self::select_all_occurrences`],
-//! [`Self::add_cursor_at`]).
-//!
-//! The design choice made here: rather than replacing `selected_range`/`selection_reversed` with a
-//! `Vec<Selection>` everywhere (which would have meant rewriting every one of this file's own
-//! already-correct, already-tested single-cursor methods, and every call site across
-//! `crate::code_surface::editing`'s ~2900 lines, to index into a vector instead of reading a plain
-//! field), the primary cursor keeps its own plain fields and every multi-cursor operation is
-//! layered on top as a genuinely new, additive code path:
-//!
-//! - **Simultaneous edits** ([`Self::replace_range`]/[`Self::backspace`]/[`Self::delete_forward`],
-//!   used by every keystroke, paste, and IME commit - `crate::code_surface::editing`'s
-//!   `EntityInputHandler` impl and `Editor*` action handlers already funnel through these three,
-//!   unchanged): each one now checks `Self::secondary_cursors` first and, if non-empty, routes
-//!   through [`Self::apply_at_every_cursor`] instead of its own prior single-range body - one
-//!   atomic multi-cursor edit, not N independent ones (see that method's own docs for the real
-//!   right-to-left splice ordering this relies on for correctness).
-//! - **Cursor movement** (`Self::move_left`/`Self::move_right`/.../`Self::select_down`, driving
-//!   every arrow-key `Editor*` action): each now routes through [`Self::move_every_cursor`] when
-//!   multiple cursors are active, so an arrow key moves *every* real cursor together instead of
-//!   silently stranding every secondary wherever `Ctrl+D` left it - see that method's own docs for
-//!   the one honest, narrow scope cut (no independent per-cursor sticky goal-column) this makes.
-//! - **Collision merging** ([`Self::merge_colliding_cursors`]): called at the end of every
-//!   operation above that could produce two overlapping/identical cursors (an edit, a movement, or
-//!   adding a new cursor) - VS Code's own "cursors merge when they collide" behavior, not a manual
-//!   step the caller has to remember.
-//! - **A plain, unmodified click always collapses back to one cursor**: [`Self::move_to`]/
-//!   [`Self::select_to`] (the real target of every ordinary/shift-click, and the same primitives
-//!   every single-cursor keyboard method already funneled through) now clear
-//!   [`Self::secondary_cursors`] as their first step - matching every real multi-cursor editor's
-//!   own "clicking without a modifier always means one cursor" rule. `Esc`
-//!   ([`Self::collapse_to_single_cursor`]) does the same thing as an explicit action.
-//!
-//! **A documented, honest gap**: `EditBuffer::replace_and_mark_range` (real IME composition) and
-//! any *explicit*-range call to `Self::replace_range` (e.g. a completion's own text-edit
-//! application) do **not** route through the multi-cursor path even while
-//! `Self::secondary_cursors` is non-empty - composing text or accepting a completion while
-//! multiple cursors are active only ever affects the primary, leaving every secondary cursor's own
-//! position stale relative to the resulting edit. A real, narrow edge case (composing CJK/accented
-//! input, or accepting an LSP completion, while mid multi-cursor selection is rare in practice),
-//! left undone rather than guessed at, per this phase's own priority: a correct core model plus
-//! `Ctrl+D`/simultaneous typing-deleting-pasting, not every possible interaction of every existing
-//! subsystem with a genuinely new one.
-//!
-//! **Also left undone, both flagged in issue #28 itself as more peripheral than the above**:
-//! Alt+Shift+drag column selection (this editor has no mouse-drag-to-select of *any* kind yet -
-//! only click and shift-click, so a column-selection variant of a feature that doesn't exist yet
-//! is out of reach without first building ordinary drag-select, itself a separate, real piece of
-//! work), and `Ctrl+K Ctrl+D`'s own "skip" is implemented ([`Self::skip_current_occurrence`]) but
-//! deliberately does not attempt to also support skipping a cursor other than the most-recently-
-//! added one (matching VS Code's own real behavior, which also only ever acts on the most recent
-//! selection).
-//!
-//! ## Diff/Merge views stay 100% read-only
-//!
-//! Only the File view gets real editing this phase. `crate::code_surface::
-//! render_diff_file_detail` and `crate::merge::render`'s conflict-resolution columns
-//! are untouched - neither renders through [`EditBuffer`] or gains any `EntityInputHandler`
-//! wiring, so a hand-edit inside a diff hunk or an in-progress merge conflict resolution is still
-//! not possible, exactly as before this phase.
-//!
-//! ## Re-highlighting cost, and why typing doesn't re-run `tree-sitter` on every keystroke
-//!
-//! A real, measured number, not a guess: highlighting this crate's own largest real `.rs` file
-//! (`crates/app/src/lsp/client.rs`, 3618 lines / ~180KB) end to end
-//! (`code_view::highlight_rust` + `code_view::build_lines`) took **~75ms** in a debug build
-//! (averaged over 10 runs). That's nowhere near the ~5-8ms/frame budget needed for typing to not
-//! visibly lag at 60fps - re-running this on every keystroke for a file that size would make the
-//! whole app stutter on every character typed, the exact "expensive recomputation on every
-//! render/keystroke" bug class this project has hit and fixed repeatedly - a separate,
-//! independent measurement of a *different* code path (per-hunk Diff/Merge highlighting) found
-//! up to ~80ms on the same file and added a 300-line cap for it there too.
-//!
-//! So [`EditBuffer::replace_range`]/[`EditBuffer::replace_and_mark_range`] (every real edit -
-//! typing, paste, Backspace/Delete/Enter all reduce to one of these two) never call a highlighter
-//! directly. Instead they call [`EditBuffer::splice_lines`], which re-derives just the line(s) the
-//! edit actually touches - via [`code_view::build_lines`] with an **empty** span list, restricted
-//! to that narrow region, never the whole buffer (see that method's own docs for the real,
-//! measured whole-buffer-per-keystroke performance bug this fixes) - a cheap, real, honest
-//! immediate result (every visible row's *text* is always exactly correct the instant you type).
-//! Only the touched line(s)' own runs reset to plain [`code_view::HighlightKind::Text`] until real
-//! highlighting catches up; an untouched line keeps whatever real highlighting it already had (a
-//! real improvement over an earlier, whole-buffer-rebuild version of this same idea, which
-//! flickered the *entire* file back to plain on every single keystroke, however far from the edit
-//! point). Either way, `EditBuffer::highlight_dirty` is set `true` whenever this happens, so
-//! `crate::root::AdeApp` knows a real re-highlight (which fully replaces every line's own runs,
-//! not just the touched ones) is owed.
-//!
-//! `crate::root::AdeApp` debounces the real `tree-sitter` re-highlight a short interval after the
-//! last keystroke (see `AdeApp::schedule_rehighlight`'s own docs) rather than either running it
-//! inline (too slow, per the measurement above) or trying to incrementally patch the previous
-//! frame's stale colored spans onto the new text (rejected as needless complexity/risk: a
-//! naively-shifted stale span landing on the *wrong* new token would be a more misleading result
-//! than the plain, honestly-uncolored text this module shows in the meantime). Once the debounce
-//! fires, [`EditBuffer::apply_highlight`] installs the real result - guarded by a `content`
-//! equality check so a highlight computed against now-stale content (a further keystroke arrived
-//! while it was computing) is discarded rather than clobbering newer, correct plain text with
-//! older, wrong-position colors.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -364,9 +197,6 @@ pub struct EditBuffer {
     pub symbols: Vec<symbols::SymbolSpan>,
     /// GitHub issue #202: this buffer's collapsible regions as of [`Self::lines`], memoized.
     /// `None` means "owed a recompute" - see [`Self::fold_ranges`].
-    ///
-    /// Private, and only ever read through that accessor, so no call site can look at a list
-    /// that describes a revision of the text this buffer has already moved past.
     fold_ranges: Option<Vec<fold::FoldRange>>,
 }
 
@@ -486,14 +316,6 @@ impl EditBuffer {
     /// GitHub issue #202: this buffer's real collapsible regions
     /// (`crate::code_surface::fold::foldable_ranges` over [`Self::lines`]), computed at most once
     /// per revision of the text rather than on every repaint.
-    ///
-    /// `&mut self` purely because of that memoization. The scan is a linear pass over the whole
-    /// buffer's runs, which is fine once per keystroke but genuinely not fine at 60fps on a large
-    /// file - and the File view's row builder needs to ask "is this line a fold start" for every
-    /// visible row, every frame. Every site that assigns or splices [`Self::lines`] clears the
-    /// cache; `folding_ranges_track_real_edits` (this module's own tests) drives a real edit
-    /// through `replace_range` and asserts the answer really moved, so a missed invalidation
-    /// would fail rather than silently serve a stale chevron.
     pub fn fold_ranges(&mut self) -> &[fold::FoldRange] {
         self.fold_ranges
             .get_or_insert_with(|| fold::foldable_ranges(&self.lines))
@@ -558,14 +380,6 @@ impl EditBuffer {
     /// [`code_view::HighlightKind::Text`]) - see this module's own "Re-highlighting cost" docs for
     /// why plain text, not a real highlight, is the right immediate result. Sets
     /// [`Self::highlight_dirty`].
-    ///
-    /// This is the *whole-buffer* path - real, still correct, still used both for
-    /// [`Self::assemble`]'s own initial construction (there is no smaller "region" to derive from
-    /// yet) and as [`Self::splice_lines`]'s own defensive fallback, but no longer the one every
-    /// real keystroke pays for - see that method's own docs for the real, measured per-keystroke
-    /// cost this was until this fix (a second, sibling instance of the same "whole-buffer
-    /// recomputation on every keystroke" bug class this file's own `Self::previous_boundary`
-    /// docs already describe fixing once).
     fn rebuild_plain_full(&mut self) {
         self.line_ranges = code_view::line_ranges(&self.content);
         self.lines = code_view::build_lines(&self.content, &[]);
@@ -583,24 +397,6 @@ impl EditBuffer {
     /// keystroke" bug class this file's own [`Self::previous_boundary`] docs describe fixing once
     /// already (an audit measured this specific whole-buffer cost at ~0.65ms/keystroke, release,
     /// on this repo's own then-211KB `root/code_surface.rs`, since split into this folder).
-    ///
-    /// Only the line(s) `range` actually intersects are re-split, via `code_view::line_ranges`/
-    /// `code_view::build_lines`, restricted to just that narrow substring - never the whole
-    /// buffer. Every line entirely before the edit keeps its own already-correct entry untouched;
-    /// every line entirely after it also keeps its own already-correct *text*, just with its
-    /// [`Self::line_ranges`]/[`Self::utf16_line_starts`] entries shifted by a real, computable
-    /// constant delta (`new_text.len()` minus the old range's own byte length; the equivalent in
-    /// UTF-16 units for the latter table) rather than re-derived from scratch.
-    ///
-    /// Defensive by construction, not just by intent: every arithmetic step below is checked
-    /// before it's trusted (line-index bounds, byte-range ordering, real UTF-8 char-boundary
-    /// safety), and [`Self::rebuild_plain_full`] (the previous, always-correct whole-buffer path)
-    /// is the real fallback the instant any of those checks doesn't hold. That fallback is never
-    /// expected to actually fire for a real edit (the reasoning: [`Self::line_ranges`]' entries
-    /// are always real char-boundary-safe line starts, `range` is always already clamped to a
-    /// real char boundary by every caller, and plain arithmetic translation of an unmodified,
-    /// untouched region's own boundary can't newly break that), but correctness always wins over
-    /// cleverness here - a real, deliberately-defensive design, not a hidden gap.
     fn splice_lines(&mut self, range: Range<usize>, new_text: &str) {
         let byte_delta = new_text.len() as isize - (range.end - range.start) as isize;
         let (first_line, _) = self.line_col_for_offset(range.start);
@@ -891,13 +687,6 @@ impl EditBuffer {
     /// `End`/a plain click. Does **not** touch [`Self::goal_column`]; callers that mean this as a
     /// horizontal move clear it themselves (vertical moves deliberately preserve it across a
     /// consecutive run - see [`Self::move_up`]/[`Self::move_down`]).
-    ///
-    /// Also clears [`Self::secondary_cursors`] - see this module's own "Multi-cursor" docs for why
-    /// an ordinary, unmodified move/click always collapses back to a single real cursor. Every
-    /// per-cursor call this method receives from [`Self::move_every_cursor`]'s own internal loop
-    /// (the mechanism that moves every real cursor together for a plain arrow key) always finds
-    /// this already empty by construction at that point (see that method's own docs), so this is
-    /// never a lossy no-op there.
     pub fn move_to(&mut self, offset: usize) {
         self.secondary_cursors.clear();
         let offset = self.floor_char_boundary(offset.min(self.content.len()));
@@ -908,9 +697,6 @@ impl EditBuffer {
     /// Extends the selection to `offset` from whichever end is currently anchored, flipping
     /// [`Self::selection_reversed`] if the selection crosses over itself - ported from
     /// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::select_to`.
-    ///
-    /// Also clears [`Self::secondary_cursors`] - see [`Self::move_to`]'s own docs for why, and for
-    /// why this is never lossy when called from within [`Self::move_every_cursor`]'s own loop.
     pub fn select_to(&mut self, offset: usize) {
         self.secondary_cursors.clear();
         let offset = self.floor_char_boundary(offset.min(self.content.len()));
@@ -1093,17 +879,6 @@ impl EditBuffer {
 
     /// [`Self::replace_range`] with explicit history context - the real implementation both it and
     /// the caret-preserving deletion helpers ([`Self::backspace`]/[`Self::delete_forward`]) share.
-    ///
-    /// `before` overrides the selection recorded as "where this edit started". That override is
-    /// load-bearing, not cosmetic: `backspace` extends the selection over the grapheme it is about
-    /// to delete *before* splicing, so the selection this method would otherwise observe is
-    /// already the doomed range rather than the caret the user actually had. Recording that would
-    /// (a) restore a selection the user never made when undone, and (b) break coalescing outright,
-    /// since consecutive backspaces would each report a different `before` than the previous one's
-    /// `after` and so never group - see `crate::text_history`'s own caret-continuity rule.
-    ///
-    /// `kind` overrides the inferred [`EditKind`], for a caller that knows an edit is a paste, an
-    /// accepted completion, or an external reload rather than ordinary typing.
     fn replace_range_recording(
         &mut self,
         range: Option<Range<usize>>,
@@ -1159,31 +934,6 @@ impl EditBuffer {
     /// but records it as [`Self::marked_range`] instead of committing it. `range` is a byte range
     /// (already converted from UTF-16 by the caller against this buffer's *pre-edit* content -
     /// safe, since it's resolved before `content` changes below).
-    ///
-    /// `new_selected_range_utf16` is the real platform IME protocol's own composing-caret/
-    /// selection position - critically, a UTF-16 offset **relative to `new_text` itself** (the
-    /// composing string), *not* an offset into the whole buffer. Verified for real against both
-    /// real platform backends this app supports: macOS's `NSTextInputClient::setMarkedText:
-    /// selectedRange:` (`vendor/zed/crates/gpui_macos/src/window.rs:2794,2809`) passes the
-    /// selection *within the marked text* on every composition update; Windows
-    /// (`vendor/zed/crates/gpui_windows/src/events.rs:731-745`) does the same via its own
-    /// `comp_string`-relative `caret_pos`. An earlier version of this method got this real
-    /// contract wrong - documented here as a "deliberate deviation" from `vendor/zed/crates/gpui/
-    /// examples/input.rs`'s own reference `TextInput`, but that framing was itself the bug: both
-    /// the reference's own formula and the old one here converted `new_selected_range_utf16` via
-    /// [`Self::range_from_utf16`], which resolves a UTF-16 offset against [`Self::content`] - the
-    /// *whole buffer*, starting from offset 0 - answering a completely different question than
-    /// "where inside `new_text`". That corrupted [`Self::selected_range`] into whatever byte
-    /// offset `new_selected_range_utf16`'s value happened to land on when misread as a
-    /// whole-buffer offset, which can fall on a non-UTF-8-char-boundary byte - a real,
-    /// live-reproduced panic on the very next [`Self::replace_range`]/[`Self::replace_and_mark_range`]
-    /// call (`String::replace_range`'s own "start of range should be a character boundary"),
-    /// reproduced with real Japanese IME composition input reporting a non-default composing
-    /// caret position (the one real shape the old, `None`-only test coverage here could never
-    /// have caught - see this file's own `mod tests` for the real regression that now covers it).
-    /// Fixed by converting `new_selected_range_utf16` against `new_text` directly (never
-    /// `self.content`), then rebasing onto `range.start` - the real, correct interpretation of
-    /// "an offset within the composing text" both formulas above were actually trying to express.
     pub fn replace_and_mark_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -1298,17 +1048,6 @@ impl EditBuffer {
     /// Steps one real undo group back: inverts every edit in it (in reverse order - the only order
     /// that is correct once a group holds more than one edit, which is exactly what one
     /// multi-cursor edit will be) and restores the recorded caret **and** selection.
-    ///
-    /// Returns whether anything was undone. A group whose recorded `inserted` text doesn't match
-    /// what's actually in `content` right now is refused outright, leaving both the buffer and the
-    /// history cursor exactly where they were: that can only mean the history has desynchronized
-    /// from the content, and applying it anyway would silently corrupt real, unsaved user text.
-    /// The refusal is defensive, not expected - every content mutation on this type records - and
-    /// is covered by a real test that deliberately desynchronizes the two.
-    ///
-    /// The peek/validate/apply/commit ordering is what makes "leaving the cursor exactly where it
-    /// was" true rather than merely intended - see `crate::text_history::TextHistory::peek_undo`'s
-    /// own docs for the desynchronization a combined `undo()` would have left behind on refusal.
     pub fn undo(&mut self) -> bool {
         let Some(group) = self.history.peek_undo() else {
             return false;
@@ -1379,21 +1118,6 @@ impl EditBuffer {
     /// Adopts `new_content` (what a real, external writer - an agent CLI, a formatter, another
     /// editor - has just put on disk) as **one single undoable step**, rather than throwing this
     /// buffer's history away and starting over.
-    ///
-    /// That distinction is the whole point per GitHub issue #17: an external rewrite landing
-    /// mid-agent must never be a silent history wipe. It is recorded as a sealed, programmatic
-    /// group, so the step before it and the step after it are both still reachable, and Ctrl+Z
-    /// immediately after the reload really does put the pre-reload content back.
-    ///
-    /// The caret is preserved by byte offset, clamped into the new content - honest and cheap. It
-    /// is deliberately *not* re-anchored by a diff of old against new (which would be the only way
-    /// to keep it on "the same" line through a large rewrite): that is real work with real failure
-    /// modes for a case where the content under the caret may not exist at all any more.
-    ///
-    /// Returns `false` when the content is already identical, having recorded nothing at all - a
-    /// reload that changes nothing must not push an empty step the user has to press Ctrl+Z past.
-    /// (It still refreshes the real on-disk `mtime`/`len` in that case; see the branch's own
-    /// comment for why leaving those stale would re-report a change that isn't there.)
     pub fn reload_from_disk(
         &mut self,
         new_content: String,
@@ -1459,15 +1183,6 @@ impl EditBuffer {
 
     /// `Backspace`: deletes the grapheme before the caret, or the real selection if one exists.
     /// A no-op at the very start of the buffer (`self.previous_boundary` can't move further).
-    ///
-    /// Passes the real, just-computed one-grapheme (or real existing) [`Self::selected_range`]
-    /// to [`Self::replace_range`] *explicitly*, rather than `None` - a real, user-visible bug an
-    /// earlier version of this method had: `Self::replace_range`'s own real priority order
-    /// (matching `EntityInputHandler::replace_text_in_range`'s documented contract) prefers
-    /// [`Self::marked_range`] over [`Self::selected_range`] whenever both exist, so passing `None`
-    /// while a real IME composition happens to be active deleted the *entire* composing text
-    /// instead of one real grapheme - wrong every time Backspace was pressed mid-composition, a
-    /// real, live-reachable case for any real CJK/composed input agent.
     pub fn backspace(&mut self) {
         if !self.secondary_cursors.is_empty() {
             self.apply_at_every_cursor(EditKind::Delete, |buffer, cursor_range| {
@@ -1526,20 +1241,6 @@ impl EditBuffer {
     /// performs on this exact gesture. Reads that whitespace from the real buffer content (via
     /// [`Self::auto_indent_insertion`]) rather than assuming any fixed width, so it respects
     /// whatever the line actually contains (tabs, spaces, or a mix).
-    ///
-    /// `extra_indent` (already resolved by the caller - `crate::code_surface::editing::
-    /// AdeApp::handle_editor_enter_action`'s own docs for the real tabs-vs-spaces/width/
-    /// `.editorconfig` resolution, the same one [`Self::indent_lines`] uses) is appended once more
-    /// on top of the carried-over whitespace whenever the line up to the cursor ends, after
-    /// trimming real trailing whitespace, with an opening bracket (`{`, `(`, `[`) - see
-    /// [`crate::code_surface::indent::ends_with_opener`]'s own docs for that narrow, single-line
-    /// heuristic's real scope.
-    ///
-    /// Multi-cursor (issue #28): each real cursor - primary and every secondary - gets its own
-    /// real indentation, computed from *its own* line, not copied from the primary's - the same
-    /// per-cursor-computed-text shape [`Self::apply_at_every_cursor`] was already built to support
-    /// (its `compute` closure returns real text per cursor, not one fixed string), so a multi-
-    /// cursor `Enter` press across lines with different real indentation gets each one right.
     pub fn insert_newline_with_auto_indent(&mut self, extra_indent: &str) {
         if !self.secondary_cursors.is_empty() {
             self.apply_at_every_cursor(EditKind::Type, |buffer, cursor_range| {
@@ -1657,21 +1358,6 @@ impl EditBuffer {
     /// covering the same real lines (including the newly-inserted indentation) rather than
     /// collapsing to a caret - see that function's own docs for the "selection ends at column 0"
     /// exclusion this shares with [`Self::dedent_lines`].
-    ///
-    /// Returns whether anything real actually changed - `false` only for the pathological empty
-    /// `indent_unit` case (`crate::code_surface::indent::indent_unit` never actually produces
-    /// one, but this stays honest rather than assuming).
-    ///
-    /// ## One atomic undo step, not N (GitHub issue #17 integration)
-    ///
-    /// The multi-line branch below splices every touched line directly via [`Self::splice_lines`]
-    /// (bypassing [`Self::replace_range`]'s own automatic per-call history recording) and records
-    /// the whole run as one [`TextHistory::record_group`] call instead - seven per-line calls to
-    /// `replace_range` would each be recorded as its own [`EditKind::Programmatic`] group (that
-    /// kind's own "never coalesces" rule means they'd never merge back into one), so a single Tab
-    /// press over N lines would need N separate `Ctrl+Z` presses to undo. See that method's own
-    /// docs for why the edits must be collected in exactly this bottom-to-top order for the
-    /// resulting group to replay correctly in both directions.
     pub fn indent_lines(&mut self, indent_unit: &str) -> bool {
         if indent_unit.is_empty() {
             return false;
@@ -1730,13 +1416,6 @@ impl EditBuffer {
     /// line already at column 0 (or with no real leading whitespace at all). Re-expands the
     /// selection to keep covering the same real lines, shifted left by however much was actually
     /// removed *at or before* each end - never past that line's own new start.
-    ///
-    /// Returns whether anything real actually changed (`false` when every touched line had no
-    /// real leading whitespace to remove) - `crate::code_surface::editing`'s caller uses this to
-    /// skip a pointless re-highlight/LSP-sync/scroll-sync for a genuine no-op keystroke.
-    ///
-    /// Records every real per-line removal as one atomic [`TextHistory::record_group`] step - see
-    /// [`Self::indent_lines`]'s own "One atomic undo step, not N" docs for why.
     pub fn dedent_lines(&mut self, tab_width: u8) -> bool {
         let before = self.selection_snapshot();
         let sel_start = self.selected_range.start;
@@ -1814,16 +1493,6 @@ impl EditBuffer {
     /// established - see that method's own docs for the measured cost of a whole-buffer scan on
     /// a large file). Crossing a line boundary (`offset` already at/before this line's own
     /// start) lands on the previous line's real end, exactly like [`Self::previous_boundary`].
-    ///
-    /// Deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`
-    /// (this buffer's own grapheme-boundary methods' crate, and this method's first real
-    /// implementation): that crate's word boundaries are UAX #29's, designed for natural-language
-    /// prose, where e.g. `WB6`/`WB7` deliberately keep `foo.bar` as *one* unbroken word (a
-    /// mid-word `.`/`'`/`:` between two letters doesn't break, matching "don't"/"e.g." staying
-    /// whole) - real, correct behavior for prose, but wrong for source code, where every real
-    /// code editor's own word-navigation stops at `.` in `foo.bar()` (confirmed by writing the
-    /// real test this docstring sits above against that assumption first - it failed against the
-    /// UAX #29 result, `foo.bar` treated as one hop, not the real, expected two).
     fn previous_word_boundary(&self, offset: usize) -> usize {
         let (line, _) = self.line_col_for_offset(offset);
         let Some(line_range) = self.line_ranges.get(line).cloned() else {
@@ -2090,16 +1759,6 @@ impl EditBuffer {
     /// together, not silently strand every secondary wherever it was left. A no-op wrapper (calls
     /// `mover` once, directly) whenever [`Self::secondary_cursors`] is empty, so ordinary
     /// single-cursor use pays no extra cost and behaves exactly as before this method existed.
-    ///
-    /// Each secondary cursor's own [`Self::goal_column`] is deliberately *not* carried across
-    /// consecutive vertical-move presses the way the primary's already is (reset to `None` before
-    /// each secondary's own `mover` call below) - a documented, honest scope cut: giving every
-    /// cursor its own independent sticky column would need a per-cursor goal-column field, real
-    /// design work this phase's priority (a correct core multi-cursor model, occurrence search,
-    /// and simultaneous edits) didn't reach. In practice this only matters for a *second*
-    /// consecutive `Up`/`Down` press after crossing a ragged-length line while multiple cursors are
-    /// active - a real, narrow, cosmetic gap, not a correctness bug (every cursor still lands on a
-    /// real, valid position on every press).
     fn move_every_cursor<F>(&mut self, mut mover: F)
     where
         F: FnMut(&mut Self),
@@ -2598,26 +2257,6 @@ impl EditBuffer {
     /// others still have real deletions to make) - skipped without a real splice, so it never
     /// spuriously marks the buffer's highlighting dirty for a cursor that didn't actually change
     /// anything.
-    ///
-    /// Processed from the rightmost cursor to the leftmost (by `range.start`), the standard multi-
-    /// cursor discipline every real editor's own batch-edit application relies on: splicing the
-    /// rightmost cursor's own edit first can never invalidate the still-unprocessed byte offsets of
-    /// any cursor still to its left, so `compute`'s own per-cursor boundary lookups (e.g.
-    /// `Self::previous_boundary` for a Backspace with no selection) never need any real cross-
-    /// cursor offset bookkeeping of their own - only this method's own bookkeeping of each
-    /// cursor's *new* caret position (recorded as it's produced, restored onto every real cursor
-    /// only once every real splice has landed) does. Every real cursor collapses to an empty caret
-    /// at its own post-edit position - the "typing/deleting closes any selection" behavior every
-    /// one of this buffer's own single-cursor edit methods already has, applied per-cursor here.
-    ///
-    /// **Records every real per-cursor splice into [`Self::history`] as one group** (GitHub issue
-    /// #17's own history, extended here for issue #28) - see this module's own "Multi-cursor edits
-    /// are one real undo step" docs for the chaining technique and its one documented limitation
-    /// (only the primary cursor's own caret/selection is restored by undo/redo, not every
-    /// secondary). `kind` is shared by every edit in the batch on purpose: typing/pasting the same
-    /// text at every cursor and deleting at every cursor are each internally uniform, and a shared
-    /// kind is what lets [`TextHistory::record`]'s own `top.kind != kind` check never split one
-    /// multi-cursor keystroke into more than one group.
     fn apply_at_every_cursor<F>(&mut self, kind: EditKind, mut compute: F)
     where
         F: FnMut(&Self, Range<usize>) -> (Range<usize>, String),
@@ -2752,11 +2391,6 @@ impl QueryBuilder {
 }
 ";
 
-    /// GitHub issue #202: the memoized fold-range cache must be invalidated by a real edit, or
-    /// the File view would keep drawing a chevron on a line that no longer opens a block (and,
-    /// worse, hide the wrong lines when it is clicked). Driven through `replace_range` - the same
-    /// real mutation a keystroke takes, which reaches the cache only via `splice_lines`' own
-    /// invalidation - rather than by poking the field.
     #[test]
     fn fold_ranges_track_real_edits() {
         let mut buf = buffer("fn alpha() {\n    let x = 1;\n}\n");
@@ -2768,7 +2402,6 @@ impl QueryBuilder {
             }]
         );
 
-        // Insert a whole new line at the very top; every region shifts down by one.
         buf.move_to(0);
         buf.replace_range(Some(0..0), "// header\n");
         assert_eq!(
@@ -2780,7 +2413,6 @@ impl QueryBuilder {
             "a stale cache would still claim line 0 opens the block"
         );
 
-        // Delete the opening brace: nothing is foldable any more.
         let brace = buf.content.find('{').expect("brace present");
         buf.replace_range(Some(brace..brace + 1), "");
         assert!(buf.fold_ranges().is_empty());
@@ -2834,7 +2466,6 @@ impl QueryBuilder {
         let good_outline = buf.symbols.clone();
         assert!(!good_outline.is_empty());
 
-        // Content moves on, so the background result computed against the old snapshot is stale.
         let stale_snapshot = buf.content.clone();
         buf.move_to(0);
         buf.replace_range(None, "// edited\n");
@@ -2914,12 +2545,9 @@ impl QueryBuilder {
         assert_eq!(buf.lines[2].text, "b");
     }
 
-    /// GitHub issue #121, test (a): pressing Enter after an indented line carries the exact same
-    /// real leading whitespace over to the new line.
     #[test]
     fn insert_newline_with_auto_indent_carries_the_real_leading_whitespace_over() {
         let mut buf = buffer("fn main() {\n    let x = 1;\n}\n");
-        // Right after the `;`, before the line's own trailing newline.
         buf.move_to("fn main() {\n    let x = 1;".len());
         buf.insert_newline_with_auto_indent("    ");
         assert_eq!(buf.content, "fn main() {\n    let x = 1;\n    \n}\n");
@@ -2930,8 +2558,6 @@ impl QueryBuilder {
         );
     }
 
-    /// GitHub issue #121, test (b): pressing Enter on a column-0 (no leading whitespace) line
-    /// inserts a bare newline - no extra whitespace fabricated out of nowhere.
     #[test]
     fn insert_newline_with_auto_indent_adds_no_whitespace_for_a_column_zero_line() {
         let mut buf = buffer("foo\nbar\n");
@@ -2940,8 +2566,6 @@ impl QueryBuilder {
         assert_eq!(buf.content, "foo\n\nbar\n");
     }
 
-    /// GitHub issue #121, test (c) - stretch goal: a line that ends with a real opening bracket
-    /// gets one extra real indent unit on top of whatever it already carried over.
     #[test]
     fn insert_newline_with_auto_indent_adds_one_extra_level_after_an_opening_bracket() {
         let mut buf = buffer("fn main() {\n");
@@ -2960,8 +2584,6 @@ impl QueryBuilder {
         );
     }
 
-    /// A real closing bracket (or any other real, non-opener text) must not trigger the stretch
-    /// goal's extra indent - only a genuine opener does.
     #[test]
     fn insert_newline_with_auto_indent_does_not_add_extra_indent_after_a_closer() {
         let mut buf = buffer("fn main() {\n}\n");
@@ -2970,9 +2592,6 @@ impl QueryBuilder {
         assert_eq!(buf.content, "fn main() {\n}\n\n");
     }
 
-    /// GitHub issue #121, PR #136 review (Colin Espinas): Python block headers end with `:`, not
-    /// an opening bracket - a `.py`-extensioned buffer must still get the extra indent unit after
-    /// a line like `if True:`.
     #[test]
     fn insert_newline_with_auto_indent_adds_one_extra_level_after_a_python_colon_header() {
         let mut buf = python_buffer("if True:\n    pass\n");
@@ -2981,8 +2600,6 @@ impl QueryBuilder {
         assert_eq!(buf.content, "if True:\n    \n    pass\n");
     }
 
-    /// The same trailing `:` must not trigger the extra indent for a non-Python buffer - a
-    /// colon means nothing special outside a real colon-block language.
     #[test]
     fn insert_newline_with_auto_indent_ignores_a_trailing_colon_outside_python() {
         let mut buf = buffer("'outer:\n    loop {}\n");
@@ -2991,8 +2608,6 @@ impl QueryBuilder {
         assert_eq!(buf.content, "'outer:\n\n    loop {}\n");
     }
 
-    /// Multi-cursor (issue #28 infrastructure, reused here): each real cursor gets its own real
-    /// indentation, computed from its own line - not copied from the primary cursor's.
     #[test]
     fn insert_newline_with_auto_indent_computes_each_multi_cursor_independently() {
         let mut buf = buffer("    a;\nb;\n");
@@ -3021,7 +2636,6 @@ impl QueryBuilder {
     #[test]
     fn line_col_for_offset_exactly_on_a_line_boundary_is_the_start_of_the_next_line() {
         let buf = buffer("abc\ndef");
-        // Byte 4 is 'd', the first byte of line 1.
         assert_eq!(buf.line_col_for_offset(4), (1, 0));
     }
 
@@ -3056,7 +2670,6 @@ impl QueryBuilder {
 
     #[test]
     fn grapheme_boundaries_do_not_split_a_real_combining_accent() {
-        // "e" + combining acute accent (U+0301) - one real grapheme cluster, two chars.
         let mut buf = buffer("e\u{301}x");
         let cluster_end = "e\u{301}".len();
         buf.move_to(0);
@@ -3070,7 +2683,6 @@ impl QueryBuilder {
 
     #[test]
     fn utf16_round_trip_covers_a_real_surrogate_pair_character() {
-        // U+1F600 encodes as a UTF-16 surrogate pair (2 code units) and 4 UTF-8 bytes.
         let buf = buffer("a\u{1f600}b");
         let byte_after_emoji = "a\u{1f600}".len();
         let utf16_after_emoji = buf.offset_to_utf16(byte_after_emoji);
@@ -3101,7 +2713,6 @@ impl QueryBuilder {
     #[test]
     fn offset_for_position_clamps_a_real_out_of_range_line_rather_than_panicking() {
         let buf = buffer("abc\ndef");
-        // Clamps to the real *last line* ("def"), character 0 - not the buffer's own end.
         assert_eq!(buf.offset_for_position(99, 0), "abc\n".len());
     }
 
@@ -3116,9 +2727,6 @@ impl QueryBuilder {
         assert!(!buf.is_dirty());
     }
 
-    /// The real race `Self::mark_saved` must not reintroduce: a save in flight for an older
-    /// snapshot must not be applied against whatever `content` is by the time it completes - if
-    /// the user typed more in the meantime, those newer keystrokes must still read as dirty.
     #[test]
     fn mark_saved_against_a_stale_snapshot_leaves_newer_edits_dirty() {
         let mut buf = buffer("abc");
@@ -3138,7 +2746,6 @@ impl QueryBuilder {
     #[test]
     fn rehighlighting_after_an_edit_that_changes_syntax_meaning_changes_the_run_kind() {
         let mut buf = buffer("foo");
-        // Immediately after the edit, `splice_lines` has run - text is correct, plain.
         buf.move_to(0);
         buf.replace_range(None, "fn ");
         assert_eq!(buf.content, "fn foo");
@@ -3168,10 +2775,6 @@ impl QueryBuilder {
         assert!(kinds.contains(&code_view::HighlightKind::Keyword));
     }
 
-    /// GitHub issue #48 ("Bug: Code editor lines blinks when editing code") - a real regression
-    /// test, not a vacuous one: checks the run kind for `"fn"`/`"foo"` on a line that was
-    /// *already* real-highlighted (`buffer(..)` runs a real immediate `tree-sitter` pass at
-    /// construction, per `EditBuffer::new`'s own docs).
     #[test]
     fn editing_inside_an_already_highlighted_line_keeps_its_untouched_runs_colored_while_a_rehighlight_is_pending(
     ) {
@@ -3361,11 +2964,6 @@ impl QueryBuilder {
         assert_eq!(buf.selection_within_line(2), None);
     }
 
-    /// The real regression this fix addresses: `cursor_within_line` used to compute
-    /// `offset - range.start` *before* checking whether `offset >= range.start` (an eager
-    /// `Option::then_some` argument, not the lazy `then(|| ...)` this now uses), panicking with a
-    /// real `usize` subtract-with-overflow the moment it was asked about any line other than the
-    /// caret's own - i.e. on every single row of a real multi-line file.
     #[test]
     fn cursor_within_line_does_not_panic_for_a_line_before_the_caret() {
         let mut buf = buffer("first\nsecond\nthird");
@@ -3375,10 +2973,6 @@ impl QueryBuilder {
         assert!(buf.cursor_within_line(2).is_some());
     }
 
-    /// GitHub issue #27: "caret is visible against every theme background, including in
-    /// selected regions" - `cursor_within_line` must keep reporting the real active end of the
-    /// selection even while one is active, not go back to `None` the moment
-    /// `selected_range` stops being empty.
     #[test]
     fn cursor_within_line_stays_some_while_a_selection_is_active() {
         let mut buf = buffer("hello world");
@@ -3416,14 +3010,6 @@ impl QueryBuilder {
         );
     }
 
-    /// CRITICAL regression coverage (finding 1): the real, live-reproduced panic an audit caught
-    /// with real Japanese IME composition input. `new_selected_range_utf16` must be interpreted
-    /// relative to `new_text` itself (the real platform contract - see
-    /// `Self::replace_and_mark_range`'s own docs), never against the whole `self.content`. The
-    /// pre-existing `replace_and_mark_range_records_a_real_marked_range_and_clears_on_empty_text`
-    /// test above always passes `None` for this argument - exactly the one case that can never
-    /// trigger this bug, which is why it survived until an audit constructed a real, non-`None`
-    /// composing caret.
     #[test]
     fn replace_and_mark_range_computes_the_composition_selection_relative_to_new_text_not_the_whole_buffer(
     ) {
@@ -3457,17 +3043,10 @@ impl QueryBuilder {
         assert_eq!(buf.content, "prefix \u{65e5}\u{672c}!\u{8a9e}ok\n");
     }
 
-    /// finding 7: pressing Backspace while a real IME composition is active must delete one real
-    /// grapheme, not silently swallow the entire composing text - `Self::replace_range`'s own real
-    /// priority (matching `EntityInputHandler::replace_text_in_range`'s documented contract)
-    /// prefers `marked_range` over `selected_range` whenever both exist and `None` is passed, so
-    /// `Self::backspace`/`Self::delete_forward` must pass their own just-computed
-    /// `selected_range` explicitly rather than relying on that default.
     #[test]
     fn backspace_during_a_real_ime_composition_deletes_one_grapheme_not_the_whole_composition() {
         let mut buf = buffer("ab");
         buf.move_to(1);
-        // Compose a real two-character CJK string mid-buffer.
         buf.replace_and_mark_range(None, "\u{65e5}\u{672c}", None);
         assert_eq!(buf.content, "a\u{65e5}\u{672c}b");
         assert!(buf.marked_range.is_some(), "composition should be active");
@@ -3481,14 +3060,6 @@ impl QueryBuilder {
         );
     }
 
-    /// finding 5: proves the incremental splice this fix introduces (`EditBuffer::splice_lines`)
-    /// produces byte-for-byte identical `lines`/`line_ranges`/`utf16_line_starts` to a real,
-    /// independent, from-scratch reconstruction (`EditBuffer::new` on the resulting content) -
-    /// the strongest real correctness check available for logic this fiddly, run across a real
-    /// variety of edit shapes: a line inserted at the very start, a real multi-byte
-    /// emoji/CJK insertion mid-line, a delete that merges two real lines, a multi-line replace
-    /// that crosses a line boundary, clearing and retyping the whole buffer, and appending past
-    /// the real end of a buffer with no trailing newline.
     #[test]
     fn incremental_splicing_matches_a_real_independent_full_rebuild_across_many_real_edits() {
         fn assert_matches_full_rebuild(buf: &EditBuffer) {
@@ -3530,19 +3101,16 @@ impl QueryBuilder {
             );
         }
 
-        // 1. Insert a real new line at the very start of the buffer.
         let mut buf = buffer("fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n");
         buf.move_to(0);
         buf.replace_range(None, "// a real comment header\n");
         assert_matches_full_rebuild(&buf);
 
-        // 2. Insert a real multi-byte emoji + CJK string mid-line (also introduces a new line).
         let insert_at = buf.content.find("let x").expect("let x present");
         buf.move_to(insert_at);
         buf.replace_range(None, "// \u{1f600} \u{65e5}\u{672c}\u{8a9e}\n    ");
         assert_matches_full_rebuild(&buf);
 
-        // 3. Delete across a real line boundary (merges two real lines into one).
         let mut buf2 = buffer("first line\nsecond line\nthird line\n");
         let newline = buf2.content.find("\nsecond").expect("newline present");
         buf2.selected_range = newline..newline + 1;
@@ -3550,7 +3118,6 @@ impl QueryBuilder {
         assert_matches_full_rebuild(&buf2);
         assert_eq!(buf2.content, "first line second line\nthird line\n");
 
-        // 4. A multi-line replace that crosses a real line boundary.
         let mut buf3 = buffer("one\ntwo\nthree\nfour\n");
         let start = buf3.content.find("two").expect("two present");
         let end = buf3.content.find("four").expect("four present");
@@ -3559,7 +3126,6 @@ impl QueryBuilder {
         assert_matches_full_rebuild(&buf3);
         assert_eq!(buf3.content, "one\nREPLACED\nBLOCK\nfour\n");
 
-        // 5. Clear the whole buffer, then retype real multi-line content from scratch.
         let mut buf4 = buffer("throwaway\ncontent\n");
         buf4.select_all();
         buf4.replace_range(None, "");
@@ -3567,7 +3133,6 @@ impl QueryBuilder {
         buf4.replace_range(None, "fresh\nreal\ncontent\n");
         assert_matches_full_rebuild(&buf4);
 
-        // 6. Append past the real end of a buffer with no trailing newline, then add one.
         let mut buf5 = buffer("no trailing newline yet");
         buf5.move_to(buf5.content.len());
         buf5.replace_range(None, " - more text");
@@ -3584,16 +3149,6 @@ impl QueryBuilder {
         assert_matches_full_rebuild(&buf6);
     }
 
-    /// finding 5: a real, measured before/after performance proof, following
-    /// `code_view_cache_tests::opening_a_large_real_file_does_not_block_render_on_the_full_parse`'s
-    /// own established "a ratio, not an absolute threshold" methodology (so it isn't flaky under
-    /// CI load) - timed directly against this repo's own real, large `lsp/client.rs` file (its
-    /// largest single source file - it was `root/code_surface.rs` before that file was split into
-    /// this folder).
-    /// `EditBuffer::rebuild_plain_full` (the previous, real whole-buffer-per-keystroke behavior)
-    /// is still real, still callable (kept on as `Self::splice_lines`'s own defensive fallback),
-    /// so this is a true apples-to-apples before/after comparison on the exact same real buffer,
-    /// not a synthetic microbenchmark.
     #[test]
     fn a_real_incremental_edit_on_a_large_real_file_is_measurably_cheaper_than_a_real_whole_buffer_rebuild(
     ) {
@@ -3687,7 +3242,6 @@ impl QueryBuilder {
         buffer.move_to(1);
         buffer.select_to(4);
         assert_eq!(buffer.selected_range, 1..4);
-        // Typing over a real selection replaces it.
         buffer.replace_range(None, "Z");
         assert_eq!(buffer.content, "aZef\n");
 
@@ -3826,11 +3380,6 @@ impl QueryBuilder {
         assert_eq!(buffer.content, "x\u{6f22}\u{5b57}\n");
     }
 
-    /// Regression for a split found in self-review: a Backspace pressed *mid-composition* reaches
-    /// `replace_range` with the composition still live, which clears `marked_range` as a side
-    /// effect - and an earlier version sealed the group on that, so the rest of what the user
-    /// experiences as one composition became a second undo step. Real platform IMEs routinely keep
-    /// composing after a backspace inside the composing string.
     #[test]
     fn a_backspace_mid_composition_does_not_split_the_composition_into_two_undo_steps() {
         let mut buffer = buffer("x\n");
@@ -3877,15 +3426,6 @@ impl QueryBuilder {
         assert_eq!(buffer.content, "\n");
     }
 
-    /// Audit finding, reproduced end to end on a real buffer: a mid-composition Backspace
-    /// deliberately leaves the `Ime` group open (so a continuing composition rejoins it), and
-    /// `EditKind::Ime` coalescing ignores both the idle timeout and caret continuity - so an
-    /// abandoned composition's group stayed open indefinitely and a completely unrelated
-    /// composition somewhere else merged into it, one Ctrl+Z reverting both.
-    ///
-    /// The backspace deliberately removes only *part* of the preedit, so the abandoned group is
-    /// genuinely not a net no-op and can't be disposed of by `EditGroup::is_net_noop` - this is
-    /// specifically the caret-jump boundary under test, not the dead-step drop.
     #[test]
     fn two_unrelated_compositions_separated_by_a_caret_jump_are_two_undo_steps() {
         let mut buffer = buffer("abcdef\n");
@@ -3898,7 +3438,6 @@ impl QueryBuilder {
         assert_eq!(buffer.content, "abcdef\u{3042}\n");
         assert!(buffer.marked_range.is_none());
 
-        // A real caret jump, then a completely unrelated composition committed there.
         buffer.move_to(0);
         buffer.replace_and_mark_range(None, "\u{304b}", None);
         buffer.replace_range(None, "\u{6f22}");
@@ -3923,7 +3462,6 @@ impl QueryBuilder {
         let mut buffer = buffer("\n");
         buffer.move_to(0);
         buffer.replace_and_mark_range(None, "\u{304b}", None);
-        // A real cancelled composition: the platform calls `unmark_text` without committing.
         buffer.unmark();
         type_text(&mut buffer, "ab");
 
@@ -3938,7 +3476,6 @@ impl QueryBuilder {
         let mut buffer = buffer("\n");
         buffer.move_to(0);
         type_text(&mut buffer, "ab");
-        // Exactly what `AdeApp::handle_editor_paste_action` does around a real paste.
         buffer.seal_history();
         buffer.replace_range(None, "PASTED");
         buffer.seal_history();
@@ -3960,11 +3497,9 @@ impl QueryBuilder {
         buffer.move_to(8);
         type_text(&mut buffer, "!");
         assert_eq!(buffer.content, "original!\n");
-        // The user's own edit is saved, so the buffer is clean again against disk...
         buffer.mark_saved("original!\n".to_string(), None, 10);
         assert!(!buffer.is_dirty());
 
-        // ...and now a real external writer (an agent CLI running in this worktree) rewrites it.
         let rewritten = "rewritten by an agent\n".to_string();
         let lines = code_view::build_lines(&rewritten, &[]);
         assert!(buffer.reload_from_disk(
@@ -3977,13 +3512,11 @@ impl QueryBuilder {
         assert_eq!(buffer.content, rewritten);
         assert!(!buffer.is_dirty(), "the reloaded buffer matches disk");
 
-        // The reload is its own real step...
         assert!(buffer.undo());
         assert_eq!(
             buffer.content, "original!\n",
             "Ctrl+Z straight after an external reload must put the pre-reload content back"
         );
-        // ...and everything recorded before it is still reachable - not wiped.
         assert!(
             buffer.can_undo(),
             "the history from before the reload must survive it - a silent wipe mid-stack is \
@@ -4109,20 +3642,15 @@ impl QueryBuilder {
     #[test]
     fn word_range_at_finds_the_real_word_touching_either_side_of_the_caret() {
         let buf = buffer("foo bar_baz\n");
-        // Caret in the middle of "foo".
         assert_eq!(buf.word_range_at(1), Some(0..3));
-        // Caret right before "bar_baz" - touches only on the right.
         assert_eq!(buf.word_range_at(4), Some(4..11));
-        // Caret right after "foo" - touches only on the left.
         assert_eq!(buf.word_range_at(3), Some(0..3));
-        // Underscore counts as a word character - the whole identifier is one word.
         assert_eq!(buf.word_range_at(8), Some(4..11));
     }
 
     #[test]
     fn word_range_at_is_none_with_no_adjacent_word_character() {
         let buf = buffer("foo   bar\n");
-        // Deep inside the run of spaces, touching neither word.
         assert_eq!(buf.word_range_at(5), None);
     }
 
@@ -4147,7 +3675,6 @@ impl QueryBuilder {
         let mut ranges = buf.all_selection_ranges();
         ranges.sort_by_key(|range| range.start);
         assert_eq!(ranges, vec![0..5, 8..13]);
-        // The newest occurrence becomes primary.
         assert_eq!(buf.selected_range, 8..13);
     }
 
@@ -4205,7 +3732,6 @@ impl QueryBuilder {
 
         assert!(buf.collapse_to_single_cursor());
         assert_eq!(buf.cursor_count(), 1);
-        // A second Escape with only one cursor left is a genuine no-op.
         assert!(!buf.collapse_to_single_cursor());
     }
 
@@ -4218,7 +3744,6 @@ impl QueryBuilder {
         let mut ranges = buf.all_selection_ranges();
         ranges.sort_by_key(|range| range.start);
         assert_eq!(ranges, vec![0..0, 4..4]);
-        // The newest (just-clicked) position becomes primary.
         assert_eq!(buf.selected_range, 4..4);
     }
 
@@ -4236,7 +3761,6 @@ impl QueryBuilder {
             buf.content, "x + x\n",
             "typing must replace the real selected text at every cursor at once"
         );
-        // Every cursor collapses to an empty caret right after its own inserted text.
         let mut ranges = buf.all_selection_ranges();
         ranges.sort_by_key(|range| range.start);
         assert_eq!(ranges, vec![1..1, 5..5]);
@@ -4516,8 +4040,6 @@ impl QueryBuilder {
         );
     }
 
-    // GitHub issue #26: `Tab`/`Shift+Tab` indentation.
-
     #[test]
     fn indent_lines_with_no_selection_inserts_at_the_caret_like_ordinary_typing() {
         let mut buf = buffer("fn main() {\nbody\n}\n");
@@ -4601,8 +4123,6 @@ impl QueryBuilder {
         assert!(buf.dedent_lines(4));
         assert_eq!(buf.content, "one\ntwo\nthree\n");
     }
-
-    // GitHub issue #17 integration: a multi-line Tab/Shift+Tab is one atomic undo step.
 
     #[test]
     fn indenting_three_lines_at_once_undoes_in_a_single_ctrl_z() {

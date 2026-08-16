@@ -1,33 +1,5 @@
 //! The `impl AdeApp` data half of agent history (GitHub issue #227): what really happens when a
 //! run ends, and the two background loads the History surface needs.
-//!
-//! Three things live here, and none of them is on the render path:
-//!
-//! 1. [`AdeApp::finish_run_record`] - called from the one funnel every close path already goes
-//!    through (`crate::work_surface::render::AdeApp::close_agent`). It captures the run's own
-//!    transcript out of its pane *before* the pane is torn down, records the real ending, and
-//!    measures what the run changed against its own review baseline.
-//! 2. [`AdeApp::load_run_drift`] - one real `wt_core::run_drift::commits_since_each` per worktree
-//!    that has history, on the background executor.
-//! 3. [`AdeApp::load_run_transcript`] - one real read of a stored transcript, when its tab opens.
-//!
-//! ## Why the capture happens at close, and only at close
-//!
-//! Everything a finished run knows about itself stops existing the moment its pane goes away: the
-//! terminal grid is dropped by `Agents::close`, and the review baseline's tree ref is deleted by
-//! `release_review_baseline`. Measuring at any later point would mean measuring something else -
-//! the worktree's *current* diff rather than what this run did - and there is no later point at
-//! which the transcript exists at all.
-//!
-//! ## What it deliberately does not do
-//!
-//! It never creates a record for an agent that does not already have one.
-//! `crate::hooks::flow::AdeApp::record_agent_statuses` only records agents that produced a real
-//! hook fact - a status inferred from pty silence is a guess, and a guess written to disk is still
-//! a guess an hour later - so an agent with no record is one Jerry never knew anything real about.
-//! Filing it into History at close time would put a run there whose every field was invented. See
-//! [`crate::hooks::store::AgentStatusState::finish`]'s own docs for the same contract on the other
-//! side of the call.
 
 use super::*;
 
@@ -40,22 +12,6 @@ const CAPTURED_TRANSCRIPT_LINES: usize = crate::run_history::transcript_store::M
 
 impl AdeApp {
     /// Records that agent `id`'s run really ended, now (GitHub issue #227).
-    ///
-    /// Called from [`Self::close_agent`] **before** it tears the agent down, because two of the
-    /// three things this needs only exist until then:
-    ///
-    /// - the run's own transcript, read synchronously out of the live pane's grid (cheap - it is
-    ///   an in-memory copy of at most [`CAPTURED_TRANSCRIPT_LINES`] lines - and impossible
-    ///   afterwards, since `Agents::close` drops the grid);
-    /// - the agent's review baseline tree id, which `release_review_baseline` is about to delete
-    ///   the ref for.
-    ///
-    /// The write itself, the diffstat measurement and the transcript file are all done on the
-    /// background executor: one `git diff`, one file write and one `fsync`ing state save have no
-    /// business on the frame that closed a tab.
-    ///
-    /// A no-op for a shell, for an agent with no persisted record, and while a capture for the
-    /// same run is already in flight.
     pub(crate) fn finish_run_record(&mut self, id: AgentId, cx: &mut Context<Self>) {
         let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
             return;
@@ -156,15 +112,6 @@ impl AdeApp {
 
     /// Loads the real drift count for every worktree that has history and has not been answered
     /// yet (GitHub issue #227).
-    ///
-    /// Single-flight through [`AdeApp::run_drift_in_flight`], and batched per worktree: one
-    /// `wt_core::run_drift::commits_since_each` answers every run in a checkout from one
-    /// traversal, so a window with five worktrees costs five `git` processes on the background
-    /// executor, not one per run.
-    ///
-    /// Called from the History body's own render (`crate::run_history::render`), which is the
-    /// only place that needs the answer - a window whose user never opens History never runs a
-    /// single one of these.
     pub(crate) fn load_run_drift(&mut self, cx: &mut Context<Self>) {
         if self.run_drift_in_flight {
             return;
@@ -236,10 +183,6 @@ impl AdeApp {
     }
 
     /// Reads one run's stored transcript back off disk, once, when its tab is opened.
-    ///
-    /// The result is stored as `Some(lines)` or `None` under the run's own key, and the
-    /// distinction between "absent from the map" and "present as `None`" is what makes the
-    /// synthesised body a decision rather than a flicker - see [`AdeApp::run_transcripts`].
     pub(crate) fn load_run_transcript(&mut self, run_key: String, cx: &mut Context<Self>) {
         if self.run_transcripts.contains_key(&run_key)
             || self._run_transcript_load_tasks.contains_key(&run_key)
@@ -270,10 +213,6 @@ impl AdeApp {
 
     /// Every checkout the window knows about, in the rail's own repo → worktree order - the input
     /// [`crate::run_history::model::build_run_tree`] groups history under.
-    ///
-    /// Built from [`AdeApp::repos`] rather than from [`AdeApp::worktrees`] (which is only ever the
-    /// focused repo's list) because History is explicitly cross-repo: §6 keys it "repo → worktree
-    /// → run, matching the rail", and the `all` scope is the whole point of the toggle.
     pub(crate) fn history_worktrees(&self) -> Vec<crate::run_history::model::HistoryWorktree> {
         self.repos
             .iter()
@@ -293,11 +232,6 @@ impl AdeApp {
 
     /// Every genuinely past run in the window, most recently active first - the flat list
     /// [`crate::run_history::model::build_run_tree`] groups.
-    ///
-    /// "Genuinely past" excludes any agent that is open right now, exactly as the rail's own
-    /// history did: a live agent already has a real row in the Worktrees view, and listing it
-    /// here as well would be the same agent rendered twice
-    /// (`crate::hooks::history::past_agents_for_worktree`'s own reasoning, applied window-wide).
     pub(crate) fn past_runs(&self) -> Vec<crate::hooks::history::PastAgent> {
         let live_keys = self.live_agent_status_keys();
         crate::hooks::history::past_agents(&self.agent_status_state)
@@ -308,12 +242,6 @@ impl AdeApp {
 
     /// Persists the record file after a run's ending was written, and prunes the transcript
     /// directory to match.
-    ///
-    /// A separate entry point from `crate::hooks::flow::AdeApp::persist_agent_statuses` (which
-    /// this delegates to) purely so the prune rides the one save that can ever *remove* a record:
-    /// `save_merged_at` caps the file at
-    /// [`crate::hooks::store::MAX_RECORDED_AGENTS`], and a transcript whose record was just
-    /// pruned is unreachable from then on.
     fn persist_agent_statuses_for_history(&mut self, cx: &mut Context<Self>) {
         self.persist_agent_statuses(cx);
         let Some(dir) = self.run_transcript_dir.clone() else {

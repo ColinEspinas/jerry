@@ -4,79 +4,6 @@
 //! config banner/snippet-block widgets (`crate::settings::widgets`) show. Deliberately
 //! separate from `crate::settings::state`, which stays about already-live in-memory app state rather
 //! than a file on disk.
-//!
-//! ## Scope: every field here is loaded, saved, and read back by something real
-//!
-//! [`Settings`] only has a field for a value this phase wires end-to-end: written to the file,
-//! read back at startup, and consumed by at least one render call site (see
-//! `crate::settings::render`'s per-page docs for which) - no field exists here "for
-//! completeness" just because the mockup shows a row for it.
-//!
-//! There used to be a documented exception here - `FileTreeSettings::max_entries`, the file tree
-//! walk's entry cap (GitHub issue #18), a real file-only tunable with no settings page. GitHub
-//! issue #160 removed the cap itself ("File tree should load all folders and files"), so the
-//! field went with it rather than staying on as a value nothing reads.
-//!
-//! [`EditorSettings`] (GitHub issue #26) is the same kind of file-only tunable: real, applied
-//! defaults for Tab/Shift+Tab indentation (`crate::code_surface::editing`'s
-//! `handle_editor_indent_action`/`handle_editor_dedent_action` read it as the fallback once no
-//! `.editorconfig` file sets a given property - see `crate::code_surface::indent`'s own docs for
-//! the real resolution order), with no settings-page UI of its own yet.
-//!
-//! ## TOML is the real file; JSON is a read-only alternate view
-//!
-//! The config banner's `TOML | JSON` segment (`crate::settings::widgets::render_config_banner`)
-//! is real, but **TOML is the one on-disk source of truth.** Picking "JSON" re-renders the same
-//! already-loaded [`Settings`] value through [`Settings::to_json_string`] for the snippet-block
-//! preview and swaps the displayed path to `~/.config/jerry/settings.json` for information
-//! purposes only - no second physical file is ever created or kept in sync. Maintaining two
-//! independently-editable config files that must always agree is a materially larger feature
-//! than previewing one file's contents in another syntax, and `CHANGELOG.md`'s change 3 only
-//! asks for the path/snippet to switch, which is what [`CfgFormat`] does.
-//!
-//! ## What's persisted-only vs. persisted-and-applied
-//!
-//! [`WindowSettings::controls`] is persisted **and** applied -
-//! `crate::root::AdeApp::window_controls_style` reads/writes it directly as the single source of
-//! truth for both the title-bar variant and the keycap glyph table.
-//!
-//! [`AppearanceSettings`]'s scaling fields are each applied through their own narrow mechanism -
-//! see each field's own doc comment: `interface_scale_percent` scales text size at a growing
-//! (not exhaustive) list of render call sites via `crate::root::AdeApp::ui_text_size`;
-//! `editor_font_size` and `editor_zoom_percent` together are Surface C's editor-zoom baseline and
-//! multiplier (`crate::root::AdeApp::effective_code_rem_px`); `terminal_font_size` resizes
-//! `crate::terminal::pane::TerminalPane`'s live cells, grid, and pty. `follow_system_text_size`
-//! stays persisted-only - investigated and found to have no real backing signal available (see
-//! `crate::settings::render`'s `toggle_follow_system_text_size` docs for the specific Linux
-//! GPUI APIs checked). `caret_style`/`caret_blink` (GitHub issue #27) are both real, applied
-//! inputs too - `crate::code_surface::editing::render_editable_file_view_line` reads
-//! `caret_style` to choose the painted caret shape (line/block/underline) and `caret_blink`
-//! (alongside the real, always-available `gpui::App::reduce_motion` - see
-//! `crate::root::caret_blink`'s module docs for why that, not real OS-level
-//! prefers-reduced-motion detection, is the honest mechanism this GPUI version exposes) gates
-//! whether `crate::root::AdeApp`'s shared blink loop ever starts at all.
-//!
-//! ## Editor zoom is one global, persisted number now (was three overlapping mechanisms)
-//!
-//! Before this consolidation, "how big is the editor text" was governed by three separate,
-//! overlapping mechanisms: this same persisted `editor_font_size` baseline; an in-memory-only
-//! `AdeApp::code_zoom_percent` multiplier that got reset to 100% on every worktree switch
-//! (`AdeApp::select_worktree`); and an optional `AdeApp::file_zoom_percent` per-open-file
-//! override, gated by a `per_tab_zoom` toggle. None of the last two survived an app restart, and
-//! the worktree-reset meant even a single agent's zoom wasn't stable while browsing worktrees.
-//! `editor_zoom_percent` replaces both: one real, `settings.toml`-persisted multiplier, applied
-//! uniformly to every open file, in every worktree, exactly like `editor_font_size` itself
-//! already was. `per_tab_zoom`, `AdeApp::file_zoom_percent`, and the worktree-reset are gone
-//! entirely - see `crate::code_surface`'s zoom methods for the surviving mechanism.
-//!
-//! [`ThemeSettings`] round-trips **and** really re-skins the running app: `crate::root::AdeApp::
-//! apply_theme_selection` compiles `name` into a real palette and installs it through
-//! `crate::theme::set_current_theme` (see that module's own docs for the runtime colour-token
-//! mechanism this drives, and `crate::settings::custom_theme` for the file format), and
-//! `follow_system`
-//! is real too (`crate::root::AdeApp::sync_theme_to_system_appearance`, a live
-//! `Window::observe_window_appearance` subscription). `high_contrast_diff` stays persisted-only -
-//! no real diff-colour-intensity mechanism exists yet to apply it through.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -118,14 +45,6 @@ pub struct TerminalSettings {
     /// the behaviour every install had before this setting existed (see
     /// `crate::terminal::pane::TerminalSpec::shell`). `None` is the zero-config default, so a
     /// user who never touches this keeps their real login shell.
-    ///
-    /// Either a bare program name to resolve against `PATH` (`"bash"`, `"fish"`, `"pwsh"`) or an
-    /// absolute path (`"/usr/local/bin/fish"`) - the same two forms `TerminalSpec::command`
-    /// already documents, resolved by the same real mechanism (`portable_pty::CommandBuilder`
-    /// inside `pty_core::spawn`), never by a second path search of this app's own.
-    ///
-    /// Agent CLI tabs (`claude`, `codex`) are unaffected: those spawn their own binary directly
-    /// rather than through a shell.
     pub shell: Option<String>,
 }
 
@@ -155,20 +74,6 @@ impl TerminalSettings {
 /// `"typescript-language-server"`, `"pyright-langserver"`, `"rust-analyzer"`,
 /// `"vue-language-server"`, `"gopls"`, or a companion's own distinct client key
 /// (`"typescript-language-server (vue)"`). Hand-edited in `settings.toml`; there is no UI for it.
-///
-/// ```toml
-/// [lsp."typescript-language-server".initialization_options.preferences]
-/// autoImportSpecifierExcludeRegexes = ["^node:"]
-/// includePackageJsonAutoImports = "off"
-/// ```
-///
-/// Exists because a real, live-hit limitation has no other way out: a server's own behaviour is
-/// frequently configured through `initializationOptions`, that is **not** a `tsconfig.json` (or
-/// equivalent) concern, and this app previously sent nothing at all. The example above is the
-/// verbatim answer to "imports from node:fs, fs etc have a module not found error" - a browser
-/// project where `@types/node` is installed gets Node's whole API offered as auto-imports, and
-/// `autoImportSpecifierExcludeRegexes` (a real `typescript-language-server` preference, read out
-/// of TypeScript's own `UserPreferences`) is what stops them being offered.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspServerSettings {
@@ -206,23 +111,6 @@ pub struct AppearanceSettings {
     pub interface_scale_percent: u16,
     /// GitHub issue #216 ("Scaling issues on Linux"): a forced display scale factor for GPUI's
     /// X11 backend, or `None` - the default - to leave GPUI's own detection alone.
-    ///
-    /// Not covered by [`Self::interface_scale_percent`], which is text-size-only by deliberate
-    /// design (see `crate::theme::ui_scale`'s own docs) and so cannot undo an over-detected
-    /// *window* scale: GPUI multiplies every painted pixel - padding, icons, fixed chrome - by
-    /// the factor its X11 client resolves once at startup, so when that number is wrong the whole
-    /// UI is oversized, not just its text.
-    ///
-    /// The reported case is the real one this exists for: a KDE/X11 session with
-    /// `ScreenScaleFactors=eDP-1=1;HDMI-1=1` (explicitly *no* scaling) still came up zoomed,
-    /// because GPUI's `get_scale_factor` never reads KScreen's config. Its real resolution order
-    /// is `GPUI_X11_SCALE_FACTOR`, then the `Xft.dpi` X resource, then a physical-millimetres-vs-
-    /// pixels RandR heuristic that over-scales on small laptop panels, then `1.0`.
-    ///
-    /// Applied by [`crate::x11_scale_factor_env_value`], read in `main` before GPUI starts: that
-    /// environment variable is the only override GPUI offers, and it is read once while the X11
-    /// client initialises, so a change here needs a restart and does nothing on Wayland or on a
-    /// non-X11 platform.
     pub display_scale_override: Option<f32>,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
@@ -254,15 +142,6 @@ pub struct AppearanceSettings {
     /// bracket-pair colorization - what VSCode calls "Bracket Pair Colorization"). `true` by
     /// default: the feature shipped enabled, so this is a real opt-*out*, not an opt-in that
     /// would silently turn it off for everyone who already has it.
-    ///
-    /// Unlike every other toggle in this struct, this one is not merely read at paint time - it
-    /// is an input to *span production*
-    /// (`crate::code_surface::code_view::HighlightOptions::apply`, reached through the
-    /// `*_with_options` highlight entry points), because the depth ring is carried as real
-    /// `HighlightKind` variants rather than a render-time colour choice. Cached `RenderedLine`s
-    /// therefore have to be rebuilt when it changes, which is what
-    /// `crate::root::AdeApp::invalidate_syntax_highlighting` exists for - see
-    /// `crate::settings::render::AdeApp::toggle_bracket_pair_colorization`.
     pub bracket_pair_colorization: bool,
 }
 
@@ -333,15 +212,6 @@ pub const INTERFACE_SCALE_PERCENT_MAX: u16 = 300;
 /// value is handed to GPUI's `GPUI_X11_SCALE_FACTOR` verbatim and GPUI parses it as a bare
 /// `f32`; keeping the stored form identical to the transmitted form means there is no
 /// percentage-to-factor conversion to get wrong in either direction.
-///
-/// The range spans every real arrangement (0.5 for a panel GPUI detects at 2x that the user
-/// wants unscaled, 4.0 beyond any shipping display) and, more importantly, excludes the values
-/// GPUI refuses: its own `valid_scale_factor` requires a positive, normal float and *panics* the
-/// process on anything else, so a `0`, a negative, or a subnormal from a bad hand-edit must never
-/// reach it - see [`sanitize_display_scale_override`].
-///
-/// The default is `1.0` because that is precisely what issue #216's reporter is asking for: their
-/// KScreen config already says "no scaling", and this is the switch that makes GPUI agree.
 pub const DISPLAY_SCALE_OVERRIDE_MIN: f32 = 0.5;
 pub const DISPLAY_SCALE_OVERRIDE_MAX: f32 = 4.0;
 pub const DISPLAY_SCALE_OVERRIDE_STEP: f32 = 0.05;
@@ -351,10 +221,6 @@ pub const DISPLAY_SCALE_OVERRIDE_DEFAULT: f32 = 1.0;
 /// [`AppearanceSettings::sanitize`] (hand-edited file), `crate::settings::render`'s stepper (UI
 /// edit) and [`crate::x11_scale_factor_env_value`] (the value actually handed to GPUI), so those
 /// three can never disagree about what is in range.
-///
-/// NaN is handled explicitly rather than left to `f32::clamp`, which propagates it: `nan` is a
-/// real, spellable TOML float literal, and a NaN reaching `GPUI_X11_SCALE_FACTOR` would panic
-/// GPUI's X11 client at startup instead of merely looking wrong.
 pub fn sanitize_display_scale_override(factor: f32) -> f32 {
     if factor.is_nan() {
         return DISPLAY_SCALE_OVERRIDE_DEFAULT;
@@ -463,12 +329,6 @@ pub struct KeybindingOverride {
 /// `crate::code_surface::blame_view`'s own module docs for the real off-thread/caching mechanism
 /// this gates, and `crate::settings::render`'s General page for the one real, wired toggle row
 /// backing this field (`Self::show_inline`).
-///
-/// There is deliberately no `show_gutter` field here: GitHub issue #29 also asks for a secondary
-/// gutter/full-file blame view, which this phase does not implement (see
-/// `crate::code_surface::blame_view`'s own "Scope" docs) - a persisted setting with no real
-/// feature behind it would be exactly the "looks wired up but isn't" this project's conventions
-/// forbid, so it isn't added until the feature it would gate actually exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BlameSettings {
@@ -615,24 +475,10 @@ pub struct EditorSettings {
     /// Whether accepting a completion also applies the item's own `additionalTextEdits` - in
     /// practice, the `import`/`use` line a language server wants added for a symbol that isn't in
     /// scope yet. Read by `crate::lsp::completion_popup::AdeApp::accept_active_completion`.
-    ///
-    /// On by default, because the alternative is inserting a name that doesn't resolve. Worth a
-    /// switch anyway, and live-requested: a server offers auto-imports for everything its own
-    /// index can reach, which in a browser project means `@types/node` - `import { appendFile }
-    /// from 'node:fs'` is valid TypeScript there and still cannot be bundled. Off, an accepted
-    /// completion inserts the name alone and leaves the import to the user.
     pub auto_import: bool,
     /// Whether language servers are asked to offer completions for symbols this file hasn't
     /// imported yet at all. On by default; off, the popup only ever suggests what is already in
     /// scope.
-    ///
-    /// Distinct from [`Self::auto_import`], which is about what happens when you *accept* such a
-    /// completion. This one is about whether they are offered, and it is the blunt answer to a
-    /// browser project where `@types/node` drags Node's whole API into the list.
-    ///
-    /// Only applied to servers where turning it off was directly verified to work - see
-    /// `crate::language::auto_import_suppression_options`, which currently means
-    /// `typescript-language-server` and no one else.
     pub suggest_auto_imports: bool,
     /// Whether the search panel's real, always-on explicit exclude list
     /// (`crate::search::exclude::DEFAULT_EXCLUDES` - `target`, `node_modules`, `.git`, and a
@@ -640,16 +486,6 @@ pub struct EditorSettings {
     /// real `.gitignore` (GitHub issue #394, which reworked #387/#388's own gitignore-only fix
     /// into this layered model after a direct "this should have nothing to do with git?"
     /// pushback - see `crate::search::exclude`'s own module docs for the full story).
-    ///
-    /// Matches VS Code's own `search.useIgnoreFiles`, including its default of `true`: on top of
-    /// the explicit list (which always applies and this toggle cannot turn off), this
-    /// additionally hides gitignored files. Off, only the explicit list applies - a search
-    /// deliberately scoped independently of git, which is what the pushback this setting exists
-    /// to satisfy actually asked for. Read by `crate::search::engine::search_worktree_cancellable`
-    /// via `crate::search::engine::SearchRequest::respect_gitignore`
-    /// (`crate::search::render::AdeApp::start_search` is the one real call site that populates it
-    /// from this field), and toggled by the Editor settings page's own row
-    /// (`crate::settings::render::AdeApp::toggle_respect_gitignore`).
     pub respect_gitignore: bool,
     /// Layer one's own real, persisted, user-editable pattern list (GitHub issue #401, a direct
     /// live follow-up to #394/#396: "The things you changed for the search are not configurable?
@@ -661,34 +497,6 @@ pub struct EditorSettings {
     /// page's own Search section - one row per pattern with a remove affordance
     /// (`crate::settings::render::AdeApp::remove_search_exclude_pattern`), plus a real text input
     /// to add a new one (`crate::settings::render::AdeApp::add_search_exclude_pattern`).
-    ///
-    /// ## Replace, not additive - and why
-    ///
-    /// This field is compiled directly into the [`crate::search::glob::GlobList`]
-    /// [`crate::search::exclude::collect_files_excluding`]'s walk prunes against
-    /// (`crate::search::exclude::exclude_list_from`) - it **replaces**
-    /// `crate::search::exclude::DEFAULT_EXCLUDES` as the walk's real input, rather than being an
-    /// *additional* list layered on top of that constant. [`Self::default`] seeds this field from
-    /// [`crate::search::exclude::default_search_excludes`] (i.e. `DEFAULT_EXCLUDES` copied into an
-    /// owned, editable `Vec<String>`), so a fresh install starts out excluding exactly what it
-    /// always did - but the value the user actually sees and edits in Settings *is* the real,
-    /// complete, walk-time list, not a second one shadowing an invisible base they cannot change.
-    ///
-    /// This matches how VS Code's own `search.exclude` genuinely works: it is the editable,
-    /// visible source of truth, pre-populated with sensible defaults, not a hidden built-in list
-    /// plus a user-only add-on layered silently over it. The alternative (an always-on hidden
-    /// floor plus this field purely additive on top) would mean a user could never actually
-    /// *remove* `target` from what gets excluded even if they had a real reason to (say, a
-    /// worktree named `target/` that legitimately holds source, however unlikely) - "visible and
-    /// editable" has to include being able to shrink it, not just grow it.
-    ///
-    /// The one real risk that design choice accepts, stated plainly: unlike the old two-layer
-    /// model's `DEFAULT_EXCLUDES`, this list is not an unconditional floor - a user who explicitly
-    /// deletes `target` (or every entry) from their own copy really does get an unfiltered walk,
-    /// on *this* repository's own real ~59 GB `target/` + `.shared-target/` included. That is the
-    /// same tradeoff VS Code itself accepts for `search.exclude`, and is judged the right one here:
-    /// a setting the user cannot actually edit down to what they want is not the real, editable
-    /// setting issue #401 asked for.
     pub search_excludes: Vec<String>,
 }
 
@@ -1095,11 +903,6 @@ mod tests {
         );
     }
 
-    /// The real toggle a user flips from the Editor settings page - see
-    /// `crate::settings::render::AdeApp::toggle_respect_gitignore`. Proven here at the file-format
-    /// level (round-trips through a real save + load, and an explicit `false` in a hand-edited
-    /// file is honoured rather than silently reset to the default) rather than only asserted
-    /// in-memory, since a toggle nobody can actually flip-and-keep-flipped is not a real setting.
     #[test]
     fn respect_gitignore_persists_through_a_real_save_and_load_in_both_states() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1122,10 +925,6 @@ mod tests {
         assert!(Settings::load_or_init_at(&path).editor.respect_gitignore);
     }
 
-    /// A `settings.toml` written before this setting existed has no `respect_gitignore` key at
-    /// all under `[editor]` - `#[serde(default)]` must fall back to the real default (`true`)
-    /// rather than failing the whole parse, the same fallback already proven for the minimap and
-    /// keymap sections.
     #[test]
     fn a_settings_file_missing_respect_gitignore_entirely_still_loads_the_real_default() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1146,10 +945,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #401's real, editable list - proven the same way `respect_gitignore_persists_
-    /// through_a_real_save_and_load_in_both_states` proves its own toggle: a real save + load
-    /// round trip, both adding a custom pattern and removing a default one, since a setting nobody
-    /// can actually edit-and-keep-edited is not a real setting.
     #[test]
     fn search_excludes_persists_through_a_real_save_and_load_with_a_custom_edit() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1194,10 +989,6 @@ mod tests {
         );
     }
 
-    /// [`EditorSettings::sanitize`]'s own "hand-edit gets normalized, not rejected" discipline,
-    /// applied to `search_excludes`: blank entries are dropped and exact duplicates are collapsed,
-    /// the same way a hand-edited `settings.toml` full of stray whitespace/repeats is normalized
-    /// rather than rejected outright elsewhere in this module.
     #[test]
     fn a_hand_edited_search_excludes_with_blanks_and_duplicates_is_sanitized() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1217,10 +1008,6 @@ mod tests {
         );
     }
 
-    /// A user who genuinely wants an unfiltered search is allowed to delete every entry - a real,
-    /// honest empty list, not one `sanitize` quietly refills back to the default. See
-    /// `EditorSettings::search_excludes`'s own "one real risk" docs for why this is the accepted
-    /// tradeoff.
     #[test]
     fn a_genuinely_empty_search_excludes_list_round_trips_as_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1263,9 +1050,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #160 deleted `[file_tree] max_entries` outright. A `settings.toml` written by
-    /// an older build still has that section in it, and it must load as a plain no-op rather than
-    /// failing the whole file back to defaults and quietly losing every other setting with it.
     #[test]
     fn a_settings_file_still_carrying_the_removed_file_tree_cap_loads_the_rest_of_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1325,11 +1109,6 @@ mod tests {
         );
     }
 
-    /// An old `settings.toml` written before the minimap existed has no `[editor]` section at
-    /// all - `#[serde(default)]` must fall back to the real defaults (minimap on) rather than
-    /// failing the whole parse, the same real fallback
-    /// `an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly` already
-    /// proves for `[keymap]`.
     #[test]
     fn an_old_settings_toml_missing_the_editor_section_entirely_still_loads_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1345,9 +1124,6 @@ mod tests {
         );
     }
 
-    /// An old `settings.toml` written before keybinding rebinding existed has no `[keymap]`
-    /// section at all - `#[serde(default)]` on [`Settings`] must fall back to an empty
-    /// `overrides` list rather than failing the whole parse.
     #[test]
     fn an_old_settings_toml_missing_the_keymap_section_entirely_still_loads_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1359,9 +1135,6 @@ mod tests {
         assert!(loaded.keymap.overrides.is_empty());
     }
 
-    /// A hand-written `[lsp.*]` section - the only way to configure a language server here -
-    /// must load, survive a save the app makes for some unrelated reason, and reach the spawn path
-    /// intact. Written exactly as the docs on [`LspServerSettings`] show it.
     #[test]
     fn a_hand_written_lsp_preferences_section_round_trips_through_toml_save_and_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1384,7 +1157,6 @@ mod tests {
             .as_ref()
             .expect("its initialization options must load");
 
-        // Exactly what `crate::language::merge_initialization_options` will send.
         let json = serde_json::to_value(options).expect("a real TOML value crosses to JSON");
         assert_eq!(
             json["preferences"]["autoImportSpecifierExcludeRegexes"],
@@ -1395,7 +1167,6 @@ mod tests {
             serde_json::json!("off")
         );
 
-        // And an unrelated save (toggling anything in the UI writes the whole file) keeps it.
         loaded.save_at(&path).expect("save should succeed");
         assert_eq!(Settings::load_or_init_at(&path), loaded);
     }
@@ -1465,10 +1236,6 @@ mod tests {
         assert_eq!(settings, loaded);
     }
 
-    /// GitHub issue #122's `show_indent_guides` toggle, round-tripped through real TOML
-    /// save/load exactly like [`a_settings_value_round_trips_through_real_toml_save_and_load`]
-    /// above covers several other `AppearanceSettings` fields - a dedicated test so a future
-    /// change to that shared fixture can't silently stop covering this one field.
     #[test]
     fn show_indent_guides_round_trips_through_real_toml_save_and_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1488,11 +1255,6 @@ mod tests {
         assert!(!loaded.appearance.show_indent_guides);
     }
 
-    /// GitHub issue #168's `bracket_pair_colorization` toggle, round-tripped through real TOML
-    /// save/load - same dedicated-test discipline as [`show_indent_guides_round_trips_through_real_toml_save_and_load`]
-    /// above, and additionally pinning that a file written *before* this key existed still loads
-    /// with the feature on. That backward-compatibility case is the one that matters here: this
-    /// shipped enabled, so a missing key has to mean "on", never "off".
     #[test]
     fn bracket_pair_colorization_round_trips_and_defaults_on_for_an_older_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1591,11 +1353,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #216. The forced X11 scale factor is the one appearance value a bad hand-edit
-    /// can do more than misrender with: it is handed to `GPUI_X11_SCALE_FACTOR`, and GPUI's own
-    /// `valid_scale_factor` panics the process on anything that isn't a positive, normal float.
-    /// `nan` is checked alongside the out-of-range numbers because it is a real TOML float
-    /// literal, and it is the one value `f32::clamp` would have propagated straight through.
     #[test]
     fn a_hand_edited_out_of_range_display_scale_override_is_clamped_on_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1624,9 +1381,6 @@ mod tests {
         }
     }
 
-    /// The default has to stay a real `None` - "let GPUI detect the scale, as it always has" - and
-    /// must be omitted from the written file entirely rather than materializing as some number,
-    /// which would silently pin every existing install to a scale its user never chose.
     #[test]
     fn the_display_scale_override_defaults_to_none_and_round_trips_through_a_real_file() {
         assert_eq!(
@@ -1656,13 +1410,6 @@ mod tests {
         );
     }
 
-    /// The real regression guard for removing `per_tab_zoom`/`AdeApp::file_zoom_percent`: an old
-    /// `settings.toml` written before this consolidation has a real `per_tab_zoom` key under
-    /// `[appearance]` that no longer maps to any field. `serde`'s default (non-`deny_unknown_
-    /// fields`) behavior is to ignore unrecognized keys rather than fail the whole parse, so this
-    /// must still load cleanly and fall back to the new field's real default - not crash, and not
-    /// silently produce a `Settings::default()` fallback (which would also discard every *other*
-    /// real value the same file had set).
     #[test]
     fn an_old_settings_toml_with_the_removed_per_tab_zoom_key_still_loads_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1723,7 +1470,6 @@ mod tests {
     #[test]
     fn settings_toml_path_is_rooted_at_a_real_home_directory_config_jerry() {
         let Some(path) = settings_toml_path() else {
-            // No home directory in this environment - a legitimate, if unusual, honest `None`.
             return;
         };
         let home = home_dir().expect("settings_toml_path resolved, so home_dir must have too");
@@ -1773,7 +1519,6 @@ mod tests {
         assert!(joined.contains(&"[window]"));
         assert!(joined.iter().any(|l| l.contains("\"macos\"")));
 
-        // Changing the live value changes the rendered snippet - this is a *view*, not a cache.
         settings.window.controls = WindowControlsStyle::System;
         let lines_after = snippet_lines(&settings, ConfigPage::General, CfgFormat::Toml);
         let joined_after: Vec<&str> = lines_after.iter().map(|l| l.text.as_str()).collect();
@@ -1793,9 +1538,6 @@ mod tests {
             .all(|line| line.kind == SnippetLineKind::Key));
     }
 
-    /// GitHub issue #213. The zero-config default must stay "whatever the OS says" - a `None`,
-    /// never a guessed `"bash"` - and a real hand-edited value must survive a full
-    /// write-then-load round trip through the same file the app itself writes.
     #[test]
     fn the_shell_override_defaults_to_none_and_round_trips_through_a_real_file() {
         assert_eq!(
@@ -1833,8 +1575,6 @@ mod tests {
         );
     }
 
-    /// A hand-edited `[terminal] shell` is normalized the same way every other hand-edited value
-    /// is: a blank/whitespace-only entry means "system default", not a program named `" "`.
     #[test]
     fn a_hand_edited_blank_shell_loads_as_the_real_system_default() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1855,8 +1595,6 @@ mod tests {
         );
     }
 
-    /// The General page's snippet block is a live view of the real file - the shell override has
-    /// to actually appear in it once set, or the banner would name a key the panel never shows.
     #[test]
     fn the_general_snippet_shows_the_real_shell_override() {
         let mut settings = Settings::default();
@@ -1924,9 +1662,6 @@ mod tests {
         assert_eq!(loaded.sound.app_start.sound, "soft-chime");
     }
 
-    /// A `settings.toml` predating this feature has no `[sound]` table at all -
-    /// `#[serde(default)]` must still parse it into the real off-by-default `SoundSettings`,
-    /// matching every other section's "missing means default" contract.
     #[test]
     fn a_settings_file_with_no_sound_section_loads_the_real_default() {
         let dir = tempfile::tempdir().expect("tempdir");

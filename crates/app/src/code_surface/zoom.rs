@@ -71,10 +71,6 @@ impl AdeApp {
     /// The toolbar's zoom control group: `-` / value / `+`, 19x19 buttons with a 1px gap, value
     /// in a fixed 36px column (every value in `ZOOM_MIN_PERCENT..=ZOOM_MAX_PERCENT` is at most 3
     /// digits). Clicking the value resets zoom to 100%.
-    ///
-    /// The design has no disabled-color state for `-`/`+` at the range boundaries; this adds one
-    /// (dims and drops the click handler/hover/cursor) rather than leaving a dead-looking button
-    /// that silently no-ops at 70%/200%.
     pub(in crate::code_surface) fn render_zoom_control(
         &self,
         cx: &mut Context<Self>,
@@ -207,13 +203,9 @@ mod code_zoom_tests {
 
     #[test]
     fn clamp_zoom_percent_rounds_to_the_nearest_real_ten_point_step() {
-        // 53 -> 5.3 -> rounds to 5 steps -> 50 -> clamped up to the real 70 minimum.
         assert_eq!(clamp_zoom_percent(53), 70);
-        // 75 -> 7.5 -> rounds away from zero to 8 steps -> 80.
         assert_eq!(clamp_zoom_percent(75), 80);
-        // 84 -> 8.4 -> rounds down to 8 steps -> 80.
         assert_eq!(clamp_zoom_percent(84), 80);
-        // 205 -> 20.5 -> rounds up to 21 steps -> 210 -> clamped down to the real 200 maximum.
         assert_eq!(clamp_zoom_percent(205), 200);
     }
 
@@ -304,11 +296,6 @@ mod code_zoom_tests {
         );
     }
 
-    /// Zoom is a single, global `Settings.appearance.editor_zoom_percent` value now (see
-    /// `settings_store`'s "Editor zoom is one global, persisted number now" docs) - zooming one
-    /// open file must change what every other open file (and a freshly opened one) shows too,
-    /// which is the real behavior this replaced `per_tab_zoom`'s two modes to guarantee
-    /// unconditionally rather than only when the toggle happened to be off.
     #[gpui::test]
     fn zoom_applies_globally_to_every_open_file_not_just_the_active_one(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -345,11 +332,6 @@ mod code_zoom_tests {
         );
     }
 
-    /// Regression for the removed per-worktree reset (`AdeApp::select_worktree` used to reset
-    /// `code_zoom_percent` to 100% on every switch, back when it was in-memory-only UI state -
-    /// see `Self::select_worktree`'s docs before this consolidation). Zoom is now a real
-    /// `Settings` field, so it must survive a worktree switch exactly like `editor_font_size`
-    /// already does.
     #[gpui::test]
     fn zoom_survives_a_worktree_switch(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -412,9 +394,6 @@ mod code_zoom_tests {
         );
     }
 
-    /// Closing a zoomed tab and reopening the same path must keep showing the same global zoom -
-    /// the opposite of the old per-file behavior (which deliberately reset a closed-then-reopened
-    /// tab to 100%, since the zoom used to be remembered *per path*, not globally).
     #[gpui::test]
     fn closing_and_reopening_a_tab_keeps_the_same_global_zoom(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -456,20 +435,6 @@ mod code_zoom_tests {
         );
     }
 
-    /// Proves `zoom_scoped`'s `WithRemSize` mechanism works: a live-rendered code row's text
-    /// grows with zoom while the fixed-`px()` line-number gutter measures identically at every
-    /// zoom level.
-    ///
-    /// ## Why a width-only assertion would be vacuous
-    ///
-    /// Comparing only the gutter's `width` can never fail, since the column is declared
-    /// `w(px(52.0))` - a compile-time literal GPUI resolves identically regardless of whether
-    /// zoom-scoping is wired up correctly. It proves nothing about whether the line-number text
-    /// inside still (wrongly) grows with zoom. This test's second half closes that gap: a
-    /// 4-digit line number, scrolled into view at the 200% zoom maximum, where the original bug
-    /// manifested (`uniform_list` sizes every row's slot from item index 0 alone - a single-digit
-    /// "1", which never wraps - so a 4-digit gutter number wrapping at higher zoom painted taller
-    /// than its allocated slot, overlapping the row below).
     #[gpui::test]
     fn zoom_scales_text_but_not_the_gutter_width(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

@@ -1,57 +1,6 @@
 //! The File view breadcrumb's **symbol path** - the real chain of enclosing declarations around
 //! wherever the caret currently sits (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26
 //! (`src › db › query_builder.rs › impl QueryBuilder › build`, ...)").
-//!
-//! GitHub issue #178: the breadcrumb band used to render only `code_view::breadcrumb_segments`'
-//! path components, which the Surface C toolbar directly above it already shows - a literal
-//! duplicate. This module supplies the half that was missing.
-//!
-//! ## Why a flat span list rather than a retained `tree_sitter::Tree`
-//!
-//! The obvious implementation is to keep the parsed tree alive and, on every caret move, call
-//! `Node::descendant_for_byte_range(offset, offset)` and walk `parent()` upwards. That is
-//! genuinely cheaper per lookup, and it is deliberately not what this does. A retained tree is
-//! only valid against the exact source text it was parsed from, so it would have to be kept in
-//! lockstep with `crate::code_surface::edit_buffer::EditBuffer::content` through every splice -
-//! and `EditBuffer` is cloned, snapshotted and compared in several places that have no business
-//! knowing about grammar lifetimes.
-//!
-//! [`symbol_outline`] instead flattens the tree **once per parse**, on the same background
-//! executor that already re-highlights the file, into plain owned data: a preorder list of
-//! `(byte range, label)`. Looking a caret up in it ([`symbol_path_at`]) is a linear scan over a
-//! few hundred entries - far below a frame budget, measured against nothing more exotic than the
-//! fact that this file's own outline has 40-odd entries. Plain data also means the outline can be
-//! unit-tested against real parses with no GPUI window and no `EditBuffer` at all, which is what
-//! this module's own tests do.
-//!
-//! ## Staleness while typing
-//!
-//! The outline is recomputed by `crate::code_surface::editing::AdeApp::schedule_rehighlight`,
-//! i.e. 150ms after the last keystroke, exactly like the syntax highlighting it rides along with.
-//! Between an edit and that refresh, the stored byte ranges describe the *pre-edit* text: spans
-//! that start after the caret are shifted by the edit's own delta. This is deliberate and is not
-//! hidden - the enclosing chain at the caret is built from spans whose `start` is *before* the
-//! edit (so still correct) and whose `end` may be off by the edit's length, which can only matter
-//! in the narrow window where the caret sits within that many bytes of a symbol's closing
-//! boundary. The alternative - clearing the outline on every keystroke - would make the
-//! breadcrumb blink empty while typing, which is a worse lie than being 150ms behind.
-//!
-//! ## Which languages are covered, and why not all of them
-//!
-//! Rust, TypeScript/TSX (and therefore `.js`/`.jsx`, which this app parses with the TypeScript
-//! grammars - see `code_view::Grammar::for_extension`), Python and Go. Those are the languages
-//! whose "what is an enclosing declaration" node kinds were each read out of the grammar's own
-//! bundled `src/node-types.json` in the pinned crate on disk, field names included, and are
-//! asserted by real parses in this module's tests.
-//!
-//! C is deliberately absent despite being a supported highlight grammar: `tree-sitter-c`'s
-//! `function_definition` has no `name` field at all (its fields are `declarator`/`type`, checked
-//! in `tree-sitter-c-0.24.2/src/node-types.json`), so producing `foo` from `static int *foo(void)`
-//! means walking down through `pointer_declarator`/`function_declarator` by hand - real work with
-//! its own failure modes, and no shared abstraction with the four languages here. TOML, JSON,
-//! YAML, Markdown, HTML and CSS have no enclosing *symbol* concept worth a breadcrumb crumb at
-//! all. For any of those, [`symbol_outline`] returns an empty outline and the breadcrumb honestly
-//! shows the path alone.
 
 use std::ops::Range;
 
@@ -109,15 +58,6 @@ impl SymbolLanguage {
 
 /// Parses `source` with the grammar `extension` maps to and flattens every enclosing declaration
 /// in it into a preorder (outermost first) [`SymbolSpan`] list.
-///
-/// Empty - never a fabricated placeholder - when `extension` has no grammar at all, has a grammar
-/// this module doesn't cover, or the parse itself fails. The empty case is what the breadcrumb
-/// renders as "path segments only", which is the honest rendering for a file whose language has
-/// no symbol nesting to report.
-///
-/// Runs a real `tree_sitter::Parser::parse` (~16ms on this repository's largest file, measured in
-/// `code_view`'s own module docs), so every production caller runs it on
-/// `cx.background_executor()`, never in a render pass.
 pub fn symbol_outline(source: &str, extension: Option<&str>) -> Vec<SymbolSpan> {
     let Some(grammar) = extension.and_then(Grammar::for_extension) else {
         return Vec::new();
@@ -157,11 +97,6 @@ fn collect(node: Node, source: &str, language: SymbolLanguage, spans: &mut Vec<S
 
 /// The real crumb chain enclosing `offset`, outermost first - `["impl QueryBuilder", "build"]` for
 /// a caret inside `QueryBuilder::build`.
-///
-/// Containment is **half-open** (`start <= offset < end`), matching `tree_sitter`'s own
-/// `descendant_for_byte_range` convention: a caret parked immediately *after* a function's closing
-/// brace is genuinely outside that function, and reporting it as still inside would be a visible
-/// lie the moment the user arrows past the brace.
 pub fn symbol_path_at(spans: &[SymbolSpan], offset: usize) -> Vec<&str> {
     spans
         .iter()
@@ -221,12 +156,6 @@ fn rust_label(node: Node, source: &str) -> Option<String> {
 /// Node kinds and field names read from `tree-sitter-typescript-0.23.2/typescript/src/
 /// node-types.json`. Note `class` and `class_declaration` are two genuinely different kinds there
 /// (a class *expression* versus a statement), both with a `name` field, and both are covered.
-///
-/// `arrow_function` has no `name` field at all, so `const handler = () => {}` and a class's
-/// `handler = () => {}` field are resolved through the parent that *does* name them -
-/// `variable_declarator` (fields `name`/`type`/`value`) and `public_field_definition` (fields
-/// `decorator`/`name`/`type`/`value`) respectively. An arrow function with neither parent (an
-/// inline callback) genuinely has no name and contributes no crumb, rather than an invented one.
 fn typescript_label(node: Node, source: &str) -> Option<String> {
     match node.kind() {
         "class_declaration" | "abstract_class_declaration" | "class" => {
@@ -280,11 +209,6 @@ fn python_label(node: Node, source: &str) -> Option<String> {
 /// `function_declaration` (fields include `name`), `method_declaration` (also `receiver`) and
 /// `type_spec` (field `name`; it is the child of `type_declaration`, which carries no fields of
 /// its own, so the crumb hangs off the spec).
-///
-/// A method's crumb is its bare name, not `(*T) Name`: the receiver field's own source text is
-/// the whole parameter list (`(b *QueryBuilder)`), and picking the type out of it means parsing a
-/// second declarator shape for one cosmetic gain. Go has no lexical nesting of declarations
-/// anyway, so a method crumb never appears beside a type crumb the way Rust's `impl` does.
 fn go_label(node: Node, source: &str) -> Option<String> {
     match node.kind() {
         "function_declaration" | "method_declaration" => {
@@ -370,9 +294,7 @@ fn free_standing() {
     #[test]
     fn moving_the_caret_out_of_every_declaration_really_empties_the_symbol_path() {
         let spans = symbol_outline(RUST_SOURCE, Some("rs"));
-        // The very first byte of the file: before `mod db` starts, so genuinely inside nothing.
         assert!(symbol_path_at(&spans, 0).is_empty());
-        // Inside a free function at the file's top level: exactly one crumb, no `mod`.
         assert_eq!(
             symbol_path_at(&spans, offset_after(RUST_SOURCE, "marker_inside_free")),
             vec!["free_standing"],

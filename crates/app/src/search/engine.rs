@@ -1,106 +1,6 @@
 //! The pure, GPUI-free content search behind the right panel's Search tab: the compiled matcher
 //! the three modifier buttons produce, the worktree walk, the two-level result tree, and the real
 //! in-place replace.
-//!
-//! Everything here is a plain function over plain data with no `Window`, no `Context` and no app
-//! state, which is the split every feature folder in this crate uses (`crate::sidebar::file_tree`
-//! vs `crate::sidebar::render`). The panel itself is `crate::search::render`.
-//!
-//! ## One matcher, three buttons
-//!
-//! `Aa` (match case), `ab` (whole word) and `.*` (regex) are not three code paths - they are three
-//! inputs to one [`Matcher`], which is always a real `regex::Regex`. A literal query is
-//! `regex::escape`d first; whole-word wraps the whole thing in `\b(?:...)\b`. That is one place
-//! for the "leftmost, non-overlapping" semantics every editor's find has, rather than a
-//! hand-rolled substring scan for two of the three states and a regex for the third - which is
-//! exactly how the two would silently drift apart on overlapping matches.
-//!
-//! The one behaviour that genuinely differs by mode is what the *replacement* string means: in
-//! regex mode `$1` is a real capture reference (what a user typing a regex expects, and what VS
-//! Code does), and in literal mode it is a literal dollar sign. See [`Matcher::replace_all`].
-//!
-//! ## Bounded, because a worktree is not bounded
-//!
-//! A `target/`- or `node_modules`-style build/dependency directory can hold hundreds of thousands
-//! of files, and (see "Scoped to real content" below) this walk no longer even opens one -
-//! but the caps here are kept regardless, as real defense in depth against whatever the active
-//! worktree really contains once it *is* real, trackable content: an enormous monorepo, or a
-//! generated-and-committed directory not on the explicit exclude list. Four real limits,
-//! each reported honestly rather than silently applied: [`MAX_MATCHES`], [`MAX_SCANNED_FILES`],
-//! [`MAX_FILE_BYTES`] and a binary-file check. [`SearchOutcome::truncated`] is what the panel's
-//! count row turns into a real truncation notice - the issue's own "results cap with an honest
-//! truncation notice".
-//!
-//! ## Parallel, because a directory walk is not one file
-//!
-//! A live report (GitHub issue #162's own follow-up) found a real, unbounded-looking query
-//! latency: typing into the query field could take "a very long time" to answer on a checkout of
-//! merely "dozens to hundreds of files" - measured directly against a 415-file, 14MB fixture at
-//! **582ms** for a single-threaded, one-file-at-a-time walk (a query that does not hit either
-//! cap, so every candidate file is really read and scanned). [`search_worktree`]'s own read+scan
-//! step (the expensive part - `fs::read` plus a real `regex::Regex` pass, not the directory
-//! listing, which is a cheap `stat` per entry) now runs across [`SEARCH_SCAN_BATCH`]-sized
-//! batches of candidates on `rayon`'s global thread pool, folding each batch's results back into
-//! [`SearchOutcome`] **sequentially and in the original, sorted order** - so [`MAX_MATCHES`]/
-//! [`MAX_SCANNED_FILES`] still stop the walk at exactly the same file/line the old sequential loop
-//! would have (`worktree_tests::the_result_cap_stops_the_search_and_says_so_rather_than_returning_a_silent_prefix`
-//! still pins the same tight `<= MAX_MATCHES + 1` bound), and a re-run never reorders rows the
-//! user was reading mid-keystroke. Batching (rather than handing the whole candidate list to
-//! `rayon` at once) is what keeps [`MAX_SCANNED_FILES`]'s own point intact: without it, a
-//! `target/`-sized checkout would still pay to read and scan every file the cap exists to avoid
-//! reading in the first place, just on more threads at once.
-//!
-//! ## Cancelled, because a superseded search is not a finished one
-//!
-//! `crate::search::render::AdeApp::start_search` already discarded a slow search's *result* once
-//! a newer one answered first (its own generation guard), but the slow search itself kept running
-//! to completion on the background executor regardless - burning a real CPU thread competing with
-//! the query that superseded it, on every keystroke of a fast typist against a large-enough
-//! worktree. [`search_worktree_cancellable`] is the real fix: `is_stale` is polled once per batch
-//! (cheap - a single atomic load) and a `true` answer stops the walk immediately, returning
-//! whatever partial [`SearchOutcome`] has accumulated so far. The caller never looks at that
-//! outcome (its own generation guard already discards it), so this is a pure CPU-saving early
-//! exit, not a correctness-affecting one. [`search_worktree`] is the non-cancellable convenience
-//! wrapper every existing (and every non-panel) caller keeps using.
-//!
-//! ## Scoped to real content, not to every byte on disk
-//!
-//! A second live report, against a real repository rather than a fixture: "it is very slow still
-//! ... it can take 10 seconds", plus its own corroborating clue - "the perf of the search seems
-//! faster after the first query". Both are explained by the same real defect, and neither the
-//! rayon batching above nor the cancellation below touch it, because it sits one step earlier:
-//! candidate *discovery*. The walk that fed both of those fixes candidates skipped only `.git` -
-//! every other directory, including a `.gitignore`d build or dependency directory, was opened and
-//! `stat`-ed like any other. Measured directly against this application's *own* checkout: 125,242
-//! files on disk, of which 99,250 (79%) sit under its own `target/` - 31 GB of Rust build output.
-//! [`MAX_SCANNED_FILES`] (20,000) is smaller than `target/` alone, so the old walk hit that cap,
-//! and reported itself truncated, entirely inside `target/` - before a single real source file
-//! was ever read.
-//!
-//! The first fix here (#387/#388) made [`wt_core::worktree_files::list_worktree_files`] (`git
-//! ls-files --cached --others --exclude-standard`) the *sole* candidate source, which fixed the
-//! real regression but, as a direct, immediate live pushback put it: "Wait what you made the
-//! search respect gitignore? This should have nothing to do with git?" - correct: a search whose
-//! entire notion of "don't walk into `target/`" was defined by `.gitignore`, and which stopped
-//! excluding anything at all outside a real git worktree, was never the intended fix.
-//!
-//! GitHub issue #394 reworked this into the two-layer model [`crate::search::exclude`]'s own
-//! module docs describe in full (VS Code's own `files.exclude`/`search.exclude` +
-//! `search.useIgnoreFiles` split, collapsed into Jerry's one combined always-on list since there
-//! is no separate file-explorer walk to share the distinction with): [`collect_candidate_files`]
-//! below now runs [`crate::search::exclude::collect_files_excluding`] - a real, rayon-parallelized
-//! filesystem walk pruned by [`SearchRequest::search_excludes`] - as the one, always-on,
-//! git-independent primary discovery mechanism, and layers `list_worktree_files` on top of it as
-//! an *additive*, independently toggleable filter
-//! ([`crate::settings::store::EditorSettings::respect_gitignore`], default `true`) rather than the
-//! sole file source. Measured directly against this repository, in both toggle states: see
-//! [`collect_candidate_files`]'s own docs.
-//!
-//! GitHub issue #401 made that pruning list itself real, persisted, user-editable settings state
-//! ([`crate::settings::store::EditorSettings::search_excludes`]) rather than the compiled-in
-//! [`crate::search::exclude::DEFAULT_EXCLUDES`] constant alone - see [`SearchRequest::
-//! search_excludes`]'s own docs for exactly what's threaded through, and `crate::search::exclude`'s
-//! own "GitHub issue #401" docs for the full replace-vs-additive design decision.
 
 use std::collections::HashSet;
 use std::fs;
@@ -179,10 +79,6 @@ impl Matcher {
     /// Compiles `query` under `options`. Returns `Ok(None)` for a query that is empty once
     /// trimmed of nothing at all - i.e. genuinely `""` - which is the panel's "not searched yet"
     /// state and not an error.
-    ///
-    /// A query of pure whitespace is a **real** query: a user searching for `"    "` (an
-    /// indentation width) means it, and treating it as empty would silently refuse a legitimate
-    /// search. Only a genuinely empty string is the idle state.
     pub fn compile(query: &str, options: SearchOptions) -> Result<Option<Self>, MatcherError> {
         if query.is_empty() {
             return Ok(None);
@@ -211,11 +107,6 @@ impl Matcher {
     }
 
     /// Every non-overlapping match in `line`, as byte ranges into it.
-    ///
-    /// Zero-length matches are dropped rather than reported. They are reachable the moment the
-    /// user types `.*` or `a?` into a regex query, and a zero-width "match" is not something the
-    /// tree can highlight, the count can honestly total, or replace can act on - it would produce
-    /// one result row per character in the worktree.
     pub fn find_in_line(&self, line: &str) -> Vec<Range<usize>> {
         self.regex
             .find_iter(line)
@@ -225,14 +116,6 @@ impl Matcher {
     }
 
     /// `text` with every match replaced, plus how many were replaced.
-    ///
-    /// In regex mode `replacement` is a real template: `$1` / `${name}` expand to captures, which
-    /// is what a user who just typed a regex means by it. In literal mode it is inserted verbatim
-    /// (`regex::NoExpand`), so replacing with `$5.00` writes `$5.00` rather than an empty capture.
-    ///
-    /// Zero-length matches are skipped here for the same reason [`Self::find_in_line`] drops them,
-    /// and by the same code path - so the count this returns is always exactly the count the tree
-    /// showed.
     pub fn replace_all(&self, text: &str, replacement: &str) -> (String, usize) {
         let mut out = String::with_capacity(text.len());
         let mut last = 0usize;
@@ -273,11 +156,6 @@ fn first_line_of(message: &str) -> String {
 }
 
 /// The two path-filter fields, resolved into the one question the walk asks per file.
-///
-/// The asymmetry between them is deliberate and is the whole reason this is a type rather than
-/// two `GlobList`s: an **empty include** means "no include filter", i.e. every path is a
-/// candidate, while an empty exclude means "exclude nothing". Both read as "the field is blank, so
-/// it is not filtering", but they are opposite defaults on a bare `GlobList::matches`.
 #[derive(Debug, Clone, Default)]
 pub struct PathFilter {
     include: GlobList,
@@ -302,10 +180,6 @@ impl PathFilter {
 }
 
 /// One matched line, and every hit on it.
-///
-/// The whole line is kept rather than a pre-trimmed display string: the panel's own left-elision
-/// rule ([`elide_around`]) is a *rendering* decision that depends on which hit a row is showing,
-/// and baking it in here would make the same data unusable for replace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineMatch {
     /// 1-based, as every editor and every `grep` reports it.
@@ -388,16 +262,6 @@ pub struct SearchRequest {
 }
 
 /// Runs a real content search over `request.root`.
-///
-/// Blocking, by design: the caller runs it on `gpui::BackgroundExecutor` exactly as
-/// `crate::sidebar::file_tree::build_file_tree` is run (see `crate::search::render::AdeApp::
-/// start_search`). Errors reading an individual file or directory are skipped rather than
-/// aborting - one unreadable folder must never blank a whole result tree - which is the same call
-/// `build_file_tree`'s own walk makes.
-///
-/// The non-cancellable convenience wrapper: every caller that isn't the panel's own debounced,
-/// generation-guarded search (every test in this module included) has nothing to cancel *for* -
-/// see [`search_worktree_cancellable`]'s own docs for the one caller that does.
 pub fn search_worktree(request: &SearchRequest) -> SearchOutcome {
     search_worktree_cancellable(request, &|| false)
 }
@@ -405,9 +269,6 @@ pub fn search_worktree(request: &SearchRequest) -> SearchOutcome {
 /// [`search_worktree`], plus the real fix for a live, reported "typing is slow" defect: `is_stale`
 /// is polled between batches, and answering `true` stops the walk immediately rather than running
 /// it to completion only to have the result discarded - see this module's own "Cancelled" docs.
-///
-/// `is_stale` is called from this function's own thread only (never from inside a `rayon` worker),
-/// so it needs no `Send`/`Sync` bound of its own.
 pub fn search_worktree_cancellable(
     request: &SearchRequest,
     is_stale: &dyn Fn() -> bool,
@@ -512,31 +373,6 @@ fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
 /// worktree-relative, `/`-separated form - the two-layer model [`crate::search::exclude`]'s own
 /// module docs describe in full, and what GitHub issue #394 reworked #387/#388's gitignore-only
 /// fix into.
-///
-/// **Layer one, always on:** [`crate::search::exclude::collect_files_excluding`] - a real,
-/// `rayon`-parallelized filesystem walk pruned by `search_excludes`, compiled via
-/// [`crate::search::exclude::exclude_list_from`] (GitHub issue #401's real, persisted
-/// `crate::settings::store::EditorSettings::search_excludes` - `target`, `node_modules`, `.git`,
-/// and a handful of other common build/dependency directory names *by default*, and genuinely
-/// user-editable from there) *before* a directory is ever opened. This is the primary discovery
-/// mechanism now, not a fallback: it runs identically whether or not `root` is a real git
-/// worktree, which is the literal answer to the live pushback this issue exists for - "this should
-/// have nothing to do with git".
-///
-/// **Layer two, toggleable:** when `request.respect_gitignore` is `true` (the default -
-/// `crate::settings::store::EditorSettings::respect_gitignore`), [`list_worktree_files`] (`git
-/// ls-files --cached --others --exclude-standard`, #388's own real fix) is additionally consulted
-/// and the layer-one candidates are narrowed to exactly the paths it lists - i.e. gitignored files
-/// are removed **on top of** whatever layer one already pruned, never instead of it. Outside a
-/// real git worktree (or wherever `git` itself can't run), [`list_worktree_files`] returns `Err`
-/// and this layer is a no-op: layer one alone is already a complete, honest answer there. When
-/// `respect_gitignore` is `false`, this layer is skipped entirely - a search deliberately scoped
-/// independently of git, which is the literal behaviour the pushback asked for.
-///
-/// Measured directly against this repository's own real checkout (31 GB `target/` + 28 GB
-/// `.shared-target/`, neither one walked by layer one regardless of `respect_gitignore`): both
-/// toggle states stay fast - see this crate's own `PR #394` real functional verification for exact
-/// numbers, not asserted here as a flaky wall-clock unit test.
 fn collect_candidate_files(
     root: &Path,
     search_excludes: &[String],
@@ -568,9 +404,6 @@ fn collect_candidate_files(
 /// `path`'s text, or `None` when it is not something to search: too large
 /// ([`MAX_FILE_BYTES`]), binary (a NUL byte in the first [`BINARY_SNIFF_BYTES`]), not valid UTF-8,
 /// or simply unreadable.
-///
-/// The UTF-8 check is real rather than lossy: a lossy decode would report byte offsets into a
-/// string that is not what is on disk, and replace would then write those offsets back.
 pub fn read_searchable(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     if metadata.len() > MAX_FILE_BYTES {
@@ -586,10 +419,6 @@ pub fn read_searchable(path: &Path) -> Option<String> {
 
 /// One file's real, on-disk replace: reads it, replaces every match, writes it back only if
 /// something actually changed.
-///
-/// Re-reads rather than trusting the [`SearchOutcome`] the tree is showing - that outcome can be
-/// seconds old and an agent may have rewritten the file since. The count returned is therefore
-/// the count that really landed, which is what "report what changed" has to mean.
 pub fn replace_in_file(
     path: &Path,
     matcher: &Matcher,
@@ -636,14 +465,6 @@ pub struct ReplaceOutcome {
 }
 
 /// Replaces across `files`, skipping any path in `dirty` entirely.
-///
-/// `dirty` is the set of files currently open in the editor with **unsaved** changes
-/// (`crate::code_surface::edit_buffer::EditBuffer::is_dirty`). Writing those would silently
-/// destroy edits the user has not saved: the replace is computed from what is on disk, so it
-/// would write disk-content-with-substitutions over a buffer the editor still believes it owns,
-/// and the editor's own next save would then write the un-replaced buffer straight back. Refusing
-/// and *naming* them is the only honest option - `REVISION-2026-08-14.md` §7 rule 1's "ship the
-/// affordance with the behaviour, or ship neither", applied to a partial one.
 pub fn replace_across(
     files: &[PathBuf],
     matcher: &Matcher,
@@ -677,14 +498,6 @@ pub const ELIDE_SUFFIX_MAX: usize = 26;
 
 /// Splits `line` around `range` into the three spans a match row draws, with the design's own
 /// left-elision applied.
-///
-/// `Jerry.dc.html` states the rule and the reason verbatim: "The row is ~40 characters at 10px
-/// mono. A long prefix pushes the match clean out of the box, which defeats the point of showing
-/// the line at all - so the prefix elides from the LEFT and the hit stays at a fixed early column,
-/// the way VS Code does it. The tail may overflow; the tail is only context."
-///
-/// Counts **characters**, not bytes, so an indented line of CJK or a comment with an emoji in it
-/// elides at the same visual width as an ASCII one rather than three times earlier.
 pub fn elide_around(line: &str, range: &Range<usize>) -> (String, String, String) {
     let before = &line[..range.start];
     let hit = &line[range.clone()];
@@ -991,12 +804,6 @@ mod tests {
 }
 
 /// Real timing/cancellation regression coverage for GitHub issue #162's own live-report follow-up.
-///
-/// "Typing is slow" was two real, separate defects: the walk itself was single-threaded (this
-/// module's own "Parallel" docs), and a superseded search kept running to completion instead of
-/// stopping (this module's own "Cancelled" docs). Both are proven here against a real, on-disk,
-/// 200-file worktree - `crate::search::render::panel_tests` proves the panel wires this all up
-/// correctly; this proves the engine underneath it is actually fast and actually cancellable.
 #[cfg(test)]
 mod perf_tests {
     use super::*;
@@ -1037,12 +844,6 @@ mod perf_tests {
         }
     }
 
-    /// A real wall-clock bound, not a micro-benchmark: loose enough (2s) that it never flakes on
-    /// a slow CI runner, following the same "generous, real bound" convention
-    /// `crate::lsp::client`'s own timing tests already use (`started.elapsed() < Duration::
-    /// from_secs(5)`/`20)`) - but tight enough that a regression back to the pre-fix,
-    /// single-threaded, one-file-at-a-time walk (measured directly at 582ms against a comparable
-    /// 415-file/14MB fixture - this module's own "Parallel" docs) would still be caught.
     #[test]
     fn a_full_walk_of_a_real_multi_file_worktree_stays_well_under_a_second() {
         let dir = many_file_fixture();
@@ -1062,9 +863,6 @@ mod perf_tests {
         );
     }
 
-    /// The real mechanism behind the live report's second half: a search that is already stale
-    /// before its very first batch must never scan the whole worktree anyway - it has to bail out
-    /// immediately, which is exactly what frees the CPU a fast typist's next keystroke needs.
     #[test]
     fn an_already_stale_search_never_scans_a_single_file() {
         let dir = many_file_fixture();
@@ -1078,8 +876,6 @@ mod perf_tests {
         );
     }
 
-    /// The other half: a search that goes stale *while it is running* stops at the next batch
-    /// boundary rather than finishing the walk it was already partway through.
     #[test]
     fn a_search_that_goes_stale_partway_through_stops_before_scanning_everything() {
         let dir = many_file_fixture();
@@ -1102,10 +898,6 @@ mod perf_tests {
 /// Real searches and real replaces over a real, multi-file worktree on disk - no in-memory stand-in
 /// for the walk, the reads or the writes, because the walk's own rules (`.git`, symlinks, binary
 /// files, the size cap) are exactly the part an in-memory fixture cannot exercise.
-///
-/// The corpus mirrors `Jerry.dc.html`'s own fixture (`refresh_token` across `src/auth/`,
-/// `tests/` and `migrations/`) so the shapes asserted here are the shapes the panel was designed
-/// against.
 #[cfg(test)]
 mod worktree_tests {
     use super::*;
@@ -1141,14 +933,11 @@ mod worktree_tests {
         );
         write("README.md", "No hits in here.\n");
         write("Cargo.lock", "refresh_token = \"1\"\n");
-        // Real `.git` bookkeeping: the one thing the walk skips unconditionally.
         write(".git/COMMIT_EDITMSG", "wip refresh_token\n");
-        // A dotfile that is *not* `.git` - searchable, deliberately, see `collect_files`' docs.
         write(
             ".github/workflows/ci.yml",
             "run: cargo test refresh_token\n",
         );
-        // A real binary file: a NUL byte in the sniff window.
         fs::write(root.join("logo.bin"), [0x89, 0x50, 0x00, 0x01, 0x02]).expect("write binary");
         dir
     }
@@ -1382,11 +1171,9 @@ mod worktree_tests {
             "every untouched line must survive verbatim"
         );
 
-        // Outside the include filter, so genuinely untouched.
         let untouched = fs::read_to_string(root.join("tests/auth_race.rs")).expect("read back");
         assert!(untouched.contains("refresh_token"));
 
-        // And the search really agrees afterwards.
         let after = run(
             root,
             "refresh_token",
@@ -1607,8 +1394,6 @@ mod layered_exclude_tests {
         })
     }
 
-    /// Gitignore mode on (the real default) hides both the explicitly-excluded directory and the
-    /// gitignore-only one, on top of finding every real file.
     #[test]
     fn gitignore_mode_on_hides_both_the_explicit_and_the_gitignore_only_directory() {
         let dir = fixture();
@@ -1649,10 +1434,6 @@ mod layered_exclude_tests {
         );
     }
 
-    /// Gitignore mode off: the explicit list still applies (it cannot be turned off), but
-    /// `secret/` - gitignored, and only gitignored - is found. This is the literal answer to
-    /// "this should have nothing to do with git": a search deliberately scoped independently of
-    /// git still excludes real build/dependency directories by name, and nothing else.
     #[test]
     fn gitignore_mode_off_still_applies_the_explicit_list_but_finds_the_gitignore_only_file() {
         let dir = fixture();
@@ -1686,7 +1467,6 @@ mod layered_exclude_tests {
     {
         let dir = fixture();
         let root = dir.path();
-        // `session.rs` is already tracked (see `fixture`); now ignore its own directory too.
         fs::write(root.join(".gitignore"), "target/\nsecret/\nsrc/auth/\n").expect("write");
 
         let outcome = run(root, "refresh_token", true);
@@ -1700,10 +1480,6 @@ mod layered_exclude_tests {
         );
     }
 
-    /// The core bug-fix guarantee (#387): a real, sizeable build/dependency directory that isn't
-    /// even listed in `.gitignore` - this repository's own real `.shared-target/` before #388
-    /// added it, the exact incident - must never be walked, in **either** toggle state. Proves
-    /// the always-on explicit list, not `.gitignore`, is what the fix's real guarantee rests on.
     #[test]
     fn an_ungitignored_build_directory_is_excluded_in_both_toggle_states() {
         let dir = tempfile::tempdir().expect("a temp worktree");
@@ -1718,7 +1494,6 @@ mod layered_exclude_tests {
         };
         write("src/lib.rs", "refresh_token\n");
         git(root, &["add", "src/lib.rs"]);
-        // Deliberately no `.gitignore` at all.
         for i in 0..300 {
             write(&format!("node_modules/pkg/dist-{i}.js"), "refresh_token\n");
         }
@@ -1797,9 +1572,6 @@ mod configurable_exclude_tests {
             .collect()
     }
 
-    /// A pattern the user typed into the Settings > Editor > Search "add a pattern" row - not on
-    /// `DEFAULT_EXCLUDES` at all - really prunes the walk, proving the request's own list, not the
-    /// compiled-in constant, is what layer one actually excludes against.
     #[test]
     fn a_real_custom_pattern_from_settings_excludes_matching_files() {
         let dir = tempfile::tempdir().expect("a temp worktree");
@@ -1818,10 +1590,6 @@ mod configurable_exclude_tests {
         );
     }
 
-    /// The user removed `node_modules` from their own copy of the list in Settings (the row's
-    /// remove affordance, `crate::settings::render::AdeApp::remove_search_exclude_pattern`) -
-    /// a real search must now find matches inside it again, proving the removal really reaches
-    /// the walk rather than only updating what Settings displays.
     #[test]
     fn removing_a_default_pattern_in_settings_re_includes_it_in_a_real_search() {
         let dir = tempfile::tempdir().expect("a temp worktree");
@@ -1841,10 +1609,6 @@ mod configurable_exclude_tests {
         );
     }
 
-    /// The default request (what every fresh install effectively sends, before any Settings edit)
-    /// still excludes `target/` - the same core #387 guarantee, now proven through the
-    /// user-editable field's own real default rather than only through the old hardcoded-constant
-    /// call path.
     #[test]
     fn the_real_default_search_excludes_still_excludes_target() {
         let dir = tempfile::tempdir().expect("a temp worktree");

@@ -4,23 +4,6 @@
 //! the worktree list: this module only ever sets a flag from a real OS watcher callback; the
 //! `gpui`-side poll loop that reads it and actually reloads the tree is
 //! `crate::root::AdeApp::start_file_tree_watch`.
-//!
-//! ## One watch, re-armed per worktree
-//!
-//! Unlike `worktree_watch` (set up once, for the repository's own `$GIT_COMMON_DIR`, which never
-//! changes over the app's lifetime), the *active worktree* changes constantly - so this watch is
-//! re-armed every time [`crate::root::AdeApp::set_file_tree_root`] points at a new root, watching
-//! exactly the worktree currently shown rather than every worktree the repo has.
-//!
-//! ## `.git/` is filtered out, not merely unwatched
-//!
-//! A recursive `notify` watch has no path-exclusion option of its own - filtering happens in the
-//! event callback, not the watch registration itself. Without it, git's own constant internal
-//! writes under `<root>/.git/` (the index, `HEAD`, loose objects, `refs/`) would mark the file
-//! tree dirty on every commit, stage, and status check `wt_core` itself performs - exactly the
-//! "recursive watch fires on every object-database write" noise
-//! [`crate::rail::worktree_watch::spawn_worktree_watcher`]'s own docs already call out avoiding
-//! for its own, separate `.git`-only watch.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -32,28 +15,6 @@ use crate::rail::worktree_watch::DirtyFlag;
 /// see the module docs on why this is re-armed per worktree rather than set up once) and returns
 /// the live [`RecommendedWatcher`] - as with `worktree_watch::spawn_worktree_watcher`, it must be
 /// kept alive by the caller for the OS-level watch to keep running.
-///
-/// Returns `None` if `worktree_root` doesn't exist, isn't really part of a git worktree, or if
-/// the underlying OS watcher couldn't be constructed or armed - all honestly-reported "there is
-/// nothing to watch" cases, not fatal: `crate::root::AdeApp::start_file_tree_watch`'s own poll
-/// fallback still runs regardless. A very large tree (e.g. an unignored `node_modules`) can also
-/// exhaust the OS's real watch-descriptor budget (inotify's `max_user_watches` on Linux) - the
-/// same honest degrade applies there too, not a special case.
-///
-/// The `wt_core::git_common_dir` check below is a real gate, not just an optimization: every
-/// real [`crate::root::AdeApp::file_tree_root`] this app ever sets is a real git worktree's path
-/// (production has no other kind), so a directory that fails it genuinely has nothing this app
-/// would ever watch in real use - mirroring
-/// [`crate::rail::worktree_watch::spawn_worktree_watcher`]'s own identical gate. It matters
-/// operationally too: without it, every test that constructs an `AdeApp` against a plain,
-/// non-git temp directory (the overwhelming majority of this crate's own GPUI tests) would arm a
-/// real OS-level `notify` watcher it never needed, and a real, reproduced regression from an
-/// earlier version of this function did exactly that - exhausting the sandbox's `inotify`
-/// instance budget partway through a full `cargo test` run and taking
-/// `crate::rail::worktree_watch`'s own, unrelated tests down with it.
-///
-/// Performs blocking I/O (`git_common_dir`'s own `git rev-parse`, and the initial recursive
-/// directory walk `notify` does to arm the watch).
 pub fn spawn_file_tree_watcher(
     worktree_root: &Path,
     dirty: DirtyFlag,

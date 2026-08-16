@@ -1,39 +1,5 @@
 //! Where the numbers actually come from: each provider's own credential on disk, its own usage
 //! endpoint, and a parser for its own response shape.
-//!
-//! # Why an out-of-band HTTP read rather than scraping the CLI
-//!
-//! Jerry spawns `claude` and `codex` as interactive TUIs in a PTY with no arguments
-//! (`crate::work_surface::agents::AgentKind::binary_name`). There is no structured event stream to
-//! read, so the in-band routes those CLIs use internally - Claude's stream events, Codex's
-//! `token_count` event and `x-codex-*` response headers - are not available to us at all. Neither
-//! CLI has a `usage` subcommand. What is available is that both store an OAuth credential in a
-//! well-known file, and both talk to a plain `GET` usage endpoint with it. That is what this
-//! module does, and it is the *same* endpoint each CLI reads for its own `/status` display, so the
-//! numbers agree with what the agent itself would tell you.
-//!
-//! # What is verified, and what is not
-//!
-//! The Claude path was verified live against a real account (issue #294's Phase 0 comment records
-//! the captured 200 payload, which is this module's own test fixture). The Codex path is
-//! *source*-verified against `openai/codex` - the URL
-//! (`codex-rs/backend-client/src/client/rate_limit_resets.rs`, `{base}/wham/usage`), the auth file
-//! (`codex-rs/login/src/auth/storage.rs`'s `AuthDotJson` -> `tokens.access_token`), the
-//! `ChatGPT-Account-Id` header (`codex-rs/backend-client/src/client.rs`'s `headers()`), and the
-//! payload shape (`codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_*.rs`) -
-//! but **not** executed, because there was no `codex` install or ChatGPT credential on the machine
-//! this was written on. It therefore reads `not connected` there rather than inventing anything,
-//! and its parser is tested against a fixture built from those published model definitions.
-//!
-//! # Credentials are read, never written or refreshed
-//!
-//! An expired token is reported as a failed poll, not silently refreshed. The refresh token lives
-//! in the CLI's own credential file and racing that CLI for it risks clobbering the user's login -
-//! re-authentication belongs to the CLI that owns the file. Nothing here ever writes to disk.
-//!
-//! On macOS the Claude CLI may keep its credential in the Keychain instead of the file, and Codex
-//! may use a keyring backend; Jerry does not read either. Those installs read as `not connected`,
-//! which is the honest statement: we have nothing, and nothing is broken.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -56,9 +22,6 @@ const _: () = assert!(
 );
 
 /// The result of one real attempt to read one provider.
-///
-/// Three outcomes, matching the three states the UI keeps distinct: no credential at all, a real
-/// snapshot, and a real failure with a real reason.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderRead {
     /// No credential for this provider on this machine - nothing was sent anywhere.
@@ -71,9 +34,6 @@ pub enum ProviderRead {
 }
 
 /// One provider's stored credential.
-///
-/// The `Debug` below is hand-written rather than derived, and that is the point of it - see its
-/// own docs.
 #[derive(Clone, PartialEq)]
 pub struct Credential {
     pub token: String,
@@ -144,10 +104,6 @@ pub fn credential_path(provider: Provider) -> Option<PathBuf> {
 }
 
 /// Reads a provider's credential off disk, or `None` when there is genuinely none to read.
-///
-/// A file that exists but carries no OAuth token (an API-key-only Codex `auth.json`, a
-/// half-written file) is `None` too: there is no token to send, which is the same fact as having
-/// no file, and both are `not connected` rather than a failure.
 pub fn read_credential(provider: Provider) -> Option<Credential> {
     let path = credential_path(provider)?;
     let raw = std::fs::read_to_string(path).ok()?;
@@ -203,10 +159,6 @@ fn usage_url(provider: Provider) -> &'static str {
 
 /// One real, blocking read of one provider. **Never call this on the UI thread** - the whole of
 /// `crate::budget::flow` runs it on `cx.background_executor()`.
-///
-/// Returns [`ProviderRead::NotConnected`] without touching the network when there is no
-/// credential, which is what makes "a provider you have not logged into costs nothing" true
-/// rather than aspirational.
 pub fn read_provider(provider: Provider) -> ProviderRead {
     let Some(credential) = read_credential(provider) else {
         return ProviderRead::NotConnected;
@@ -230,27 +182,6 @@ pub const PANICKED_READ_REASON: &str = "the read failed unexpectedly";
 
 /// Runs one provider read so that a panic inside it becomes a reported failure instead of a
 /// silently wedged poll.
-///
-/// # Why this exists at all
-///
-/// [`super::state::ProviderBudget::in_flight`] is set before the read starts and cleared when its
-/// result lands. A panic on the way - and everything this parses is a *remote* server's
-/// choice of bytes - would leave that guard set with nothing to clear it, and
-/// [`super::state::ProviderBudget::may_poll_now`] then refuses the background loop **and** every
-/// `Refresh`/`Retry` click for the rest of the process's life: the popover sticks on `checking…`
-/// with dead buttons and no error to show. That is a strictly worse outcome than the panic
-/// itself, and it is not hypothetical - a hostile `reset_after_seconds` really did panic
-/// [`codex_reset_instant`] before that function learned to check its arithmetic.
-///
-/// Catching the unwind here, on the background thread that runs the read, is deliberate rather
-/// than relying on a `Drop` guard: this closure is handed to `cx.background_executor()`, and a
-/// future that panics inside an executor does not necessarily unwind back through the awaiting
-/// task at all - the awaited result may simply never arrive. A value that is *returned* always
-/// arrives.
-///
-/// Nothing captured here is state a panic could leave half-written: [`Provider`] is a `Copy` tag
-/// and the read owns everything else it touches, so the unwind-safety this asserts nothing about
-/// is genuinely trivial rather than papered over.
 pub fn read_provider_catching_panics(provider: Provider) -> ProviderRead {
     catching_panics(move || read_provider(provider))
 }
@@ -265,19 +196,6 @@ pub fn catching_panics(
 }
 
 /// The one HTTP client this module uses, built once for the life of the process.
-///
-/// Built once rather than per request because a fresh `reqwest::blocking::Client` builds a whole
-/// new connection pool and TLS configuration each time, and this module makes the same two
-/// requests against the same two hosts forever.
-///
-/// # Redirects are refused outright
-///
-/// `reqwest` strips `Authorization` when a redirect crosses to another host, but it has no way to
-/// know that Codex's `ChatGPT-Account-Id` is equally sensitive - a custom header follows the
-/// redirect verbatim. A *usage* endpoint has no legitimate reason to redirect anywhere, so the
-/// policy is `none`: a 3xx becomes an ordinary non-2xx failure with its status in the reason,
-/// which is both the honest report and the one that cannot leak a header to a host we never
-/// chose to talk to.
 fn usage_client() -> Result<&'static reqwest::blocking::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
     CLIENT
@@ -342,27 +260,11 @@ pub fn parse_usage(provider: Provider, body: &str) -> Result<ProviderSnapshot, S
 /// A provider's own "percent used" figure, clamped to the real 0-100 range an over-quota account
 /// can otherwise leave (a `utilization` above 100 is possible, and would otherwise render as a
 /// meter overflowing its own track).
-///
-/// Clamped but **not** converted: the number every surface prints is the one the API sent - see
-/// `crate::budget::state`'s own docs for why this build shows `% used` rather than the design
-/// bundle's `% left`.
 fn used_percent_from(utilization: f64) -> f32 {
     utilization.clamp(0.0, 100.0) as f32
 }
 
 /// Anthropic's `GET /api/oauth/usage`.
-///
-/// ```json
-/// {"five_hour": {"utilization": 19.0, "resets_at": "2026-08-15T20:00:00+00:00"},
-///  "seven_day": {"utilization": 60.0, "resets_at": "2026-08-18T06:00:00+00:00"},
-///  "limits": [ ... ]}
-/// ```
-///
-/// The two named windows are what this reads: they are the two the CLI's own status display uses,
-/// they carry their own reset instants, and their names fix their durations at 5h and 7d. The
-/// `limits` array beside them carries the same two figures plus per-model scoped rows
-/// (`weekly_scoped`), which are a *breakdown of* the weekly window rather than a third limit - so
-/// reading them too would double-count the same budget under two labels.
 pub fn parse_claude_usage(body: &str) -> Result<ProviderSnapshot, String> {
     let json: serde_json::Value =
         serde_json::from_str(body).map_err(|err| format!("the response was not JSON: {err}"))?;
@@ -392,19 +294,6 @@ pub fn parse_claude_usage(body: &str) -> Result<ProviderSnapshot, String> {
 }
 
 /// ChatGPT's `GET /backend-api/wham/usage`, as `openai/codex`'s own generated models define it:
-///
-/// ```json
-/// {"plan_type": "pro",
-///  "rate_limit": {"allowed": true, "limit_reached": false,
-///                 "primary_window":   {"used_percent": 12, "limit_window_seconds": 18000,
-///                                      "reset_after_seconds": 900, "reset_at": 1786930000},
-///                 "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800,
-///                                      "reset_after_seconds": 200000, "reset_at": 1787130000}}}
-/// ```
-///
-/// Both window labels are formatted from the server's own `limit_window_seconds` rather than
-/// assumed to be 5h/7d: unlike Claude's, these are numbers the API sends, and a plan whose primary
-/// window is not five hours must not be labelled as though it were.
 pub fn parse_codex_usage(body: &str) -> Result<ProviderSnapshot, String> {
     let json: serde_json::Value =
         serde_json::from_str(body).map_err(|err| format!("the response was not JSON: {err}"))?;
@@ -443,26 +332,6 @@ pub fn parse_codex_usage(body: &str) -> Result<ProviderSnapshot, String> {
 /// wins when it is genuinely an epoch timestamp; otherwise the relative one is added to the
 /// current clock, so a payload that only carries the relative form still produces a real
 /// countdown instead of none.
-///
-/// # Both numbers are a remote server's choice, and are treated as one
-///
-/// Every value here arrives from the network, so neither is trusted to be sane before it is used
-/// in arithmetic:
-///
-/// - **Range first.** A reset instant outside [`PLAUSIBLE_EPOCH_FLOOR`]..=[`PLAUSIBLE_EPOCH_CEILING`],
-///   or a countdown longer than [`MAX_RESET_AFTER_SECONDS`], is not a rate-limit window - it is a
-///   malformed field, and it is dropped for the same reason a `used_percent` that is not a number
-///   is dropped. Without this a technically-addable value (say 10<sup>12</sup> seconds) would
-///   render a perfectly confident `resets in 11574074d 0h`.
-/// - **Then checked arithmetic.** `SystemTime + Duration` *panics* on overflow, and near
-///   `i64::MAX` both of these additions really do overflow - a provider (or anything able to
-///   answer as one) could otherwise crash the poll with a single JSON number. Reproduced before
-///   this guard existed; see this module's `a_hostile_reset_field_cannot_panic_the_poll` test.
-///
-/// Either rejection lands as `None`, which is the same "the provider did not send a usable reset
-/// instant" the parser already reports for a missing field, and which the render side draws as no
-/// countdown at all rather than as a fabricated one. The window's *headroom* - the number the
-/// reader actually came for - is unaffected either way.
 fn codex_reset_instant(entry: &serde_json::Value) -> Option<SystemTime> {
     /// Anything below this is not a plausible epoch second (it would be 2001), so it is a
     /// relative value in a field named as though it were absolute.
@@ -490,11 +359,6 @@ fn codex_reset_instant(entry: &serde_json::Value) -> Option<SystemTime> {
 
 /// The narrow slice of RFC 3339 the Anthropic payload actually uses:
 /// `2026-08-15T20:00:00+00:00`, `...Z`, and offsets like `-05:00`.
-///
-/// Hand-written rather than reached for as a dependency: this crate has no date/time crate today,
-/// and pulling `chrono` (or `time`) plus its own transitive stack in to read one field of one
-/// response would be a large amount of new build surface for a fixed-shape timestamp. Fractional
-/// seconds are accepted and discarded - a reset instant is not a sub-second fact.
 pub fn parse_rfc3339(raw: &str) -> Option<SystemTime> {
     let bytes = raw.as_bytes();
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' {
@@ -600,9 +464,6 @@ mod budget_fetch_tests {
       }
     }"#;
 
-    /// The one direction rule the whole feature rests on: the API reports *used*, and so does
-    /// every value in Jerry. `19% used` stays `19%`, and is never quietly flipped to the `81%
-    /// left` this build shipped first.
     #[test]
     fn the_claude_payload_parses_into_two_windows_of_usage_not_headroom() {
         let snapshot = parse_claude_usage(CLAUDE_LIVE_PAYLOAD).expect("a real payload parses");
@@ -631,8 +492,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// The two reset instants are independent, and both are real absolute times rather than the
-    /// same value repeated.
     #[test]
     fn each_claude_window_carries_its_own_reset_instant() {
         let snapshot = parse_claude_usage(CLAUDE_LIVE_PAYLOAD).expect("parses");
@@ -647,7 +506,6 @@ mod budget_fetch_tests {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("after the epoch")
                 .as_secs(),
-            // 2026-08-15T20:00:00Z
             1_786_824_000,
             "the timestamp must parse to the exact instant, not an approximation"
         );
@@ -685,8 +543,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// A plan whose primary window is not five hours must label itself honestly - the whole reason
-    /// the label is formatted from the payload.
     #[test]
     fn a_codex_window_of_an_unusual_length_is_labelled_as_what_it_is() {
         let body = r#"{"rate_limit": {"allowed": true, "limit_reached": false,
@@ -715,16 +571,6 @@ mod budget_fetch_tests {
         )
     }
 
-    /// **The panic this test exists for was real, not theoretical.** `SystemTime + Duration`
-    /// panics on overflow ("overflow when adding duration to instant"), and both reset fields are
-    /// a remote server's free choice of `i64`, filtered only for a sign before this fix. A single
-    /// JSON number was enough to bring down the poll - and, because the single-flight guard is set
-    /// before the read starts, to wedge every subsequent poll *and* every `Refresh`/`Retry` click
-    /// for the rest of the session with it.
-    ///
-    /// The contract asserted here is the whole fix: the window still parses, its percentage - the
-    /// number the reader actually came for - is still real, and only the unusable reset instant is
-    /// dropped.
     #[test]
     fn a_hostile_reset_field_cannot_panic_the_poll() {
         for hostile in [
@@ -767,10 +613,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// The other half of the same guard: a value that would *not* overflow but is still not a
-    /// rate-limit window. Left unbounded, `reset_after_seconds` of ten billion renders a
-    /// confident `resets in 115740d 17h` - a fabricated fact dressed as a measured one, which is
-    /// the one thing this whole module refuses to do.
     #[test]
     fn an_implausible_but_addable_reset_is_rejected_rather_than_rendered() {
         let nonsense = parse_codex_usage(&codex_window_with(
@@ -804,9 +646,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// A panic anywhere under a read must come back as a *reported* failure. Without this the
-    /// single-flight guard would never be cleared and the provider's polling would be wedged for
-    /// the rest of the process's life - see [`read_provider_catching_panics`]'s own docs.
     #[test]
     fn a_panicking_read_becomes_a_reported_failure_rather_than_a_lost_result() {
         let read = catching_panics(|| panic!("overflow when adding duration to instant"));
@@ -823,7 +662,6 @@ mod budget_fetch_tests {
             other => panic!("expected a failure, got {other:?}"),
         }
 
-        // And the ordinary path is untouched - the wrapper only catches, it never invents.
         assert_eq!(
             catching_panics(|| ProviderRead::NotConnected),
             ProviderRead::NotConnected
@@ -861,9 +699,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// An API-key-only Codex login, and a Claude file with no OAuth block, both have no token to
-    /// send - which is the same fact as having no file at all, and must read as `not connected`
-    /// rather than as a failure.
     #[test]
     fn a_credential_file_with_no_oauth_token_is_not_connected_rather_than_broken() {
         assert_eq!(
@@ -882,9 +717,6 @@ mod budget_fetch_tests {
         assert_eq!(parse_credential(Provider::Claude, "broken"), None);
     }
 
-    /// A live bearer token must never be printable. The one place a credential could plausibly
-    /// escape into a log or a panic message is `{:?}`, so that is the hole this closes - and this
-    /// test is what stops a later `#[derive(Debug)]` from quietly reopening it.
     #[test]
     fn a_credential_never_prints_its_own_token() {
         let credential = Credential {
@@ -950,8 +782,6 @@ mod budget_fetch_tests {
         );
     }
 
-    /// The credential path really is the file each CLI writes, and really does follow that CLI's
-    /// own environment override.
     #[test]
     fn the_credential_directory_follows_each_clis_own_environment_override() {
         let home = Some(PathBuf::from("/home/someone"));

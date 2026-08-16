@@ -1,40 +1,11 @@
 //! The one real "only one menu is open at a time, and it closes when interaction moves away"
 //! mechanism, shared by every floating dropdown/context-menu surface in the app (GitHub issue
 //! #176).
-//!
-//! Before this module each of the six menu surfaces owned an independent `Option`/`bool` with no
-//! knowledge of its siblings, and only two hand-added pairwise rules existed (graph row ↔ graph
-//! push, and title bar → `+`). Everything else could genuinely stack: opening the tab strip's `+`
-//! menu and then right-clicking a file tree row left *both* popovers painted at once, because the
-//! `+` menu's scrim only listens for a *left* click and the file tree's own right-click handler
-//! never looked at `plus_menu_open`. That is exactly the "2 context menus open at the same time"
-//! the issue reports.
-//!
-//! [`MenuSurface`] is the fix's shape: a payload-free name for each surface, an `ALL` array, and
-//! two exhaustive `match`es ([`AdeApp::menu_surface_is_open`]/[`AdeApp::close_menu_surface`]).
-//! Adding another popover without teaching it the invariant is a compile error, not a silent
-//! drift - the same reason `crate::root::widgets::menu_popover_chrome` is a shared *function*
-//! rather than a shared set of style constants.
-//!
-//! The state each surface owns stays where it is (it carries per-surface payload - which title
-//! menu, which tree row, which graph commit - that a common field could not hold), so callers
-//! that open a payload-carrying menu run [`AdeApp::close_menu_surfaces_except`] and then assign
-//! their own field, rather than this module trying to own all six shapes.
 
 use super::*;
 
 /// Every real floating menu/dropdown surface in the app - the thirteen built on
 /// [`crate::root::widgets::menu_popover_chrome`].
-///
-/// Deliberately *not* including the command palette, the "New file" prompt, or the Settings
-/// surface: those are focus-owning modal overlays with their own capture/restore contract
-/// (`crate::root::mod`'s [`OverlayFocus`]), not click-away menus, and they already close each
-/// other explicitly. They do, however, close *these* - see
-/// [`crate::root::focus::AdeApp::open_palette`]/`open_settings`.
-///
-/// Payload-free on purpose: which title menu is open, which tree row a context menu targets, and
-/// which graph commit a row menu names all stay in the surfaces' own fields. This enum only
-/// answers "is it open" and "close it", which is all the shared invariant needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuSurface {
     /// The tab strip's `+` menu - [`AdeApp::plus_menu_open`]. The rail repo header's own `+` used
@@ -139,10 +110,6 @@ impl AdeApp {
 
     /// Closes `surface`, leaving every other one alone. Does **not** `cx.notify()` - the callers
     /// below batch a single notify for the whole sweep.
-    ///
-    /// The tree context menu goes through [`Self::close_tree_context_menu`]'s own plain field
-    /// clear rather than that method (which takes a `Context` and notifies); the extra work that
-    /// method does is exactly the notify this one deliberately defers.
     pub(crate) fn close_menu_surface(&mut self, surface: MenuSurface) {
         match surface {
             MenuSurface::Plus => self.plus_menu_open = false,
@@ -180,13 +147,6 @@ impl AdeApp {
     /// Closes every open menu surface except `keep` (pass `None` to close all of them). Returns
     /// whether anything was actually open and got closed, so callers can skip a pointless
     /// `cx.notify()`.
-    ///
-    /// This is the whole "opening a second menu closes the first" rule. Every real path that
-    /// *opens* one of them calls it with its own surface as `keep` immediately before setting
-    /// its own state - so the invariant holds no matter which of the (many) entry points was used:
-    /// a click on the tab strip `+`, a title bar label, a right-click in the file tree, the commit
-    /// composer's `▾`, the graph's `Push ▾`, a graph row's `⋯`, a right-click on a graph row, or a
-    /// right-click on a Branches-panel branch row.
     #[must_use]
     pub(crate) fn close_menu_surfaces_except(&mut self, keep: Option<MenuSurface>) -> bool {
         let mut closed_any = false;
@@ -294,8 +254,6 @@ mod menu_surface_tests {
         });
     }
 
-    /// The exact "2 context menus open at the same time" shape from GitHub issue #176, at the
-    /// level of the shared primitive: whichever surface is being opened is the only survivor.
     #[gpui::test]
     fn opening_any_one_surface_closes_all_the_others(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -327,11 +285,6 @@ mod menu_surface_tests {
         }
     }
 
-    /// The issue's headline requirement - "when a dropdown loses focus it should be closed" - at
-    /// its coarsest real granularity: the whole window losing OS focus. Driven through GPUI's own
-    /// `VisualTestContext::deactivate_window`, which really runs the platform active-status
-    /// callback and so really fires [`AdeApp::_window_activation_subscription`]; nothing here
-    /// calls the close path directly.
     #[gpui::test]
     fn the_window_losing_focus_really_closes_every_open_menu(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

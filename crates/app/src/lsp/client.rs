@@ -14,58 +14,12 @@ pub(in crate::lsp) type LspClientKey = (PathBuf, &'static str);
 /// `LSP_REQUEST_DEBOUNCE_TIMEOUT` (`vendor/zed/crates/editor/src/editor.rs:307`,
 /// `Duration::from_millis(50)`), which Zed uses to debounce the *expensive requests* (hover,
 /// completions) a buffer edit can trigger.
-///
-/// That citation needs a real caveat, not a blind copy: per `vendor/zed/crates/editor/src/
-/// editor.rs:9566-9608`'s own `on_buffer_event` -> `update_lsp_data`, Zed sends the `didChange`
-/// *notification* itself promptly, on every edit, undebounced - only the requests are debounced.
-/// This app deliberately debounces the notification too, and that's a considered, verified
-/// deviation, not a shortcut: [`lsp_core::LspClient::did_change_full`] always sends
-/// **full-document** sync (a `TextDocumentContentChangeEvent` with no `range` - see that method's
-/// own docs), which makes coalescing safe in a way Zed's own per-edit *incremental* sync cannot
-/// be - an incremental delta that gets silently skipped corrupts the server's reconstructed
-/// document, but a full-document replacement event never depends on any earlier one, so sending
-/// only the *latest* content a debounce window settles on loses nothing a server needs to know.
-/// Reusing Zed's exact 50ms figure keeps this in the same "still feels live while typing" range
-/// that number was chosen for, without inventing a second, unverified constant for what is, in
-/// this app's case, a safe generalization of the same underlying idea.
 const LSP_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// How many extra times [`AdeApp::schedule_lsp_sync`] re-pulls diagnostics if a real
 /// `lsp_core::LspClient::pull_diagnostics` call succeeds but reports an empty result - or
 /// outright fails/times out - right after a real `didChange`. Two distinct, genuine, live-
 /// observed races, both closed by the same retry budget:
-///
-/// - A real rust-analyzer's own internal reanalysis can still be catching up to the exact
-///   content just sent even when it *doesn't* cancel the pull, answering instead with a real,
-///   structurally valid, but stale "no problems" report (observed live, under real parallel-
-///   process CPU contention, while building this feature - see `lsp_core::client::tests::
-///   did_change_full_then_a_real_pull_reports_a_real_new_diagnostic`'s own docs for the same
-///   race caught at the `lsp-core` layer). This is distinct from the `ServerCancelled` retry
-///   `pull_diagnostics` itself already handles internally.
-/// - A real pull request can also simply time out (`LSP_QUERY_TIMEOUT`) under severe real
-///   full-suite parallel load, where a genuinely busy server takes longer than one request's own
-///   budget to answer even though it's still alive - a transient failure, not a genuine "this
-///   server can't answer" condition, and one this loop must retry exactly like an empty result
-///   rather than give up on. This matters especially for rust-analyzer: it never re-pushes
-///   `publishDiagnostics` unsolicited after its first `didOpen` (see `LspClient::
-///   supports_diagnostic_pull`'s own docs), so this pull loop is the *only* path a post-edit
-///   diagnostic update ever reaches this app through for it - treating a single timed-out
-///   attempt as terminal used to permanently strand the diagnostic no matter how long a caller's
-///   own outer wait loop kept polling afterward (see `lsp_diagnostics_wiring_tests`' own real,
-///   live-reproduced failure this fixes).
-///
-/// Only ever consulted when [`LspSyncRequest::previous_result_was_non_empty`] is `true`
-/// (Revision R8.5b audit finding 2's fix for a real, live-measured bug): retrying *every* real
-/// empty pull result, unconditionally, meant that for any genuinely clean file - where an empty
-/// result is simply the honest truth, not staleness - every single settled keystroke paid this
-/// retry budget's full real ~8s in the common case, live-measured to also gate the real
-/// `textDocument/completion` request behind it (see [`AdeApp::schedule_lsp_sync`]'s own docs for
-/// why that gating is *also* now independently fixed). "The previous known result for this file
-/// was non-empty" is the real, honest signal that a *fresh* empty result is actually suspicious
-/// (diagnostics don't just vanish on their own) rather than assumed by default; a file with no
-/// prior non-empty result (freshly opened and clean, or this is the very first sync) gets exactly
-/// one real pull and accepts whatever it says, trusting the next real sync tick to naturally
-/// refresh it rather than pre-emptively distrusting an honest "no problems" answer.
 const PULL_DIAGNOSTICS_EMPTY_RETRIES: u32 = 20;
 /// Real backoff between [`PULL_DIAGNOSTICS_EMPTY_RETRIES`] re-pulls - together with that count,
 /// a real ~8s worst-case total budget, only ever actually paid for a file whose diagnostics were
@@ -88,22 +42,6 @@ struct LspSyncPlan {
 /// the facade every caller in this crate now goes through instead of holding a raw
 /// `lsp_core::LspClient`, so `code_surface`'s hover/go-to-definition/render paths never need to
 /// know or care which it is.
-///
-/// ## Why two variants and not, say, a `Vec<Arc<LspClient>>`
-///
-/// Only one real language needs a second process, and it needs it in one specific, verified way
-/// (see [`crate::language::CompanionServer`]): a *primary* that owns the language's identity, and
-/// a *companion* that is both a relay target and an independent contributor. That asymmetry is
-/// real - the primary alone determines the connection's advertised capabilities, drives document
-/// version bookkeeping, and is the only one whose failures are the caller's failures - so
-/// flattening both into a symmetric collection would lose information every method below actually
-/// uses. [`Self::Single`] is deliberately a plain, zero-extra-work passthrough so the three
-/// already-working single-process languages pay nothing for this (see
-/// `lsp_connection_facade_tests::single_delegation_stays_under_a_generous_1000ns_ceiling`).
-///
-/// Constructed fresh per lookup by [`AdeApp::lsp_connection_for_path`] - two `Arc::clone`s and an
-/// enum tag, never cached, so it can never hold a stale view of which clients are currently
-/// `Ready`.
 pub(crate) enum LspConnection {
     Single(std::sync::Arc<lsp_core::LspClient>),
     WithCompanion {
@@ -115,26 +53,6 @@ pub(crate) enum LspConnection {
 
 /// Whether a real, typed LSP result carries **no information at all** - the protocol's own
 /// "nothing here", in every one of the three real wire shapes it actually takes:
-///
-/// | shape                       | real example                                                  |
-/// |-----------------------------|---------------------------------------------------------------|
-/// | `null`                      | `Option<Hover>::None`, `Option<GotoDefinitionResponse>::None` |
-/// | `[]`                        | `GotoDefinitionResponse::Array(vec![])`/`Link(vec![])`, `CompletionResponse::Array(vec![])` |
-/// | `{"items": [], ..}`         | `CompletionResponse::List(CompletionList { items: vec![], .. })` |
-///
-/// Generic over any `R::Result` (which `lsp_types` guarantees is `Serialize`) so
-/// [`LspConnection::request`]'s companion-fallback rule stays a real property of the *connection
-/// shape* plus [`crate::language::CompanionServer::fallback_methods`], with no per-method
-/// special-casing in the facade itself. Serializing and inspecting the resulting
-/// [`serde_json::Value`] is what makes that genuinely possible: inside one generic function the
-/// concrete `R::Result` isn't known, but the real wire encoding of "nothing here" is - it *is* the
-/// encoding the server actually sent, round-tripped back.
-///
-/// This is a strict superset of the earlier null-only check it replaced, and it deliberately stays
-/// one: the `"items"` key must genuinely be **present and an empty array**, never merely absent, so
-/// a real `Hover` (an object with `contents`, and no `items` at all) can never be mistaken for an
-/// empty completion list. A result that somehow fails to re-serialize is treated as non-empty - the
-/// honest conservative answer, since it definitely isn't one of the three shapes above.
 fn lsp_result_is_empty<T: serde::Serialize>(value: &T) -> bool {
     let Ok(value) = serde_json::to_value(value) else {
         return false;
@@ -154,13 +72,6 @@ fn lsp_result_is_empty<T: serde::Serialize>(value: &T) -> bool {
 /// (which reports it for the file being rendered) and [`AdeApp::reap_dead_lsp_clients`] (which
 /// records it into [`LspClientState::Failed`] on the poll cadence) so the two can't drift into
 /// telling the user two different things about the same dead process.
-///
-/// Says "exited or stopped responding", not just "exited", because both are now real, distinct
-/// ways `lsp_core::LspClient::is_connection_alive` genuinely goes `false`: the reader thread
-/// seeing EOF (a crash/kill), and an outbound write that the server never accepted within
-/// `lsp-core`'s own write budget (a hung-but-alive server - see that crate's
-/// `transport::write_message_bounded`). Naming only the first would be actively wrong for the
-/// second.
 fn connection_lost_message(server: &str) -> String {
     format!("{server}'s connection was lost (the process exited or stopped responding)")
 }
@@ -181,30 +92,6 @@ impl LspConnection {
     }
 
     /// Sends a real request. [`Self::Single`] delegates straight through.
-    ///
-    /// [`Self::WithCompanion`] delegates to the primary as well, except for the real methods that
-    /// companion's own [`crate::language::CompanionServer::fallback_methods`] names: for those, a
-    /// primary answering something [`lsp_result_is_empty`] recognizes as "nothing here" is retried
-    /// against the companion, and the companion's non-empty answer is what surfaces.
-    ///
-    /// Which methods those are is a registry fact, not a facade one - see that field's own docs and
-    /// `crate::language`'s `VUE_FALLBACK_METHODS` table for the by-hand measurement behind Vue's
-    /// list (hover, go-to-definition **and** completion all come back genuinely empty from a real
-    /// `vue-language-server` inside a `.vue` script block; all three are answered by the real
-    /// companion). Nothing here is hardcoded to hover, or to Vue.
-    ///
-    /// Callers genuinely do not need to know whether this is one process or two *for the methods on
-    /// that list*, which today is every request this app actually sends through a two-server
-    /// connection (`code_surface`'s hover and F12 go-to-definition, and
-    /// [`AdeApp::schedule_lsp_sync`]'s completion). A method deliberately left off the list goes to
-    /// the primary and only the primary - not an oversight but the point: a request the primary
-    /// answers correctly must never have a second server's answer quietly substituted for it.
-    ///
-    /// A companion error or timeout can only ever *lose* the fallback, never change the answer:
-    /// the primary's own honest empty result is what's returned in that case, so a slow companion
-    /// can't turn "neither server knows anything here" into a spurious failure. A primary *error*
-    /// is returned as-is and never falls back - a real failure is real information, and quietly
-    /// substituting a different server's answer for it would hide it.
     pub(crate) fn request<R: lsp_core::lsp_types::request::Request>(
         &self,
         params: R::Params,
@@ -262,12 +149,6 @@ impl LspConnection {
     /// `None` only when *neither* has answered yet, preserving
     /// `lsp_core::LspClient::diagnostics_for_uri`'s own real distinction between "haven't heard
     /// back" and "analyzed, found nothing".
-    ///
-    /// A genuine union, not a preference: each half reports a real, disjoint class of problem for
-    /// the same file (live-verified for Vue - the primary reports template compile errors like
-    /// `"Element is missing end tag."`, the companion reports TypeScript semantics like `"Type
-    /// 'string' is not assignable to type 'number'."`), so dropping either side's would silently
-    /// hide real errors from the user.
     pub(crate) fn diagnostics_for_uri(
         &self,
         uri: &lsp_core::lsp_types::Uri,
@@ -318,10 +199,6 @@ impl LspConnection {
     /// companion is its distinct `client_key`, e.g. `"typescript-language-server (vue)"`, not the
     /// bare binary name) - so a dead companion is surfaced as honestly as a dead primary already
     /// was, rather than silently degrading into wrong-but-plausible results.
-    ///
-    /// A `WithCompanion` connection is only fully alive when *both* halves are: the companion is
-    /// not a nice-to-have there, it is where an entire real class of this file's analysis comes
-    /// from, and the primary will also start hanging on relay requests nobody can answer.
     pub(in crate::lsp) fn liveness_failure_reason(&self) -> Option<String> {
         for client in [Some(self.primary()), self.companion()]
             .into_iter()
@@ -360,15 +237,6 @@ impl LspConnection {
     }
 
     /// Opens `path` in every process backing this connection.
-    ///
-    /// The primary's own result is this method's result, unchanged from the single-server
-    /// contract every existing caller was already written against - it is what drives
-    /// `AdeApp::lsp_opened_files`/version bookkeeping. The companion's own `didOpen` (with its
-    /// own real `language_id`, since it needs to recognize the file as the same language, not as
-    /// plain text) is fired alongside, best-effort: a failure there is logged, never propagated.
-    /// The companion is a real, additional analysis source, not a gate on the primary's own
-    /// correctness, and letting it fail this call would regress the primary's already-audited
-    /// state machine for a reason that has nothing to do with it.
     pub(in crate::lsp) fn did_open(
         &self,
         path: &Path,
@@ -425,10 +293,6 @@ impl LspConnection {
 
     /// Pulls fresh diagnostics from the **primary**, which is what drives this method's real
     /// return value and real wall-clock cost.
-    ///
-    /// The companion's own pull, when it has one to make, is deliberately *not* fired from in
-    /// here. See [`Self::companion_diagnostics_pull_target`] for the real reason and for where it
-    /// actually happens now.
     pub(in crate::lsp) fn pull_diagnostics(
         &self,
         path: &Path,
@@ -443,25 +307,6 @@ impl LspConnection {
     /// `diagnosticProvider` (which is every real one today: `typescript-language-server` pushes
     /// `publishDiagnostics` instead, so this is a live capability check rather than a version pin,
     /// and it starts returning `Some` the moment a companion that *does* advertise pull is used).
-    ///
-    /// Exposed for the caller to drive rather than fired from inside [`Self::pull_diagnostics`],
-    /// which is a real fix, not a stylistic move. Two things were wrong with doing it in there:
-    ///
-    /// 1. It used a bare, detached `std::thread::spawn` that nothing tracked or joined. A live
-    ///    `Arc<LspClient>` clone held by such a thread also makes [`AdeApp::evict_stale_lsp_clients`]'s
-    ///    own `Arc::try_unwrap` fail, silently downgrading that client's shutdown from a graceful
-    ///    `shutdown`/`exit` handshake to a `SIGKILL` via `Drop`.
-    /// 2. [`AdeApp::schedule_lsp_sync`] calls `pull_diagnostics` up to
-    ///    `PULL_DIAGNOSTICS_EMPTY_RETRIES + 1` times per settled keystroke, so one keystroke could
-    ///    pile up ~21 of those threads. That retry loop exists for a race that is specifically the
-    ///    *primary's* (see that constant's own docs); re-firing an unrelated companion pull on
-    ///    every attempt is unbounded work with no matching benefit.
-    ///
-    /// The caller now fires it exactly once per sync tick, as a real, tracked
-    /// [`gpui::Task`] in [`AdeApp::_lsp_tasks`], alongside - not sequenced before - the primary's
-    /// own pull: nothing downstream waits on the companion's result (it lands in the companion's
-    /// own diagnostics map, which [`Self::diagnostics_for_uri`] reads on the next render
-    /// regardless), so sequencing it would double the tick's real latency for nothing.
     pub(in crate::lsp) fn companion_diagnostics_pull_target(
         &self,
     ) -> Option<std::sync::Arc<lsp_core::LspClient>> {
@@ -519,20 +364,6 @@ impl AdeApp {
     /// [`Self::lsp_opened_files`] entries for files under an evicted root, so a future
     /// [`Self::dispatch_did_open`] against a freshly-respawned client for that root won't
     /// wrongly believe the file is already open and skip sending `didOpen`.
-    ///
-    /// ## Getting `&mut LspClient` out of a shared `Arc`
-    ///
-    /// [`LspClientState::Ready`] holds an `Arc<lsp_core::LspClient>`, cloned out to whichever
-    /// in-flight background task last needed it. A clone could still be alive at the exact
-    /// moment of eviction. [`LspClient::shutdown`] needs `&mut self` and does real, potentially
-    /// slow, blocking work (a `shutdown` request, `exit`, `SIGTERM`, a grace period, `SIGKILL`,
-    /// joining reader threads) - unacceptable to run inline on the GPUI thread. So the `Arc` is
-    /// moved into a `cx.background_executor()` task, and `Arc::try_unwrap` is attempted there:
-    /// if this was the last clone, a graceful `shutdown()` runs off-thread; if not,
-    /// `try_unwrap` returns the `Arc` back and it's just dropped - not a silent no-op, since
-    /// `LspClient`'s own `Drop` impl still does a `SIGKILL`-based teardown either way. This only
-    /// happens in the rare case a clone outlives the switch, and "process gets `SIGKILL`ed
-    /// instead of asked nicely" is an acceptable trade-off for never blocking the UI.
     pub(crate) fn evict_stale_lsp_clients(&mut self, active_root: &Path, cx: &mut Context<Self>) {
         let stale_keys = stale_lsp_client_keys(
             &self.lsp_clients.keys().cloned().collect::<Vec<_>>(),
@@ -577,7 +408,6 @@ impl AdeApp {
     /// [`Self::evict_stale_lsp_clients`]'s own docs for why each half of that rule is what it is.
     fn shutdown_lsp_client_off_thread(&mut self, state: LspClientState, cx: &mut Context<Self>) {
         let LspClientState::Ready(client) = state else {
-            // `Spawning`/`Failed` hold no process to tear down.
             return;
         };
         let server_name = client.name();
@@ -598,21 +428,6 @@ impl AdeApp {
     /// [`LspClientState::Failed`] one naming it. Returns `true` if anything changed, so
     /// [`Self::ensure_lsp_poll_task`]'s loop - the one real cadence this runs on - can `cx.notify()`
     /// only when there's something new to draw.
-    ///
-    /// ## The real bug this closes
-    ///
-    /// `lsp_core::LspClient::is_connection_alive` has been a real, honest signal since Revision
-    /// R8.5b, but nothing in this crate ever *checked* it on a cadence: it was read only by
-    /// `lsp_file_status`, i.e. only while the dead server's own language happened to be the file
-    /// being rendered. A dead `rust-analyzer` therefore stayed `Ready` in [`Self::lsp_clients`]
-    /// indefinitely while a TypeScript file was open, with every sync tick, hover and completion
-    /// still being routed at a process that will never answer, and nothing anywhere saying so.
-    ///
-    /// Demoting to `Failed` fixes both halves of that at once, because the rest of this module
-    /// already treats `Failed` correctly: [`Self::lsp_connection_for_path`] stops resolving a
-    /// connection at all (so no further doomed requests are dispatched), and [`lsp_file_status`]
-    /// reports the real message. It deliberately does **not** respawn - see
-    /// [`Self::restart_lsp_clients`] for why that stays the user's call.
     pub(in crate::lsp) fn reap_dead_lsp_clients(&mut self, cx: &mut Context<Self>) -> bool {
         let dead: Vec<(LspClientKey, String)> = self
             .lsp_clients
@@ -649,38 +464,6 @@ impl AdeApp {
     /// render path start fresh ones - the real recovery action behind
     /// [`crate::palette::state::PaletteCommand::RestartLanguageServers`] and the File view footer's own
     /// clickable failed-status chip.
-    ///
-    /// ## Why this is a user action and not an automatic respawn
-    ///
-    /// Before this existed there was no recovery path at all: [`Self::spawn_lsp_client`]
-    /// deliberately no-ops for a key that already has an entry *in any state* (so a failure isn't
-    /// retried on every render), and nothing ever removed an entry whose process had died. The
-    /// only thing that did was [`Self::evict_stale_lsp_clients`], on a worktree switch - so the
-    /// sole real way a user could revive a dead server was to switch worktrees and back, or
-    /// restart the app, neither of which is discoverable as a fix for "diagnostics stopped
-    /// appearing".
-    ///
-    /// Automatic respawning was considered and deliberately not chosen. A server that died *while
-    /// analyzing a particular file* will very likely die again the moment it's handed that same
-    /// file, and an automatic loop turns one honest failure into a permanent, invisible
-    /// spawn/crash cycle - the opposite of this app's "honest status over magic" rule. Real Zed
-    /// makes the same call, and it was checked in the vendored tree rather than assumed: its own
-    /// recovery is a user-invoked `"Restart Server"` menu entry
-    /// (`vendor/zed/crates/language_tools/src/lsp_button.rs:476`) calling
-    /// `LspStore::restart_language_servers_for_buffers`; no automatic post-crash respawn path was
-    /// found in `vendor/zed/crates/project/src/lsp_store.rs` to point at (an absence, so cited as
-    /// one rather than as a verified line).
-    ///
-    /// ## Why the document bookkeeping has to be cleared too
-    ///
-    /// [`Self::lsp_opened_files`] is what makes `didOpen` fire exactly once per path, and the
-    /// version/sync maps describe a conversation with a process that no longer exists. Leaving
-    /// any of them behind would give the fresh server a file it was never told to open, or a
-    /// `didChange` at a version it never saw - a *worse* silent failure than the dead connection
-    /// this is recovering from, since everything would look alive while answering about nothing.
-    /// [`Self::lsp_uri_cache`] is deliberately kept: it is a pure path-to-`file://` mapping with
-    /// no server state in it at all, and dropping it would needlessly stall the next tick's
-    /// completions (see [`Self::prepare_lsp_sync`]'s own cache-miss branch).
     pub(crate) fn restart_lsp_clients(&mut self, cx: &mut Context<Self>) {
         self.restart_lsp_scope(LspRestartScope::EveryServer, cx);
     }
@@ -691,12 +474,6 @@ impl AdeApp {
     /// [`crate::language::LspIdentity::binary`], or a
     /// [`crate::language::CompanionServer::client_key`] such as
     /// `"typescript-language-server (vue)"`).
-    ///
-    /// Runs [`Self::restart_lsp_clients`]' teardown discipline verbatim - same code, same order -
-    /// but scoped to this one server: see [`Self::restart_lsp_scope`], which both go through, and
-    /// [`restart_scope_owns_path`] for how "this server's own documents" is decided. A no-op for
-    /// a key that isn't currently live (or is still `Spawning`, which
-    /// [`Self::restart_lsp_clients`]' own docs explain must never be torn down mid-spawn).
     pub(crate) fn restart_lsp_client(&mut self, binary: &'static str, cx: &mut Context<Self>) {
         self.restart_lsp_scope(LspRestartScope::OneServer(binary), cx);
     }
@@ -704,26 +481,6 @@ impl AdeApp {
     /// The shared body of both restarts, so the ordering discipline
     /// [`Self::restart_lsp_clients`]' docs describe exists in exactly one place and the
     /// single-server path can never drift from it.
-    ///
-    /// The only thing `scope` changes is *how much* is forgotten. Restarting everything forgets
-    /// the whole active root's conversation (what this method did when it was the only restart
-    /// there was); restarting one server forgets only the paths that server was ever told about
-    /// ([`restart_scope_owns_path`]), and touches another live client's sync bookkeeping,
-    /// diagnostics and completions not at all - a `rust-analyzer` restart must not silently
-    /// desync the `typescript-language-server` running beside it.
-    ///
-    /// ## The one honest gap in the single-server case
-    ///
-    /// The completions/hover/diagnostics half is decided by whether the *file on screen*
-    /// ([`AdeApp::active_editable_path`]) belongs to the restarted server, since all three
-    /// describe that file. If a completion request was dispatched against this server and the
-    /// user then switched to another language's file before clicking restart, its task is left
-    /// running: its captured `Arc` clone will defeat `Arc::try_unwrap` in the teardown below, so
-    /// the old process is dropped rather than shut down gracefully (`lsp_core::LspClient`'s own
-    /// `Drop` still kills it once that task finishes or is cancelled). The alternative -
-    /// cancelling completion work unconditionally - would break the "restarting one server never
-    /// disturbs another's live state" guarantee for a much more common case, so this narrow,
-    /// self-healing one is accepted rather than hidden.
     fn restart_lsp_scope(&mut self, scope: LspRestartScope, cx: &mut Context<Self>) {
         let root = self.file_tree_root.clone();
         // Whether what is currently on screen was computed by a server this restart is tearing
@@ -817,11 +574,6 @@ impl AdeApp {
     /// Every live client under the active worktree root a user could meaningfully restart right
     /// now, newest state and all - what the palette's "which server?" step lists, and the reason
     /// it can list something real rather than a hardcoded menu of server names.
-    ///
-    /// Sorted by client key so the rows have a stable order across renders ([`AdeApp::lsp_clients`]
-    /// is a `HashMap`, whose iteration order is not). `Spawning` entries are deliberately absent -
-    /// see [`Self::restart_lsp_scope`]'s own filter for why restarting one is a no-op, and offering
-    /// a choice that does nothing would be exactly the fake affordance this app refuses.
     pub(crate) fn restartable_language_servers(&self) -> Vec<RunningLanguageServer> {
         let root = self.file_tree_root.clone();
         let mut servers: Vec<RunningLanguageServer> = self
@@ -851,34 +603,6 @@ impl AdeApp {
     /// in any state (a previous failure is not retried on every render; this is only called once
     /// per key per [`Self::render_file_view`] pass), or if `extension` has no real LSP identity
     /// at all.
-    ///
-    /// ## Why `extension`, not an already-built `ServerSpawnConfig`
-    ///
-    /// This used to take a real `lsp_core::ServerSpawnConfig` built by the caller - which meant
-    /// [`Self::render_file_view`] had to call `crate::language::server_spawn_config` (and, for
-    /// Python, its real `$PATH` probing via `pyright_initialization_options`) on *every single
-    /// repaint*, just to find out whether a spawn was even needed, before this method's own
-    /// early-return on an already-present key ever got a chance to short-circuit that work. Now
-    /// only a cheap, static [`crate::language::lsp_binary_for_extension`] lookup happens on the
-    /// caller's (render) side; the real, possibly-expensive `ServerSpawnConfig` is built here,
-    /// inside the `cx.background_executor()` task, and only once this method has confirmed a
-    /// fresh spawn genuinely needs to happen - never on the GPUI foreground thread. `extension`
-    /// must be the registry's own canonical `&'static str` (e.g. from
-    /// `crate::language::entry_for_extension(..).map(|entry| entry.extension)`), not an arbitrary
-    /// borrowed slice off a `Path`, since it has to move into a `'static` background task.
-    /// Also spawns `extension`'s [`crate::language::CompanionServer`], when it has one, under its
-    /// own separate [`LspClientKey`] - a genuinely independent [`LspClientState`] entry, spawned,
-    /// polled and evicted through 100% of the same already-battle-tested machinery every other
-    /// client uses (a dead companion is just another dead `Ready` entry). That's deliberate: it
-    /// means no new process-lifecycle code exists for the two-server case, which is where
-    /// lifecycle bugs would otherwise hide.
-    ///
-    /// The two spawns are fully independent. A companion whose own real prerequisite is missing
-    /// (no resolvable `@vue/typescript-plugin`) lands in `Failed` **without** preventing the
-    /// primary from starting: `vue-language-server` alone is a real, reduced-but-working
-    /// experience (its own template diagnostics still arrive), and
-    /// [`Self::lsp_connection_for_path`] degrades to [`LspConnection::Single`] for it rather than
-    /// refusing everything.
     pub(crate) fn ensure_lsp_client(
         &mut self,
         repo_root: PathBuf,
@@ -953,11 +677,6 @@ impl AdeApp {
     /// both halves of [`Self::ensure_lsp_client`], so the `Spawning`-then-`Ready`/`Failed`
     /// lifecycle exists in one place rather than being duplicated per server. A no-op if `key`
     /// already has an entry in any state (a previous failure is not retried on every render).
-    ///
-    /// `build_config` runs on `cx.background_executor()`, never the GPUI thread: it does real
-    /// `$PATH`/filesystem probing. Its `Err` is a real, checked prerequisite failure and is shown
-    /// as-is in [`LspClientState::Failed`], rather than being flattened into a generic message
-    /// that would hide *why*.
     fn spawn_lsp_client(
         &mut self,
         key: LspClientKey,
@@ -1006,12 +725,6 @@ impl AdeApp {
     /// file reaches the real typescript-language-server client rather than assuming Rust (this
     /// app's only supported language before Revision R8). `None` for an extension with no LSP
     /// identity at all (`.go`/anything unrecognized) or one whose primary isn't `Ready` yet.
-    ///
-    /// A [`LspConnection::WithCompanion`] is built **only** when the companion is genuinely
-    /// `Ready` too; a companion that's still spawning, failed, or gone honestly degrades to
-    /// [`LspConnection::Single`] rather than fabricating a pairing that isn't there. Freshly
-    /// constructed per call (two `Arc::clone`s and an enum tag) precisely so that degrade tracks
-    /// the real current state rather than whatever was true when some earlier lookup happened.
     pub(crate) fn lsp_connection_for_path(
         &self,
         path: &Path,
@@ -1051,37 +764,6 @@ impl AdeApp {
     /// read fresh here (separate from [`Self::file_view_cache`]'s own cached parse; this only
     /// happens once per file open, not per render). Runs on `cx.background_executor()` since
     /// both the file read and the write to the server's stdin are blocking I/O.
-    ///
-    /// Also computes and caches `path`'s real `file://` [`lsp_core::lsp_types::Uri`] into
-    /// [`Self::lsp_uri_cache`] here, off-thread (Revision R8.5b audit finding 8's fix) - a real,
-    /// live-reproduced rule violation: an earlier version of [`Self::prepare_lsp_sync`] called
-    /// [`lsp_core::LspClient::uri_for_path`] (a blocking `canonicalize()` syscall) inline, on the
-    /// GPUI foreground thread, on *every* real debounced sync tick, directly contradicting this
-    /// same module's own stated "never acceptable to run inline on the GPUI thread" convention
-    /// (see [`Self::schedule_lsp_sync`]'s own docs for the identical rule already being followed
-    /// for [`lsp_core::LspClient::diagnostics_for`]'s own internal canonicalize). Computing it
-    /// exactly once here - the same real moment `path` is confirmed to have a real, ready LSP
-    /// client and is about to have its content read anyway - means [`Self::prepare_lsp_sync`]
-    /// never needs to call it at all: a cache miss there (only possible if an edit somehow lands
-    /// before this background task resolves) just honestly skips dispatching a completion request
-    /// for that one tick, rather than falling back to a second, still-blocking inline computation.
-    ///
-    /// ## Judgment call: no `textDocument/didClose` is ever sent
-    ///
-    /// A real editor sends `didClose` when a buffer stops being open. This viewer is read-only
-    /// and has no "close" event of its own - [`Self::open_file_view`] can be called again for
-    /// the same path later (switching tabs back and forth), and [`Self::lsp_opened_files`]
-    /// intentionally treats that as "already open," not "reopen." Sending `didClose` on every
-    /// tab switch would mean re-sending `didOpen` (and re-waiting through indexing) every time
-    /// the user switches back to a file - real latency for no benefit, since this app keeps at
-    /// most a handful of files' worth of server-side state alive per agent. The `LspClient`
-    /// (and every document it opened) is torn down when its owning root's client is dropped -
-    /// this app's actual document lifetime boundary.
-    ///
-    /// Takes an [`LspConnection`], not a raw client: for a two-server language the *same* real
-    /// `didOpen` must reach both processes (see [`LspConnection::did_open`]'s own docs), and the
-    /// single [`Self::lsp_opened_files`] guard above correctly covers both, since they are opened
-    /// together or not at all.
     pub(crate) fn dispatch_did_open(
         &mut self,
         client: std::sync::Arc<LspConnection>,
@@ -1204,25 +886,6 @@ impl AdeApp {
     /// Performs one real relay round trip for a primary that asked its client to query its
     /// companion (see [`crate::language::CompanionServer`] for what this protocol is and why the
     /// client - not either server - is the one that has to do it):
-    ///
-    /// 1. The primary's notification carries `[[requestId, command, args]]` - one 3-element array
-    ///    inside an outer array. That double wrapping is not incidental: both real servers are
-    ///    built on `vscode-jsonrpc`, whose positional notification params put the handler's single
-    ///    spread argument inside an outer array. A payload whose `command`/`args` are malformed but
-    ///    whose `requestId` is genuinely recoverable is still answered, with the same honest `null`
-    ///    body used everywhere else here (see [`relay_request_id`]); only a payload with no
-    ///    recoverable id at all is a true, logged no-op, because there is then nothing to reply to.
-    /// 2. The companion answers over a plain, typed `workspace/executeCommand`, and its result is
-    ///    the raw tsserver response envelope - the real answer is its `body`.
-    /// 3. The answer goes back as `[[requestId, body]]`, the same double wrapping in reverse
-    ///    (verified live: sending `[requestId, body]` un-wrapped makes the real primary's own
-    ///    handler throw `"number 1 is not iterable"` internally).
-    ///
-    /// The primary is left with a hanging internal promise if it never hears back, so **every**
-    /// path here still sends a response - a `null` body for a companion that isn't `Ready` (a real
-    /// race if a worktree switch lands mid-flight), that errors, or that times out. Both clients
-    /// are re-resolved from `lsp_clients` at the moment this task actually runs, not captured at
-    /// drain time, for the same reason.
     fn dispatch_companion_relay(
         &mut self,
         repo_root: PathBuf,
@@ -1261,7 +924,6 @@ impl AdeApp {
                 .flatten();
 
             let body = match (command_and_args, companion) {
-                // Already logged above, at parse time - the reply itself still has to go out.
                 (None, _) => serde_json::Value::Null,
                 (Some((command, args)), Some(companion)) => {
                     let request = lsp_core::lsp_types::ExecuteCommandParams {
@@ -1356,41 +1018,6 @@ impl AdeApp {
     /// into one debounced step is safe. Called from every real edit call site in
     /// `crate::code_surface::editing` (`replace_text_in_range`/`replace_and_mark_text_in_range`/
     /// backspace/delete), alongside `Self::schedule_rehighlight`.
-    ///
-    /// A single slot per path in [`AdeApp::_lsp_sync_tasks`] (matching
-    /// `Self::schedule_rehighlight`'s own `_rehighlight_tasks` discipline): assigning a fresh
-    /// task here drops whatever earlier debounce/in-flight sync+pull cycle was still running for
-    /// the same path, so a fast typist can never produce two overlapping real `didChange`/pull
-    /// round trips for one file - the same "only the most recent keystroke's work should ever
-    /// land" guarantee this project's own history (Revision R3, R5.5) keeps needing.
-    ///
-    /// ## The real completion request is never gated behind the diagnostics pull
-    ///
-    /// Revision R8.5b audit finding 2's fix for a real, live-measured bug: an earlier version
-    /// dispatched the real `textDocument/completion` request only *after* the whole diagnostics-
-    /// pull retry sequence below finished - up to a real, measured ~8s on a genuinely clean file
-    /// (see [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s own docs), during which real `Enter`/`Up`/`Down`
-    /// keystrokes had nothing to act on (compounding finding 1's own bug). The real completion
-    /// request is now dispatched as its own, genuinely independent [`Self::_completions_request_task`]
-    /// the moment the server is known to have the latest content - either right after a real sync
-    /// this tick succeeds, or immediately if there was nothing new to sync in the first place -
-    /// rather than being sequenced after the pull loop. It's still dispatched *after*, not
-    /// *before*, a real sync that did need to happen: both a `didChange` notification and a
-    /// completion request travel over the same real, `Mutex`-guarded stdin pipe (see
-    /// `lsp_core::client`'s own module docs), so reversing that order would risk the server
-    /// answering completions against stale, pre-edit content - a real correctness bug, not just a
-    /// latency one; only the diagnostics-*pull* retry loop, the actual multi-second offender, is
-    /// being decoupled here.
-    ///
-    /// `cwd` is the worktree [`AdeApp::edit_buffers`]'s composite key needs to find `relative_
-    /// path`'s buffer - the caller's own current [`AdeApp::file_tree_root`] when called
-    /// synchronously (every direct `crate::code_surface::editing` call site), or a `cwd` that
-    /// caller itself already captured before its own `.await` when this is called from inside
-    /// another real `cx.spawn` continuation (`crate::code_surface::tabs::AdeApp::spawn_file_load`'s
-    /// "reloaded" branch) - never re-derived from `self.file_tree_root` once *this* method's own
-    /// debounce timer resumes below, which could by then name a worktree the user has since
-    /// switched away to. See [`AdeApp::edit_buffers`]'s own docs for the stale-worktree bug class
-    /// this prevents.
     pub(crate) fn schedule_lsp_sync(
         &mut self,
         cwd: PathBuf,
@@ -1673,11 +1300,6 @@ impl AdeApp {
     /// This is a deliberate, documented duplication of `schedule_lsp_sync`'s own sync-dispatch
     /// shape rather than a deeper shared refactor of that already-large method - see this crate's
     /// own `CONTRIBUTING.md` for why a judgment call like this gets a comment, not a silent choice.
-    ///
-    /// A genuine no-op when [`Self::prepare_lsp_sync`] finds nothing real to do (no buffer, or no
-    /// ready LSP client for this file's language) - `Ctrl+Space` in a file with no language server
-    /// simply does nothing, the same honest "nothing real to complete against" this app already
-    /// gives the automatic, keystroke-driven path in that case.
     pub(crate) fn invoke_completions_now(
         &mut self,
         relative_path: PathBuf,
@@ -1763,20 +1385,6 @@ impl AdeApp {
     /// [`Self::schedule_lsp_sync`]'s async continuation. `None` when there's nothing real to do
     /// at all (no buffer, no ready client, content already in sync and no completion-worthy
     /// context).
-    ///
-    /// Deliberately does **not** write [`AdeApp::lsp_last_synced_content`]/[`AdeApp::
-    /// lsp_synced_version`] here (Revision R8.5b audit finding 6's fix - see [`Self::
-    /// schedule_lsp_sync`]'s own docs for where that write actually happens now, and why): this
-    /// is *plan* time, before the real `did_change_full` send is even attempted, let alone known
-    /// to have succeeded.
-    ///
-    /// `force_completion` (GitHub issue #26's `Ctrl+Space` manual invoke - see
-    /// [`AdeApp::invoke_completions_now`]) bypasses [`crate::lsp::completion::completion_trigger`]'s
-    /// own "was the character before the caret completion-worthy" judgment entirely, always
-    /// building a real `CompletionTriggerKind::INVOKED` request with no `trigger_character` -
-    /// the real "explicitly ask for suggestions right here, mid-word or not" contract `Ctrl+Space`
-    /// needs, as opposed to the automatic, keystroke-driven path this same method also serves
-    /// (`force_completion: false`, from [`AdeApp::schedule_lsp_sync`]).
     fn prepare_lsp_sync(
         &mut self,
         cwd: &Path,
@@ -2019,17 +1627,6 @@ impl AdeApp {
     /// (`crate::lsp::completion::completion_documentation_text`/`completion_module_path`, plus
     /// `item.detail` for the signature line) - without this, that pane stays empty for nearly
     /// every real item, not just the rare one a server genuinely has nothing more to say about.
-    ///
-    /// A real no-op whenever: there's no `Ready` popup, the currently selected item already has
-    /// both a `detail` and real `documentation` (nothing more a resolve could usefully add), this
-    /// exact `(path, generation, item index)` has already been *answered* once (successfully or
-    /// not - see [`Self::completions_resolved`]'s own docs) or is the one currently still in
-    /// flight ([`Self::completions_resolve_in_flight`]), or the connection's own primary server
-    /// doesn't advertise `completionProvider.resolveProvider` at all.
-    ///
-    /// Deliberately *not* a no-op for an item whose earlier request a later selection cancelled:
-    /// that item has no answer, so asking again is the only way it ever gets one. See
-    /// [`Self::completions_resolve_in_flight`]'s own docs for the real data that used to cost.
     pub(crate) fn maybe_resolve_selected_completion_item(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.as_ref() else {
             return;
@@ -2167,8 +1764,6 @@ impl AdeApp {
     /// The best real description this app has of the item at `item_index` **for the detail pane
     /// and for accepting it** - the merged `completionItem/resolve` response when one has landed
     /// for the current generation, and the server's own inline item otherwise.
-    ///
-    /// Deliberately not what a row reads. See [`Self::completions_resolved_items`].
     pub(crate) fn described_completion_item<'a>(
         &'a self,
         items: &'a [lsp_core::lsp_types::CompletionItem],
@@ -2196,11 +1791,6 @@ pub(in crate::lsp) enum LspRestartScope {
 /// documents `scope`'s servers were ever told about, and therefore whose bookkeeping this restart
 /// must forget. Unconditionally true for [`LspRestartScope::EveryServer`], which is what keeps
 /// the whole-root restart byte-for-byte the pass it always was.
-///
-/// Extension-keyed via `crate::language::lsp_client_key_owns_extension`, so the sharing cases are
-/// the registry's answer rather than a second opinion: `.ts`/`.tsx`/`.js`/`.jsx` all belong to one
-/// `typescript-language-server`, and a `.vue` file belongs to *both* `vue-language-server` and its
-/// distinctly-keyed companion, because both were genuinely sent its `didOpen`.
 fn restart_scope_owns_path(scope: LspRestartScope, path: &Path) -> bool {
     match scope {
         LspRestartScope::EveryServer => true,
@@ -2264,14 +1854,6 @@ pub(crate) enum LspClientState {
 /// [`AdeApp::dispatch_companion_relay`]'s own docs for why it's double-wrapped). Returns the three
 /// pieces as raw [`serde_json::Value`]s - `requestId` in particular is echoed back verbatim rather
 /// than parsed into a Rust integer, so no real id can be lost or altered in translation.
-///
-/// `None` for any shape that isn't genuinely that - a missing outer array, an empty one, an inner
-/// array with fewer than two entries, or a non-string command (which the companion's own
-/// `executeCommand` would reject anyway). Kept a free function so its parsing is unit-testable
-/// with no `AdeApp`, GPUI window, or real server involved.
-///
-/// A `None` here does **not** mean the dispatch may stay silent: see [`relay_request_id`], which
-/// recovers the id independently precisely so a payload this refuses can still be answered.
 fn parse_relay_request(
     params: &serde_json::Value,
 ) -> Option<(serde_json::Value, serde_json::Value, serde_json::Value)> {
@@ -2290,18 +1872,6 @@ fn parse_relay_request(
 
 /// Just the `requestId` out of a drained relay notification, recovered **independently** of
 /// whether the rest of the payload is usable.
-///
-/// Deliberately separate from [`parse_relay_request`]: an unanswered relay leaves the primary
-/// holding an internal promise that never resolves, which is the single failure mode
-/// [`AdeApp::dispatch_companion_relay`] exists to prevent, and a payload like
-/// `[[7, 42, {}]]` (real, valid id; command that isn't a string) carries everything needed to send
-/// the same honest `[[7, null]]` that path already sends for a not-`Ready`, timed-out, or errored
-/// companion. Folding that case into the whole-payload parse meant it was dropped in silence
-/// instead.
-///
-/// The id must genuinely be a JSON-RPC id - a number or a string. Anything else (including a
-/// `null` id, or no inner array at all) is the one real case with nothing to reply *to*, and stays
-/// a true no-op.
 fn relay_request_id(params: &serde_json::Value) -> Option<serde_json::Value> {
     let request_id = params.as_array()?.first()?.as_array()?.first()?;
     (request_id.is_number() || request_id.is_string()).then(|| request_id.clone())
@@ -2342,13 +1912,6 @@ pub(crate) enum LspFileStatus {
 /// `None` only when computing the `file://` URI for the open file's path failed, in which case
 /// this reports [`LspFileStatus::Indexing`] (there's no way to answer "is there a result"
 /// without a URI to look one up by) rather than fabricating any other status.
-///
-/// Takes three real inputs because a two-server language genuinely has three states worth telling
-/// apart: `primary_state`/`companion_state` are the raw lifecycle entries (only they can express
-/// `Spawning`/`Failed`), and `connection` is the already-resolved [`LspConnection`] the same render
-/// pass is using, so the counts reported here are computed from the exact same merged view that's
-/// actually being drawn - they can't disagree with it. `companion_state` is `None` for every
-/// single-server language, which keeps this function's behavior there byte-for-byte what it was.
 pub(crate) fn lsp_file_status(
     primary_state: &Option<LspClientState>,
     companion_state: Option<&LspClientState>,
@@ -2456,11 +2019,6 @@ mod lsp_client_eviction_tests {
         assert!(stale.is_empty());
     }
 
-    /// The real regression test the widened `(PathBuf, &'static str)` key needed (see
-    /// `AdeApp::lsp_clients`'s own docs): every *language's* client for an evicted root must be
-    /// torn down on a worktree switch, not just whichever one happened to be first in the map -
-    /// seeds two entries (standing in for a Rust file and a TypeScript file both having been
-    /// opened under the same old worktree) and confirms both are gone after switching away.
     #[test]
     fn stale_lsp_client_keys_catches_every_binary_under_an_evicted_root_not_just_one() {
         let keys = vec![
@@ -2479,11 +2037,6 @@ mod lsp_client_eviction_tests {
         );
     }
 
-    /// The end-to-end proof at the `AdeApp` level: browsing several worktrees, each with an
-    /// `lsp_clients` entry seeded for it (standing in for "a Rust file was opened here"), never
-    /// lets more than one entry accumulate - [`AdeApp::select_worktree`]'s call into
-    /// [`AdeApp::evict_stale_lsp_clients`] must fire on every switch, including a later revisit
-    /// of an already-seen worktree.
     #[gpui::test]
     fn switching_between_several_worktrees_never_lets_lsp_clients_grow_past_one(
         cx: &mut TestAppContext,
@@ -2539,7 +2092,6 @@ mod lsp_client_eviction_tests {
             });
         }
 
-        // Bounce back to worktree A - a fourth switch, proving eviction fires on a revisit too.
         app.update_in(cx, |app, window, cx| {
             app.select_worktree(0, window, cx);
             let root = app.file_tree_root.clone();
@@ -2556,12 +2108,6 @@ mod lsp_client_eviction_tests {
         });
     }
 
-    /// The `AdeApp`-level proof (not just the pure `stale_lsp_client_keys` helper above) that a
-    /// worktree switch tears down **every** language's client for the old root - seeds both a
-    /// `rust-analyzer` and a `typescript-language-server` entry under the same old worktree
-    /// (standing in for a `.rs` and a `.ts` file both having been opened there, the exact real
-    /// scenario the widened `(PathBuf, &'static str)` key exists to support) and confirms both
-    /// are gone, and only the new root's entry remains, after switching.
     #[gpui::test]
     fn a_worktree_switch_evicts_every_language_client_for_the_old_root_not_just_one(
         cx: &mut TestAppContext,
@@ -2624,23 +2170,6 @@ mod lsp_client_eviction_tests {
 /// Real coverage for [`LspConnection`] itself - the merge/fallback/liveness rules, and the real
 /// relay round trip - driven against **genuinely spawned** language server processes talking the
 /// real `Content-Length`-framed JSON-RPC transport, just tiny ones.
-///
-/// ## Why a small real server rather than the Vue toolchain here
-///
-/// Every behavior under test in this module is a property of *this app's* coordination logic, not
-/// of Vue: "does a companion timeout still produce a response", "does a dead half get named
-/// honestly", "is the relay's wire shape right". Pinning those to `vue-language-server` would make
-/// them slow, dependent on a specific npm install, and - worse - unable to *provoke* the failures
-/// they're about (there is no way to ask a real Vue server to hang or die on cue). So they run
-/// against [`FAKE_SERVER_SOURCE`]: a real process, a real handshake, real framing, real
-/// request/response correlation, with real, deliberately-triggerable failure modes. It is a real
-/// server, not a mock of one - nothing here stubs out `lsp_core`.
-///
-/// The real Vue toolchain is exercised end to end separately, in
-/// `crate::code_surface`'s own `vue_two_server_wiring_tests` (it lives there because it
-/// asserts on the real rendered hover state as well as diagnostics), which is where "does this
-/// actually work against the real
-/// thing" is proven.
 #[cfg(test)]
 pub(crate) mod lsp_connection_facade_tests {
     use super::*;
@@ -2649,41 +2178,6 @@ pub(crate) mod lsp_connection_facade_tests {
 
     /// A real, minimal LSP server over the real wire protocol, with real, requestable failure
     /// modes. Modes:
-    ///
-    /// - `normal`: answers everything, and answers the three fallback-eligible methods with each
-    ///   one's own real *empty* shape - `null` for hover, `[]` for definition, and
-    ///   `{"isIncomplete": false, "items": []}` for completion. Those are deliberately three
-    ///   different encodings of "nothing here", matching what a real `vue-language-server` was
-    ///   measured to send for each (see `crate::language`'s `VUE_FALLBACK_METHODS`), so a test
-    ///   driving this server exercises [`lsp_result_is_empty`]'s real job rather than a null check.
-    /// - `hover`: answers `textDocument/hover` with real content instead of `null`.
-    /// - `semantic`: a real stand-in for the companion - answers hover, definition **and**
-    ///   completion with real, non-empty content.
-    /// - `silent`: never answers a `workspace/executeCommand` or a `textDocument/references` (a
-    ///   real, un-answering companion, for the paths that need one).
-    /// - `pull`: additionally advertises a real `diagnosticProvider` in its handshake, which is
-    ///   what `lsp_core::LspClient::supports_diagnostic_pull` genuinely reads. No real companion
-    ///   advertises one today, so this is the only way to exercise that branch honestly rather
-    ///   than by pinning a version.
-    /// - `no_resolve`: like `normal`, but its `completionProvider.resolveProvider` is `false` -
-    ///   every other mode advertises `true`, matching every real, installed server this app
-    ///   supports. Answers `completionItem/resolve` with a real `detail`/`documentation` pair
-    ///   derived from the request's own `label`, for the modes that do advertise it.
-    /// - `pull_flaky`: like `pull`, but answers the real *first* `textDocument/diagnostic`
-    ///   request it ever receives with a genuine JSON-RPC error (not `ServerCancelled`, so
-    ///   `lsp_core::LspClient::pull_diagnostics` returns immediately rather than retrying
-    ///   internally) and every request after that with a real, non-empty `Full` report - a real,
-    ///   deterministic, on-cue stand-in for the live, load-dependent "one real pull attempt times
-    ///   out or errors, a later one succeeds" condition
-    ///   [`AdeApp::schedule_lsp_sync`]'s own retry-on-`None` fix exists for (see that match arm's
-    ///   docs), reproduced here without needing real CPU contention or a real multi-second wait.
-    ///
-    /// Two test-only methods make its behavior observable and controllable from Rust without
-    /// weakening anything real: `test/die` makes the process genuinely exit (standing in for a
-    /// crash), and `test/publish` makes it push a real `textDocument/publishDiagnostics`. It also
-    /// echoes anything it receives on `tsserver/response` back as a real `publishDiagnostics`
-    /// against a sentinel uri, which is how a test observes - through `lsp_core`'s own real
-    /// notification sink, not a side channel - exactly what bytes the relay sent it.
     const FAKE_SERVER_SOURCE: &str = r#"
 let buf = Buffer.alloc(0);
 // `node -e <script> -- <mode>` consumes the `--` itself, so the mode lands at argv[1].
@@ -2913,11 +2407,6 @@ process.stdin.on('data', (d) => {
     /// Same real push as [`publish_and_wait`], at a real `line` and a real `severity`, naming a
     /// real `source` - the whole shape one row of the sidebar Problems view renders (GitHub issue
     /// #292: "severity square, message, file, line, source").
-    ///
-    /// Exists rather than widening [`publish_and_wait`] for the reason
-    /// [`publish_with_source_and_wait`] gives for its own pair: a bare error on line 0 with no
-    /// source is itself a real case that other tests deliberately drive, and a helper that
-    /// silently started sending more would change what those prove.
     pub(crate) fn publish_full_and_wait(
         client: &lsp_core::LspClient,
         target: &str,
@@ -3014,9 +2503,6 @@ process.stdin.on('data', (d) => {
         assert_eq!(args, serde_json::json!({ "file": "/tmp/App.vue" }));
     }
 
-    /// The un-wrapped shape is specifically what a naive implementation would send, and is
-    /// specifically what the real server does *not* use - so it must not be silently accepted as
-    /// if it were valid.
     #[test]
     fn a_malformed_relay_payload_is_an_honest_none_not_a_panic() {
         for payload in [
@@ -3034,10 +2520,6 @@ process.stdin.on('data', (d) => {
         }
     }
 
-    /// Revision R11 audit finding 4. The request id is recovered **independently** of the rest of
-    /// the payload, because a recoverable id means a reply is genuinely possible - and an
-    /// unanswered relay is exactly the hanging-primary failure this whole path exists to prevent.
-    /// Only a payload with no real id at all has nothing to reply to.
     #[test]
     fn a_real_request_id_is_recovered_even_when_the_rest_of_the_payload_is_not() {
         for (payload, expected) in [
@@ -3075,8 +2557,6 @@ process.stdin.on('data', (d) => {
         }
     }
 
-    /// Args are genuinely optional on the wire - a two-element inner array is real and must
-    /// forward a real `null`, not be rejected.
     #[test]
     fn a_relay_payload_with_no_args_forwards_a_real_null() {
         let (_, _, args) = parse_relay_request(&serde_json::json!([[1, "_vue:projectInfo"]]))
@@ -3084,9 +2564,6 @@ process.stdin.on('data', (d) => {
         assert_eq!(args, serde_json::Value::Null);
     }
 
-    /// Diagnostics from a two-server connection are a real union: each half reports a genuinely
-    /// different class of problem for the same file, so keeping only one side would hide real
-    /// errors. Also pins the `None`-vs-`Some(vec![])` distinction across the merge.
     #[test]
     fn a_two_server_connection_merges_both_halves_real_diagnostics() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3131,8 +2608,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// A single-server connection must behave byte-for-byte like the raw client it wraps -
-    /// including passing `None` through as `None`.
     #[test]
     fn a_single_server_connection_passes_diagnostics_straight_through() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3149,8 +2624,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// The hover fallback: the primary genuinely answers `null` (which is real, expected behavior
-    /// for a hybrid-mode primary, not a failure), so the companion's real answer is what surfaces.
     #[test]
     fn hover_falls_back_to_the_companion_when_the_primary_has_nothing() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3226,11 +2699,6 @@ process.stdin.on('data', (d) => {
         }
     }
 
-    /// Revision R11 audit finding 1, first half. `textDocument/definition` is on Vue's real
-    /// [`crate::language::CompanionServer::fallback_methods`] list because the real primary was
-    /// measured returning an **empty array** (not a `null`) for an identifier inside a `.vue`
-    /// script block while the real companion returned a real `Location`. Before this fix, F12 on
-    /// such an identifier did nothing at all: the facade hardcoded its fallback to hover only.
     #[test]
     fn goto_definition_falls_back_to_the_companion_on_an_empty_array_answer() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3275,10 +2743,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// Revision R11 audit finding 1, second half - the third real "nothing here" shape. The
-    /// primary answers a real, structurally valid `CompletionList` whose `items` are empty (an
-    /// *object* on the wire, neither `null` nor `[]`), so before this fix completions inside a
-    /// `.vue` script block were always empty with no fallback ever attempted.
     #[test]
     fn completion_falls_back_to_the_companion_on_an_empty_completion_list() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3319,26 +2783,6 @@ process.stdin.on('data', (d) => {
         assert_eq!(labels, vec!["alpha", "beta"]);
     }
 
-    /// Direct regression coverage for the completions-popup flicker: an earlier version of
-    /// `AdeApp::prepare_lsp_sync` unconditionally reset `AdeApp::completions` to `Loading` on
-    /// *every* debounced re-sync tick, even while a `Ready` popup for the same path (already
-    /// honestly narrowed in place by `Self::refilter_completions`, GitHub issue #189) was already
-    /// showing real, useful content - so the popup visibly flashed to a bare "loading
-    /// completions..." row and back on nearly every keystroke, and silently dropped the
-    /// `"completions"` key context for that same window (`Self::completions_open_for_active_path`
-    /// requires `Ready`).
-    ///
-    /// Calls `AdeApp::prepare_lsp_sync` directly rather than driving it through the real debounced
-    /// `Self::schedule_lsp_sync` task and `cx.run_until_parked`: that method is a plain, synchronous
-    /// state mutation (it only *builds* the completion request plan; dispatching and awaiting the
-    /// real response is a separate, independently-spawned task further up the call chain), so its
-    /// own decision about whether to touch `AdeApp::completions` can be observed with zero real
-    /// I/O and zero timing race. A first version of this test drove it through a real fake-server
-    /// round trip instead, and turned out unable to observe the bug at all: `cx.run_until_parked`
-    /// blocks for the real duration of an awaited `client.request(..)` call (proven by adding an
-    /// artificial multi-second server-side delay and watching the test's own wall-clock time grow
-    /// to match), so by the time control returns to the test the real response - not just the
-    /// `Loading` seed - has already landed, whatever the delay.
     #[gpui::test]
     fn a_debounced_re_sync_never_drops_an_already_ready_popup_back_to_loading(
         cx: &mut TestAppContext,
@@ -3423,13 +2867,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// Direct regression coverage for the real, live-reported bug: accepting a completion
-    /// routinely leaves the caret right after a real identifier character (accepting a bare
-    /// `println` leaves it right after a real `n`), which the very next debounced re-sync tick
-    /// used to read as a fresh, completion-worthy keystroke - immediately reopening the popup,
-    /// filtered down to essentially just the item the user had just picked. Calls `prepare_lsp_sync`
-    /// directly (no `cx.run_until_parked` needed) for the same reason [`a_debounced_re_sync_never_drops_an_already_ready_popup_back_to_loading`]
-    /// does: the decision under test is synchronous, before any request is ever dispatched.
     #[gpui::test]
     fn accepting_a_completion_does_not_immediately_reopen_the_popup(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3519,14 +2956,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// Direct coverage for the Completions popup's detail pane (`crate::lsp::completion_popup::
-    /// AdeApp::render_completion_detail_pane`) being nearly empty for real items in practice: most
-    /// real servers (rust-analyzer very much included) send only a bare `label`/`kind` inline in
-    /// `textDocument/completion` and expect a follow-up `completionItem/resolve` for whichever one
-    /// the user is actually looking at. This proves the real, live round trip - `spawn_fake_server`
-    /// now advertises `completionProvider.resolveProvider: true` and answers `completionItem/
-    /// resolve` with a real `detail`/`documentation` pair - lands in the exact item `AdeApp::
-    /// completions` holds, not a parallel/shadow copy the render path wouldn't ever read.
     #[gpui::test]
     fn selecting_a_completion_item_resolves_its_real_detail_and_documentation(
         cx: &mut TestAppContext,
@@ -3599,19 +3028,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The real, live-reproduced bug behind "the shown things are still modules instead of real
-    /// types" surviving even after the detail-splitting fix: this merge used to keep the
-    /// *unresolved* `detail` whenever the server had sent one, on the theory that an inline
-    /// `detail` was the server's own considered choice and resolve was only ever additive.
-    ///
-    /// A real dump against a live `typescript-language-server` disproves that for the exact case
-    /// that matters. For an auto-import completion it sends `detail: "./helper"` inline - a bare
-    /// module specifier standing in as a placeholder - and only the `completionItem/resolve`
-    /// response carries the genuinely richer `"Auto import from './helper'\nconstructor
-    /// RemoteHelper(): RemoteHelper"` that actually contains the signature. Discarding the
-    /// resolved value pinned the item to the placeholder forever, so the popup had a module path
-    /// and no type no matter what the render path did with it. Per the LSP spec, resolve returns
-    /// the item with its fields filled in, so a resolved `detail` is the authoritative one.
     #[gpui::test]
     fn a_real_resolved_detail_replaces_a_placeholder_the_server_sent_inline(
         cx: &mut TestAppContext,
@@ -3640,7 +3056,6 @@ process.stdin.on('data', (d) => {
                 status: CompletionsStatus::Ready {
                     items: vec![lsp_core::lsp_types::CompletionItem {
                         label: "RemoteHelper".to_string(),
-                        // The real placeholder a live typescript-language-server sends inline.
                         detail: Some("./helper".to_string()),
                         ..Default::default()
                     }],
@@ -3679,19 +3094,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// Arrowing past an item must not permanently cost that item its type and documentation.
-    ///
-    /// Only one resolve request is ever in flight ([`AdeApp::_completions_resolve_task`] is a
-    /// single slot), so moving the selection replaces - and therefore, since dropping a `Task`
-    /// cancels it, *aborts* - whatever resolve the previous item had going. That is the intended
-    /// economy. The bug was that the aborted item had already been written into
-    /// [`AdeApp::completions_resolved`] at dispatch time, so it counted as answered forever: come
-    /// back to it and no second request would ever go out, and its row and detail pane stayed
-    /// pinned to whatever the unresolved item happened to carry - for a real
-    /// `typescript-language-server` auto-import, a bare module specifier and no type at all.
-    ///
-    /// This walks that exact sequence: select item 0 and dispatch, move to item 1 and dispatch
-    /// (killing item 0's request before it can land), let that settle, then come back to item 0.
     #[gpui::test]
     fn an_item_whose_resolve_was_cancelled_by_moving_on_is_resolved_again_on_return(
         cx: &mut TestAppContext,
@@ -3781,8 +3183,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The economy that fix must not undo: re-selecting an item whose resolve is *still in flight*
-    /// must not fire a second, redundant request for the same thing.
     #[gpui::test]
     fn an_item_with_a_resolve_already_in_flight_is_not_asked_twice(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3822,7 +3222,6 @@ process.stdin.on('data', (d) => {
                 Some((relative.clone(), app.completions_generation, 0)),
                 "the first dispatch must record exactly which item it is waiting on"
             );
-            // A re-render/re-selection of the same item while that request is still out.
             app.maybe_resolve_selected_completion_item(cx);
             assert_eq!(
                 app.completions_resolve_in_flight, in_flight,
@@ -3861,11 +3260,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// A server with no real `completionProvider.resolveProvider` at all must never get a
-    /// `completionItem/resolve` request - there's nothing on the other end that could ever answer
-    /// one usefully, and firing it anyway would just be a request every such server has to somehow
-    /// handle (most just answer `null`/an error, which resolves to a harmless no-op here, but the
-    /// request should never leave in the first place).
     #[gpui::test]
     fn a_server_without_resolve_support_is_never_asked_to_resolve(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -3915,13 +3309,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The other side of the registry-driven rule: a method that is genuinely **not** on the
-    /// companion's `fallback_methods` list must never fan out, so a request the primary answers
-    /// correctly can't have a second server's answer quietly substituted for it.
-    ///
-    /// `textDocument/references` is a real method this app doesn't list for Vue. The companion is
-    /// `silent` for it specifically, so a fallback would cost the full real timeout - the elapsed
-    /// bound is the actual proof, not the returned value.
     #[test]
     fn a_request_outside_the_fallback_list_never_consults_the_companion() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -3968,10 +3355,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// [`lsp_result_is_empty`] pinned directly against every real typed shape it has to classify -
-    /// including the two negative cases that make it safe to apply to *every* listed method rather
-    /// than just hover: a real `Hover` is an object with no `items` key at all, and must never be
-    /// read as an empty completion list.
     #[test]
     fn the_emptiness_predicate_recognizes_every_real_shape_of_nothing_here() {
         use lsp_core::lsp_types::{
@@ -4029,8 +3412,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// A dead half must be reported honestly, by name - not silently swallowed into a
-    /// plausible-looking "everything's fine" status.
     #[test]
     fn a_dead_companion_flips_liveness_and_is_named_in_the_real_status() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4045,7 +3426,6 @@ process.stdin.on('data', (d) => {
         assert!(connection.is_connection_alive());
         assert!(connection.liveness_failure_reason().is_none());
 
-        // A real, unprompted process death - no `shutdown()`, standing in for a crash.
         companion
             .notify_raw("test/die", serde_json::Value::Null)
             .expect("the fake server should accept the notification that kills it");
@@ -4082,7 +3462,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// The same honesty rule in the other direction: a dead primary names the primary.
     #[test]
     fn a_dead_primary_is_named_rather_than_blamed_on_the_companion() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4112,8 +3491,6 @@ process.stdin.on('data', (d) => {
         }
     }
 
-    /// A companion that failed its own spawn must be surfaced honestly rather than silently
-    /// leaving the user with half the analysis and a confident-looking status.
     #[test]
     fn a_companion_that_failed_to_spawn_is_surfaced_in_the_real_file_status() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4133,8 +3510,6 @@ process.stdin.on('data', (d) => {
         assert_eq!(message, "no real @vue/typescript-plugin found");
     }
 
-    /// A companion still coming up is not an error and must not be reported as one - the primary
-    /// alone is genuinely working in the meantime.
     #[test]
     fn a_still_spawning_companion_leaves_the_primarys_own_status_intact() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4165,16 +3540,6 @@ process.stdin.on('data', (d) => {
         }
     }
 
-    /// The real bug: nothing in this crate ever checked `is_connection_alive` on a *cadence*. It
-    /// was read only by [`lsp_file_status`], i.e. only while the dead server's own language
-    /// happened to be the file on screen - so a `rust-analyzer` that died while a TypeScript file
-    /// was open stayed `Ready` in `lsp_clients` indefinitely, with every sync tick, hover and
-    /// completion still routed at a process that would never answer, and nothing anywhere saying
-    /// so.
-    ///
-    /// Driven through a genuinely spawned process killed on cue, and through the real
-    /// [`AdeApp::reap_dead_lsp_clients`] the production poll loop calls - not a simulated state
-    /// flip.
     #[gpui::test]
     fn a_dead_ready_client_is_reaped_into_a_real_named_failed_state(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4192,7 +3557,6 @@ process.stdin.on('data', (d) => {
             );
         });
 
-        // A real, unprompted process death, with no `shutdown()` - standing in for a crash.
         client
             .notify_raw("test/die", serde_json::Value::Null)
             .expect("the fake server should accept the notification that kills it");
@@ -4231,16 +3595,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The other half of the same bug, and the one a user actually feels: before this, there was
-    /// no recovery path at all. [`AdeApp::spawn_lsp_client`] deliberately no-ops for a key that
-    /// already has an entry *in any state*, and nothing ever removed one whose process had died -
-    /// so the only real way to revive a dead server was to switch worktrees and back, or restart
-    /// the app.
-    ///
-    /// Also pins the part that would be a *worse* silent failure if it were forgotten: the
-    /// per-server document bookkeeping has to go too. `lsp_opened_files` is what makes `didOpen`
-    /// fire exactly once per path, so a restart that left it behind would give the fresh server a
-    /// file it was never told to open - everything would look alive while answering about nothing.
     #[gpui::test]
     fn restarting_clears_the_dead_client_and_all_of_its_document_bookkeeping(
         cx: &mut TestAppContext,
@@ -4294,30 +3648,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The race an adversarial review of this fix caught, and the nastier half of it: clearing
-    /// the bookkeeping is not enough on its own, because the tasks that *write* that bookkeeping
-    /// are still in flight when the restart happens.
-    ///
-    /// [`AdeApp::schedule_lsp_sync`]'s continuation captures its own `Arc<LspConnection>` at plan
-    /// time and never re-checks [`AdeApp::lsp_clients`] afterwards, so once past that point it
-    /// completes against the *old* client and writes back unconditionally: `lsp_last_synced_content`
-    /// and `lsp_synced_version` when its `did_change_full` returns `Ok`, and
-    /// `lsp_diagnostics_confirmed_version` on every attempt of a retry loop that runs for a real
-    /// ~8 seconds. A resurrected `lsp_last_synced_content` entry is the damaging one:
-    /// [`AdeApp::prepare_lsp_sync`] reads it as "the server already has this content", so the
-    /// freshly spawned server would never be sent a `didChange` for a dirty buffer and would
-    /// answer forever about the file's on-disk text - a user who restarted *because* diagnostics
-    /// went wrong then silently gets diagnostics for the wrong content.
-    ///
-    /// ## What this test does and does not prove
-    ///
-    /// It pins the **mechanism**, not the symptom: that a restart genuinely drops the in-flight
-    /// sync/completion tasks, which is what makes the write-back impossible. Reproducing the
-    /// interleaving itself was attempted and abandoned honestly - GPUI's deterministic test
-    /// executor collapses exactly the window in question (driving the clock runs the awaiting
-    /// continuation straight through to completion), so a test written against the symptom passes
-    /// identically with and without the fix, which was verified rather than assumed. The
-    /// assertions below do fail without it.
     #[gpui::test]
     async fn a_restart_drops_the_in_flight_tasks_that_would_repopulate_cleared_bookkeeping(
         cx: &mut TestAppContext,
@@ -4368,7 +3698,6 @@ process.stdin.on('data', (d) => {
             );
         });
 
-        // And the bookkeeping those tasks write is genuinely clear once everything drains.
         cx.background_executor.advance_clock(LSP_SYNC_DEBOUNCE * 4);
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -4378,9 +3707,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The recovery has to be reachable without already knowing where to look, so the palette
-    /// command is wired to the same real method the failed-status chip calls - proven by running
-    /// the real [`AdeApp::execute_palette_command`], not by asserting the enum variant exists.
     #[gpui::test]
     fn the_restart_palette_command_runs_the_real_restart(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4417,17 +3743,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// A live client dies, the real poll-cadence reap notices, the real restart clears it, and a
-    /// subsequent real spawn attempt genuinely *reaches the OS* under the same key.
-    ///
-    /// That last step is the whole point, and it is deliberately checked with a binary that
-    /// cannot exist rather than a real server: what has to be proven is that
-    /// [`AdeApp::spawn_lsp_client`]'s "already have an entry, do nothing" guard - the exact thing
-    /// that made a dead connection permanent - is genuinely cleared, and a real `Failed` outcome
-    /// proves an attempt was made where previously none would have been. This test does not
-    /// claim a working server comes back; that is `ensure_lsp_client`'s ordinary cold-start path,
-    /// already covered end to end against a real rust-analyzer by
-    /// `lsp_diagnostics_wiring_tests`.
     #[gpui::test]
     async fn a_restart_frees_the_key_so_a_fresh_spawn_is_really_attempted(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4498,10 +3813,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The single-server restart's whole point, and the thing that would make it worse than
-    /// useless if it were wrong: restarting one server must not disturb another one running
-    /// beside it. Both clients here are genuinely spawned processes with real armed sync tasks
-    /// and real bookkeeping, and only one of them is restarted.
     #[gpui::test]
     async fn restarting_one_server_leaves_every_other_live_client_untouched(
         cx: &mut TestAppContext,
@@ -4622,9 +3933,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// Restarting everything still means everything, including a language whose files the
-    /// single-server path would have scoped away - this is the same fixture as the test above,
-    /// run through the bulk command instead.
     #[gpui::test]
     async fn restarting_every_server_still_forgets_the_whole_roots_conversation(
         cx: &mut TestAppContext,
@@ -4697,12 +4005,7 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// Vue is the one language whose files belong to two clients at once, so it is the one place
-    /// "which documents does this server own" can go wrong in both directions: restarting the
-    /// companion must forget the `.vue` bookkeeping (the companion really was sent that file) and
-    /// must not take the primary's own client down with it.
     #[gpui::test]
-    // Real vue-language-server spawn, not installed in CI - GitHub issue #348.
     #[ignore]
     fn restarting_a_companion_forgets_its_own_documents_without_touching_its_primary(
         cx: &mut TestAppContext,
@@ -4771,8 +4074,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// What the palette's "which server?" step actually reads. `Spawning` is deliberately absent:
-    /// the restart itself skips those keys, so offering one would be a row that does nothing.
     #[gpui::test]
     fn the_restartable_server_list_is_the_real_live_client_map(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4793,7 +4094,6 @@ process.stdin.on('data', (d) => {
                 (root.clone(), "pyright-langserver"),
                 LspClientState::Spawning,
             );
-            // A different worktree's client, which this worktree's restart never touches.
             app.lsp_clients.insert(
                 (root.join("other"), "gopls"),
                 LspClientState::Failed("elsewhere".to_string()),
@@ -4822,11 +4122,6 @@ process.stdin.on('data', (d) => {
         });
     }
 
-    /// The real, full relay round trip through the real production dispatch, with both halves
-    /// genuinely spawned: the primary's `[[id, command, args]]` reaches the companion as a real
-    /// `workspace/executeCommand`, and the companion's `body` comes back as a real
-    /// `[[id, body]]` - double-wrapped, which is not optional (a real `vue-language-server`'s own
-    /// handler throws internally on the un-wrapped shape).
     #[gpui::test]
     fn a_real_relay_round_trip_delivers_the_companions_body_in_the_real_wire_shape(
         cx: &mut TestAppContext,
@@ -4868,9 +4163,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// Adversarial case (a): a companion that never answers must not leave the primary's own
-    /// internal promise hanging forever - the real `LSP_QUERY_TIMEOUT` applies and a real `null`
-    /// body still goes back.
     #[gpui::test]
     fn a_companion_that_never_answers_still_gets_a_real_null_response_back_to_the_primary(
         cx: &mut TestAppContext,
@@ -4915,9 +4207,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// Adversarial case (b): a companion that isn't `Ready` when a relay arrives (still spawning,
-    /// or evicted by a worktree switch mid-flight) must not panic, and must not silently drop the
-    /// primary's request either.
     #[gpui::test]
     fn a_relay_arriving_before_the_companion_is_ready_still_answers_the_primary(
         cx: &mut TestAppContext,
@@ -4933,7 +4222,6 @@ process.stdin.on('data', (d) => {
                 (root.clone(), "vue-language-server"),
                 LspClientState::Ready(primary.clone()),
             );
-            // Deliberately mid-spawn, exactly as a real race would leave it.
             app.lsp_clients
                 .insert((root.clone(), spec.client_key), LspClientState::Spawning);
             app.dispatch_companion_relay(
@@ -4953,12 +4241,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// Revision R11 audit finding 3. `LspConnection::pull_diagnostics` used to fire the
-    /// companion's own pull itself, from a bare, detached `std::thread::spawn` re-run on every one
-    /// of [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s attempts. That decision is now
-    /// [`LspConnection::companion_diagnostics_pull_target`]'s - a real, live capability read the
-    /// caller drives once per sync tick as a tracked task - so this pins the capability check
-    /// itself in both directions, against real handshakes rather than a version assumption.
     #[test]
     fn only_a_companion_that_really_advertises_pull_support_becomes_a_pull_target() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -4995,13 +4277,6 @@ process.stdin.on('data', (d) => {
         assert_eq!(target.name(), "pull-capable-companion");
     }
 
-    /// Adversarial case (c), Revision R11 audit finding 4: a payload whose `command` is malformed
-    /// (a number, which the companion's own `executeCommand` could never accept) but whose
-    /// `requestId` is perfectly real. Distinct from
-    /// [`a_malformed_relay_payload_is_an_honest_none_not_a_panic`], which covers payloads that
-    /// can't be answered at all: here a reply is genuinely possible, so before this fix the
-    /// dispatch bailing outright left the primary's own internal promise hanging forever -
-    /// contradicting this path's own "every path still sends a response" invariant.
     #[gpui::test]
     fn a_relay_with_a_real_id_but_a_malformed_command_still_answers_the_primary(
         cx: &mut TestAppContext,
@@ -5042,20 +4317,6 @@ process.stdin.on('data', (d) => {
         );
     }
 
-    /// Item 5 of the issue's scope: the facade must add no meaningful overhead to the already-
-    /// working single-server path. Measures a real, non-network method (the server's own
-    /// advertised `textDocumentSync` capability, read under a `Mutex`) called directly on the raw
-    /// client vs. through `LspConnection::Single`'s delegating method.
-    ///
-    /// No hard threshold is asserted on the *ratio* - timing in a sandbox under real parallel
-    /// process load is genuinely noisy, and a flaky performance gate is worse than none. What is
-    /// asserted is a deliberately generous, real bound - 1000ns - not "zero"/"unmeasurable": on a
-    /// loaded CI runner the delta is real wall-clock time and can land anywhere under that
-    /// ceiling, not nanoseconds as the ceiling's own headroom might suggest. Kept in the normal,
-    /// non-`#[ignore]` suite on purpose, matching this project's own established convention for
-    /// its other timing-sensitive tests (see `lsp_diagnostics_wiring_tests`'s module docs) - this
-    /// project has no separate slow/perf-test lane. The measured numbers are printed so a
-    /// regression is visible in the log even when the assertion passes.
     #[test]
     fn single_delegation_stays_under_a_generous_1000ns_ceiling() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -5063,7 +4324,6 @@ process.stdin.on('data', (d) => {
         let connection = LspConnection::Single(client.clone());
         const ITERATIONS: u32 = 200_000;
 
-        // A real warm-up pass, so neither measurement pays first-touch costs the other doesn't.
         for _ in 0..1_000 {
             std::hint::black_box(client.supports_document_sync());
             std::hint::black_box(connection.supports_document_sync());
@@ -5102,17 +4362,6 @@ process.stdin.on('data', (d) => {
 /// through this crate's own real code path (`AdeApp::open_file_view` -> `ensure_lsp_client` ->
 /// `dispatch_did_open` -> `render_file_view`) rather than by calling `lsp_core` directly and
 /// bypassing `AdeApp`.
-///
-/// This genuinely spawns a real `rust-analyzer` against a tiny, dependency-free scratch cargo
-/// project (kept dependency-free so `cargo metadata`/rust-analyzer's own workspace discovery
-/// never needs network access) with a genuine `let x: i32 = "not a number";` type mismatch, and
-/// polls real wall-clock time (up to 480s - see this module's own real-deadline constants for
-/// the exact per-test budgets, widened past `lsp_core::client`'s own e2e test's 180s baseline;
-/// see the docs on the deadlines themselves for why) for the diagnostic to actually arrive - no
-/// sleep stands in for that wait, and nothing is fabricated if the wait times out (the assertion
-/// just fails). This is a genuinely slow test (real process spawn plus real sysroot indexing)
-/// kept in the normal, non-`#[ignore]` suite on purpose - this project has no separate "slow
-/// test" lane.
 #[cfg(test)]
 mod lsp_diagnostics_wiring_tests {
     use super::*;
@@ -5195,11 +4444,6 @@ mod lsp_diagnostics_wiring_tests {
         }
     }
 
-    /// The end-to-end proof this fix exists to deliver: a real `rust-analyzer`, spawned via this
-    /// app's own `AdeApp::ensure_lsp_client`/`AdeApp::dispatch_did_open` code path, publishes a
-    /// diagnostic for a real type mismatch, and that diagnostic - real byte range, real message
-    /// - ends up in `AdeApp::file_view_diagnostics`, which is exactly what
-    /// `AdeApp::render_file_view`'s row builder reads to draw the underline/card.
     #[gpui::test]
     fn a_real_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
@@ -5300,15 +4544,7 @@ mod lsp_diagnostics_wiring_tests {
         });
     }
 
-    /// The real end-to-end proof that Revision R8's generalization actually reaches
-    /// `AdeApp`, not just `lsp_core` directly (that already-thorough proof lives in
-    /// `lsp_core::client::tests::typescript_language_server_reports_a_real_diagnostic_for_a_real_type_error`)
-    /// - the same `AdeApp::open_file_view` -> `render_center_pane` (-> the old `is_rust` gate,
-    /// now `crate::language::server_spawn_config`) -> `ensure_lsp_client` -> `dispatch_did_open`
-    /// path the Rust test above exercises, but for a real `.ts` file, proving the extension-based
-    /// dispatch that replaced the old boolean gate genuinely reaches a non-Rust language too.
     #[gpui::test]
-    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
     #[ignore]
     fn a_real_typescript_diagnostic_reaches_file_view_diagnostics_through_the_real_app_code_path(
         cx: &mut TestAppContext,
@@ -5427,14 +4663,6 @@ mod lsp_diagnostics_wiring_tests {
         cx.run_until_parked();
     }
 
-    /// The real, live proof Revision R8.5b exists to deliver, for `rust-analyzer`: opening a
-    /// clean real file, then making a real *unsaved* edit that introduces a genuine type error,
-    /// reaches a real new diagnostic through nothing but this app's own real
-    /// `AdeApp::schedule_lsp_sync` -> `lsp_core::LspClient::did_change_full` path - not a saved-
-    /// disk-content reload, and not a synthetic notification. The same real, indexed client is
-    /// then reused (no second spawn) to prove real, live Completions: typing a real partial
-    /// identifier reaches a real `textDocument/completion` response, and accepting it splices the
-    /// real chosen item's text into the real buffer via `EditBuffer::replace_range`.
     #[gpui::test]
     fn rust_analyzer_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
@@ -5612,18 +4840,6 @@ mod lsp_diagnostics_wiring_tests {
         });
     }
 
-    /// The real fix for a real, live-observed bug behind this module's own widened deadlines
-    /// (see [`PULL_DIAGNOSTICS_EMPTY_RETRIES`]'s own docs for the full account): a single real
-    /// `pull_diagnostics` attempt that fails or times out - a real, live possibility under full-
-    /// suite parallel load, not a genuine "the server can't answer" condition - used to
-    /// permanently strand a post-edit diagnostic, because the retry loop treated that outcome
-    /// (`None`) as terminal instead of retrying it exactly like it already retried an honest
-    /// "still empty" answer. This reproduces the failure deterministically, without needing real
-    /// CPU contention or a real multi-second wait: [`spawn_fake_server`]'s `pull_flaky` mode
-    /// answers the real *first* `textDocument/diagnostic` request with a real JSON-RPC error and
-    /// every request after that with a real, non-empty report, so a pre-fix build (which breaks
-    /// out after that first error) never sees the second, successful attempt's real diagnostic,
-    /// while a fixed build does.
     #[gpui::test]
     fn a_transient_pull_failure_is_retried_not_treated_as_a_permanent_stall(
         cx: &mut TestAppContext,
@@ -5709,11 +4925,7 @@ mod lsp_diagnostics_wiring_tests {
         );
     }
 
-    /// The same real, live proof as the rust-analyzer test above, for `typescript-language-server`
-    /// - see `crate::language`'s own docs on why `npm install typescript@5` is a genuine, real
-    /// project-local requirement in this sandbox, not conservative caution.
     #[gpui::test]
-    // Real typescript-language-server spawn, not installed in CI - GitHub issue #348.
     #[ignore]
     fn typescript_language_server_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,
@@ -5836,9 +5048,7 @@ mod lsp_diagnostics_wiring_tests {
         });
     }
 
-    /// The same real, live proof as the two tests above, for `pyright-langserver`.
     #[gpui::test]
-    // Real pyright-langserver spawn, not installed in CI - GitHub issue #348.
     #[ignore]
     fn pyright_tracks_a_real_live_unsaved_edit_for_both_diagnostics_and_completions(
         cx: &mut TestAppContext,

@@ -1,20 +1,5 @@
 //! The real sidebar History body (GitHub issue #227): the scope toggle, the count line, the
 //! repo → worktree → run tree, and the click that opens a run's transcript.
-//!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3 is the whole brief for this
-//! file, in one sentence: History "is a **list you pick from**, like a file tree - not a
-//! document. Centre tabs hold things you read or work in; the sidebar holds things you navigate."
-//! So nothing here renders a transcript; a row's only job is to open one
-//! ([`crate::run_history::tab`]).
-//!
-//! `REVISION-2026-08-14.md` §6 amends §3's flat, one-worktree list into the hierarchy this file
-//! paints: "**Agent history** is repo → worktree → run, matching the rail, with an `all` /
-//! `this worktree` scope toggle. Active worktree carries the blue edge and opens by default."
-//!
-//! Every decision about *what a row says* lives in [`crate::run_history::model`] and is asserted
-//! there without a window; this file is the `gpui::Div` half only, exactly the split
-//! [`crate::rail::strip`]/[`crate::rail::strip_render`] already keep for the Problems view one
-//! module over.
 
 use super::*;
 
@@ -25,11 +10,6 @@ use crate::run_history::model::{self, HistoryScope, RunEntry, RunGroup, RunTree}
 impl AdeApp {
     /// Switches the sidebar to History - the `⋯` overflow's own `History` row
     /// (`crate::rail::menu::RailMenuAction::OpenHistory`).
-    ///
-    /// Kicks the real drift traversal off here as well as on the body's own render, so the very
-    /// first History frame already has an answer to paint for a window that has been open a
-    /// while: `load_run_drift` is single-flight and skips every worktree it has already answered,
-    /// so calling it from both places costs nothing.
     pub(crate) fn open_history_view(&mut self, cx: &mut Context<Self>) {
         self.set_sidebar_view(SidebarView::History, cx);
         self.load_run_drift(cx);
@@ -37,11 +17,6 @@ impl AdeApp {
 
     /// A worktree row's own `↺ N earlier runs` line (`REVISION-2026-08-13.md` §6): selects that
     /// checkout, switches the sidebar to History and narrows the scope to it.
-    ///
-    /// Narrowing the scope is what makes this line land somewhere - §6 says it switches "the
-    /// sidebar to History **for that worktree**", and the `all` scope's whole-window list would
-    /// answer a different question than the row that was clicked. The toggle is right there to
-    /// widen it back, so this is a starting position rather than a mode.
     pub(crate) fn open_history_for_worktree(
         &mut self,
         path: PathBuf,
@@ -75,10 +50,6 @@ impl AdeApp {
 
     /// The real repo → worktree → run tree for whatever the window knows right now, already
     /// scoped, filtered and folded.
-    ///
-    /// One place builds it, so the count line, the rows and the two empty notes are three
-    /// readings of one pass - the same guarantee `crate::rail::render::AdeApp::render_rail` gives
-    /// the strip's marker and the Problems body (§2: "tallied over their own data").
     pub(crate) fn history_run_tree(&self) -> RunTree {
         model::build_run_tree(
             &self.past_runs(),
@@ -171,11 +142,6 @@ impl AdeApp {
     }
 
     /// The `all` / `this worktree` toggle (`REVISION-2026-08-14.md` §6).
-    ///
-    /// Two segments, drawn from one `map` over [`HistoryScope::ALL`] rather than two hand-written
-    /// pills, for §7 rule 7's reason - a control drawn twice is one control, and two copies drift
-    /// on padding first. Each carries its own tooltip, since `this worktree` is only meaningful
-    /// once you know which checkout that is.
     fn render_history_scope_toggle(
         &self,
         branch: Option<&str>,
@@ -226,12 +192,6 @@ impl AdeApp {
     }
 
     /// One worktree group's header: the caret, the branch it is, and how many runs are under it.
-    ///
-    /// The active worktree carries [`theme::border::SELECTED_EDGE`] - §6's "blue edge" - which is
-    /// the same 2px edge the rail's own selected worktree row paints, read from the same token so
-    /// the two views cannot disagree about which checkout you are in. Every other row reserves
-    /// the 2px transparently, for the reason the rail's childless rows reserve their caret slot:
-    /// a row that omits it starts 2px left of every other row in the column.
     fn render_history_group(
         &self,
         group: &RunGroup,
@@ -300,12 +260,6 @@ impl AdeApp {
 
     /// One run row - §3's "two lines each: agent chip · title · duration, then outcome pill ·
     /// drift dot · drift text · finished-at".
-    ///
-    /// Clicking it opens *that run's* transcript as a centre tab, which is the whole Explorer →
-    /// editor pattern §3 is built on.
-    ///
-    /// A run whose drift has not been answered yet paints **no** dot and no drift text, rather
-    /// than the reassuring `at the tip` - see [`crate::run_history::model::RunEntry::drift`].
     fn render_history_run_row(
         &self,
         entry: &RunEntry,
@@ -460,11 +414,6 @@ impl AdeApp {
 /// Real-window, real-git coverage for the History surface (GitHub issue #227): the overflow row
 /// that reaches it, the rows it really paints for real persisted records, the transcript tab a
 /// row really opens, and the rail line that replaced the inline `HISTORY` section.
-///
-/// Everything here drives the same entry points the UI does - `open_history_view`,
-/// `open_run_tab`, `select_agent` - rather than poking state directly, so it proves the wiring
-/// and not just the pure model underneath it (which `crate::run_history::model`'s own tests
-/// already hold without a window).
 #[cfg(test)]
 mod history_surface_tests {
     use super::*;
@@ -540,9 +489,6 @@ mod history_surface_tests {
         key
     }
 
-    /// The `⋯` overflow's own `History` row really lands on a real, painted History body - the
-    /// only entry point §4t leaves it, so a row that switched nothing would be the whole feature
-    /// unreachable.
     #[gpui::test]
     fn the_overflow_history_row_really_opens_a_painted_history_view(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -581,8 +527,6 @@ mod history_surface_tests {
         );
     }
 
-    /// A real persisted record becomes a real row, and clicking it opens *that run's* transcript
-    /// as a real centre tab - §3's Explorer → editor pattern, end to end.
     #[gpui::test]
     fn a_real_run_row_opens_its_own_transcript_tab(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -647,20 +591,6 @@ mod history_surface_tests {
         }
     }
 
-    /// Live user report: "agents and agents history rows were not unselected when switching
-    /// between them when needed." An agent row and a history run row both derived their own
-    /// "am I the selected one" from a piece of state nothing ever cleared the *other* row's own
-    /// state for, so switching from one to the other could leave both reading as selected at
-    /// once - two rail rows (and two tab-strip tabs) both drawn as active.
-    ///
-    /// Asserted the same way `nothing_selected_means_nothing_shown_anywhere` (`crate::rail::
-    /// render`) already asserts single-selection consistency: by reading the exact fields the
-    /// render code itself branches on - `AdeApp::active_agent_pane_id` (what
-    /// `crate::rail::render::AdeApp::render_agent_row` and `Self::render_agent_tab` both call for
-    /// their own `is_selected`/`is_active`) and the `run_tab_active` + `run_tab_by_worktree`
-    /// pair (`crate::run_history::render::AdeApp::render_history_run_row`'s own `is_open`) -
-    /// rather than trying to read painted colour back out of a window, which this codebase's own
-    /// `gpui::TestAppContext` has no way to do (only `debug_bounds`, a geometry lookup).
     #[gpui::test]
     fn switching_between_an_agent_and_a_history_run_leaves_exactly_one_selected(
         cx: &mut TestAppContext,
@@ -747,8 +677,6 @@ mod history_surface_tests {
         });
     }
 
-    /// §3: "One run tab per worktree; opening another replaces it." The replacement is a
-    /// replacement, not a second tab - and it does not touch another checkout's own open tab.
     #[gpui::test]
     fn a_second_run_replaces_the_tab_rather_than_stacking_beside_it(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -782,7 +710,6 @@ mod history_surface_tests {
             "opening another run replaces the tab; it never stacks a second one"
         );
 
-        // Another checkout's run tab is its own - opening one there must leave this one alone.
         app.update_in(cx, |app, window, cx| {
             app.open_run_tab(elsewhere.to_path_buf(), other, window, cx);
         });
@@ -798,13 +725,6 @@ mod history_surface_tests {
         );
     }
 
-    /// The `all` scope lists every checkout's runs, so a row click very often names a worktree
-    /// you are not standing in - and the tab it opens lives in *that* worktree's strip. Opening
-    /// one must therefore select its checkout, or the tab is filed somewhere nothing is drawing.
-    ///
-    /// A real regression test: before the fix, this rendered an empty tab strip and a centre pane
-    /// reading "this run is no longer in the history", because `open_run_key` resolves against the
-    /// selected worktree. Caught by a screenshot of the running app.
     #[gpui::test]
     fn opening_another_checkouts_run_selects_that_checkout(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -855,9 +775,6 @@ mod history_surface_tests {
         assert!(cx.debug_bounds("run-view").is_some());
     }
 
-    /// The other half of the same rule: switching worktrees *leaves* the run tab, so the centre
-    /// pane never keeps painting another checkout's recording - or, worse, a "no longer in the
-    /// history" note for a worktree that simply has no run tab of its own.
     #[gpui::test]
     fn switching_worktrees_leaves_the_run_tab_behind_in_its_own_strip(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -896,9 +813,6 @@ mod history_surface_tests {
         );
     }
 
-    /// §7's real cost, in this app's own terms: the run tab occupies the centre pane, so
-    /// selecting an agent while it is showing must genuinely *leave* it - not merely stop drawing
-    /// it while `Window::focus` still points at a handle nothing is tracking.
     #[gpui::test]
     fn selecting_an_agent_really_leaves_the_run_tab(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -935,12 +849,6 @@ mod history_surface_tests {
         );
     }
 
-    /// §6's rail line, and the deletion that came with it: a worktree with real history and **no
-    /// live agent** gets a `↺ N earlier runs` line and no disclosure caret - the caret only ever
-    /// meant "this worktree has children", and history is no longer one of them.
-    ///
-    /// The line is the *whole* rail-side surface for history now. The inline `HISTORY` section it
-    /// replaced - a label plus one `Resume`/`Reopen` row per run - is deleted, per §7 rule 5.
     #[gpui::test]
     fn a_worktree_with_history_and_no_agent_gets_the_earlier_runs_line(cx: &mut TestAppContext) {
         let repo = init_repo();
@@ -1016,24 +924,6 @@ mod history_surface_tests {
         assert!(cx.debug_bounds("sidebar-history").is_some());
     }
 
-    /// Screenshot-reported: "the earlier run row spacing in the worktree pane is wrong, it should
-    /// be correctly centered - like [the `main checkout \u{b7} clean` row]". Real root cause,
-    /// found with `debug_bounds` against this exact row before the fix: `render_earlier_runs_link`
-    /// used to add `trailing_pb`'s `.pb(px(7.0))` straight onto the same `div` that carries a
-    /// fixed `.h(px(19.0))`. `taffy`'s default `BoxSizing::BorderBox` (the same rule
-    /// `Self::render_worktree_row`'s own `header` note documents) means that padding ate into the
-    /// row's own 19px content area rather than adding space below it - real measured bounds on the
-    /// unfixed code showed both the `\u{21ba}` glyph and the `N earlier runs` label centered
-    /// 3.5px *above* the row's own vertical center, spilling 1.5px above the row's own top edge.
-    ///
-    /// The fix moved the 7px into a real sibling spacer box (the same idiom
-    /// `Self::render_worktree_row`/`Self::render_repo_group_header` already use), leaving `row`'s
-    /// own 19px content area untouched. This test proves the real, painted result: the icon and
-    /// label glyphs' own vertical centers land on the row's own vertical center - and, so this is
-    /// not just an accident of this one row's numbers, that the exact sibling row the user's own
-    /// screenshot called out as already correct - the worktree row's own `\u{b7} <note>` text,
-    /// e.g. `main checkout \u{b7} clean` (`Self::render_worktree_row`) - centers its own text the
-    /// same way: on its own row's real geometric center, not the note text's own.
     #[gpui::test]
     fn earlier_runs_link_icon_and_label_are_centered_like_the_worktree_rows_own_note(
         cx: &mut TestAppContext,
@@ -1146,8 +1036,6 @@ mod history_surface_tests {
         );
     }
 
-    /// The two empty states are two different facts, and the view says which one it is - the same
-    /// pair the Problems view one module over keeps, for the same reason.
     #[gpui::test]
     fn no_history_and_no_match_are_two_different_notes(cx: &mut TestAppContext) {
         let repo = init_repo();

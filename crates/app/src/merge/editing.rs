@@ -3,43 +3,6 @@
 //! of the read-only two-column quick-pick view (`crate::merge::render::
 //! render_conflict_columns`) once [`AdeApp::start_merge_hand_edit`] toggles hand-edit mode on for
 //! the currently active conflicted file.
-//!
-//! ## What's genuinely shared with the File view, and what's structurally new
-//!
-//! The real editing engine ([`crate::code_surface::edit_buffer::EditBuffer`]), the single, generalized
-//! `EntityInputHandler` impl, and the `Editor*` action handler *bodies* (`crate::code_surface::editing`)
-//! are all reused as-is, routed here whenever [`crate::code_surface::editing::AdeApp::active_edit_target`]
-//! resolves to the merge buffer rather than a File-view one - see that method's own docs for the
-//! real "at most one editable surface is ever on screen" guarantee this relies on.
-//!
-//! What's deliberately *not* shared: this module's own row-painting function
-//! ([`render_merge_edit_line`]) and its own dedicated layout-cache fields
-//! ([`AdeApp::merge_edit_row_layout`]/[`AdeApp::merge_edit_last_layout`]/
-//! [`AdeApp::merge_edit_last_bounds`]/[`AdeApp::merge_edit_last_layout_for`]/
-//! [`AdeApp::merge_edit_scroll_handle`]) - kept structurally separate from the File view's own
-//! equivalents (`crate::code_surface::editing::render_editable_file_view_line`,
-//! `AdeApp::file_view_row_layout`, etc.) rather than reused verbatim, so the two independently
-//! virtualized row lists' click/cursor hit-testing caches can never cross-contaminate - the exact
-//! class of bug this project's own audits (BUILD-LOG's Revision R9a diff-highlight-cache finding)
-//! keep finding when two structurally different surfaces share one cache.
-//!
-//! ## Deliberately no syntax highlighting, no diagnostics, no hover, no LSP, no completions
-//!
-//! [`AdeApp::start_merge_hand_edit`] seeds this view's [`crate::code_surface::edit_buffer::EditBuffer`] with
-//! `extension: None`, so [`crate::code_surface::edit_buffer::EditBuffer::highlighter`] always resolves to
-//! `None` and every line stays a single plain [`code_view::HighlightKind::Text`] run - real,
-//! deliberate scope cuts: a mid-merge buffer full of `<<<<<<<`/`=======`/`>>>>>>>` markers has no
-//! meaningful language-server semantics, and no language server relationship is ever established
-//! for this flow, so there is no debounced re-highlight task class here at all (unlike
-//! `crate::code_surface::editing::AdeApp::schedule_rehighlight`), no diagnostics gutter, no hover, and no
-//! `"completions"` key-context tag is ever added to this surface's own `"merge-editor"` context
-//! (`crate::default_key_bindings` never binds a `Completions*` action to it).
-//!
-//! ## No undo/redo
-//!
-//! Same real, documented scope cut as the File view's own `EditBuffer` (see that module's own
-//! docs) - the only real "undo" this phase offers is a coarse, whole-buffer
-//! [`AdeApp::discard_merge_hand_edit`].
 
 use gpui::{canvas, fill, point, Bounds, ElementInputHandler, Entity, TextRun};
 

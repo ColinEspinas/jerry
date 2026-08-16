@@ -1,29 +1,5 @@
 //! How a theme file is *written* - the layout, ordering and comments that make
 //! `assets/themes/*.toml` and `~/.config/jerry/themes/*.toml` pleasant to open and hand-edit.
-//!
-//! Reading a theme file is `crate::settings::custom_theme`'s job and is deliberately liberal: key
-//! order, grouping and comments carry no meaning at all, so a hand-edited file never has to look
-//! like what this module produces. This module only decides what *Jerry* writes - when it
-//! generates the five bundled themes, canonicalizes an import, converts a VSCode theme, or exports
-//! one for sharing.
-//!
-//! ## Where the comments come from
-//!
-//! Every explanatory comment in a written file is parsed out of `crate::theme`'s own source at
-//! startup ([`SOURCE`]), never hand-maintained here. A module's section blurb is that module's own
-//! `///` doc comment; a key's trailing note is the token's own trailing `//` comment, or the first
-//! sentence of its `///` docs. That matters because the alternative - a second table of
-//! descriptions living in this module - would be a copy that silently drifts the first time
-//! someone retunes a token and updates only the doc comment next to it. Here, the doc comment next
-//! to the token *is* what the file says.
-//!
-//! ## Ordering
-//!
-//! [`SECTIONS`] lays the modules out in the order a person reading a theme top to bottom would
-//! want them - the big surfaces first, then text, then what colour *means* in this app, then code,
-//! then the smaller chrome - rather than in `crate::theme::TOKEN_GROUPS`' declaration order. A
-//! module that isn't listed there still gets written (under a trailing "Other" section), so adding
-//! one to `crate::theme` can never silently drop its keys out of generated files.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -35,12 +11,6 @@ use crate::settings::custom_theme::CustomThemeFile;
 const SOURCE: &str = include_str!("../theme.rs");
 
 /// The written layout: a section heading, and the `crate::theme` modules that belong under it.
-///
-/// Grouped by what a person is actually looking for when they open a theme file. Surfaces and
-/// borders first because they are what a new theme changes first and what dominates the screen;
-/// text next; then the tokens where colour carries *meaning* rather than structure (agent status,
-/// diffs, tags) which are the ones you must not casually recolour; then the code surface; then the
-/// long tail of small chrome.
 const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Surfaces and structure",
@@ -132,13 +102,6 @@ fn first_sentence(doc: &str) -> String {
 const MAX_KEY_NOTE: usize = 60;
 
 /// Turns a token's own doc into a note worth putting next to a value in a theme file, or `None`.
-///
-/// A doc comment is written for someone editing `crate::theme`, not for someone editing a theme,
-/// so some of them are whole paragraphs of design history and cite things (`Jerry.dc.html`, issue
-/// numbers, other tokens) a theme author has no use for. This keeps the short, genuinely
-/// descriptive ones - which is most of the palette, since the tokens ported from the design
-/// handoff carry real one-line labels like `window body` - and drops the rest rather than
-/// wrapping an essay into the file. No note is better than a wall of text.
 fn key_note_from(doc: &str) -> Option<String> {
     let sentence = first_sentence(doc);
     // A leading "GitHub issue #141:" tells a theme author nothing.
@@ -326,9 +289,6 @@ const WIDTH: usize = 96;
 /// Writes one theme file's real TOML text: a short header, the identity fields, then one
 /// `[module]` table per group of keys - laid out in [`SECTIONS`]' reading order, with each
 /// section's and each key's own explanation pulled from `crate::theme`'s source.
-///
-/// `header` is the file-specific preamble (what this particular theme is, and for a generated one,
-/// how it was generated); the format explainer below it is the same for every file.
 pub fn write_theme_toml(file: &CustomThemeFile, header: &str) -> String {
     let mut out = String::new();
 
@@ -460,31 +420,23 @@ mod tests {
 
     #[test]
     fn key_notes_are_parsed_from_real_trailing_comments_and_doc_comments() {
-        // A trailing `// window body` comment on the token line.
         assert_eq!(key_note("surface.window"), Some("window body"));
-        // A `///` doc comment's first sentence.
         let keycap_hint = key_note("surface.keycap_hint").expect("this token is documented");
         assert!(
             keycap_hint.starts_with("The hint-size keycap's own background"),
             "got {keycap_hint:?}"
         );
-        // Rustdoc link brackets and backticks are cleaned out.
         assert!(!keycap_hint.contains('['), "got {keycap_hint:?}");
         assert!(!keycap_hint.contains('`'), "got {keycap_hint:?}");
     }
 
-    /// A `(fg, bg)` pair and an array are declared across several source lines by rustfmt, so the
-    /// parser has to gather a whole statement rather than read one line - an earlier version did
-    /// not, and silently gave every pair and array key no note at all.
     #[test]
     fn a_multi_line_pair_or_array_declaration_is_really_parsed() {
-        // `lang::RS`'s own trailing `// "rs"` label, on a wrapped two-line declaration.
         assert_eq!(key_note("lang.rs.fg"), key_note("lang.rs.bg"));
         assert!(
             key_note("lang.rs.fg").is_some(),
             "a wrapped pair declaration must still be parsed"
         );
-        // `graph::LANES`' own doc comment, shared by all six elements.
         assert!(key_note("graph.lanes.0").is_some());
         assert_eq!(key_note("graph.lanes.0"), key_note("graph.lanes.5"));
     }
@@ -547,8 +499,6 @@ mod tests {
         assert_eq!(first_sentence("No full stop here"), "No full stop here");
     }
 
-    /// Every module `crate::theme` declares is really placed by [`SECTIONS`] - a module missing
-    /// from the layout still gets written (under "Other"), but that is a fallback, not the intent.
     #[test]
     fn every_registered_module_is_placed_in_a_real_section() {
         for (module, _) in crate::theme::TOKEN_GROUPS {

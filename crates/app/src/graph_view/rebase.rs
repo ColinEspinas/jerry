@@ -2,22 +2,6 @@
 //! a separate screen (design spec §1). This file owns the mode's state and every mutation
 //! (entering/leaving, editing the in-memory plan, driving `wt_core::rebase` for real); rendering
 //! lives in `crate::graph_view::rebase_render`.
-//!
-//! ## What this is a thin front-end over
-//!
-//! Every real git mutation goes straight through `wt_core::rebase` (`start_interactive_rebase`/
-//! `continue_rebase`/`skip_rebase_commit`/`abort_rebase`) - see that module's own docs for the
-//! real stopping semantics this UI has to reflect honestly: `edit` and message-less `reword`
-//! both stop; `pick`/`squash`/`fixup`/`drop` and message-supplied `reword` never do. This module
-//! never simulates an outcome - every phase transition below is driven by a real
-//! `wt_core::rebase::RebaseOutcome` a real subprocess produced.
-//!
-//! ## Plan order
-//!
-//! [`RebaseModeState::plan`] is oldest-first, applied top to bottom - `wt_core::rebase`'s own
-//! `RebasePlanEntry` slice order (see [`AdeApp::enter_rebase_mode`], which builds it from
-//! `wt_core::rebase::commits_to_rebase`, itself already oldest-first). The graph pane's own
-//! commit list is newest-first; this mode deliberately reverses it.
 
 use super::*;
 use crate::text_history::TextField;
@@ -388,11 +372,6 @@ impl AdeApp {
     /// reachable from `onto`, oldest first - exactly `git rebase -i <onto>`'s default todo). A
     /// no-op for the synthetic "Working tree" row (`row.commit.id` is empty there - never a
     /// real rebase target).
-    ///
-    /// GitHub issue #241 made this the row menu's *only* rebase entry: a second, separate
-    /// "rebase onto this commit, immediately, with no plan shown" row ran the same replay while
-    /// skipping the Planning banner entirely, which is exactly the review step the banner's own
-    /// one-click `Start rebase` already makes cheap. One entry, one banner, no capability lost.
     pub(crate) fn enter_rebase_mode(&mut self, from_row_index: usize, cx: &mut Context<Self>) {
         let Some(row) = self.current_graph_row(from_row_index) else {
             return;
@@ -405,18 +384,6 @@ impl AdeApp {
     /// The Branches panel's branch menu "Rebase current branch on Branch…" action (GitHub issue
     /// #241) - the same rebase mode [`Self::enter_rebase_mode`] enters, targeting `branch`'s real
     /// tip commit.
-    ///
-    /// Resolves the branch to a real commit first (`wt_core::graph::resolve_commit`, a real `git
-    /// log -1` in the focused worktree) rather than handing the branch *name* to the rebase
-    /// engine, for two real reasons: a branch is a moving pointer, so pinning the tip that was
-    /// really there when the user clicked is what makes the plan the banner then shows honest;
-    /// and [`RebaseModeState::onto`] is a commit id everywhere else, which the banner and
-    /// `wt_core::rebase` both already depend on.
-    ///
-    /// That resolution is real blocking I/O, so it runs on the background executor and calls
-    /// [`Self::enter_rebase_mode_inner`] when it lands - never inline on the UI thread. A branch
-    /// that no longer resolves (deleted since the panel last loaded) reports git's own real error
-    /// through the graph tab's status line and enters no mode at all.
     pub(in crate::graph_view) fn enter_rebase_mode_onto_branch(
         &mut self,
         branch: String,
@@ -473,13 +440,6 @@ impl AdeApp {
     /// form, for display) rather than a row index - so nothing downstream depends on that commit
     /// still occupying a particular row of the currently loaded graph. A background reload between
     /// opening the row menu and clicking genuinely renumbers rows, while a commit id does not move.
-    ///
-    /// GitHub issue #242 is what this rides on, and the reason the row menu's rebase entry stopped
-    /// calling `wt_core::rewrite::rebase_onto` (a plain `git rebase <onto>`) at all: a conflict
-    /// stops in [`RebasePhase::Stopped`], where the existing banner offers real
-    /// `Continue`/`Skip`/`Abort` and `Resolve in the diff view`. The plain `git rebase` left the
-    /// worktree genuinely mid-rebase with nothing in this app able to continue, skip or abort it -
-    /// a real dead end, recoverable only from a terminal.
     pub(in crate::graph_view) fn enter_rebase_mode_inner(
         &mut self,
         onto: String,
@@ -668,13 +628,6 @@ impl AdeApp {
     /// [`RebaseModeState::paused_agents`] this session's own "Pause now" suspended -
     /// design spec §1.6 warning 1's "Resume after" contract: automatic the moment the mode
     /// reaches a terminal state. Called from every real exit path via [`Self::leave_rebase_mode`].
-    ///
-    /// Known, accepted gap (documented rather than silently unhandled - GitHub issue #242 phase B
-    /// review): a real app crash or `SIGKILL` with no destructor run leaves a paused process
-    /// exactly as stopped as `pause` left it, with no next-launch recovery in this revision - a
-    /// `SIGSTOP`'d process cannot even react to the pty's own master-close `SIGHUP` while
-    /// stopped. Recovering from that would mean persisting paused pids to disk and `SIGCONT`ing
-    /// them on the next real startup; not implemented here.
     fn resume_paused_rebase_agents(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_mut() else {
             return;
@@ -1094,10 +1047,6 @@ impl AdeApp {
     /// `Self::run_graph_remote_op`'s own background-spawn/repaint shape (see that method's docs),
     /// but returns a real `RebaseOutcome` rather than `Result<(), Error>`, so it's a distinct
     /// function rather than a reuse of that one.
-    ///
-    /// Refuses (a no-op) if a rebase operation is already in flight - the shared half of the
-    /// real double-click guard every caller also checks itself before doing any real work (see
-    /// [`Self::continue_rebase`]'s own docs for why the caller-side check still matters too).
     fn run_rebase_op(
         &mut self,
         cx: &mut Context<Self>,

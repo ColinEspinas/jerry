@@ -1,24 +1,4 @@
 //! In-file find (`mod+F`) - the find bar inside the focused file view, and its pure model.
-//!
-//! GitHub issue #162's original ask, kept below the rev-6 re-scope: "`mod+F` opens a find bar in
-//! the focused file view with match count and next/prev, following the panel's modifier-button and
-//! three-state conventions. (No mock exists for this; match the panel's vocabulary rather than
-//! inventing a new one.)"
-//!
-//! So this deliberately reuses, rather than parallels, the panel:
-//!
-//! - the same [`crate::search::engine::Matcher`], so `Aa` / `ab` / `.*` mean here exactly what
-//!   they mean there, overlapping matches included,
-//! - the same [`crate::search::state::SearchModifier`] buttons and the same 17x17 boxes,
-//!   drawn by the same helper,
-//! - the same `crate::text_history::TextField` with a real caret,
-//! - and the same **three-state gate**: an empty field is *not searched yet*, which is not the
-//!   same fact as *searched, found nothing* (`REVISION-2026-08-14.md` §7 rule 6).
-//!
-//! What it deliberately does **not** share is the subject: the panel searches the worktree on
-//! disk, and this searches the **buffer** - `crate::code_surface::edit_buffer::EditBuffer`'s live
-//! content, unsaved edits included. Finding the file's saved bytes while the user is looking at
-//! their own unsaved edits would be answering a question about a file that is not on screen.
 
 use std::ops::Range;
 
@@ -35,9 +15,6 @@ pub struct FindHit {
 }
 
 /// Every hit in `content`, in document order.
-///
-/// One row per **match**, not per line, exactly as the panel's tree is - so `3 of 12` counts the
-/// same things the panel's `12 results` would.
 pub fn find_all(content: &str, matcher: &Matcher) -> Vec<FindHit> {
     content
         .lines()
@@ -68,13 +45,6 @@ pub struct FindBar {
     pub error: Option<String>,
     /// A clone of `crate::root::AdeApp::find_bar_focus_handle` - the app's own permanent handle,
     /// not one minted per opening.
-    ///
-    /// That distinction is load-bearing: the bar is created and dropped every time `mod+F` is
-    /// pressed, and a fresh handle each time would have to be re-wired into
-    /// `crate::root::caret_blink`'s shared loop on every opening, growing
-    /// `AdeApp::caret_blink_handles` without bound and giving five chances to forget the wiring
-    /// instead of one. One permanent handle wired once at start-up, exactly like every other
-    /// field in this app, has neither problem.
     pub focus_handle: gpui::FocusHandle,
 }
 
@@ -98,10 +68,6 @@ impl FindBar {
 
     /// Recomputes [`Self::hits`] against `content`, keeping the caret on the nearest hit at or
     /// after where it already was rather than snapping back to the top.
-    ///
-    /// Keeping position matters more here than it would in the panel: the user is looking at the
-    /// file while they type, and a find that jumps to hit 1 on every keystroke drags the viewport
-    /// away from what they were reading.
     pub fn recompute(&mut self, content: &str) {
         let previous_line = self.current_hit().map(|hit| hit.line_number);
         match Matcher::compile(self.query.as_str(), self.options) {
@@ -135,10 +101,6 @@ impl FindBar {
 
     /// Steps to the next hit, wrapping - which is what every editor's find does, and what makes
     /// the count row's `N of M` honest about there being a cycle rather than an end.
-    ///
-    /// `step_next` rather than `next`: a bare `next(&mut self) -> Option<&T>` on a non-iterator is
-    /// the exact shape `clippy::should_implement_trait` flags, and it would be read as an
-    /// `Iterator` by anyone skimming.
     pub fn step_next(&mut self) -> Option<&FindHit> {
         if self.hits.is_empty() {
             return None;

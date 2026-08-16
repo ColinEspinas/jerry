@@ -27,37 +27,6 @@ impl AdeApp {
     /// §4t's per-agent provider budget, right-aligned in the pane's readout strip:
     /// `claude 5h ▓░░░░░░ 19% 7d ▓▓▓▓░░░ 60%`, for **this** agent's provider - each meter filling
     /// with what has been *spent* (`super::state`'s "Used, not left").
-    ///
-    /// `None` - nothing at all, not a dimmed placeholder - for a pane that spends no provider.
-    /// §4t words that as "a local model shows nothing, correctly"; in this build the pane that
-    /// spends nothing is the shell ([`super::state::provider_of`]).
-    ///
-    /// # One bar per window
-    ///
-    /// §4u′, and issue #294's Phase 0 finding: both providers expose two independent windows with
-    /// their own reset instants, so each bar is hued on **its own** value
-    /// ([`super::state::budget_level`] -> `crate::theme::budget`'s tokens, which #279 landed). A
-    /// single bar filled to the tighter window hides *which* limit is tight - and on the live
-    /// account this was verified against, a healthy 5-hour window sat next to a 7-day window on
-    /// the amber boundary, so the single bar would have reported the session as constrained when
-    /// it was not.
-    ///
-    /// # Window label before the value
-    ///
-    /// §4c, verbatim: "`92% 5h` parsed as '92% for 5 hours'; `5h 92%` parses as '5-hour window,
-    /// 92% left'". Every string and every element order here puts the label first - an argument
-    /// about which half of the pair leads, which the flip from `% left` to `% used`
-    /// (`super::state`'s "Used, not left") leaves exactly as it was.
-    ///
-    /// # Why a not-connected provider still renders a (bare) cluster
-    ///
-    /// §4b's rule that unconnected providers "never appear" was written for the footer's
-    /// *per-provider list*, where each extra row was pure cost. This strip is scoped to one agent
-    /// that is literally running that provider's CLI, and §4t's own correction applies instead:
-    /// hiding the slot "took the popover's only trigger with it, so ... a failed provider's
-    /// `Retry` became unreachable". With §4u′ deleting the footer anchor, this strip is the *only*
-    /// route to the popover - so a connected-or-not agent pane keeps a trigger, and the cluster
-    /// says plainly which state it is in rather than fabricating numbers for it.
     pub(crate) fn render_agent_budget_readout(
         &self,
         kind: ProcessKind,
@@ -242,13 +211,6 @@ impl AdeApp {
     /// §4c/§4u′'s popover: the tightest provider on top with each window as a labelled meter and
     /// a reset countdown, the other providers with their own windows or their own failure state,
     /// and `Updated N ago · Refresh` at the foot.
-    ///
-    /// Anchored **directly above the readout that opened it** (§4u′: "it is now
-    /// `position:absolute; right:-8px; bottom:22px` inside the pane readout itself, opening
-    /// directly above the thing you clicked"). Positioned off the readout's real painted bounds,
-    /// which is why it is a direct child of the root element rather than of the strip: those
-    /// bounds are window-space, so `.absolute()` positioning built from them is only correct
-    /// there - the same shape `render_resources_popover` and `render_plus_menu` use.
     pub(crate) fn render_budget_popover(
         &self,
         window: &mut Window,
@@ -309,15 +271,6 @@ impl AdeApp {
     }
 
     /// `RATE LIMITS` and the `Refresh` control.
-    ///
-    /// **`Refresh` sits in the header, not next to `Updated N ago` in the foot.** §4c's prose runs
-    /// the two together in one sentence ("`Updated 3m ago` and a `Refresh` that sets `Updated just
-    /// now`"), but `Jerry.dc.html` - the newest state of the bundle, and the build §4u′ describes -
-    /// puts `Refresh` at the head opposite the title and leaves the foot to `Updated N ago` and the
-    /// `counts spend, not headroom` footnote. That is also the better reading of the same sentence:
-    /// it fixes what `Refresh` *does* to the foot line, not where it is drawn. The mock wins on
-    /// placement; the prose's actual claim - that the foot line is derived from a real read - is
-    /// what [`Self::render_budget_popover_footer`] implements.
     fn render_budget_popover_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -415,9 +368,6 @@ impl AdeApp {
     }
 
     /// One window inside the lead block: `5h · 8% used · resets in 4h 53m`, over its own meter.
-    ///
-    /// The window label leads here too (§4c), and it is a real duration token (`5h`/`7d`) rather
-    /// than a word, so the two rows read as a series.
     fn render_budget_lead_row(&self, window: &BudgetWindow) -> impl IntoElement {
         let level = window.level();
         let value_color = if level == BudgetLevel::Ok {
@@ -479,15 +429,6 @@ impl AdeApp {
 
     /// Every provider that is not the lead, each in whichever state it is really in - its own
     /// windows, `not connected`, `refresh failed` + `Retry`, or `last read <age>`.
-    ///
-    /// **No aggregate `⚠ N` anywhere**, and nothing is summed across these rows (§2, verbatim:
-    /// "Amber means *your work is affected*. A provider you do not use failing to poll is
-    /// telemetry about telemetry"). A failure states itself, in its own row, next to the control
-    /// that acts on it.
-    ///
-    /// This build has two providers, so this section holds at most one row - it is deliberately
-    /// **not** padded out to the mock's four (`claude`/`codex`/`copilot`/`grok`), which would mean
-    /// listing providers no agent kind here can spend.
     fn render_budget_other_providers(
         &self,
         lead: Option<Provider>,
@@ -531,15 +472,6 @@ impl AdeApp {
 
     /// One provider's row. The `refresh failed` / `last read <age>` text carries the **real
     /// reason** the last attempt failed as its tooltip.
-    ///
-    /// `refresh failed` on its own says only that something went wrong; the difference between
-    /// "the provider answered 401" (the CLI's stored token has expired - re-authenticate *there*,
-    /// Jerry does not log anyone in) and "the provider answered 429" (the endpoint's own limiter -
-    /// wait, do not keep clicking `Retry`) is the whole of what a reader can act on, and it was
-    /// already being carried all the way here in [`super::state::ProviderBudget::last_error`] only
-    /// to be dropped one line short of the screen. It hangs off the state text rather than the
-    /// whole row so it points at the thing it explains, and it sits beside the `Retry` the same
-    /// failure earns.
     fn render_budget_other_row(
         &self,
         provider: Provider,
@@ -644,11 +576,6 @@ impl AdeApp {
     /// §4c's foot: `Updated 3m ago` and the footnote `counts spend, not headroom` - the design
     /// bundle's own `counts headroom, not spend`, inverted along with the numbers it describes
     /// (`super::state`'s "Used, not left").
-    ///
-    /// The age comes from the real instant a real result last landed
-    /// ([`super::state::BudgetState::last_read_at`]), through the *same* formatter the Resources
-    /// popover's own foot line uses - two popovers stating the same kind of fact in two different
-    /// vocabularies would be exactly the drift `resources::agent_readout` exists to prevent.
     fn render_budget_popover_footer(&self) -> impl IntoElement {
         let since = self
             .budget

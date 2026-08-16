@@ -1,47 +1,4 @@
 //! Pure logic for the Changes panel's four stacked sections (GitHub issue #285).
-//!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1: the right panel's single flat
-//! change list becomes **four collapsible sections in one scroller**, each with its own count and
-//! diffstat, the commit box pinned above them.
-//!
-//! > Sections, not a segmented picker: triage needs to see that there are uncommitted changes
-//! > *and* three commits *and* a run waiting, without operating a control.
-//!
-//! ## The four scopes are four different questions, not one list filtered four ways
-//!
-//! | | **Runs** | **Uncommitted** | **Commits** | **Against main** |
-//! |---|---|---|---|---|
-//! | Answers | what *this agent* did in *this run* | what is dirty in the checkout | what is written down | what would land |
-//! | Backed by | the provenance union's per-author `split` (`crate::provenance::change_set`) | `wt_core::diff::diff_against_head` | `wt_core::diff::commits_since_base` | `wt_core::diff::diff_against_base` |
-//! | Checkboxes | **never** | yes | no | no |
-//!
-//! The middle row is the load-bearing one. Before this issue the panel showed exactly one of
-//! these (the merge-base diff) and called it "Changes", so committed and uncommitted work sat
-//! intermixed in one list and none of the four questions was answerable at a glance.
-//! `diff_against_head` is a genuinely new scope added for this (see its own docs for why it is not
-//! a filtered view of `diff_against_base`).
-//!
-//! ## Why Runs sums to Uncommitted
-//!
-//! `STAGE-A-CHANGELOG.md` §5 records the mock hitting this exact problem and the fix:
-//!
-//! > Rather than duplicate rows (which would reintroduce the double-staging defect the 07-31 rule
-//! > exists to prevent), run rows now derive from the **union**, taking each agent's share from a
-//! > new `split` field on shared rows. […] Runs now sums to Uncommitted by construction.
-//!
-//! [`run_rows`] does exactly that and nothing else: a run's file count and diffstat are read
-//! straight off [`crate::provenance::change_set::ChangeSet`]'s own per-author partition of the
-//! **uncommitted** diff. There is no second count for the two to disagree about, so the Runs
-//! header's total is the agents' share of the Uncommitted header's total by construction - equal
-//! to it exactly when every uncommitted line is some agent's, and short of it by precisely the
-//! human's own and the unattributed lines otherwise. Both properties are pinned by this module's
-//! own tests.
-//!
-//! ## Self-labelling (audit I6)
-//!
-//! Every section states its own base: [`ChangesSection::scope_phrase`] is rendered as the header's
-//! tooltip, so all five entry points that land in this panel arrive somewhere that declares its
-//! scope rather than at an unlabelled list.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,13 +13,6 @@ use crate::theme;
 use crate::work_surface::agents::AgentId;
 
 /// A background-loaded scope's three real outcomes, plus not-yet.
-///
-/// Mirrors `crate::code_surface::state::DiffLoadState`'s and
-/// `crate::review::state::ReviewLoadState`'s shape, for one consistent idiom across this crate's
-/// background-loaded surfaces. The distinction that matters is the same one they document:
-/// [`ScopeLoad::Error`] is a real message from the underlying `wt_core` call, surfaced rather than
-/// swallowed into an empty result - which would read as "nothing changed", the single most
-/// misleading thing a Changes section could say.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ScopeLoad<T> {
     #[default]
@@ -88,8 +38,6 @@ impl<T> ScopeLoad<T> {
 }
 
 /// One of the Changes panel's four sections.
-///
-/// The variant order is the render order, and [`Self::ORDER`] is the one place it is written down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ChangesSection {
     Uncommitted,
@@ -105,10 +53,6 @@ impl ChangesSection {
     /// The first three are one ladder of git state, narrowing to widening. Runs is not on that
     /// ladder — it indexes the same changes by author — so it sits after it rather than inside it,
     /// which also keeps Uncommitted's top edge fixed however many agents have run."
-    ///
-    /// `REVISION-2026-08-14.md` §1's own sketch lists Runs first; the mock is the more authoritative
-    /// of the two design sources and is unambiguous (comment and paint order agree), so this follows
-    /// the mock.
     pub const ORDER: [ChangesSection; 4] = [
         ChangesSection::Uncommitted,
         ChangesSection::Commits,
@@ -131,9 +75,6 @@ impl ChangesSection {
     /// The header's uppercase label. `Against main` names the real detected base branch, so it is
     /// the one label that depends on git state - `Against base` when no base branch was detected,
     /// never a hardcoded `main` the repository might not have.
-    ///
-    /// Uppercased here rather than by the renderer because GPUI has no `text-transform`: the
-    /// string a test reads back and the string that is painted have to be the same string.
     pub fn label(self, base_branch: Option<&str>) -> String {
         match self {
             ChangesSection::Runs => "RUNS".to_string(),
@@ -156,9 +97,6 @@ impl ChangesSection {
     }
 
     /// The section's 2px left edge (`REVISION-2026-08-14.md` §1's table).
-    ///
-    /// `None` for [`ChangesSection::Runs`]: a run's edge is *its own agent's tint*, resolved per
-    /// row, which is the entire point of per-agent attribution - see [`RunRow::tint_fg`].
     pub fn edge_color(self) -> Option<Rgba> {
         match self {
             ChangesSection::Runs => None,
@@ -169,20 +107,12 @@ impl ChangesSection {
     }
 
     /// Whether rows in this section carry a staging checkbox.
-    ///
-    /// `REVISION-2026-08-14.md` §9, box 1: "checkboxes only on Uncommitted". A checkbox in any
-    /// other section would be a control acting outside its own scope - staging a commit, or
-    /// staging one agent's share of a file the other agent also wrote.
     pub fn has_checkboxes(self) -> bool {
         matches!(self, ChangesSection::Uncommitted)
     }
 }
 
 /// Which sections are open right now.
-///
-/// Absence means "never toggled", which falls through to [`ChangesSection::starts_open`] rather
-/// than to a blanket default - so the two git-history sections really do start collapsed, and a
-/// section the user has explicitly collapsed stays collapsed even though that matches the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionCollapse {
     overrides: HashMap<ChangesSection, bool>,
@@ -257,11 +187,6 @@ impl RunRow {
 }
 
 /// Builds the Runs section's rows from the **uncommitted** change set's own per-author partition.
-///
-/// Every number on a row is read off `change_set`, never counted a second time here, which is what
-/// makes the section header's total the agents' share of the Uncommitted header's total by
-/// construction rather than by agreement (see this module's own docs, and
-/// [`runs_sum_to_the_uncommitted_total_when_every_line_is_an_agent_s`]).
 pub fn run_rows(sources: &[RunSource], change_set: &ChangeSet) -> Vec<RunRow> {
     sources
         .iter()
@@ -285,19 +210,6 @@ pub fn run_rows(sources: &[RunSource], change_set: &ChangeSet) -> Vec<RunRow> {
 }
 
 /// Line 1 of a run row: the files this run wrote, newest-listed-first in the diff's own order.
-///
-/// **This app records no per-run task title, and this deliberately does not invent one.** The mock
-/// puts a sentence here (`Extract query builder from the ORM layer`) because its runs are authored
-/// demo data; nothing in this codebase captures a run's brief - not the hook layer
-/// (`crate::hooks::event` reports tool calls and notifications, never the prompt), not
-/// `crate::hooks::store` (status, activity and question only), not the terminal title. A plausible
-/// invented sentence in the most prominent line of the row would be the single worst place in this
-/// panel to put fiction.
-///
-/// So line 1 answers the section's own question - *what did this agent do in this run* - with the
-/// real answer the app actually has: the paths, from the very same change-set partition the row's
-/// counts come from. `no files yet` when the run has written nothing, which is a real state (a run
-/// that has only read, or has not written yet), not an error.
 pub fn run_title(paths: &[&Path]) -> String {
     const NAMED: usize = 2;
     let names: Vec<String> = paths
@@ -330,10 +242,6 @@ pub fn run_meta(agent_label: &str, live: bool, elapsed: Duration) -> String {
 }
 
 /// A section header's right-aligned diffstat, split into its two coloured halves.
-///
-/// `None` for a section with nothing in it: `STAGE-A-CHANGELOG.md`'s own headers render an empty
-/// diffstat rather than `+0 −0`, and §7 rule 2 generalises it - "a control that acts on results
-/// does not exist when there are none".
 pub fn section_diffstat(stat: DiffStat) -> Option<(String, String)> {
     if stat.is_empty() {
         return None;
@@ -363,18 +271,6 @@ pub fn seen_fraction(seen: usize, total: usize) -> f32 {
 }
 
 /// What was true about a file the moment it was marked seen.
-///
-/// `theme::changes`' own docs state the semantics this exists to honour: *"The state these encode
-/// is **'seen since the agent last changed it'**, not 'opened once': a file you read and the agent
-/// then edits again reverts to unseen."* Storing the diffstat the file had when it was opened is
-/// what makes that real - if the file's stat has moved since, something has changed it since you
-/// looked, so it is unseen again. Deliberately not a bare `HashSet<PathBuf>`, which could only ever
-/// encode "opened once".
-///
-/// This is the `reviewed` half of `REVISION-2026-08-14.md` §1's rule 2 ("**`reviewed` and `staged`
-/// are separate fields.** Reviewing must never stage."). It is a wholly separate map from
-/// `crate::root::AdeApp::staged_files`, read by nothing that stages and written by nothing that
-/// stages.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SeenFiles {
     /// Keyed by worktree root, then by repo-relative path - so switching worktrees and back does
@@ -420,13 +316,6 @@ impl SeenFiles {
 }
 
 /// One row of the panel's single scroller, flattened across all four sections.
-///
-/// The panel is one scroller holding genuinely different row heights - a 24px section header, a
-/// 27px file row, a 48px two-line run row - which is precisely what `gpui::uniform_list` cannot
-/// represent (it sizes every slot from item 0). So the list is `gpui::list`/`gpui::ListState`,
-/// GPUI's own variable-height virtualized list, and this is its item model. It is still real
-/// virtualization: a row scrolled far below the viewport is never built at all, which
-/// `crate::sidebar::render`'s own `virtualization_tests` assert against a live render.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SectionRow {
     Header(SectionHeader),
@@ -458,11 +347,6 @@ pub enum SectionRow {
 
 impl SectionRow {
     /// Whether this row is one of the things its section's header *counts*.
-    ///
-    /// Headers, the Against-main context card and section notes are not: counting them would break
-    /// the panel's own acceptance criterion that a header's count equals the number of rows it
-    /// renders, for the three sections where that correspondence holds. See [`SectionHeader::count`]
-    /// for the fourth, Against main, whose count is never derived from this at all.
     pub fn is_counted(&self) -> bool {
         matches!(
             self,
@@ -498,9 +382,6 @@ pub struct SectionHeader {
     /// rendered row count" is a property of how the list is built rather than an agreement
     /// between two counters. The body is built whether or not the section is open, and only
     /// *pushed* when it is, which is what lets a collapsed section still state a true count.
-    ///
-    /// For Against main: the real file count directly (`Self::changes_section_rows`), since that
-    /// section renders no row per file at all - only its one context card.
     pub count: usize,
     pub stat: DiffStat,
     pub open: bool,
@@ -586,7 +467,6 @@ mod tests {
             let s3 = AgentKey::new("utf8:/repo/wt-a|Claude|1700000000");
             let s10 = AgentKey::new("utf8:/repo/wt-a|Claude|1700000900");
 
-            // s3 rewrites the first line, s10 the last - one path, two agents.
             agent_writes(&mut store, repo, "shared.rs", &s3, "ONE\ntwo\nthree\n");
             agent_writes(
                 &mut store,
@@ -747,7 +627,6 @@ mod tests {
 
     #[test]
     fn a_runs_row_never_has_a_checkbox_and_only_uncommitted_does() {
-        // `REVISION-2026-08-14.md` §9, box 1.
         assert!(!ChangesSection::Runs.has_checkboxes());
         assert!(ChangesSection::Uncommitted.has_checkboxes());
         assert!(!ChangesSection::Commits.has_checkboxes());

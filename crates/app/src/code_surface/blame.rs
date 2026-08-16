@@ -4,26 +4,6 @@
 //! Deliberately `gpui`-window-free (only plain `String`s are produced here, mirroring
 //! `crate::lsp::hover`'s own split - `crate::code_surface::editing`/`crate::code_surface::
 //! file_view` wrap them in a `SharedString`/real tooltip element at render time).
-//!
-//! ## Scope: current-line inline blame is real; gutter/full-file blame is not built
-//!
-//! GitHub issue #29's checklist also asks for a secondary "gutter blame / full-file blame
-//! view". That is **not implemented** - see the module docs on `crate::code_surface::blame_view`
-//! for the reasoning and what would be needed. Nothing in this module or its caller pretends
-//! otherwise: there is no settings toggle for it, and no UI element that looks wired to it.
-//!
-//! ## What "revision" means for the cache this backs
-//!
-//! [`wt_core::blame::FileBlame::head_commit`] plus the file's own on-disk `(mtime, len)` -
-//! computed alongside it by `crate::code_surface::blame_view::AdeApp::spawn_blame_load` off the
-//! foreground thread - together key `AdeApp::blame_cache`
-//! (`crate::code_surface::state::BlameCacheEntry`): a cached blame is only trusted while both
-//! still match the file currently on disk. This is deliberately the same "on-disk (mtime, len)"
-//! signal `AdeApp::file_view_cache`'s own `code_view::cache_is_fresh` already uses for syntax
-//! highlighting, reused here rather than inventing a second freshness mechanism - see that
-//! function's docs for why (mtime) alone isn't trusted either: like that check, a real external
-//! rewrite could restore byte-identical content with a new mtime, or vice versa, so both must
-//! agree.
 
 use crate::root::plural;
 use wt_core::blame::BlameLine;
@@ -110,10 +90,6 @@ const RELATIVE_DATE_BUCKETS: &[(i64, &str)] = &[
 /// bucketing, matching what `git log --relative-date`/GitHub's own commit list show, and simple
 /// enough to need no new date/time dependency (this workspace has none; see `Cargo.toml`'s own
 /// "don't add a dependency that duplicates something already vendored" convention).
-///
-/// `then_unix` in the future (a clock skew, or a commit whose author-time was set ahead by
-/// hand - both real, if rare) is clamped to `"just now"` rather than printing a nonsensical
-/// negative duration.
 pub fn format_relative_date(then_unix: i64, now_unix: i64) -> String {
     let elapsed = now_unix.saturating_sub(then_unix);
     if elapsed < 60 {

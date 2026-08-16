@@ -6,34 +6,6 @@
 //! colored *source-text* runs for the Source view - this module keeps real block/inline
 //! structure (heading level, list nesting, table shape) that a flat run list has already thrown
 //! away.
-//!
-//! ## Scope (deliberately v1)
-//!
-//! - Reference-style (`[text][ref]`) and shortcut (`[text]`) links are not resolved against their
-//!   `link_reference_definition` - only inline links (`` [text](url) ``) render as real, styled
-//!   links. A reference/shortcut link's visible text still renders (as plain text via the generic
-//!   gap-capture in [`build_inline_run`]), just without link styling or a destination - not
-//!   dropped, just not specially recognized.
-//! - An inline link with an absolute `http`/`https`/`mailto` destination is really clickable and
-//!   really opens in the OS default browser (GitHub issue #201, see [`openable_url`] and
-//!   [`render_prose_font`]). A *relative* destination (`./CONTRIBUTING.md`, `#a-heading`) is
-//!   deliberately **not** clickable: resolving it needs the previewed file's own directory as a
-//!   base, and handing a bare relative path to the OS handler would silently open the wrong
-//!   thing. Those still render as styled link text, exactly as before - the app just never
-//!   advertises a click it cannot honour. Opening a relative link *inside this editor* would be a
-//!   real feature, but it is a navigation feature, not this bug fix.
-//! - Table cells render as plain trimmed text, not further inline-parsed - a cell containing
-//!   `**bold**` shows the literal asterisks rather than real bold text.
-//! - Images render as a small `[image: alt]` placeholder, not the fetched picture - this is a
-//!   text preview, not a browser; no destination is even loaded, so a missing/broken image
-//!   destination can never break the preview.
-//! - GitHub task-list checkboxes (`- [ ] foo`) are not specially recognized - a task item renders
-//!   as an ordinary bullet, marker text included in its own paragraph text like any other list
-//!   item content.
-//!
-//! None of this is a silent gap: every real CommonMark block kind either renders for real or is
-//! silently skipped as a *block* (HTML blocks, link reference definitions - neither has a
-//! sensible visual form in a preview), never partially rendered as raw leftover markup syntax.
 
 use tree_sitter::{Node, Parser};
 
@@ -397,21 +369,6 @@ fn build_image(image: Node, text: &str) -> MdInline {
 /// GitHub issue #201 ("Markdown links do not work"): whether `destination` is a real absolute URL
 /// this app can honestly hand to the OS default browser (`gpui::App::open_url`, the same real
 /// mechanism `crate::title_bar::menu` already opens this project's own GitHub links with).
-///
-/// Deliberately scheme-gated rather than "open whatever the link says". A relative destination
-/// (`./CONTRIBUTING.md`, `#a-heading`) is a real and common thing to find in a README, but it is
-/// *not* something a browser can resolve on its own: the resolution base is the previewed file's
-/// own directory, which this function doesn't have, and handing a bare relative path to
-/// `xdg-open` would resolve it against the app's working directory instead - silently opening the
-/// wrong file, or nothing. Those destinations keep rendering as styled link text (exactly as
-/// before this fix) but are not painted as clickable, so the app never advertises a click it
-/// can't honour. See this module's own "Scope" docs.
-///
-/// `mailto:` is included because it is the one non-`http` scheme that genuinely appears in real
-/// prose docs and that every desktop's default-handler chain really does route (to a mail
-/// client). Every other scheme is rejected rather than passed through, so a `javascript:` or
-/// `file:` destination embedded in a downloaded/untrusted Markdown file can never be handed to
-/// the OS handler by a single click in this app.
 pub(crate) fn openable_url(destination: &str) -> Option<&str> {
     let trimmed = destination.trim();
     // Angle-bracket destinations (`[x](<https://example.com/a b>)`) are real CommonMark - the
@@ -440,15 +397,6 @@ pub(crate) struct InlineLinkSpan {
 /// the render sites that only ever see already-flattened prose rather than a parsed block tree
 /// (`crate::code_surface::lsp_ui::render_doc_prose`'s LSP hover/completion doc bodies, which
 /// arrive as one plain `String` from `crate::lsp::hover::degrade_markdown_to_plain_text`).
-///
-/// Runs the *same* real `tree-sitter-md` inline grammar [`parse_inline_node`] uses rather than a
-/// hand-rolled bracket/paren scanner, so exactly the constructs CommonMark calls a link are
-/// recognized here and in the preview - one grammar, one answer. A hand-rolled scan would have to
-/// re-derive nesting, escaping (`\[not a link\](x)`) and code-span exclusion for itself and would
-/// inevitably disagree with the preview about some real document.
-///
-/// Returns an empty `Vec` (never panics) if the inline grammar fails to load, matching
-/// [`parse_markdown`]'s own posture for the same should-never-happen case.
 pub(crate) fn inline_link_spans(text: &str) -> Vec<InlineLinkSpan> {
     let mut parser = Parser::new();
     if parser
@@ -603,12 +551,6 @@ impl AdeApp {
 /// `options` is threaded down from [`AdeApp::render_markdown_preview`]'s own `&self` rather than
 /// read from ambient state, so a fenced code block honours `appearance.bracket_pair_colorization`
 /// exactly like the source view does - see `code_view::HighlightOptions`' own docs.
-///
-/// `next_id` is a document-wide running counter handing every prose run its own unique
-/// [`InteractiveText`] element id - see [`render_prose_font`]'s own docs for why sharing one
-/// would be a real bug rather than a cosmetic one. A counter, rather than hashing each block's
-/// text, because two identical paragraphs in one document are perfectly legal and must still get
-/// distinct ids.
 fn render_block(
     block: &MdBlock,
     options: code_view::HighlightOptions,
@@ -695,20 +637,6 @@ fn render_prose(
 /// (bold/italic/code/link spans flowing together on the same line), not a `flex()` row of
 /// separate divs, which GPUI does not word-wrap the way inline HTML does. `base_color`/`base_font`
 /// are this run's own default styling before any nested emphasis/strong/link/code override.
-///
-/// GitHub issue #201 ("Markdown links do not work"): when this run contains at least one link
-/// with a genuinely openable destination, the `StyledText` is wrapped in a real
-/// [`InteractiveText`], whose `on_click` fires only for a press *and* release inside the same
-/// registered byte range (`vendor/zed/crates/gpui/src/elements/text.rs:1022`) - so clicking the
-/// link text opens it, and clicking the prose around it does nothing. `InteractiveText` is the
-/// only GPUI element that can make a sub-range of one wrapped text element clickable; splitting
-/// the paragraph into per-span `div`s to hang an `on_click` on instead would have destroyed the
-/// word wrapping this single-`StyledText` shape exists to preserve.
-///
-/// `id` must be unique across the whole rendered document - [`InteractiveText`] is a *stateful*
-/// element that stores its in-progress mouse-down byte index under this id
-/// (`InteractiveTextState`), so two paragraphs sharing an id would share that state and misreport
-/// which range a click landed in.
 fn render_prose_font(
     inline: &[MdInline],
     base_color: theme::ColorToken,
@@ -894,12 +822,6 @@ fn build_text_runs(inlines: &[MdInline], style: &RunStyle, out: &mut ProseRuns) 
 /// A preview code card's real, coloured lines - split out of [`render_code_block`] purely so the
 /// colouring itself is testable without building a GPUI element (`AnyElement` exposes nothing to
 /// assert on).
-///
-/// The fence-tag alias table it resolves through used to live here as a private copy; GitHub issue
-/// #154 lifted it into [`crate::language::extension_for_fence_language`] because the *source*
-/// view's own tree-sitter injection callback needs the identical mapping, and two copies could
-/// disagree about what ` ```py ` means. Sharing it is also what gave preview mode real HTML/CSS
-/// fence colouring with no further change here - see that function's own docs.
 fn highlighted_code_block_lines(
     language: Option<&str>,
     text: &str,
@@ -1091,9 +1013,6 @@ mod code_block_color_tests {
             .map(|(_, kind)| *kind)
     }
 
-    /// GitHub issue #154 in *preview* mode, which is a genuinely separate rendering path from the
-    /// source view's own highlighting: a ` ```html ` fence's card is really coloured by
-    /// `tree-sitter-html`, not left flat.
     #[test]
     fn a_preview_html_fence_is_really_colored_by_the_html_grammar() {
         let lines = highlighted_code_block_lines(
@@ -1115,7 +1034,6 @@ mod code_block_color_tests {
         assert_eq!(kind_of(&lines, "card"), Some(HighlightKind::Property));
     }
 
-    /// The pre-existing languages must be unaffected by the alias table moving out of this module.
     #[test]
     fn a_preview_rust_fence_is_still_colored_by_the_rust_grammar() {
         let lines = highlighted_code_block_lines(
@@ -1126,9 +1044,6 @@ mod code_block_color_tests {
         assert_eq!(kind_of(&lines, "fn"), Some(HighlightKind::Keyword));
     }
 
-    /// A real gain the shared table brought with it: this module's own private copy mapped a
-    /// ` ```jsx ` fence to the `"js"` extension, which wires the *plain* TypeScript grammar - one
-    /// that cannot parse JSX at all. It now maps to `"jsx"`, which wires the real TSX grammar.
     #[test]
     fn a_preview_jsx_fence_reaches_a_grammar_that_can_actually_parse_jsx() {
         let lines = highlighted_code_block_lines(
@@ -1140,8 +1055,6 @@ mod code_block_color_tests {
         assert_eq!(kind_of(&lines, "id"), Some(HighlightKind::Attribute));
     }
 
-    /// An unrecognized fence tag, and a fence with no tag at all, render as one flat unclassified
-    /// card rather than being force-fitted into some other language.
     #[test]
     fn an_unknown_or_absent_preview_fence_language_stays_plain_text() {
         for language in [Some("zig"), None] {
@@ -1429,8 +1342,6 @@ mod link_tests {
         }
     }
 
-    /// Scheme matching is case-insensitive (`HTTPS://` is a real, legal URL), but the returned
-    /// destination is never normalized - it is handed to the OS handler byte-for-byte as written.
     #[test]
     fn scheme_matching_ignores_case_without_rewriting_the_url() {
         assert_eq!(
@@ -1439,8 +1350,6 @@ mod link_tests {
         );
     }
 
-    /// CommonMark's own angle-bracket destination form: the brackets delimit the destination and
-    /// are never part of the URL handed to the browser.
     #[test]
     fn an_angle_bracketed_destination_sheds_its_delimiters() {
         assert_eq!(
@@ -1449,9 +1358,6 @@ mod link_tests {
         );
     }
 
-    /// The deliberate limit, stated honestly rather than silently: a destination this app cannot
-    /// resolve on its own is *not* openable, so it never gets painted as a clickable link. See
-    /// [`openable_url`]'s own docs.
     #[test]
     fn a_destination_this_app_cannot_honestly_resolve_is_not_openable() {
         for destination in [
@@ -1460,11 +1366,9 @@ mod link_tests {
             "#a-heading",
             "docs/guide.md",
             "",
-            // Not a navigation at all - never handed to the OS default handler on one click.
             "javascript:alert(1)",
             "file:///etc/passwd",
             "data:text/html,<script>alert(1)</script>",
-            // Scheme present but nothing after it.
             "https://",
         ] {
             assert_eq!(openable_url(destination), None, "{destination:?}");
@@ -1492,8 +1396,6 @@ mod link_tests {
         );
     }
 
-    /// A real LSP hover body is multi-line plain text with several sections, not one tidy line -
-    /// every link in it must still be found, in source order.
     #[test]
     fn every_link_across_a_real_multi_line_doc_body_is_found_in_order() {
         let doc = "Fetches a resource.\n\nSee [MDN](https://developer.mozilla.org/x) for \
@@ -1515,9 +1417,6 @@ mod link_tests {
         }
     }
 
-    /// A link whose visible text is itself emphasized must report the real *visible* text, not an
-    /// empty string - `flatten_text` only ever read the top level, which is exactly the shape
-    /// (`[**bold link**](url)`) that would have silently rendered as a blank clickable gap.
     #[test]
     fn a_link_whose_text_is_emphasized_still_reports_its_real_visible_text() {
         let spans = inline_link_spans("[**bold link**](https://example.com)");
@@ -1531,10 +1430,6 @@ mod link_tests {
         assert!(inline_link_spans("").is_empty());
     }
 
-    /// The real reason this scans with `tree-sitter-md`'s own inline grammar rather than a
-    /// hand-rolled bracket/paren scan: a bracketed span that is *not* a CommonMark inline link
-    /// must not be mistaken for one. A hand-rolled `[`-then-`](` scan would happily match inside
-    /// a code span.
     #[test]
     fn a_bracketed_span_that_is_not_a_real_link_is_not_reported() {
         assert!(

@@ -5,22 +5,6 @@
 //! settings file's own location, files loaded from disk with a size cap and per-file errors
 //! reported rather than aborting the whole load, and an importer that validates before it ever
 //! writes anything.
-//!
-//! ## What's different from themes
-//!
-//! A theme file is validated by parsing it as TOML and checking every key against
-//! `crate::theme::TOKEN_GROUPS`. A sound file has no such schema - the only real validation
-//! available is decoding it, so [`import_sound_file`] does that for real (`rodio::Decoder::new`)
-//! before ever copying the file into the library. A file that looks like a `.wav` by extension
-//! but isn't real audio is rejected at import time, never added to fail silently the first time
-//! something tries to play it.
-//!
-//! A sound also has no internal `name` field the way a theme file does (`name = "Midnight
-//! Coral"` inside the TOML) - its identity is its filename stem. That's what [`LibrarySound::id`]
-//! is, for both built-in and imported sounds alike, so a user importing a file also named
-//! `soft-chime.mp3` collides with the built-in `soft-chime` sound exactly the way importing a
-//! theme named `"Jerry Dark"` collides with that built-in theme - reported, not silently
-//! shadowed or duplicated.
 
 use std::path::{Path, PathBuf};
 
@@ -190,13 +174,6 @@ fn file_stem_id(path: &Path) -> String {
 /// `custom_theme::load_custom_themes_from_dir` does. A missing directory (never imported anything
 /// yet) is empty results, not an error - this is the same "not configured" case
 /// [`crate::sound::flow`] otherwise falls back to built-ins for.
-///
-/// Files are processed in sorted-path order so which one wins an id collision is deterministic
-/// rather than dependent on `std::fs::read_dir`'s own unspecified iteration order (same reasoning
-/// as the theme loader). A file whose stem collides with an already-loaded id (another user file,
-/// or a built-in) is skipped and reported rather than silently overwriting the earlier entry in
-/// the returned list - two library rows sharing one dropdown value would be a real, confusing bug,
-/// not a cosmetic one.
 pub fn load_user_sounds_from_dir(dir: &Path) -> (Vec<LibrarySound>, Vec<String>) {
     let mut errors = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -453,7 +430,6 @@ mod tests {
         write_file(dir.path(), "ping.mp3", &tiny_valid_wav());
         write_file(dir.path(), "ping.wav", &tiny_valid_wav());
         let (sounds, errors) = load_user_sounds_from_dir(dir.path());
-        // Sorted path order: "ping.mp3" < "ping.wav", so the mp3 wins and the wav is reported.
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].id, "ping");
         assert_eq!(errors.len(), 1);
@@ -581,16 +557,6 @@ mod tests {
         assert!(first_path.exists(), "first import must not be overwritten");
     }
 
-    /// Unlike `crate::settings::builtin_themes` (whose checked-in files are one derivation's own
-    /// *output*, so a drift test compares two independently-computable sources of truth),
-    /// [`BUILTIN_SOUNDS`]'s bytes come straight from `include_bytes!` on the checked-in files
-    /// themselves - there is no second, independently-computed copy that could disagree with
-    /// them. What *can* still drift is the file list: someone drops a new `.wav` into
-    /// `assets/sounds/` without adding its `include_bytes!` entry (silently never offered in the
-    /// library), or removes an entry's own referenced file (which would already be a hard
-    /// compile error, not a silent one - `include_bytes!` fails the build). This test catches the
-    /// first, real, silent case: every real file in `assets/sounds/` must be exactly the set
-    /// [`BUILTIN_SOUNDS`] declares.
     #[test]
     fn every_real_file_in_assets_sounds_is_a_declared_builtin_and_vice_versa() {
         let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

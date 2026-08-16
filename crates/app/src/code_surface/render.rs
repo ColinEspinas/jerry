@@ -43,9 +43,6 @@ impl AdeApp {
     /// pill, +n/-n stats, the `File | Diff` toggle, the zoom group, close) over
     /// either [`Self::render_diff_file_detail`]'s folded hunk content or [`Self::render_file_view`]'s
     /// syntax-highlighted content, both zoom-scoped through [`zoom_scoped`].
-    ///
-    /// `effective_view` forces `File` when `diff_file` is `None`, regardless of what
-    /// `self.code_view` was last left at by a different file.
     pub(crate) fn render_code_surface(
         &mut self,
         relative_path: &Path,
@@ -364,7 +361,6 @@ impl AdeApp {
             selected.to_string(),
             cx,
             |this, index, _window, cx| {
-                // Index 0 is `File`, index 1 is `Diff`, per the options array above.
                 this.code_view = match index {
                     0 => code_view::CodeView::File,
                     _ => code_view::CodeView::Diff,
@@ -392,7 +388,6 @@ impl AdeApp {
             selected.to_string(),
             cx,
             |this, index, _window, cx| {
-                // Index 0 is `Source`, index 1 is `Preview`, per the options array above.
                 this.markdown_view = match index {
                     0 => markdown_preview::MarkdownView::Source,
                     _ => markdown_preview::MarkdownView::Preview,
@@ -495,7 +490,6 @@ mod choice_control_dispatch_tests {
              dispatch, not a re-match on whatever that segment's label currently says"
         );
 
-        // Segment at structural index 1 ("Diff") - back the other way, same mechanism.
         let diff_bounds = cx
             .debug_bounds("choice-diff-file-toggle-1")
             .expect("the Diff segment must have painted at least once");
@@ -594,11 +588,6 @@ mod markdown_preview_toggle_tests {
         );
     }
 
-    /// GitHub issue #145/#127-adjacent regression class: opening a *different* file must not
-    /// leave a previous file's `Preview` selection stuck on screen for a file that never asked
-    /// for it - `markdown_view` is one shared field, not per-tab state (see
-    /// `root::AdeApp::markdown_view`'s own docs), so every file-open path must reset it exactly
-    /// like `code_view` already resets.
     #[gpui::test]
     fn opening_a_different_markdown_file_resets_the_toggle_back_to_source(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -673,15 +662,6 @@ mod markdown_preview_toggle_tests {
         cx.run_until_parked();
     }
 
-    /// GitHub issue #201, "Markdown links do not work" - the real, reported bug, end to end.
-    ///
-    /// The parse side already produced a real destination; the render side threw it away
-    /// (`build_text_runs` matched `destination: _`), so a link painted as coloured text that did
-    /// nothing at all when clicked. This clicks a real rendered link in a real Preview tab and
-    /// asserts the app really asked the platform to open that exact URL - `cx.opened_url()` reads
-    /// what `gpui::App::open_url` actually handed the platform layer
-    /// (`vendor/zed/crates/gpui/src/platform/test/platform.rs:418`), so nothing here is stubbed on
-    /// this app's side of the call.
     #[gpui::test]
     fn clicking_a_real_preview_link_really_opens_its_url(cx: &mut TestAppContext) {
         let (_app, cx, _repo) = open_markdown_preview(
@@ -702,10 +682,6 @@ mod markdown_preview_toggle_tests {
         );
     }
 
-    /// The other half of "clickable": clicking the ordinary prose *around* a link must not open
-    /// anything. Without this, a test that only ever clicks a link cannot tell a real per-range
-    /// hit test apart from a paragraph-wide "any click opens the first URL" handler - which would
-    /// be exactly the kind of fake this fix must not be.
     #[gpui::test]
     fn clicking_ordinary_prose_next_to_a_link_opens_nothing(cx: &mut TestAppContext) {
         let (_app, cx, _repo) = open_markdown_preview(
@@ -722,11 +698,6 @@ mod markdown_preview_toggle_tests {
         );
     }
 
-    /// The deliberate, documented limit (`markdown_preview::openable_url`), pinned as real
-    /// behaviour rather than left to drift: a relative destination is not something this app can
-    /// resolve, so clicking it must do *nothing* rather than hand a bare relative path to the OS
-    /// default handler, which would resolve it against the app's working directory and open the
-    /// wrong thing.
     #[gpui::test]
     fn clicking_a_relative_link_opens_nothing_rather_than_the_wrong_thing(cx: &mut TestAppContext) {
         let (_app, cx, _repo) =

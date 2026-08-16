@@ -1,40 +1,6 @@
 //! The sidebar strip, as pure data (GitHub issue #291): which views the left column offers, which
 //! cells the strip really paints, what each cell's marker and tooltip say, and the one gate that
 //! empties the strip on a day with no worktrees.
-//!
-//! GPUI-free, like every other `state`-shaped module in this folder - "does an empty day still
-//! claim three agents need a human" and "does the Problems cell mark red or amber" are decisions
-//! worth asserting without a window. [`crate::rail::strip_render`] is the `impl AdeApp` half: the
-//! real 36px band, the real switch, and the real Problems body.
-//!
-//! ## What the strip is
-//!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1 introduced it - "The left panel
-//! was hard-wired to one thing. It is now a switchable surface with a **horizontal icon strip
-//! along the top** - Cursor's arrangement, not VS Code's vertical activity bar. A vertical bar
-//! costs 44px of permanent width on a window whose whole job is fitting three panels side by
-//! side" - and `STAGE-A-CHANGELOG.md` §4v is its final form, which this module implements.
-//!
-//! §1's draft had four view cells (Worktrees, History, Search, Problems) plus a Settings gear.
-//! §4u/§4v supersede that and are what ships: **Search moved to the right panel** ("Search is now
-//! the middle tab of the right panel"), **History moved into the `⋯` overflow** ("a permanent cell
-//! in a 5-cell strip is a claim that you switch to it constantly. If you don't, it belongs in the
-//! overflow"), and Settings went with it. What is left is [`SidebarView`]'s two entries - which is
-//! why this enum has two variants and not four.
-//!
-//! ## The gate is here, not in the renderer
-//!
-//! §1, verbatim: "On **First run** and **Empty day** the icon strip drops its four buttons and
-//! keeps only the `+` action; the sidebar shows the rail's own empty state. With no worktrees
-//! there are no views to offer, and a switcher with four dead views is worse than no switcher."
-//! And: "Gate this **at the source** - `sideItems` and each view's `show*` flag - not in the
-//! template. The badges and the History/Search/Problems bodies derive from `sessions`, `histDefs`,
-//! `searchHits` and the diagnostics list; ungated they claimed 3 agents needing a human and 4
-//! problems on a day the rail, title bar and footer all reported zero."
-//!
-//! [`strip_view_cells`] is that source. It takes the real counts and returns an empty `Vec` when
-//! there is nothing to switch between, so there is no `when(..)` in the renderer that could be
-//! written once for the cells and forgotten for the badges.
 
 use crate::icons::Icon;
 use crate::lsp::diagnostics::Severity;
@@ -42,20 +8,6 @@ use crate::root::plural;
 use crate::theme;
 
 /// A view the left column can show.
-///
-/// [`SidebarView::Worktrees`] is the rail this app has always had, unchanged - §2's table says so
-/// in as many words ("the existing repo → worktree → agent tree, unchanged"). The strip does not
-/// rebuild it; it sits above it and gates it.
-///
-/// ## Two of these are strip cells, and one deliberately is not
-///
-/// [`SidebarView::ALL`] is the **strip**'s list, not this enum's: §4t moved History out of the
-/// strip and into the `⋯` overflow ("a permanent cell in a 5-cell strip is a claim that you
-/// switch to it constantly. If you don't, it belongs in the overflow"), and §4u fixed the strip
-/// at "two cells and the overflow - Worktrees, Problems, `⋯`". History is still a real *view* -
-/// the sidebar body paints it, the filter row follows it, and `crate::rail::menu`'s overflow row
-/// switches to it - it simply has no cell of its own. That is why [`SidebarView::History`] exists
-/// here but is absent from `ALL`, and why the test below pins both halves of that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SidebarView {
     /// The repo → worktree → agent tree.
@@ -115,11 +67,6 @@ impl SidebarView {
     /// The cell's `title="<view> — <hint>"` tooltip (§1), with the marker's real count appended in
     /// parentheses when there is one - `Jerry.dc.html`'s own
     /// `v.label + ' — ' + v.hint + (badge ? ' (' + badge + ')' : '')`.
-    ///
-    /// The count living *here* rather than on the cell is §4v's own correction: "The 9px pill
-    /// printing a count at 7px sat on top of the glyph and was a second vocabulary for state in a
-    /// strip built to match the tabs - which already mark state with a **5px square dot**. That is
-    /// what the cells use now, in the badge's colour, with the count moved to the tooltip."
     pub fn tooltip(self, marker: Option<StripMarker>) -> String {
         match marker {
             Some(marker) => format!(
@@ -155,9 +102,6 @@ impl MarkerTone {
 }
 
 /// A cell's state marker: the tabs' own 5px square dot, in a status hue, with its real count.
-///
-/// Never constructed at zero - see [`StripMarker::new`]. §1's rule for the badge it replaced still
-/// governs: "Hidden at zero."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StripMarker {
     /// How many things the marker is standing for. Shown in the tooltip, never on the cell.
@@ -167,9 +111,6 @@ pub struct StripMarker {
 
 impl StripMarker {
     /// A marker for `count` things, or `None` at zero.
-    ///
-    /// Total on purpose: every caller here would otherwise repeat `(count > 0).then(..)`, and the
-    /// one that forgot would paint a dot standing for nothing.
     pub fn new(count: usize, tone: MarkerTone) -> Option<Self> {
         (count > 0).then_some(StripMarker { count, tone })
     }
@@ -187,16 +128,6 @@ pub struct StripCell {
 
 impl StripCell {
     /// The colour this cell paints the window's column rule in - **the cut-out**.
-    ///
-    /// `STAGE-A-CHANGELOG.md` §4v: selected is "a filled slab that cuts the column rule to join
-    /// the panel below", achieved by drawing that rule in the panel's own background, so it stops
-    /// reading as a rule at all under this one cell. That is exactly what the centre tab strip's
-    /// active tab already does with [`theme::surface::CENTER`]
-    /// (`crate::work_surface::state::tab_colors`), one column over.
-    ///
-    /// A method on the model rather than an `if` in the renderer so the fact that these two
-    /// colours are a *pair* - the cut and the rule it cuts - is stated once and can be asserted
-    /// without a window.
     pub const fn rule_color(self) -> theme::ColorToken {
         if self.selected {
             theme::surface::RAIL
@@ -219,13 +150,6 @@ impl StripCell {
 
 /// One diagnostic in the Problems list, already reduced to what the row paints and what a click
 /// on it needs.
-///
-/// A view model rather than a borrowed `lsp_types::Diagnostic`: the list is scoped to a worktree,
-/// not to an open buffer, so it outlives no particular file's state and needs nothing from
-/// `lsp_types` past the fields below. It lives here, with the rest of the strip's data, so the
-/// list's real decisions - what a filter query matches, how `line:column` prints, how the tally is
-/// counted - are assertable without a window; [`crate::rail::strip_render`] is where a real
-/// `crate::lsp::client::LspClientState` is read into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     pub severity: Severity,
@@ -258,9 +182,6 @@ impl Problem {
     /// substring test over the row's own visible text that [`crate::rail::state::WorktreeRow::
     /// matches_filter`] applies to a worktree row, so one field behaves the same way whichever
     /// view is under it. A blank query matches everything.
-    ///
-    /// This is what lets the filter row's placeholder really say `filter problems`
-    /// (`REVISION-2026-08-13.md` §1) rather than promising a filter that does nothing (§7 rule 1).
     pub fn matches_filter(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
@@ -276,10 +197,6 @@ impl Problem {
 
     /// Most severe first, then by file, then by position - the list-level counterpart of
     /// [`Severity::rank`]'s own within-a-line "worst wins" ordering.
-    ///
-    /// A **total** order, deliberately: `lsp_core::LspClient::published_diagnostics` already sorts
-    /// by path so a re-render can't reshuffle, and a comparison that stopped at severity would
-    /// hand that back by leaving equal-severity rows in whatever order the map yielded them.
     pub fn worst_first(left: &Problem, right: &Problem) -> std::cmp::Ordering {
         right
             .severity
@@ -292,10 +209,6 @@ impl Problem {
 
 /// The severities really present in the selected worktree's diagnostics, tallied over the real
 /// list rather than authored as a pair.
-///
-/// `REVISION-2026-08-13.md` §2 is explicit about why all three are counted and not just two: "The
-/// header names every severity the list is showing: an authored `{err: 2, warn: 2}` pair left the
-/// `info` row uncounted and unnamed, so five diagnostics sat under a badge reading 4."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProblemTally {
     pub errors: usize,
@@ -305,11 +218,6 @@ pub struct ProblemTally {
 
 impl ProblemTally {
     /// `problems` counted into `REVISION-2026-08-13.md` §2's three buckets.
-    ///
-    /// LSP's `Information` and `Hint` both land in [`Self::hints`]: §2's own table names three
-    /// severities and the mock tallies both into its `info` bucket, so these are two levels the
-    /// design does not distinguish anywhere - which is why summing them is not §7 rule 4's "two
-    /// states distinguished anywhere in the app are never summed anywhere in it".
     pub fn over(problems: &[Problem]) -> Self {
         let mut tally = ProblemTally::default();
         for problem in problems {
@@ -329,11 +237,6 @@ impl ProblemTally {
     }
 
     /// The marker for this tally, or `None` when the worktree is clean.
-    ///
-    /// Red once anything is a real error, amber otherwise - `Jerry.dc.html`'s own
-    /// `probTally.err ? '#e0625c' : '#e2a336'`. A worktree with only warnings is genuinely not in
-    /// the same state as one that does not compile, and the strip is the only place that says so
-    /// before you open the view.
     pub fn marker(self) -> Option<StripMarker> {
         StripMarker::new(
             self.total(),
@@ -347,11 +250,6 @@ impl ProblemTally {
 
     /// The Problems body's own count line - `"2 errors · 2 warnings · 1 hint"`, naming only the
     /// severities really present.
-    ///
-    /// §2: "Both list headers and the Problems badge are **tallied over their own data**". Every
-    /// term agrees through [`crate::root::plural`] rather than a hand-written ternary (§7 rule 9).
-    /// Returns `None` for a clean worktree, where the empty note ([`problems_empty_note`]) says
-    /// the real thing instead of a line of three zeroes.
     pub fn count_line(self) -> Option<String> {
         let parts: Vec<String> = [
             (self.errors, "error"),
@@ -367,12 +265,6 @@ impl ProblemTally {
 }
 
 /// The Problems view's empty note, naming the checkout it is empty *for*.
-///
-/// `REVISION-2026-08-14.md` §6, verbatim: "A clean worktree gets *No diagnostics in `<branch>`.*
-/// and no badge." Naming the branch is the point - §6's whole entry is that "Problems is keyed by
-/// worktree and filtered on the active one, exactly like history - a diagnostic belongs to a
-/// checkout", and a note that did not say which checkout would leave that unsaid at exactly the
-/// moment it matters.
 pub fn problems_empty_note(branch: Option<&str>) -> String {
     match branch {
         Some(branch) => format!("No diagnostics in {branch}."),
@@ -384,12 +276,6 @@ pub fn problems_empty_note(branch: Option<&str>) -> String {
 
 /// The Problems view's note when the worktree really does have diagnostics but the sidebar's own
 /// filter box has hidden every one of them.
-///
-/// A different fact from [`problems_empty_note`]'s clean checkout, and said as one: the rail's own
-/// list already distinguishes "this repo has no worktrees" from "your filter matched none of
-/// them", and a Problems view that reported a clean checkout over five hidden rows would be
-/// claiming more than it knows (`STAGE-A-CHANGELOG.md` §4g). Counts through
-/// [`crate::root::plural`] like every other count in the window (§7 rule 9).
 pub fn problems_filtered_away_note(hidden: usize) -> String {
     format!(
         "No match in this worktree's {}.",
@@ -398,20 +284,6 @@ pub fn problems_filtered_away_note(hidden: usize) -> String {
 }
 
 /// The cells the strip really paints, in order - **and the empty gate**.
-///
-/// `has_worktrees` is whether this window really has a worktree to look at. At `false` this
-/// returns no cells at all, which is §1's "with no worktrees there are no views to offer, and a
-/// switcher with four dead views is worse than no switcher", gated at the source: the markers
-/// cannot survive the gate because they are built here, below it, rather than beside a `when(..)`
-/// in the renderer that someone could later write for one and not the other.
-///
-/// `agents_needing_you` is the real count of agents waiting on a human. §1 names the unit
-/// outright - "worktrees shows agents needing a human" - and `Jerry.dc.html` computes exactly
-/// that (`sessions.filter(s => s.status === 'ask' || s.status === 'fail').length`), which is why
-/// this is an agent count and not the worktree count §4v's one-line hue table reads as. It comes
-/// from the same `crate::rail::state::urgency_counts` pass over the same [`crate::rail::state::
-/// AgentRow`]s the title bar's own dots read, so the two can never report different numbers for
-/// the same window. `problems` is the real tally for the selected worktree.
 pub fn strip_view_cells(
     has_worktrees: bool,
     selected: SidebarView,
@@ -449,11 +321,6 @@ pub fn strip_view_cells(
 }
 
 /// Which view the sidebar body really shows, given the empty gate.
-///
-/// With no worktrees there is no switcher, so there is no other view to be in: the body falls back
-/// to Worktrees, which is where the rail paints its own empty state ("the sidebar shows the rail's
-/// own empty state", §1). Without this, switching to Problems and then closing the last worktree
-/// would strand the window on a Problems view with no cell to switch back from.
 pub fn effective_view(has_worktrees: bool, selected: SidebarView) -> SidebarView {
     if has_worktrees {
         selected
@@ -482,9 +349,6 @@ mod tests {
         }
     }
 
-    /// The Problems list's own filter really applies, and the strip's marker deliberately does
-    /// not follow it - the strip reports what is really in the worktree, the list reports what you
-    /// asked to see.
     #[test]
     fn a_filter_narrows_the_list_without_touching_what_the_strip_reports() {
         let rows = vec![
@@ -548,16 +412,12 @@ mod tests {
         );
     }
 
-    /// §2's row spec prints `line:column`, 1-based - the shape `Jerry.dc.html`'s own `212:17`
-    /// takes, and the shape the click's own target line is derived from.
     #[test]
     fn a_rows_position_reads_the_way_every_compiler_prints_one() {
         let row = problem(Severity::Error, "src/db/mod.rs", 118, "no method", "rustc");
         assert_eq!(row.position(), "118:9");
     }
 
-    /// Worst first, then file, then position - and **total**, so two rows of one severity keep the
-    /// order the store handed them rather than swapping between renders.
     #[test]
     fn the_list_orders_worst_first_and_never_leaves_two_rows_tied() {
         let mut rows = [
@@ -590,9 +450,6 @@ mod tests {
         );
     }
 
-    /// §2's "the header names every severity the list is showing" over a real list, including the
-    /// authored-pair defect it was written for: `Information` and `Hint` are one bucket, so five
-    /// diagnostics can never sit under a header reading four.
     #[test]
     fn the_tally_counts_every_row_the_list_is_showing() {
         let rows = vec![
@@ -623,8 +480,6 @@ mod tests {
         );
     }
 
-    /// §4u/§4v: the strip is down to two view cells and the overflow. Search went to the right
-    /// panel and History into the `⋯`, so neither may reappear as a cell here.
     #[test]
     fn the_strip_offers_worktrees_and_problems_and_nothing_else() {
         let cells = strip_view_cells(true, SidebarView::Worktrees, 0, ProblemTally::default());
@@ -645,9 +500,6 @@ mod tests {
         );
     }
 
-    /// The other half of the same rule: History being absent from the strip must not make it a
-    /// second-class view. It carries the same tooltip pair, the same glyph the overflow row shows,
-    /// and it survives [`effective_view`] exactly like Problems does.
     #[test]
     fn history_is_a_full_view_even_though_it_has_no_cell() {
         assert_eq!(SidebarView::History.label(), "History");
@@ -671,10 +523,6 @@ mod tests {
         );
     }
 
-    /// §1's empty gate, at the source. The assertion that matters is not just "no cells" - it is
-    /// that a real, non-zero set of counts cannot smuggle a marker through, which is the exact
-    /// defect the section describes ("ungated they claimed 3 agents needing a human and 4 problems
-    /// on a day the rail, title bar and footer all reported zero").
     #[test]
     fn an_empty_day_offers_no_views_and_no_markers_whatever_the_counts_say() {
         let loud = ProblemTally {
@@ -699,7 +547,6 @@ mod tests {
         );
     }
 
-    /// Exactly one cell is selected, and it is the one asked for.
     #[test]
     fn exactly_one_cell_is_selected_and_it_is_the_current_view() {
         for view in SidebarView::ALL.iter().copied() {
@@ -717,8 +564,6 @@ mod tests {
         }
     }
 
-    /// A marker is a real count or it is not painted - §1's "Hidden at zero", carried by the
-    /// constructor so no call site can forget it.
     #[test]
     fn a_marker_never_stands_for_nothing() {
         assert_eq!(StripMarker::new(0, MarkerTone::NeedsYou), None);
@@ -727,8 +572,6 @@ mod tests {
         assert!(cells.iter().all(|cell| cell.marker.is_none()));
     }
 
-    /// `Jerry.dc.html`'s `probTally.err ? '#e0625c' : '#e2a336'`, and the Worktrees cell's single
-    /// amber - read through the real tokens, so a theme rename can't quietly decouple them.
     #[test]
     fn the_marker_hues_are_the_apps_own_status_hues() {
         let warnings_only = ProblemTally {
@@ -761,7 +604,6 @@ mod tests {
         );
     }
 
-    /// §1's `title="<view> — <hint>"`, with §4v's count moved into it.
     #[test]
     fn every_cell_carries_its_view_hint_tooltip_and_the_count_lives_in_it() {
         assert_eq!(
@@ -781,9 +623,6 @@ mod tests {
         }
     }
 
-    /// §4v's cut-out, as the pair it is: the selected cell paints the column rule in the rail's
-    /// own background - the same trick the centre tab strip's active tab plays with the work
-    /// surface's - and every other cell paints the real rule.
     #[test]
     fn the_selected_cell_paints_the_column_rule_in_the_panels_own_background() {
         let cells = strip_view_cells(true, SidebarView::Problems, 0, ProblemTally::default());
@@ -816,15 +655,12 @@ mod tests {
         assert_eq!(worktrees.glyph_color(), theme::text::FAINTER);
     }
 
-    /// §8's mapping table, held here too so the strip's own glyph choice can't drift from it.
     #[test]
     fn the_view_glyphs_are_the_two_the_revision_maps() {
         assert_eq!(SidebarView::Worktrees.icon(), Icon::TreeStructure);
         assert_eq!(SidebarView::Problems.icon(), Icon::Warning);
     }
 
-    /// §2's "the header names every severity the list is showing" - and only those, so a
-    /// warnings-only worktree does not print `0 errors`.
     #[test]
     fn the_count_line_names_every_severity_present_and_no_others() {
         assert_eq!(
@@ -854,7 +690,6 @@ mod tests {
         );
     }
 
-    /// A filter that hid every row is not a clean checkout, and must not claim to be one.
     #[test]
     fn a_filtered_away_list_says_so_rather_than_reporting_a_clean_checkout() {
         assert_eq!(
@@ -873,8 +708,6 @@ mod tests {
         );
     }
 
-    /// §6's "A clean worktree gets *No diagnostics in `<branch>`.*" - and an honest sentence on a
-    /// detached `HEAD`, where there is no branch name to print.
     #[test]
     fn the_empty_note_names_the_checkout_it_is_empty_for() {
         assert_eq!(

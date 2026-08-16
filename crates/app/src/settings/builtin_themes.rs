@@ -1,40 +1,5 @@
 //! The real generator behind the five bundled non-Jerry-Dark theme files, and the parity tests
 //! that keep them honest.
-//!
-//! ## Why these files are generated, not hand-written
-//!
-//! Before the theme system's rewrite, this app had exactly one hand-authored palette (Jerry Dark,
-//! the ~270 `crate::theme::ColorToken` defaults) and five *derived* ones: each of the other bundled
-//! themes was five swatches, and every one of the app's colours was computed from them on the fly,
-//! per token, on every single `resolve()` call, by `crate::theme::derive_shift`'s HSL transform.
-//!
-//! The rewrite replaced that with real, literal, per-token theme files - which raised an obvious
-//! requirement: the five bundled themes had to keep looking **exactly** as they did, not
-//! approximately. Hand-transcribing ~270 derived hex values per theme by eyeballing that
-//! transform's output would have been both enormous and untrustworthy. So they are generated
-//! instead: [`generate_builtin_theme_toml`] runs the *same* real derivation over every registered
-//! token once and writes the literal results into `assets/themes/*.toml`.
-//!
-//! The five swatch sets each theme was originally defined by are pinned here
-//! ([`BUILTIN_THEME_SOURCES`]) as the real, transcribed inputs that derivation ran on - so the
-//! generator can be re-run and its output compared against what is actually checked in
-//! ([`tests::every_checked_in_builtin_theme_file_matches_the_generator`]), and so the *old*
-//! mechanism's own output can be recomputed and compared token by token against what the new
-//! mechanism really resolves
-//! ([`tests::every_builtin_theme_resolves_exactly_what_the_old_derivation_produced`]) - the real
-//! proof that this migration changed no colours.
-//!
-//! ## Regenerating
-//!
-//! ```text
-//! JERRY_REGENERATE_THEMES=1 cargo test -p app --lib builtin_themes -- --nocapture
-//! ```
-//!
-//! That writes every file in [`BUILTIN_THEME_SOURCES`] straight into `assets/themes/`. It is a
-//! real, checked-in dev utility rather than a throwaway script because the same generator is what
-//! the Themes page's "Generate from colour" action uses
-//! (`crate::settings::render::AdeApp::generate_theme_from_seed_color` -> [`generated_theme_file`]),
-//! so it has to keep working regardless.
 
 use crate::settings::custom_theme::{CustomTheme, CustomThemeFile};
 use crate::theme;
@@ -43,11 +8,6 @@ use crate::theme;
 /// file it lives in, and the five `[background, panel, green-ish, amber-ish, blue-ish]` swatches
 /// it was originally defined by (transcribed verbatim from the pre-rewrite
 /// `assets/themes/*.toml` files, which held exactly these five values and nothing else).
-///
-/// Those swatches are no longer what the app renders from - each theme's file now holds a full,
-/// literal palette - but they remain load-bearing in two real ways: they are the input the
-/// generator derives that palette from, and they are what each file carries forward as its
-/// `preview`, so the Themes page's cards paint exactly what they always did.
 pub struct BuiltinThemeSource {
     pub name: &'static str,
     pub subtitle: &'static str,
@@ -105,11 +65,6 @@ pub fn jerry_dark_swatches() -> [u32; 5] {
 /// Builds a real, complete, writable theme file from a derived palette - the one shared shape both
 /// the built-in generator below and the Themes page's "Generate from colour" action produce, so
 /// the two can never emit differently-structured files.
-///
-/// `base` is always `Some("Jerry Dark")` for anything generated: a generated file names every
-/// token explicitly, so the base changes nothing about how it renders, but it makes the file's
-/// intent obvious and means a hand-edit that *deletes* a line degrades to Jerry Dark's own value
-/// for that token rather than to nothing.
 pub fn generated_theme_file(
     name: &str,
     subtitle: &str,
@@ -129,11 +84,6 @@ pub fn generated_theme_file(
 
 /// The real TOML text for one bundled theme's `assets/themes/*.toml` file, header comment
 /// included.
-///
-/// Jerry Dark is the one real special case: it *is* the compiled default palette
-/// (`crate::theme::ColorToken::default`), so its file names no colours at all - only its identity
-/// and its card preview. Writing out 270 lines that restate the defaults would be redundant, and
-/// worse, would mean two places to change if a default is ever retuned.
 #[allow(clippy::expect_used)] // a generated theme file must be valid by construction
 pub fn generate_builtin_theme_toml(source: &BuiltinThemeSource) -> String {
     let is_jerry_dark = source.swatches == jerry_dark_swatches();
@@ -214,9 +164,6 @@ mod tests {
         include_str!("../../../../assets/themes/paper.toml"),
     ];
 
-    /// The real regeneration utility (see this module's own docs) - a no-op unless
-    /// `JERRY_REGENERATE_THEMES=1` is set, so an ordinary `cargo test` run never writes to the
-    /// repository.
     #[test]
     fn regenerate_builtin_theme_files_when_asked() {
         if std::env::var("JERRY_REGENERATE_THEMES").as_deref() != Ok("1") {
@@ -234,9 +181,6 @@ mod tests {
         }
     }
 
-    /// The checked-in files really are this generator's own output - so a future change to the
-    /// derivation, to the registry, or to the file writer can't silently leave the shipped themes
-    /// stale.
     #[test]
     fn every_checked_in_builtin_theme_file_matches_the_generator() {
         for (source, checked_in) in BUILTIN_THEME_SOURCES.iter().zip(CHECKED_IN.iter()) {
@@ -249,20 +193,6 @@ mod tests {
         }
     }
 
-    /// **The generator's own proof.** For every bundled theme and every single registered token,
-    /// what the app resolves today (through the real, checked-in file, compiled the real way, with
-    /// no derivation anywhere in the path) must equal what the generator produces right now -
-    /// `derived_palette(derive_shift(jerry_dark, swatches))`.
-    ///
-    /// This used to compare against the *old* live HSL derivation instead, as the migration's
-    /// bit-for-bit proof that turning derived palettes into files changed no colours. The theme
-    /// redesign deliberately changed the derivation - to OKLCH, plus a real contrast-floor guard -
-    /// so that comparison is no longer the right question and has been replaced by this one: the
-    /// checked-in files must be exactly what today's generator makes, which is what stops a
-    /// hand-edit or a stale file from surviving unnoticed.
-    ///
-    /// Compared at 8-bit-per-channel precision, which is the precision a theme file (and a
-    /// rendered pixel) actually has.
     #[test]
     fn every_builtin_theme_resolves_exactly_what_the_generator_produces() {
         use crate::settings::custom_theme::compile_palette_by_name;
@@ -296,11 +226,6 @@ mod tests {
         }
     }
 
-    /// The redesign's own headline guarantee, checked on the real checked-in files rather than on
-    /// the generator in memory: **every** bundled theme clears its syntax contrast floors. This is
-    /// what `theme::enforce_syntax_contrast_floors` exists to make true, and it is stated here as
-    /// well as in `theme::syntax_palette_tests` because this is the layer where a stale file
-    /// (rather than a bad default) would break it.
     #[test]
     fn every_bundled_theme_file_clears_its_syntax_contrast_floors() {
         use crate::settings::custom_theme::compile_palette_by_name;
@@ -333,9 +258,6 @@ mod tests {
         }
     }
 
-    /// Jerry Dark is the identity: with it selected, every token resolves to its own compiled
-    /// default, exactly as it did before the rewrite (where index `0` short-circuited the
-    /// derivation entirely).
     #[test]
     fn jerry_dark_is_still_a_real_identity_with_no_overrides_at_all() {
         let jerry_dark = parse_builtin(0);
@@ -350,8 +272,6 @@ mod tests {
             .expect("must validate")
     }
 
-    /// Every bundled file is a real, ordinary theme file: it parses through the exact same
-    /// user-facing parser, and (once renamed past the built-in collision check) validates.
     #[test]
     fn every_bundled_file_is_an_ordinary_theme_file_a_user_could_have_written() {
         for (index, source) in BUILTIN_THEME_SOURCES.iter().enumerate() {
@@ -366,9 +286,6 @@ mod tests {
         }
     }
 
-    /// The generated palettes really are *different from each other* - a real guard against a
-    /// generator bug that emitted the same (e.g. identity) palette six times and still passed
-    /// every round-trip test.
     #[test]
     fn every_bundled_theme_is_a_genuinely_different_palette() {
         let windows: Vec<u32> = THEME_DEFS
@@ -385,15 +302,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #208, at the layer where a stale checked-in file (rather than a bad default)
-    /// would break it: every bundled theme's terminal must really be its *own* terminal, and must
-    /// really be readable.
-    ///
-    /// The readability floor is WCAG's own 4.5:1 "normal text" number, which is the right bar here
-    /// (unlike `crate::settings::custom_theme::MIN_CONTRAST_PER_HUNDRED`, a deliberately far lower
-    /// *validity* floor for arbitrary user-authored themes): these six files are this project's own
-    /// generated output, so anything below the real bar is a generator bug to fix, not a theme to
-    /// tolerate.
     #[test]
     fn every_bundled_theme_paints_its_own_readable_terminal() {
         use crate::settings::custom_theme::compile_palette_by_name;
@@ -439,8 +347,6 @@ mod tests {
         );
     }
 
-    /// "Paper" is the one real light bundled theme - its generated `surface.window` must really be
-    /// light, the same property the old derivation's lightness fit produced live.
     #[test]
     fn paper_really_generates_a_light_window_background_and_the_rest_stay_dark() {
         for def in THEME_DEFS.iter() {

@@ -1,27 +1,6 @@
 //! Real backing for `Keep all changes` and `Discard worktree` and, since Revision R12 §5, the
 //! Changes panel commit composer's "commit staged files"
 //! (`crate::sidebar::render::AdeApp::commit_staged_files`).
-//!
-//! Their surfaces, after GitHub issue #295 cut the agent pane's action bar down to a readout
-//! (`STAGE-A-CHANGELOG.md` §4t): `Discard worktree` is the failed-run strip's second button
-//! ([`work_surface::ActionKind::DiscardWorktree`]) and the rail worktree menu's
-//! `Remove worktree…`; `Keep all changes` is the title bar's `Agent` menu, which is now its only
-//! home - §4r deleted the finished-agent button as "a fiction borrowed from buffer-based
-//! inline-diff tools", since the agent's edits are already on disk.
-//!
-//! ## One in-flight flag for all three operations
-//!
-//! [`AdeApp::worktree_history_op_in_flight`] serializes "keep all changes", "discard worktree",
-//! and "commit staged files": a click for any of the three while the flag is `true` is a no-op,
-//! mirroring [`AdeApp::prune_in_flight`]'s own single-flag-per-feature precedent
-//! (`crate::rail::render`). Every completion handler still only mutates [`AdeApp`] state from
-//! inside `this.update`/`this.update_in`, after its real `wt_core::undo::*` call has actually
-//! resolved, matching every other real git-backed action in this app.
-//!
-//! `commit_staged_files` is real (`wt_core::undo::commit_paths`: a real `git add -- <paths>` +
-//! `git commit`), and, like `Keep`/`Discard`, has no undo integration - this project's
-//! worktree-level undo/redo action was removed outright (GitHub issue #47), not merely left
-//! unwired here.
 
 use super::*;
 
@@ -41,10 +20,6 @@ impl AdeApp {
     /// Looks up worktree `path`'s branch name for display (History/status-line text) - falls
     /// back to the path itself if the worktree list doesn't (yet, or any more) have an entry for
     /// it. Display-only: never consulted by a real `wt_core::undo::*` call.
-    ///
-    /// `pub(crate)`, not private: `crate::sidebar::render::AdeApp::commit_staged_files` (Revision
-    /// R12 §5's commit composer) reuses this same lookup for its own status-line text rather than
-    /// duplicating it.
     pub(crate) fn branch_display_for(&self, path: &Path) -> String {
         self.worktrees
             .iter()
@@ -152,20 +127,6 @@ impl AdeApp {
     /// The rail's `Remove worktree…` row (GitHub issue #290), keyed by worktree path - two
     /// clicks, exactly like [`Self::request_discard_worktree`]'s button, and running the same
     /// real [`Self::execute_discard_worktree_path`] underneath.
-    ///
-    /// Keyed by *path*, not by agent, because a worktree row's menu is reachable for a worktree
-    /// with no agent in it at all - and because the worktree is what the operation really acts
-    /// on. The arming state lives in [`AdeApp::remove_worktree_confirm_armed`] and is cleared by
-    /// every path that closes the menu, so a half-confirmed removal can never survive into the
-    /// next time the menu is opened.
-    ///
-    /// Returns whether this call really ran the removal (`false` when it only armed, or when
-    /// another worktree-history operation was already in flight), so the caller knows whether to
-    /// leave the menu open for the confirming click. The in-flight check is deliberately made
-    /// *before* the confirmation is touched, exactly as
-    /// `crate::graph_view::render::AdeApp::request_graph_delete_branch`'s own audit finding
-    /// requires: disarming and then refusing to run would silently turn the click the user is
-    /// about to repeat into a dead one.
     pub(crate) fn request_discard_worktree_path(
         &mut self,
         worktree_path: PathBuf,
@@ -193,10 +154,6 @@ impl AdeApp {
     /// The real, already-confirmed discard of one worktree - the single place
     /// `wt_core::undo::discard_worktree` is called from, whether the confirmation came from the
     /// Review footer's per-agent button or the rail's per-worktree menu row.
-    ///
-    /// Closes **every** agent open in that worktree on success, not just the one whose button
-    /// started it: the directory all of their `cwd`s point at no longer exists, so any tab left
-    /// behind is a shell running in a deleted path.
     pub(in crate::worktree_history) fn execute_discard_worktree_path(
         &mut self,
         worktree_path: PathBuf,
@@ -425,7 +382,6 @@ mod worktree_history_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let id = spawn_agent(&app, cx, feature.clone());
 
-        // Click 1: arm.
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -435,7 +391,6 @@ mod worktree_history_regression_tests {
         );
         assert!(feature.exists(), "the first click must not touch anything");
 
-        // Click 2: confirm - runs the real discard.
         app.update_in(cx, |app, window, cx| {
             app.request_discard_worktree(id, window, cx)
         });
@@ -456,9 +411,6 @@ mod worktree_history_regression_tests {
         );
     }
 
-    /// Regression coverage for `wt_core::undo::DiscardSnapshot::had_ignored_content` actually
-    /// being read, not just computed and left silently unused - the whole point of that field
-    /// (this module's own docs) is telling the user honestly that something real was lost.
     #[gpui::test]
     fn discard_worktree_status_honestly_notes_when_gitignored_content_was_lost(
         cx: &mut TestAppContext,

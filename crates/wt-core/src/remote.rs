@@ -1,16 +1,10 @@
-//! Real git remote operations: fetch, pull, and push (with force/force-with-lease variants) -
-//! GitHub issue #1's own acceptance criteria ("push (force with lease, force, no force)",
-//! "pull"). Every mutation shells out to a real `git` subprocess and surfaces git's own real
-//! stderr on failure ([`Error::GitCommand`]) rather than inventing a parsed/paraphrased message -
-//! a merge conflict, a rejected non-fast-forward push, or a missing upstream all read as git's
-//! own honest words, the same discipline every other `wt-core` module already follows.
+//! Remote operations: fetch, pull, and push with its force variants.
 //!
-//! [`pull`] does not attempt to resolve a real merge conflict itself - it shells out to `git
-//! pull` and surfaces whatever git reports, honestly, rather than leaving the working tree in a
-//! conflicted state with no way back into this app's own conflict-resolution surface
-//! (`crate::merge`, built for a worktree-add flow, not a mid-session pull). A conflicted pull is
-//! a real, stated gap: the caller sees git's own real error text, and the worktree is left
-//! exactly where a real `git pull` on the command line would leave it.
+//! Every failure surfaces git's own stderr via [`Error::GitCommand`] rather than a paraphrase.
+//!
+//! Known gap: [`pull`] does not resolve conflicts. `crate::merge` is built for the worktree-add
+//! flow, not a mid-session pull, so a conflicted pull leaves the worktree exactly where the
+//! command line would.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -18,57 +12,34 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{check_success, run_git};
 
-/// Real `git fetch` for `worktree_path`'s configured remote (whatever a bare `git fetch` itself
-/// resolves to - almost always `origin`). Updates remote-tracking refs only; never touches the
-/// working tree or the current branch.
-///
-/// Performs blocking I/O.
+/// `git fetch` for whatever remote a bare fetch resolves to. Updates remote-tracking refs only.
 pub fn fetch(worktree_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["fetch".into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Real `git pull` (fetch + merge into the current branch) for `worktree_path`. A merge
-/// conflict, a detached HEAD, or uncommitted changes that would be overwritten all surface as
-/// git's own real stderr via [`Error::GitCommand`] - see this module's own docs on why a
-/// conflicted pull is not resolved here.
-///
-/// Performs blocking I/O.
+/// `git pull` into the current branch. Conflicts, a detached `HEAD`, and changes that would be
+/// overwritten all surface as git's own stderr.
 pub fn pull(worktree_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["pull".into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// How hard [`push`] should push - `git push`'s own three real postures (GitHub issue #1's own
-/// "push (force with lease, force, no force)").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushForce {
-    /// A plain `git push` - refuses outright on any non-fast-forward.
+    /// Refuses outright on any non-fast-forward.
     None,
-    /// `git push --force-with-lease` - overwrites the remote branch, but only if it still
-    /// points where this worktree's own remote-tracking ref last saw it (aborts if someone
-    /// else pushed in between).
+    /// Overwrites the remote branch only if it still points where remote-tracking last saw it.
     WithLease,
-    /// `git push --force` - overwrites the remote branch unconditionally, even if someone else
-    /// pushed in between. The one real, unguarded way to lose someone else's already-pushed
-    /// work; the UI layer (`app::graph_view`) is responsible for a real, explicit two-step
-    /// confirmation before this variant ever reaches here - this function itself performs no
-    /// confirmation of its own, matching [`crate::undo::discard_worktree`]'s own "the caller
-    /// already confirmed, this is the real mutation" division of responsibility.
+    /// Overwrites unconditionally - the one unguarded way to lose someone else's pushed work.
+    /// Confirming that is the caller's job; this performs none.
     Force,
 }
 
-/// Real `git push` for `worktree_path`'s current branch, per `force`. A branch with no
-/// configured upstream yet gets `--set-upstream origin <branch>` folded into the same push -
-/// `origin` specifically, matching this codebase's own single-remote assumption
-/// (`wt_core::graph::ahead_behind_against_upstream`'s own upstream detection already assumes a
-/// clone has exactly one remote, so this isn't inventing a new one) - rather than making a
-/// first-ever push fail with git's own comparatively opaque "no upstream" error and requiring a
-/// second, separate recovery step.
-///
-/// Performs blocking I/O.
+/// A branch with no upstream gets `--set-upstream origin <branch>` folded into the same push,
+/// rather than failing and needing a second recovery step.
 pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
     let branch = current_branch_name(worktree_path)?;
     let has_upstream = has_configured_upstream(worktree_path, None)?;
@@ -83,41 +54,15 @@ pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Real `git push` of an **explicit** `branch` from `worktree_path`, per `force` - the Branches
-/// panel's own branch context menu "Push Branch…" (GitHub issue #241), which pushes whichever
-/// branch was right-clicked rather than whatever happens to be checked out.
+/// Pushes an explicit `branch`, which need not be the one checked out.
 ///
-/// The only differences from [`push`] are that the branch is named rather than derived from
-/// `HEAD`, and that both the upstream check and the push itself are therefore scoped to *that*
-/// branch (`<branch>@{upstream}` and an explicit `origin <branch>` refspec) - a plain `git push`
-/// would otherwise push `HEAD`'s branch instead, silently pushing something the user never
-/// clicked. The `--set-upstream origin <branch>` fallback for a branch with no upstream yet is
-/// identical, for the identical reason (see [`push`]'s own docs).
+/// Both the upstream check and the push are scoped to that branch (`<branch>@{upstream}`, and an
+/// explicit `origin <branch>` refspec); a bare `git push` would send `HEAD`'s branch instead.
+/// Naming a not-checked-out branch requires naming the remote too, so it is always `origin` -
+/// this crate assumes a single remote throughout.
 ///
-/// The remote is always `origin`, whether or not an upstream is already configured - unlike
-/// [`push`], which (having no refspec at all when an upstream exists) lets git route the push to
-/// whatever remote that branch's upstream names. Pushing a branch that is *not* checked out
-/// requires naming a remote and a branch explicitly, so there is no "let git decide" form
-/// available here, and `origin` is this module's own already-documented single-remote assumption
-/// (see [`push`]'s docs). In a repository with exactly one remote - which is what
-/// `crate::graph::ahead_behind_against_upstream` already assumes across this crate - the two are
-/// the same push.
-///
-/// A non-fast-forward, a missing remote, or a branch name that doesn't exist all surface as git's
-/// own real stderr via [`Error::GitCommand`] - nothing is pre-checked. Still accepts the full
-/// [`PushForce`] even though the branch context menu only ever passes [`PushForce::None`]: the
-/// posture is git's own, and there is no reason for this function to be able to do less than
-/// [`push`] already can.
-///
-/// `branch` gets the same mandatory `--` terminator [`checkout_branch`](crate::checkout::
-/// checkout_branch) documents, for the identical reason: it is an ordinary positional here (the
-/// refspec, after the `origin` repository argument), not one of `-b`'s/`--branch`'s own
-/// option-values, and `git push` really does still scan a later positional for flag-shaped text -
-/// live-reproduced: `git push origin --evil` (no `--`) fails with `error: unknown option
-/// 'evil'`, not a refspec-not-found refusal. With `--` in front the same string is refused
-/// honestly instead (`error: src refspec --evil does not match any`).
-///
-/// Performs blocking I/O.
+/// The `--` terminator is mandatory: `git push origin --evil` is otherwise read as an option
+/// (`error: unknown option 'evil'`) rather than refused as a refspec.
 pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Result<(), Error> {
     let has_upstream = has_configured_upstream(worktree_path, Some(branch))?;
 
@@ -132,9 +77,6 @@ pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Resu
     check_success(&args, &output)
 }
 
-/// The `git push` argument prefix both [`push`] and [`push_branch`] start from - `push` plus
-/// whatever flag `force` really means. Shared so the two can never drift into disagreeing about
-/// what a given [`PushForce`] does.
 fn push_args(force: PushForce) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["push".into()];
     match force {
@@ -145,8 +87,6 @@ fn push_args(force: PushForce) -> Vec<OsString> {
     args
 }
 
-/// The real, current branch's short name (`git rev-parse --abbrev-ref HEAD`) - used only for
-/// [`push`]'s own `--set-upstream origin <branch>` fallback.
 fn current_branch_name(worktree_path: &Path) -> Result<String, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()];
     let output = run_git(worktree_path, &args)?;
@@ -154,16 +94,11 @@ fn current_branch_name(worktree_path: &Path) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Whether a branch already has a configured upstream - the exact same real `git rev-parse
-/// --abbrev-ref @{upstream}` resolution
-/// [`crate::graph::ahead_behind_against_upstream`] already uses for the identical question, so
-/// the two never independently disagree about what counts as "has an upstream". A non-zero exit
-/// here is the expected, honest "no upstream configured" signal, not a real error to propagate.
+/// Whether a branch has a configured upstream; a non-zero exit is the "no upstream" signal, not
+/// an error to propagate.
 ///
-/// `branch` is `None` for `HEAD`'s own branch (the bare `@{upstream}` [`push`] has always used,
-/// unchanged) and `Some(name)` for an explicit branch ([`push_branch`]), which needs
-/// `<name>@{upstream}` instead - the bare form would answer for whatever is checked out, not for
-/// the branch actually being pushed.
+/// `branch` is `None` for `HEAD`'s own branch and `Some(name)` for an explicit one, which needs
+/// `<name>@{upstream}` - the bare form would answer for whatever is checked out instead.
 fn has_configured_upstream(worktree_path: &Path, branch: Option<&str>) -> Result<bool, Error> {
     let upstream = match branch {
         Some(branch) => format!("{branch}@{{upstream}}"),
@@ -219,8 +154,7 @@ mod tests {
         git(dir, &["commit", "-m", message]);
     }
 
-    /// A real clone of `remote` with a real committer identity configured (a bare `git init`
-    /// clone has none) - every test in this module needs exactly this starting point.
+    /// A clone of `remote` with a committer identity configured, which a bare clone lacks.
     fn clone_of(remote: &Path) -> TempDir {
         let local = TempDir::new().expect("tempdir");
         git(
@@ -246,7 +180,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Advance the remote again after the local clone, so `fetch` has something real to do.
         commit(seed.path(), "b.txt", "1", "second");
         git(seed.path(), &["push", "origin", "main"]);
 
@@ -305,7 +238,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Diverge both sides on the same file/line, so the merge really conflicts.
         commit(seed.path(), "a.txt", "remote change", "remote diverges");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "a.txt", "local change", "local diverges");
@@ -396,9 +328,8 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Rewrite local history (amend) so a plain push would be a non-fast-forward, but the
-        // remote itself has not moved since the clone - the real case force-with-lease exists
-        // for.
+        // Amend so a plain push is a non-fast-forward, while the remote has not moved - the
+        // case force-with-lease exists for.
         commit(local.path(), "b.txt", "1", "local work");
         git(
             local.path(),
@@ -425,7 +356,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Someone else pushes to the remote after the local clone's last real knowledge of it.
         commit(seed.path(), "c.txt", "1", "someone else's push");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "b.txt", "1", "local work");
@@ -526,8 +456,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // A second, never-pushed branch - and, critically, `main` is what stays checked out, so a
-        // push that silently used `HEAD` instead of the named branch would be visible here.
         git(local.path(), &["checkout", "-b", "side-branch"]);
         commit(local.path(), "b.txt", "1", "side work");
         git(local.path(), &["checkout", "main"]);
@@ -573,10 +501,8 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // A second local branch at the very same commit the remote already has, with no upstream
-        // of its own - so this push has genuinely nothing to transfer, and yet a real invocation
-        // still leaves an observable trace (`--set-upstream`). Without that, "succeeded as a
-        // no-op" would be indistinguishable from "did nothing at all".
+        // Nothing to transfer, so `--set-upstream`'s trace is the only thing separating
+        // "succeeded as a no-op" from "did nothing at all".
         git(local.path(), &["branch", "already-there", "main"]);
         let remote_main_before = git_output(remote.path(), &["rev-parse", "main"]);
         assert!(
@@ -619,13 +545,11 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // The remote moves on, and the local branch rewrites its own history - a genuine
-        // divergence a plain push must refuse.
         commit(seed.path(), "c.txt", "1", "diverged upstream work");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "b.txt", "1", "local work");
-        // Push the *named* branch from a worktree sitting on a different branch entirely, so the
-        // refusal proves it really targeted `main` rather than `HEAD`.
+        // Pushed from a worktree on a different branch, so the refusal proves it targeted the
+        // named branch rather than `HEAD`.
         git(local.path(), &["checkout", "-b", "elsewhere"]);
 
         let result = push_branch(local.path(), "main", PushForce::None);

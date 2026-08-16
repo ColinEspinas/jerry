@@ -4,13 +4,6 @@
 //! result into `gpui::Div` trees and real click/key handlers, since it owns the `Context<AdeApp>`
 //! those need. Every [`PaletteCommand`] variant maps one-to-one onto an existing `AdeApp` method
 //! (see `crate::root::AdeApp::execute_palette_command`) - none is a stub.
-//!
-//! Matching is a plain, deterministic, case-insensitive (ASCII-fold) leftmost substring search
-//! ([`substring_match`]), not fuzzy/skip-char matching, so a match highlights one contiguous
-//! span per row rather than scattered characters. Results rank by how early the match starts;
-//! an entry that only matched via a secondary field (an agent's branch, a file's directory, a
-//! command's keywords) still qualifies but ranks after every primary-label match - see
-//! [`match_against`].
 
 use std::path::PathBuf;
 
@@ -88,12 +81,6 @@ pub fn typed_scope_prefix(ch: char) -> Option<PaletteScope> {
 /// Which step of the palette is showing. The palette is normally a flat list ([`Self::Root`]);
 /// a step is the one real drill-down shape it has, entered by running a command that needs an
 /// argument rather than doing something immediately.
-///
-/// Deliberately *not* a fourth [`PaletteScope`]: a scope is a user-switchable filter over the
-/// same three candidate kinds (`⇥` cycles them, and every scope is reachable at any time), while
-/// a step is entered only by picking a specific command, lists something else entirely, and is
-/// left with `Esc` - which here means "back to the command list", not "close the palette". See
-/// `crate::root::AdeApp::handle_palette_key_down`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaletteStep {
     #[default]
@@ -128,12 +115,6 @@ pub enum PaletteCommand {
     NewCodexAgent,
     /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files - Search - Changes`
     /// control.
-    ///
-    /// A **cycle**, not a toggle, since GitHub issue #162 made the panel three tabs: `Toggle` was
-    /// this command's own name while there were exactly two, and leaving it named that over three
-    /// would have been a name stating something the command no longer does - the "two
-    /// specifications of one thing" defect `STAGE-A-CHANGELOG.md` 4w names, in its
-    /// name-versus-behaviour form.
     CycleRightPanel,
     /// `crate::root::AdeApp::request_prune` - goes through the same two-click confirmation gate
     /// as the rail footer's own `prune` button, never bypassing it.
@@ -155,11 +136,6 @@ pub enum PaletteCommand {
     /// one immediately rather than showing a one-row menu; with none running it isn't listed at
     /// all (the same "never list a command that would silently do nothing" rule
     /// `crate::root::AdeApp::build_palette_groups` already applies to `OpenGitGraph`).
-    ///
-    /// Worth having beside [`Self::RestartLanguageServers`] because the servers under one root
-    /// are genuinely independent processes: a dead `rust-analyzer` says nothing about the
-    /// `typescript-language-server` beside it, and restarting a healthy multi-GB rust-analyzer to
-    /// recover an unrelated one is real, minutes-long re-indexing a user didn't ask for.
     RestartLanguageServer,
     /// Pins `crate::keymap::WindowControlsStyle::System`. These three variants and the
     /// Settings "General" page's `Window controls` row both call
@@ -288,12 +264,6 @@ pub struct CommandCandidate {
 /// One real, live language server client under the active worktree root - a
 /// [`PaletteStep::PickLanguageServer`] row, built by `crate::root::AdeApp::build_palette_groups`
 /// from `crate::lsp::client::AdeApp::restartable_language_servers`.
-///
-/// The primary label is the real client key (`"rust-analyzer"`,
-/// `"typescript-language-server (vue)"`) rather than the language's display name, because the key
-/// is what is actually unique: Vue runs two processes, and both would otherwise render as "Vue".
-/// The language name is not lost - it goes in [`Self::secondary`] alongside the server's real
-/// state, and into [`Self::keywords`] so typing "vue" or "rust" still finds the row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LanguageServerCandidate {
     /// The `crate::root::AdeApp::lsp_clients` key's own binary half - what
@@ -580,9 +550,6 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
 /// filter/rank/highlight/cap pipeline every other group goes through ([`match_against`],
 /// [`finish_group`]), so typing filters this list, `↑`/`↓` walk it and `⏎` runs it exactly like
 /// the command list a keystroke ago.
-///
-/// Returns no group at all (rather than an empty one) when nothing matches, matching
-/// [`build_groups`]' own convention - the palette then renders its ordinary "no results" state.
 pub fn build_language_server_groups(
     query: &str,
     servers: &[LanguageServerCandidate],
@@ -619,24 +586,6 @@ pub fn build_language_server_groups(
 /// Builds the palette's result groups for the current `scope`/`query`. Group order is always
 /// Agents, Terminals, Commands, Files; a group with zero matches is omitted entirely rather than
 /// shown as an empty header.
-///
-/// **`Agents` and `Terminals` are two groups, not one** (GitHub issue #381). Both are open panes
-/// and both are worth switching to by name, but a plain `ProcessKind::Shell` is not an agent -
-/// `Jerry.dc.html` has never counted the terminal among a worktree's `agents`, and filing a shell
-/// under a heading that reads `Agents` told the user the opposite of what the rest of the app
-/// (the rail, which gives a shell no agent row at all; the pane chrome, which draws a shell a
-/// different bottom bar) tells them. Splitting rather than filtering is deliberate: the palette
-/// is the keyboard route to a pane, and dropping shells out of it would have made a terminal tab
-/// mouse-reachable only - a real loss, and an unnecessary one, since the honest fix is just to
-/// stop calling it an agent.
-///
-/// Both groups only appear in [`PaletteScope::All`] - there is no dedicated Agents segment in the
-/// scope control. For an empty query in a scope that shows files, the file candidates are first
-/// narrowed to changed files (`FileCandidate::changed.is_some()`) under a `"Recent Files"`
-/// label: this app has no file-access/mtime history to rank true recency by, so "recent" is
-/// defined as "currently has uncommitted changes" - the one recency-adjacent signal the data
-/// model actually has. A non-empty query searches every file in the tree instead, under a plain
-/// `"Files"` label.
 pub fn build_groups(
     scope: PaletteScope,
     query: &str,
@@ -983,9 +932,6 @@ mod tests {
         );
     }
 
-    /// The cap test above can't catch a ranking bug: every one of its synthetic files matches
-    /// `"target"` at the same offset. This uses two files matching at different offsets to
-    /// assert `finish_group` actually sorts by rank rather than passthrough order.
     #[test]
     fn group_entries_in_the_same_group_are_ranked_by_earliest_match_offset() {
         // "logger.rs" matches "log" at offset 0; "my_logger.rs" matches it at offset 3. Passed
@@ -1058,8 +1004,6 @@ mod tests {
         );
     }
 
-    /// The step is not a second, differently-behaved widget: the same typing filters it, with the
-    /// same leftmost-match highlighting every other palette row gets.
     #[test]
     fn typing_filters_the_language_server_step_and_highlights_the_match() {
         let servers = vec![
@@ -1088,8 +1032,6 @@ mod tests {
         );
     }
 
-    /// A `.vue` project runs two processes whose keys differ but whose language name doesn't -
-    /// the language name is still searchable, and both rows stay individually pickable.
     #[test]
     fn a_language_name_matches_through_keywords_without_collapsing_two_real_servers() {
         let servers = vec![
@@ -1122,16 +1064,6 @@ mod tests {
         )));
     }
 
-    /// `PaletteCommand::ALL` only enumerates the enum - it is read by tests, never by
-    /// `AdeApp::build_palette_groups` (the hand-built `Vec<CommandCandidate>` in
-    /// `palette::render` is the one thing the palette actually searches), so a variant appearing
-    /// here is not proof a user can ever find it. That gap is exactly the live-reported bug fixed
-    /// separately (issue #203's own visibility fix): `RestartLanguageServers` and
-    /// `CheckForUpdates` both have real labels here and were still unreachable. This test is
-    /// deliberately scoped to what *is* true at the enum level - two distinct variants with two
-    /// distinct labels - not to whether either is listed; whether the new singular
-    /// `RestartLanguageServer` really is listed is covered live, against the real
-    /// `build_palette_groups` output, by `render::palette_language_server_step_tests` instead.
     #[test]
     fn restart_one_and_restart_all_are_two_distinct_commands_with_their_own_labels() {
         assert_ne!(
@@ -1183,9 +1115,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #381: a plain [`ProcessKind::Shell`] is not an agent, so it does not appear
-    /// under a heading that says `Agents` - it gets its own `Terminals` group instead, in the
-    /// same palette, so it stays fully keyboard-reachable while being named honestly.
     #[test]
     fn a_shell_is_listed_under_terminals_never_under_agents() {
         let candidates = vec![
@@ -1229,9 +1158,6 @@ mod tests {
         );
     }
 
-    /// A group with no members is omitted entirely, exactly like every other palette group -
-    /// splitting agents from terminals must not add a permanently-empty `Terminals` header to
-    /// every window that has no shell open.
     #[test]
     fn the_terminals_group_is_absent_when_no_shell_is_open() {
         let candidates = vec![agent(1, "Fix rate limiter", Some("fix/rl"), Status::Run)];

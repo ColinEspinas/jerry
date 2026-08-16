@@ -1,74 +1,4 @@
 //! Real, on-disk persistence for the Files tree's expand/collapse state (GitHub issue #18).
-//!
-//! ## What is stored, and why it's *expanded* rather than *collapsed*
-//!
-//! The tree opens **fully collapsed** on the first visit to a worktree, so "expanded" is the
-//! exceptional state and the one worth recording: an empty (or missing) entry for a worktree
-//! means "nothing is expanded", which is exactly the right default for a worktree this file has
-//! never seen - a freshly created worktree therefore inherits nothing and starts collapsed, with
-//! no special case needed anywhere. `crate::root::AdeApp::expanded_dirs` is the live mirror of
-//! one worktree's entry here.
-//!
-//! ## Why a separate file rather than a `[file_tree]` section in `settings.toml`
-//!
-//! `crate::settings::store`'s own module docs are explicit that every field of `Settings` is a
-//! value some settings *page* reads and writes, and the config banner/snippet widgets render
-//! those sections back to the user as hand-editable config. This is not that: it's machine-
-//! managed UI state, potentially hundreds of paths across every worktree ever opened, that no
-//! settings page shows and nobody would hand-edit. It lives in its own
-//! `~/.config/jerry/file-tree-state.toml`, resolved as a sibling of the real settings path
-//! ([`fold_state_path_for`]) so the two always share a directory and a test that supplies a
-//! temp-dir settings path automatically gets a temp-dir fold-state path too.
-//!
-//! The second, load-bearing reason is crash-safety, which the issue asks for by name.
-//! `Settings::save_at` is documented as a deliberately non-atomic truncate-then-write; a crash
-//! mid-write there loses at worst a settings edit. [`FoldState::save_at`] instead writes a
-//! process-unique sibling temp file, `File::sync_all`s it, `std::fs::rename`s it over the
-//! target, and syncs the parent directory - so neither a killed process nor a power loss can
-//! leave a half-written (and therefore unparseable) file behind. What survives a crash is
-//! always either the previous complete state or the new complete state.
-//!
-//! ## Two running instances share this file, so writes merge rather than clobber
-//!
-//! One `jerry` process opens one window against one repository (`crate::run`), so running it
-//! against two repositories at once means two processes writing this one file. The temp file's
-//! name therefore includes the process id and a per-process counter (two writers can't scribble
-//! over each other's temp file), and the app writes through [`FoldState::save_merged_at`], which
-//! re-reads whatever is on disk and replaces only the worktree keys *this* instance actually
-//! owns. Without that merge, the last process to save would silently erase every other
-//! repository's fold state, since each holds a whole-file copy read at its own startup.
-//!
-//! Honest about the two things that does *not* buy, both real:
-//!
-//! 1. The merge is an unlocked read-modify-write, so two instances owning *different* worktrees
-//!    whose saves genuinely interleave can still lose one update. That narrows the exposure from
-//!    "every save clobbers every other repository" to "a few microseconds around each save".
-//! 2. Two instances that own the **same** worktree key - the same worktree open twice - are not
-//!    merged at all, and this is not a narrow window: each save replaces that key's whole entry
-//!    with its own copy, so the two instances permanently revert each other's expansions for
-//!    that worktree, last-writer-wins, for as long as both are running. Fixing it properly means
-//!    a delta-based merge (record what changed, not what the whole entry now is), which is a
-//!    materially bigger design than this feature justifies; the sibling-worktree case above is
-//!    the one that actually happens (one `jerry` per repository), and it *is* fixed. This is
-//!    written down rather than left to be discovered.
-//!
-//! ## Nothing is ever pruned because a path merely looks absent
-//!
-//! Stale entries are pruned against a real, completed directory walk
-//! ([`FoldState::prune_missing_dirs`]) and nothing else. An earlier draft also dropped whole
-//! worktrees at startup whose root `Path::exists()` reported gone; that was removed as
-//! destructive-on-a-false-negative - an unmounted volume, or a parent directory that is briefly
-//! unreadable, would have permanently deleted that worktree's state. The cost of not doing it is
-//! a few hundred bytes per worktree that no longer exists.
-//!
-//! ## Identity: keyed by real worktree path, never by relative path alone
-//!
-//! Two worktrees of the same repository share every relative path in the tree, so a fold-state
-//! entry keyed only by `src/app` would apply to both. The map is therefore keyed by the
-//! worktree's real, canonicalized absolute path ([`worktree_key`]) with worktree-relative paths
-//! stored *inside* that entry - the same "identity guard" discipline the rest of this codebase
-//! documents. A path that doesn't sit under the worktree root at all is refused outright rather
-//! than stored with a surprising key ([`relative_key`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
@@ -96,20 +26,6 @@ pub fn fold_state_path_for(settings_path: &Path) -> PathBuf {
 /// through a symlink (or a `.`-relative invocation) resolves to one entry rather than two.
 /// Falls back to the path as given when it can't be canonicalized (it may not exist yet, or be
 /// a pure in-memory path in a unit test), which is still a stable key for that path.
-///
-/// **Calls `std::fs::canonicalize`, so it must never be called from a render or per-event
-/// path.** On a stale or slow mount (NFS, FUSE, a briefly-disconnected network drive) that syscall can
-/// block for the mount's full timeout, which on the foreground thread is a frozen window. Every
-/// hot caller instead uses the `*_with_key` variants below against
-/// `crate::root::AdeApp::fold_state_root_key`, which is resolved exactly once per worktree
-/// change; this function is called only from those few real change points (and from tests).
-///
-/// `None` for a path that isn't valid UTF-8. TOML keys are strings, and the obvious shortcut -
-/// `to_string_lossy` - would map every undecodable byte to the same U+FFFD, so two genuinely
-/// different worktrees could collapse onto one key: the exact cross-worktree leak this module
-/// exists to prevent. Refusing outright means such a worktree simply doesn't persist fold state
-/// (and says so in the log, see `crate::root::AdeApp::set_dir_expanded`), which is a far smaller
-/// failure than silently sharing another worktree's.
 pub fn worktree_key(root: &Path) -> Option<String> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     canonical.to_str().map(str::to_owned)
@@ -305,17 +221,6 @@ impl FoldState {
     /// actually owns into whatever is currently on disk, then writes the result via
     /// [`Self::save_at`]. See the module docs for why a plain whole-file write would silently
     /// erase a second running instance's state.
-    ///
-    /// `owned` is the set of [`worktree_key`]s this instance has recorded anything for. Keys in
-    /// `owned` are taken from `self` (including *absence* - that's how "collapse all" deletes an
-    /// entry); every other key on disk is passed through untouched.
-    ///
-    /// GitHub issue #90: wrapped in `crate::persisted_state_lock::with_locked_merge` - "New
-    /// Window" made this load-merge-save cycle reachable *concurrently within one process*, not
-    /// just across two separate `jerry` processes (which the `owned`-scoped merge above already
-    /// handled) - see that module's own docs for the real race two truly concurrent callers could
-    /// otherwise hit, and why one process-wide lock, shared with `crate::rail::repo::RepoState`/
-    /// `crate::work_surface::tab_order_state::TabOrderState`'s own identical methods, is enough.
     pub fn save_merged_at(&self, path: &Path, owned: &BTreeSet<String>) -> io::Result<()> {
         crate::persisted_state_lock::with_locked_merge(|| {
             let mut merged = FoldState::load_at(path);
@@ -418,11 +323,6 @@ impl FoldState {
     /// Drops any recorded directory for `root` that isn't in `existing_dirs` - the "stale entries
     /// (folders since deleted or renamed) are silently ignored and pruned, never an error" half
     /// of the issue. Returns whether anything was pruned.
-    ///
-    /// Takes the real, currently-loaded directory set rather than doing its own `Path::exists`
-    /// calls: the caller has just walked the tree, so this needs no syscalls at all, and - more
-    /// importantly - it cannot prune an entry merely because a *slow or racing* filesystem check
-    /// happened to miss it.
     pub fn prune_missing_dirs(&mut self, root: &Path, existing_dirs: &HashSet<PathBuf>) -> bool {
         match worktree_key(root) {
             Some(key) => self.prune_missing_dirs_with_key(&key, root, existing_dirs),
@@ -528,8 +428,6 @@ mod tests {
         assert!(!set(&mut state, root, &root.join("src"), false));
     }
 
-    /// The identity guard this module exists for: two worktrees of the same repository share
-    /// every relative path, so state recorded for one must never appear in the other.
     #[test]
     fn fold_state_for_one_worktree_never_leaks_into_another() {
         let a = Path::new("/repo/worktree-a");
@@ -611,9 +509,6 @@ mod tests {
         assert_eq!(expanded_set(&state, b), vec!["/repo/worktree-b/src"]);
     }
 
-    /// The multi-instance guarantee: a second `jerry` saving its own worktree's state must not
-    /// erase the first's. Both instances hold a whole-file copy read at their own startup, so a
-    /// plain whole-file write would do exactly that.
     #[test]
     fn saving_merges_with_another_instances_entries_instead_of_erasing_them() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -621,13 +516,11 @@ mod tests {
         let a = Path::new("/repo/worktree-a");
         let b = Path::new("/repo/worktree-b");
 
-        // Instance A saves first.
         let mut instance_a = FoldState::default();
         set(&mut instance_a, a, &a.join("src"), true);
         let owned_a: BTreeSet<String> = [worktree_key(a).expect("key")].into_iter().collect();
         instance_a.save_merged_at(&path, &owned_a).expect("save a");
 
-        // Instance B started before A wrote anything, so its in-memory copy knows nothing of A.
         let mut instance_b = FoldState::default();
         set(&mut instance_b, b, &b.join("src"), true);
         let owned_b: BTreeSet<String> = [worktree_key(b).expect("key")].into_iter().collect();
@@ -642,9 +535,6 @@ mod tests {
         assert_eq!(expanded_set(&on_disk, b), vec!["/repo/worktree-b/src"]);
     }
 
-    /// The other half of the merge contract: for a worktree this instance *does* own, absence is
-    /// a real deletion (that's how "collapse all" removes an entry), not something to merge back
-    /// in from disk.
     #[test]
     fn a_merged_save_really_deletes_an_owned_worktrees_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -681,10 +571,6 @@ mod tests {
         assert_eq!(FoldState::load_at(&path), FoldState::default());
     }
 
-    /// The non-UTF-8 refusal, exercised against a genuinely non-UTF-8 path rather than only
-    /// described in the docs. Both halves matter: a directory name that isn't UTF-8 is refused
-    /// (it has no honest TOML key), and - crucially - refusing it does not disturb the entries
-    /// that *are* recordable for the same worktree.
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_path_is_refused_and_leaves_the_rest_of_the_worktree_intact() {
@@ -695,7 +581,6 @@ mod tests {
         let mut state = FoldState::default();
         set(&mut state, root, &root.join("src"), true);
 
-        // 0xff is not valid UTF-8 in any position.
         let invalid = root.join(OsStr::from_bytes(&[b'b', b'a', 0xff, b'd']));
         assert_eq!(
             state.set_expanded(root, &invalid, true),
@@ -720,8 +605,6 @@ mod tests {
         assert!(state.expanded_dirs(&invalid_root).is_empty());
     }
 
-    /// A hand-corrupted (or maliciously written) file must not be able to make the app treat a
-    /// path outside the worktree as an expanded directory.
     #[test]
     fn a_traversal_entry_in_a_hand_edited_file_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -740,8 +623,6 @@ mod tests {
         );
     }
 
-    /// The atomic-write contract: after a save there is exactly one real file at `path` and no
-    /// leftover temp file, and its contents parse.
     #[test]
     fn saving_leaves_no_temp_file_behind_and_the_result_parses() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -767,9 +648,6 @@ mod tests {
         assert_eq!(FoldState::load_at(&path), state);
     }
 
-    /// A save killed between creating its temp file and renaming it leaves an orphan behind.
-    /// Because the temp name is process-unique (so two instances can't tear each other's
-    /// writes), those would otherwise accumulate forever.
     #[test]
     fn a_stale_orphaned_temp_file_is_swept_and_a_fresh_one_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -801,7 +679,6 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// Overwriting an existing file must replace it wholesale, not merge into it.
     #[test]
     fn saving_over_an_existing_file_replaces_its_contents() {
         let dir = tempfile::tempdir().expect("tempdir");

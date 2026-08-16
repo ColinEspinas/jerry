@@ -6,83 +6,6 @@
 //! [`TerminalSpec`] - `TerminalPane` itself has no notion of "shell" vs. "agent CLI". The
 //! agent/tab bookkeeping that decides which spec to use, and that owns more than one
 //! `TerminalPane` as tabs, lives in `crate::work_surface::agents`/`crate::root`, one layer up.
-//!
-//! ## Offloading blocking work off the GPUI foreground thread
-//!
-//! `pty_core::spawn` performs blocking I/O, so it runs via `cx.background_executor().spawn(..)`
-//! (verified at `vendor/zed/crates/gpui/src/executor.rs:89`; its `timer(..)` sibling used
-//! below is at `:162`, same `impl BackgroundExecutor`), not on the foreground/UI thread.
-//! `PtySession::output()` is a bounded `std::sync::mpsc::Receiver<Vec<u8>>`; rather than a
-//! second dedicated OS thread to bridge it, this drains it with non-blocking `try_recv()`
-//! from inside a GPUI foreground async task that wakes every [`POLL_INTERVAL`] (or, for a
-//! pane whose agent isn't the globally active tab, every [`BACKGROUND_POLL_INTERVAL`] -
-//! see [`tick_cadence`]) via `cx.background_executor().timer(..)`. `try_recv()` never
-//! blocks, but see [`MAX_BYTES_PER_TICK`] for why the drain loop itself is still bounded -
-//! "never blocks" isn't the same as "bounded work per call".
-//!
-//! This is a *poller*, and that is a real, deliberate difference from Zed's own terminal, which
-//! is event-driven: `vendor/zed/crates/terminal/src/terminal.rs`'s event loop blocks on
-//! `self.events_rx.next().await` (a `futures` channel fed by `alacritty_terminal`'s own reader
-//! thread), processes the first event immediately "for lowered latency", and only then
-//! coalesces further events behind a 4ms timer. It can do that because its producer is an async
-//! channel; `pty_core::PtySession::output()` is a `std::sync::mpsc::Receiver`, which has no
-//! `await`, so bridging it event-driven would need a second OS thread per pane purely to turn
-//! blocking `recv()`s into wakeups. Polling avoids that thread, at the cost of up to one
-//! [`POLL_INTERVAL`] of latency per byte - which is why that interval is sized against the
-//! frame budget rather than picked as a "redraw rate"; see its own docs.
-//!
-//! ## Input
-//!
-//! Typed keys are forwarded to the child process: [`TerminalPane`] is focusable
-//! (`cx.focus_handle()` + `.track_focus(..)`, the same pattern
-//! `vendor/zed/crates/terminal_view/src/terminal_view.rs` uses), and [`keystroke_to_bytes`]
-//! turns a `gpui::Keystroke` into the bytes a real terminal would send (printable characters,
-//! Enter/Backspace/Tab/Escape/arrows/PageUp/PageDown, `Ctrl`+letter control codes). This is a
-//! deliberately small subset of `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str`
-//! (which needs more `alacritty_terminal` terminal-mode state than this pane threads through,
-//! e.g. application cursor-key mode) - enough to type commands, use arrow keys, page through a
-//! full-screen program, and send `Ctrl-C`, not a full VT100 keymap.
-//!
-//! PageUp/PageDown are shared between this pane and the child rather than owned outright: on the
-//! normal screen they drive this pane's own retained scrollback (GitHub issue #331), and on the
-//! alt screen - which has no scrollback for them to drive - they go to the running program
-//! instead (GitHub issue #368). See [`TerminalPane::handle_key_down`].
-//!
-//! ## Double-width characters (GitHub issue #211)
-//!
-//! CJK ideographs and most emoji occupy two grid columns. `crate::terminal::grid` labels those
-//! cells (`CellWidth`, from `alacritty_terminal`'s own `WIDE_CHAR`/`WIDE_CHAR_SPACER` flags); this
-//! module is what acts on the label, in [`row_runs`]/[`wide_run_width`]:
-//!
-//! - The spacer cell the emulator writes after a wide character paints nothing at all. Painting it
-//!   (which is what this module used to do, having no idea it existed) put a stray blank column
-//!   after every wide glyph.
-//! - A run of wide characters is pinned to an explicit `2 * cell_width` per character rather than
-//!   left to whatever advance the font gives that glyph, so the column grid stays exact even when
-//!   an emoji resolves through font fallback to a face with a different advance.
-//!
-//! Together those keep every grid column starting at exactly `column * cell_width`, which is what
-//! lets [`cell_position_in_grid`]'s mouse arithmetic stay a pure function of pixels - see its own
-//! docs.
-//!
-//! ## Windows: process-exit detection can't rely on pty EOF
-//!
-//! [`Self::spawn_process`]'s poll loop has exactly one unix-native trigger for "the process
-//! ended": `pty_core::PtySession::output()`'s channel disconnecting (`TryRecvError::
-//! Disconnected`), which fires once the reader thread inside `pty-core` observes real pty EOF.
-//! On unix that happens quickly after the child exits. On Windows it structurally can't be
-//! relied on at all: `pty_core`'s Windows reader thread only observes EOF once
-//! `PtySession::master` itself is dropped (a `ClosePseudoConsole` chain - see that crate's
-//! `run_reader_loop` docs), which killing/reaping the child does **not** do on its own. Left to
-//! only the channel-disconnect path, a killed Windows process would never be noticed here:
-//! [`Self::session`] would stay `Some` forever, [`Self::is_running`] would stay `true`,
-//! [`Self::exit_status`] would stay `None`, and [`TerminalGrid::mark_ended`] would never run -
-//! this pane's entire "the process ended" story silently breaks on that platform. So the poll
-//! loop's live-session branch also independently polls `pty_core::PtySession::try_wait`
-//! directly every tick under `#[cfg(windows)]`, regardless of channel state - real, cheap
-//! (`GetExitCodeProcess`, non-blocking), and correct even when pty I/O itself never signals
-//! anything - and feeds a confirmed exit into the exact same `newly_exited`/`process_ended`
-//! state transition the unix EOF path already uses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -109,26 +32,6 @@ use crate::theme;
 /// How often the poll task of the *globally active* agent's pane (see
 /// [`TerminalPane::set_foreground`]; every other pane uses [`BACKGROUND_POLL_INTERVAL`]) wakes
 /// up to drain any pty output that has arrived and, if there was any, re-render.
-///
-/// 8ms, i.e. roughly twice per 60Hz frame, so a byte that arrives from the child is decoded
-/// into the grid within the same frame it arrived in. This was 33ms ("close to a 30fps redraw
-/// rate"), which was measurably wrong on two counts, both confirmed against a real streaming
-/// child in a release build:
-///
-/// - **It was not a redraw *rate*, it was a sleep *between* drains.** The loop's real period is
-///   `POLL_INTERVAL` plus however long the tick's own work took, so 33ms produced ~24 ticks/s,
-///   not 30 - and every one of those ticks found output already waiting, meaning the loop spent
-///   >99% of its time asleep on top of bytes that had already arrived.
-/// - **It throttled the child.** `pty-core`'s output channel is bounded and deliberately
-///   backpressures (see that crate's docs), so a drain that runs 24x/s with a bounded per-tick
-///   budget caps how fast the child is *allowed* to write. Measured against a child that
-///   streams 4.3MB/s standalone, the pane consumed 0.80MB/s - the UI was holding the process
-///   to ~19% of its natural speed, and the visible grid ran correspondingly behind.
-///
-/// Polling this often is not expensive when there is nothing to do: an empty tick is one
-/// `try_recv` returning `Empty`, and `cx.notify()` is only called when bytes actually arrived,
-/// so an idle pane still invalidates zero frames. `vendor/zed/crates/terminal/src/terminal.rs`
-/// uses a 4ms window for the same job (it coalesces pty events for 4ms before re-rendering).
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 /// [`POLL_INTERVAL`]'s counterpart for a pane whose agent is *not* the globally active tab
@@ -136,15 +39,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// polling it twice per frame buys nothing. 33ms (the pre-tightening interval, ~30 drains/s)
 /// keeps a background agent's status/activity signal fresh to within a frame or two while
 /// capping how much foreground-thread work each background pane can generate.
-///
-/// This split exists because the 8ms/[`MAX_BYTES_PER_TICK`] tightening, correct for the *one*
-/// visible pane, was measured to be a real multi-pane regression: it raised every pane's
-/// drainable throughput ~5x, and this app's whole point is running many agents at once. With
-/// 25 concurrently-firehosing panes (release build, real X11), all-panes-at-8ms measured
-/// 10-12fps with 60-70ms invalidation-to-paint latency and the foreground thread at ~80%
-/// saturation, vs 17-19fps / ~27ms before the tightening - the aggregate decode work, not the
-/// wake frequency, is what scales with pane count. Keying cadence on real tab visibility keeps
-/// the measured single-agent throughput fix without paying it once per open agent.
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
@@ -154,23 +48,6 @@ const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 /// re-rendering. Capping the per-tick budget spreads that cost across ticks instead - whatever
 /// isn't drained is still sitting in the channel (pty-core's reader thread backpressures) and
 /// gets picked up next tick.
-///
-/// This is deliberately a byte bound, not the chunk-count bound it replaced
-/// (`MAX_CHUNKS_PER_TICK = 64`). A chunk is "whatever one `read(2)` on the pty master returned", which ranges
-/// from a couple of dozen bytes to a full `pty_core` read buffer - so a chunk-count cap
-/// bounded a tick's real work only to within orders of magnitude, and in practice bound it far
-/// too tightly: measured against a real streaming child, *every single tick* hit the 64-chunk
-/// cap while carrying only ~29KB, i.e. the cap was throttling throughput rather than defending
-/// against a pathological tick. 256KiB is the same worst-case byte budget the old cap allowed
-/// (64 chunks x pty-core's 4KiB read buffer), now expressed in the unit that actually bounds
-/// the work; at the ~90MB/s `TerminalGrid::append_bytes` decodes at (measured in situ) it costs
-/// the foreground thread ~3ms in the worst case. `alacritty_terminal`'s own reader bounds its
-/// equivalent batch by bytes too (`MAX_LOCKED_READ = u16::MAX`, the number of bytes it will
-/// process before releasing the terminal lock), for the same reason.
-///
-/// Note this is a *budget*, not a buffer: the drain stops once it has taken **at least** this
-/// many bytes, so one oversized chunk is always taken whole. Chunks are never split, so byte
-/// order and chunk boundaries reaching `TerminalGrid::append_bytes` are unchanged.
 const MAX_BYTES_PER_TICK: usize = 256 * 1024;
 
 /// [`MAX_BYTES_PER_TICK`]'s counterpart for a background pane (see
@@ -187,15 +64,6 @@ const BACKGROUND_MAX_BYTES_PER_TICK: usize = 32 * 1024;
 /// The poll cadence - (sleep interval, per-tick drain byte budget) - for one tick of
 /// [`TerminalPane::spawn_process`]'s loop, given whether this pane's agent is the globally
 /// active tab and whether pty EOF is already pending.
-///
-/// `eof_pending` forces the foreground cadence regardless of visibility: [`MAX_EOF_POLL_TICKS`]
-/// is derived from [`POLL_INTERVAL`], so ticking the EOF grace countdown at any other interval
-/// would silently stretch the real ~10s exit-confirmation window (~41s at
-/// [`BACKGROUND_POLL_INTERVAL`]) - and an EOF-pending pane has nothing left to drain anyway, so
-/// there is no throughput cost to bound.
-///
-/// A pure function (not a method) so the cadence policy is unit-testable without a GPUI
-/// window - see this module's tests.
 fn tick_cadence(is_foreground: bool, eof_pending: bool) -> (Duration, usize) {
     if is_foreground || eof_pending {
         (POLL_INTERVAL, MAX_BYTES_PER_TICK)
@@ -212,38 +80,11 @@ const TERMINAL_COLS: u16 = 160;
 /// How many [`POLL_INTERVAL`] ticks (~10s total) [`TerminalPane`]'s poll loop keeps retrying
 /// `PtySession::try_wait` after observing pty EOF before giving up - see
 /// [`eof_poll_decision`]'s docs for the race this bounds.
-///
-/// Derived from [`POLL_INTERVAL`] rather than written as a literal tick count, so the real
-/// grace period stays ~10s of wall time no matter what the poll interval is set to. It was a
-/// bare `300` back when [`POLL_INTERVAL`] happened to be 33ms; shortening the interval to 8ms
-/// would silently have cut the grace to 2.4s, making the very race `eof_poll_decision` exists
-/// to survive (a child that closes its pty stdio well before it exits) reappear for any child
-/// that takes longer than that to exit - reported, wrongly, as
-/// [`crate::rail::status::Status::Fail`].
 const MAX_EOF_POLL_TICKS: u32 = (10_000 / POLL_INTERVAL.as_millis()) as u32;
 
 /// Decides what a poll tick should do once pty EOF has been observed (the output channel's
 /// `TryRecvError::Disconnected`) but the child's exit status hasn't been confirmed yet, given
 /// this tick's own non-blocking `PtySession::try_wait` result.
-///
-/// Factored out of `TerminalPane::spawn_process`'s poll loop as a pure function so a real,
-/// checker-reproduced bug is directly unit-testable without a real GPUI window or wall-clock
-/// timing: the original code called `try_wait` exactly once at the moment EOF was observed,
-/// and if that returned `Ok(None)` (child not yet reaped, but still alive) it gave up
-/// immediately and dropped the `PtySession` - which, per `pty-core`'s `Drop` impl, signals
-/// the still-live process, killing a legitimate running child out from under itself - leaving
-/// `exit_status` `None` forever, which `crate::rail::status::derive_status` reads as `Status::Idle`
-/// rather than `Status::Fail`. This is a reproducible race: any child that closes its
-/// pty-attached stdio before actually exiting (`sh -c 'exec 0<&- 1>&- 2>&-; sleep 2; exit 7'`
-/// is a minimal repro - see the end-to-end test below) triggers EOF well before it's reapable.
-///
-/// Returns `None` when the caller should keep the session alive and retry next tick - this
-/// must *not* cause the caller to drop the `PtySession`. Returns `Some(status)` once the
-/// caller should finalize: either the confirmed [`ExitStatus`], or - once
-/// [`MAX_EOF_POLL_TICKS`] is exhausted - a synthetic failed status (`ExitStatus::with_signal`,
-/// whose `success()` is always `false`), so a process whose exit could never be confirmed is
-/// reported as [`crate::rail::status::Status::Fail`] rather than silently reverting to
-/// [`crate::rail::status::Status::Idle`].
 fn eof_poll_decision(
     try_wait_result: Result<Option<ExitStatus>, ()>,
     ticks_pending: u32,
@@ -270,13 +111,6 @@ fn eof_poll_decision(
 /// ratio, unrelated to this font's real metrics - was what rendered) because that mismatch
 /// was a real, measured "scales weirdly" bug; see [`TerminalPane::cell_size`]'s docs for the
 /// rest of that story.
-///
-/// `terminal_font_size` is a real, persisted, user-editable setting
-/// (`crate::settings::store::AppearanceSettings::terminal_font_size`, default `12.5`), so every
-/// production [`TerminalPane`] is constructed with an explicit font size from that setting
-/// (see [`TerminalPane::new`]) rather than this constant - this stays only as the ratio
-/// [`TerminalPane::line_height_px`] scales from, and as the fixture value this module's
-/// resize tests use.
 const ROW_FONT_SIZE_PX: f32 = 12.0;
 const ROW_LINE_HEIGHT_PX: f32 = 19.0;
 
@@ -288,16 +122,6 @@ const APPROX_CELL_WIDTH_PX: f32 = 7.0;
 /// How many grid lines one detent ("notch") of a real mouse wheel is worth, used only to convert
 /// [`TerminalPane::handle_scroll_wheel`]'s line count back into wheel gestures for
 /// [`TerminalPane::forward_scroll_as_page_keys`] (GitHub issue #368).
-///
-/// Three is the long-standing platform convention (Windows' own `SPI_GETWHEELSCROLLLINES`
-/// default, and what X11 button-4/5 events are conventionally worth), and it is what GPUI
-/// actually delivers here: **measured live** against the running app over X11, a single wheel
-/// notch over a terminal pane produces a `ScrollWheelEvent` whose delta resolves to exactly
-/// `3.0` grid lines.
-///
-/// Only the alt-screen page-key path needs this. The ordinary scrollback path deliberately does
-/// not: there, a line of wheel delta really is a line of scrollback, and
-/// `TerminalGrid::scroll_display` moves by exactly that.
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 
 /// The pane root's own padding, applied on every side via `.p(px(PANE_PADDING_PX))` in
@@ -305,10 +129,6 @@ const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
 /// so [`TerminalPane::maybe_resize_pty`] can subtract the exact same padding it applies from
 /// its own measured content-area bounds before converting to a grid size - see that method's
 /// docs for the padding-box-vs-content-box bug this fixes.
-///
-/// `pub(crate)`, not private: `crate::code_surface`'s terminal-link click interaction
-/// test needs this exact value to compute a click position off the pane's own measured
-/// `content_bounds`, rather than a second, hand-copied `8.0` literal that could drift from it.
 pub(crate) const PANE_PADDING_PX: f32 = 8.0;
 
 /// What a [`TerminalPane`] should spawn: a program, its arguments, and the working directory
@@ -323,13 +143,6 @@ pub struct TerminalSpec {
     /// itself inherited (`portable_pty`'s `CommandBuilder::env` adds to the inherited
     /// environment rather than replacing it, which is what makes this safe to use for a couple
     /// of variables without having to reconstruct a whole environment).
-    ///
-    /// Empty for every spawn except a Claude agent, where it carries the hook listener's port,
-    /// this launch's token and the pane's own agent id (GitHub issue #239 phase 2 -
-    /// `crate::hooks::HookRuntime::spawn_extras`). Those three are what let the dumb forwarder
-    /// script know where to post and which row an event belongs to, and putting them in the
-    /// environment rather than in the generated settings file is what allows one settings file
-    /// to serve every agent this launch spawns.
     pub env: Vec<(String, String)>,
 }
 
@@ -339,16 +152,6 @@ impl TerminalSpec {
     /// itself never sets, so the fallback needs its own real Windows equivalent rather than the
     /// same Unix path unconditionally, which is a real path (`/bin/bash`) that doesn't exist on
     /// Windows at all - every default-shell spawn there was trying, and failing, to launch it.
-    ///
-    /// `configured` is the user's own chosen shell (GitHub issue #213 -
-    /// `crate::settings::store::TerminalSettings::shell_override`, threaded here from live
-    /// settings by `crate::work_surface::agents::Agents::spawn`, exactly like the terminal font
-    /// size already is). `None` - the zero-config default - keeps the real OS behaviour above,
-    /// byte for byte. A configured value is handed straight through as the program to spawn: a
-    /// bare name (`"fish"`) is resolved against `PATH` by `pty_core::spawn`'s own
-    /// `CommandBuilder`, the same already-relied-on mechanism [`Self::command`] documents, and an
-    /// absolute path is used as-is. Nothing here checks whether it exists - see
-    /// [`configured_shell_program`]'s docs for why that is deliberate.
     pub fn shell(cwd: PathBuf, configured: Option<&str>) -> Self {
         Self {
             program: configured_shell_program(configured)
@@ -430,23 +233,6 @@ fn shell_program_from_env(env_value: Option<std::ffi::OsString>, fallback: &str)
 /// The user's configured shell (GitHub issue #213) as a real program to spawn, or `None` when
 /// there genuinely isn't one - the pure half of [`TerminalSpec::shell`]'s decision, so both
 /// branches are testable on any host without touching the process environment.
-///
-/// Whitespace-only counts as "unset": the settings row backing this is a free-text field, and an
-/// accidental space must fall back to the OS default rather than becoming a program named `" "`
-/// that could never spawn. (`crate::settings::store::TerminalSettings::sanitize` already
-/// normalizes this on load; doing it here too means a value reaching this function by any other
-/// route can't reintroduce the case.)
-///
-/// Deliberately does **not** check that the program exists. `pty_core::spawn` is the only thing
-/// that can answer that question authoritatively - it is the code that actually resolves and
-/// execs it - and it already reports a real, typed `PtyError::Spawn` for a program that isn't
-/// there, which `TerminalPane` surfaces as a real `spawn_error` on the failed tab
-/// (`pty_core`'s own `spawn_reports_typed_error_for_nonexistent_program`). Second-guessing that
-/// here could only produce a *different* answer than the real spawn (a `PATH` search of this
-/// app's own is not the one `CommandBuilder` runs), which would mean silently refusing to launch
-/// a shell that would in fact have worked. The Settings row shows a live, advisory
-/// found/not-found hint instead (`crate::settings::state::detect_shell_status`), which informs
-/// without overriding.
 fn configured_shell_program(configured: Option<&str>) -> Option<PathBuf> {
     configured
         .map(str::trim)
@@ -480,12 +266,6 @@ mod shell_program_tests {
         );
     }
 
-    /// The real regression: the Windows fallback must be `cmd.exe`, a real path that exists on
-    /// Windows - never the Unix `/bin/bash` this crate used to fall back to unconditionally,
-    /// which does not exist there at all.
-    /// GitHub issue #213: a configured shell wins over whatever the OS environment says, in both
-    /// of the two documented forms - a bare name (`pty_core::spawn` resolves it on `PATH`) and an
-    /// absolute path (used verbatim).
     #[test]
     fn a_configured_shell_replaces_the_environment_default() {
         let cwd = std::env::temp_dir();
@@ -513,9 +293,6 @@ mod shell_program_tests {
         );
     }
 
-    /// The zero-config path this setting must never disturb: no override (or a blank one, which
-    /// the settings field can genuinely produce) spawns *exactly* what this app spawned before
-    /// the setting existed.
     #[test]
     fn no_configured_shell_is_byte_for_byte_the_previous_os_default() {
         let cwd = std::env::temp_dir();
@@ -534,13 +311,6 @@ mod shell_program_tests {
         );
     }
 
-    /// The end-to-end half of the two tests above: the exact `program` a configured bare name
-    /// produces really starts a live process through the same `pty_core::spawn` a shell tab uses,
-    /// and a typo'd one really fails with the typed error `TerminalPane` turns into a visible
-    /// `spawn_error` on the tab - no silent blank pane either way.
-    ///
-    /// unix-only, like `pty-core`'s own suite: it spawns `sh`, a real binary this project's CI
-    /// only runs tests on (see that crate's "Platform scope" docs).
     #[cfg(unix)]
     #[test]
     fn a_configured_shell_really_spawns_and_a_typo_really_fails() {
@@ -569,8 +339,6 @@ mod shell_program_tests {
         }
     }
 
-    /// Trimming happens at the edge, so `" fish "` (a real, plausible copy-paste) spawns `fish`
-    /// rather than a name with spaces in it that no `PATH` entry could ever match.
     #[test]
     fn a_configured_shell_is_trimmed_before_it_becomes_a_program() {
         assert_eq!(
@@ -601,14 +369,6 @@ mod shell_program_tests {
 /// though the terminal's real scroll position is `alacritty_terminal::Term`'s line-based
 /// `display_offset` (`TerminalGrid::scroll_offset`), not a GPUI-native scrollable div's pixel
 /// offset.
-///
-/// `Rc<RefCell<..>>`, not owned data: [`ScrollableHandle::set_scroll_offset`] is called from the
-/// scrollbar's own `on_mouse_down`/`on_drag_move` closures, which only ever get a `.clone()` of
-/// this handle, never `&mut TerminalPane` - so a click/drag has to leave a real record somewhere
-/// the *next* [`TerminalPane::render`] can pick up and turn into a real
-/// `TerminalGrid::set_scroll_offset` call (see [`TerminalScrollState::requested_display_offset`]).
-/// The same `Rc`'d-interior-mutability idiom `crate::terminal::grid::TermEventSink` uses, for the
-/// same "the real callback signature only ever hands out `&self`" reason.
 #[derive(Clone)]
 struct TerminalScrollHandle(Rc<RefCell<TerminalScrollState>>);
 
@@ -728,16 +488,6 @@ pub struct TerminalPane {
     /// When this pane's process last fired an OSC 9 / OSC 777 desktop notification that the
     /// human has not yet answered, or `None` if it never has or the human has since answered
     /// (GitHub issue #239).
-    ///
-    /// This is the latch that turns the *event* the pty carries into the *state* the rail needs.
-    /// [`crate::terminal::osc::OscWatcher::take_attention_ping`] is deliberately consume-on-read,
-    /// because a notification is a point-in-time "now" that nothing in the protocol ever
-    /// un-fires; but `crate::rail::status` is read from the render path many times a second, so
-    /// consuming it *there* would make an agent's "needs input" status blink out one frame after
-    /// it appeared. So the poll loop consumes the one-shot flag exactly once, here, and holds it
-    /// until something real answers it: the human typing into this pane
-    /// ([`Self::handle_key_down`]), or a new process starting ([`Self::spawn_process`]). It
-    /// cannot leak across either boundary, and it never outlives the session that raised it.
     attention_ping_at: Option<Instant>,
     /// `true` from the moment pty EOF is observed until the child's exit status is either
     /// confirmed or given up on - see [`eof_poll_decision`]'s docs for the bug this state
@@ -775,18 +525,6 @@ pub struct TerminalPane {
     /// (`crate::work_surface::agents::Agents::active`). Drives [`tick_cadence`]: only the active
     /// agent's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
     /// cadence; every other pane polls at the coarser background cadence.
-    ///
-    /// Deliberately "globally active", not "actually visible on screen right now": a file tab
-    /// (`AdeApp::open_change`) or Settings can occupy the centre pane while the active
-    /// agent's pane keeps its foreground cadence. That costs at most *one* full-cadence
-    /// pane - the multi-pane aggregate this flag exists to bound is unaffected - and keeps
-    /// the flag derivable from `Agents::active` alone, rather than also tracking
-    /// `open_change`/`settings_open` transitions here (more writers, more ways to go stale -
-    /// this codebase's recurring bug class).
-    ///
-    /// Maintained solely by `crate::work_surface::agents::Agents::sync_pane_cadence` (the single
-    /// writer, resynced on every active-agent change); `true` at construction because
-    /// `Agents::spawn` makes a new agent active in the same step.
     is_foreground: bool,
     /// `true` between a real left mouse-down inside the grid and the matching mouse-up - i.e.
     /// while a text-selection drag is genuinely in progress (GitHub issue #158). Gates
@@ -798,9 +536,6 @@ pub struct TerminalPane {
     /// painted with (GitHub issue #208). Written by `render` itself and by nothing else, so a test
     /// asserting on it is asserting on what the pane genuinely painted rather than re-deriving the
     /// palette a second way and hoping the two agree.
-    ///
-    /// `#[cfg(test)]` because production has no use for it - the palette is resolved fresh every
-    /// frame and consumed within that frame (see [`theme_terminal_palette`]).
     #[cfg(test)]
     last_painted_palette: Option<TerminalPalette>,
     /// The scrollback scrollbar's own [`ScrollableHandle`] adapter (GitHub issue #331) - see
@@ -873,13 +608,6 @@ impl TerminalPane {
     /// `crate::work_surface::agents::Agents::set_terminal_font_size`) to this already-live pane - a
     /// no-op if the sanitized value is unchanged (e.g. a stepper click already at a clamp
     /// boundary).
-    ///
-    /// Invalidates [`Self::cell_width_px`] and `cx.notify()`s - the next render's
-    /// [`Self::maybe_resize_pty`] call (runs unconditionally at the top of `render`) then does
-    /// the real work: [`Self::cell_size`] remeasures at the new size, [`size_to_grid`]
-    /// recomputes `(rows, cols)`, and [`Self::resize_to`] applies that to [`Self::grid`] and,
-    /// if a session is live, a `PtySession::resize` call - the same resize path an actual
-    /// window resize already drives.
     pub fn set_font_size(&mut self, font_size_px: f32, cx: &mut Context<Self>) {
         let font_size_px = sanitized_font_size_px(font_size_px);
         if font_size_px == self.font_size_px {
@@ -945,11 +673,6 @@ impl TerminalPane {
     }
 
     /// The window title this pane's process last set via OSC 0/2, if any (GitHub issue #239).
-    ///
-    /// Real agent CLIs put a live status glyph here - Claude Code alternates a `\u{25d0}`-family
-    /// spinner while working and rests on `\u{2733}`; Gemini CLI writes `\u{25c7}  Ready (...)`
-    /// when idle (both observed directly against real CLIs; see
-    /// `crate::rail::title_signal`, which is what turns this raw string into a status signal).
     pub fn title(&self) -> Option<&str> {
         self.grid.title()
     }
@@ -1047,16 +770,6 @@ impl TerminalPane {
     /// Clears the terminal - the header's `clear` hint action (a click-only, not
     /// global-keybinding, affordance). Delegates to [`TerminalGrid::clear`] and notifies so
     /// the now-empty grid repaints.
-    ///
-    /// ## Also signals the child process, when one is live
-    ///
-    /// Clearing only this pane's local grid is correct for a plain shell at a prompt (it
-    /// redraws on the next Enter regardless), but this terminal also runs full-screen,
-    /// cursor-addressed programs (`vim`, `htop`, an agent CLI's own UI) - for those, blanking
-    /// the grid alone leaves a dead screen, since the child process has no idea its output was
-    /// discarded. A `Ctrl-L` (`0x0c`) written to the pty - the same [`PtySession::write_input`]
-    /// path [`Self::interrupt`] uses for `Ctrl-C` - is the standard way to ask a running
-    /// program to redraw. A no-op (beyond the local grid clear) when no session is live.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.grid.clear();
         if let Some(session) = &self.session {
@@ -1096,11 +809,6 @@ impl TerminalPane {
     /// (`gpui::App::write_to_clipboard`, the same call `crate::sidebar::tree_ops::AdeApp::
     /// copy_path_to_system_clipboard` already uses for "Copy Path" - one clipboard mechanism in
     /// this app, not two). Returns whether anything was actually copied.
-    ///
-    /// A no-op when nothing is selected, deliberately: `Ctrl+Shift+C` with no selection must
-    /// leave whatever the user copied earlier alone rather than replacing it with an empty
-    /// string. See [`crate::terminal::grid::TerminalGrid::selected_text`] for what "nothing
-    /// selected" covers (no anchor, an undragged anchor, or an all-blank span).
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = self.grid.selected_text() else {
             return false;
@@ -1113,9 +821,6 @@ impl TerminalPane {
     /// `PtySession::write_input` - the exact same path [`Self::handle_key_down`] writes typed
     /// keystrokes through, so a paste is indistinguishable to the child from very fast typing.
     /// Returns whether bytes were actually written.
-    ///
-    /// Framing is [`paste_payload`]'s job; see its docs for why a raw write of the clipboard
-    /// text would be wrong.
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
@@ -1136,11 +841,6 @@ impl TerminalPane {
     }
 
     /// Whether the program running in this pane currently has bracketed paste on (`DECSET 2004`).
-    ///
-    /// Read live off the real terminal mode, never latched - see
-    /// [`crate::terminal::grid::TerminalGrid::bracketed_paste_enabled`]'s own docs. Exposed
-    /// because GitHub issue #288's batched review-note prompt has to *compose itself differently*
-    /// depending on the answer, not merely frame itself differently: see [`Self::send_prompt`].
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.grid.bracketed_paste_enabled()
     }
@@ -1148,27 +848,6 @@ impl TerminalPane {
     /// Delivers `text` into this pane's real pty as **one** prompt, submitted once - the whole of
     /// GitHub issue #288's *"Sending delivers one batched, line-anchored prompt into the target
     /// agent's pty - never one message per note"*.
-    ///
-    /// Returns whether bytes were really written.
-    ///
-    /// ## Why this is not just `paste_from_clipboard` with a `\r` after it
-    ///
-    /// The bytes are framed by [`paste_payload`], exactly as a paste is, and then **one** `\r` -
-    /// [`keystroke_to_bytes`]' own Enter byte - is appended, in the same write, so the child sees
-    /// a paste followed by a single Enter: precisely what a human does. Nothing else in this app
-    /// submits on the user's behalf, so this is the only place that byte is written
-    /// programmatically, and it is written exactly once per call.
-    ///
-    /// The refusal below is the load-bearing part. With bracketed paste **off**, `paste_payload`
-    /// normalises every `\n` to `\r`, and `\r` is Enter: a five-line prompt would arrive as
-    /// **five** submissions. That is not a hypothetical - it is exactly the "one comment at a
-    /// time" behaviour `AUDIT-2026-08-13-competitive-v2.md` §6 top-5 #2 says *"causes the agent to
-    /// swing back and forth"*, i.e. the failure this whole feature exists to prevent, and it would
-    /// look on screen like it had worked. So a payload that could split is refused outright rather
-    /// than sent hopefully. The caller's job is to hand over a form that cannot split;
-    /// [`crate::review_notes::prompt::BatchedPrompt::for_delivery`] takes
-    /// [`Self::bracketed_paste_enabled`] and does exactly that, and this check is what makes that
-    /// contract checked rather than assumed.
     pub fn send_prompt(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if text.is_empty() {
             return false;
@@ -1211,7 +890,6 @@ impl TerminalPane {
             cx.notify();
             return false;
         }
-        // The submit. One byte, once - see this method's own docs.
         if let Err(err) = session.write_input(b"\r") {
             self.spawn_error = Some(format!("failed to write input: {err}"));
             cx.notify();
@@ -1222,12 +900,6 @@ impl TerminalPane {
 
     /// Maps a window-space pointer position onto the grid cell under it, or `None` before this
     /// pane has ever painted (no measured [`Self::content_bounds`] to resolve against yet).
-    ///
-    /// The grid's own origin is the pane's padding box inset by [`PANE_PADDING_PX`] (see
-    /// [`Self::maybe_resize_pty`]'s docs for why `content_bounds` is the padding box), pushed
-    /// down one further line when the spawn-error message is occupying the first rendered line:
-    /// `render` draws that message *above* the grid rows, so ignoring it would shift every
-    /// computed row by one on exactly the panes that show it.
     fn cell_position_at(
         &mut self,
         position: gpui::Point<Pixels>,
@@ -1305,21 +977,6 @@ impl TerminalPane {
     /// alt screen active (GitHub issues #362, #368) - forwards the equivalent number of
     /// PageUp/PageDown presses to the child process instead; see
     /// [`Self::forward_scroll_as_page_keys`]'s own docs for why.
-    ///
-    /// A real `on_scroll_wheel` handler, not GPUI's built-in `overflow_y_scroll`/`track_scroll`
-    /// mechanism every other scrollable region in this app uses (`crate::root::scrollbar`'s own
-    /// docs): this pane paints its own fixed-size cell grid rather than a tall scrollable div of
-    /// child rows (see the module docs), so there is no GPUI-native scrollable content for that
-    /// mechanism to act on - the grid's real "scroll position" is `alacritty_terminal::Term`'s
-    /// own `display_offset`, and only `TerminalGrid::scroll_display` can move it.
-    ///
-    /// A negative `delta.y` (the platform convention for "scrolling down" - the same sign
-    /// `vendor/zed/crates/gpui/src/elements/div.rs`'s own built-in scroll listener adds straight
-    /// onto a `ScrollHandle`'s offset, whose own docs say "negative when scrolled down") scrolls
-    /// toward the live tail; a positive one scrolls up into history - matching
-    /// [`ScrollAmount::Lines`]'s own sign convention, so the delta needs no inversion here. The
-    /// same convention carries over to [`Self::forward_scroll_as_page_keys`]: positive sends
-    /// PageUp, negative sends PageDown.
     fn handle_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1349,35 +1006,6 @@ impl TerminalPane {
     /// [`keystroke_to_bytes`] already produces for a real page-key press, and writes it straight
     /// to the pty (GitHub issues #362, #368) - reusing that one encoder rather than a second,
     /// hand-rolled `\x1b[5~`/`\x1b[6~` literal here, so the two can never drift apart.
-    ///
-    /// **Why the wheel is forwarded at all.** There is no real scrollback grid under the alt
-    /// screen for a wheel event to move (see
-    /// [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs), so the only thing that can
-    /// scroll a full-screen program's view is the program itself - which means synthesising a
-    /// key it understands and handing it over. That much is the standard `alternateScroll`
-    /// behavior xterm/iTerm2/Alacritty/kitty/Windows Terminal all implement.
-    ///
-    /// **Why *page* keys and not arrow keys.** Issue #362 shipped arrow keys, on the reasoning
-    /// that xterm's own `alternateScroll` sends them. That is genuinely what xterm does, and it
-    /// works for a pager-shaped program (`less`, `vim`, `htop`) where an arrow key means "move
-    /// the view by one line". It is the wrong key for a program whose full-screen UI also owns a
-    /// *line editor*, where Up/Down mean "previous/next entry in the prompt history" and moving
-    /// the transcript is a separate, page-keyed action. Claude Code's CLI is exactly that shape,
-    /// and it does not leave this to inference: shown real arrow keys from the wheel, it printed
-    /// its own on-screen hint, **"Scroll wheel is sending arrow keys · use PgUp/PgDn to
-    /// scroll"** - a program telling us, in its own words, which key scrolls it. Page keys are
-    /// also the strictly safer default of the two: PageUp/PageDown navigate content in every
-    /// pager-shaped program too (`less` pages, `vim`'s `Ctrl-B`/`Ctrl-F`, `htop` pages), so no
-    /// program that worked with arrows loses scrolling, while programs that treat arrows as
-    /// cursor/history movement stop being poked in the editor by a scroll gesture.
-    ///
-    /// **Granularity.** One page key per *wheel notch*, not per grid line: a page key moves a
-    /// screenful, so `lines` presses would send a just-perceptible flick several screens away.
-    /// [`WHEEL_LINES_PER_NOTCH`] converts back - a single notch sends exactly one press, and a
-    /// fast flick that accumulated several notches' worth of delta sends proportionally more, so
-    /// the gesture still scales with how hard the human spun the wheel. Never rounds down to
-    /// zero presses: a wheel event that produced a whole line of movement always moves the
-    /// program by at least one page, or a slow scroll would silently do nothing.
     fn forward_scroll_as_page_keys(&mut self, lines: i32) {
         let Some(session) = &self.session else {
             return;
@@ -1417,16 +1045,6 @@ impl TerminalPane {
     /// nothing to jump to: this only ever appears while genuinely showing scrollback, matching
     /// [`crate::root::scrollbar::render_vertical_scrollbar`]'s own "`None` when there's nothing
     /// to act on" convention.
-    ///
-    /// Highlighted (`theme::status::RUN`, the same blue `theme::terminal::CURSOR` already
-    /// paints this pane's own cursor with) once [`Self::new_output_while_scrolled`] has
-    /// latched - real output arrived underneath while the human was reading history, the same
-    /// "something happened while you were looking elsewhere" idea `crate::rail::status`'s own
-    /// attention signal answers for a whole tab, applied here to a single pane's own scroll
-    /// state instead. A plain `text_tooltip` carries the explanation rather than a keycap: no
-    /// new keyboard shortcut is bound to this action (typing while scrolled back already jumps
-    /// back on its own - see `Self::handle_key_down`), so there is no key combo for a keycap to
-    /// show.
     fn render_jump_to_bottom_affordance(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.grid.is_scrolled_back() {
             return None;
@@ -1593,11 +1211,6 @@ impl TerminalPane {
 
     /// Everything this pane's process has really printed that the emulator still holds, capped to
     /// the last `max_lines` - see [`crate::terminal::grid::TerminalGrid::retained_text_lines`].
-    ///
-    /// GitHub issue #227's transcript capture reads this once, at the moment a run ends
-    /// (`crate::run_history::flow::AdeApp::capture_run_transcript`), because that is the last
-    /// moment the run's own output exists anywhere: `Agents::close` shuts the pane down and drops
-    /// the grid with it.
     pub fn retained_text_lines(&self, max_lines: usize) -> Vec<String> {
         self.grid.retained_text_lines(max_lines)
     }
@@ -1903,9 +1516,6 @@ impl TerminalPane {
     /// computes its own terminal's `cell_width` the same way) - not a guess. The height is
     /// [`ROW_LINE_HEIGHT_PX`] directly: [`render_row`] sets that as this pane's explicit
     /// `.line_height()`, so there's nothing to measure for height.
-    ///
-    /// Cached in [`Self::cell_width_px`] after the first successful measurement, falling back
-    /// to [`APPROX_CELL_WIDTH_PX`] only on an outright measurement failure.
     fn cell_size(&mut self, window: &Window) -> Size<Pixels> {
         let width = match self.cell_width_px {
             Some(width) => width,
@@ -1945,54 +1555,6 @@ impl TerminalPane {
     /// whenever the pane's own size changes - not just the window's, since Phase A's
     /// three-zone shell means those are no longer the same thing (see [`size_to_grid`]'s docs
     /// for the bug this distinction fixes).
-    ///
-    /// [`Self::content_bounds`] reflects the *previous* frame's measured bounds (the measuring
-    /// `canvas()` in `render` only fires during paint, after `render` itself returns) - one
-    /// frame stale on the very first resize, self-correcting on the next render (the same
-    /// one-frame lag `vendor/zed/crates/workspace/src/workspace.rs`'s own bounds-measurement
-    /// canvas pattern has). Before any paint has happened, falls back to
-    /// `window.viewport_size()` - too wide, but better than not resizing at all.
-    ///
-    /// [`Self::content_bounds`] itself is the *padding box*, not the content box glyphs render
-    /// into: `render`'s measuring `canvas()` is `.absolute().size_full()` inside the pane root,
-    /// which also carries [`PANE_PADDING_PX`] of padding - an absolutely positioned, size-full
-    /// child sizes against its ancestor's padding box, while the row `div`s (normal flow) are
-    /// laid out inside the *content* box, inset by that padding. Measured proof: an 844x713px
-    /// pane at a 7.2x19.0px cell size computed 117 cols/37 rows from the raw padding-box
-    /// measurement, but only ~115 cols/~36 rows actually fit once [`PANE_PADDING_PX`] (applied
-    /// per side) is subtracted - the extra column/row painted through `overflow_hidden()`.
-    ///
-    /// **The first real measurement discards any scrollback it manufactured (GitHub issue
-    /// #362).** [`Self::new`] spawns the child process (and sizes [`Self::grid`]) at a fixed
-    /// placeholder (`TERMINAL_ROWS`/`TERMINAL_COLS`) before this pane has ever painted once, so
-    /// [`Self::content_bounds`] is still `None` and every resize up to this point has used the
-    /// `window.viewport_size()` guess above - not this pane's own real space, which is normally
-    /// smaller (a tab strip, sidebar, rail, status bar, ... all share the window with it).
-    /// Whatever the child printed while the grid still believed it had the placeholder's -
-    /// usually taller - size can get legitimately evicted into real retained scrollback the
-    /// instant this method applies the smaller, correct size (`alacritty_terminal`'s own
-    /// shrink-resize semantics - see `TerminalGrid::discard_scrollback`'s own docs), even though
-    /// the human never saw it overflow at the size they're actually looking at. Discarding once,
-    /// right here, means a brand-new pane never opens already showing a scrollbar for content
-    /// nobody watched scroll past - while a later *real* resize (an actual window resize, a
-    /// font-size change, both of which reach this same method) still creates real scrollback
-    /// exactly as before, since [`Self::settled_real_size`] only ever latches once.
-    ///
-    /// **That latch has to wait for the pty, not just for the grid (GitHub issue #368).** Issue
-    /// #362's version latched on the first render that had a measured `content_bounds` at all,
-    /// which - measured live against the running app - is frame 2, roughly 16ms after
-    /// [`Self::new`], while [`Self::session`] is *still `None`*: spawning the child is
-    /// asynchronous (see [`Self::spawn_process`], and [`ResizeLatch`]'s own docs for why the
-    /// session side is latched separately). The pty therefore did not exist yet, the child had
-    /// not been forked, and there was nothing whatsoever in the grid - so the discard ran
-    /// against an empty history and then, being one-shot, stopped guarding forever. Everything
-    /// it was written to catch - the child's startup output, produced while the pty is still at
-    /// the `TERMINAL_ROWS`/`TERMINAL_COLS` placeholder because the corrective resize could not
-    /// reach a session that did not exist - happens strictly *after* that. Gating the latch on
-    /// the resize having genuinely reached a live pty (`ResizeLatch::session`, only ever set by
-    /// a `PtySession::resize` that returned `Ok`) moves the discard to the first moment the
-    /// child is actually running at the size the human is looking at, which is the moment the
-    /// guard was always meant to describe.
     fn maybe_resize_pty(&mut self, window: &Window) {
         let raw_size = self
             .content_bounds
@@ -2040,24 +1602,6 @@ impl TerminalPane {
 /// caller-measured `cell_size` a single monospace cell renders at (see
 /// [`TerminalPane::cell_size`]). A pure function of two [`Size<Pixels>`] values, independent
 /// of `Window` or this pane's own state, so it's directly unit-testable (see the tests below).
-///
-/// Two bugs lived here across two phases, both in *what this function was called with*, never
-/// in the arithmetic itself:
-///
-/// - **Phase A: the wrong size.** `TerminalPane::maybe_resize_pty` used to pass the whole
-///   window's `viewport_size()` unconditionally. The three-zone shell's rail/panel/chrome
-///   don't belong to this pane's own content, so at a 1440px window that computed roughly 205
-///   columns even though the real terminal pane is only ~820-840px wide. Fixed by passing the
-///   pane's own measured content-area size (`TerminalPane::content_bounds`) instead.
-/// - **Phase C: the wrong cell size.** `cell_size` was a guessed `APPROX_CELL_WIDTH_PX`/`16.0`
-///   height, neither measured against the real bundled font or this pane's real rendered line
-///   height. Rows had no explicit `.line_height()` before this phase, so GPUI's own default
-///   (`phi()`, the golden ratio, ~19.4px at 12px font) was what actually rendered - ~21% more
-///   than the `16.0` guess, so `maybe_resize_pty` always requested more rows than fit, and the
-///   bottom rows rendered past the pane's `overflow_hidden()` clip. Fixed by making the line
-///   height an explicit fact ([`ROW_LINE_HEIGHT_PX`], set by [`render_row`]) and measuring the
-///   cell width via GPUI's font-metrics API instead of guessing - see
-///   [`TerminalPane::cell_size`]'s docs.
 fn size_to_grid(size: Size<Pixels>, cell_size: Size<Pixels>) -> (u16, u16) {
     let cols = ((size.width.as_f32() / cell_size.width.as_f32()) as u16).max(20);
     let rows = ((size.height.as_f32() / cell_size.height.as_f32()) as u16).max(10);
@@ -2068,32 +1612,6 @@ fn size_to_grid(size: Size<Pixels>, cell_size: Size<Pixels>) -> (u16, u16) {
 /// painted `origin` (top-left of row 0, column 0), the measured `cell_size`, and the grid's
 /// current `rows`/`cols`. Pure - independent of `Window` and this pane's state - so the
 /// pixel-to-cell arithmetic is directly unit-testable, the same split [`size_to_grid`] uses.
-///
-/// Clamped into the grid on every side rather than returning `None` off-grid: a drag that runs
-/// past the last column or below the last row is an ordinary "select to the end" gesture, and
-/// every terminal treats it that way. The clamped-past-the-right-edge case resolves to
-/// [`CellSide::Right`] specifically, so the final column is genuinely *included* in the
-/// selection - `Selection::to_range`'s own `range_simple` drops the last cell when the
-/// selection ends on a cell's left side (`selection.rs:333`).
-///
-/// ## Why one fixed `cell_width` is still correct with double-width characters (issue #211)
-///
-/// A row full of CJK looks like it should break `pixel_x / cell_width`, and it would under a
-/// renderer that painted a wide glyph across two columns *and* still painted the spacer cell after
-/// it. This one doesn't: [`row_runs`] drops spacer cells entirely and [`wide_run_width`] pins a
-/// wide run to exactly `2 * cell_width` per character, so every grid column - wide, spacer, or
-/// narrow - still starts at exactly `column * cell_width`. That invariant is the deliberate reason
-/// `CellWidth::Spacer::columns()` is zero rather than one, it is asserted directly by
-/// `wide_char_render_tests::painted_columns_always_sum_to_the_grid_column_count`, and it is
-/// checked at real painted pixel coordinates end to end by `mouse_selection_tests::
-/// a_drag_after_two_cjk_characters_still_hits_the_columns_it_looks_like_it_hits`. So this stays a
-/// pure function of pixels and cell size, with no need to know the row's contents.
-///
-/// Clicking the *right* half of a wide character resolves to its spacer column, which is what a
-/// real terminal does too - `alacritty_terminal`'s own selection handles that case
-/// (`Selection::contains_cell` includes a wide char whose trailing spacer is selected,
-/// `selection.rs:86`, and `Term::line_to_string` extends a selection that starts on a spacer back
-/// onto the character, `term/mod.rs:584`).
 fn cell_position_in_grid(
     position: gpui::Point<Pixels>,
     origin: gpui::Point<Pixels>,
@@ -2125,16 +1643,6 @@ fn cell_position_in_grid(
 /// Frames clipboard text for writing into a pty, matching
 /// `vendor/zed/crates/terminal/src/terminal.rs`'s own `paste` (`:2306`) rather than writing the
 /// raw string:
-///
-/// - **Bracketed paste on** (`DECSET 2004`, which shells like `zsh`/`fish` and every full-screen
-///   editor turn on): wrap in `ESC[200~`/`ESC[201~` so the program knows this was pasted, not
-///   typed - that is exactly what stops a multi-line paste from auto-executing each line in a
-///   shell, and what lets `vim` skip auto-indent. Any `ESC` inside the pasted text is stripped,
-///   since a payload containing `ESC[201~` could otherwise close the bracket early and have the
-///   rest interpreted as commands.
-/// - **Bracketed paste off**: newlines are normalized to `\r`, the byte the Enter key actually
-///   sends ([`keystroke_to_bytes`]'s own `"enter" => b"\r"`). A raw `\n` is a line *feed*, not a
-///   carriage return, and a shell reading it in canonical mode would not run the line.
 fn paste_payload(text: &str, bracketed_paste: bool) -> String {
     if bracketed_paste {
         format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
@@ -2172,26 +1680,6 @@ struct ResizeActions {
 
 /// Tracks, separately, which `(rows, cols)` [`TerminalGrid`] currently reflects and which
 /// `(rows, cols)` was last successfully sent to a *live* `PtySession::resize`.
-///
-/// This split exists because of an empirically-confirmed bug: a single latched "last size"
-/// field, set unconditionally on every call (including before any `PtySession` existed -
-/// `TerminalPane::new` returns with `session: None`, since spawning is async), meant the very
-/// first render latched a target size while there was no session to resize yet, and every
-/// later call with that same computed size then short-circuited on "already up to date" -
-/// permanently, even once a session appeared. The child pty stayed stuck at its spawn-time
-/// size (`TERMINAL_ROWS`/`TERMINAL_COLS`) forever, diverging from what `TerminalGrid` (and the
-/// rendered UI) believed the size was - confirmed via `stty -F <pty> size` against a live
-/// session. A full-screen, cursor-addressed program (`vim`, `less`, an agent CLI's own UI)
-/// would then paint for the wrong dimensions.
-///
-/// [`Self::grid`] is latched unconditionally (resizing `TerminalGrid` can't fail), but
-/// [`Self::session`] is latched only by [`Self::session_resize_succeeded`] - called by
-/// `TerminalPane::resize_to` only once `PtySession::resize` has returned `Ok`. A target size
-/// computed before a session exists therefore never gets latched as "session in sync", so
-/// `TerminalPane::spawn_process`'s success callback re-running `resize_to` at that same cached
-/// target genuinely reaches the pty instead of being skipped.
-/// A `(rows, cols)` pair - named so [`TerminalPane::resize_sync_state_for_test`]'s return type
-/// doesn't trip clippy's `type_complexity` lint on a bare nested tuple-of-tuples.
 type GridDims = (u16, u16);
 
 #[derive(Debug, Default)]
@@ -2315,10 +1803,6 @@ fn pack_rgb((r, g, b): (u8, u8, u8)) -> u32 {
 
 /// One [`theme::ColorToken`], resolved against whichever theme is really live right now and
 /// reduced to the 8-bit-per-channel RGB triple [`TerminalPalette`] carries.
-///
-/// 8-bit is the terminal's real precision on both ends - `alacritty_terminal` hands back `u8`
-/// channels for a program-specified colour, and a theme file stores `#rrggbb` - so nothing is lost
-/// here that the grid could have represented anyway.
 fn token_rgb(token: theme::ColorToken) -> (u8, u8, u8) {
     let color = token.resolve();
     let channel = |component: f32| (component.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -2327,14 +1811,6 @@ fn token_rgb(token: theme::ColorToken) -> (u8, u8, u8) {
 
 /// The live theme's real terminal palette (GitHub issue #208) - `crate::theme::terminal`'s twenty
 /// registered tokens resolved against whichever theme is installed right now.
-///
-/// This is the one place the terminal's colours cross from the theme system into
-/// `crate::terminal::grid`, which is deliberately theme-free (see that module's own docs). Called
-/// fresh inside [`Render::render`] rather than cached on the pane: `crate::theme`'s resolution is a
-/// single hash lookup per token, and `AdeApp::apply_theme_selection` already forces a repaint of
-/// every window when the selection changes (`App::refresh_windows`), so reading it at paint time
-/// means a theme switch lands on the very next frame with no invalidation hook of its own to
-/// forget.
 fn theme_terminal_palette() -> TerminalPalette {
     TerminalPalette {
         background: token_rgb(theme::terminal::BACKGROUND),
@@ -2464,22 +1940,6 @@ struct LinkSpanPaint {
 /// `color:#7fb4e3;border-bottom:1px dotted #3d6a91`, hover `color:#a5cdf0;border-bottom:1px
 /// solid #78a8d0`. The link's fixed colour always replaces whatever ANSI colour the underlying
 /// cells had, matching the mockup.
-///
-/// GPUI's `BorderStyle` enum has exactly two variants, `Solid`/`Dashed`
-/// (`vendor/zed/crates/gpui/src/scene.rs:597`) - no `Dotted`. `.border_dashed()` is the
-/// closest honest match to the design's dotted underline; the hover state switches it back to
-/// `Solid` via `Styled::style()` directly, since `Styled` exposes no `.border_solid()`
-/// counterpart.
-///
-/// The click gesture requires holding the platform `secondary` modifier (`⌘` on macOS, `Ctrl`
-/// elsewhere - the modifier the pane header's `mod + click a path to open it` hint
-/// advertises) rather than firing on a bare click, so an ordinary click inside the terminal
-/// (still needed for input focus) is never hijacked into a navigation; a bare click on a link
-/// span still bubbles up to the pane's own root `on_click` (focus), unchanged.
-///
-/// Checks [`click_included_secondary_modifier`] rather than the simpler
-/// `event.modifiers().secondary()` - see that function's docs for the bug that distinction
-/// fixes.
 fn render_link_span(
     text: String,
     link: &LinkMatch,
@@ -2524,15 +1984,6 @@ fn render_link_span(
 
 /// Whether a click held the platform `secondary` modifier at *either* mouse-down or mouse-up,
 /// not just mouse-up.
-///
-/// `ClickEvent::modifiers()` (`vendor/zed/crates/gpui/src/interactive.rs:296-306`) only
-/// reports the modifiers held at mouse-*up* - documented GPUI behavior, but wrong for this
-/// call site: holding Ctrl, clicking, and releasing Ctrl a moment before releasing the mouse
-/// button is an ordinary way to click-and-modify, and checking mouse-up alone silently drops
-/// it. [`ClickEvent::Mouse`] carries both `MouseDownEvent` and `MouseUpEvent`
-/// (`vendor/zed/crates/gpui/src/interactive.rs:211-217`), each with their own `modifiers`
-/// field, so this checks both. `Keyboard`/`Touch` click variants have no modifiers at all, so
-/// this defers to `ClickEvent::modifiers()` for them.
 fn click_included_secondary_modifier(event: &ClickEvent) -> bool {
     match event {
         ClickEvent::Mouse(mouse) => {
@@ -2563,14 +2014,6 @@ struct RowRun {
 /// Splits one grid row into the runs [`render_row`] paints - pure, so the whole wide-character
 /// layout contract is unit-testable with no GPUI window (see this module's
 /// `wide_char_render_tests`).
-///
-/// Spacer cells are dropped up front (GitHub issue #211), which does two things at once:
-///
-/// - They contribute no glyph, so a double-width character is no longer followed by a stray blank
-///   column pushing the rest of the row right.
-/// - Everything downstream sees the row's *real* text. In particular `find_links` runs against
-///   `日本/x.rs` rather than `日 本 /x.rs`, and [`split_segments`]'s char offsets keep indexing
-///   one painted cell each - the contract `crate::terminal::links::LinkMatch` is built on.
 fn row_runs(row: &[GridCell]) -> Vec<RowRun> {
     let cells: Vec<&GridCell> = row
         .iter()
@@ -2626,16 +2069,6 @@ fn row_runs(row: &[GridCell]) -> Vec<RowRun> {
 
 /// The explicit pixel width a run must be pinned to, or `None` for an ordinary narrow run that
 /// can just take its glyphs' natural advance (GitHub issue #211).
-///
-/// A double-width character owns exactly two grid columns, but nothing guarantees the font
-/// actually advances by two monospace cells for it - a CJK ideograph in the bundled mono face
-/// usually does, an emoji resolved through font fallback does not (measured: Segoe UI Emoji
-/// overshoots, and before `whitespace_nowrap()` was added the overshoot made a fixed-width span
-/// *wrap*, dropping the last emoji of a run onto a line of its own). Pinning each wide character
-/// to `2 * cell_width` makes the row's column grid exact regardless of which face the glyph came
-/// from; `flex_none()` stops the row's flex layout from shrinking the box back, and
-/// `whitespace_nowrap()` stops an overshooting glyph from reflowing out of it (both applied at the
-/// span-building call sites).
 fn wide_run_width(run: &RowRun, cell_width: Pixels) -> Option<Pixels> {
     (run.style.width == CellWidth::Wide).then(|| cell_width * run.columns as f32)
 }
@@ -2647,9 +2080,6 @@ fn wide_run_width(run: &RowRun, cell_width: Pixels) -> Option<Pixels> {
 /// Additionally splits any run that contains a detected link
 /// (`crate::terminal::links::find_links`, via the pure [`split_segments`]) into its own
 /// clickable span - see [`render_link_span`]'s docs.
-///
-/// All of the row-splitting decisions live in the pure [`row_runs`]; this only turns each run
-/// into an element, applying [`wide_run_width`] to the double-width ones.
 fn render_row(
     row: &[GridCell],
     row_index: usize,
@@ -2938,17 +2368,6 @@ mod cadence_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// The mutation this exists to catch - this project's recurring stale-state bug class,
-    /// applied to this exact loop: hoisting the `is_foreground` read out of the poll loop
-    /// (capturing it once at spawn) instead of reading it fresh every tick. All the pure
-    /// [`tick_cadence`] tests below would still pass under that mutation; this one fails,
-    /// because a pane spawned foreground (the only way panes spawn) would then keep draining
-    /// on 8ms ticks forever, and the "nothing may drain in less than one background interval"
-    /// window asserted here would see the Ctrl-L echo arrive early.
-    ///
-    /// Deterministic despite the real pty: the *arrival* of the echo into pty-core's channel
-    /// takes real wall time (covered by a real sleep, generously sized), but the *drain* only
-    /// happens on poll ticks, and those are driven purely by the test executor's fake clock.
     #[gpui::test]
     fn a_background_pane_drains_on_the_background_interval_read_fresh_each_tick(
         cx: &mut TestAppContext,
@@ -3198,9 +2617,6 @@ mod resize_tests {
         assert!(!actions.resize_session);
     }
 
-    /// The exact regression this whole module exists to prevent: a target size computed
-    /// before any session exists must still trigger a real session resize once one
-    /// appears, not be silently treated as already in sync.
     #[test]
     fn a_size_computed_before_any_session_exists_is_retried_once_one_appears() {
         let mut latch = ResizeLatch::default();
@@ -3296,11 +2712,6 @@ mod eof_poll_tests {
         }
     }
 
-    /// Empirical proof (no GPUI needed) that the race `eof_poll_decision` exists to handle is
-    /// genuine: a child that closes its own pty-attached stdio before actually exiting causes
-    /// the output channel to disconnect while the process is still alive - a single
-    /// non-blocking `try_wait` at that moment legitimately observes nothing, and only a later
-    /// retry observes the real exit status.
     #[test]
     fn real_process_closing_pty_fds_before_exiting_is_not_yet_reaped_at_eof() {
         let mut session = pty_core::spawn(
@@ -3395,17 +2806,6 @@ mod keystroke_tests {
         assert_eq!(keystroke_to_bytes(&ks), Some(b"n".to_vec()));
     }
 
-    /// Direct proof of the control-byte mapping alone: this mapping sends the standard readline
-    /// "previous history" control byte (`0x10`) a focused terminal needs to receive, independent
-    /// of whether GPUI's own dispatch ever actually lets a Ctrl+P keystroke reach this pane's
-    /// `on_key_down` to be mapped. It no longer does in practice: `secondary-p` is now
-    /// `TogglePalette`'s own real, unscoped global keybinding (see
-    /// `crate::default_key_bindings`'s docs for the accepted tradeoff), so GPUI's action dispatch
-    /// intercepts a focused terminal's Ctrl+P before this mapping is ever consulted. Mirrors
-    /// `crate::root::focus::tab_strip_keybinding_tests::
-    /// ctrl_p_opens_the_palette_even_while_a_terminal_is_focused`: that test proves the app-level
-    /// dispatch *does* now intercept it; this one just pins that the pure byte-mapping function
-    /// itself is unchanged, for whatever unmodified-by-a-global-binding context still reaches it.
     #[test]
     fn ctrl_p_maps_to_the_real_readline_previous_history_control_byte() {
         let modifiers = Modifiers {
@@ -3421,15 +2821,6 @@ mod keystroke_tests {
         );
     }
 
-    /// Direct proof of the control-byte mapping `TextUndo`/`TextRedo`'s `Some("text-input")`
-    /// scoping depends on: no terminal surface ever carries `"text-input"`, specifically because
-    /// `secondary-z` resolves to plain `Ctrl+Z` on Linux/Windows, and this mapping sends the real
-    /// `SIGTSTP` terminal-suspend control byte (`0x1a`) a focused interactive program relies on.
-    /// Mirrors `ctrl_p_maps_to_the_real_readline_previous_history_control_byte` and
-    /// `crate::root::focus::text_undo_scoping_tests`'s own
-    /// `secondary_z_with_a_terminal_focused_does_not_reach_text_undo`: that test proves the
-    /// scoped dispatch doesn't intercept it; this one proves what reaches the pty once it
-    /// doesn't.
     #[test]
     fn ctrl_z_maps_to_the_real_sigtstp_control_byte() {
         let modifiers = Modifiers {
@@ -3445,12 +2836,6 @@ mod keystroke_tests {
         );
     }
 
-    /// Regression test for GitHub issue #236: Shift+Tab silently sent the exact same byte as
-    /// plain Tab, so any CLI relying on the standard back-tab sequence to detect Shift+Tab
-    /// (readline-based tools, Claude Code's own mode-cycling shortcut) never saw it and did
-    /// nothing. Pinning both mappings side by side in one test is the point - it's not enough
-    /// for Shift+Tab to produce *something*, it must produce something a real terminal would
-    /// never also produce for plain Tab.
     #[test]
     fn shift_tab_sends_the_real_back_tab_sequence_distinct_from_plain_tab() {
         let plain = keystroke("tab", Modifiers::default());
@@ -3482,11 +2867,6 @@ mod keystroke_tests {
         );
     }
 
-    /// Ctrl+Shift+Tab is deliberately left alone by the back-tab fix above: it still falls
-    /// through to the plain `"tab"` match arm and sends `\t`, exactly as it did before GitHub
-    /// issue #236 was fixed. This pins that the fix's `!modifiers.control` guard actually does
-    /// what its comment says, rather than back-tab semantics silently spreading to a modifier
-    /// combination nobody asked for.
     #[test]
     fn ctrl_shift_tab_is_unaffected_by_the_back_tab_fix() {
         let ks = keystroke(
@@ -3526,13 +2906,8 @@ mod link_segment_tests {
         assert_eq!(segments, vec![RowSegment::Plain { start: 0, end: 10 }]);
     }
 
-    /// The CHANGELOG's contract: "a line is authored as `[prefix, colour, link, suffix]` - the
-    /// link is a span inside the line, not a whole-line style". A link in the middle of an
-    /// otherwise plain row must split it into a plain prefix, the link, and a plain suffix -
-    /// never a whole-row link, and never dropping the surrounding plain text.
     #[test]
     fn a_link_in_the_middle_splits_into_prefix_link_suffix_not_a_whole_line_style() {
-        // `"  \u{21b3} tests/upload.rs:88:"` - the link spans chars 4..19 (`tests/upload.rs:88`).
         let links = [link(4, 19, "tests/upload.rs")];
         let segments = split_segments(20, &links);
         assert_eq!(
@@ -3627,12 +3002,6 @@ mod clear_pty_signal_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// End-to-end proof that `clear()` signals the child process: a [`TerminalPane`] backed by
-    /// a real `cat` child on a real pty, [`TerminalPane::clear`] called, and what this test
-    /// observes is the pty's own cooked-mode line-discipline echo - not a direct assertion
-    /// that `write_input` was called, but its round-tripped effect landing back in the grid.
-    /// With `ECHOCTL` (the standard-on-Linux termios default), the raw `0x0c` byte `clear()`
-    /// writes is echoed back as the two printable characters `^L`.
     #[gpui::test]
     fn clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back(cx: &mut TestAppContext) {
         let pane = cx.new(|cx| {
@@ -3890,9 +3259,6 @@ mod cell_position_tests {
         );
     }
 
-    /// The side is what decides whether the cell under the pointer is included in the selection
-    /// at all (`Selection::to_range`'s `range_simple` drops a cell the selection ends left of),
-    /// so the half-cell boundary is real behavior, not a detail.
     #[test]
     fn the_right_half_of_a_cell_reports_the_right_side() {
         assert_eq!(at(35.0, 0.0).side, CellSide::Right);
@@ -3922,8 +3288,6 @@ mod cell_position_tests {
         assert_eq!(at(0.0, 10_000.0).row, 23);
     }
 
-    /// Dragging back above/left of the grid origin (a real gesture - the pointer leaves the
-    /// pane) must clamp to the first cell rather than underflow into a huge `usize`.
     #[test]
     fn a_position_above_and_left_of_the_origin_clamps_to_the_first_cell() {
         let position = cell_position_in_grid(
@@ -3937,8 +3301,6 @@ mod cell_position_tests {
         assert_eq!(position.column, 0);
     }
 
-    /// A failed font measurement can only produce a zero cell size; dividing by it would make
-    /// every index `inf as usize`. Guarded rather than left to chance.
     #[test]
     fn a_degenerate_zero_cell_size_does_not_produce_a_garbage_index() {
         let position = cell_position_in_grid(
@@ -3981,8 +3343,6 @@ mod paste_payload_tests {
         );
     }
 
-    /// The real reason `ESC` is stripped: a payload carrying its own `ESC[201~` would close the
-    /// bracket early and have everything after it interpreted as typed input.
     #[test]
     fn a_pasted_escape_cannot_close_the_bracket_early() {
         let payload = paste_payload("safe\x1b[201~rm -rf /", true);
@@ -4038,9 +3398,6 @@ mod clipboard_tests {
         assert_eq!(text.as_deref(), Some("world"));
     }
 
-    /// Copy with nothing selected must leave the clipboard alone. Overwriting it with `""` (the
-    /// obvious way to write this) would silently destroy whatever the user copied last, every
-    /// time they hit the shortcut out of habit.
     #[gpui::test]
     fn copying_with_no_selection_leaves_the_clipboard_untouched(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
@@ -4058,11 +3415,6 @@ mod clipboard_tests {
         assert_eq!(text.as_deref(), Some("keep me"));
     }
 
-    /// End-to-end proof that paste reaches the *child process*, observed the same way
-    /// [`clear_pty_signal_tests`] proves `clear()`'s byte does: a real `cat` on a real pty
-    /// echoes back what it is fed, so the pasted text appearing in the grid is round-tripped
-    /// evidence the bytes genuinely left the app, not an assertion that `write_input` was
-    /// called.
     #[gpui::test]
     fn pasting_writes_the_real_clipboard_text_to_the_real_pty(cx: &mut TestAppContext) {
         let pane = new_pane(cx, "cat");
@@ -4102,13 +3454,6 @@ mod clipboard_tests {
 }
 
 /// GitHub issue #288's delivery mechanism, against a real pty and a real child process.
-///
-/// [`TerminalPane::send_prompt`] is the only place this app ever types on the user's behalf, and
-/// the one property the whole review-notes feature rests on is that a batch arrives as **one**
-/// message. Both halves are checked here for real: the bytes genuinely leave the app (observed
-/// through a real `cat`'s own echo, the same way `clipboard_tests` and `clear_pty_signal_tests`
-/// observe theirs), and the refusal that stops a batch from silently becoming N messages really
-/// fires.
 #[cfg(test)]
 mod send_prompt_tests {
     use super::*;
@@ -4151,8 +3496,6 @@ mod send_prompt_tests {
         }
     }
 
-    /// The real thing: a child that turns bracketed paste on (exactly as an agent's full-screen
-    /// TUI does) receives a real multi-line batch, in one write, and echoes it back.
     #[gpui::test]
     fn a_multi_line_batch_reaches_a_real_pty_whose_child_has_bracketed_paste_on(
         cx: &mut TestAppContext,
@@ -4198,10 +3541,6 @@ mod send_prompt_tests {
         );
     }
 
-    /// The refusal. Without bracketed paste, `paste_payload` turns every `\n` into the Enter
-    /// byte, so a multi-line batch would arrive as several separate messages - the exact "one
-    /// comment at a time" failure the audit says makes an agent swing back and forth. It must be
-    /// refused outright, and nothing may reach the child.
     #[gpui::test]
     fn a_multi_line_batch_is_refused_when_the_child_has_bracketed_paste_off(
         cx: &mut TestAppContext,
@@ -4243,9 +3582,6 @@ mod send_prompt_tests {
         });
     }
 
-    /// The other half of the same rule: the single-line delivery form
-    /// (`BatchedPrompt::for_delivery(false)`) really is accepted and really does arrive, so the
-    /// refusal above is a guard on a genuine hazard rather than a blanket block.
     #[gpui::test]
     fn the_single_line_form_is_delivered_to_a_child_with_bracketed_paste_off(
         cx: &mut TestAppContext,
@@ -4280,10 +3616,6 @@ mod send_prompt_tests {
 /// GitHub issue #158's mouse half, end to end through real GPUI event dispatch: before this,
 /// `TerminalPane` registered no mouse-down/move/up handlers at all, so no amount of dragging
 /// produced a selection and "copy" would have had nothing to copy even with a binding in place.
-///
-/// Backed by a real `cat` child rather than a shell: `cat` writes nothing of its own, so the
-/// grid contains exactly the injected bytes and the pixel geometry the drag is computed from
-/// can't be moved out from under the test by a prompt arriving mid-run.
 #[cfg(test)]
 mod mouse_selection_tests {
     use super::*;
@@ -4379,8 +3711,6 @@ mod mouse_selection_tests {
         );
     }
 
-    /// A plain click is how a user dismisses a selection, and it must not leave a one-character
-    /// one behind.
     #[gpui::test]
     fn a_plain_click_clears_a_previous_selection(cx: &mut TestAppContext) {
         let (pane, cx, bounds, cell_size) = painted_pane(cx);
@@ -4405,8 +3735,6 @@ mod mouse_selection_tests {
         );
     }
 
-    /// Moving the mouse over the terminal with no button held must never start or extend a
-    /// selection - the drag has to be gated on a real mouse-down having happened.
     #[gpui::test]
     fn hovering_without_a_button_held_selects_nothing(cx: &mut TestAppContext) {
         let (pane, cx, bounds, cell_size) = painted_pane(cx);
@@ -4429,8 +3757,6 @@ mod mouse_selection_tests {
         );
     }
 
-    /// A drag repaints the cells it covers - the flag has to survive all the way into what
-    /// `render_row` consumes, or the user gets no visual feedback at all while dragging.
     #[gpui::test]
     fn a_drag_marks_the_covered_cells_selected_for_the_renderer(cx: &mut TestAppContext) {
         let (pane, cx, bounds, cell_size) = painted_pane(cx);
@@ -4457,23 +3783,12 @@ mod mouse_selection_tests {
         assert_eq!(flagged, "hello");
     }
 
-    /// GitHub issue #211's mouse-math half, end to end through real GPUI event dispatch at real
-    /// painted pixel coordinates.
-    ///
-    /// `cell_position_in_grid` divides by a single fixed `cell_width`, which would be wrong for
-    /// any row where painted x offsets stopped matching `column * cell_width`. They don't: a wide
-    /// cell paints two columns and its spacer paints none (see `CellWidth::columns`), so the
-    /// offsets stay exact - and *this* is what proves it, by dragging over the `"world"` that
-    /// sits four grid columns (two CJK characters) into the row and getting exactly `"world"`
-    /// back. Under the pre-fix renderer those two characters painted six columns' worth of
-    /// glyphs, so the same pixel positions landed two columns early.
     #[gpui::test]
     fn a_drag_after_two_cjk_characters_still_hits_the_columns_it_looks_like_it_hits(
         cx: &mut TestAppContext,
     ) {
         let (pane, cx, bounds, cell_size) = painted_pane_showing(cx, "你好world".as_bytes());
 
-        // `你好` occupies grid columns 0..=3, so `world` is columns 4..=8.
         let start = point(
             bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 4.1,
             cell_centre(bounds, cell_size, 0, 4).y,
@@ -4495,8 +3810,6 @@ mod mouse_selection_tests {
         );
     }
 
-    /// Dragging over the wide characters themselves - including across the second (spacer) column
-    /// of the last one - must copy them once each, with no emulator-written padding spaces.
     #[gpui::test]
     fn a_drag_over_cjk_characters_copies_them_once_each(cx: &mut TestAppContext) {
         let (pane, cx, bounds, cell_size) = painted_pane_showing(cx, "你好world".as_bytes());
@@ -4525,22 +3838,6 @@ mod mouse_selection_tests {
 
 /// GitHub issue #211's *input* half - real UTF-8 going **into** the pty rather than coming out of
 /// it.
-///
-/// Reading the real path end to end turned up nothing broken to fix, and these exist to keep it
-/// that way rather than to fix anything: [`keystroke_to_bytes`] hands
-/// `gpui::Keystroke::key_char`'s own `String` straight to `str::as_bytes`, [`paste_payload`]'s
-/// `str::replace` calls are all char-oriented, and `pty_core::PtySession::write_input` copies the
-/// slice into a `Vec<u8>` that its writer thread `write_all`s. Nothing on that path is
-/// byte-indexed, length-capped, or `char`-typed, so a three-byte CJK character and a
-/// multi-codepoint ZWJ emoji sequence are as safe as ASCII. Regression coverage matters anyway,
-/// since any of those three could grow a `.chars().next()`-shaped shortcut later.
-///
-/// One real limitation, stated plainly rather than papered over: this covers keys that arrive as a
-/// finished `key_char`, which is what a direct (including AltGr/dead-key) keypress produces.
-/// Composing text through a platform IME - the normal way CJK is *typed* - goes through GPUI's
-/// `EntityInputHandler`/`Window::set_input_handler` machinery instead, which this pane does not
-/// implement at all. That is a separate, larger piece of work than this issue, and it is untouched
-/// here; pasting CJK works today, typing it through an IME does not.
 #[cfg(test)]
 mod utf8_input_tests {
     use super::*;
@@ -4554,8 +3851,6 @@ mod utf8_input_tests {
         }
     }
 
-    /// A three-byte character must reach the pty as all three of its bytes, in order - not as one
-    /// truncated byte, and not as a replacement character.
     #[test]
     fn a_multi_byte_character_is_forwarded_as_its_exact_utf8_bytes() {
         assert_eq!(
@@ -4569,9 +3864,6 @@ mod utf8_input_tests {
         );
     }
 
-    /// A grapheme cluster made of several codepoints (here a ZWJ family emoji: three emoji joined
-    /// by U+200D) arrives as one `key_char` string and must be forwarded whole. Truncating to the
-    /// first `char` would send a lone `👨`.
     #[test]
     fn a_multi_codepoint_grapheme_cluster_is_forwarded_whole() {
         let family = "👨\u{200d}👩\u{200d}👧";
@@ -4582,8 +3874,6 @@ mod utf8_input_tests {
         );
     }
 
-    /// Paste framing is `str`-level throughout, so it must not disturb multi-byte text either -
-    /// in both bracketed and unbracketed mode.
     #[test]
     fn paste_framing_leaves_multi_byte_text_byte_for_byte_intact() {
         let text = "日本語 🎉";
@@ -4594,11 +3884,6 @@ mod utf8_input_tests {
         );
     }
 
-    /// The real round trip, through everything: a real `KeyDownEvent` into the pane's own
-    /// `handle_key_down`, out through `PtySession::write_input`'s writer thread to a real pty, and
-    /// back as a real `cat` process's echo - which the grid then parses as real UTF-8. What is
-    /// asserted is the character landing in the grid as a genuine wide cell, so nothing along that
-    /// path can have mangled the bytes.
     #[gpui::test]
     fn typing_a_cjk_character_round_trips_through_a_real_pty_as_a_wide_cell(
         cx: &mut TestAppContext,
@@ -4665,10 +3950,6 @@ mod utf8_input_tests {
 /// (roughly two-advance) glyph *plus* the blank spacer cell `alacritty_terminal` writes after it -
 /// three columns of paint for two columns of grid, and every character after it on the row shifted
 /// right.
-///
-/// These drive real UTF-8 through a real `TerminalGrid` (the same `alacritty_terminal` parser
-/// production uses) and assert on [`row_runs`], which is genuinely what `render_row` turns into
-/// elements - not a re-derivation of the layout a second way.
 #[cfg(test)]
 mod wide_char_render_tests {
     use super::*;
@@ -4683,10 +3964,6 @@ mod wide_char_render_tests {
             .expect("a two-row grid always has a row 0")
     }
 
-    /// The invariant the whole design rests on, and the reason `cell_position_in_grid`'s fixed
-    /// `pixel_x / cell_width` arithmetic needed no change: however many wide characters a row
-    /// contains, the painted columns still add up to exactly the grid's own column count, so the
-    /// x offset of grid column `k` is always `k * cell_width`.
     #[test]
     fn painted_columns_always_sum_to_the_grid_column_count() {
         for bytes in [
@@ -4707,8 +3984,6 @@ mod wide_char_render_tests {
         }
     }
 
-    /// The bug itself: the spacer cell must contribute no glyph. Painting the whole row's runs
-    /// back to a string has to give the characters the program actually printed, once each.
     #[test]
     fn a_spacer_cell_contributes_no_glyph_of_its_own() {
         let runs = row_runs(&row_zero("你好world", 20));
@@ -4720,9 +3995,6 @@ mod wide_char_render_tests {
         );
     }
 
-    /// Every wide character is its own two-column run - never merged with the next one, so a glyph
-    /// whose real advance overshoots two cells can't accumulate that overshoot across a run.
-    /// Narrow text still merges into as few runs as possible.
     #[test]
     fn each_wide_character_is_its_own_two_column_run() {
         let runs = row_runs(&row_zero("你好world", 20));
@@ -4742,8 +4014,6 @@ mod wide_char_render_tests {
         );
     }
 
-    /// The pixel width a wide run is pinned to, and the fact a narrow one is left unpinned (it can
-    /// use its glyphs' natural monospace advance, which is already correct).
     #[test]
     fn only_a_wide_run_gets_an_explicit_pixel_width() {
         let runs = row_runs(&row_zero("你好world", 20));
@@ -4751,8 +4021,6 @@ mod wide_char_render_tests {
         assert_eq!(wide_run_width(&runs[2], px(8.0)), None);
     }
 
-    /// A narrow run and a wide run can never be merged, whatever their colours - the merged span
-    /// would be sized for the wrong number of columns.
     #[test]
     fn a_wide_run_never_merges_into_the_narrow_text_around_it() {
         let runs = row_runs(&row_zero("a好b", 20));
@@ -4762,13 +4030,9 @@ mod wide_char_render_tests {
             .collect();
         assert_eq!(shapes[0], ("a", 1));
         assert_eq!(shapes[1], ("好", 2));
-        // The trailing run is `b` plus the row's blank remainder.
         assert_eq!(&shapes[2].0[..1], "b");
     }
 
-    /// Link detection has to see the row's real text, not the emulator's padding. With the spacer
-    /// cells still in the row text this reads `/tmp/日 本 /main.rs`, whose space breaks the path
-    /// apart; the link then either fails to match or matches the wrong span.
     #[test]
     fn a_link_containing_wide_characters_is_still_detected_as_one_link() {
         let runs = row_runs(&row_zero("see /tmp/日本/main.rs:12 ok", 40));
@@ -4791,9 +4055,6 @@ mod wide_char_render_tests {
         assert_eq!(link_text, "/tmp/日本/main.rs:12");
     }
 
-    /// A link sitting *after* a wide character still gets its own span, and the plain text around
-    /// it is preserved - i.e. `split_segments`'s char offsets and the painted cells stayed in
-    /// lockstep once the spacers were dropped.
     #[test]
     fn a_link_after_a_wide_character_still_lands_on_the_right_characters() {
         let runs = row_runs(&row_zero("好 src/main.rs done", 40));
@@ -4805,13 +4066,10 @@ mod wide_char_render_tests {
         assert_eq!(painted.trim_end(), "好 src/main.rs done");
     }
 
-    /// Selection is still carried per wide character - a run that lost the flag halfway would
-    /// paint the selection fill across characters that aren't selected.
     #[test]
     fn the_selection_flag_survives_onto_the_wide_characters_it_covers() {
         let mut grid = TerminalGrid::new(2, 20);
         grid.append_bytes("你好世界".as_bytes());
-        // Columns 0..=3 are `你好` (each a wide cell plus its spacer).
         grid.start_selection(CellPosition {
             row: 0,
             column: 0,
@@ -4839,8 +4097,6 @@ mod wide_char_render_tests {
             || run.columns == 2 && run.text.chars().count() == 1));
     }
 
-    /// `visible_text_lines` backs the rail's question preview, which is plain text a human reads -
-    /// it must not carry the emulator's padding spaces either.
     #[gpui::test]
     fn the_plain_text_view_of_the_grid_drops_the_padding_spaces(cx: &mut gpui::TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
@@ -4865,14 +4121,6 @@ mod wide_char_render_tests {
 
 /// GitHub issue #208, end to end through a real painted GPUI window: the integrated terminal's own
 /// rendered colours must follow the selected theme.
-///
-/// Before this, `crate::terminal::grid` held them as module constants (VS Code's own default
-/// terminal palette), so every one of this app's six themes rendered the terminal identically - a
-/// `#1e1e1e` rectangle sitting inside a `#0d0f11` app, unchanged by switching to the light theme.
-///
-/// These assert on [`TerminalPane::last_painted_palette_for_test`], which `Render::render` itself
-/// writes - so what is checked is the palette a real paint genuinely used, not one this test
-/// re-derived a second way.
 #[cfg(test)]
 mod terminal_theme_tests {
     use super::*;
@@ -4930,10 +4178,6 @@ mod terminal_theme_tests {
         (pane, cx)
     }
 
-    /// `crate::terminal::grid` stays theme-free, so it carries its own transcription of Jerry
-    /// Dark's terminal palette. This is what stops that copy from going stale: with no theme
-    /// installed (the real Jerry Dark identity case), resolving the real tokens must produce
-    /// exactly it.
     #[test]
     fn the_pure_grid_default_palette_is_exactly_jerry_darks_own() {
         assert!(
@@ -4948,9 +4192,6 @@ mod terminal_theme_tests {
         );
     }
 
-    /// The headline behaviour. The *same* pane, painted twice, must genuinely change colour when
-    /// the theme changes - and land on the light theme's own real values, not merely on something
-    /// different.
     #[gpui::test]
     fn switching_to_the_light_theme_really_repaints_the_terminal_light(cx: &mut TestAppContext) {
         let (pane, cx) = painted_pane(cx, b"hello world");
@@ -4998,8 +4239,6 @@ mod terminal_theme_tests {
         );
     }
 
-    /// Two visually distinct *dark* themes must differ too - a guard against a fix that only
-    /// happened to work because one bundled theme inverts lightness.
     #[gpui::test]
     fn two_different_dark_themes_paint_two_different_terminals(cx: &mut TestAppContext) {
         let (pane, cx) = painted_pane(cx, b"hello world");
@@ -5030,9 +4269,6 @@ mod terminal_theme_tests {
         );
     }
 
-    /// A colour the *running program* asked for by name (`SGR 32`, "green") has to come out of the
-    /// theme's own palette too, not only the pane's default fill and text - that is the half a fix
-    /// that only retinted the background would miss entirely.
     #[gpui::test]
     fn a_named_ansi_colour_is_painted_from_the_themes_own_palette(cx: &mut TestAppContext) {
         let (pane, cx) = painted_pane(cx, b"\x1b[32mOK\x1b[0m");
@@ -5057,8 +4293,6 @@ mod terminal_theme_tests {
         );
     }
 
-    /// Unstyled text - the overwhelming majority of what a terminal paints - must take the theme's
-    /// foreground, and an unstyled cell's background must be the theme's terminal background.
     #[gpui::test]
     fn unstyled_output_takes_the_themes_own_foreground_and_background(cx: &mut TestAppContext) {
         let (pane, cx) = painted_pane(cx, b"plain");
@@ -5141,15 +4375,6 @@ mod scrollback_pane_tests {
 
     /// Pumps real poll ticks until `predicate` sees the pty round-trip land, or until a generous
     /// cap is reached, then returns the joined visible text.
-    ///
-    /// Every test in this module that observes forwarded bytes does it by letting a real child
-    /// process echo them back, which is a real kernel pty round-trip: the write has to reach the
-    /// child, the child has to be scheduled, and its reply has to come back through the poll
-    /// loop. A fixed tick count is therefore a wall-clock assumption, and this workspace has a
-    /// documented history of exactly that going flaky under heavy concurrent test load. Waiting
-    /// on the *condition* instead - with a cap so a genuine regression still fails, and fails
-    /// fast - removes the assumption without weakening a single assertion: every caller still
-    /// asserts the exact byte counts afterwards.
     fn drain_until(
         pane: &gpui::Entity<TerminalPane>,
         cx: &mut gpui::VisualTestContext,
@@ -5195,10 +4420,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// Real proof PageUp/PageDown are claimed *before* `keystroke_to_bytes`/`PtySession::
-    /// write_input`, not just that the grid's own offset happens to move: a real `cat` process
-    /// echoes back anything it receives on stdin, so if PageUp were (wrongly) also forwarded as
-    /// pty input, the grid would show a stray echoed byte on the next tick.
     #[gpui::test]
     fn page_up_never_reaches_the_real_pty(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5284,7 +4505,6 @@ mod scrollback_pane_tests {
         });
         assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 3);
 
-        // Scrolling back down (negative delta) must move back toward live by the same amount.
         pane.update_in(cx, |pane, window, cx| {
             pane.handle_scroll_wheel(
                 &wheel_event(gpui::ScrollDelta::Lines(gpui::point(0.0, -3.0))),
@@ -5295,24 +4515,6 @@ mod scrollback_pane_tests {
         assert_eq!(pane.read_with(cx, |pane, _| pane.grid.scroll_offset()), 0);
     }
 
-    /// GitHub issues #362/#368: a mouse-wheel scroll reaching a pane whose child has the alt
-    /// screen active must be forwarded to the pty as real **PageUp/PageDown** bytes (via the
-    /// same [`keystroke_to_bytes`] encoder a real page-key press uses), rather than moving
-    /// [`TerminalGrid::scroll_display`] - the alt screen has no scrollback of its own to move
-    /// (see [`TerminalGrid::alt_scroll_forwarding_active`]'s own docs).
-    ///
-    /// Page keys, not the arrow keys issue #362 originally shipped: see
-    /// [`TerminalPane::forward_scroll_as_page_keys`]'s own docs for the live evidence (Claude
-    /// Code's CLI printing "Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll" at a
-    /// real user). This asserts the *absence* of arrow bytes as hard as it asserts the presence
-    /// of page bytes - sending both would leave the regression half-alive.
-    ///
-    /// `cat -v`, not plain `cat`: it visualizes control bytes (`ESC` -> the literal two
-    /// characters `^[`) as ordinary printable text, so the forwarded `\x1b[5~` bytes show up in
-    /// this pane's own grid as the literal string `^[[5~` instead of being reinterpreted as a
-    /// real escape sequence by this same grid's own VT parser - the one way to observe the
-    /// *exact* bytes a real child process received without a second, hand-rolled test-only pty
-    /// seam.
     #[gpui::test]
     fn alt_screen_scroll_forwards_page_keys_to_the_real_pty(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
@@ -5370,8 +4572,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// The mirror of the test above: downward scroll on the alt screen must forward PageDown
-    /// bytes, not PageUp.
     #[gpui::test]
     fn alt_screen_scroll_down_forwards_page_down_keys(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
@@ -5411,10 +4611,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// GitHub issue #368: a *fast flick* still scales - several notches' worth of accumulated
-    /// delta forwards proportionally more page presses, rather than being flattened to one.
-    /// Pinned alongside the single-notch cases above so the [`WHEEL_LINES_PER_NOTCH`] division
-    /// can never quietly become a constant `1`.
     #[gpui::test]
     fn a_fast_alt_screen_flick_forwards_proportionally_more_page_keys(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
@@ -5430,7 +4626,6 @@ mod scrollback_pane_tests {
             pane.inject_bytes_for_test(b"\x1b[?1049h", cx); // enter the alt screen
         });
 
-        // Three notches' worth of upward delta in one event.
         pane.update_in(cx, |pane, window, cx| {
             pane.handle_scroll_wheel(
                 &wheel_event(gpui::ScrollDelta::Lines(gpui::point(
@@ -5450,15 +4645,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// GitHub issue #368: a **real** PageUp keystroke must reach the child process while a
-    /// full-screen program owns the alt screen.
-    ///
-    /// This is the other half of the same live report. Issue #331 claimed plain PageUp/PageDown
-    /// unconditionally for this app's own scrollback, on the reasoning that a page key reaching
-    /// a full-screen program was already a no-op - true only while [`keystroke_to_bytes`] had no
-    /// mapping for either key. The alt screen keeps no scrollback, so claiming the key there
-    /// gave the human nothing and denied the running program the one key it asked for by name.
-    /// `cat -v` again visualizes the exact bytes that really crossed the pty.
     #[gpui::test]
     fn a_real_page_key_reaches_a_full_screen_program(cx: &mut TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
@@ -5498,10 +4684,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// GitHub issue #362: once a full-screen program exits the alt screen, a mouse-wheel scroll
-    /// must go straight back to real `TerminalGrid::scroll_display` - no leftover forwarding
-    /// state, and no arrow-key bytes reaching whatever process (a plain shell prompt) is now
-    /// running there instead.
     #[gpui::test]
     fn leaving_the_alt_screen_restores_real_scrollback_on_the_next_scroll(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5533,23 +4715,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// **GitHub issue #368, the live report: a genuinely fresh, empty Shell pane could still be
-    /// scrolled up.**
-    ///
-    /// Issue #362's guard was a one-shot: `TerminalPane::maybe_resize_pty` discarded scrollback
-    /// exactly once, at the first render with a measured `content_bounds`. That left the whole
-    /// rest of a pane's life unguarded, and a pane's layout keeps settling long after its first
-    /// two frames - the window gets resized, a panel opens, the terminal font size changes.
-    /// Every one of those runs `alacritty_terminal`'s reflow, and reflowing a just-opened pane
-    /// narrower pushes the blank line a shell prints before its prompt out of the viewport and
-    /// into real retained history. Measured live against the running app: a real `zsh` pane went
-    /// from `history_size == 0` to `1` on a `110x36 -> 38x26` resize, and the mouse wheel then
-    /// really moved `display_offset` to `1` on a terminal that had nothing in it.
-    ///
-    /// This drives the real pane through a whole sequence of settled sizes - not just the first
-    /// one - and demands the same thing at every step: nothing to scroll to, an inert wheel, and
-    /// no scrollbar. Uses a real spawned pty pane (`new_pane`) and the same
-    /// `inject_bytes_for_test` append path real pty bytes take.
     #[gpui::test]
     fn a_fresh_pane_never_becomes_scrollable_as_its_layout_settles(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5627,16 +4792,6 @@ mod scrollback_pane_tests {
         assert!(cx.debug_bounds("terminal-scrollbar").is_some());
     }
 
-    /// GitHub issue #368: the discard `maybe_resize_pty` performs on settling has to wait for
-    /// the corrective resize to actually reach the **live pty**, not just the local grid.
-    ///
-    /// Issue #362's version latched on the first render that had any measured `content_bounds`,
-    /// which - measured live - is frame 2, ~16ms after `TerminalPane::new`, while
-    /// `TerminalPane::session` is still `None` because spawning the child is asynchronous. The
-    /// discard therefore ran against an empty grid on a pty that did not exist yet, and then
-    /// stopped guarding forever, which is why it never caught anything it was written for. This
-    /// pins the ordering directly: with no session, settling must not latch; once a session
-    /// exists and the resize really reaches it, it must.
     #[gpui::test]
     fn settling_waits_for_the_resize_to_reach_the_real_pty(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5667,7 +4822,6 @@ mod scrollback_pane_tests {
              placeholder size, which is exactly the window this guard exists to cover"
         );
 
-        // The spawn completes; the same target now genuinely reaches the pty.
         pane.update(cx, |pane, _cx| pane.session = session);
         pane.update_in(cx, |pane, window, _cx| pane.maybe_resize_pty(window));
         assert!(
@@ -5677,12 +4831,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// GitHub issue #362: a freshly-opened pane whose child prints only a handful of lines -
-    /// genuinely fewer than the real viewport height - must never show the scrollbar affordance.
-    /// `crate::root::scrollbar::render_vertical_scrollbar` already returns `None` whenever
-    /// `TerminalScrollHandle::max_scroll_offset` is at or below zero (see that function's own
-    /// docs), so this is really a test that a fresh pane's real `scroll_history_len` starts and
-    /// stays `0` for genuinely non-overflowing content - the scrollbar's own gate does the rest.
     #[gpui::test]
     fn a_fresh_pane_with_little_content_shows_no_scrollbar(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5702,7 +4850,6 @@ mod scrollback_pane_tests {
             "the scrollbar must not be painted when there is nothing to scroll to"
         );
 
-        // Genuine overflow - more lines than the real viewport holds - must still show it.
         let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
         push_numbered_lines(&pane, cx, rows * 3);
 
@@ -5716,21 +4863,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// The precise mechanism behind the test above (GitHub issue #362): `TerminalPane::new`
-    /// spawns the child (and sizes `TerminalGrid`) at the `TERMINAL_ROWS`/`TERMINAL_COLS`
-    /// placeholder before this pane has ever measured its own real content-box size. If the
-    /// child prints more than the eventual *real* (smaller) viewport will hold - but still less
-    /// than the placeholder's own height - before that correction lands,
-    /// `alacritty_terminal`'s own shrink-resize semantics legitimately evict the overflow into
-    /// real retained scrollback the instant `TerminalPane::maybe_resize_pty` applies the
-    /// correct, smaller size. This reproduces that exact race deterministically by resetting a
-    /// pane back to its pre-first-paint state (a placeholder-sized grid, `content_bounds` still
-    /// unmeasured), resizing the pane's *real* test window down to the small target size the
-    /// eventual measurement will find, then printing content that fits the placeholder but not
-    /// that real size - the pane's own measuring `canvas()` self-heals toward the real window on
-    /// its own once it renders again (see that `canvas()` call's own docs), so this only has to
-    /// drive real output and let a couple of real frames land, not call `maybe_resize_pty`
-    /// directly the way this test did before that self-healing existed.
     #[gpui::test]
     fn the_placeholder_spawn_races_content_bounds_but_the_first_real_resize_discards_it(
         cx: &mut TestAppContext,
@@ -5844,9 +4976,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// Trackpad pixel deltas rarely divide evenly by the row height - two individually-sub-line
-    /// deltas must still accumulate into a real whole-line scroll rather than each being
-    /// truncated to zero and silently dropped (see [`TerminalPane::pending_scroll_px`]'s docs).
     #[gpui::test]
     fn sub_line_trackpad_deltas_accumulate_into_a_real_line_scroll(cx: &mut TestAppContext) {
         let (pane, cx) = new_pane(cx);
@@ -5890,10 +5019,6 @@ mod scrollback_pane_tests {
         );
     }
 
-    /// The real integration proof for GitHub issue #331's "stay put" requirement, at the pane
-    /// level: real pty output arriving through the real poll loop while scrolled back must not
-    /// move the viewport, and must latch the jump-to-bottom affordance's own "new output"
-    /// indicator.
     #[gpui::test]
     fn new_real_pty_output_while_scrolled_back_does_not_move_the_viewport_and_latches_the_indicator(
         cx: &mut TestAppContext,
@@ -5990,10 +5115,6 @@ mod scrollback_pane_tests {
         assert!(!pane.read_with(cx, |pane, _| pane.new_output_while_scrolled));
     }
 
-    /// The scrollbar's own `ScrollableHandle` adapter (GitHub issue #331): synced from real grid
-    /// state, its geometry must answer with the *lines-from-top* convention documented on
-    /// `TerminalScrollHandle::viewport_bounds` - live (`display_offset == 0`) at the bottom of
-    /// the track, fully scrolled back at the top.
     #[test]
     fn terminal_scroll_handle_reports_live_at_the_bottom_and_history_at_the_top() {
         let handle = TerminalScrollHandle::new();
@@ -6019,7 +5140,6 @@ mod scrollback_pane_tests {
              top of the track"
         );
 
-        // A click near the bottom of the track must request an offset close to live.
         handle.sync(bounds, px(20.0), 100, 100);
         handle.set_scroll_offset(gpui::point(px(0.0), px(-1900.0)));
         assert_eq!(handle.take_requested_display_offset(), Some(5));

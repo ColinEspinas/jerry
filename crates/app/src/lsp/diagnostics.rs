@@ -44,12 +44,6 @@ impl Severity {
     /// Ordering from most to least severe, used as the tie-break in [`Severity::worst`] when a
     /// line carries diagnostics of more than one severity - not "whichever is first in the
     /// `Vec`", which would depend on server-side ordering.
-    ///
-    /// Public since GitHub issue #292: the sidebar Problems view sorts a whole worktree's
-    /// diagnostics worst-first, which is this same ordering applied to a list rather than to a
-    /// line, and it had copied the four arms rather than call them. Two copies of one severity
-    /// ordering is exactly the "a key defined twice is two specifications of one thing"
-    /// duplication `REVISION-2026-08-14.md` §7 rule 5 is about.
     pub fn rank(self) -> u8 {
         match self {
             Severity::Error => 3,
@@ -109,19 +103,6 @@ fn number_or_string_to_string(code: &lsp_types::NumberOrString) -> String {
 }
 
 /// The real error and warning counts (in that order) over a raw published diagnostics list.
-///
-/// Counted **per diagnostic**, straight off `lsp_types::Diagnostic::severity`, which is why this
-/// exists as its own function rather than being derived from [`index_diagnostics_by_line`]'s
-/// output: that index deliberately records a multi-line diagnostic on *every* line it touches, so
-/// counting it would report one three-line error as three. `crate::root::AdeApp::
-/// file_view_error_count`'s own docs already flag that trap; this is the single implementation
-/// both the File view footer's `N errors, M warnings` label and (GitHub issue #178) the
-/// breadcrumb's right-hand error/warning counts ultimately read, through
-/// `crate::lsp::client::lsp_file_status`.
-///
-/// `Information`/`Hint` are counted as neither - they are real diagnostics, but the design's
-/// breadcrumb and status-bar treatments only define an error and a warning slot, and folding a
-/// hint into either would overstate how bad the file is.
 pub fn count_errors_and_warnings(diagnostics: &[lsp_types::Diagnostic]) -> (usize, usize) {
     let mut errors = 0;
     let mut warnings = 0;
@@ -195,18 +176,6 @@ pub fn index_diagnostics_by_line(
 /// and a diagnostic range rarely share an exact boundary, so this intersection keeps the
 /// underline aligned to the diagnostic's own column range rather than rounded out to the
 /// nearest syntax-highlight token boundary.
-///
-/// Defensive against a real, live-reproduced panic: `diagnostics` is always indexed against
-/// whichever content was current when the language server last published it, which - for Surface
-/// C's editable File view (Revision R8.5a) - can genuinely diverge from `runs`' own text once a
-/// real edit changes the line (e.g. a multi-byte character shifts a byte offset that used to be a
-/// real char boundary onto one that no longer is). `crate::code_surface` gates diagnostic
-/// rendering off entirely for a dirty buffer specifically to make this unreachable in practice
-/// (see that module's own docs), but this function is still hardened independently, as a real,
-/// deliberate second line of defense, not left to rely solely on that caller-side gate: every
-/// candidate cut point is only ever added if it's a genuine char boundary within the run's own
-/// text, and the final slice is looked up with [`str::get`] (never a raw index) so a boundary that
-/// slips through anyway is skipped rather than panicking.
 pub fn overlay_diagnostic_runs(
     runs: &[(SharedString, HighlightKind)],
     diagnostics: &[LineDiagnostic],
@@ -424,11 +393,8 @@ mod tests {
             3,
             "all three real lines the range touches should be indexed"
         );
-        // First line: from the start column to the real end of that line's own text.
         assert_eq!(by_line[&1][0].byte_range, 8..lines[0].text.len());
-        // Middle line: the whole real line.
         assert_eq!(by_line[&2][0].byte_range, 0..lines[1].text.len());
-        // Last line: from 0 up to the end column.
         assert_eq!(by_line[&3][0].byte_range, 0..1);
     }
 
@@ -469,12 +435,10 @@ mod tests {
         a.severity = Severity::Hint;
         let mut b = line_diag(0..1);
         b.severity = Severity::Error;
-        // Error listed second, on purpose - the real ordering, not "first in the Vec", must win.
         assert_eq!(
             Severity::worst(&[a.clone(), b.clone()]),
             Some(Severity::Error)
         );
-        // Same pair, reversed order - the answer must not depend on Vec order either way.
         assert_eq!(Severity::worst(&[b, a]), Some(Severity::Error));
     }
 
@@ -574,17 +538,9 @@ mod tests {
         assert_eq!(marked, " x: ");
     }
 
-    /// HIGH regression coverage (finding 3): the real, live-reproduced panic an audit caught -
-    /// stale diagnostics indexed against last-*saved* content get sliced against the *edited*
-    /// buffer's real text once the File view (Revision R8.5a) makes that divergence possible.
-    /// "caf\u{e9}" - '\u{e9}' ("\u{e9}", i.e. é) is a real 2-byte UTF-8 character starting at byte
-    /// 3; byte 4 falls strictly inside it. A diagnostic computed against different, stale content
-    /// can end up with exactly this shape once a real edit shifts/changes the line's bytes -
-    /// `overlay_diagnostic_runs` must never index directly into that offset.
     #[test]
     fn a_diagnostic_byte_range_landing_mid_character_after_a_real_edit_does_not_panic() {
         let runs = vec![(SharedString::new("caf\u{e9}"), HighlightKind::Text)];
-        // end (4) is not a real char boundary in "caf\u{e9}".
         let diagnostics = vec![line_diag(2..4)];
 
         let overlaid = overlay_diagnostic_runs(&runs, &diagnostics); // must not panic
@@ -597,11 +553,9 @@ mod tests {
         );
     }
 
-    /// The mirror case: the diagnostic's own *start* (not end) lands mid-character.
     #[test]
     fn a_diagnostic_byte_range_starting_mid_character_after_a_real_edit_does_not_panic() {
         let runs = vec![(SharedString::new("caf\u{e9} x"), HighlightKind::Text)];
-        // start (4) is not a real char boundary in "caf\u{e9} x".
         let diagnostics = vec![line_diag(4..6)];
 
         let overlaid = overlay_diagnostic_runs(&runs, &diagnostics); // must not panic

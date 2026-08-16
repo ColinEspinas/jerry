@@ -5,46 +5,6 @@
 //! actually decides when to open/refresh/close this popup), and this module owns the resulting
 //! `AdeApp::completions` state, its keyboard-driven navigation/accept/dismiss actions, and its
 //! real, cursor-anchored popover paint.
-//!
-//! ## Positioning: reusing Revision R8.5a's own real cursor pixel math
-//!
-//! The popover is anchored to the real caret's own painted position - [`AdeApp::file_view_last_bounds`]/
-//! [`AdeApp::file_view_last_layout`]/[`AdeApp::file_view_last_layout_for`], the exact same real,
-//! already-computed values `crate::code_surface::editing`'s `EntityInputHandler::bounds_for_range`/
-//! `character_index_for_point` read (see that module's own docs) - never a second, independently
-//! computed position. Painted as a top-level sibling in [`AdeApp::render`] (the same real
-//! `.absolute()`-positioned-off-a-captured-`Bounds` idiom `crate::work_surface::render::
-//! AdeApp::render_plus_menu` already establishes for this app's other floating popover, off
-//! `AdeApp::plus_button_bounds`), not nested inside the File view's own `uniform_list` - a popup
-//! anchored to one row must not be clipped by that row's own virtualized scroll container.
-//!
-//! ## Scrolling (GitHub issue #185)
-//!
-//! The item list is a real virtualized [`gpui::uniform_list`] tracked by
-//! [`AdeApp::completions_scroll_handle`], capped at [`popover_list_max_height`]
-//! ([`MAX_VISIBLE_COMPLETION_ROWS`] rows) with this app's own overlay scrollbar
-//! ([`crate::root::scrollbar::AdeApp::render_vertical_scrollbar`]) as a sibling. There is no
-//! render cap: an earlier version of this module truncated the real, live-returned response at
-//! `MAX_RENDERED_COMPLETION_ITEMS` (12) and painted a static `"+ N more"` row instead, which made
-//! every item past the twelfth permanently unreachable by keyboard *and* by mouse - and, since
-//! that version's popup was only `182px` tall inside an `overflow_hidden()` container, seven
-//! whole rows was all it could actually show of the twelve it built, so it silently clipped the
-//! rest *and* the `"+ N more"` row itself. [`AdeApp::move_completions_selection`] now wraps over
-//! the whole list and scrolls the viewport to follow the selection.
-//!
-//! ## Deliberately not on the shared menu chrome (GitHub issue #129)
-//!
-//! An audit for that issue flagged this popover's `theme::surface::POPOVER` background,
-//! `theme::radius::CARD_SM` (5px) corner radius, and `theme::shadow::POPOVER` shadow as
-//! inconsistent with the `theme::surface::PALETTE`/`theme::radius::CARD`/`theme::shadow::MENU`
-//! recipe every dropdown/context-menu in the app now shares. They're not drift: each value is
-//! pinned to `design_handoff_jerry_ade/Jerry.dc.html`'s own completions-popup markup (line ~406 -
-//! `border-radius:5px;background:#181c20;box-shadow:0 8px 20px rgba(0,0,0,.5)`), which specifies
-//! a genuinely different recipe from the app-level menus for this specific surface. Left
-//! unchanged, along with `crate::code_surface::lsp_ui`'s hover card, which intentionally matches
-//! it (same `theme::surface::POPOVER`/`theme::border::POPOVER` pair, plus every plain tooltip via
-//! `crate::root::widgets::TextTooltip`) - all three are the "info popover" family, not the "menu"
-//! family, and have no per-row hover at all (keyboard/passive, not mouse-driven).
 
 use super::*;
 use crate::code_surface::code_view;
@@ -177,11 +137,6 @@ const DETAIL_PANE_TYPICAL_HEIGHT: gpui::Pixels = gpui::px(190.0);
 /// gives the scroll handle a real viewport smaller than its content. See
 /// [`AdeApp::render_completions_popover`]'s own comment at the `max_h` call site for the measured,
 /// honest account of how this and [`popover_max_height`] divide the work (they overlap).
-///
-/// A `fn` rather than a `const`, since `gpui::Pixels`' inner `f32` is only `pub(crate)` inside
-/// `gpui`, so `Pixels * f32` (`vendor/zed/crates/gpui/src/geometry.rs:2707`) isn't
-/// `const`-callable here - deriving it for real still beats restating the product as a magic
-/// number.
 fn popover_list_max_height() -> gpui::Pixels {
     POPOVER_ROW_HEIGHT * MAX_VISIBLE_COMPLETION_ROWS as f32
 }
@@ -238,20 +193,6 @@ impl AdeApp {
     /// instead is open (see those handlers' own docs), and the same real condition
     /// `crate::code_surface::render::AdeApp::render_code_surface` uses to decide whether to add the
     /// `"completions"` key context.
-    ///
-    /// Deliberately requires [`CompletionsStatus::Ready`], not just *any* [`CompletionsEntry`]
-    /// (Revision R8.5b audit finding 1's fix for a real, live-reproduced keystroke-swallowing
-    /// bug): [`crate::lsp::client::AdeApp::prepare_lsp_sync`] seeds a real `Loading` entry on
-    /// *every* completion-worthy keystroke, before the real `textDocument/completion` request
-    /// even goes out - an earlier version of this method returned `true` for that `Loading` state
-    /// too, which meant the `"completions"` key context (and thus the `CompletionsAccept`/`Up`/
-    /// `Down` bindings) claimed `Enter`/`Up`/`Down` for the *entire* real round-trip a completion
-    /// request takes, even though there was nothing yet to navigate or accept - live-reproduced
-    /// against a real rust-analyzer: pressing Enter while a request was merely in flight inserted
-    /// no newline at all, and Down did nothing either. A `Failed` entry gets the same honest
-    /// treatment: nothing real to navigate/accept there either, just an error message to read.
-    /// Only a genuine [`CompletionsStatus::Ready`] popup - something the user can actually
-    /// navigate/accept right now - is allowed to claim these keystrokes.
     pub(crate) fn completions_open_for_active_path(&self) -> bool {
         let Some(path) = self.active_editable_path() else {
             return false;
@@ -278,16 +219,6 @@ impl AdeApp {
     /// buffer (`crate::lsp::completion::identifier_prefix_start` - the exact same real word-start
     /// scan [`resolve_completion_edit`] already uses to decide what an accepted item replaces, so
     /// "what gets filtered on" and "what gets overwritten on accept" can never disagree).
-    ///
-    /// Deliberately derived from the buffer every time rather than accumulated in a separate
-    /// "typed since trigger" field: that scan is already the real definition of the word being
-    /// completed, it stays correct through Backspace/Delete and caret moves with no extra
-    /// bookkeeping to get out of sync, and it is empty exactly when it should be - right after a
-    /// real trigger character (`foo.`, `std::`), where nothing has been typed to narrow by yet.
-    /// This is the same "word range at the position" query model VSCode's own suggest widget uses.
-    ///
-    /// `None` when there is no buffer for `path` at all; the empty string (match everything) is a
-    /// real, distinct answer from that.
     pub(crate) fn completion_filter_query(&self, path: &Path) -> Option<String> {
         let buffer = self.edit_buffer(path)?;
         let cursor = buffer.cursor_offset();
@@ -305,19 +236,6 @@ impl AdeApp {
     /// the one call site every real edit path already funnels through), so the popup narrows
     /// instantly rather than waiting on the debounced `textDocument/completion` round trip that
     /// refreshes the underlying candidate set behind it.
-    ///
-    /// The two compose without fighting: the server's own response still *replaces* `items`
-    /// wholesale when it lands (a moved position genuinely changes what's semantically valid), and
-    /// `crate::lsp::client::AdeApp::apply_completion_result` re-derives `visible` from this same
-    /// query as it does so - so a response always arrives already narrowed to what's typed, and
-    /// every keystroke in between narrows further without a round trip.
-    ///
-    /// Narrowing to nothing dismisses the popup outright, matching both what a real suggest widget
-    /// does when the typed text stops matching anything and this module's own existing discipline
-    /// (`crate::lsp::client::AdeApp::prepare_lsp_sync` already dismisses when the context that
-    /// justified the popup is gone). It matters mechanically too: [`Self::
-    /// completions_open_for_active_path`] claims `Enter`/`Up`/`Down` for *any* `Ready` entry, so an
-    /// entry left open with nothing visible would silently swallow those keystrokes.
     pub(crate) fn refilter_completions(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self
             .completions
@@ -390,22 +308,6 @@ impl AdeApp {
 
     /// Moves the popup's keyboard selection by `delta` rows, wrapping at both ends, and scrolls
     /// the list's viewport just enough to keep the newly selected row visible.
-    ///
-    /// The wrap is over the **whole** real, live-returned item list (GitHub issue #185). It used
-    /// to be over `items.len().min(MAX_RENDERED_COMPLETION_ITEMS)` - a 12-item render cap with no
-    /// scroll mechanism behind it - which made every item past the twelfth permanently unreachable
-    /// by keyboard *and* by mouse. There is no cap of any kind now: [`Self::completions_scroll_handle`]
-    /// plus the `uniform_list` in [`Self::render_completions_popover`] is the real scrolling the
-    /// cap was standing in for.
-    ///
-    /// `gpui::ScrollStrategy::Nearest` (not `Top`/`Center`) is the "scroll the minimum amount
-    /// needed to bring this row fully into view, and don't move at all if it already is"
-    /// strategy: the same one `crate::code_surface::editing::AdeApp::sync_cursor_and_scroll` uses
-    /// to keep the real caret's own row in view, and the same one `vendor/zed/crates/editor/src/
-    /// code_context_menus.rs:611` uses for this exact job in Zed's own completions menu. The
-    /// scroll is a *deferred* target resolved in the list's next prepaint (see
-    /// `vendor/zed/crates/gpui/src/elements/uniform_list.rs:150`), so the `cx.notify()` below is
-    /// what actually makes it happen - it is not an immediate offset write.
     fn move_completions_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.as_mut() else {
             return;
@@ -480,21 +382,6 @@ impl AdeApp {
     /// app - typing, paste, Backspace/Delete - reduces to, per `crate::code_surface::edit_buffer`'s own top
     /// docs), then re-runs the same real re-highlight/LSP-sync/scroll bookkeeping an ordinary
     /// keystroke would. Always dismisses the popup first (via `Option::take`).
-    ///
-    /// Every early-return "nothing real to accept" path (no entry at all, not `Ready`, an
-    /// out-of-range selection, no buffer) falls through to the real [`AdeApp::
-    /// handle_editor_enter_action`] behavior - a real newline at the real caret - rather than
-    /// silently swallowing the keystroke (Revision R8.5b audit finding 1's fix). In ordinary,
-    /// real keystroke-driven use this fallback is unreachable: `crate::default_key_bindings`
-    /// only ever routes `Enter`/`Tab` here while `Self::completions_open_for_active_path` is
-    /// true, which (per that method's own docs) now itself requires a genuine `Ready` entry -
-    /// so a real user can no longer land in any of these branches through an ordinary keystroke.
-    /// It stays as a real, deliberate defense-in-depth guard for this method's own *direct*
-    /// callers (this crate's own tests call it that way, mirroring `crate::code_surface::editing::
-    /// AdeApp::handle_editor_enter_action`'s own identical "guard the handler, not just the
-    /// binding" discipline - see that method's own docs), and for the popup's mouse-click accept
-    /// row (which only ever renders for a genuine `Ready` item, so it too should never actually
-    /// hit these branches in practice).
     fn accept_active_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.completions.take() else {
             self.replace_text_in_range(None, "\n", window, cx);
@@ -1062,15 +949,6 @@ impl AdeApp {
     /// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
     /// exactly (same three-piece shape, same reasoning for showing it), just for the selected
     /// completion item instead of a `textDocument/hover` response.
-    ///
-    /// Design-review follow-up: this pane didn't exist at all before - the popup was list-only, a
-    /// real, previously undocumented-to-the-user scope gap (see [`DETAIL_WIDTH`]'s own docs).
-    ///
-    /// A method, not a free function, since the signature+doc region below now needs
-    /// [`Self::completions_detail_scroll_handle`] and [`crate::root::scrollbar::
-    /// AdeApp::render_vertical_scrollbar`], both of which need `&self` - the identical reason
-    /// `crate::code_surface::lsp_ui::AdeApp::render_hover_card_content` stopped being a free
-    /// function.
     fn render_completion_detail_pane(
         &self,
         item: &lsp_core::lsp_types::CompletionItem,
@@ -1305,12 +1183,6 @@ fn resolve_completion_edit(
 /// `uniform_list` virtualization, real `gpui::UniformListScrollHandle` geometry - rather than
 /// asserting on the selection index alone, which would prove nothing about whether the selected
 /// row is actually on screen.
-///
-/// The `Ready` popup state is seeded directly rather than driven through a real language server,
-/// matching `crate::code_surface::tabs::stale_completions_popup_tests`' own established precedent
-/// (`crate::lsp::client::lsp_diagnostics_wiring_tests` owns the real, live end-to-end
-/// rust-analyzer completion proof this module doesn't duplicate). What's under test here is the
-/// popup's own scrolling, which is entirely independent of where the items came from.
 #[cfg(test)]
 mod completions_scroll_tests {
     use super::*;
@@ -1339,9 +1211,6 @@ mod completions_scroll_tests {
     /// [`AdeApp::render_completions_popover`] anchors to - without a real paint first the popover
     /// honestly renders nothing at all), then seeds a real `Ready` popup of `count` items for it
     /// and paints again.
-    ///
-    /// The returned `TempDir` is the file's own real backing directory and must be held for the
-    /// lifetime of the test - dropping it deletes the file out from under the open buffer.
     fn open_with_seeded_popup(
         cx: &mut TestAppContext,
         count: usize,
@@ -1405,9 +1274,6 @@ mod completions_scroll_tests {
         })
     }
 
-    /// The load-bearing assertion for issue #185: with a real 40-item response, `down` must reach
-    /// every one of the 40 - the old `rem_euclid(items.len().min(12))` wrap made items 13..40
-    /// permanently unreachable, silently, with no error and no feedback.
     #[gpui::test]
     fn keyboard_navigation_reaches_every_item_past_the_old_twelve_item_cap(
         cx: &mut TestAppContext,
@@ -1440,9 +1306,6 @@ mod completions_scroll_tests {
         );
     }
 
-    /// Reaching an item is only half the fix - the viewport has to follow, or item 39 is
-    /// "selected" while the popup still paints rows 0..12. This asserts on the real
-    /// `uniform_list` geometry and on which rows genuinely painted, not on the index.
     #[gpui::test]
     fn the_viewport_really_scrolls_to_follow_keyboard_selection(cx: &mut TestAppContext) {
         let (app, cx, _repo, _relative) = open_with_seeded_popup(cx, LONG);
@@ -1525,7 +1388,6 @@ mod completions_scroll_tests {
              `uniform_list` is really virtualizing rather than painting all {LONG} at once"
         );
 
-        // Wrapping back around to the first item must scroll back to it, too.
         cx.simulate_keystrokes("down");
         cx.run_until_parked();
         assert_eq!(
@@ -1544,9 +1406,6 @@ mod completions_scroll_tests {
         );
     }
 
-    /// A row that only exists past the old cap must be clickable, too - `uniform_list` builds a
-    /// real, hit-testable element for it once it's scrolled into view, which the old truncated
-    /// render never did. Clicks the row's own real painted bounds.
     #[gpui::test]
     fn a_row_past_the_old_cap_can_be_accepted_with_a_real_mouse_click(cx: &mut TestAppContext) {
         let (app, cx, _repo, relative) = open_with_seeded_popup(cx, LONG);
@@ -1580,8 +1439,6 @@ mod completions_scroll_tests {
         );
     }
 
-    /// The other half of the ask: a list that comfortably fits must not grow a scrollbar, must
-    /// not scroll, and must paint every one of its rows.
     #[gpui::test]
     fn a_short_completions_list_neither_scrolls_nor_paints_a_scrollbar(cx: &mut TestAppContext) {
         let (app, cx, _repo, _relative) = open_with_seeded_popup(cx, SHORT);
@@ -1684,10 +1541,6 @@ mod completion_detail_pane_tests {
         (app, cx, relative)
     }
 
-    /// GitHub issue #200's rendered-side coverage: a real completion item whose documentation
-    /// contains a real JSDoc-style block tag must paint each tag as its own real, separately-
-    /// coloured `render_doc_prose` run, mirroring `crate::code_surface::lsp_ui`'s identical hover
-    /// coverage - the two real places this shared render helper is called from.
     #[gpui::test]
     fn a_real_jsdoc_tag_in_the_completion_doc_body_paints_its_own_tag_run(cx: &mut TestAppContext) {
         let item = lsp_core::lsp_types::CompletionItem {
@@ -1708,10 +1561,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// GitHub issue #200's own real "params/returns/example ... displayed like code in their own
-    /// section" ask, mirroring `crate::code_surface::lsp_ui`'s identical hover coverage: a real
-    /// `@param`/`@example` block tag inside a completion item's own documentation must paint as
-    /// its own real, structured section here too, not just differently-coloured inline text.
     #[gpui::test]
     fn real_jsdoc_block_tags_in_the_completion_doc_body_paint_their_own_structured_sections(
         cx: &mut TestAppContext,
@@ -1738,10 +1587,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// A real, fully-populated item (a real `detail`, `documentation`, and `label_details`
-    /// description - the three real fields the detail pane reads) must paint a real list column,
-    /// a real detail pane beside it, and the real footer hint row - the whole shape the mockup's
-    /// own two-column popup describes, none of which existed at all before this fix.
     #[gpui::test]
     fn a_real_selected_item_paints_both_the_list_column_and_a_real_detail_pane(
         cx: &mut TestAppContext,
@@ -1802,15 +1647,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Direct regression coverage for the real, live-reported "position is not right and can be
-    /// super high compared to the actual typing location" bug: when the popup has to flip above
-    /// the caret (no real room below), the pre-fix version always positioned it as if a full
-    /// `MAX_VISIBLE_COMPLETION_ROWS`-row list were about to paint - `popover_max_height()`'s own
-    /// worst case - even for a real, short, filtered list. That left a large, real, visibly wrong
-    /// gap between the flipped-above popup and the caret row it's meant to anchor to. Proven by
-    /// forcing a real flip (a real multi-line file, caret on its last line, a genuinely short
-    /// window) and checking the real gap between the popup and the caret row against
-    /// `estimated_popover_height` - the tight, real estimate - rather than the old worst case.
     #[gpui::test]
     fn a_short_lists_flipped_above_position_is_close_to_the_caret_not_the_worst_case_height(
         cx: &mut TestAppContext,
@@ -1903,12 +1739,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// A real completion row's own selected/hover background (`theme::completions_popup::
-    /// ITEM_SELECTED_BG`) must cover the *whole* row, not just as much of it as the label text
-    /// happens to need - an earlier version left `.w_full()` off the row `div()` entirely, so the
-    /// row (and therefore its background) shrank to its own content width instead of stretching
-    /// to fill `LIST_WIDTH`, leaving a real, visible gap of unhighlighted background to the right
-    /// of a short label.
     #[gpui::test]
     fn a_selected_rows_background_spans_the_full_list_width_not_just_its_text(
         cx: &mut TestAppContext,
@@ -1937,19 +1767,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Accepting an auto-import must write the import, not just the name.
-    ///
-    /// Verbatim from a live `typescript-language-server`, resolving the `appendFile` candidate the
-    /// duplicate report was about: alongside the completion itself it returns
-    /// `additionalTextEdits: [{range: 1:0-1:0, newText: "import { appendFile } from 'fs';\n"}]`.
-    /// Nothing in this app applied that field, so accepting the row inserted `appendFile` into a
-    /// file with no import of it - an identifier that does not resolve, written by the editor
-    /// itself. It is also what makes collapsing several import candidates into one row honest:
-    /// the surviving row names a module, and now genuinely adds that module's import.
-    ///
-    /// Also pins the caret. The import lands *above* the caret, so every character it inserts
-    /// shifts the whole document under it; leaving the caret where `replace_range` put it would
-    /// park it back inside the `import` line it had just written.
     #[gpui::test]
     fn accepting_a_real_auto_import_writes_its_import_line_and_keeps_the_caret(
         cx: &mut TestAppContext,
@@ -1964,7 +1781,6 @@ mod completion_detail_pane_tests {
         cx.run_until_parked();
         let relative = PathBuf::from("main.ts");
 
-        // Caret at the end of `const other = app`, exactly where the popup would have opened.
         let caret_before = app.update(cx, |app, _| {
             let buffer = app.edit_buffer_mut(&relative).expect("a real buffer");
             let caret = buffer.content.find("= app").expect("the fixture line") + "= app".len();
@@ -2022,14 +1838,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The live-requested setting: with `editor.auto_import` off, accepting the very same item
-    /// inserts the name and nothing else - no `import` line - while everything else about the
-    /// accept is unchanged.
-    ///
-    /// It exists because a language server offers auto-imports for everything its own index can
-    /// reach, which in a browser project includes `@types/node`: `import { appendFile } from
-    /// 'node:fs'` is valid TypeScript there (verified against a live server - it raises no
-    /// diagnostic at all) and still cannot be bundled.
     #[gpui::test]
     fn the_auto_import_setting_off_inserts_the_name_without_the_import(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -2089,11 +1897,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The live-reported "`appendFile` appears four times", on screen. Node ships every builtin
-    /// under two specifiers and `typescript-language-server` offers both, so these two items
-    /// (dumped verbatim - see
-    /// `completion_view::tests::a_real_auto_import_row_says_which_module_it_comes_from_and_is_not_repeated`)
-    /// would write the identical import. One row survives, and it paints the module it comes from.
     #[gpui::test]
     fn repeated_auto_import_candidates_paint_one_row_naming_its_module(cx: &mut TestAppContext) {
         let candidate = |module: &str| lsp_core::lsp_types::CompletionItem {
@@ -2124,14 +1927,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The load-bearing rule behind the live-reported "all data should be here without needing to
-    /// select the suggestion": a row is built from the server's own untouched response, so a
-    /// `completionItem/resolve` landing later cannot add anything to it or change it.
-    ///
-    /// Verbatim from a live `typescript-language-server`: `app` arrives bare
-    /// (`{"label":"app","kind":6}`) and only its resolve carries `detail: "const app:
-    /// App<Element>"`. This drives that merge through the real path
-    /// (`AdeApp::apply_resolved_completion_item`) and then re-reads the painted row.
     #[gpui::test]
     fn a_landed_resolve_fills_the_detail_pane_and_leaves_the_row_alone(cx: &mut TestAppContext) {
         let bare = lsp_core::lsp_types::CompletionItem {
@@ -2186,9 +1981,6 @@ mod completion_detail_pane_tests {
         });
     }
 
-    /// The other side of that: an ordinary item with a real type and no import at all must paint
-    /// no import-source span, so the row gains nothing it doesn't genuinely have. Dumped from a
-    /// live `rust-analyzer` (`label: "count"`, `kind: FIELD`, `detail: "usize"`).
     #[gpui::test]
     fn an_ordinary_item_with_no_import_paints_no_import_source(cx: &mut TestAppContext) {
         let item = lsp_core::lsp_types::CompletionItem {
@@ -2210,11 +2002,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// A real, unusually long detail/type hint (a deeply nested generic, a long tuple return
-    /// type) must not be left free to grow the right-hand hint span past a real, bounded width -
-    /// unbounded, it would push the row's total content wider than the list column itself
-    /// (`flex_none` doesn't shrink), overflowing the popup horizontally. `.max_w(120px)` plus
-    /// `.truncate()` caps it at a real, fixed share of the row instead.
     #[gpui::test]
     fn a_very_long_detail_hint_is_capped_to_a_bounded_width_not_left_to_grow(
         cx: &mut TestAppContext,
@@ -2241,12 +2028,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// A real, long documentation string (a multi-paragraph rustdoc comment is common) must not
-    /// grow the detail pane past the popup's own real maximum height - `.max_h(popover_max_height())`
-    /// on the pane itself is the real, hard backstop - and, unlike an earlier version of this fix
-    /// that clamped the doc paragraph to 6 visible lines with no way to read the rest, the real
-    /// overflow must be reachable through the same real scrollbar a tall signature gets: a doc
-    /// this long never fits, so it must show one.
     #[gpui::test]
     fn a_very_long_documentation_string_does_not_grow_the_pane_without_bound(
         cx: &mut TestAppContext,
@@ -2286,13 +2067,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Direct regression coverage for the real, live-reported bug: when the real detail pane's
-    /// own content (a long signature plus a real, resolved doc paragraph) makes it taller than
-    /// the list side's own natural content needs, `list_column`'s own box stretches to match it
-    /// (GPUI's default cross-axis stretch on `popover`'s own row layout) - but without
-    /// `flex_1()` on the scrolling-list wrapper, the footer hints row just kept its own shorter,
-    /// natural height inside that taller box, leaving real, visible empty space between the
-    /// footer and the popover's true bottom edge instead of sitting flush against it.
     #[gpui::test]
     fn the_footer_hints_row_stays_pinned_to_the_real_bottom_even_when_the_detail_pane_is_taller(
         cx: &mut TestAppContext,
@@ -2328,13 +2102,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Direct regression coverage for the real, reported bug: a genuinely tall signature (the
-    /// real shape typescript-language-server produces pretty-printing a wide object/union type
-    /// across many real lines, now that it renders in full instead of being truncated to its own
-    /// first line) used to grow the detail pane's own content past the popup's `overflow_hidden()`
-    /// clip, hiding the module-path footer beneath it - the same real bug the Hover card had. The
-    /// module-path footer must stay pinned near the pane's own real bottom regardless of how tall
-    /// the signature above it is, and a real scrollbar must appear for the overflowing region.
     #[gpui::test]
     fn a_tall_signature_keeps_the_module_path_footer_pinned_and_shows_a_real_scrollbar(
         cx: &mut TestAppContext,
@@ -2383,9 +2150,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// The other half: an ordinary, short signature that fits comfortably within the pane's own
-    /// max height must never paint a scrollbar - the common case stays exactly as unadorned as it
-    /// always was.
     #[gpui::test]
     fn a_short_signature_paints_no_detail_scrollbar(cx: &mut TestAppContext) {
         let item = lsp_core::lsp_types::CompletionItem {
@@ -2406,11 +2170,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Direct regression coverage for the real, reported bug: the signature column had no
-    /// explicit width, so it shrank to fit its own (often much narrower) text - a short signature
-    /// like `"fn x()"` left the real `.border_b_1()` seam below it visibly short of the pane's
-    /// own real 300px-wide right edge, a real gap on the side the design mockup's own Hover card
-    /// equivalent never has.
     #[gpui::test]
     fn the_signature_border_spans_the_full_pane_width_not_just_its_text(cx: &mut TestAppContext) {
         let item = lsp_core::lsp_types::CompletionItem {
@@ -2440,9 +2199,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// `Loading` has no real selected item to describe - the detail pane and footer hints must
-    /// both stay genuinely absent, and the popover must paint at the narrower list-only width,
-    /// not the wider two-column one.
     #[gpui::test]
     fn a_loading_popup_paints_only_the_list_column_with_no_detail_pane_or_footer_hints(
         cx: &mut TestAppContext,
@@ -2468,7 +2224,6 @@ mod completion_detail_pane_tests {
         let popover = cx
             .debug_bounds("completions-popover")
             .expect("the real popover must still paint a real loading message");
-        // `+ px(2.0)`: the popover's own real `.border_1()` (1px on each side).
         assert_eq!(
             popover.size.width,
             LIST_WIDTH + gpui::px(2.0),
@@ -2487,12 +2242,6 @@ mod completion_detail_pane_tests {
         );
     }
 
-    /// Direct regression coverage for the real, reported bug: a genuinely multi-line `detail` -
-    /// the real shape `typescript-language-server` produces for a wide utility/generic type like
-    /// `Pick<{ a: string; b: number }, "a">` once it pretty-prints across several lines - used to
-    /// render as just its own first line, with every real line after the first newline silently
-    /// dropped (the old code took only `highlight_block`'s first `RenderedLine`). A token from a
-    /// real *second* line must still paint.
     #[gpui::test]
     fn a_genuinely_multi_line_detail_keeps_every_real_line_not_just_the_first(
         cx: &mut TestAppContext,

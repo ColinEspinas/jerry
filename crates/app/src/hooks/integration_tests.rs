@@ -1,27 +1,4 @@
 //! End-to-end tests for the agent hook side-channel (GitHub issue #239 phase 2).
-//!
-//! Two tiers, deliberately:
-//!
-//! 1. **Real transport, no `claude`.** [`the_real_forwarder_script_delivers_a_real_payload_end_to_end`]
-//!    runs the *actual generated* forwarder script, as a real subprocess, with a real Claude Code
-//!    payload on its stdin, against a real [`crate::hooks::server::HookListener`] on a real
-//!    loopback port - and asserts the fact comes out the far end as a real
-//!    [`crate::rail::status::Status`]. Everything except Claude Code itself is the production
-//!    object, and it runs everywhere, always.
-//!
-//! 2. **Real `claude`.** The tests below it drive the genuine binary when one is installed,
-//!    which is what pins Jerry's two real behavioural dependencies on it: that a `--settings`
-//!    file's hooks actually fire, and that they are *merged* with the user's own rather than
-//!    replacing them. Skipped (loudly) when no binary is present, and tolerant of one that is
-//!    present but unusable (no auth, no network) - a sandbox without credentials must not fail
-//!    the suite, but it also must not silently look like a pass, so each of those paths logs why.
-//!
-//! Both tiers run on Unix *and* on native Windows. They used to bail out immediately unless
-//! `cfg!(unix)`, because hook injection was disabled on Windows outright; now that it is real
-//! there, the difference between the two platforms is exactly one thing - which shell Claude Code
-//! runs the generated `command` string through - and that is confined to [`shell_running`]. Every
-//! assertion below is the same on both, which is the point: a Windows-only regression in the
-//! generated command, the forwarder or the transport fails a real test rather than skipping one.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -35,9 +12,6 @@ use crate::work_surface::agents::ProcessKind;
 /// A `Command` that runs `command` through the same shell Claude Code would - `sh -c` on Unix,
 /// and on Windows the PowerShell that `crate::hooks::settings_file::windows_hook_entry`'s
 /// `"shell": "powershell"` asks Claude Code for.
-///
-/// The one platform difference in this whole file. Stdin is left for the caller to set, because
-/// the payload arriving on it is the thing under test.
 #[cfg(not(windows))]
 fn shell_running(command: &str) -> std::process::Command {
     let mut process = std::process::Command::new("/bin/sh");
@@ -200,14 +174,6 @@ fn a_forwarder_run_outside_jerry_reaches_no_listener_at_all() {
 
 /// Set `JERRY_REQUIRE_REAL_CLAUDE=1` to turn every "no usable `claude` here" skip below into a
 /// hard failure.
-///
-/// Without this the real-binary tests pass vacuously wherever no binary or no credentials exist,
-/// which means a green CI run says nothing at all about the two behaviours they exist to pin
-/// (that `--settings` hooks fire, and that they merge with the user's own rather than replacing
-/// them). Those are behaviours of a third-party binary that can change under Jerry without any
-/// change to Jerry, so they need a job where the skip is not an option. This is the switch that
-/// job sets; the default stays skip-friendly so a contributor without Claude Code installed can
-/// still run the suite.
 const REQUIRE_REAL_CLAUDE_ENV: &str = "JERRY_REQUIRE_REAL_CLAUDE";
 
 /// Reports a skip, or panics if [`REQUIRE_REAL_CLAUDE_ENV`] demands a real run.
@@ -224,9 +190,6 @@ fn real_claude() -> Option<std::path::PathBuf> {
 }
 
 /// Runs a real, minimal `claude` turn in `cwd` with `settings`, returning whether it succeeded.
-///
-/// A failure here is treated as "this environment can't run `claude`" (no credentials, no
-/// network) rather than as a test failure - see the module docs.
 fn run_real_claude(
     binary: &Path,
     cwd: &Path,
@@ -399,21 +362,6 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     );
 }
 
-/// The end-to-end test that covers what a *user* does, through the objects a user's click really
-/// goes through: [`crate::root::AdeApp::new_agent`] (what the palette's "New Claude agent", the
-/// Agent menu and the rail's "+" all call), a real
-/// [`crate::work_surface::agents::Agents::spawn`], a real pty, a real `claude`, and a real
-/// [`crate::hooks::HookRuntime`] brought up by the real lazy `hook_injection_for` gate - then
-/// asserts the fact comes back out of the app's own runtime under that agent's own real id.
-///
-/// The tests above this one hand-assemble the `--settings` argument and the `JERRY_*` environment
-/// from the production helpers and hand them to a `std::process::Command`. That pins Claude
-/// Code's half of the contract and nothing at all of Jerry's: every step between a click and the
-/// child process - the lazy runtime bring-up, the Claude-only gate, whether the `AgentId` in the
-/// environment is the one the rail reads back, `ProcessKind::spec`, `TerminalSpec::env`,
-/// `pty_core`'s `CommandBuilder` - is skipped by all of them. This one skips none of it, which is
-/// the whole reason it exists: a regression anywhere along that chain would leave every other
-/// test in this file green.
 #[gpui::test]
 fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     cx: &mut gpui::TestAppContext,

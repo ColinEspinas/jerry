@@ -4,26 +4,6 @@
 //! jerry-core`); every worktree belongs to exactly one repo and carries it (`repo:` on the
 //! worktree record, a later phase's concern - see [`Repo::worktrees`]'s own docs for why that
 //! field can't just be derived by walking up a worktree's path).
-//!
-//! Kept separate from [`super::worktrees`] (which maps *one* repo's `wt_core::WorktreeResult`
-//! list into display rows) the same way [`super::status`] is separate from [`super::state`]:
-//! [`Repo`] is the identity/persistence layer multiple worktrees hang off of, not another
-//! worktree-shaped thing itself.
-//!
-//! ## Persistence
-//!
-//! Which repos are currently added must survive an app restart (this revision's Phase 0 scope -
-//! see the revision doc's introduction). [`RepoState`] is `crate::sidebar::fold_state::FoldState`'s
-//! own shape and safety properties, copied rather than reinvented: a sibling
-//! `~/.config/jerry/repos.toml`, written via the identical crash-safe temp-file-then-rename
-//! sequence ([`RepoState::save_at`]), and merged rather than clobbered when more than one `jerry`
-//! process is running ([`RepoState::save_merged_at`]) - see that module's docs for the full
-//! reasoning, which applies here unchanged. The one difference: a repo has no per-worktree
-//! sub-structure to merge *within* one key the way fold state's `expanded` set does, so there is
-//! no `*_with_key` fast path here - [`repo_key`] is only ever called from real add/remove/save
-//! points (a user action, or startup), never a render or per-keystroke path, so its blocking
-//! `std::fs::canonicalize` call is cheap enough to call directly rather than caching it the way
-//! `crate::root::AdeApp::fold_state_root_key` caches [`super::worktrees`]'s equivalent.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -66,9 +46,6 @@ pub struct Repo {
     /// is instead mirrored straight from `crate::root::AdeApp::load_worktrees`'s real fetch (see
     /// that method's own docs) rather than independently fetched a second time, so this repo's
     /// git is never queried twice in parallel for the same data.
-    ///
-    /// Empty until [`Self::worktrees_loaded`] is `true` - see that field's own docs for why an
-    /// empty `Vec` alone can't be trusted as "this repo really has zero worktrees".
     pub worktrees: Vec<WorktreeItem>,
     /// Whether [`Self::worktrees`] reflects a real, completed fetch attempt for this repo - not
     /// merely "non-empty", since a genuinely empty result (an inaccessible path;
@@ -106,9 +83,6 @@ impl Repo {
 /// before moving on to the next, so no more than `concurrency` are ever in flight for that sweep
 /// simultaneously, regardless of how many repos are due for a refresh. A user with dozens of
 /// added repos never causes a single tick to fire dozens of `git` child processes at once.
-///
-/// `concurrency == 0` is treated as `1` - a defensive floor, since `[T]::chunks` itself panics on
-/// a zero chunk size, and the caller's own constant is never expected to be zero anyway.
 pub(crate) fn batch_repos_for_refresh(ids: &[RepoId], concurrency: usize) -> Vec<Vec<RepoId>> {
     ids.chunks(concurrency.max(1))
         .map(<[RepoId]>::to_vec)
@@ -141,27 +115,6 @@ pub fn repo_state_path_for(settings_path: &Path) -> PathBuf {
 /// resolved (symlinks followed, `.`/`..` and a relative invocation made absolute), falling back to
 /// the path exactly as given when it can't be resolved at all - a directory that doesn't exist
 /// yet, or a pure in-memory path in a unit test, which must still be usable rather than an error.
-///
-/// This is load-bearing, not cosmetic. Every worktree path this app displays comes from
-/// `wt_core::list_worktrees_porcelain`, i.e. from git, which always reports **fully resolved**
-/// paths (git derives them from `getcwd`, which resolves symlinks). Every one of this app's real
-/// per-worktree lookups is an exact `PathBuf` comparison against those - `crate::rail::state::
-/// build_worktree_rows_with_history` folding an agent into its worktree row,
-/// `crate::work_surface::agents::Agents::iter_for_cwd`/`activate_for_worktree`,
-/// `crate::root::AdeApp::diff_cache`/`worktree_notes`/`open_files_by_worktree`/`edit_buffers`.
-/// A [`Repo::path`] kept verbatim from `jerry .`, `jerry ~/link-to-repo`, or any relative
-/// argument therefore never equals git's own answer for the same directory, and
-/// `crate::root::AdeApp::current_worktree_path`'s repo-root fallback hands exactly that unresolved
-/// path to `Agents::spawn` as an agent's `cwd`. The real, reproduced consequence: an agent
-/// spawned that way matches no worktree row at all, and - because `build_worktree_rows_with_
-/// history` maps over *worktrees* and folds agents into them - is dropped from the rail
-/// silently, with no row of its own and no error anywhere.
-///
-/// Normalizing once, where a repo path enters this app ([`crate::root::AdeApp::add_repo`],
-/// [`crate::root::AdeApp::open_repo_in_current_window`], and startup's own resolved CLI path), is
-/// what keeps that whole family of exact-path comparisons meaningful - as opposed to
-/// canonicalizing at each comparison, which would put a blocking `std::fs::canonicalize` on a
-/// per-row, per-render path and still leave the *spawned process's* real cwd unresolved.
 pub fn canonical_repo_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -206,14 +159,6 @@ pub struct RepoRecord {
     /// "everything reopens" true at launch rather than only after the user clicks the right rail
     /// row (a worktree's own tabs are restored when it is genuinely selected - see
     /// `crate::work_surface::session`).
-    ///
-    /// Stored as a plain path string rather than a [`PathBuf`] for the same reason every other
-    /// field in this file is a string: it is a TOML value that must survive a build that has never
-    /// heard of it. `None` for a repo whose worktrees were never selected in, and for a record
-    /// written before this field existed (`#[serde(default)]`). Never trusted blindly on read -
-    /// [`RepoState::remembered_worktree`] checks it still names a real directory, and
-    /// `crate::rail::worktrees::selection_for_opened_repo` independently checks it still names a
-    /// real worktree of the repo, falling back to the main checkout if not.
     pub selected_worktree: Option<String>,
 }
 
@@ -329,10 +274,6 @@ impl RepoState {
     /// same "two writers, one file" situation fold state already solved: a plain whole-file write
     /// here would let the second process's save silently erase the first process's repo from the
     /// list the moment it saves anything of its own.
-    ///
-    /// `owned` is the set of [`repo_key`]s this instance has recorded anything for (added or
-    /// removed) - taken from `self`, *including absence* (that's how removing a repo deletes its
-    /// entry); every other key already on disk is passed through untouched.
     pub fn save_merged_at(
         &self,
         path: &Path,
@@ -450,9 +391,6 @@ mod tests {
         assert_eq!(RepoState::load_at(&path), RepoState::default());
     }
 
-    /// The per-repo "land back where I left off" record: remembered, still on disk, and really
-    /// returned - plus the three real ways it must fall back to `None` rather than to a broken
-    /// selection (unknown repo, never selected in, since deleted).
     #[test]
     fn a_remembered_worktree_is_returned_only_while_it_still_exists() {
         let worktree = tempfile::tempdir().expect("tempdir");
@@ -541,8 +479,6 @@ mod tests {
         assert_eq!(siblings, vec!["repos.toml".to_string()]);
     }
 
-    /// The multi-instance guarantee, mirroring `crate::sidebar::fold_state`'s own identical test:
-    /// a second `jerry` instance saving its own repo must not erase the first's.
     #[test]
     fn saving_merges_with_another_instances_repo_instead_of_erasing_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -560,7 +496,6 @@ mod tests {
             ["/repo/a".to_string()].into_iter().collect();
         instance_a.save_merged_at(&path, &owned_a).expect("save a");
 
-        // Instance B started before A wrote anything, so its in-memory copy knows nothing of A.
         let mut instance_b = RepoState::default();
         instance_b.repos.insert(
             "/repo/b".to_string(),
@@ -581,9 +516,6 @@ mod tests {
         assert!(on_disk.repos.contains_key("/repo/b"));
     }
 
-    /// The other half of the merge contract: for a repo this instance *does* own, absence is a
-    /// real deletion (how removing a repo removes its entry), not something merged back in from
-    /// disk.
     #[test]
     fn a_merged_save_really_deletes_an_owned_repos_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -611,8 +543,6 @@ mod tests {
         );
     }
 
-    /// GitHub issue #90's own real "still valid" check - the four cases
-    /// [`RepoState::last_focused_existing_path`]'s own docs enumerate.
     #[test]
     fn last_focused_existing_path_is_none_when_nothing_was_ever_remembered() {
         let state = RepoState::default();
@@ -657,10 +587,6 @@ mod tests {
         );
     }
 
-    /// The other real "no longer a usable repo" case an independent audit found this method
-    /// missing: the remembered path still `exists()` (so a plain `exists()` check would wrongly
-    /// accept it), but a real directory was replaced by a plain file - `is_dir()` is the real
-    /// check that must reject this, not merely "something is there".
     #[test]
     fn last_focused_existing_path_is_none_when_the_remembered_path_was_replaced_by_a_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -717,8 +643,6 @@ mod tests {
         );
     }
 
-    /// [`RepoState::save_merged_at`] must persist `last_focused` too, not just `repos` - the
-    /// real mechanism GitHub issue #90's "remembers the last-opened folder" needs.
     #[test]
     fn save_merged_at_persists_last_focused() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -741,9 +665,6 @@ mod tests {
         assert_eq!(reloaded.last_focused, Some("/repo/a".to_string()));
     }
 
-    /// `last_focused` is a real, single global value - a later save from the same instance with
-    /// a genuine new focus must overwrite whatever the previous save left, even across two
-    /// separate `save_merged_at` calls simulating two real `AdeApp::focus_repo` calls.
     #[test]
     fn save_merged_at_overwrites_a_previous_last_focused_with_a_newer_one() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -790,10 +711,6 @@ mod tests {
         assert!(!repo.worktrees_loaded);
     }
 
-    /// The concurrency cap's real shape: ten due repos with a cap of four must split into
-    /// `[4, 4, 2]`, never a single batch of ten (which would let all ten real `git worktree list`
-    /// subprocesses fire at once) and never one repo per batch either (which would serialize the
-    /// whole sweep needlessly).
     #[test]
     fn batch_repos_for_refresh_splits_into_capped_chunks() {
         let ids: Vec<RepoId> = (0..10).map(RepoId).collect();
@@ -823,9 +740,6 @@ mod tests {
         assert!(batch_repos_for_refresh(&[], 4).is_empty());
     }
 
-    /// A defensive floor, not a real call site (every real caller uses a real positive constant):
-    /// `concurrency == 0` must not panic (`[T]::chunks` itself panics on a zero chunk size) or
-    /// silently drop every id - it degrades to one id per batch instead.
     #[test]
     fn batch_repos_for_refresh_treats_a_zero_concurrency_as_one() {
         let ids: Vec<RepoId> = (0..3).map(RepoId).collect();

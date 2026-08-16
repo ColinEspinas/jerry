@@ -150,9 +150,6 @@ fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_
     });
 }
 
-/// The other half of the model, at the same altitude: a real save through Jerry's own editor -
-/// `⌘S` → `save_active_file` → the real serial writer loop → a real `fs::write` - must flip
-/// exactly the lines it changed to `you`, on top of what an agent already wrote.
 #[gpui::test]
 fn a_real_save_through_jerrys_own_editor_flips_exactly_its_own_lines_to_you(
     cx: &mut gpui::TestAppContext,

@@ -1,55 +1,5 @@
 //! The Windows [`ProcessSampler`](super::ProcessSampler) backend: `GetProcessTimes` for CPU time
 //! and PSAPI's `GetProcessMemoryInfo` for the working set (GitHub issue #283).
-//!
-//! ## The two calls, and the handle each one needs
-//!
-//! Both readings go through a process handle from `OpenProcess`, so both are wrapped in
-//! [`ProcessHandle`], a real RAII guard that `CloseHandle`s on drop - a handle leaked once per
-//! agent per status poll would be a genuine, unbounded resource leak in a long-running window,
-//! not a theoretical one.
-//!
-//! - `GetProcessTimes` needs only `PROCESS_QUERY_LIMITED_INFORMATION`, and returns four
-//!   `FILETIME`s of which this backend sums the kernel and user ones. A `FILETIME` here is *not*
-//!   a wall-clock date: for the kernel/user fields it is a duration in 100-nanosecond units,
-//!   which is why the two halves are recombined into a `u64` and multiplied by 100 rather than
-//!   run through any date conversion.
-//! - `GetProcessMemoryInfo` needs the same right, and *only* that right. Checked against the
-//!   current Microsoft documentation rather than assumed: "The handle must have the
-//!   **PROCESS_QUERY_INFORMATION** or **PROCESS_QUERY_LIMITED_INFORMATION** access right", with
-//!   `PROCESS_VM_READ` additionally required only on "Windows Server 2003 and Windows XP" -
-//!   platforms this app does not target and could not run on. So both readings open the process
-//!   exactly once, with exactly one access right, rather than trying a wider mask first and
-//!   falling back.
-//!
-//! `WorkingSetSize` is the field read, not `PagefileUsage`/`PrivateUsage`: the working set is the
-//! physical memory currently resident for the process, which is what Linux's `VmRSS` and macOS's
-//! `ri_resident_size` also are, and issue #283's requirement is that the same status-bar number
-//! mean the same thing on all three.
-//!
-//! ## WSL
-//!
-//! This backend covers *native* Windows processes. An agent hosted inside a WSL2 distro is a real
-//! Linux process, sampled by a real Linux build of this app running inside that distro through
-//! `super::linux`'s `/proc` path - see the parent module's docs.
-//!
-//! See the parent module's docs for the per-process (not per-process-tree) limitation, which is
-//! documented once there for every platform rather than repeated per backend - `GetProcessTimes`
-//! covers this pid alone, exactly like the Linux and macOS readings. (A Windows job object could
-//! roll a whole tree up here, which is precisely why that fix must not land on this platform
-//! alone.)
-//!
-//! ## Verification status
-//!
-//! This file was written on a Linux machine, so nothing in it was executed locally. What *was*
-//! verified locally is that it type-checks against the real `windows-sys` bindings, by
-//! cross-compiling this module for `x86_64-pc-windows-gnu` - see the PR for issue #283.
-//!
-//! Its real execution happens in CI. Note that `cargo build` does *not* compile `#[cfg(test)]`
-//! modules at all, so the `windows-latest` build job alone would never have run a line of this
-//! file's tests - `.github/workflows/ci.yml`'s Windows job therefore has a dedicated
-//! `cargo test -p app --lib status_bar::process_stats` step, added with this backend, which is
-//! what actually exercises the code below on a real Windows runner. Without it, "CI covers this"
-//! would have been an empty claim.
 
 // This module exists entirely to call Win32 FFI (`OpenProcess`, `GetProcessTimes`,
 // `GetProcessMemoryInfo`, `GlobalMemoryStatusEx`) - every call site below carries its own
@@ -132,15 +82,6 @@ impl ProcessSampler for Sampler {
 
 /// See [`super::system_memory_bytes`] - this machine's real total physical memory, from one
 /// `GlobalMemoryStatusEx` call's `ullTotalPhys`.
-///
-/// `GlobalMemoryStatusEx` rather than the older `GlobalMemoryStatus`: the older call's fields are
-/// `SIZE_T`, so on a machine with more memory than fits the type it reports a clamped value
-/// instead of failing - Microsoft's own documentation says to use the `Ex` form for exactly that
-/// reason. `ullTotalPhys` is a `u64` and is the installed physical memory, which is the
-/// denominator the Resources popover's memory meter needs.
-///
-/// Read once and cached, for the same reason the macOS backend caches its `hw.memsize`: installed
-/// memory cannot change while the process runs, and this is a per-frame call site.
 pub fn system_memory_bytes() -> Option<u64> {
     static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TOTAL.get_or_init(read_total_memory_bytes)
@@ -177,10 +118,6 @@ fn filetime_to_hundred_nanos(time: FILETIME) -> u64 {
 }
 
 /// A real `OpenProcess` handle, closed exactly once on drop.
-///
-/// `CloseHandle` on drop rather than at each early return: [`Sampler::cpu_time`] and
-/// [`Sampler::resident_bytes`] both have failure paths after the open, and a handle leaked on
-/// one of them would leak once per agent per status poll for the lifetime of the window.
 struct ProcessHandle(HANDLE);
 
 impl ProcessHandle {
@@ -212,8 +149,6 @@ impl Drop for ProcessHandle {
 mod tests {
     use super::*;
 
-    /// The `FILETIME` recombination, against hand-checked bit patterns - the one piece of this
-    /// backend that is pure arithmetic and so can be wrong in a way no OS call would catch.
     #[test]
     fn filetime_recombines_its_two_halves() {
         assert_eq!(
@@ -246,8 +181,6 @@ mod tests {
         );
     }
 
-    /// One real CPU-second is 10,000,000 `FILETIME` units - the conversion this backend applies
-    /// before handing a [`Duration`] to the shared math, checked end to end.
     #[test]
     fn a_hundred_nanosecond_count_converts_to_real_time() {
         let one_cpu_second = filetime_to_hundred_nanos(FILETIME {
@@ -260,8 +193,6 @@ mod tests {
         );
     }
 
-    /// Real Win32 calls against this very test process, which always exists and which this
-    /// process can always open.
     #[test]
     fn reads_this_real_test_process() {
         let pid = std::process::id();
@@ -285,10 +216,6 @@ mod tests {
         assert_eq!(Sampler.resident_bytes(u32::MAX), None);
     }
 
-    /// A real `GlobalMemoryStatusEx` read on the runner itself: every real Windows machine has
-    /// some physical memory, and it is always at least as large as this process's own working
-    /// set - which is what makes it a usable meter denominator rather than a number that could
-    /// put the numerator past 100%.
     #[test]
     fn reads_this_real_machines_total_memory() {
         let total =

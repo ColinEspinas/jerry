@@ -1,86 +1,5 @@
 //! Surface C's real minimap (GitHub issue #30's second half) - a VS-Code-style reduced-scale
 //! overview of the File view's own already-highlighted content, to the right of the code column.
-//!
-//! ## What's real here
-//!
-//! - **Syntax colors, not invented ones.** `build_line_rects` reads the exact same
-//!   `code_view::RenderedLine` runs (`(SharedString, HighlightKind)` pairs) the File view's own
-//!   rows paint from - whichever of `crate::code_surface::edit_buffer::EditBuffer::lines` (a live
-//!   buffer) or `code_view::ParsedFile::lines` (the read-only cache) `Self::render_file_view`
-//!   already resolved this render, passed in by the caller rather than re-derived here. There is
-//!   no second, simplified color table: `code_view::color_for_kind` is the one real mapping this
-//!   app has, and this module is its only other consumer besides the File view rows themselves.
-//! - **A real, draggable viewport slider**, not a decorative rectangle - `MinimapSliderDrag`
-//!   plus `on_drag`/`on_drag_move` on the slider itself (the exact mechanism
-//!   `crate::root::scrollbar`'s own overlay-scrollbar thumb already established - see that
-//!   module's docs for why the drag payload needs its own `&'static str` identity once more than
-//!   one drag-driven element can be mounted at once) and a real click-to-jump handler on the
-//!   track. Both drive `AdeApp::file_view_scroll_handle` directly
-//!   (`UniformListScrollHandle::scroll_to_item`/`scroll_to_item_strict`) - the *same* real scroll
-//!   handle the code column's own overlay scrollbar (`crate::root::scrollbar`) and go-to-definition
-//!   already drive, so dragging the minimap slider really moves the code you're reading, not a
-//!   second, disconnected notion of scroll position.
-//! - **A real git-diff overlay** - `build_git_overlay_rects` reuses
-//!   `AdeApp::file_view_changed_lines` (the same on-disk diff already backing the code column's
-//!   gutter stripe and its own scrollbar's decoration marks - see `crate::code_surface::file_view`'s
-//!   `editor_scrollbar_marks` docs), not a second diff computed here.
-//! - **A real, structural "hidden by default for very large files" gate**
-//!   (`should_render_minimap`) - independent of `crate::settings::store::EditorSettings::minimap_enabled`:
-//!   a file over `MAX_MINIMAP_LINES` lines never gets a minimap at all, regardless of the
-//!   setting, so turning the setting on can't accidentally light up an unreadable, expensive
-//!   overview for a huge generated file.
-//!
-//! ## Overlays for search matches: honestly not implemented
-//!
-//! Same real gap `crate::root::scrollbar`'s own docs already record for the code column's
-//! scrollbar decoration marks: this app has no find-in-file feature anywhere
-//! (`grep -rn "SearchMatch\|find_in_file" crates/app/src` matches nothing), so there are no real
-//! match positions to paint ticks for. Inventing a fake match set would be exactly the "no
-//! simulated output" violation `CONTRIBUTING.md` exists to prevent - left out here for the same
-//! reason, not an oversight.
-//!
-//! ## A deliberate simplification: compress the whole file to fit, never pan
-//!
-//! A real VS Code-style minimap for a very long file lets the minimap's own drawn region pan
-//! independently as you scroll (so each line keeps a legible, fixed pixel height). This module
-//! makes a simpler, honestly-documented choice instead: `effective_line_height` always draws
-//! *every* line of the file, compressing the per-line height below its natural
-//! `MINIMAP_BASE_LINE_HEIGHT_PX` whenever the whole file wouldn't otherwise fit in the panel's
-//! own measured height. This trades fidelity on a long file (many lines compress into a blurred
-//! band of average color, the same visual cost a "fit to viewport" minimap setting has in real
-//! editors) for a much simpler, single-code-path implementation with no second scroll offset of
-//! its own to keep in sync - a real, independently-panning minimap is a separate, larger feature
-//! this phase doesn't attempt. `MAX_MINIMAP_LINES` is picked so this compression stays legible
-//! (a few hundred pixels tall panel, a few thousand lines) rather than degenerating into a solid
-//! color smear before the large-file gate above would hide it anyway.
-//!
-//! ## Not off the main thread, honestly
-//!
-//! This module's original scoping-out cited GPUI's own single foreground-thread
-//! rendering architecture as the reason a real minimap *paint* can never genuinely run off the
-//! main thread - only the highlighting step could (and already does, via
-//! `AdeApp::spawn_file_load`/`Self::schedule_rehighlight`, unrelated to this module). That
-//! constraint hasn't changed: `AdeApp::render_minimap` paints on the same foreground thread
-//! `Self::render_file_view` itself runs on, via a plain `gpui::canvas` (the same primitive
-//! `crate::code_surface::editing`'s cursor overlay already uses for its own per-row paint). What
-//! *has* changed is the honest risk assessment: this module never re-highlights anything (it only
-//! reads already-computed `RenderedLine` runs) and the large-file gate above bounds how much
-//! per-render work the compression/rect-building step (`build_line_rects`) can ever do, so a real
-//! render ships now instead of staying deferred - but this was not verified against a real
-//! `gpui::FrameTiming` measurement the way this codebase's own terminal-poll-cadence and
-//! file-tree-virtualization work was. That is a real, disclosed gap in this change's own rigor,
-//! not a claim of a benchmark that wasn't actually run.
-//!
-//! ## One more disclosed, established-pattern gap: a one-frame bounds lag
-//!
-//! The slider's own pixel geometry needs the minimap panel's real rendered height, which (like
-//! `crate::root::AdeApp::body_bounds`/`crate::work_surface::render::AdeApp::plus_button_bounds`/
-//! `crate::terminal::pane::TerminalPane::content_bounds` before it) can only come from a small
-//! measuring `gpui::canvas` child's own prepaint callback - so it always reflects the *previous*
-//! frame's layout, not a chicken-and-egg same-frame measurement. The very first frame a File view
-//! opens, `AdeApp::minimap_panel_bounds` is still `gpui::Bounds::default()` (zero height), so
-//! `effective_line_height` returns `0.0` and nothing is drawn that one frame - self-correcting
-//! on the next real render, exactly like the three established call sites above.
 
 use std::collections::HashSet;
 
@@ -177,17 +96,6 @@ fn visible_line_range(
 
 /// [`visible_line_range`]'s answer translated out of *visual row* space into the *buffer line*
 /// space every other helper in this module works in (GitHub issue #202).
-///
-/// [`visible_line_range`] divides a real scroll offset by the real row height, so what it really
-/// returns is which `uniform_list` rows are on screen. This panel draws one bar per real line of
-/// the file - collapsed or not, see this module's own "compress the whole file to fit" docs - so
-/// the viewport slider has to be placed over the *lines* those rows show. With nothing folded
-/// `FoldMap::line_for_row` is the identity and this returns exactly what
-/// [`visible_line_range`] did.
-///
-/// Returns `(first_visible_line, visible_line_count)`, `0`-indexed/counted, matching
-/// [`visible_line_range`]'s own convention so [`slider_geometry`]/[`line_for_pointer`] take it
-/// unchanged.
 fn visible_line_range_through_folds(
     viewport_height: f32,
     scrolled_px: f32,
@@ -355,16 +263,6 @@ impl gpui::Render for MinimapSliderDrag {
 
 impl AdeApp {
     /// GitHub issue #202: `fold_map` is what keeps this panel honest once a block is collapsed.
-    ///
-    /// Every helper in this module works in *buffer line* space (it draws one bar per real line
-    /// of the file, collapsed or not - see this module's own "compress the whole file to fit"
-    /// docs), while `file_view_scroll_handle` works in *visual row* space. Those were the same
-    /// number until folding existed, and this method is the only boundary where they meet: the
-    /// viewport slider is derived from a scroll offset (rows -> lines), and both the drag and the
-    /// track click produce a line the code column must scroll to (lines -> rows). Left
-    /// unconverted, a fold would put the slider over the wrong band and send a click to the wrong
-    /// place. With nothing folded both conversions are the identity, so an unfolded file's
-    /// minimap behaves exactly as it did.
     pub(in crate::code_surface) fn render_minimap(
         &self,
         lines: &[code_view::RenderedLine],
@@ -552,12 +450,9 @@ mod geometry_tests {
         assert!(!should_render_minimap(false, 10));
     }
 
-    /// GitHub issue #202. With nothing collapsed the row->line translation must be a no-op, or
-    /// this fix would have silently moved every existing minimap's slider.
     #[test]
     fn with_nothing_folded_the_slider_range_is_exactly_what_it_always_was() {
         let unfolded = fold::FoldMap::unfolded(100);
-        // 10 rows of 20px scrolled 200px: rows 10..=19, i.e. lines 10..=19.
         assert_eq!(
             visible_line_range_through_folds(200.0, 200.0, 20.0, &unfolded),
             (10, 10)
@@ -565,9 +460,6 @@ mod geometry_tests {
         assert_eq!(visible_line_range(200.0, 200.0, 20.0), (10, 10));
     }
 
-    /// The real point of the translation: the ten rows on screen span a much wider band of the
-    /// *file* when a collapsed region sits inside them, and the minimap draws the whole file - so
-    /// the slider must cover that wider band, not ten lines' worth of it.
     #[test]
     fn a_collapsed_region_inside_the_viewport_widens_the_slider_to_the_lines_it_spans() {
         let ranges = [fold::FoldRange {

@@ -5,73 +5,6 @@
 //! position-encoding helper the hover trigger needs to build that request. Deliberately
 //! `gpui`-window-free (no `gpui` type is used at all - output is plain `String`s, wrapped in a
 //! `SharedString` by `crate::root` at render time).
-//!
-//! ## Completions are out of scope
-//!
-//! `design_handoff_jerry_ade/README.md`'s `lsp_popup` state also covers `Completions`, not built
-//! here. The design's Completions popup assumes an editable caret mid-edit (`⏎ accept` inserts
-//! the selected candidate) - `crate::code_surface::code_view`'s File view is read-only, with no caret and no
-//! text insertion, so a Completions popup would show real candidates with no way to accept one:
-//! a component bound to nothing, which this project's conventions forbid. Hover and
-//! go-to-definition have no such problem - both are complete, read-only actions - so they're
-//! built; Completions is left for a future phase with a real editing surface.
-//!
-//! ## Observed rust-analyzer hover shape
-//!
-//! `lsp_types::Hover::contents` is a single unstructured markup blob - the LSP spec says nothing
-//! about its internal structure, so the module path/signature/doc split
-//! [`build_hover_render_model`] parses was reverse-engineered by spawning a real
-//! `rust-analyzer` against scratch fixtures and inspecting replies directly (the same technique
-//! `lsp_core::client`'s hover/definition end-to-end tests use). Four examples captured this way,
-//! reused as this module's test fixtures (a documented function at its call site; a local
-//! variable; a function parameter; an integer literal):
-//!
-//! ```text
-//! "hover_probe_fixture\n\nfn add_one(x: i32) -> i32\n\n\nAdds one to the given number.\n\nReturns the incremented value."
-//! "let result: i32\n\n\nsize = 4, align = 0x4, no Drop"
-//! "x: i32"
-//! "i32\n\n\nvalue of literal: 41 (0x29|0b101001)"
-//! ```
-//!
-//! The observed convention: the response is a sequence of blank-line-separated paragraphs. An
-//! item with a module path puts it on the first paragraph, immediately followed by a paragraph
-//! that is itself an item signature (starts with `fn `/`struct `/... - see
-//! [`looks_like_item_signature`]); anything else (a local, parameter, literal - none of which
-//! have a module path) starts directly with its signature/type paragraph. Any remaining
-//! paragraph is doc prose. The heuristic is imperfect: a bare paragraph that is itself a whole
-//! hover, with no signature paragraph following, could in principle be misread as a module path
-//! with no signature - see [`looks_like_item_signature`] for why the signature check exists to
-//! keep that rare.
-//!
-//! ## Why plain text, not Markdown - and the real Markdown fallback for when a server ignores it
-//!
-//! `lsp_core::LspClient::initialize` now explicitly requests `PlainText` as this client's
-//! preferred `content_format` (Revision R8's generalization past rust-analyzer, which never
-//! needed to be asked - it was observed here to always default to
-//! [`lsp_types::MarkupKind::PlainText`] on its own). Pyright was directly observed (see
-//! `lsp_core::client`'s own real Python hover test) honoring that preference for real. But
-//! `typescript-language-server` was directly observed doing the opposite - sending `Markdown`
-//! regardless (see `lsp_core::client`'s own real TypeScript hover test, whose captured sample
-//! [`degrade_markdown_to_plain_text`]'s own tests reuse verbatim) - so this module can't assume
-//! every response is plain text just because it asked. [`markup_text`] checks the real
-//! `MarkupKind` on every `Markup` response and runs [`degrade_markdown_to_plain_text`] only over
-//! genuinely `Markdown`-kinded content: real fenced-code/heading/list/bold syntax characters are
-//! stripped so they never render literally, but this is deliberately *not* a structured Markdown
-//! parse - this module's paragraph/signature heuristics below stay Rust-hover-shaped (a
-//! documented, honest scope limit, not silently pretended away). [`markup_text`] still handles
-//! the older [`lsp_types::HoverContents::Scalar`]/`Array` shapes defensively even though only
-//! `Markup` has ever actually been observed.
-//!
-//! ## Position precision: per-token, not per-character
-//!
-//! [`byte_offset_to_utf16_offset`] converts a byte offset into the UTF-16 `character` offset the
-//! LSP position encoding requires, but the byte offset it's given
-//! (`crate::code_surface::file_view::render_file_view_line`'s click handler) is always the *start* of whichever
-//! highlighted token the user clicked, not a sub-token pixel-accurate position - this app has no
-//! character-level mouse hit-testing against monospace text. In practice this is
-//! indistinguishable from per-character precision: `rust-analyzer` resolves a hover/definition
-//! query to whichever whole token contains the position, and a token's start always falls inside
-//! that same token.
 
 use std::ops::Range;
 
@@ -183,12 +116,6 @@ fn split_param_name(rest: &str) -> (String, String) {
 
 /// Drops the dash a doc tag's own prose is commonly separated from its tag/name by, so a rendered
 /// description never opens with a stray dangling dash.
-///
-/// Covers the real em dash a live `typescript-language-server` uses (`"@returns \u{2014} The
-/// formatted display name"`, captured verbatim in this module's own
-/// `REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER`) alongside the ASCII hyphen a hand-written JSDoc comment
-/// conventionally uses, and an en dash for good measure - all three are the same real convention,
-/// and only one of them was handled before.
 fn strip_separator_dash(text: &str) -> &str {
     text.strip_prefix(['-', '\u{2013}', '\u{2014}'])
         .map(str::trim_start)
@@ -430,27 +357,6 @@ fn markup_text(contents: &lsp_types::HoverContents) -> String {
 /// `typescript-language-server` hover output (see this function's own tests, which reuse the
 /// exact captured sample `lsp_core::client`'s real TypeScript hover test produced), not
 /// synthetic Markdown invented for this function alone.
-///
-/// A fenced code block's own delimiter lines (`` ```lang ``/`` ``` ``) are dropped entirely, and
-/// closing one starts a new paragraph (an inserted blank line) - a real, observed
-/// typescript-language-server hover puts a fenced signature immediately followed, with no blank
-/// line, by doc prose (`` "\n```typescript\nfn...\n```\nAdds one..." ``); without this, the
-/// signature and doc prose would run together into what looks like one unbroken paragraph rather
-/// than the two visually distinct pieces a Rust-analyzer-style response would have delivered as.
-/// A leading `#`/`##`/... heading marker and a leading `- `/`* ` list bullet are stripped per
-/// line; `**`/`` ` `` are stripped wherever they appear (bold/inline-code markers) - a coarse,
-/// line/character-level pass, not a real Markdown AST walk, which this module's modest "degrade
-/// gracefully" scope (not "render Markdown") doesn't call for.
-///
-/// Deliberately does **not** strip a bare `__` the way it strips `**` - a real, common
-/// TypeScript/JavaScript identifier can itself contain a genuine double underscore (`__proto__`,
-/// `__dirname`, `__esModule`, ...), and that shape is *byte-for-byte indistinguishable* from real
-/// Markdown's own `__bold__` emphasis syntax: there is no rule that tells `__proto__` (an
-/// identifier) apart from `__proto__` (real bold text), paired or not - a "only strip balanced
-/// pairs" rule would still wrongly strip the identifier case. The real, live-verified hover
-/// output this app actually parses (`typescript-language-server`, captured in this module's own
-/// tests) uses `**` for emphasis, never `__` - so `__` is left alone entirely rather than risk
-/// silently corrupting a real identifier for a real server that doesn't even need it stripped.
 pub(crate) fn degrade_markdown_to_plain_text(markdown: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
     let mut in_fence = false;
@@ -493,21 +399,6 @@ pub(crate) fn degrade_markdown_to_plain_text(markdown: &str) -> String {
 
 /// Unwraps real single-`*` Markdown emphasis (`*@param*` -> `@param`), leaving an asterisk that
 /// isn't real emphasis exactly where it was.
-///
-/// Not cosmetic, and not covered by the `**` strip above: a real, live
-/// `typescript-language-server` wraps **every** JSDoc tag it reports in single-asterisk emphasis
-/// (`"*@param* `first` \u{2014} ..."`, captured verbatim in this module's own
-/// `REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER`). [`parse_doc_sections`] recognizes a tag only when the
-/// line's first non-whitespace byte is `@`, so before this unwrap not one real TypeScript doc tag
-/// was ever recognized - the entire structured `@param`/`@returns`/`@example` rendering silently
-/// degraded to a single flat paragraph with literal `*` characters in it, which is what the app
-/// genuinely put on screen.
-///
-/// Deliberately a paired-run scan rather than a blanket `replace('*', "")`: an opening marker
-/// must be immediately followed by a non-whitespace byte and have a later closing marker
-/// immediately preceded by one - real Markdown's own emphasis rule. A lone `*args`, a glob, or a
-/// `3 * 4` multiplication has no such pair and passes through untouched, so this can't corrupt
-/// real prose or real code the way an unconditional strip would.
 fn unwrap_paired_emphasis(line: &str) -> String {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
@@ -695,9 +586,6 @@ mod tests {
         );
     }
 
-    /// A real rustdoc-style doc comment (Rust's own convention: no `@`-tags at all in the
-    /// overwhelming majority of real crates) must come back as `description` alone, unchanged -
-    /// GitHub issue #200's own explicit non-goal, not a parsing gap.
     #[test]
     fn parse_doc_sections_leaves_a_real_untagged_rustdoc_style_comment_as_plain_description() {
         let doc = "Adds one to the given number.\n\nReturns the incremented value.";
@@ -788,12 +676,6 @@ mod tests {
         "console.log(name);\n```"
     );
 
-    /// The real, live-reproduced bug behind "JSDoc rendering does nothing" (verified on screen
-    /// against the real running app, not just here): because a real `typescript-language-server`
-    /// emphasizes its tags, every doc line reached [`parse_doc_sections`] as `*@param* ...`, whose
-    /// first non-whitespace byte is `*` and not `@`, so not one tag was ever recognized - the
-    /// whole structured-section feature silently degraded to one flat paragraph with literal
-    /// asterisks in it. Degrading must unwrap real paired emphasis so the tags survive as tags.
     #[test]
     fn degrade_markdown_unwraps_the_real_emphasis_typescript_wraps_every_jsdoc_tag_in() {
         let plain = degrade_markdown_to_plain_text(REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER);
@@ -811,9 +693,6 @@ mod tests {
         );
     }
 
-    /// A bare `*` that is not real paired emphasis (a multiplication sign, a glob, a `*args`-style
-    /// prefix with no closing partner) must survive untouched - the unwrap above must not become
-    /// a blanket asterisk strip that corrupts real prose or real code.
     #[test]
     fn degrade_markdown_leaves_a_real_unpaired_asterisk_alone() {
         assert_eq!(
@@ -822,10 +701,6 @@ mod tests {
         );
     }
 
-    /// The real end-to-end payoff of the two fixes above, driven by the exact real server string:
-    /// a genuinely JSDoc-tagged TypeScript hover must come back as real, separated sections -
-    /// two named params with their real prose, a real returns line, and a real multi-line example
-    /// body - rather than the one flat run-on paragraph the app actually rendered on screen.
     #[test]
     fn a_real_typescript_jsdoc_hover_parses_into_real_structured_sections() {
         let hover = markdown_hover(REAL_TYPESCRIPT_JSDOC_MARKDOWN_HOVER);
@@ -879,12 +754,6 @@ mod tests {
         assert!(!model.doc.unwrap().contains('`'));
     }
 
-    /// Real, live-reported corruption: a fenced `@example` code block's own real content (a JS
-    /// template literal's backtick, a `2 ** 10` exponent) used to be stripped right along with
-    /// genuine Markdown `` ` ``/`**` syntax, since the old blanket `.replace(...)` ran once over
-    /// the whole joined string with no notion of "was this line inside a fence". The fence's own
-    /// delimiter lines are still dropped (unrelated, separate code path), but real code between
-    /// them must survive byte-for-byte.
     #[test]
     fn degrade_markdown_to_plain_text_never_mangles_real_code_inside_a_fence() {
         let plain = degrade_markdown_to_plain_text(
@@ -919,12 +788,6 @@ mod tests {
         assert!(plain.contains("bold and code"));
     }
 
-    /// Regression coverage for the real bug this fix addresses: a blanket `.replace("__", "")`
-    /// used to silently corrupt a real, common TypeScript/JavaScript identifier that happens to
-    /// contain a genuine double underscore whenever it showed up in real Markdown-formatted hover
-    /// text - `__proto__` becoming `proto`, `__dirname` becoming `dirname`. Real
-    /// `typescript-language-server` hover output (see this module's own captured sample) uses
-    /// `**` for emphasis, never `__`, so leaving `__` alone entirely costs nothing real.
     #[test]
     fn degrade_markdown_to_plain_text_never_mangles_a_real_double_underscore_identifier() {
         let plain = degrade_markdown_to_plain_text(

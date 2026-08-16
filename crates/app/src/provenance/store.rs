@@ -1,48 +1,5 @@
 //! The provenance store itself: who wrote each line, kept per worktree and per path
 //! (GitHub issue #284).
-//!
-//! GPUI-free, git-free and process-free. The only I/O it does is reading the files it is asked
-//! about, so every rule below is directly `#[test]`-able without a window - the same contract
-//! `crate::hooks::event` and `crate::rail::status` already hold.
-//!
-//! ## How a line gets an author
-//!
-//! Not from the edit payload. A Claude Code `Edit` payload carries `old_string`/`new_string`, a
-//! `Write` carries whole-file `content`, a `MultiEdit` carries an array, and a `Bash` running
-//! `sed -i` carries nothing at all - four shapes, three of which would need their own bespoke
-//! "where did this land in the file" reasoning, and the fourth of which is unanswerable. So the
-//! store never reads the payload's content. It reads **the file**, twice:
-//!
-//! 1. [`WorktreeProvenance::begin_edit`], from the tool call's `PreToolUse` - before the agent has
-//!    written anything. This is the "what was there before" snapshot, and it is the whole reason
-//!    the first edit to a file attributes two changed lines rather than all five hundred.
-//! 2. [`WorktreeProvenance::record`], from the matching `PostToolUse` - after the write landed.
-//!    The two contents are diffed line by line, and the lines that changed become that agent's.
-//!
-//! Everything that survived the diff keeps the author it already had. That is what makes the
-//! attribution accumulate across agents instead of the last writer taking the whole file.
-//!
-//! ## The two hard-won rules, and where they live
-//!
-//! - **A hand edit flips that line back to you.** There is no separate code path for it:
-//!   [`WorktreeProvenance::record`] takes the author as a parameter, and Jerry's own editor passes
-//!   [`Author::You`]. The rule is therefore not a special case that could be forgotten - it is the
-//!   same mechanism with a different author, and it flips *exactly* the lines that changed.
-//! - **Attribution is local, never committed.** Nothing here writes anything into the worktree.
-//!   The store reads files and mutates memory; the only durable artifact is
-//!   `super::persist_state`'s sibling of `settings.toml`.
-//!
-//! ## Deletions need their own ledger, and why
-//!
-//! Per-line authorship can only describe lines that still exist. A deleted line has no line to
-//! hang an author off, and yet a diffstat's `−N` half is entirely made of them - so a `split`
-//! derived from line authors alone could never account for a removal, and
-//! `super::change_set`'s "the shares sum to the total" invariant would be unprovable.
-//!
-//! [`RemovalMark`] is that ledger: when a diff removes lines, the store records *who* removed
-//! *how many*, anchored to the position in the surviving content where they used to be. The
-//! anchors move with the file (an insertion above shifts them down), and a mark inside a region
-//! that a later edit rewrote is dropped rather than carried onto content it no longer describes.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -56,10 +13,6 @@ use super::{AgentKey, Author, DiffStat};
 /// rather than tracked at a cost nobody asked for: the store keeps the file's content in memory
 /// (it is the "what was there before" half of every future diff), so this is a real per-tracked-
 /// file memory bound, not a parse guard.
-///
-/// 2 MiB matches `wt_core::diff::MAX_DIFF_OUTPUT_BYTES`'s cap on a whole worktree's diff text,
-/// which is the same order of magnitude for the same reason - past it, a file is generated output
-/// or a checked-in blob, and per-line authorship of it is not a thing a human is going to read.
 pub const MAX_TRACKED_BYTES: usize = 2 * 1024 * 1024;
 
 /// Largest file, in lines, the store will track. A separate bound from [`MAX_TRACKED_BYTES`]
@@ -68,9 +21,6 @@ pub const MAX_TRACKED_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TRACKED_LINES: usize = 200_000;
 
 /// A run of lines deleted from a path, and who deleted them.
-///
-/// `at` is an index into the *surviving* lines - the deletion happened immediately before that
-/// line, so `0` means "before the first line" and `line_count()` means "at the end of the file".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovalMark {
     pub at: usize,
@@ -86,10 +36,6 @@ pub enum RecordOutcome {
     /// This path had no recorded state, so there was nothing to diff against. The content is now
     /// the baseline, and every line of it is [`Author::Unattributed`] - the honest answer, since
     /// nothing here knows which of those lines this author actually wrote.
-    ///
-    /// In production this is the rare path: `PreToolUse` seeds the baseline before the agent
-    /// writes (see [`WorktreeProvenance::begin_edit`]), so the matching `PostToolUse` finds a real
-    /// baseline and attributes properly. This is what a Jerry launched *mid-tool-call* sees.
     Seeded,
     /// The content is byte-identical to what was already recorded - a `PostToolUse` for a tool
     /// that read rather than wrote, or a save of an unmodified buffer. Nothing is attributed,
@@ -314,10 +260,6 @@ impl WorktreeProvenance {
 
     /// Snapshots `content` as the baseline for `relative` if there is not already one, attributing
     /// nothing. Called from an agent's `PreToolUse`, before it writes.
-    ///
-    /// Returns `true` if a baseline was actually taken. An already-tracked path is left completely
-    /// alone: re-seeding it would erase every author already recorded for it, which is precisely
-    /// the bug that would make the second agent to touch a file appear to have written all of it.
     pub fn begin_edit(&mut self, relative: &Path, content: &str) -> bool {
         if self.paths.contains_key(relative) {
             return false;
@@ -391,12 +333,6 @@ impl ProvenanceStore {
     /// it stands right now. Safe and cheap to call for a path that is already tracked (it does
     /// nothing), and for a tool call that turns out not to write anything (the snapshot is simply
     /// never diffed against).
-    ///
-    /// **Only correct when called at `PreToolUse` time.** The app does not call this: by the time
-    /// the UI thread drains the edit log the agent has already written, and this would snapshot
-    /// the *after* content as if it were the before. See [`snapshot_for_edit`] and
-    /// [`Self::begin_agent_edit_with`] for the shape that is actually wired up, and
-    /// `crate::provenance::flow`'s module docs for why the distinction matters.
     pub fn begin_agent_edit(&mut self, worktree: &Path, file: &Path) {
         let Some(relative) = relative_within(worktree, file) else {
             return;
@@ -505,14 +441,6 @@ pub fn recorded_split(record: &PathProvenance) -> BTreeMap<Author, DiffStat> {
 }
 
 /// Reads a file as the "before" half of an agent's edit, at the moment the edit is announced.
-///
-/// `Some("")` for a file that does not exist yet - which is exactly right for a `Write` that is
-/// about to create it: every line it lands is genuinely that agent's. `None` for a file this store
-/// will not track (binary, unreadable, past the caps), so no baseline is taken at all.
-///
-/// Public because the one place this can honestly be called from is
-/// `crate::hooks::server`'s connection handler, on the `PreToolUse` request itself - see
-/// [`ProvenanceStore::begin_agent_edit`].
 pub fn snapshot_for_edit(absolute: &Path) -> Option<String> {
     match read_trackable(absolute) {
         Readable::Content(content) => Some(content),
@@ -529,11 +457,6 @@ fn new_lines(content: &str) -> Vec<&str> {
 }
 
 /// A `TokenSource` over an already-split line vector.
-///
-/// Not `&str`'s own built-in one: that would tokenize the content a second time, inside the diff,
-/// and this module's line *indices* are the whole product - an off-by-one between "how the store
-/// counts lines" and "how the diff counts lines" would silently attribute the wrong line. Feeding
-/// the diff the exact vector [`new_lines`] produced makes that class of bug unrepresentable.
 struct LineTokens<'a>(&'a [&'a str]);
 
 impl<'a> TokenSource for LineTokens<'a> {
@@ -575,11 +498,6 @@ fn trackable(content: &str) -> bool {
 }
 
 /// `file` expressed relative to `worktree`, or `None` if it is not inside it.
-///
-/// Accepts an already-relative path as-is (a hook payload can carry either shape - see
-/// `crate::hooks::event::EditedFile`), and refuses anything containing a `..` component even after
-/// stripping, so a payload naming `../../etc/passwd` can never be recorded under a worktree it is
-/// not in.
 pub fn relative_within(worktree: &Path, file: &Path) -> Option<PathBuf> {
     let relative = if file.is_absolute() {
         file.strip_prefix(worktree).ok()?
@@ -713,10 +631,8 @@ mod tests {
             authors_of(&store, dir.path(), "a.txt"),
             vec![
                 Author::Unattributed,
-                // Still the agent's: the hand edit did not touch this line.
                 Author::Agent(s3),
                 Author::Unattributed,
-                // The one line the human really changed.
                 Author::You,
                 Author::Unattributed,
             ],
@@ -896,7 +812,6 @@ mod tests {
             &s3,
             "one\nTWO\nthree\nfour\nfive\n",
         );
-        // A `PostToolUse` for a tool call that read rather than wrote.
         assert_eq!(
             store.record_agent_edit(dir.path(), &dir.path().join("a.txt"), &agent("s10")),
             RecordOutcome::Unchanged
@@ -928,7 +843,6 @@ mod tests {
             .get(Path::new("blob.bin"))
             .is_some());
 
-        // Now the same path becomes real binary content.
         std::fs::write(&file, [0u8, 159, 146, 150]).expect("write binary");
         assert_eq!(
             store.record_agent_edit(dir.path(), &file, &s3),
@@ -1071,10 +985,8 @@ mod tests {
             "one\nTWO\nthree\nBY HAND\nfive\n",
         );
 
-        // Everything the store recorded is real...
         assert_eq!(authors_of(&store, repo, "a.txt")[3], Author::You);
 
-        // ...and none of it is in the repository.
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-m", "the agent's work"]);
 

@@ -1,29 +1,5 @@
 //! The batched prompt: every review note on one file, composed into **one** string, in the two
 //! forms a pty can actually carry it.
-//!
-//! Pure and GPUI-free, because the one thing this feature must not get wrong is what it types into
-//! somebody's running agent, and that has to be assertable without a window.
-//!
-//! ## Why there are two forms
-//!
-//! `AUDIT-2026-08-13-competitive-v2.md` §6 top-5 #2 is built on one hard-won competitor finding:
-//! *"sending comments one at a time causes the agent to swing back and forth"*. So the whole
-//! feature is worthless unless delivery is genuinely **one** message. On a pty that is not a
-//! property of the text, it is a property of the bytes:
-//!
-//! - With **bracketed paste** on (`DECSET 2004`, which every full-screen agent TUI turns on while
-//!   its prompt is up), `ESC[200~ … ESC[201~` tells the receiving program the whole blob was
-//!   pasted. Newlines inside it are just newlines - the program does not run each line. One
-//!   trailing `\r` then submits the lot. This is the form worth reading, so it is the one used
-//!   whenever it is available.
-//! - With bracketed paste **off**, `crate::terminal::pane::paste_payload` normalises every `\n`
-//!   to `\r`, which is the Enter byte. A five-line prompt would arrive as **five** submissions -
-//!   exactly the failure mode this feature exists to prevent, and it would look like it worked.
-//!   So the fallback form contains no line breaks at all: the same sentences, joined with the
-//!   design's own `·` separator, delivered with one `\r`.
-//!
-//! Both forms are one submission. [`crate::terminal::pane::TerminalPane::send_prompt`] enforces
-//! that rather than trusting it - see its own docs.
 
 use super::{NoteAnchor, ReviewNote};
 use crate::root::plural;
@@ -34,9 +10,6 @@ use std::path::Path;
 const FLAT_SEPARATOR: &str = " \u{b7} ";
 
 /// One batched, line-anchored prompt, as its own lines, before either delivery form is chosen.
-///
-/// Kept as lines rather than one pre-joined string precisely so [`Self::for_delivery`] can pick
-/// the joiner, and so the tests can read the composition and the framing apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchedPrompt {
     lines: Vec<String>,
@@ -50,12 +23,6 @@ pub struct BatchedPrompt {
 
 impl BatchedPrompt {
     /// Composes every note on `path` into one prompt.
-    ///
-    /// `notes` arrives in the order the notes are **pinned in the diff**, top to bottom, which is
-    /// the order the reviewer wrote them in and the order the agent will read the file in.
-    ///
-    /// `None` when there is nothing real to send. A prompt for zero notes is not an empty prompt,
-    /// it is not a prompt.
     pub fn compose(path: &Path, notes: &[(NoteAnchor, &ReviewNote)]) -> Option<BatchedPrompt> {
         let notes: Vec<(NoteAnchor, &ReviewNote)> = notes
             .iter()
@@ -101,9 +68,6 @@ impl BatchedPrompt {
     }
 
     /// The exact text to hand to the pty, given whether the target really has bracketed paste on.
-    ///
-    /// See this module's own docs for why the two differ, and why the difference is a correctness
-    /// requirement rather than a formatting preference.
     pub fn for_delivery(&self, bracketed_paste: bool) -> String {
         if bracketed_paste {
             self.lines.join("\n")
@@ -114,16 +78,6 @@ impl BatchedPrompt {
 }
 
 /// Strips every control character out of text that is about to be typed into a terminal.
-///
-/// A review note is text the user wrote, not text the user is trusted to have written *for a
-/// terminal*: a pasted stack trace or a snippet copied out of a log can genuinely contain `ESC`,
-/// and `ESC` in a payload is not a character, it is an instruction. `paste_payload`'s own bracket
-/// guard already strips `ESC` on the bracketed path (a note containing `ESC[201~` could otherwise
-/// close the paste early and have the rest read as commands), but the flat path has no such guard
-/// and `\r`/`\n`/`\t` matter there too - a stray `\r` in a note would be a second submission, the
-/// one thing this whole module exists to make impossible.
-///
-/// Replaced with a space rather than removed, so two words never silently fuse into one.
 pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -149,7 +103,6 @@ mod tests {
         PathBuf::from("src/api/users.rs")
     }
 
-    /// The composition, end to end, against the mock's own two authored notes for this file.
     #[test]
     fn a_batch_names_the_file_the_count_and_every_line_it_is_anchored_to() {
         let first = note("This drops the page argument on the floor.");
@@ -181,7 +134,6 @@ mod tests {
             .starts_with("Please address every note above in one revision"));
     }
 
-    /// One note is `1 note`, not `1 notes` - the same helper, the same rule.
     #[test]
     fn a_single_note_reads_as_one_note() {
         let only = note("only one");
@@ -190,7 +142,6 @@ mod tests {
         assert!(prompt.lines()[0].contains("\u{2014} 1 note, one prompt"));
     }
 
-    /// A removed line says so, so the agent looks in the right column.
     #[test]
     fn a_note_on_a_removed_line_says_removed() {
         let only = note("why did this go?");
@@ -210,8 +161,6 @@ mod tests {
         );
     }
 
-    /// The whole point of the feature, at the level the bytes decide it: whichever form goes down
-    /// the pty, it is **one** message.
     #[test]
     fn the_flat_delivery_form_contains_no_line_break_of_any_kind() {
         let first = note("one");
@@ -232,8 +181,6 @@ mod tests {
         assert!(flat.contains("line 5: one \u{b7} line 9: two"));
     }
 
-    /// And the readable form really is the multi-line one, so a bracketed-paste-capable agent
-    /// gets a prompt worth reading rather than the fallback's run-on line.
     #[test]
     fn the_bracketed_delivery_form_keeps_one_note_per_line() {
         let first = note("one");
@@ -249,8 +196,6 @@ mod tests {
         assert!(delivered.contains("\nline 5: one\nline 9: two\n"));
     }
 
-    /// A note is user text, not terminal input. Nothing in it may be read as an instruction, and
-    /// nothing in it may become a second submission.
     #[test]
     fn control_characters_in_a_note_never_reach_the_delivery_string() {
         let nasty = note("before\x1b[201~\rrm -rf /\nafter\ttab");
@@ -275,8 +220,6 @@ mod tests {
         );
     }
 
-    /// A path is user-controlled too (it comes off the real working tree), so it goes through the
-    /// same guard as the note text.
     #[test]
     fn a_path_is_sanitised_the_same_way_the_notes_are() {
         let only = note("fine");

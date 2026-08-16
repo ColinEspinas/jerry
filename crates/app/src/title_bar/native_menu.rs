@@ -4,15 +4,6 @@
 //! command sets. Only ever compiled on macOS (see this module's `#[cfg(target_os = "macos")]` in
 //! `crate::title_bar`'s own module declaration) - Windows/Linux keep the in-window popover as
 //! their only menu surface, which is the whole reason `crate::title_bar::menu` exists.
-//!
-//! ## No `disabled:` bookkeeping in here
-//!
-//! Every item built here leaves `disabled: false` - real enablement comes entirely from
-//! `crate::root::menu_commands::AdeApp::menu_command_enabled`, which gates whether that command's
-//! `on_action` listener is even attached to the focused window's dispatch tree (see that module's
-//! own docs). `gpui_macos`'s `on_validate_app_menu_command` calls `gpui::App::is_action_available`
-//! to decide what AppKit greys out, which reads exactly that - so this module never needs to
-//! recompute or mirror the predicate itself.
 use gpui::{Menu, MenuItem, SystemMenuType};
 
 use crate::title_bar::menu::TitleMenu;
@@ -48,14 +39,6 @@ fn menu_items(rows: &[MenuRow]) -> Vec<MenuItem> {
 /// The real menu bar `crate::run` hands to `gpui::App::set_menus`: the macOS application menu
 /// (the app's own name, left of `File`), then the five `File Edit View Agent Help` menus in the
 /// same order [`TitleMenu::ALL`] gives the Windows/Linux popover.
-///
-/// The application menu's `Services` submenu (`gpui::MenuItem::os_submenu`) is inserted here,
-/// not represented in [`MenuCommand::app_menu_rows`] at all - it isn't a real [`MenuCommand`] (no
-/// label/keystroke/action of its own; the OS populates its contents at runtime), so
-/// `menu_model` has no row for it to be. It's placed right after the Hide/Hide Others/Show All
-/// group and before the separator that leads into Quit - the conventional macOS application-menu
-/// position (see e.g. TextEdit.app's own application menu: About, Preferences, Services, Hide
-/// group, Quit).
 pub(crate) fn native_menus() -> Vec<Menu> {
     let mut app_menu_items = menu_items(MenuCommand::app_menu_rows());
     // `app_menu_rows()`'s own order is `About, sep, Settings, sep, Hide, HideOthers, ShowAll,
@@ -82,8 +65,6 @@ pub(crate) fn native_menus() -> Vec<Menu> {
 mod native_menu_tests {
     use super::*;
 
-    /// `native_menus()` is real, static data - buildable with no live `App`/`Window` at all,
-    /// which is exactly why this is a plain `#[test]`, not a `#[gpui::test]`.
     #[test]
     fn native_menus_returns_the_application_menu_plus_all_five_real_menus() {
         let menus = native_menus();
@@ -109,8 +90,6 @@ mod native_menu_tests {
         }
     }
 
-    /// The application menu's own two macOS-only affordances - a real Quit item, and a real
-    /// Services submenu inserted at the conventional position - not just a non-empty item list.
     #[test]
     fn the_application_menu_has_a_real_quit_item_and_a_services_submenu() {
         let menus = native_menus();
@@ -131,9 +110,6 @@ mod native_menu_tests {
         );
     }
 
-    /// Every real item count matches its `MenuCommand` source exactly - a stray extra/missing
-    /// row here would silently offer a different command set than the popover's own
-    /// `MenuCommand::rows`/`app_menu_rows`.
     #[test]
     fn every_menu_has_exactly_as_many_items_as_its_menu_command_rows() {
         let menus = native_menus();

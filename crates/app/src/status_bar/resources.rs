@@ -1,30 +1,6 @@
 //! The Resources popover's data model: the `repo → worktree → agent` cost tree behind the status
 //! bar's `41% cpu · 3.4 GB` readout (GitHub issue #293,
 //! `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4d).
-//!
-//! Pure and GPUI-free, like `crate::rail::state` - the whole point of this module is that the one
-//! sentence §4d insists on ("**everything derives from `resDefs`, so the bar readout is the sum of
-//! the tree** - a hardcoded total that drifts from its own breakdown is the defect this panel
-//! would otherwise ship with") is a property that can be tested directly, without a window.
-//!
-//! ## One derivation, two surfaces
-//!
-//! [`ResourceTree`] is built once per frame from the app's real per-pid samples
-//! (`crate::status_bar::process_stats`). The bar's readout is [`ResourceTree::cpu_percent`]/
-//! [`ResourceTree::memory_bytes`] - literally the sum over the same [`ResourceRow`]s the popover
-//! lists, never a separately-aggregated total that could disagree with the rows underneath it.
-//! `resources_readout_tests::the_bar_readout_is_the_sum_of_the_tree_not_a_second_aggregate` is the
-//! test that would fail if anyone reintroduced a second aggregation path.
-//!
-//! ## The `None` rule, and why it matches `aggregate_process_stats`
-//!
-//! A row's CPU or memory is `None` when that pid genuinely has no reading yet (its very first
-//! sample has no prior to diff a percentage against; a zombie mid-EOF-poll has no `VmRSS` line).
-//! Summing follows `process_stats::aggregate_process_stats`'s audited rule exactly: a row with an
-//! unknown field contributes nothing to that field rather than nullifying every other row's real
-//! contribution, and the total is only `None` when *nothing at all* is known yet.
-//! `the_tree_total_agrees_with_aggregate_process_stats` pins the two definitions together against
-//! real sample maps, so the agreement is checked rather than assumed.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -42,10 +18,6 @@ pub const JERRY_GROUP_LABEL: &str = "jerry itself";
 
 /// One agent's (or Jerry's own) real, current cost - one `tint · agent · worktree · cpu · memory`
 /// row in the popover's `LIVE NOW` tree.
-///
-/// `cpu_percent` is already normalized to the real 0-100%-of-system-capacity scale
-/// (`process_stats::normalize_cpu_percent`), so the rows and the total they sum to are on the same
-/// scale as each other and as the bar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceRow {
     /// Which repo this row is grouped under - the rail's own `RepoGroup::repo_name`, or
@@ -108,11 +80,6 @@ pub struct ResourceTree {
 impl ResourceTree {
     /// Groups `rows` by [`ResourceRow::repo_name`], preserving first-seen order for both groups
     /// and rows.
-    ///
-    /// A pid already seen is dropped rather than added a second time: two views of one process
-    /// would inflate both its own group's subtotal and the bar readout above it, which is exactly
-    /// the "total that drifts from its own breakdown" this whole module exists to prevent.
-    /// (`process_stats::aggregate_process_stats` guards the identical case for the same reason.)
     pub fn from_rows(rows: Vec<ResourceRow>) -> Self {
         let mut groups: Vec<ResourceGroup> = Vec::new();
         let mut seen_pids = std::collections::HashSet::new();
@@ -157,12 +124,6 @@ impl ResourceTree {
 }
 
 /// One process's cost in the window's one readout wording: `"6.2% cpu · 0.51 GB"`.
-///
-/// Shared verbatim by [`ResourceTree::bar_readout`] (the whole-window total) and the agent pane's
-/// per-agent strip (`STAGE-A-CHANGELOG.md` §4t, GitHub issue #295 -
-/// `crate::work_surface::render::AdeApp::render_agent_cost_readout`). Two surfaces stating a cost
-/// in two different formats would be two vocabularies for one fact, so there is exactly one
-/// formatter and both call it.
 pub fn agent_readout(cpu_percent: Option<f32>, memory_bytes: Option<u64>) -> String {
     format!(
         "{} cpu \u{b7} {}",
@@ -237,9 +198,6 @@ pub fn memory_label(bytes: Option<u64>) -> String {
 
 /// §4d's `loadHue()`, verbatim: "grey below 60%, amber to 85%, red above. Healthy load spends no
 /// colour - same rule as §4c: amber means your work is affected."
-///
-/// An enum rather than a colour directly, so the thresholds are testable without a theme and so
-/// the three steps have names the render side reads back (`crate::theme::status_bar::LOAD_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadLevel {
     /// <= 60% - healthy, spends no attention colour.
@@ -286,10 +244,6 @@ pub fn meter_fraction(used: Option<u64>, total: Option<u64>) -> Option<f32> {
 
 /// The popover's freshness line: `"Updated 8s ago"`, `"Updated 3m ago"`, `"Updated just now"`
 /// under a second, and an honest `"not sampled yet"` before the first poll has ever landed.
-///
-/// The unit words go through [`plural`] like every other count in the window (rev 6 §7 rule 9:
-/// "Every count goes through the pluralisation helper; never inline a ternary"), so `1s`'s
-/// spelled-out sibling cannot drift into `"1 seconds"`.
 pub fn updated_ago_label(since: Option<Duration>) -> String {
     let Some(since) = since else {
         return "not sampled yet".to_string();
@@ -325,12 +279,6 @@ pub fn prunable_label(count: usize) -> String {
 
 /// The disk line's right half, in bytes: the sum of `known_sizes` for however many candidates
 /// there really are.
-///
-/// Zero candidates is a real, known `Some(0)` - there is nothing to sum, which is not the same
-/// state as "some candidates exist but their sizes haven't come back from disk yet"
-/// ([`memory_label`]'s own `None` -> `"..."`). Collapsing the two would show that same "still
-/// loading" ellipsis for the ordinary, permanent case of nothing to prune - the ellipsis is
-/// then indistinguishable from a real disk scan that is still running.
 pub fn prunable_total_bytes(candidate_count: usize, known_sizes: &[u64]) -> Option<u64> {
     if candidate_count == 0 {
         return Some(0);
@@ -360,9 +308,6 @@ mod resources_readout_tests {
 
     const GB: u64 = 1024 * 1024 * 1024;
 
-    /// §4d's headline property: the bar readout is the sum of the tree. Proved by *changing the
-    /// tree* and requiring the readout to move with it - a hardcoded or separately-aggregated
-    /// total would keep reporting the old number and fail here.
     #[test]
     fn the_bar_readout_is_the_sum_of_the_tree_not_a_second_aggregate() {
         let mut rows = vec![
@@ -389,7 +334,6 @@ mod resources_readout_tests {
             "the bar readout must be formatted from that same summed total"
         );
 
-        // Now move one row. Every derived number above it must move too.
         let before = tree.bar_readout();
         rows[2].cpu_percent = Some(59.4);
         rows[2].memory_bytes = Some(GB * 3);
@@ -401,8 +345,6 @@ mod resources_readout_tests {
         );
     }
 
-    /// The per-repo subtotals are sums of their own rows, and the whole-tree total is the sum of
-    /// the subtotals - so no level of the tree can drift from the level below it.
     #[test]
     fn every_repo_subtotal_is_the_sum_of_its_own_rows_and_they_sum_to_the_total() {
         let tree = ResourceTree::from_rows(vec![
@@ -430,9 +372,6 @@ mod resources_readout_tests {
         assert_eq!(tree.memory_bytes(), Some(subtotal_mem));
     }
 
-    /// The tree's summing rule and `process_stats::aggregate_process_stats`'s are two spellings
-    /// of one definition, so this pins them together against real sample maps - including the
-    /// partially-unknown case the aggregation function was specifically fixed for.
     #[test]
     fn the_tree_total_agrees_with_aggregate_process_stats() {
         let mut stats = HashMap::new();
@@ -443,7 +382,6 @@ mod resources_readout_tests {
                 resident_bytes: Some(GB),
             },
         );
-        // A real zombie mid-EOF-poll: CPU known, no `VmRSS` line at all.
         stats.insert(
             12,
             ProcessSample {
@@ -451,7 +389,6 @@ mod resources_readout_tests {
                 resident_bytes: None,
             },
         );
-        // A freshly-spawned agent: memory known, no prior sample to derive a rate from.
         stats.insert(
             13,
             ProcessSample {
@@ -478,8 +415,6 @@ mod resources_readout_tests {
         );
     }
 
-    /// A pid that appears twice is counted once. Without this the bar readout would exceed the
-    /// visible breakdown, which is the exact drift §4d names.
     #[test]
     fn one_process_seen_twice_is_counted_once() {
         let tree = ResourceTree::from_rows(vec![
@@ -490,8 +425,6 @@ mod resources_readout_tests {
         assert_eq!(tree.memory_bytes(), Some(GB));
     }
 
-    /// Nothing known at all is `None` (rendered `...`), not a fabricated zero - but one known row
-    /// beside an unknown one still reports that one row's real contribution.
     #[test]
     fn unknown_readings_are_none_not_zero_and_never_blank_a_known_sibling() {
         let all_unknown = ResourceTree::from_rows(vec![row("jerry-core", 11, None, None)]);
@@ -507,8 +440,6 @@ mod resources_readout_tests {
         assert!((mixed.cpu_percent().expect("real") - 3.0).abs() < 0.001);
     }
 
-    /// §4d's `loadHue()` thresholds, at their exact boundaries: 60 and 85 are *not* over the
-    /// line, 60.1 and 85.1 are.
     #[test]
     fn load_thresholds_are_neutral_below_sixty_amber_to_eighty_five_red_above() {
         assert_eq!(load_level(Some(0.0)), LoadLevel::Neutral);
@@ -520,14 +451,11 @@ mod resources_readout_tests {
         assert_eq!(load_level(Some(100.0)), LoadLevel::Critical);
     }
 
-    /// A reading nobody has yet never spends the attention colour.
     #[test]
     fn an_unknown_load_is_never_amber_or_red() {
         assert_eq!(load_level(None), LoadLevel::Neutral);
     }
 
-    /// The three steps really are three different colours - a mapping that collapsed two of them
-    /// would make the thresholds above unobservable on screen.
     #[test]
     fn the_three_load_steps_resolve_to_three_distinct_colours() {
         let neutral = LoadLevel::Neutral.color().resolve();
@@ -544,11 +472,9 @@ mod resources_readout_tests {
         assert_eq!(meter_fraction(None, Some(GB)), None);
         assert_eq!(meter_fraction(Some(GB), Some(0)), None);
         assert_eq!(meter_fraction(Some(GB), Some(GB * 4)), Some(0.25));
-        // Clamped, so a numerator that somehow exceeded its total cannot paint past the track.
         assert_eq!(meter_fraction(Some(GB * 8), Some(GB * 4)), Some(1.0));
     }
 
-    /// Rev 6 §7 rule 9 - every count conjugates, including the freshness line's own units.
     #[test]
     fn the_freshness_line_conjugates_every_unit() {
         assert_eq!(updated_ago_label(None), "not sampled yet");
@@ -589,9 +515,6 @@ mod resources_readout_tests {
         assert_eq!(prunable_label(2), "2 worktrees prunable");
     }
 
-    /// Zero candidates is a real, known zero (`"0 B"`), never the `"..."` ellipsis that means
-    /// "a real candidate's size hasn't come back from disk yet" - the ordinary, permanent state
-    /// of nothing to prune must not look like a scan that is still running.
     #[test]
     fn zero_candidates_is_a_real_zero_not_an_unread_ellipsis() {
         assert_eq!(prunable_total_bytes(0, &[]), Some(0));
@@ -609,7 +532,6 @@ mod resources_readout_tests {
         assert_eq!(prunable_total_bytes(2, &[1_000, 2_000]), Some(3_000));
     }
 
-    /// A genuinely small but non-zero agent must not render as `0%` and read as "costs nothing".
     #[test]
     fn a_small_but_real_cpu_reading_keeps_a_decimal() {
         assert_eq!(cpu_label(Some(0.4)), "0.4%");

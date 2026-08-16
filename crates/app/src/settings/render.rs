@@ -83,23 +83,6 @@ impl AdeApp {
     /// Selects a Settings nav page - the nav row click handler. Cancels any in-progress
     /// keybinding recording first - see [`Self::close_settings`]'s identical reasoning for why a
     /// live `App::intercept_keystrokes` subscription must never outlive the page it started on.
-    ///
-    /// Also moves real keyboard focus off the Keybindings page's own filter field when leaving it.
-    /// That field is `track_focus`'d and stops being rendered the instant the page changes, so
-    /// without this the focused `FocusId` is no longer in the rendered frame at all and GPUI falls
-    /// back to the dispatch root with an **empty** context stack
-    /// (`Window::focus_node_id_in_rendered_frame`). Every scoped binding is dead against an empty
-    /// stack - `KeyBindingContextPredicate::eval_inner` short-circuits to `false` when there is no
-    /// context to evaluate against - so `secondary-z` reached neither undo system and vanished
-    /// with no feedback at all.
-    ///
-    /// The dangling-focus mechanism itself long predates GitHub issue #17 (it is the same class
-    /// `OverlayFocus`/`restore_focus` exists for, and which `close_agent`/`select_worktree`/
-    /// `cancel_new_file` already handle). What that issue changed is that this specific site
-    /// became *silent*: before the filter field carried a `"text-input"` context there was nothing
-    /// here for a stale focus to be pointing at in the first place. Found by an independent
-    /// adversarial audit - the fourth site of this shape, after the three already fixed on this
-    /// branch.
     pub(crate) fn select_settings_page(
         &mut self,
         page: SettingsPage,
@@ -946,12 +929,6 @@ impl AdeApp {
     /// `crate::env_info`/`crate::root::widgets::render_env_chip` environment chip (real WSL
     /// detection - Revision R6's job, per the doc comment this replaced) - the same chip the
     /// status bar and terminal footer render, not a fourth copy.
-    ///
-    /// `Restore agents on launch` and `Confirm before discarding a worktree` - two more rows
-    /// `Jerry.dc.html`'s own `settingsRows.general` fixture shows - stay left out for the same
-    /// reason as the Agents/Worktrees toggle sections (see `crate::settings::state`'s module docs):
-    /// agent-restore-on-launch and a discard-confirmation flow are app behaviour this build
-    /// doesn't have, not settings plumbing around behaviour that already exists.
     pub(in crate::settings) fn render_settings_general_page(
         &self,
         cx: &mut Context<Self>,
@@ -1042,15 +1019,6 @@ impl AdeApp {
     /// GitHub issue #213's "Shell" control: a real, focusable free-text field naming the program
     /// a Shell tab launches, plus a live, advisory hint saying what that name really resolves to
     /// right now ([`Self::shell_status`]).
-    ///
-    /// The field is the same minimal hand-rolled input shape as the Themes page's seed field
-    /// ([`Self::render_theme_seed_row`]) and the Keybindings filter - a real `FocusHandle`, a
-    /// real caret ([`Self::render_simple_input_caret`]), append/backspace/`Esc`-clears, real
-    /// per-widget undo - deliberately reusing that established pattern rather than introducing a
-    /// second, richer text-input mechanism this app doesn't otherwise have.
-    ///
-    /// The placeholder is the real answer to "what happens if I leave this blank": whichever
-    /// program the OS itself names, not a blank field with no consequence stated.
     fn render_settings_shell_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shell = self.shell_input.as_str().to_string();
         let has_shell = !shell.is_empty();
@@ -1159,14 +1127,6 @@ impl AdeApp {
     /// deliberate scope cut (no cursor positioning, no selection, no IME). Every real change
     /// goes straight to the persisted setting through [`Self::apply_shell_input`], so there is
     /// no separate "save" step that could be forgotten.
-    ///
-    /// The suggestion dropdown deliberately consumes **no** keystroke this handler needs. It has
-    /// no keyboard selection of its own (no up/down/enter capture), so every key still means
-    /// exactly what it meant before the dropdown existed - the field is the only thing typing can
-    /// reach. `Esc` in particular keeps its existing, tested meaning (clear the field, undoably),
-    /// rather than being stolen as a "close the dropdown" key; it just closes the dropdown as
-    /// well, since a cleared field is the user saying they want out of the way, and every other
-    /// edit re-opens it so the filtered list keeps up with what is being typed.
     pub(in crate::settings) fn handle_settings_shell_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1212,16 +1172,6 @@ impl AdeApp {
 
     /// Opens (or re-opens) the Shell field's suggestion dropdown, re-detecting the machine's real
     /// shells first (GitHub issue #213's follow-up).
-    ///
-    /// The detection runs here, on a real user gesture - a click on the field, a keystroke that
-    /// changed it - and never from `render`: [`crate::settings::state::detect_installed_shells`]
-    /// reads `/etc/shells` and walks `$PATH`, which is exactly the class of work
-    /// [`Self::refresh_shell_status`] and [`Self::load_agent_rows`] already keep off the frame
-    /// path. Re-running it per gesture rather than once at startup is what makes a shell the user
-    /// installed *while* the app was running actually show up.
-    ///
-    /// Goes through [`Self::close_menu_surfaces_except`] like every other menu-opening path
-    /// (GitHub issue #176), so this dropdown and some other popover can never be painted at once.
     pub(in crate::settings) fn open_shell_suggestions(&mut self, cx: &mut Context<Self>) {
         let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::ShellSuggestions));
         self.refresh_shell_suggestions();
@@ -1284,13 +1234,6 @@ impl AdeApp {
     /// Copies the Shell field's current text into the real, persisted setting and saves it
     /// (GitHub issue #213). An empty/whitespace-only field is stored as a real `None` - "use the
     /// system default" - never as `Some("")`.
-    ///
-    /// Deliberately does **not** touch already-open tabs: which program a terminal runs is fixed
-    /// when its process is spawned, and this app has no way to swap a live pty's program out from
-    /// under a running shell. The next Shell tab picks it up (`Agents::spawn` reads live
-    /// settings on every spawn), which is the honest scope - unlike the terminal *font size*,
-    /// which really can be applied to a live pane and therefore is
-    /// ([`Self::adjust_terminal_font_size`]).
     pub(in crate::settings) fn apply_shell_input(&mut self, cx: &mut Context<Self>) {
         let typed = self.shell_input.as_str().trim();
         self.settings.terminal.shell = (!typed.is_empty()).then(|| typed.to_string());
@@ -1303,10 +1246,6 @@ impl AdeApp {
     /// ([`crate::settings::state::detect_shell_status`], with the real
     /// `pty_core::resolve_on_path`). Called on every edit and when Settings opens - never from
     /// `render`, which would put a real `$PATH` walk on the frame path.
-    ///
-    /// A single `$PATH` walk for one name, unlike [`Self::load_agent_rows`]'s walk *per agent
-    /// binary*, so this stays on the foreground thread rather than growing a background task and
-    /// a stale-result race for a keystroke-frequency operation.
     pub(crate) fn refresh_shell_status(&mut self) {
         self.shell_status = settings::detect_shell_status(
             self.settings.terminal.shell_override(),
@@ -1317,27 +1256,6 @@ impl AdeApp {
     /// The Shell field's suggestion dropdown (GitHub issue #213's follow-up): one clickable row
     /// per shell this machine genuinely has ([`Self::shell_suggestions`]), filtered by whatever is
     /// currently typed, positioned directly under the field.
-    ///
-    /// **Why it is a top-level sibling in [`AdeApp::render`]** rather than a child of the settings
-    /// row: the row lives inside the settings page's own scrolling column, which clips its
-    /// children, so a popover nested there would be cut off at the column's edge. The established
-    /// answer in this app is the `+` menu's: capture the trigger's window-space bounds with a real
-    /// `gpui::canvas` ([`Self::shell_field_bounds`]) and position an `.absolute()` root-level
-    /// sibling off them.
-    ///
-    /// **Chrome is not invented here.** The panel is
-    /// [`crate::root::widgets::menu_popover_chrome`] with `theme::shadow::MENU` - the one real
-    /// dropdown/context-menu surface every other popover in the app is built from - and the rows
-    /// mirror `crate::work_surface::render::render_dropdown_menu_row`'s exact tokens (see
-    /// [`Self::render_shell_suggestion_row`] for the one reason they can't literally call it).
-    /// The click-away scrim is the file tree context menu's: full-window below the title bar
-    /// (never over it - a full-window occluding scrim swallows the caption buttons) and
-    /// `.occlude()`d, with the panel calling `cx.stop_propagation()` so a click on a row is not
-    /// also a click on the scrim.
-    ///
-    /// Dismissal is therefore the same as every other menu's, not a new rule: the scrim's click,
-    /// opening any other menu surface, the window losing focus
-    /// (`crate::root::menus::MenuSurface::ShellSuggestions`), leaving Settings, and picking a row.
     pub(crate) fn render_shell_suggestions(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = self.shell_field_bounds;
         // Right-aligned with the field (which sits at the right edge of its settings row) so the
@@ -1411,14 +1329,6 @@ impl AdeApp {
     /// uses), the shell's real name, and the real absolute path it was found at, so the user can
     /// tell `/bin/bash` from `/usr/local/bin/bash` before clicking. Clicking types that path into
     /// the field ([`Self::select_shell_suggestion`]).
-    ///
-    /// Visually this is `crate::work_surface::render::render_dropdown_menu_row` - same 29px band,
-    /// same 10px padding and 9px gap, same 14×14 chip, same label/sub type ramp, same
-    /// `theme::surface::MENU_ROW_HOVER` hover. It cannot literally call that function for one real
-    /// reason: that helper keys its GPUI element id off a `&'static str` label, and a shell's name
-    /// is neither `'static` nor guaranteed unique (a machine can genuinely have two different
-    /// `bash` binaries at two different paths), so the ids would collide. The row's identity is
-    /// its position in the filtered list instead.
     fn render_shell_suggestion_row(
         &self,
         index: usize,
@@ -1483,12 +1393,6 @@ impl AdeApp {
     /// every row's control - stepper value, choice-segment labels, config banner/snippet block -
     /// see `crate::settings::widgets`'s module docs), so editing the choice control below
     /// visibly rescales this page's own text, not just its four preview cards.
-    ///
-    /// Only *text* sizes respond, by deliberate scope - `theme::ui_scale`'s module docs carry
-    /// the current list of which surfaces read this setting and which don't (kept there, not
-    /// duplicated here). `editor_font_size`/`terminal_font_size` are separately-applied
-    /// baselines for Surface C's zoom (`Self::effective_code_rem_px`) and `crate::terminal::pane`
-    /// respectively, distinct from the interface-scale multiplier above them.
     pub(in crate::settings) fn render_settings_appearance_page(
         &self,
         cx: &mut Context<Self>,
@@ -1662,18 +1566,6 @@ impl AdeApp {
     /// [`settings_store::AppearanceSettings::display_scale_override`] from `None` (GPUI detects
     /// the scale, as it always has) into a real forced factor, plus - only while it is on - a
     /// stepper for that factor.
-    ///
-    /// Two rows rather than one control, because the setting is genuinely two states: "leave
-    /// detection alone" is not the same as "force 1.0", and a bare stepper could not express the
-    /// first. The stepper is hidden rather than disabled while the override is off, so the page
-    /// never shows a number that isn't being used.
-    ///
-    /// Built as a `#[cfg]` pair of same-named methods - the idiom
-    /// `crate::status_bar::render::AdeApp::render_status_agents_cluster` already established for a
-    /// platform-conditional *rendered* element - scoped to the two targets whose `gpui_platform`
-    /// dependency requests the `x11` feature (`crates/app/Cargo.toml`). Everywhere else the
-    /// variable this writes is never read by anything, so the row would be a control bound to
-    /// nothing.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn render_display_scale_override_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let override_factor = self.settings.appearance.display_scale_override;
@@ -2029,20 +1921,6 @@ impl AdeApp {
 
     /// GitHub issue #141's "Generate from colour" row: a real, focusable `#rrggbb` input plus the
     /// button that turns it into a whole theme file.
-    ///
-    /// This is where `crate::theme::derive_shift`'s HSL machinery ended up after the theme
-    /// system's rewrite took it out of the live resolution path: one seed colour becomes a real,
-    /// complete, literal, hand-editable theme file on disk (`Self::generate_theme_from_seed`),
-    /// derived by exactly the same code that generated the five bundled themes' own files
-    /// (`custom_theme`/`builtin_themes`). It is a starting point, not a black box - the whole
-    /// point of writing it out as ~270 explicit lines is that the user can then retune any one of
-    /// them by hand.
-    ///
-    /// The input is the same minimal hand-rolled field shape as the Keybindings filter
-    /// ([`Self::render_settings_keymap_filter_row`]) - a real `FocusHandle`, a real caret
-    /// ([`Self::render_simple_input_caret`]), append/backspace/`Esc`-clears - deliberately reusing
-    /// that established pattern rather than introducing a second, richer text-input mechanism this
-    /// app doesn't otherwise have.
     fn render_theme_seed_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let seed = self.theme_seed_input.as_str().to_string();
         let has_seed = !seed.is_empty();
@@ -2189,10 +2067,6 @@ impl AdeApp {
     /// generator the five bundled theme files were produced with), and writes it into this
     /// instance's own themes directory through the same validate-then-write-then-reload-from-disk
     /// path every other theme-creating action uses, on the background executor.
-    ///
-    /// A malformed or empty seed is a real, specific status-line error rather than a silent no-op
-    /// or a guessed default - there is no honest colour to fall back to when the whole action is
-    /// "build a theme around *this* colour".
     pub(in crate::settings) fn start_generate_theme_from_seed(&mut self, cx: &mut Context<Self>) {
         let Some(seed) = parse_seed_hex(self.theme_seed_input.as_str()) else {
             self.custom_theme_status = Some(Err(format!(
@@ -2508,12 +2382,6 @@ impl AdeApp {
     /// banner/snippet here - these rows aren't a single flat `settings.toml` table the way
     /// `crate::settings::store::ConfigPage`'s other pages are, since each one carries its own
     /// per-row identity (see `crate::keymap_overrides::BindingIdentity`'s own docs).
-    ///
-    /// Real rebind UI: clicking a row's keycap starts recording (`Self::start_recording_
-    /// keybinding`), the next real physical key chord replaces it (or reports a real collision -
-    /// `Self::keymap_rebind_error`), and an overridden row gets a "Reset" affordance
-    /// (`Self::reset_one_keybinding`). "Reset all" (`Self::reset_all_keybindings`) clears every
-    /// override at once, shown only when at least one exists.
     pub(in crate::settings) fn render_settings_keymap_page(
         &self,
         cx: &mut Context<Self>,
@@ -3385,10 +3253,6 @@ impl AdeApp {
     /// the card's own final row - the same "filter/action row lives inside the same card as the
     /// rows it acts on" shape [`Self::render_settings_keymap_page`] already established for the
     /// Keybindings page's filter field, applied here to an add-row instead of a filter.
-    ///
-    /// A genuinely empty list (every entry removed) renders the card with nothing in it but the
-    /// add row - a real, honest state, not specially called out, since
-    /// `EditorSettings::search_excludes`'s own docs already say plainly what an empty list means.
     fn render_search_exclude_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let patterns = self.settings.editor.search_excludes.clone();
         let has_patterns = !patterns.is_empty();
@@ -3621,11 +3485,6 @@ impl AdeApp {
     /// afterwards: a blank `Enter` had nothing to clear, and a duplicate's already-desired end
     /// state (that pattern being excluded) already holds, so leaving the just-submitted text
     /// sitting in the field would read as "did that not work?" for no reason.
-    ///
-    /// No `sanitize()` call here - trimming and de-duplicating this one insertion inline is
-    /// simpler and exactly as correct as calling the whole-list `EditorSettings::sanitize` for a
-    /// single append would be, and avoids re-normalizing (and potentially reordering) every other
-    /// entry on every keystroke's `Enter`.
     fn add_search_exclude_pattern(&mut self, cx: &mut Context<Self>) {
         let pattern = self.search_exclude_input.as_str().trim().to_string();
         if !pattern.is_empty()
@@ -3707,12 +3566,6 @@ impl AdeApp {
     /// One [`SoundEventKind`] row: label/hint from the event itself, a "choose a sound" trigger
     /// button (opens [`Self::render_sound_picker`], a floating popover - see that method's own
     /// docs for why it can't just be a child of this row), and the event's own on/off toggle.
-    ///
-    /// While the master "Sound effects" switch is off, every event row is genuinely inert - none
-    /// of its own settings has any effect until the master is back on - so both the trigger and
-    /// the toggle are rendered non-interactive (`interactive: false`) and the whole row is dimmed
-    /// to [`SOUND_ROW_DISABLED_OPACITY`], rather than leaving three controls on screen that look
-    /// live but silently do nothing when clicked.
     fn render_sound_event_row(
         &self,
         event: SoundEventKind,
@@ -3752,12 +3605,6 @@ impl AdeApp {
     /// [`Self::render_choice_control`]'s segmented control: a segmented control reads fine for
     /// three options and unreadable for a library that can grow past a handful of imports (see
     /// GitHub issue #226's own scoping decision), where a dropdown scales.
-    ///
-    /// `interactive` mirrors `Self::render_toggle_control_gated`'s own flag - `false` while the
-    /// master "Sound effects" switch is off, so this field can't open its popover for a setting
-    /// that currently has no effect. The bounds-capturing canvas below stays regardless: it never
-    /// opens anything on its own, and dropping it would leave `Self::sound_event_button_bounds`
-    /// stale the next time the row does become interactive.
     fn render_sound_picker_trigger(
         &self,
         event: SoundEventKind,
@@ -4335,11 +4182,6 @@ impl AdeApp {
     /// `pub(crate)`, not private: `terminal_font_size_tests` below drives this directly, the
     /// same edit path the Appearance page's stepper click invokes, rather than a second,
     /// test-only setter.
-    ///
-    /// The new value isn't only persisted - it's also pushed into every currently open agent's
-    /// [`crate::terminal::pane::TerminalPane`] via
-    /// [`crate::work_surface::agents::Agents::set_terminal_font_size`], so already-open panes pick it up
-    /// too, not just newly spawned ones.
     pub(in crate::settings) fn adjust_terminal_font_size(
         &mut self,
         delta: f32,
@@ -4375,13 +4217,6 @@ impl AdeApp {
     /// detection) and a real forced factor, starting at
     /// [`settings_store::DISPLAY_SCALE_OVERRIDE_DEFAULT`] - `1.0`, the unscaled value the reported
     /// bug is asking for, so turning the switch on is already the fix in the common case.
-    ///
-    /// Persist-and-notify only, with no live application, and that is the whole honest story:
-    /// GPUI reads `GPUI_X11_SCALE_FACTOR` once while its X11 client initialises, so the new value
-    /// is picked up by `crate::main` at the *next* launch. The row's hint says so.
-    ///
-    /// `#[cfg]`-scoped to match [`Self::render_display_scale_override_rows`], its only caller -
-    /// an ungated mutator would be dead code on every other platform.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(in crate::settings) fn toggle_display_scale_override(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.display_scale_override =
@@ -4396,13 +4231,6 @@ impl AdeApp {
     /// GitHub issue #216's stepper. A no-op while the override is off - there is no factor to
     /// step, and inventing one would silently turn the override on from a button the page isn't
     /// even showing then.
-    ///
-    /// Each result is snapped back to the two decimal places the row displays, rather than left as
-    /// whatever repeatedly adding [`settings_store::DISPLAY_SCALE_OVERRIDE_STEP`] to an `f32`
-    /// accumulates. Twenty clicks then land on a real `2.00`, not on a `1.9999998` that would look
-    /// like `2.00` in the row while being written to `settings.toml` - and exported to GPUI -
-    /// verbatim. Two decimals is exactly the step's own precision (`0.05`), so no reachable value
-    /// is lost to the snap.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(in crate::settings) fn adjust_display_scale_override(
         &mut self,
@@ -4539,21 +4367,6 @@ impl AdeApp {
     /// repaint (`App::refresh_windows`, `vendor/zed/crates/gpui/src/app.rs:1025`) so every
     /// already-rendered surface - not just ones that happen to re-render for some other reason -
     /// picks up the new colours on the very next frame.
-    ///
-    /// The selection is *compiled* here, once - `custom_theme::compile_palette_by_name` resolves
-    /// the name against the six built-in `settings::THEME_DEFS` first, then
-    /// [`Self::custom_themes`], walks its whole `base` chain and flattens it into one real
-    /// `crate::theme::Palette` that live token resolution then reads with a single hash lookup per
-    /// colour. A name matching nothing (only reachable via a hand-edited `settings.toml`, or a
-    /// custom theme file that's since been deleted) compiles to `None`, i.e. Jerry Dark, rather
-    /// than leaving the previous theme's palette installed unnoticed.
-    ///
-    /// A real compile *error* (a `base` chain that loops, or names a theme that isn't loaded) is
-    /// logged and falls back to Jerry Dark rather than being silently ignored or panicking. That
-    /// path is a backstop, not the primary reporting surface:
-    /// `custom_theme::load_custom_themes_from_dir` already checks every theme's chain when it
-    /// loads the directory and surfaces a real, per-file error on the Themes page, so a broken
-    /// chain is normally rejected before it can ever be selected.
     pub(crate) fn apply_theme_selection(&self, cx: &mut Context<Self>) {
         let palette = match custom_theme::compile_palette_by_name(
             &self.settings.theme.name,
@@ -4895,14 +4708,6 @@ impl AdeApp {
     /// `vendor/zed/crates/miniprofiler_ui/src/miniprofiler_ui.rs`'s own real caller before writing
     /// this). The real file write itself runs on the background executor, matching every other
     /// disk write in this codebase (`crate::settings::store::Settings::save_at`'s own callers).
-    ///
-    /// A built-in theme is exported under `"<name> (copy)"`, never its own bare built-in name -
-    /// `crate::settings::custom_theme::CustomThemeFile::validate` unconditionally rejects any
-    /// file whose `name` collides with a `settings::THEME_DEFS` entry, so exporting e.g. "Slate"
-    /// verbatim would produce a file this app (the exporter's own, or anyone it's shared with)
-    /// can never actually import back - a real "looks like it worked, quietly can't be used"
-    /// bug an adversarial audit caught. A custom theme keeps its own name, so re-importing an
-    /// unmodified export is a real no-op "update" rather than spawning a `(copy)` duplicate.
     pub(in crate::settings) fn start_export_custom_theme(&mut self, cx: &mut Context<Self>) {
         let active_name = self.settings.theme.name.clone();
         let Some(active) = self.theme_by_name(&active_name).cloned() else {
@@ -5155,13 +4960,6 @@ fn parse_seed_hex(input: &str) -> Option<u32> {
 /// The real, complete theme file [`AdeApp::start_generate_theme_from_seed`] writes for `seed` -
 /// a pure function, so what "generate from colour" actually produces is directly testable without
 /// a window, a file dialog or a disk.
-///
-/// Named `"Custom #rrggbb"` after the seed itself: unique per seed (so generating from two
-/// different colours produces two themes rather than silently overwriting one), never colliding
-/// with a built-in name, and immediately obvious on the Themes page. Its five card preview
-/// swatches are read straight out of the derived palette's own
-/// `surface.window`/`surface.rail`/`status.review`/`status.ask`/`status.run`, so the card really
-/// shows what the theme looks like.
 fn generated_theme_file_for_seed(seed: u32) -> custom_theme::CustomThemeFile {
     let shift = theme::shift_from_seed(theme::hex_rgba(seed));
     let palette = theme::derived_palette(shift);
@@ -5224,8 +5022,6 @@ mod theme_seed_tests {
         }
     }
 
-    /// The generated file is a real, complete, valid theme - every registered token named, a real
-    /// base, real preview swatches - not a stub.
     #[test]
     fn a_generated_seed_theme_is_a_real_complete_valid_palette() {
         let file = generated_theme_file_for_seed(0xe07a5f);
@@ -5239,8 +5035,6 @@ mod theme_seed_tests {
         assert_eq!(reparsed.overrides, validated.overrides);
     }
 
-    /// Two different seeds really produce two different palettes and two different names - the
-    /// real proof the seed is doing something, and that generating twice doesn't overwrite.
     #[test]
     fn two_different_seeds_produce_two_genuinely_different_themes() {
         let warm = generated_theme_file_for_seed(0xe07a5f)
@@ -5256,9 +5050,6 @@ mod theme_seed_tests {
         );
     }
 
-    /// The seed's own hue really is where the app's accent lands - the documented contract of
-    /// `crate::theme::shift_from_seed`, checked here through the whole file-building path rather
-    /// than only at the maths layer.
     #[test]
     fn the_generated_theme_puts_the_apps_accent_on_the_seeds_own_hue() {
         let generated = generated_theme_file_for_seed(0xe07a5f)
@@ -5291,10 +5082,6 @@ mod export_theme_name_tests {
         assert_eq!(export_theme_name_for("Midnight Coral"), "Midnight Coral");
     }
 
-    /// The real, end-to-end proof this fixes the bug it exists for: exporting a built-in under
-    /// its bare name would produce a file `CustomThemeFile::validate` rejects (a real, previously
-    /// shipped "looks like it worked, quietly can't be imported back" bug an adversarial audit
-    /// caught) - the renamed form must actually validate successfully.
     #[test]
     fn the_renamed_export_of_a_builtin_actually_validates_as_importable() {
         let bare = custom_theme::CustomThemeFile {
@@ -5423,11 +5210,6 @@ mod search_exclude_settings_tests {
         })
     }
 
-    /// Typing a real pattern into the add row and pressing `Enter` must both update the live
-    /// setting (so the very next search picks it up - `crate::search::render::AdeApp::
-    /// start_search` reads `settings.editor.search_excludes` fresh every time) and clear the
-    /// field for the next entry, exactly like `crate::root::new_file`'s own Enter-submits-and-
-    /// prompt-closes shape.
     #[gpui::test]
     fn typing_a_pattern_and_pressing_enter_adds_it_and_clears_the_field(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5475,9 +5257,6 @@ mod search_exclude_settings_tests {
         );
     }
 
-    /// Pressing `Enter` on a blank field, or on a pattern that's already on the list, must not
-    /// grow the list with a blank/duplicate entry - see `Self::add_search_exclude_pattern`'s own
-    /// docs for why both are silent no-ops rather than errors.
     #[gpui::test]
     fn enter_on_a_blank_or_duplicate_pattern_is_a_silent_no_op(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5512,11 +5291,6 @@ mod search_exclude_settings_tests {
         );
     }
 
-    /// Clicking a pattern row's own remove affordance must remove exactly that pattern from the
-    /// real, live setting, leave every other default entry alone, and persist the removal to a
-    /// real `settings.toml` on disk - the same "click really reaches the file" bar
-    /// `custom_theme_settings_tests::clicking_the_real_remove_button_deletes_the_theme_without_
-    /// selecting_its_card` already sets for a theme card's own remove button.
     #[gpui::test]
     fn clicking_the_remove_button_removes_exactly_that_pattern_and_persists(
         cx: &mut TestAppContext,
@@ -5615,7 +5389,6 @@ mod terminal_font_size_tests {
             "the initial spawn's own resize must have already reached the real live pty"
         );
 
-        // A large jump so the resulting grid dimensions can't coincidentally match the old ones.
         app.update(cx, |app, cx| {
             app.adjust_terminal_font_size(18.0 - app.settings.appearance.terminal_font_size, cx);
         });
@@ -5657,7 +5430,6 @@ mod terminal_font_size_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
-        // A second real agent, spawned at whatever the default font size already was.
         app.update_in(cx, |app, window, cx| {
             app.new_agent(ProcessKind::Shell, window, cx);
         });
@@ -5741,9 +5513,6 @@ mod settings_lsp_install_action_tests {
 /// is. Every test here drives the same path a user does - a real window, a real settings value or
 /// real keystrokes into the real field, a real spawned pty - rather than asserting on the pure
 /// helper alone (which `terminal::pane::shell_program_tests` already covers).
-///
-/// unix-only: these spawn `sh`, matching this project's own convention of only running the test
-/// suite on Linux (`pty-core`'s "Platform scope" docs).
 #[cfg(all(test, unix))]
 mod shell_setting_tests {
     use super::*;
@@ -5779,10 +5548,6 @@ mod shell_setting_tests {
         settings
     }
 
-    /// The whole point of the issue: a configured shell is what a real Shell tab really runs.
-    /// `sh` rather than the machine's own `$SHELL` so the assertion means something on any host
-    /// (a developer already using `sh` as their login shell would make a `$SHELL` comparison
-    /// vacuous).
     #[gpui::test]
     fn a_configured_shell_is_what_a_real_shell_tab_really_spawns(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5817,8 +5582,6 @@ mod shell_setting_tests {
         });
     }
 
-    /// The zero-config guarantee: an install that never touches this setting keeps spawning
-    /// exactly what it spawned before the setting existed.
     #[gpui::test]
     fn an_unconfigured_shell_still_spawns_the_real_os_default(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5839,10 +5602,6 @@ mod shell_setting_tests {
         });
     }
 
-    /// GitHub issue #213's honest-failure question: a typo'd shell name must fail the way any
-    /// other missing program already does - a real, typed spawn error, named on the tab itself
-    /// and reflected in the tab's real status - not a blank pane, and not a silently substituted
-    /// fallback that would hide the user's mistake.
     #[gpui::test]
     fn a_misconfigured_shell_fails_visibly_on_the_tab_itself(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -5878,7 +5637,6 @@ mod shell_setting_tests {
              shows status, not as idle"
         );
 
-        // And the Settings row says so up front, before the user has to read a terminal.
         app.update(cx, |app, _| app.refresh_shell_status());
         assert!(
             app.read_with(cx, |app, _| app.shell_status.is_not_found()),
@@ -5886,9 +5644,6 @@ mod shell_setting_tests {
         );
     }
 
-    /// The real user journey, driven through the real UI: focus the real painted field, type a
-    /// real shell name, and it lands in the real `settings.toml` *and* in the next real tab's
-    /// real child process.
     #[gpui::test]
     fn typing_a_shell_into_the_settings_row_persists_it_and_the_next_tab_uses_it(
         cx: &mut TestAppContext,
@@ -5926,7 +5681,6 @@ mod shell_setting_tests {
             "the edit must really be persisted to settings.toml, got: {written}"
         );
 
-        // The next real Shell tab runs it - and really starts.
         app.update_in(cx, |app, window, cx| {
             app.close_settings(window, cx);
             app.new_agent(ProcessKind::Shell, window, cx);
@@ -5941,7 +5695,6 @@ mod shell_setting_tests {
             assert!(pane.is_running(), "the typed shell must really be running");
         });
 
-        // Clearing the field again is a real edit back to the system default, not a stuck value.
         app.update_in(cx, |app, window, cx| {
             app.open_settings(window, cx);
             app.select_settings_page(SettingsPage::General, window, cx);
@@ -5960,9 +5713,6 @@ mod shell_setting_tests {
         );
     }
 
-    /// A shell configured in the file shows up in the field the moment Settings is opened -
-    /// otherwise a user with a hand-edited `settings.toml` would see a blank field and assume
-    /// nothing was set.
     #[gpui::test]
     fn an_already_persisted_shell_is_shown_in_the_field_at_startup(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6001,13 +5751,6 @@ mod shell_setting_tests {
 /// GitHub issue #213's follow-up ("would a select + auto-detect installed shells be better?" -
 /// answered as a hybrid): real detected shells offered as clickable suggestions under a field that
 /// stays unrestricted free text.
-///
-/// Every test here drives the real thing end to end - a real window, real painted bounds, a real
-/// mouse click on a real suggestion row, the real `/etc/shells`/`PATH` detection of the machine
-/// running the suite - rather than asserting on the pure detector alone (which
-/// `crate::settings::state`'s own tests already cover against real tempdir fixtures).
-///
-/// unix-only, like its sibling module: the final assertions spawn a real shell.
 #[cfg(all(test, unix))]
 mod shell_suggestion_dropdown_tests {
     use super::*;
@@ -6058,8 +5801,6 @@ mod shell_suggestion_dropdown_tests {
         cx.run_until_parked();
     }
 
-    /// The core of the feature: clicking the field really paints a dropdown, and every row in it
-    /// is a shell that genuinely exists on this machine - detected, not hardcoded.
     #[gpui::test]
     fn clicking_the_field_opens_a_dropdown_of_genuinely_detected_shells(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6107,9 +5848,6 @@ mod shell_suggestion_dropdown_tests {
         }
     }
 
-    /// The whole user journey the follow-up asked for, with no typing at all: click the field,
-    /// click a real detected shell, and that shell's real path is in the field, in the real
-    /// `settings.toml`, and running as the real child process of the next Shell tab.
     #[gpui::test]
     fn clicking_a_suggestion_configures_it_and_the_next_tab_really_runs_it(
         cx: &mut TestAppContext,
@@ -6163,7 +5901,6 @@ mod shell_suggestion_dropdown_tests {
             "and it must really stop painting"
         );
 
-        // The real proof it was a usable choice and not just a string: the next Shell tab spawns it.
         app.update_in(cx, |app, window, cx| {
             app.close_settings(window, cx);
             app.new_agent(ProcessKind::Shell, window, cx);
@@ -6184,9 +5921,6 @@ mod shell_suggestion_dropdown_tests {
         });
     }
 
-    /// The field must stay genuinely free text: a path this machine has never heard of is still
-    /// typeable and still persists, and the dropdown - which has nothing to suggest for it -
-    /// simply shows no rows rather than restricting or overriding anything.
     #[gpui::test]
     fn a_custom_value_the_machine_has_never_heard_of_still_works(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6248,10 +5982,6 @@ mod shell_suggestion_dropdown_tests {
         }
     }
 
-    /// A clicked suggestion is an ordinary edit of the same [`crate::text_history::TextField`] the
-    /// field already used, so the field's existing undo history really covers it - a real
-    /// regression guard against the dropdown growing a second, parallel way to change the value
-    /// that undo would not know about.
     #[gpui::test]
     fn a_clicked_suggestion_is_a_single_undoable_edit_of_the_real_field(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6262,7 +5992,6 @@ mod shell_suggestion_dropdown_tests {
             repo.path().to_path_buf(),
         );
         click_the_shell_field(cx);
-        // A real typed value first, so undo has something distinct to come back to.
         cx.simulate_keystrokes("s");
         cx.run_until_parked();
         assert_eq!(
@@ -6302,9 +6031,6 @@ mod shell_suggestion_dropdown_tests {
         );
     }
 
-    /// The dropdown obeys the app's one shared dismissal rule
-    /// (`crate::root::menus::MenuSurface`), rather than owning a second one: a click away closes
-    /// it, the window losing focus closes it, and leaving Settings closes it.
     #[gpui::test]
     fn the_dropdown_dismisses_the_same_way_every_other_menu_does(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6315,7 +6041,6 @@ mod shell_suggestion_dropdown_tests {
             repo.path().to_path_buf(),
         );
 
-        // It is a real member of the shared menu-surface set, not a private bool.
         click_the_shell_field(cx);
         assert!(
             app.read_with(cx, |app, _| app
@@ -6323,7 +6048,6 @@ mod shell_suggestion_dropdown_tests {
             "the dropdown must answer the shared 'is a menu open' question"
         );
 
-        // A click away from the panel hits the scrim and closes it.
         let popover = cx
             .debug_bounds("settings-shell-suggestions-popover")
             .expect("the dropdown must be painted");
@@ -6337,7 +6061,6 @@ mod shell_suggestion_dropdown_tests {
             "clicking away from the dropdown must close it"
         );
 
-        // Leaving Settings entirely never leaves it armed for the next visit.
         click_the_shell_field(cx);
         assert!(app.read_with(cx, |app, _| app.shell_suggestions_open));
         app.update_in(cx, |app, window, cx| app.close_settings(window, cx));
@@ -6415,11 +6138,6 @@ mod caret_settings_tests {
         );
     }
 
-    /// [`AdeApp::toggle_caret_blink`] must both flip the real persisted setting *and* take
-    /// effect immediately on the live blink loop - a toggle that only updated `settings.toml`
-    /// and left a currently-blinking caret blinking (or a currently-solid one solid, if it had
-    /// just been turned back on) until some unrelated future action reset it would be a real,
-    /// user-visible "the toggle didn't do anything until I clicked elsewhere" bug.
     #[gpui::test]
     fn toggle_caret_blink_flips_the_real_setting_and_takes_effect_immediately(
         cx: &mut TestAppContext,
@@ -6473,15 +6191,6 @@ mod indent_guide_settings_tests {
     /// duplicate rather than a cross-module dependency on a test-only helper), which is what gives
     /// this test a real `settings.toml` to persist to and reload from, unlike
     /// `crate::root::focus::palette_focus_tests::open_test_app`'s deliberately unpersisted `None`.
-    ///
-    /// Loads real settings from `settings_path` first (via `Settings::load_or_init_at`, the same
-    /// real load `crate::root::mod`'s own startup path uses) rather than always constructing with
-    /// `Settings::default()` - see `keybinding_rebind_tests::
-    /// open_test_app_with_real_settings_path`'s identical real-load-before-construct pattern, one
-    /// call site up in this same file. Passing a fixed `Settings::default()` regardless of what's
-    /// really on disk would make every "reload" in this module a no-op standing in for nothing -
-    /// a real, live-caught bug in this test module's own first draft (a "reload" that never
-    /// re-reads its own file can never fail no matter what persistence bug it's meant to catch).
     fn open_app_with_state_dir(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
@@ -6615,17 +6324,6 @@ mod settings_keymap_filter_caret_tests {
         );
     }
 
-    /// **The second live instance of the same structural caret bug**, found by auditing every
-    /// hand-rolled input in this app after the review-note card's own report (*"Caret is not
-    /// right, does not follow the typing of the user and just stays on the right side"*).
-    ///
-    /// This field used to carry `.flex_1().min_w_0()` on its **text** element. The field itself is
-    /// a fixed 168px box, so the text's layout box filled the whole of it whatever the shell path
-    /// said, and the caret - a `flex_none` sibling *after* that box - was pinned against the
-    /// field's right-hand border rather than sitting after the last character typed.
-    ///
-    /// Both this field and the review-note card now build their caret+text row through
-    /// `AdeApp::render_simple_input_row`, which is where that placement lives now.
     #[gpui::test]
     fn the_shell_fields_caret_follows_the_text_rather_than_pinning_to_the_fields_edge(
         cx: &mut TestAppContext,
@@ -6680,10 +6378,6 @@ mod settings_keymap_filter_caret_tests {
         );
     }
 
-    /// GitHub issue #45's own title, taken literally - see
-    /// `crate::rail::render::rail_filter_caret_tests`' identical test for why
-    /// `cx.simulate_input` (not a bare `window.focus`) is what actually forces the real redraw
-    /// `on_focus` fires from in this test harness.
     #[gpui::test]
     fn focusing_the_settings_keymap_filter_starts_the_real_shared_blink_loop(
         cx: &mut TestAppContext,
@@ -6752,13 +6446,6 @@ mod keybinding_rebind_tests {
         })
     }
 
-    /// The real, live-dispatched proof this whole mechanism actually works: recording a new
-    /// chord for `TogglePalette` through the same `App::intercept_keystrokes` path a real click
-    /// on the Keybindings page's "rebind" affordance uses, confirming the *old* keystroke stops
-    /// opening the palette and the *new* one does, that the override round-trips through a real
-    /// `settings.toml` write, and that a freshly constructed `AdeApp` loading that same file -
-    /// standing in for a real app restart, since nothing in this codebase can restart the actual
-    /// process mid-test - applies the override again at startup with no further action needed.
     #[gpui::test]
     fn a_real_rebind_persists_across_a_simulated_reload_and_the_old_chord_stops_working(
         cx: &mut TestAppContext,
@@ -6827,7 +6514,6 @@ mod keybinding_rebind_tests {
             "the old default chord must genuinely stop opening the palette after a real rebind"
         );
 
-        // The *new* chord must now open it.
         cx.simulate_keystrokes(new_chord);
         assert!(
             app.read_with(cx, |app, _| app.palette_open),
@@ -6873,15 +6559,6 @@ mod keybinding_rebind_tests {
         );
     }
 
-    /// A real, live-dispatched collision: recording `EditorLeft` (scoped `"file-editor"`) onto
-    /// `secondary-p` - the real, currently-global `TogglePalette` chord - must be rejected with a
-    /// real, visible error, and must leave both bindings' real dispatch behavior completely
-    /// unchanged. `find_colliding_binding` only ever flags a single-keystroke candidate against
-    /// another single-keystroke binding (`crate::keymap_overrides`'s own docs), so `"ctrl-k"`
-    /// alone can't be used here any more either: it's now only a *prefix* of the real, two-
-    /// keystroke `"ctrl-k ctrl-d"` chord (`EditorSkipOccurrence`), which this checker doesn't
-    /// examine at all - `secondary-p` is the one real, single-keystroke global binding left to
-    /// prove a genuine rejection with.
     #[gpui::test]
     fn recording_a_chord_that_collides_with_a_real_global_binding_is_rejected(
         cx: &mut TestAppContext,
@@ -6935,7 +6612,6 @@ mod keybinding_rebind_tests {
             "the error should name the real command it collides with, got: {message:?}"
         );
 
-        // The real, original TogglePalette binding must still work, completely undisturbed.
         cx.simulate_keystrokes(secondary_p);
         assert!(app.read_with(cx, |app, _| app.palette_open));
     }
@@ -7006,7 +6682,6 @@ mod theme_swap_tests {
              what's saved"
         );
 
-        // Selecting back to Jerry Dark must restore the exact original value.
         app.update(cx, |app, cx| {
             app.set_theme_name("Jerry Dark".to_string(), cx);
         });
@@ -7015,10 +6690,6 @@ mod theme_swap_tests {
         assert_eq!(theme::surface::WINDOW.resolve(), jerry_dark_window_bg);
     }
 
-    /// Real `follow_system` behavior - `Self::apply_follow_system_appearance` is the shared real
-    /// logic both the live OS-appearance subscription and turning the toggle on both go through
-    /// (see that method's own docs); this drives it directly with real `gpui::WindowAppearance`
-    /// values, the same real enum `Window::appearance()`/`App::window_appearance()` return.
     #[gpui::test]
     fn follow_system_selects_paper_on_light_and_jerry_dark_on_dark(cx: &mut TestAppContext) {
         let _guard = ResetThemeIndexOnDrop;
@@ -7050,10 +6721,6 @@ mod theme_swap_tests {
         assert!(theme::current_theme_palette().is_none());
     }
 
-    /// Regression for a real data-loss bug an audit caught: before `Settings.theme.
-    /// last_dark_theme` existed, an OS-dark signal always hardcoded `"Jerry Dark"`, silently
-    /// discarding whichever dark theme a user had actually chosen (e.g. "Slate") the moment their
-    /// OS round-tripped through light and back to dark.
     #[gpui::test]
     fn follow_system_restores_the_users_own_last_chosen_dark_theme_not_a_hardcoded_default(
         cx: &mut TestAppContext,
@@ -7077,7 +6744,6 @@ mod theme_swap_tests {
             app.read_with(cx, |app, _| app.settings.theme.name.clone()),
             "Paper"
         );
-        // Selecting "Paper" itself must not overwrite the real remembered dark theme.
         assert_eq!(
             app.read_with(cx, |app, _| app.settings.theme.last_dark_theme.clone()),
             "Slate"
@@ -7094,9 +6760,6 @@ mod theme_swap_tests {
         );
     }
 
-    /// Turning `follow_system` on while the real (test-environment) OS appearance is already
-    /// known must apply it immediately, not wait for a later change - see `Self::
-    /// toggle_theme_follow_system`'s own docs for why an immediate sync matters.
     #[gpui::test]
     fn turning_follow_system_on_immediately_syncs_to_the_real_current_appearance(
         cx: &mut TestAppContext,
@@ -7189,10 +6852,6 @@ mod custom_theme_settings_tests {
          [syntax]\n\
          keyword = \"#e07a5f\"\n";
 
-    /// A real theme file, sitting in the settings-sibling `themes/` directory before the app is
-    /// ever constructed, is loaded at startup (`crate::root::AdeApp::new_with_settings`) and
-    /// really renders as a selectable card on the Themes page - not just present in
-    /// `Self::custom_themes` as data nothing draws.
     #[gpui::test]
     fn a_custom_theme_file_on_disk_loads_at_startup_and_renders_as_a_real_card(
         cx: &mut TestAppContext,
@@ -7235,11 +6894,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// Selecting a real custom theme (`Self::set_theme_name`, the same method a card click
-    /// invokes) must really re-skin the app - a representative colour token resolves to
-    /// something other than Jerry Dark's own value - and persist the selection, exactly like
-    /// `theme_swap_tests::selecting_a_real_theme_card_changes_the_live_selected_index_and_a_representative_color`
-    /// proves for a built-in theme.
     #[gpui::test]
     fn selecting_a_custom_theme_really_reskins_the_app_and_persists(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7281,21 +6935,11 @@ mod custom_theme_settings_tests {
              dark theme"
         );
 
-        // Persisted for real - reloading the same settings file picks the same theme back up.
         cx.run_until_parked();
         let reloaded = settings_store::Settings::load_or_init_at(&settings_path);
         assert_eq!(reloaded.theme.name, "Midnight Coral");
     }
 
-    /// The real, synchronous validate-then-apply step (`Self::apply_custom_theme_import_result`)
-    /// behind `Self::start_import_custom_theme`'s async file-picker plumbing - driven directly
-    /// with a real `custom_theme::import_theme_file`/`load_custom_themes_from_dir` result here
-    /// since there is no real headless file dialog to simulate, matching how
-    /// `Self::open_install_url`/`Self::open_settings_file`'s own OS-handoff calls are only ever
-    /// unit-tested at the pure-decision-function layer (`crate::settings::widgets::
-    /// open_command_for`), never through an actual OS dialog. The picker plumbing itself
-    /// (`cx.prompt_for_paths`, `cx.background_executor()`) is real, verified GPUI API usage, not
-    /// re-tested here.
     #[gpui::test]
     fn importing_a_real_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy(
         cx: &mut TestAppContext,
@@ -7340,7 +6984,6 @@ mod custom_theme_settings_tests {
             "import must write a real, canonical copy into the settings-sibling themes directory"
         );
 
-        // A malformed source is rejected with a real error and does not touch the registry.
         let bad_source = source_dir.path().join("bad.toml");
         std::fs::write(&bad_source, "name = \"\"\n").expect("write bad source");
         let bad_result = custom_theme::import_theme_file(&bad_source, &dest_dir).map(|imported| {
@@ -7362,12 +7005,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// GitHub issue #141: the same real validate-then-apply proof
-    /// `importing_a_real_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy` gives
-    /// the plain-TOML path, driven through `vscode_theme::import_vscode_theme_file` and the now-
-    /// generic `Self::apply_custom_theme_load_result` instead - a real VSCode theme JSON file on
-    /// disk really does become a real, selectable custom theme, and a malformed one is rejected
-    /// without touching the registry.
     #[gpui::test]
     fn importing_a_real_vscode_theme_file_adds_it_to_the_registry_and_writes_a_canonical_copy(
         cx: &mut TestAppContext,
@@ -7459,11 +7096,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// GitHub issue #141's "Generate from colour": typing a real hex seed into the Themes page's
-    /// own input and clicking Generate must write a real, complete theme file into this instance's
-    /// themes directory, load it as a real card, and report a real success - the whole action
-    /// end-to-end, driven the way a user drives it (a real focused input receiving real
-    /// keystrokes, then a real click on the real painted button), not by calling the pure helper.
     #[gpui::test]
     fn typing_a_seed_colour_and_clicking_generate_really_writes_a_whole_theme_file(
         cx: &mut TestAppContext,
@@ -7527,7 +7159,6 @@ mod custom_theme_settings_tests {
             "the written file must really be the grouped, editable format, not an opaque blob"
         );
 
-        // And it is genuinely selectable: picking it really re-skins the app.
         let jerry_dark_window = theme::surface::WINDOW.resolve();
         app.update(cx, |app, cx| {
             app.set_theme_name("Custom #e07a5f".to_string(), cx);
@@ -7540,8 +7171,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// A malformed seed is a real, specific error - not a silent no-op, and not a guessed default
-    /// colour.
     #[gpui::test]
     fn generating_from_a_malformed_seed_is_a_real_reported_error(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7572,9 +7201,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// The real, click-driven proof the "Import VSCode theme…" button itself is wired to a real
-    /// handler - mirrors `clicking_the_real_import_button_reaches_the_real_handler`'s own
-    /// discipline for the plain-TOML button.
     #[gpui::test]
     fn clicking_the_real_import_vscode_theme_button_reaches_the_real_handler(
         cx: &mut TestAppContext,
@@ -7608,12 +7234,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// GitHub issue #141: selecting a real, imported VSCode theme with a `[syntax]` table must
-    /// really change `code_surface::code_view::color_for_kind`'s *live* output for the buckets
-    /// it named - not just update `Self::custom_themes`' own in-memory record. This is the one
-    /// real end-to-end proof connecting `Self::apply_theme_selection` to
-    /// `crate::theme::set_current_syntax_overrides`, on top of `vscode_theme`'s own pure
-    /// conversion tests and `code_view`'s own pure override-precedence test.
     #[gpui::test]
     fn selecting_an_imported_vscode_theme_really_changes_the_live_syntax_colour(
         cx: &mut TestAppContext,
@@ -7668,9 +7288,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// Re-importing the theme currently in use must immediately re-skin the app with its updated
-    /// swatches, not leave it rendering the stale palette until a restart - a real bug an
-    /// adversarial audit caught in the first version of `Self::apply_custom_theme_import_result`.
     #[gpui::test]
     fn reimporting_the_currently_active_theme_immediately_reskins_the_app(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7717,12 +7334,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// The Themes page's "Remove" action - real two-click confirmation
-    /// (`Self::request_remove_custom_theme`/`Self::custom_theme_remove_armed`): the first click
-    /// only arms it and touches nothing on disk; the second click actually deletes the real
-    /// backing file and, when the removed theme was the active selection or the remembered
-    /// `last_dark_theme`, falls back to Jerry Dark rather than leaving a dangling name neither
-    /// can resolve.
     #[gpui::test]
     fn removing_the_active_custom_theme_requires_two_clicks_then_falls_back_to_jerry_dark(
         cx: &mut TestAppContext,
@@ -7752,7 +7363,6 @@ mod custom_theme_settings_tests {
             "Midnight Coral"
         );
 
-        // First click only arms the confirmation - nothing is deleted yet.
         app.update(cx, |app, cx| {
             app.request_remove_custom_theme("Midnight Coral".to_string(), cx);
         });
@@ -7767,7 +7377,6 @@ mod custom_theme_settings_tests {
         );
         assert_eq!(app.read_with(cx, |app, _| app.custom_themes.len()), 1);
 
-        // Second click on the same name actually removes it.
         app.update(cx, |app, cx| {
             app.request_remove_custom_theme("Midnight Coral".to_string(), cx);
         });
@@ -7793,9 +7402,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// Leaving the Themes page must disarm a pending "Remove" confirmation - otherwise a stray
-    /// click landing back on the same card position later could delete a theme the user never
-    /// actually confirmed removing this time.
     #[gpui::test]
     fn leaving_the_themes_page_disarms_a_pending_remove_confirmation(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7832,13 +7438,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// The real, click-driven proof behind [`Self::request_remove_custom_theme`]'s
-    /// `cx.stop_propagation()` (an adversarial audit verified this by reading GPUI's own event
-    /// dispatch source rather than a live test - this closes that gap for real): two genuine
-    /// simulated clicks on the Remove button's own real painted bounds delete the theme, and
-    /// neither click also fires the card's own `on_click` underneath it - if it did, the first
-    /// click would have switched the active theme to "Midnight Coral" instead of just arming the
-    /// confirmation.
     #[gpui::test]
     fn clicking_the_real_remove_button_deletes_the_theme_without_selecting_its_card(
         cx: &mut TestAppContext,
@@ -7867,7 +7466,6 @@ mod custom_theme_settings_tests {
             .debug_bounds("settings-theme-card-remove-Midnight Coral")
             .expect("the Remove affordance must have painted on the custom theme's card");
 
-        // First real click: arms the confirmation.
         cx.simulate_click(remove_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(
@@ -7898,11 +7496,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// The real, click-driven proof the Import/Export action buttons themselves are wired to a
-    /// real handler, not just present in the tree - clicking "Import theme…" with no real file
-    /// dialog available in this headless test environment still reaches
-    /// `Self::start_import_custom_theme` (proven by the in-flight picker task actually being
-    /// set), rather than silently doing nothing because the button's `on_click` was never wired.
     #[gpui::test]
     fn clicking_the_real_import_button_reaches_the_real_handler(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7934,8 +7527,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// Same real-click proof as
-    /// [`clicking_the_real_import_button_reaches_the_real_handler`], for "Export current theme…".
     #[gpui::test]
     fn clicking_the_real_export_button_reaches_the_real_handler(cx: &mut TestAppContext) {
         let _guard = ResetThemeStateOnDrop;
@@ -7967,14 +7558,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// The full real, click-driven "New from template" round trip - not just "the handler was
-    /// reached" (unlike the Import/Export click tests above, this action has no file-picker
-    /// dialog to get stuck awaiting, so a real click here really can run to completion under
-    /// `cx.run_until_parked()`): a genuine click on the button writes the real template file to
-    /// disk, the resulting theme actually renders as a selectable Themes-page card (not just data
-    /// sitting unrendered in `Self::custom_themes`), selecting that card really re-skins the app,
-    /// and the two-click Remove affordance on it really deletes the file again - proving this
-    /// isn't a decorative button bound to nothing.
     #[gpui::test]
     fn clicking_new_from_template_creates_a_real_selectable_removable_theme_end_to_end(
         cx: &mut TestAppContext,
@@ -8001,14 +7584,12 @@ mod custom_theme_settings_tests {
             "sanity check: no custom theme should exist before the click"
         );
 
-        // The real click.
         let create_bounds = cx
             .debug_bounds("settings-theme-new-from-template")
             .expect("the New from template… button must have painted");
         cx.simulate_click(create_bounds.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        // The real file landed on disk, at the real settings-sibling themes directory.
         let written_path = themes_dir.join("my-custom-theme.toml");
         assert!(
             written_path.exists(),
@@ -8028,14 +7609,12 @@ mod custom_theme_settings_tests {
              {status:?}"
         );
 
-        // It really renders as a selectable card, not just data.
         assert!(
             cx.debug_bounds("settings-theme-card-My Custom Theme")
                 .is_some(),
             "the created theme must actually render as a card on the Themes page"
         );
 
-        // Selecting it really re-skins the app and persists.
         let jerry_dark_window_bg = theme::surface::WINDOW.resolve();
         let card_bounds = cx
             .debug_bounds("settings-theme-card-My Custom Theme")
@@ -8052,7 +7631,6 @@ mod custom_theme_settings_tests {
              colour token resolves to"
         );
 
-        // And it's really removable: first click arms, second click deletes.
         let remove_bounds = cx
             .debug_bounds("settings-theme-card-remove-My Custom Theme")
             .expect("the Remove affordance must have painted");
@@ -8080,10 +7658,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// A second real click on "New from template" refreshes the same on-disk file rather than
-    /// creating a second, differently-suffixed one - matching
-    /// `custom_theme::write_template_theme_a_second_time_refreshes_the_same_file_not_a_new_one`'s
-    /// pure-function proof, exercised here through the real button instead.
     #[gpui::test]
     fn clicking_new_from_template_twice_refreshes_the_same_file_not_a_duplicate(
         cx: &mut TestAppContext,
@@ -8119,8 +7693,6 @@ mod custom_theme_settings_tests {
         );
     }
 
-    /// A malformed theme file on disk at startup is skipped with a real, honest error - not
-    /// silently dropped, and not a startup crash.
     #[gpui::test]
     fn a_malformed_theme_file_on_disk_is_skipped_with_a_real_recorded_error(
         cx: &mut TestAppContext,
@@ -8238,8 +7810,6 @@ mod bracket_pair_colorization_settings_tests {
         );
     }
 
-    /// The setting is what `AdeApp::highlight_options` reports - i.e. the value really reaches the
-    /// highlighting pipeline, rather than being a persisted field nothing consumes.
     #[gpui::test]
     fn the_setting_really_drives_the_highlight_options_the_pipeline_consumes(
         cx: &mut TestAppContext,
@@ -8266,8 +7836,6 @@ mod bracket_pair_colorization_settings_tests {
         );
     }
 
-    /// The real Settings UI row: it paints, and clicking it flips the real persisted value. This
-    /// is what would catch a row wired to nothing, or wired to the wrong handler.
     #[gpui::test]
     fn the_appearance_page_row_paints_and_clicking_it_flips_the_real_setting(
         cx: &mut TestAppContext,
@@ -8330,15 +7898,6 @@ mod bracket_pair_colorization_settings_tests {
 }
 
 /// GitHub issue #216's Appearance rows, driven through the same real mutators a click invokes.
-///
-/// Scoped to the platforms that render the rows at all - see
-/// [`AdeApp::render_display_scale_override_rows`]'s `#[cfg]` pair.
-///
-/// The honest limit of this coverage: it proves the setting is a real, persisted, correctly
-/// clamped tri-state that survives a reload, and `crate::x11_scale_factor_env_tests` proves which
-/// string that turns into for `GPUI_X11_SCALE_FACTOR`. Neither proves GPUI then paints at that
-/// scale - that happens inside a pinned dependency during X11 client init, against a real display
-/// this test harness does not have.
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod display_scale_override_settings_tests {
@@ -8477,8 +8036,6 @@ mod display_scale_override_settings_tests {
         );
     }
 
-    /// The real Appearance page row: it paints, and a real click on it flips the real persisted
-    /// value - what would catch a row wired to nothing or wired to the wrong handler.
     #[gpui::test]
     fn the_appearance_page_row_paints_and_clicking_it_flips_the_real_setting(
         cx: &mut TestAppContext,
@@ -8625,9 +8182,6 @@ mod sound_settings_page_tests {
         );
     }
 
-    /// Clicking the sound-choice trigger opens the picker, and clicking a row in it both assigns
-    /// that sound to the event and closes the popover - the real end-to-end path
-    /// `Self::open_sound_picker`/`Self::select_sound_for_event` wire together.
     #[gpui::test]
     fn picking_a_sound_from_the_popover_assigns_it_and_closes_the_popover(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8693,12 +8247,6 @@ mod sound_settings_page_tests {
         );
     }
 
-    /// While the master switch is off (the real default - see the sanity check in
-    /// `the_master_switch_paints_off_by_default_and_clicking_it_flips_and_persists`), an event
-    /// row's own toggle must be inert: it still paints (so a real test, and a real user, can find
-    /// it) but clicking it must not flip the setting, since
-    /// `Self::render_toggle_control_gated`'s `interactive: false` path never attaches a click
-    /// handler at all.
     #[gpui::test]
     fn an_event_toggle_does_nothing_while_the_master_switch_is_off(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -8725,8 +8273,6 @@ mod sound_settings_page_tests {
         );
     }
 
-    /// Same "no handler attached" guarantee as the toggle test above, for the sound-choice
-    /// trigger: clicking it while the master switch is off must not open the picker popover.
     #[gpui::test]
     fn the_sound_choice_trigger_does_nothing_while_the_master_switch_is_off(
         cx: &mut TestAppContext,
@@ -8751,17 +8297,6 @@ mod sound_settings_page_tests {
         );
     }
 
-    /// Turning the master switch off while an event's sound picker is open must close the
-    /// popover - otherwise it would sit open, pointing at a trigger that no longer responds to
-    /// clicks (`Self::toggle_sound_enabled`'s own `sound_picker_open = None` on the off path).
-    ///
-    /// The master switch is flipped by calling `Self::toggle_sound_enabled` directly rather than
-    /// simulating a click on its painted bounds: the picker's own full-page scrim
-    /// (`Self::render_sound_picker`'s `settings-sound-picker-scrim`) sits on top of the whole
-    /// page precisely to catch an outside click and close the popover, so a simulated click
-    /// landing on the master switch while the popover is open would hit that scrim first and
-    /// never reach the switch at all - not a real way to reach this guard, just an artifact of
-    /// coordinates overlapping in a headless test.
     #[gpui::test]
     fn switching_the_master_off_closes_an_open_sound_picker(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

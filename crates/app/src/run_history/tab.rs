@@ -1,37 +1,5 @@
 //! The real run-transcript centre tab (GitHub issue #227): its strip entry, its header, its
 //! dimmed body, and its footer's `Resume here` / `Start a new agent from this`.
-//!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3-§4 is this file's brief. Two
-//! of its sentences are load-bearing enough to repeat here, because breaking either one is what
-//! the design caught *itself* doing:
-//!
-//! 1. **Keyed by run id, never the live agent's buffer.** "Borrowing the live buffer produces a
-//!    pane whose header and body describe two different runs, whose diffstats contradict each
-//!    other, and - worst - one that ends on an unanswered question with a highlighted,
-//!    apparently-selectable option list. A completed run cannot be awaiting an answer, and 70%
-//!    opacity does not disambiguate that." This file therefore reads one run's record and one
-//!    run's stored lines, both by [`crate::hooks::history::PastAgent::key`], and hands them to
-//!    [`crate::run_history::model::transcript_body`], which structurally cannot mix two runs.
-//! 2. **Every run resumes.** "Scoping history to a worktree means the checkout is always present,
-//!    so there are no resume tiers. What varies is drift." So the footer has no disabled state
-//!    for a run that is merely old; it has a drift sentence that says what resuming will mean.
-//!
-//! ## One run tab per worktree
-//!
-//! §3: "One run tab per worktree; opening another replaces it." [`AdeApp::run_tab_by_worktree`]
-//! is that map, and [`work_surface::TabRef::Run`] carries no payload for the same reason
-//! [`work_surface::TabRef::Graph`] does not: a worktree's tab strip can hold at most one of
-//! these, so within the strip there is nothing to tell two apart. Replacing the run a tab shows
-//! therefore keeps the tab's dragged position, which is what "replaced" rather than
-//! "closed and reopened" means.
-//!
-//! ## Open/close/focus discipline
-//!
-//! [`AdeApp::open_run_tab`]/[`AdeApp::leave_run_tab`]/[`AdeApp::close_run_tab`] are deliberate
-//! copies of `crate::review::render`'s own trio, which are themselves copies of the graph tab's -
-//! see that module's docs for the two real, live-reproduced dangling-focus bugs the discipline
-//! exists to prevent. [`AdeApp::run_tab_focus_handle`] has exactly the same conditional-render
-//! lifetime, so it needs exactly the same sweep.
 
 use super::*;
 
@@ -42,21 +10,6 @@ use crate::work_surface::state as work_surface;
 
 impl AdeApp {
     /// Opens (or replaces) the run-transcript tab in `worktree`, showing the run `run_key`.
-    ///
-    /// The single real door: the History view's row click is the only caller, and re-clicking the
-    /// row that is already open simply re-activates the tab.
-    ///
-    /// **Selects `worktree` first.** The `all` scope lists every checkout's runs
-    /// (`REVISION-2026-08-14.md` §6), so the row you click is very often *not* in the worktree you
-    /// are standing in - and this tab lives in that run's own worktree's strip. Without the
-    /// switch, the tab was filed under a worktree whose strip was not on screen: nothing appeared
-    /// in the tab strip at all and the centre pane read "this run is no longer in the history",
-    /// because `Self::open_run_key` resolves against the *selected* worktree. Found by a real
-    /// screenshot of the running app, not by a test.
-    ///
-    /// Selecting the run's checkout is also what §3's resume story already assumes - "scoping
-    /// history to a worktree means the checkout is always present" - so the footer's `Resume here`
-    /// acts on the worktree you are now looking at.
     pub(crate) fn open_run_tab(
         &mut self,
         worktree: PathBuf,
@@ -144,11 +97,6 @@ impl AdeApp {
     /// Common bookkeeping whenever the run tab stops being the active centre-pane content -
     /// selecting an agent/file/graph/review tab while it was showing, or closing it outright. A
     /// no-op if it wasn't active.
-    ///
-    /// [`Self::run_tab_focus_handle`] is about to stop being `track_focus`'d
-    /// ([`Self::render_run_view`] is only rendered while `run_tab_active`), so real keyboard focus
-    /// moves off it *first*, before anything else can capture it as an [`OverlayFocus`] return
-    /// target - and any target already holding it from earlier is swept. See this module's docs.
     pub(crate) fn leave_run_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.run_tab_active {
             return;
@@ -306,10 +254,6 @@ impl AdeApp {
 
     /// The transcript itself, at §3's 70% opacity - "the one signal that this is a recording, not
     /// a live pane".
-    ///
-    /// A monospace text block rather than a real [`crate::terminal::pane::TerminalPane`], and
-    /// deliberately: a pane is a live pty with a cursor you can type into, and half of §3's own
-    /// warning is about a recording that looks answerable. There is nothing here to type into.
     fn render_run_transcript(
         &self,
         lines: &[model::TranscriptLine],
@@ -357,17 +301,6 @@ impl AdeApp {
 
     /// §3's footer: "drift dot, the consequence sentence, **Resume here** ... and `Start a new
     /// agent from this`."
-    ///
-    /// Both actions are real and neither is tiered (§3: "every run resumes"). `Resume here` is
-    /// `crate::hooks::flow::AdeApp::resume_past_agent` - a literal `claude --resume <session_id>`
-    /// where the run's hooks caught one, and an honest fresh agent in the same checkout where
-    /// they did not. `Start a new agent from this` is deliberately the *other* thing: a clean
-    /// agent of the same kind in the same checkout, carrying none of this run's conversation.
-    ///
-    /// A run whose drift has not been answered yet paints no dot and no sentence, for
-    /// [`crate::run_history::model::RunEntry::drift`]'s reason - `Nothing has landed since this
-    /// run ended` is a real claim about the branch, and making it before the traversal answered
-    /// would be a guess dressed as the most reassuring of the three bands.
     fn render_run_footer(
         &self,
         run: &crate::hooks::history::PastAgent,
@@ -481,11 +414,6 @@ impl AdeApp {
 /// The tab strip's own run entry, rendered only for [`work_surface::TabRef::Run`] - which
 /// `work_surface::state::reconcile_tab_order` only ever produces while this worktree really has
 /// one open.
-///
-/// §3's label: "Tab label `sonnet-4.5 · today 09:41`, chip in the agent's tint, closeable" - with
-/// this app's real agent-kind label in place of the mock's model name, since Jerry knows which
-/// CLI it spawned and does not know which model that CLI chose
-/// ([`crate::run_history::model::run_tab_label`]).
 pub(crate) fn render_run_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::AnyElement {
     let is_active = app.run_tab_active;
     let colors = crate::work_surface::state::tab_colors(is_active);
