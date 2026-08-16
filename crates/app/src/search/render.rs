@@ -20,6 +20,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, KeyDownEvent, SharedString, Window};
@@ -30,7 +32,9 @@ use crate::root::{plural, scrollbar, AdeApp, FindInFile, SearchInWorktree, TextR
 use crate::search::engine::{
     self, Matcher, PathFilter, ReplaceOutcome, SearchOutcome, SearchRequest,
 };
-use crate::search::state::{BodyState, CompletedSearch, SearchField, SearchModifier};
+use crate::search::state::{
+    self, BodyState, CompletedSearch, SearchField, SearchListItem, SearchModifier,
+};
 use crate::sidebar::file_tree::lang_chip_for_name;
 use crate::sidebar::render::RightSidebarView;
 use crate::theme;
@@ -42,6 +46,13 @@ use crate::theme;
 /// the same value as `crate::code_surface::editing::REHIGHLIGHT_DEBOUNCE`, and for the same
 /// reason: it must fire *within* a typing burst, not survive one.
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How far past `AdeApp::search_list_state`'s own viewport `AdeApp::render_search_body`'s
+/// `gpui::list` measures rows ahead of time - the same real overdraw margin
+/// `crate::rail::render::RAIL_LIST_OVERDRAW`/`crate::sidebar::render::CHANGES_LIST_OVERDRAW` use
+/// for the identical "a little slack so a small scroll doesn't have to measure a brand new row
+/// synchronously" reason.
+pub(crate) const SEARCH_LIST_OVERDRAW: gpui::Pixels = px(48.0);
 
 impl AdeApp {
     /// The whole Search tab, under the panel header the `Files · Search · Changes` toggle draws.
@@ -542,60 +553,128 @@ impl AdeApp {
         let Some(outcome) = self.search.results() else {
             return div().flex_1().min_h_0().into_any_element();
         };
+        // A real, per-render snapshot rather than a live borrow through `self.search`: `gpui::
+        // list` may not actually build a given row's element until several frames after this
+        // pass ran, and the row data a stale index resolves against then has to be a real,
+        // captured value - mirrors `crate::rail::render::AdeApp::render_rail_list`'s own
+        // `Rc<Vec<RepoGroup>>` snapshot, taken for the identical reason.
+        let outcome: Rc<SearchOutcome> = Rc::new(outcome.clone());
+        let items: Rc<Vec<SearchListItem>> = Rc::new(state::flatten_search_list_items(
+            &outcome,
+            &self.search.collapsed,
+        ));
+        // `ListState` owns a measured height per item, so it has to be told when the item set
+        // changes size. Reset only on a real change: a reset drops the scroll position, and
+        // `AdeApp::start_search` already clears `self.search.collapsed` on every fresh result set
+        // (opening every file), so this is never reached with the same length meaning a genuinely
+        // different tree - the same real-change gate `changes_sections_list`/`rail_list_state`
+        // both use.
+        if self.search_list_state.item_count() != items.len() {
+            self.search_list_state.reset(items.len());
+        }
+
+        let build_items = items.clone();
+        let build_outcome = outcome.clone();
+        let list = gpui::list(
+            self.search_list_state.clone(),
+            cx.processor(
+                move |this: &mut Self,
+                      index: usize,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    // Bounds-checked rather than indexed, mirroring `Self::render_rail_list`'s own
+                    // dispatch: this frame's flattened snapshot may be stale by the time `gpui::
+                    // list` actually asks for one of its rows, and a stale index must render
+                    // nothing rather than panic.
+                    match build_items.get(index) {
+                        Some(item) => {
+                            this.render_search_list_item(&build_outcome, item, window, cx)
+                        }
+                        None => div().into_any_element(),
+                    }
+                },
+            ),
+        )
+        .w_full()
+        .flex_1()
+        .min_h_0();
+
+        // See `Self::render_file_tree`'s own docs (mirrored by every other virtualized list in
+        // this app) on why the scrollbar must be a sibling of the list, inside its own
+        // non-scrolling `.relative()` wrapper: the list now owns its own scroll offset via
+        // `self.search_list_state` rather than the wrapper scrolling a plain `.children(...)`.
         div()
             .id("search-body")
+            .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.search_scroll_handle)
-            .children(
-                outcome
-                    .files
-                    .iter()
-                    .enumerate()
-                    .map(|(index, file)| self.render_search_file(index, file, cx)),
-            )
-            // The app's shared overlay scrollbar, off the same handle this scroller tracks - not a
-            // second, parallel tracking mechanism. Drawn as a sibling of the rows for the same
-            // reason `crate::sidebar::render::AdeApp::render_file_tree` draws its own that way.
+            .child(list)
+            // The app's shared overlay scrollbar, off the same `ListState` the list itself scrolls
+            // - not a second, parallel tracking mechanism.
             .children(scrollbar::render_vertical_scrollbar(
                 "search-scrollbar",
-                &self.search_scroll_handle,
+                &self.search_list_state,
                 &[],
                 cx,
             ))
-            .relative()
             .into_any_element()
     }
 
-    /// One file's row plus, unless it is collapsed, one row per match under it.
-    fn render_search_file(
+    /// Dispatches one flattened [`SearchListItem`] to the renderer for its kind - see that type's
+    /// own docs. `outcome` is this frame's own captured snapshot (never a possibly-stale live
+    /// borrow), the same defensive re-resolve `crate::rail::render::AdeApp::render_rail_list_item`
+    /// already documents for the identical reason.
+    fn render_search_list_item(
+        &self,
+        outcome: &SearchOutcome,
+        item: &SearchListItem,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match *item {
+            SearchListItem::FileRow { file_index } => match outcome.files.get(file_index) {
+                Some(file) => {
+                    let open = !self.search.collapsed.contains(&file.path);
+                    self.render_search_file_row(file_index, file, open, cx)
+                }
+                None => div().into_any_element(),
+            },
+            SearchListItem::MatchRow {
+                file_index,
+                line_index,
+                hit_index,
+            } => {
+                let resolved = outcome.files.get(file_index).and_then(|file| {
+                    let line = file.lines.get(line_index)?;
+                    let range = line.ranges.get(hit_index)?;
+                    let is_first = line_index == 0 && hit_index == 0;
+                    let is_last =
+                        line_index + 1 == file.lines.len() && hit_index + 1 == line.ranges.len();
+                    Some((file, line, range, is_first, is_last))
+                });
+                match resolved {
+                    Some((file, line, range, is_first, is_last)) => self.render_search_match(
+                        file, line, hit_index, range, file_index, is_first, is_last, cx,
+                    ),
+                    None => div().into_any_element(),
+                }
+            }
+        }
+    }
+
+    /// One file's own header row - its name, its chip, its match count, its collapse caret. The
+    /// match rows under it (unless it is collapsed) are separate, sibling [`SearchListItem::
+    /// MatchRow`] items in the same flattened list, not children of this one - see
+    /// [`SearchListItem`]'s own docs for why.
+    fn render_search_file_row(
         &self,
         index: usize,
         file: &engine::FileMatches,
+        open: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let open = !self.search.collapsed.contains(&file.path);
-        // Built eagerly rather than inside the `.children(..)` closure below: that closure is
-        // `FnMut` and would have to capture `cx` by move, which the borrow checker rightly
-        // refuses. One `Vec` of already-rendered rows is also one place the "one row per match,
-        // not per line" rule lives.
-        let match_rows: Vec<gpui::AnyElement> = if open {
-            file.lines
-                .iter()
-                .flat_map(|line| {
-                    line.ranges
-                        .iter()
-                        .enumerate()
-                        .map(move |(hit, range)| (line, hit, range))
-                })
-                .map(|(line, hit, range)| {
-                    self.render_search_match(file, line, hit, range, index, cx)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         let chip = lang_chip_for_name(file.file_name());
         let path = file.path.clone();
         let replace_path = file.path.clone();
@@ -727,26 +806,6 @@ impl AdeApp {
                         cx.notify();
                     })),
             )
-            .when(open, |el| {
-                el.child(
-                    div()
-                        .relative()
-                        .pt(px(2.0))
-                        .pb(px(3.0))
-                        // The vertical rule under the file row's caret, tying its match rows to
-                        // it - the same indent guide the file tree draws.
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(11.0))
-                                .top_0()
-                                .bottom_0()
-                                .w(px(1.0))
-                                .bg(theme::border::DIVIDER),
-                        )
-                        .children(match_rows),
-                )
-            })
             .into_any_element()
     }
 
@@ -756,6 +815,17 @@ impl AdeApp {
     /// line number and the hit highlighted"), so two hits on one line are two rows that each
     /// point at their own - which is also what makes the count row's total and the rows on screen
     /// agree.
+    ///
+    /// `is_first`/`is_last` place this row within its own file's run of match rows in the
+    /// flattened list (`SearchListItem::MatchRow` no longer has a shared parent to hang the
+    /// group's own top/bottom breathing room or its vertical guide rule on - see
+    /// `crate::search::state::SearchListItem`'s own docs on why match rows are now flat siblings
+    /// rather than a file row's children). The old wrapping div's `pt(2)`/`pb(3)` becomes this
+    /// row's own top/bottom padding exactly when it is the first/last row of that run - a flex
+    /// column's padding only ever visually affects its first and last child's leading/trailing
+    /// edge, so this is pixel-identical to the old wrapper's own spacing. The guide rule likewise
+    /// becomes a per-row absolutely-positioned segment spanning this row's own height: consecutive
+    /// rows' segments abut with no gap, reading as the one continuous rule the old wrapper drew.
     #[allow(clippy::too_many_arguments)]
     fn render_search_match(
         &self,
@@ -764,6 +834,8 @@ impl AdeApp {
         hit: usize,
         range: &std::ops::Range<usize>,
         file_index: usize,
+        is_first: bool,
+        is_last: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (before, matched, after) = engine::elide_around(&line.text, range);
@@ -771,63 +843,81 @@ impl AdeApp {
         let line_number = line.line_number;
         let id = SharedString::from(format!("search-match-{file_index}-{line_number}-{hit}"));
         div()
-            .id(id.clone())
-            .debug_selector(move || id.to_string())
-            .flex()
-            .items_baseline()
-            .gap(px(8.0))
-            .h(theme::band::SEARCH_MATCH_ROW)
-            .pl(px(18.0))
-            .pr(px(10.0))
-            .cursor_pointer()
-            .hover(|el| el.bg(theme::surface::ROW_HOVER))
-            .tooltip(text_tooltip(format!(
-                "{}:{line_number} \u{2014} open",
-                file.relative
-            )))
+            .relative()
+            .when(is_first, |el| el.pt(px(2.0)))
+            .when(is_last, |el| el.pb(px(3.0)))
+            // The vertical rule under the file row's caret, tying this match row to it - the same
+            // indent guide the file tree draws, now painted per row rather than once across the
+            // old wrapper (see this function's own docs).
             .child(
                 div()
-                    .flex_none()
-                    .w(px(26.0))
-                    .text_right()
-                    .whitespace_nowrap()
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(9.5))
-                    .text_color(theme::text::DISABLED)
-                    .child(line_number.to_string()),
+                    .absolute()
+                    .left(px(11.0))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(theme::border::DIVIDER),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .id(id.clone())
+                    .debug_selector(move || id.to_string())
                     .flex()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .font(font(theme::font::MONO))
-                    .text_size(self.ui_text_size(10.0))
+                    .items_baseline()
+                    .gap(px(8.0))
+                    .h(theme::band::SEARCH_MATCH_ROW)
+                    .pl(px(18.0))
+                    .pr(px(10.0))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER))
+                    .tooltip(text_tooltip(format!(
+                        "{}:{line_number} \u{2014} open",
+                        file.relative
+                    )))
                     .child(
                         div()
                             .flex_none()
-                            .text_color(theme::search::LINE)
-                            .child(before),
+                            .w(px(26.0))
+                            .text_right()
+                            .whitespace_nowrap()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(9.5))
+                            .text_color(theme::text::DISABLED)
+                            .child(line_number.to_string()),
                     )
                     .child(
                         div()
-                            .flex_none()
-                            .bg(theme::search::MATCH_BG)
-                            .text_color(theme::search::MATCH_FG)
-                            .child(matched),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font(font(theme::font::MONO))
+                            .text_size(self.ui_text_size(10.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme::search::LINE)
+                                    .child(before),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .bg(theme::search::MATCH_BG)
+                                    .text_color(theme::search::MATCH_FG)
+                                    .child(matched),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(theme::search::LINE)
+                                    .child(after),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(theme::search::LINE)
-                            .child(after),
-                    ),
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_search_match(path.clone(), line_number, window, cx);
+                    })),
             )
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open_search_match(path.clone(), line_number, window, cx);
-            }))
             .into_any_element()
     }
 }
@@ -969,13 +1059,20 @@ impl AdeApp {
     /// Compiles the query and, if it compiles to something, starts a real debounced search of the
     /// active worktree on the background executor.
     ///
-    /// Generation-guarded rather than task-cancelled: a slow search over a big worktree must never
-    /// overwrite a newer, faster one's results, and the check is one comparison at the moment the
-    /// result lands. The debounce is `SEARCH_DEBOUNCE` - see its own docs for why a search is not
-    /// run per keystroke.
+    /// Generation-guarded on the *result*: a slow search over a big worktree must never overwrite
+    /// a newer, faster one's results, and that check is one comparison at the moment the result
+    /// lands. The walk itself is also cooperatively cancelled while it runs - GitHub issue #162's
+    /// own live-report follow-up found that the generation guard alone let a fast typist pile up
+    /// several full worktree walks competing for CPU at once, since a superseded walk kept running
+    /// to completion only to have its result thrown away. `self.search_generation` (a real,
+    /// cross-thread `Arc<AtomicU64>` - see that field's own docs) is bumped here alongside
+    /// `self.search.generation`, and `crate::search::engine::search_worktree_cancellable` polls it
+    /// once per scan batch, so a superseded walk stops within one batch of being superseded. The
+    /// debounce is `SEARCH_DEBOUNCE` - see its own docs for why a search is not run per keystroke.
     pub(crate) fn start_search(&mut self, cx: &mut Context<Self>) {
         self.search.generation += 1;
         let generation = self.search.generation;
+        self.search_generation.store(generation, Ordering::SeqCst);
 
         let matcher = match Matcher::compile(self.search.query.as_str(), self.search.options) {
             Ok(Some(matcher)) => {
@@ -1011,6 +1108,11 @@ impl AdeApp {
         let include = self.search.include.as_str().to_string();
         let exclude = self.search.exclude.as_str().to_string();
 
+        // Cloned before the `move` below: the closure the background executor calls needs its own
+        // handle to poll, independent of whatever `self.search_generation` ends up being cloned
+        // into by a later keystroke's own `start_search`.
+        let search_generation = self.search_generation.clone();
+
         self.search.searching = true;
         self._search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
@@ -1022,7 +1124,11 @@ impl AdeApp {
             }
             let outcome: SearchOutcome = cx
                 .background_executor()
-                .spawn(async move { engine::search_worktree(&request) })
+                .spawn(async move {
+                    engine::search_worktree_cancellable(&request, &|| {
+                        search_generation.load(Ordering::SeqCst) != generation
+                    })
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.search.generation != generation {
@@ -1699,6 +1805,182 @@ mod panel_tests {
             Some(&query_handle),
             "a `FocusId` no rendered frame can resolve silently kills every context-scoped \
              binding until the next click"
+        );
+    }
+}
+
+/// Proves GitHub issue #162's own live-report follow-up (report (a): "when a lot of results are
+/// shown it lags"). `AdeApp::render_search_body` used to build every file row and every match row
+/// unconditionally, on every render - up to `crate::search::engine::MAX_MATCHES` match rows for
+/// one popular query. Mirrors `crate::rail::render::rail_virtualization_tests`'s own real
+/// black-box proof for the rail's identical fix (GitHub issue #364): absence/presence of a real
+/// painted element, not an internal call counter, because that is the one thing a regression in
+/// this exact area (an eager `.children(...)` tree standing in for real virtualization again)
+/// cannot fake past.
+#[cfg(test)]
+mod search_virtualization_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+    use tempfile::TempDir;
+
+    /// Deliberately more match rows than any plausible test viewport can show at
+    /// `theme::band::SEARCH_MATCH_ROW` each - a single file with `ROW_COUNT` distinct one-per-line
+    /// hits, the same "a real result tree easily holds hundreds of rows for one popular symbol"
+    /// shape the live report itself described.
+    const ROW_COUNT: usize = 300;
+
+    fn fixture_repo() -> TempDir {
+        let repo = TempDir::new().expect("tempdir");
+        let mut content = String::new();
+        for i in 0..ROW_COUNT {
+            content.push_str(&format!("let needle_{i} = needle;\n"));
+        }
+        std::fs::write(repo.path().join("big.rs"), content).expect("write");
+        repo
+    }
+
+    fn open_search<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &TempDir,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| app.open_search_panel(window, cx));
+        cx.run_until_parked();
+        (app, cx)
+    }
+
+    fn type_and_settle(cx: &mut gpui::VisualTestContext, text: &str) {
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+    }
+
+    /// The real `search-match-0-{line_number}-0` selector `render_search_match` paints under.
+    fn match_selector(line_number: usize) -> &'static str {
+        Box::leak(format!("search-match-0-{line_number}-0").into_boxed_str())
+    }
+
+    /// Before this fix, this row would have painted too: `render_search_body` built every match
+    /// row unconditionally, regardless of scroll position. `crate::sidebar::render::
+    /// virtualization_tests`' own docs record the same class of measurement for the file tree
+    /// before *that* surface's equivalent fix.
+    #[gpui::test]
+    fn a_match_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        // Small enough that `ROW_COUNT` rows genuinely overflow the panel's own viewport many
+        // times over.
+        cx.simulate_resize(gpui::size(px(420.0), px(400.0)));
+        type_and_settle(cx, "needle");
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.body_state(), BodyState::Results);
+        });
+
+        let first = match_selector(1);
+        let far_below = match_selector(ROW_COUNT);
+        assert!(
+            cx.debug_bounds(first).is_some(),
+            "the first match row must really paint - if it doesn't, this test proves nothing \
+             about virtualization, only that the panel is empty"
+        );
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "the {ROW_COUNT}th match row is far below any plausible viewport, so a real \
+             virtualized list must never build it as an element at all"
+        );
+    }
+
+    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
+    /// must still be reachable by scrolling.
+    #[gpui::test]
+    fn scrolling_the_virtualized_results_materializes_a_row_that_was_not_painted(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+        cx.simulate_resize(gpui::size(px(420.0), px(400.0)));
+        type_and_settle(cx, "needle");
+
+        let far_below = match_selector(ROW_COUNT);
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before scrolling"
+        );
+
+        let target_index = app.update(cx, |app, _cx| {
+            let outcome = app.search.results().expect("results").clone();
+            let items = state::flatten_search_list_items(&outcome, &app.search.collapsed);
+            items
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        state::SearchListItem::MatchRow { line_index, .. }
+                            if *line_index + 1 == ROW_COUNT
+                    )
+                })
+                .expect("the last match must be a real flattened list item")
+        });
+        // Several incremental calls, the same real reason `crate::rail::render::
+        // rail_virtualization_tests` needs them: `gpui::ListState`'s rows this far below the fold
+        // are still `Unmeasured` (contributing no height to its running total yet), so revealing
+        // an item this far past the fold takes the same real incremental steps a user dragging
+        // the scrollbar all the way down would.
+        for _ in 0..ROW_COUNT {
+            app.update(cx, |app, cx| {
+                app.search_list_state.scroll_to_reveal_item(target_index);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.debug_bounds(far_below).is_some() {
+                break;
+            }
+        }
+
+        assert!(
+            cx.debug_bounds(far_below).is_some(),
+            "scrolling to reveal the last row must really materialize it - if this fails the \
+             list is not scrollable any more, which is a far worse regression than the render \
+             cost this change set out to fix"
+        );
+    }
+
+    /// The live report itself, made falsifiable: hovering a row that is really on screen must
+    /// never materialize one that is not, even though GPUI's own `.hover()` forces a full
+    /// `Window::refresh()` on the transition.
+    #[gpui::test]
+    fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (_app, cx) = open_search(cx, &repo);
+        cx.simulate_resize(gpui::size(px(420.0), px(400.0)));
+        type_and_settle(cx, "needle");
+
+        let first_row = match_selector(1);
+        let far_below = match_selector(ROW_COUNT);
+        let first_bounds = cx
+            .debug_bounds(first_row)
+            .expect("the first match row must really paint");
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "precondition: the last row must not be painted before any hover"
+        );
+
+        cx.simulate_mouse_move(gpui::point(px(1.0), px(1.0)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(first_bounds.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(far_below).is_none(),
+            "hovering a row that is really on screen must not materialize one that is not - a \
+             hover-triggered `Window::refresh()` bypassing every view's per-entity render cache is \
+             exactly what made this class of list slow to hover before, and exactly what real \
+             virtualization has to stay correct under"
         );
     }
 }
